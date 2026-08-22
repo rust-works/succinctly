@@ -8862,6 +8862,45 @@ impl JqRegex {
     }
 }
 
+/// Validate a regex flags string against real yq's own accepted grammar
+/// for `match`/`test`/`capture` (#1426) -- real yq doesn't use jq's flag
+/// grammar at all. Live-verified against yq v4.53.3: `g` is the only
+/// character it accepts; every other jq-style flag (`i`/`x`/`s`/`m`/`n`/
+/// `l`/`p`, and anything else) is rejected. `i` gets its own distinct
+/// message pointing at yq's inline-pattern alternative (`match("(?i)cat")`)
+/// rather than the generic "unrecognised match params" wording, and takes
+/// priority over that generic message even when other invalid characters
+/// are also present in the same string (`test("a";"ix")` and
+/// `test("a";"xi")` both report the `i`-specific message, never `xi`'s).
+/// The generic message reports every non-`g` character found, in the
+/// order they appear, without deduplicating repeats (`test("a";"zgz")`
+/// reports `'zz'`, not `'z'`).
+///
+/// Deliberately scoped to `match`/`test`/`capture` only, not `sub`/`gsub`/
+/// `scan`/`split`/`splits`: live-probing those found `sub`'s 3-arg flags
+/// argument doesn't raise this error for *any* character, valid or not --
+/// its real behavior is a separate, still-unresolved mystery (#1122).
+/// `split`'s 2-arg form has the identical symptom, and its own separate
+/// mystery (#1439). `gsub`/`scan`/`splits` aren't real yq builtins at all
+/// (`yq -o=json 'scan("a")'` fails at the *lexer*, before any flags are
+/// even evaluated, #1436). All three left as open follow-ups rather than
+/// folded in here.
+#[cfg(feature = "regex")]
+fn validate_yq_match_flags(flags: &str) -> Result<(), EvalError> {
+    if flags.contains('i') {
+        return Err(EvalError::new(
+            "'i' is not a valid option for match. To ignore case, use an expression like match(\"(?i)cat\")",
+        ));
+    }
+    let invalid: String = flags.chars().filter(|&c| c != 'g').collect();
+    if !invalid.is_empty() {
+        return Err(EvalError::new(format!(
+            "unrecognised match params '{invalid}', please see docs at https://mikefarah.gitbook.io/yq/operators/string-operators"
+        )));
+    }
+    Ok(())
+}
+
 /// Build regex flags from jq flag string
 #[cfg(feature = "regex")]
 fn build_regex(pattern: &str, flags: Option<&str>) -> Result<JqRegex, EvalError> {
@@ -9134,6 +9173,35 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(qr) => return qr,
     };
     let flags = flags.as_deref();
+
+    // #1426: yq mode's flag grammar for `match`/`test`/`capture` is
+    // narrower than jq's -- see `validate_yq_match_flags`'s own doc
+    // comment for the full rule, live-verified against yq v4.53.3.
+    //
+    // The `optional` branch below mirrors this function's own pre-existing
+    // `build_regex`/input-type checks a few lines down, all gated on the
+    // same parameter -- and, like those, is provably unreachable through
+    // any currently-wired call path (confirmed via HTML coverage hit
+    // counts: `Err(_e) if optional => return QueryResult::None` a few
+    // lines below already shows 0 hits on `main`, before this diff).
+    // Nothing today sets `optional: true` for a `test`/`match`/`capture`
+    // call itself -- the postfix `?` succinctly's own grammar accepts
+    // there suppresses errors via an *outer* mechanism instead, not this
+    // parameter. Kept rather than special-cased away: if a future install
+    // point ever does thread `optional: true` through here, this arm is
+    // exactly what should already exist to honor it, matching every other
+    // gated branch in this function.
+    if S::TAG == EvalTag::Yq {
+        if let Some(f) = flags {
+            if let Err(e) = validate_yq_match_flags(f) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    e.into()
+                };
+            }
+        }
+    }
 
     // Get the input string
     let input = match &value {
@@ -9802,6 +9870,35 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let flags = flags.as_deref();
 
+    // #1426: yq mode's flag grammar for `match`/`test`/`capture` is
+    // narrower than jq's -- see `validate_yq_match_flags`'s own doc
+    // comment for the full rule, live-verified against yq v4.53.3.
+    //
+    // The `optional` branch below mirrors this function's own pre-existing
+    // `build_regex`/input-type checks a few lines down, all gated on the
+    // same parameter -- and, like those, is provably unreachable through
+    // any currently-wired call path (confirmed via HTML coverage hit
+    // counts: `Err(_e) if optional => return QueryResult::None` a few
+    // lines below already shows 0 hits on `main`, before this diff).
+    // Nothing today sets `optional: true` for a `test`/`match`/`capture`
+    // call itself -- the postfix `?` succinctly's own grammar accepts
+    // there suppresses errors via an *outer* mechanism instead, not this
+    // parameter. Kept rather than special-cased away: if a future install
+    // point ever does thread `optional: true` through here, this arm is
+    // exactly what should already exist to honor it, matching every other
+    // gated branch in this function.
+    if S::TAG == EvalTag::Yq {
+        if let Some(f) = flags {
+            if let Err(e) = validate_yq_match_flags(f) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    e.into()
+                };
+            }
+        }
+    }
+
     // Get the input string
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
@@ -9872,6 +9969,35 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(qr) => return qr,
     };
     let flags = flags.as_deref();
+
+    // #1426: yq mode's flag grammar for `match`/`test`/`capture` is
+    // narrower than jq's -- see `validate_yq_match_flags`'s own doc
+    // comment for the full rule, live-verified against yq v4.53.3.
+    //
+    // The `optional` branch below mirrors this function's own pre-existing
+    // `build_regex`/input-type checks a few lines down, all gated on the
+    // same parameter -- and, like those, is provably unreachable through
+    // any currently-wired call path (confirmed via HTML coverage hit
+    // counts: `Err(_e) if optional => return QueryResult::None` a few
+    // lines below already shows 0 hits on `main`, before this diff).
+    // Nothing today sets `optional: true` for a `test`/`match`/`capture`
+    // call itself -- the postfix `?` succinctly's own grammar accepts
+    // there suppresses errors via an *outer* mechanism instead, not this
+    // parameter. Kept rather than special-cased away: if a future install
+    // point ever does thread `optional: true` through here, this arm is
+    // exactly what should already exist to honor it, matching every other
+    // gated branch in this function.
+    if S::TAG == EvalTag::Yq {
+        if let Some(f) = flags {
+            if let Err(e) = validate_yq_match_flags(f) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    e.into()
+                };
+            }
+        }
+    }
 
     // Get the input string
     let input = match &value {

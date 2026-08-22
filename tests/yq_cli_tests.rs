@@ -18919,3 +18919,122 @@ fn test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298() -> Result<
     assert!(err.contains("boom"), "err={err}");
     Ok(())
 }
+
+/// #1426: real yq's flag grammar for `test`/`match`/`capture` is much
+/// narrower than jq's -- only `g` is a real flag, live-verified against
+/// yq v4.53.3. Every case here is a direct transcription of a live probe
+/// against that binary, not an assumption from jq familiarity.
+#[test]
+fn test_yq_regex_flag_grammar_rejects_jq_only_flags_1426() -> Result<()> {
+    // `g` is the only accepted flag.
+    let (out, code) = run_yq_stdin("test(\"abc\";\"g\")", "abc", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "true");
+
+    // `i` gets its own distinct message, not the generic one.
+    for query in [
+        "test(\"abc\";\"i\")",
+        "match(\"abc\";\"i\")",
+        "capture(\"(?P<x>a)\";\"i\")",
+    ] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(query, "abc", &["-o", "json"])?;
+        assert_ne!(code, 0, "query={query}");
+        assert!(
+            err.contains("'i' is not a valid option for match"),
+            "query={query} err={err}"
+        );
+    }
+
+    // Every other jq-style flag gets the generic "unrecognised match
+    // params" message, naming the offending character.
+    for (flag, query) in [
+        ("x", "test(\"abc\";\"x\")"),
+        ("s", "test(\"abc\";\"s\")"),
+        ("m", "test(\"abc\";\"m\")"),
+        ("n", "test(\"abc\";\"n\")"),
+        ("l", "test(\"abc\";\"l\")"),
+        ("p", "test(\"abc\";\"p\")"),
+    ] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(query, "abc", &["-o", "json"])?;
+        assert_ne!(code, 0, "flag={flag}");
+        assert!(
+            err.contains(&format!("unrecognised match params '{flag}'")),
+            "flag={flag} err={err}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1426: multi-character flag strings -- `g` is stripped out (not
+/// reported) wherever it appears, the remaining invalid characters are
+/// reported in their original order without deduplicating repeats, and
+/// `i` takes priority over the generic message regardless of position
+/// (`ix` and `xi` both report the `i`-specific message, never the
+/// generic one for `xi`). Every case live-verified against yq v4.53.3.
+#[test]
+fn test_yq_regex_flag_grammar_multi_char_rules_1426() -> Result<()> {
+    for query in ["test(\"abc\";\"gxz\")", "test(\"abc\";\"xgz\")"] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(query, "abc", &["-o", "json"])?;
+        assert_ne!(code, 0, "query={query}");
+        assert!(
+            err.contains("unrecognised match params 'xz'"),
+            "query={query} err={err}"
+        );
+    }
+
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("test(\"abc\";\"zgz\")", "abc", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("unrecognised match params 'zz'"), "err={err}");
+
+    for query in ["test(\"abc\";\"ix\")", "test(\"abc\";\"xi\")"] {
+        let (_out, err, code) = run_yq_stdin_with_stderr(query, "abc", &["-o", "json"])?;
+        assert_ne!(code, 0, "query={query}");
+        assert!(
+            err.contains("'i' is not a valid option for match"),
+            "query={query} err={err}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1426: jq mode is unaffected -- the wider flag grammar (including `l`,
+/// `n`, permanently accepted per ADR-0019/#920) stays exactly as it was.
+#[test]
+fn test_yq_regex_flag_grammar_jq_mode_unaffected_1426() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_stdin_with_stderr("test(\"a|aa|aaa\";\"l\")", "\"aaa\"", &["-c"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout.trim(), "true");
+    Ok(())
+}
+
+/// #1426: a postfix `?` on the call itself suppresses the new
+/// flag-validation error end to end. Traced (via temporary debug tracing,
+/// removed before finalizing) that this suppression happens through an
+/// *outer* mechanism, not the `optional: bool` parameter these builtins
+/// receive -- that parameter is `false` here even under `?`, matching
+/// this function's own pre-existing `build_regex`/input-type checks a
+/// few lines away, whose identical `optional`-gated arms already show 0
+/// coverage hits on `main` (confirmed via HTML coverage output, not
+/// assumed) for the same reason. Succinctly's own extended grammar
+/// accepts `?` directly after a function call in this position; real
+/// yq's narrower grammar does not (`test(...)? ` fails to lex there even
+/// though `.a?` on a path works) — this pins succinctly's own established
+/// end-to-end behavior, not a claim about real yq syntax at this exact
+/// position.
+#[test]
+fn test_yq_regex_flag_grammar_optional_suppresses_error_1426() -> Result<()> {
+    for query in [
+        "test(\"abc\";\"z\")?",
+        "match(\"abc\";\"z\")?",
+        "capture(\"(?P<x>a)\";\"z\")?",
+    ] {
+        let (out, code) = run_yq_stdin(query, "abc", &["-o", "json"])?;
+        assert_eq!(code, 0, "query={query} out={out}");
+        assert_eq!(out.trim(), "", "query={query}");
+    }
+    Ok(())
+}
