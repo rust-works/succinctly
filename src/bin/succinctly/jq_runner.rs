@@ -862,32 +862,6 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Get the filter expression
     let filter_str = get_filter(&args)?;
 
-    // Whether the filter could reference `input`/`inputs`/`input_line_number`
-    // (#723) -- a conservative text-level check on the raw source rather than
-    // an AST walk: every real use of any of the three necessarily contains
-    // "input" as a contiguous substring (jq identifiers can't be split
-    // across an escape/continuation) *within this same source string*, so a
-    // direct top-level use is never under-detected. A false positive (`.input`
-    // field access, an `"input"` string literal, a comment) only costs a
-    // missed fast-path optimization below, never a wrong result.
-    //
-    // Known real gap, NOT just a theoretical one (code review, #723): this
-    // check runs on `filter_str` alone, before `module_loader.process_program`
-    // (below) inlines any `-L`/`import`/`include`-loaded module body. A call
-    // to `input`/`inputs`/`input_line_number` that only exists inside an
-    // imported module's own function -- never spelled out in `filter_str`
-    // itself -- is invisible here, so the filter wrongly takes the
-    // fast/lazy path and those builtins run against an unseeded queue,
-    // producing a *wrong result* (confirmed live: every document reports
-    // spurious exhaustion instead of only the true last one). Filed as
-    // follow-up issue #1309 rather than fixed here -- fixing it correctly
-    // means walking the expanded, post-module `expr` a few lines below
-    // instead of scanning source text, which needs the same exhaustive,
-    // no-wildcard `Expr`/`Builtin` match this file's own `contains_split_doc`
-    // (`yq_runner.rs`) already establishes as the safe pattern for this kind
-    // of check -- real work, not a one-line fix.
-    let uses_input_builtins = filter_str.contains("input");
-
     // Parse the filter as a full program (with module directives)
     let program = jq::parse_program(&filter_str).map_err(|e| {
         eprintln!("jq: compile error: {e}");
@@ -911,6 +885,29 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     all_vars.push(("ARGS", &args_value));
 
     let expr = jq::substitute_vars(&expr, all_vars);
+
+    // Whether the filter references `input`/`inputs`/`input_line_number`
+    // (#723), which decides below whether the shared input queue gets seeded
+    // at all.
+    //
+    // Deliberately computed *here* rather than at the top of this function:
+    // it must see the expanded tree. `module_loader.process_program` above is
+    // what inlines a `-L`/`import`/`include`-loaded module body, so a call
+    // that exists only inside an imported module's own function -- never
+    // spelled out in `filter_str` -- becomes visible only at this point. The
+    // substring scan of `filter_str` this replaced missed exactly that case,
+    // and the miss was not benign: the unseeded queue made every document
+    // report spurious exhaustion (#1309, oracle-confirmed against jq 1.7.1).
+    //
+    // `substitute_vars` cannot introduce one of these builtins -- it
+    // substitutes `OwnedValue`s, not sub-expressions -- so walking after it
+    // rather than immediately after `process_program` is equivalent, and
+    // keeps this to a single `expr` binding.
+    //
+    // Exact in both directions now, where the substring scan over-reported as
+    // well as under-reported: `.input`, `.inputs` and an `"input"` string
+    // literal no longer force the non-lazy read path.
+    let uses_input_builtins = jq::walk::uses_input_builtins(&expr);
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -1121,21 +1118,15 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         //
         // `force_read_under_null_input` narrows `uses_input_builtins` by one
         // safety check: never force a real read under `-n` when stdin is an
-        // interactive terminal with no files given. `uses_input_builtins` is
-        // a conservative text-level heuristic (see its own doc comment) that
-        // can false-positive on a filter that merely *contains* the
-        // substring "input" (a `.input` field, an `"input"` string literal)
-        // without actually calling the builtin -- harmless everywhere else
-        // (just a missed fast-path optimization), except specifically here:
-        // forcing a read under `-n` on a false positive, with no piped input
-        // and no files, would otherwise hang waiting on a TTY that was never
-        // going to send anything. Narrowing it this way means a false
-        // positive just makes `input`/`inputs` report exhausted immediately
-        // (the queue never gets seeded) instead of hanging -- never a wrong
-        // *answer*, only conceivably a real `input`/`inputs` call losing its
-        // data if someone runs `-n 'inputs'` at a bare interactive prompt
-        // with data they intend to type in live rather than pipe/redirect --
-        // an already-unusual way to invoke `-n` in the first place.
+        // interactive terminal with no files given. Since #1309 the check
+        // itself is exact -- an AST walk, not the substring scan that used to
+        // fire on a `.input` field -- so this narrowing no longer exists to
+        // contain false positives. It covers the genuine case: `-n 'inputs'`
+        // typed at a bare prompt would otherwise block reading a TTY the user
+        // may not have meant to feed. `input`/`inputs` then correctly report
+        // exhausted against an empty queue instead of hanging; the only data
+        // lost is data the user intended to type in live rather than
+        // pipe/redirect, an already-unusual way to invoke `-n`.
         let force_read_under_null_input = should_force_read_under_null_input(
             uses_input_builtins,
             args.null_input,
@@ -1382,14 +1373,12 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
 }
 
 /// Whether to force a real read under `-n` for `input`/`inputs`/
-/// `input_line_number` (#723), given `uses_input_builtins`' own text-level
-/// heuristic (see its doc comment at the call site for why it can
-/// false-positive). Narrowed by one safety check, pulled out as a pure
-/// function so it's unit-testable without a real terminal: never force the
-/// read when `-n` is set, no files were given, and stdin is an interactive
-/// terminal -- a false positive there would otherwise hang waiting on a TTY
-/// that was never going to send anything, instead of just costing a missed
-/// fast-path optimization the way every other false positive does.
+/// `input_line_number` (#723), given whether the filter actually references
+/// one of them (`jq::walk::uses_input_builtins`, exact since #1309).
+/// Narrowed by one safety check, pulled out as a pure function so it's
+/// unit-testable without a real terminal: never force the read when `-n` is
+/// set, no files were given, and stdin is an interactive terminal -- that
+/// would block on a TTY the user may not have meant to feed.
 ///
 /// Four bools, each independently meaningful and named at every call site
 /// (no adjacent pair is ever confusable) -- a two-variant-enum refactor

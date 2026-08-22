@@ -16585,6 +16585,88 @@ fn test_jq_inputs_and_input_line_number_inside_user_defined_function_723() -> Re
     Ok(())
 }
 
+// #1309 item 1: an `input` call that only a `-L`/`import`/`include`-loaded
+// module body spells out. The detection this replaced was a substring scan of
+// the raw filter text, which never sees a module body -- so the input queue
+// went unseeded and every `readNext` reported exhaustion instead of reading
+// the stream. Both expectations below are pinned jq 1.7.1's own output.
+
+/// Writes `def readNext: input;` into a fresh module directory and returns it.
+/// The `tempfile::TempDir` must outlive the run, so it is returned, not the
+/// path alone.
+fn input_builtin_module_dir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(dir.path().join("mylib.jq"), "def readNext: input;")?;
+    Ok(dir)
+}
+
+#[test]
+fn test_jq_input_inside_imported_module_seeds_the_queue_1309() -> Result<()> {
+    let dir = input_builtin_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, r#"import "mylib" as m; ., m::readNext"#],
+        Some("1\n2\n3\n"),
+    )
+    .expect("imported-module input repro runs");
+
+    assert_eq!(stdout, "1\n2\n3\n", "stderr: {stderr}");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    // Exactly one `break`: the final, genuinely exhausted call. Before the
+    // fix there were three -- one per document, none of them real.
+    assert_eq!(
+        stderr.matches("break").count(),
+        1,
+        "expected one genuine exhaustion, got: {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_jq_input_inside_included_module_seeds_the_queue_1309() -> Result<()> {
+    let dir = input_builtin_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, r#"include "mylib"; ., readNext"#],
+        Some("1\n2\n3\n"),
+    )
+    .expect("included-module input repro runs");
+
+    assert_eq!(stdout, "1\n2\n3\n", "stderr: {stderr}");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stderr.matches("break").count(),
+        1,
+        "expected one genuine exhaustion, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// The other direction #1309 fixed: the substring scan also *over*-reported,
+/// forcing a filter that merely spells "input" in a field name or a string
+/// literal off the fast path. Output must be identical either way -- these
+/// pin that the two paths agree, so a future regression in one of them
+/// surfaces here rather than as a silent formatting difference.
+#[test]
+fn test_jq_field_named_input_is_not_an_input_builtin_1309() -> Result<()> {
+    for (filter, input, expected) in [
+        (".input", r#"{"input": 1.10}"#, "1.10\n"),
+        (".inputs", r#"{"inputs": 4e4}"#, "4E+4\n"),
+        (
+            ".input_line_number",
+            r#"{"input_line_number": 2.50}"#,
+            "2.50\n",
+        ),
+        (r#""input""#, "1", "\"input\"\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(input)).expect("field-named-input repro runs");
+        assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
