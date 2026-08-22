@@ -822,6 +822,19 @@ enum LazySource<V: DocumentValue> {
     /// Array `keys_unsorted | map(f)` (#724) — synthetic `[0, 1, ..., len-1]`,
     /// no cursor to point at.
     IndexRange { next: usize, len: usize },
+    /// `Values`'s duplicate-key fallback (#1398): `obj | map(f)` is `[.[] |
+    /// f]`, and `.[]` collapses a repeated key to its first position but
+    /// last-seen value in both modes (see `Expr::Iterate`'s identical
+    /// rule). That requires seeing every occurrence before any value can
+    /// be emitted, so it can't stay a `Fields` cons-list walk -- this
+    /// variant holds the already-collapsed value cursors instead.
+    /// Constructed only when `document::collapsed_fields` actually finds a
+    /// repeat, so the ordinary duplicate-free `Values` path above is
+    /// unaffected.
+    CollapsedValues {
+        cursors: Vec<V::Cursor>,
+        next: usize,
+    },
 }
 
 // See `LazyElem`'s `Debug` impl above for why this is hand-written, not derived.
@@ -835,6 +848,11 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
                 .debug_struct("LazySource::IndexRange")
                 .field("next", next)
                 .field("len", len)
+                .finish(),
+            Self::CollapsedValues { next, cursors } => f
+                .debug_struct("LazySource::CollapsedValues")
+                .field("next", next)
+                .field("len", &cursors.len())
                 .finish(),
         }
     }
@@ -868,6 +886,11 @@ impl<V: DocumentValue> LazySource<V> {
                 let i = *next;
                 *next += 1;
                 Some(LazyElem::Owned(OwnedValue::Int(i as i64)))
+            }
+            Self::CollapsedValues { cursors, next } => {
+                let cursor = cursors.get(*next).copied()?;
+                *next += 1;
+                Some(LazyElem::Cursor(cursor))
             }
         }
     }
@@ -2364,13 +2387,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     GenericResult::ManyCursor(cursors)
                 }
             } else if let Some(fields) = value.as_object() {
-                // Duplicate keys collapse here in jq mode (#1385): `.[]` on
-                // `{"b":1,"a":2,"b":3}` yields `3, 2`, not `1, 2, 3`, since
-                // the object jq iterates only ever had two members. yq keeps
-                // all three -- `S::COLLAPSE_DUPLICATE_KEYS` is false there,
-                // so `effective_fields` reduces to the plain walk this used
-                // to do inline, and monomorphization drops the check.
-                let cursors: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                // `.[]` collapses a repeated key to its first position but
+                // last-seen value in *both* modes (#1398) -- unlike every
+                // other builtin `S::COLLAPSE_DUPLICATE_KEYS` governs, real
+                // yq is inconsistent here and does collapse under `.[]`
+                // traversal alone (confirmed live against yq v4.53.3), so
+                // this always passes `true` rather than the mode flag.
+                let cursors: Vec<_> = effective_fields(&fields, true)
                     .into_iter()
                     .map(|field| field.value_cursor)
                     .collect();
@@ -4093,7 +4116,25 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     LazySeq::new(LazySource::Elements(elements)).push_map(f, S::TAG),
                 )
             } else if let Some(fields) = value.as_object() {
-                GenericResult::LazySeq(LazySeq::new(LazySource::Values(fields)).push_map(f, S::TAG))
+                // `.[]` collapses a repeated key to its first position but
+                // last-seen value in both modes (#1398), which needs every
+                // occurrence seen before any value can be emitted --
+                // incompatible with `Values`'s incremental cons-list pull.
+                // `collapsed_fields` gates the materializing fallback
+                // behind a cheap fingerprint probe (`document::census`),
+                // so the duplicate-free case (by far the common one) keeps
+                // #724/#725's lazy pull unchanged.
+                let source = match collapsed_fields(&fields) {
+                    Some(collapsed) => LazySource::CollapsedValues {
+                        cursors: collapsed
+                            .into_iter()
+                            .map(|field| field.value_cursor)
+                            .collect(),
+                        next: 0,
+                    },
+                    None => LazySource::Values(fields),
+                };
+                GenericResult::LazySeq(LazySeq::new(source).push_map(f, S::TAG))
             } else if optional {
                 GenericResult::None
             } else {
