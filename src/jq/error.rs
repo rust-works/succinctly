@@ -432,9 +432,9 @@ impl EvalError {
     /// this has no length budget — `error(v)`'s message is the whole value, verbatim,
     /// same as real jq.
     ///
-    /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
-    /// [`EvalError::from_value_with`] once `S: EvalSemantics` is in scope at the
-    /// call site.
+    /// jq-pinned shim (#1055): delegates to [`EvalError::from_value_with`]
+    /// fixed at `EvalTag::Jq` — use that constructor directly once
+    /// `S: EvalSemantics` is in scope at the call site.
     pub fn from_value(value: OwnedValue) -> Self {
         Self::from_value_with(EvalTag::Jq, value)
     }
@@ -690,9 +690,10 @@ impl EvalError {
 
     /// `Cannot iterate over <type> (<value>)`.
     ///
-    /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
-    /// [`EvalError::cannot_iterate_with`] once `S: EvalSemantics` is in scope
-    /// at the call site.
+    /// jq-pinned shim (#1055): delegates to
+    /// [`EvalError::cannot_iterate_with`] fixed at `EvalTag::Jq` — use that
+    /// constructor directly once `S: EvalSemantics` is in scope at the call
+    /// site.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
         Self::cannot_iterate_with(EvalTag::Jq, value)
     }
