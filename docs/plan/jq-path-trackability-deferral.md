@@ -375,7 +375,15 @@ measured slice-by-slice rather than as one combined change.
    `Expr::As`'s own gap (a variable bound *outside* `path(...)`'s argument, or from a source
    that isn't a syntactic passthrough of `.`, losing trackability across the binding) was closed
    by #844 — see `is_identity_passthrough` and `resolve_node`'s `Expr::TrackedVar` arm in
-   `src/jq/eval.rs`. The others in this list remain open.
+   `src/jq/eval.rs`. #1440 closed the sibling gap for `Expr::Reduce`/`Expr::Foreach` (which had
+   no `resolve_node` arm at all, not merely an unaudited one) — see `resolve_reduce`/
+   `resolve_foreach` and the `FoldRegister` type, which model jq's own `(path, value_at_path)`
+   register rather than reusing `Expr::As`'s AST-substitution mechanism: the accumulator has no
+   name (it's `.` inside UPDATE), and empirically the register resets between source-element
+   iterations of the same fold (jq's own "backtracking restores the register to its fork point"
+   rule) but carries forward within one fold step from UPDATE into EXTRACT — a genuinely
+   different shape than a named-variable binding, not just the same mechanism applied to a
+   fold. The others in this list remain open.
 5. **`del`/assignment write-path semantics**, not just `path()`'s read-only output. #972's own
    revert (on a related but different fix in this same code region) was specifically about
    silent data corruption on the write path once multi-key index/slice fan-outs were involved.

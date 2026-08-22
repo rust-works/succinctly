@@ -15098,6 +15098,56 @@ fn resolve_node<'a, S: EvalSemantics>(
             }
         }
 
+        // #1440: `reduce`/`foreach` are real sugar over the same
+        // variable-binding primitive every other construct uses (real jq
+        // has no fold-specific path machinery at all), so a path-trackable
+        // variable referenced inside UPDATE/EXTRACT should track the same
+        // way it does anywhere else — but until this arm existed, both
+        // fell to `resolve_leaf`'s catch-all, which evaluates the whole
+        // construct via the ordinary value evaluator and always marks the
+        // result untracked. See `resolve_reduce`/`resolve_foreach` and
+        // `FoldRegister` for the full model, derived empirically against
+        // jq 1.7.1.
+        //
+        // `patterns.len() == 1` is the overwhelmingly common case (a bare
+        // `?//`-free `as` clause) and the only one `resolve_reduce`/
+        // `resolve_foreach` handle; #1365's own `?//`-alternatives retry
+        // machinery (`try_reduce_step_alternatives`/
+        // `try_foreach_step_alternatives`) landed on `main` after this
+        // arm was designed and isn't threaded through path-tracking here.
+        // Real jq still tracks a variable through a `?//`-alternatives
+        // fold (confirmed live: `path(. as $x | reduce (1) as $y ?// $z
+        // (0; $x))` is `[]`), so falling to `resolve_leaf`'s catch-all for
+        // that case is a real but safe (refuse-only, never a wrong path)
+        // divergence — documented in `docs/compliance/jq/limitations.md`.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => match patterns.as_slice() {
+            [pattern] => resolve_reduce::<S>(input, pattern, init, update, value, trackable),
+            _ => resolve_leaf::<S>(expr, value, trackable),
+        },
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => match patterns.as_slice() {
+            [pattern] => resolve_foreach::<S>(
+                input,
+                pattern,
+                init,
+                update,
+                extract.as_deref(),
+                value,
+                trackable,
+            ),
+            _ => resolve_leaf::<S>(expr, value, trackable),
+        },
+
         // #844: a frozen variable snapshot from a statically-verified
         // identity-passthrough `as`-binding (see `is_identity_passthrough`
         // and the two `substitute_var_tracked` call sites above). The
@@ -15655,6 +15705,417 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
             )),
         },
     }
+}
+
+/// The register `path()`-tracking compares each `reduce`/`foreach` fold
+/// iteration's own navigation against — jq's `(path, value_at_path)` pair,
+/// derived empirically against jq 1.7.1 (#1440; no fold-specific machinery
+/// exists in real jq, since `reduce`/`foreach` are sugar over the same
+/// variable-binding primitive every other construct uses — confirmed by
+/// `substitute_var_impl`'s existing `Reduce`/`Foreach` arms, which already
+/// correctly thread an outer `Expr::TrackedVar` marker into UPDATE/EXTRACT;
+/// the only missing piece was `resolve_node` never walking into the
+/// construct at all).
+///
+/// **Fixed once per INIT fork ([`FoldRegister::enter`]) — never advances
+/// across source-element iterations of the same fold.** Confirmed live:
+/// `path(reduce (1,2) as $i (.a; .b))` on `{"a":{"b":{"b":9}}}` raises
+/// "near attempt to access element \"b\" of {\"b\":9}" on the *second*
+/// iteration — if the register had advanced to iteration 1's own result
+/// (path `["a","b"]`, value `{"b":9}`), iteration 2's `.b` would have
+/// navigated it successfully instead of raising. `foreach` has the
+/// identical reset between source elements (confirmed live the same way),
+/// even though *within* one source element it does chain UPDATE into
+/// EXTRACT (see [`FoldRegister::advance`]) — the register resets at every
+/// "re-entry" into UPDATE for a new element, but not at the direct,
+/// same-step continuation from UPDATE into EXTRACT.
+///
+/// `reduce`'s own *final* accumulator gets the identical reset treatment,
+/// even though it isn't itself a new UPDATE call: confirmed live,
+/// `path(reduce (1) as $i (.a; .b))` on `{"a":{"b":9}}` raises "Invalid
+/// path expression with result 9" — `.b`'s own navigation inside that one
+/// UPDATE call *was* genuinely trackable (path `["a","b"]`), but reduce's
+/// exit back into its own caller is itself another such boundary, so the
+/// emitted value is re-checked against the same fixed register one more
+/// time rather than keeping UPDATE's own transient path. `foreach`'s own
+/// per-element emission (UPDATE directly, or via EXTRACT) is *not* such a
+/// boundary — confirmed live, `path(foreach (1) as $i (.a; .b; .))` on
+/// `{"a":{"b":5},"c":5}` is `["a","b"]`, inheriting UPDATE's own
+/// trackable result through EXTRACT directly, no reset.
+struct FoldRegister {
+    path: Vec<Expr>,
+    value: OwnedValue,
+    trackable: bool,
+}
+
+impl FoldRegister {
+    /// Seed the register from one INIT branch (one INIT fork) and the
+    /// accumulator's own starting value (always INIT's own computed
+    /// value, regardless of whether it was itself trackable).
+    ///
+    /// If INIT navigated to a real path, the register starts there.
+    /// Otherwise (INIT was computed, e.g. a literal `0`) the register
+    /// stays exactly where it was *before* INIT ran: the caller's own
+    /// ambient position — INIT's own computation doesn't "move" the
+    /// register, only genuine navigation does (the same rule
+    /// [`FoldRegister::advance`] applies within one fold step). Confirmed
+    /// live: `path(. as $x | reduce (1) as $i (0; $x))` is `[]` (register
+    /// never moved off the document root, despite INIT computing `0`),
+    /// but `path(. as $x | reduce (1,2) as $i (.a; $x))` raises (INIT's
+    /// own navigation moved the register off `$x`'s frozen position).
+    fn enter(
+        init_branch: &PathBranch<'_>,
+        value: &OwnedValue,
+        trackable: bool,
+    ) -> (Self, OwnedValue) {
+        let acc = init_branch.value.clone().into_owned();
+        let reg = if init_branch.trackable {
+            Self {
+                path: init_branch.path.clone(),
+                value: acc.clone(),
+                trackable: true,
+            }
+        } else {
+            Self {
+                path: Vec::new(),
+                value: value.clone(),
+                trackable,
+            }
+        };
+        (reg, acc)
+    }
+
+    /// Resolve `expr` (`UPDATE` or `EXTRACT`) against one fold step's own
+    /// input, relocating every resulting branch through this register.
+    ///
+    /// Mirrors jq's own per-emission `jv_identical(current_input,
+    /// value_at_path)` check, softened to structural equality since
+    /// `OwnedValue` has no stable identity to compare — the same softening
+    /// `Expr::TrackedVar`'s own arm already makes. `input` is always
+    /// resolved as `Cow::Owned` (via [`resolve_against_cow`]) since the
+    /// accumulator is always a freshly-computed `OwnedValue`, never a
+    /// literal subpart of the original document, mirroring
+    /// `eval_owned_expr_fork`'s identical convention in the value-position
+    /// evaluators this parallels.
+    fn resolve<'a, S: EvalSemantics>(
+        &self,
+        expr: &Expr,
+        input: OwnedValue,
+    ) -> PathResolveResult<'a> {
+        let tr = self.trackable && input == self.value;
+        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr) {
+            Ok(branches) => Ok(self.relocate(branches)),
+            Err((prefix, e)) => Err((self.relocate(prefix), e)),
+        }
+    }
+
+    fn relocate<'a>(&self, branches: Vec<PathBranch<'a>>) -> Vec<PathBranch<'a>> {
+        branches
+            .into_iter()
+            .map(|b| {
+                if b.trackable {
+                    let mut path = self.path.clone();
+                    path.extend(b.path);
+                    PathBranch::new(path, b.value, true)
+                } else if self.trackable && *b.value == self.value {
+                    PathBranch::new(self.path.clone(), b.value, true)
+                } else {
+                    PathBranch::untracked(b.value)
+                }
+            })
+            .collect()
+    }
+
+    /// Move to a trackable UPDATE branch, for resolving `foreach`'s EXTRACT
+    /// against it — the only within-one-fold-step chain of two navigable
+    /// positions (UPDATE's own result feeds directly into EXTRACT, with no
+    /// "re-entry" boundary between them, unlike the reset between source
+    /// elements — see this type's own doc comment).
+    ///
+    /// An untracked UPDATE branch leaves the register unchanged (not
+    /// reset to untracked) — a computed UPDATE result doesn't erase where
+    /// the register already was, mirroring `enter`'s identical "computed
+    /// doesn't move the register" rule for INIT. Confirmed live:
+    /// `path(. as $x | foreach (1) as $i (0; 5; $x))` is `[]` — UPDATE=`5`
+    /// never navigates, so the register EXTRACT sees is still wherever it
+    /// was before UPDATE ran (the document root, from `enter`'s untracked
+    /// branch), letting `$x` (bound from that same root) match.
+    fn advance(&self, branch: &PathBranch<'_>) -> Self {
+        if branch.trackable {
+            Self {
+                path: branch.path.clone(),
+                value: branch.value.clone().into_owned(),
+                trackable: true,
+            }
+        } else {
+            Self {
+                path: self.path.clone(),
+                value: self.value.clone(),
+                trackable: self.trackable,
+            }
+        }
+    }
+}
+
+/// `path()`-tracking counterpart of [`eval_reduce`] — resolves
+/// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
+/// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
+/// fold, shared step budget, `Halt`/`Break`/`Error` propagation, "only the
+/// last UPDATE output survives each step") while threading a
+/// [`FoldRegister`] through UPDATE instead of a plain value, so a
+/// path-trackable variable referenced inside UPDATE (#844's
+/// `Expr::TrackedVar`) can still resolve to a real path (#1440).
+///
+/// No new AST substitution is needed for the accumulator itself: unlike a
+/// named `$var` binding (`Expr::As`), the accumulator has no name — it's
+/// `.` inside UPDATE — and `.`/`.a`/`.a.b`-style bare navigation already
+/// resolves correctly by passing the accumulator as `resolve_node`'s own
+/// `value` parameter (via [`FoldRegister::resolve`]/[`resolve_against_cow`]),
+/// exactly the way a value computed mid-chain is already handled elsewhere
+/// in this file. `substitute_var_impl`'s existing `Reduce`/`Foreach` arms
+/// already correctly thread an outer `TrackedVar` marker into UPDATE, so
+/// this function receives it already embedded; `FoldRegister`'s only job is
+/// keeping that marker's own check comparing against the position it was
+/// actually bound from, not the accumulator's.
+fn resolve_reduce<'a, S: EvalSemantics>(
+    input: &Expr,
+    pattern: &Pattern,
+    init: &Expr,
+    update: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> PathResolveResult<'a> {
+    // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
+    // output is always single-shot, so a `Partial` input just extracts the
+    // control and drops the prefix (there's no path-tracking analogue of
+    // "a prefix" for the source stream itself, same as the value
+    // evaluator).
+    let (input_values, input_escape) = eval_owned_expr_fork::<S>(input, value, false);
+    if let Some(control) = input_escape {
+        return Err((Vec::new(), control.into()));
+    }
+
+    // INIT resolved through the path resolver, not the plain evaluator:
+    // each branch is one INIT fork, and whether it navigated (vs. was
+    // merely computed) is exactly what `FoldRegister::enter` needs.
+    let (init_branches, init_escape) = match resolve_node::<S>(init, value, trackable) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
+    if init_branches.is_empty() {
+        return path_result(Vec::new(), init_escape);
+    }
+
+    // `eval_reduce`'s own substitution, minus the two things this
+    // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s dispatch
+    // arm) rules out: #1365's `patterns`-matrix, and #1368's null-fill for
+    // names an alternative leaves unbound -- a bare `$var` pattern binds
+    // its one name unconditionally, so there is never an unbound name to
+    // fill.
+    let substituted_updates: Vec<Result<Expr, EvalError>> = input_values
+        .iter()
+        .map(|v| {
+            extract_pattern_bindings(pattern, v, false)
+                .map(|b| substitute_vars(update, as_var_refs(&b)))
+        })
+        .collect();
+
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+    // Shared across every INIT fork (#695), same "whole tree, not
+    // per-branch" accounting `eval_reduce` itself uses.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    for init_branch in &init_branches {
+        let (reg, acc) = FoldRegister::enter(init_branch, value, trackable);
+        // `Option`, not a bare `OwnedValue`, mirroring `eval_reduce`'s own
+        // accumulator exactly: a step whose UPDATE produces zero outputs
+        // leaves it unbound rather than ending the fold, read back as
+        // `null` (#534), and `.take()` below moves it out without a clone
+        // since nothing reads the old value again once UPDATE has run.
+        let mut acc: Option<OwnedValue> = Some(acc);
+        let mut aborted: Option<Control> = None;
+        for substituted in &substituted_updates {
+            if let Some(control) = charge_budget(&mut budget, "reduce") {
+                aborted = Some(control);
+                break;
+            }
+            let substituted = match substituted {
+                Ok(expr) => expr,
+                Err(e) => {
+                    aborted = Some(Control::Error(e.clone()));
+                    break;
+                }
+            };
+            let acc_input = acc.take().unwrap_or(OwnedValue::Null);
+            match reg.resolve::<S>(substituted, acc_input) {
+                Ok(branches) => {
+                    // Only the last output of a multi-output UPDATE
+                    // becomes the new accumulator (same rule as
+                    // `eval_reduce`) — trackability is discarded here, not
+                    // just the path: it is re-derived from scratch against
+                    // the same fixed `reg` at every subsequent step and at
+                    // final emission below, never carried forward as a
+                    // value flows from one step to the next (see this
+                    // function's own doc comment and `FoldRegister`'s).
+                    acc = branches.into_iter().last().map(|b| b.value.into_owned());
+                }
+                Err((_prefix, e)) => {
+                    // Whatever this step's UPDATE partially resolved
+                    // before erroring never becomes a real accumulator —
+                    // the whole fork aborts here, same as `eval_reduce`'s
+                    // own `aborted = Some(control); break;`.
+                    aborted = Some(e.into());
+                    break;
+                }
+            }
+        }
+        match aborted {
+            Some(control) => return path_result(out, Some(control.into())),
+            None => {
+                // Final emission: the accumulator, re-checked against the
+                // same fixed register one more time — reduce's own exit
+                // back into its caller is itself a "re-entry" boundary,
+                // exactly like the reset between source-element
+                // iterations above, so a transient trackable result from
+                // the last UPDATE step does not automatically survive
+                // (confirmed live, see this function's own doc comment).
+                let acc = acc.unwrap_or(OwnedValue::Null);
+                out.extend(reg.relocate(vec![PathBranch::untracked(Cow::Owned(acc))]));
+            }
+        }
+    }
+    path_result(out, init_escape)
+}
+
+/// `path()`-tracking counterpart of [`eval_foreach`] — see [`resolve_reduce`]
+/// for the shared design; differs exactly where `eval_foreach` differs from
+/// `eval_reduce`: the source stream's own partial prefix is genuinely
+/// iterated (not discarded), each UPDATE output is emitted (or fed through
+/// EXTRACT) rather than folded away, and the source stream's own trailing
+/// control is applied per-fork after that fork's own inner loop (#534
+/// follow-up), not deferred until every fork has run.
+fn resolve_foreach<'a, S: EvalSemantics>(
+    input: &Expr,
+    pattern: &Pattern,
+    init: &Expr,
+    update: &Expr,
+    extract: Option<&Expr>,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> PathResolveResult<'a> {
+    // Unlike `reduce`, a `Partial` source stream's own prefix is iterated
+    // below — mirrors `eval_foreach`'s identical rule.
+    let (input_values, input_control) = eval_owned_expr_fork::<S>(input, value, false);
+
+    let (init_branches, init_escape) = match resolve_node::<S>(init, value, trackable) {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
+    if init_branches.is_empty() {
+        return path_result(Vec::new(), init_escape);
+    }
+
+    let bindings_per_element: Vec<Result<Vec<(String, OwnedValue)>, EvalError>> = input_values
+        .iter()
+        .map(|v| extract_pattern_bindings(pattern, v, false))
+        .collect();
+    // Same single-alternative, no-null-fill reasoning as `resolve_reduce`'s
+    // own substitution above.
+    let substituted_updates: Vec<Result<Expr, EvalError>> = bindings_per_element
+        .iter()
+        .map(|b| {
+            b.as_ref()
+                .map(|b| substitute_vars(update, as_var_refs(b)))
+                .map_err(Clone::clone)
+        })
+        .collect();
+    let substituted_extracts: Option<Vec<Result<Expr, EvalError>>> = extract.map(|ext| {
+        bindings_per_element
+            .iter()
+            .map(|b| {
+                b.as_ref()
+                    .map(|b| substitute_vars(ext, as_var_refs(b)))
+                    .map_err(Clone::clone)
+            })
+            .collect()
+    });
+
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    for init_branch in &init_branches {
+        let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
+        let mut aborted: Option<Control> = None;
+        'input: for (idx, substituted_update) in substituted_updates.iter().enumerate() {
+            if let Some(control) = charge_budget(&mut budget, "foreach") {
+                aborted = Some(control);
+                break;
+            }
+            let substituted_update = match substituted_update {
+                Ok(expr) => expr,
+                Err(e) => {
+                    aborted = Some(Control::Error(e.clone()));
+                    break;
+                }
+            };
+            let update_branches = match reg.resolve::<S>(substituted_update, state) {
+                Ok(branches) => branches,
+                Err((_prefix, e)) => {
+                    aborted = Some(e.into());
+                    break;
+                }
+            };
+            for update_branch in &update_branches {
+                if let Some(extracts) = &substituted_extracts {
+                    if let Some(control) = charge_budget(&mut budget, "foreach") {
+                        aborted = Some(control);
+                        break 'input;
+                    }
+                    let ext_expr = match &extracts[idx] {
+                        Ok(expr) => expr,
+                        Err(e) => {
+                            aborted = Some(Control::Error(e.clone()));
+                            break 'input;
+                        }
+                    };
+                    let extract_reg = reg.advance(update_branch);
+                    match extract_reg
+                        .resolve::<S>(ext_expr, update_branch.value.clone().into_owned())
+                    {
+                        Ok(branches) => out.extend(branches),
+                        Err((prefix, e)) => {
+                            out.extend(prefix);
+                            aborted = Some(e.into());
+                            break 'input;
+                        }
+                    }
+                } else if update_branch.trackable {
+                    out.push(PathBranch::new(
+                        update_branch.path.clone(),
+                        update_branch.value.clone(),
+                        true,
+                    ));
+                } else {
+                    out.push(PathBranch::untracked(update_branch.value.clone()));
+                }
+            }
+            // Only the last UPDATE output carries forward as state for the
+            // next source element — same rule as `eval_foreach`.
+            // Trackability is discarded here too, for the same reason as
+            // `resolve_reduce`'s identical step: the next iteration
+            // re-derives it from scratch against the same fixed `reg`.
+            state = update_branches
+                .into_iter()
+                .last()
+                .map_or(OwnedValue::Null, |b| b.value.into_owned());
+        }
+        // The source stream's own trailing control belongs to this fork
+        // too, applied after its own inner loop — mirrors `eval_foreach`'s
+        // #534-follow-up fix exactly.
+        let aborted = aborted.or_else(|| input_control.clone());
+        if let Some(control) = aborted {
+            return path_result(out, Some(control.into()));
+        }
+    }
+    path_result(out, init_escape)
 }
 
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
@@ -52557,5 +53018,410 @@ mod tests {
         );
         assert_eq!(paths.len(), 300);
         assert!(paths.iter().all(|p| p == r#"["root_marker",0]"#));
+    }
+
+    // =========================================================================
+    // #1440: path() tracks a variable referenced inside reduce/foreach's
+    // UPDATE/EXTRACT. All cases below confirmed live against jq 1.7.1.
+    // =========================================================================
+
+    /// The issue's own two repros: a trackable variable passed straight
+    /// through `reduce`/`foreach`'s UPDATE, never touched by it, still
+    /// resolves to the root path it was actually bound from.
+    #[test]
+    fn test_path_tracks_variable_through_reduce_foreach_update_1440() {
+        assert_eq!(
+            outputs(br#"{"a":1}"#, "path(. as $x | reduce (1,2) as $i (0; $x))"),
+            [r"[]"]
+        );
+        assert_eq!(
+            outputs(br#"{"a":1}"#, "path(. as $x | foreach (1,2) as $i (0; $x))"),
+            [r"[]", r"[]"]
+        );
+    }
+
+    /// `reduce`'s register-restore semantics: INIT's own path survives an
+    /// empty or non-empty fold untouched, but is checked fresh (not
+    /// inherited from a transient UPDATE result) at every iteration
+    /// boundary and at final emission — see `FoldRegister`'s own doc
+    /// comment for the full model.
+    #[test]
+    fn test_reduce_register_restore_semantics_1440() {
+        // INIT's path survives an empty fold (no source elements at all).
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"c":2}"#,
+                "path(reduce empty as $i (.a; .))"
+            ),
+            [r#"["a"]"#]
+        );
+        // ...and a non-empty one, since UPDATE (`.`) never moves off it.
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"c":2}"#,
+                "path(reduce (1,2) as $i (.a; .))"
+            ),
+            [r#"["a"]"#]
+        );
+        // The register restores between the fold's own internal steps and
+        // at final emission: UPDATE's `.b` genuinely navigates *within*
+        // one step, but the fold's own final value is re-checked against
+        // the fixed, INIT-derived register rather than inheriting that
+        // transient result.
+        query!(br#"{"a":{"b":9}}"#, "path(reduce (1) as $i (.a; .b))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 9");
+            }
+        );
+        // The restore forces the "near attempt" wording on a *later*
+        // iteration navigating off a value the register no longer agrees
+        // with (iteration 1's own `.b` succeeded; iteration 2 restores the
+        // register to INIT's own position before trying `.b` again).
+        query!(
+            br#"{"a":{"b":{"b":9}}}"#,
+            "path(reduce (1,2) as $i (.a; .b))",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to access element \"b\" of {\"b\":9}"),
+                    "{}", e.message
+                );
+            }
+        );
+        query!(
+            br#"{"a":{"b":1},"c":2}"#,
+            "path(reduce (1,2) as $i (.; .a.b))",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to access element \"a\" of 1"),
+                    "{}", e.message
+                );
+            }
+        );
+    }
+
+    /// Multi-element input: only the *last* UPDATE output per step
+    /// survives the fold, same rule as `eval_reduce`'s own value-position
+    /// fold.
+    #[test]
+    fn test_reduce_last_update_output_wins_1440() {
+        query!(
+            br#"{"a":{"b":1},"c":2}"#,
+            "path(reduce (1,2) as $i (.; .a, .c))",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to access element \"a\" of 2"),
+                    "{}", e.message
+                );
+            }
+        );
+    }
+
+    /// Mixed per-iteration trackability — the issue's own open question,
+    /// now pinned both ways: whichever iteration's UPDATE is last decides,
+    /// and an intermediate iteration's own trackability never leaks into a
+    /// later one (the register is fixed per INIT fork, re-checked fresh
+    /// every step).
+    #[test]
+    fn test_reduce_mixed_per_iteration_trackability_1440() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                "path(. as $x | reduce (1,2) as $i (0; if $i==1 then $x else . end))"
+            ),
+            [r"[]"]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                "path(. as $x | reduce (1,2) as $i (0; if $i==2 then $x else . end))"
+            ),
+            [r"[]"]
+        );
+    }
+
+    /// A fold whose UPDATE never derives from the trackable variable at
+    /// all behaves exactly like the pre-#844 baseline: an ordinary,
+    /// untracked computed result.
+    #[test]
+    fn test_reduce_foreach_never_derived_from_tracked_var_1440() {
+        query!(
+            br#"{"a":1,"b":2}"#,
+            "path(reduce (1,2) as $i (0; .+1))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 2");
+            }
+        );
+        query!(
+            br#"{"a":1,"b":2}"#,
+            "path(foreach (1,2) as $i (0; .+1))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+    }
+
+    /// `foreach`'s emission/register-advance rules: UPDATE's own trackable
+    /// result carries *directly* into EXTRACT (no reset), but a computed
+    /// (untracked) UPDATE result leaves the register wherever it already
+    /// was rather than clearing it — see `FoldRegister::advance`.
+    #[test]
+    fn test_foreach_register_advance_within_one_step_1440() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"b":7}"#,
+                "path(foreach (1) as $i (.; .a, .; .b))"
+            ),
+            [r#"["a","b"]"#, r#"["b"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":7}}"#,
+                "path(foreach (1) as $i (.; .a; .b, .))"
+            ),
+            [r#"["a","b"]"#, r#"["a"]"#]
+        );
+        // UPDATE computes (doesn't navigate); EXTRACT's own $x reference
+        // still succeeds because the register never moved off the
+        // document root in the first place.
+        assert_eq!(
+            outputs(
+                br#"{"b":7}"#,
+                "path(. as $x | foreach (1) as $i (0; 5; $x))"
+            ),
+            [r"[]"]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"b":7}"#,
+                "path(. as $x | foreach (1) as $i (0; $x; $x))"
+            ),
+            [r"[]"]
+        );
+    }
+
+    /// The register resets between *source elements* for `foreach` too,
+    /// exactly like `reduce`'s own per-iteration reset — the within-one-step
+    /// UPDATE→EXTRACT chain above is the only place it carries forward.
+    #[test]
+    fn test_foreach_register_resets_between_source_elements_1440() {
+        query!(
+            br#"{"a":{"b":{"b":9}}}"#,
+            "path(foreach (1,2) as $i (.a; .b))",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a","b"]"#]);
+                assert!(
+                    e.message.contains("near attempt to access element \"b\" of {\"b\":9}"),
+                    "{}", e.message
+                );
+            }
+        );
+    }
+
+    /// Empty UPDATE leaves the accumulator unbound (read back as `null`),
+    /// same rule as the value-position evaluator (#534) — for `reduce`
+    /// this becomes the terminal (untracked) value; for `foreach` it
+    /// simply never emits since there is no UPDATE output for EXTRACT (or
+    /// the implicit identity extract) to run on.
+    #[test]
+    fn test_reduce_foreach_empty_update_1440() {
+        query!(br#"{"a":1}"#, "path(reduce (1,2) as $i (.; empty))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result null");
+            }
+        );
+        assert_eq!(
+            outputs(br#"{"a":1}"#, "path(foreach (1,2) as $i (.; empty))"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Escapes and the `PathResolveResult` keep-partial contract: INIT's
+    /// own partial prefix still forks, the source stream's own partial
+    /// prefix behaves differently for `reduce` (single-shot, drops it)
+    /// vs. `foreach` (streams it), a mid-fold error aborts cleanly, and a
+    /// `break` reaches an outer `label` rather than being swallowed
+    /// (#824's contract, mirrored from `Expr::As`'s own arm).
+    #[test]
+    fn test_reduce_foreach_escapes_and_partial_prefix_1440() {
+        // INIT partial: the fork already produced from `.a` survives, then
+        // the error is raised — same shape for both constructs.
+        query!(
+            br#"{"a":{"b":1}}"#,
+            r#"path(reduce (1) as $i ((.a, error("z")); .))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "z");
+            }
+        );
+        query!(
+            br#"{"a":{"b":1}}"#,
+            r#"path(foreach (1) as $i ((.a, error("z")); .))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "z");
+            }
+        );
+
+        // Source-stream partial: `foreach` streams the produced prefix
+        // (two outputs) before raising; `reduce` is single-shot and drops
+        // it, raising with nothing.
+        query!(
+            br#"{"a":1}"#,
+            r#"path(foreach (1,2,error("s")) as $i (.; .))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r"[]", r"[]"]);
+                assert_eq!(e.message, "s");
+            }
+        );
+        query!(
+            br#"{"a":1}"#,
+            r#"path(reduce (1,2,error("s")) as $i (.; .))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "s");
+            }
+        );
+
+        // A mid-fold error aborts the whole construct, keeping whatever
+        // prior source elements already emitted (foreach only — reduce
+        // never emits per-element).
+        query!(
+            br#"{"a":{"b":1},"c":2}"#,
+            r#"path(foreach (1,2,3) as $i (.; if $i==2 then error("boom") else . end))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r"[]"]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+
+        // `break` reaches an outer `label`, not swallowed into a synthetic
+        // "not in label" error — mirrors `Expr::As`'s own #824 contract.
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r"[label $out | path(reduce (1,2) as $i (.; if $i==2 then ., break $out else . end))]"
+            ),
+            [r"[]"]
+        );
+    }
+
+    /// `reduce`'s own INIT-fork behavior: each INIT output forks the whole
+    /// construct into an independent path, exactly mirroring
+    /// `eval_reduce`'s own value-position fork semantics.
+    #[test]
+    fn test_reduce_init_forks_1440() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"c":2}"#,
+                "path(reduce (1) as $i ((.a,.c); .))"
+            ),
+            [r#"["a"]"#, r#"["c"]"#]
+        );
+    }
+
+    /// Composition: a fold mid-pipe, a fold as a pipe's own source, and
+    /// nested folds — the register mechanism is purely local to each
+    /// `resolve_reduce`/`resolve_foreach` call, so nesting composes for
+    /// free with no special-casing.
+    #[test]
+    fn test_reduce_foreach_composition_1440() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, "path(.a | reduce (1,2) as $i (.; .))"),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1}}"#,
+                "path((reduce (1,2) as $i (.a; .)) | .b)"
+            ),
+            [r#"["a","b"]"#]
+        );
+        query!(
+            br#"{"a":{"b":1}}"#,
+            "path((reduce (1,2) as $i (0; .+1)) | .a)",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to access element \"a\" of 2"),
+                    "{}", e.message
+                );
+            }
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                "path(. as $x | reduce (1) as $i (0; reduce (1) as $j (0; $x)))"
+            ),
+            [r"[]"]
+        );
+        query!(
+            br#"{"a":{"b":1}}"#,
+            "path(reduce (1) as $i (.; reduce (1) as $j (.; .a)))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":1}"#);
+            }
+        );
+    }
+
+    /// Write side: a trackable fold result works as an assignment/delete
+    /// target too, not just for `path()` itself — `resolve_reduce`/
+    /// `resolve_foreach` are reached from the same `resolve_dynamic_indexes`
+    /// entry point `=`/`del()`/`|=` all share.
+    #[test]
+    fn test_reduce_foreach_write_side_1440() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, "(reduce (1,2) as $i (.a; .)) = 9"),
+            [r#"{"a":9}"#]
+        );
+        assert_eq!(
+            outputs(br#"{"a":{"b":1},"c":2}"#, "del(reduce (1) as $i (.a; .))"),
+            [r#"{"c":2}"#]
+        );
+        assert_eq!(
+            outputs(br#"{"b":7}"#, "(. as $x | reduce (1,2) as $i (0; $x)) |= 9"),
+            [r"9"]
+        );
+    }
+
+    /// A pattern that rebinds the same name as an outer trackable variable
+    /// must shadow it inside UPDATE, not accidentally resolve the outer
+    /// binding — `substitute_pattern`'s own untracked substitution for the
+    /// loop variable already handles this; this pins the negative case.
+    #[test]
+    fn test_reduce_pattern_shadowing_outer_var_1440() {
+        query!(
+            br#"{"a":1}"#,
+            "path(. as $x | reduce (1,2) as $x (0; $x))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 2");
+            }
+        );
+    }
+
+    /// Performance/correctness sanity over a larger fold, mirroring
+    /// `test_path_tracks_variable_referenced_in_a_loop_844`'s own shape:
+    /// 300 fold iterations over a bare passthrough of a trackable outer
+    /// variable still resolve to that variable's own root path, with
+    /// nothing degrading (correctness-wise) as the fold runs longer.
+    /// `FoldRegister` threads a small, fixed-size struct through a plain
+    /// loop (no per-iteration AST rebuild the way `Expr::As`'s own
+    /// marker-substitution needed `Rc` to keep O(1)), so this is a
+    /// regression pin on correctness at scale rather than a wall-clock
+    /// benchmark (too flaky for a unit test, same rationale as `_844`'s
+    /// own doc comment).
+    #[test]
+    fn test_reduce_foreach_tracks_a_large_loop_1440() {
+        let json = br#"{"a":1}"#;
+        assert_eq!(
+            outputs(
+                json,
+                r"path(. as $root | reduce range(300) as $i (0; $root))"
+            ),
+            [r"[]"]
+        );
+        let foreach_paths = outputs(
+            json,
+            r"path(. as $root | foreach range(300) as $i (0; $root))",
+        );
+        assert_eq!(foreach_paths.len(), 300);
+        assert!(foreach_paths.iter().all(|p| p == r"[]"));
     }
 }

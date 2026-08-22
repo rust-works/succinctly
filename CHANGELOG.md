@@ -264,6 +264,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jq`: `path()` tracks a variable referenced inside `reduce`/`foreach`'s
+  `UPDATE`/`EXTRACT`** (#1440): `resolve_node` had no `Expr::Reduce`/
+  `Expr::Foreach` arm at all, so `path(. as $x | reduce (1,2) as $i (0; $x))`
+  raised "Invalid path expression" where jq gives `[]`. New
+  `resolve_reduce`/`resolve_foreach` arms model jq's own `(path,
+  value_at_path)` register (derived empirically, since real jq has no
+  fold-specific path machinery — `reduce`/`foreach` are sugar over the same
+  variable-binding primitive every other construct uses): the register
+  resets between source-element iterations of the same fold but carries
+  forward within one fold step from `UPDATE` into `EXTRACT`. Four narrower,
+  safe (refuse-only) divergences remain, documented in
+  `docs/compliance/jq/limitations.md`.
+
+- **`jq`: `path(paths(f))` stops pulling from `f` once `path()` is
+  satisfied** (#987): `resolve_leaf`'s fallback for `path()`'s non-primitive
+  argument fully materialized the whole expression before checking whether
+  the first output was path-shaped, so a later output's side effects
+  (`stderr`, a consumed `input`) or error still fired even though real jq's
+  streaming generator never reaches them. Completes Stage 3 of
+  `docs/plan/jq-lazy-generator-consumers.md`: `builtin_paths_filter` becomes
+  a lazy producer (`each_paths_filter`, including each node's own filter
+  fan-out, not just the outer path loop), and `resolve_leaf` splits into a
+  stop-after-first sink for its general case and an always-continue sink for
+  the four static primitives that still need to distinguish 0/1/many
+  outputs.
+
+- **`jq`: `first()`/`limit()` truncate the keep-partial path resolvers**
+  (#972): `resolve_node`'s `first`/`limit` arms fully resolved their inner
+  expression before truncating to `n` outputs, so an error/break/halt after
+  the `n`th output still surfaced. A prior fix (PR #985) was reverted after
+  review found its core assumption — that a `PathResolveResult`'s `Err`
+  prefix is always exactly jq's pre-escape output — false for
+  `resolve_index_expr`/`resolve_slice_expr`'s key/bound × target cross
+  product. Both now restrict their key/bound loops to a single element once
+  their target has escaped, making the invariant hold, before reinstating
+  `first`/`limit`'s truncation.
+
 - **`yq --front-matter`/`--split-exp`/`--eval-all` correctness fixes found
   reviewing #715 before merge**:
   - `--front-matter=extract --inplace` overwrote the target file with just
