@@ -20153,3 +20153,21 @@ fn test_yq_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()
     assert_eq!(stderr, "");
     Ok(())
 }
+
+/// #1476: `parent(n)` must agree with bare `parent` exactly at the root
+/// boundary (`n == current_path.len()`) in yq mode too, since both route
+/// through the same `eval_pipe_with_path_context_internal` shared by jq
+/// and yq mode. `parent`/`parent(n)` are succinctly-only extensions with
+/// no real yq equivalent, so this is an internal-consistency check, not a
+/// yq-parity one: `.a | parent` and `.a | parent(1)` must still agree with
+/// each other, and both give the root.
+#[test]
+fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result<()> {
+    let (chained, code) = run_yq_stdin(".a | parent", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {chained:?}");
+    let (n_form, code) = run_yq_stdin(".a | parent(1)", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {n_form:?}");
+    assert_eq!(n_form, chained, "parent(1) must agree with parent");
+    assert!(n_form.contains(r#""a": 1"#), "output: {n_form:?}");
+    Ok(())
+}

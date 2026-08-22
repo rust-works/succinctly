@@ -22007,15 +22007,29 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 
         // Calculate parent path (n levels up). A borrowed slice, same
         // zero-allocation reasoning as the plain `Parent` arm above
-        // (#1449) -- pre-existing here, not introduced by this PR, but
-        // fixed in passing since it's the identical pattern.
-        let parent_path: &[OwnedValue] = if n >= current_path.len() {
+        // (#1449).
+        //
+        // #1476: landing *exactly* on the root (`n == current_path.len()`)
+        // must resolve to the root value, same as chaining bare `parent`
+        // `n` times would -- `.a | parent` and `.a | parent(1)` must agree.
+        // The old `n >= current_path.len()` guard conflated that case with
+        // genuinely overshooting *past* the root (`n > current_path.len()`,
+        // where there's nothing left to resolve), so `parent(1)` on a
+        // depth-1 path wrongly gave `{}` instead of the root. Testing
+        // `n > current_path.len()` directly distinguishes the two: at
+        // exactly `n == len`, `parent_path` is the empty slice and
+        // `get_value_at_owned_path(root, &[])` already resolves to `root`
+        // itself, so no separate root-shortcut is needed here (unlike the
+        // plain `Parent` arm, which has no "past root" case of its own to
+        // guard against and so never needed this distinction).
+        let overshoot = n > current_path.len();
+        let parent_path: &[OwnedValue] = if overshoot {
             &[]
         } else {
             &current_path[..current_path.len() - n]
         };
 
-        let parent_result = if parent_path.is_empty() && n > 0 {
+        let parent_result = if overshoot {
             // Gone past root - return empty object
             QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
         } else {

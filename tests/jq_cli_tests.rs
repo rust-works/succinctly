@@ -5344,14 +5344,46 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 
     // `parent(n)` with `n` strictly greater than the current path's depth
     // (genuinely overshoots past the root, unlike `parent(2)` above which
-    // stays within the path) -- `n == depth` is #1476's exact-boundary bug,
-    // deliberately not exercised here since it would pin the wrong answer.
+    // stays within the path).
     let (output, _, code) = run_jq_full(
         &["-c", ".a.b.c | parent(4)"],
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "{}");
+
+    Ok(())
+}
+
+/// `parent(n)` must agree with chaining bare `parent` `n` times, including
+/// exactly *at* the root boundary (#1476): `n == current_path.len()` lands
+/// on the root and must resolve to it, distinct from `n >
+/// current_path.len()` (#5349 above), which genuinely overshoots past the
+/// root into an empty object. The old code conflated the two (both produce
+/// an empty `parent_path`), so `.a | parent(1)` on a depth-1 document
+/// wrongly gave `{}` instead of the root.
+#[test]
+fn test_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result<()> {
+    let (chained, _, code) = run_jq_full(&["-c", ".a | parent"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    let (n_form, _, code) = run_jq_full(&["-c", ".a | parent(1)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(n_form, chained, "parent(1) must agree with parent");
+    assert_eq!(n_form.trim(), r#"{"a":1}"#);
+
+    let (chained, _, code) =
+        run_jq_full(&["-c", ".a.b | parent | parent"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    let (n_form, _, code) = run_jq_full(&["-c", ".a.b | parent(2)"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(n_form, chained, "parent(2) must agree with parent | parent");
+    assert_eq!(n_form.trim(), r#"{"a":{"b":1}}"#);
+
+    // The fresh-root reset after landing on the boundary still applies --
+    // `key` afterward is `null`, same as it is after a plain `parent`.
+    let (output, _, code) = run_jq_full(&["-c", ".a | parent(1) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
 
     Ok(())
 }
