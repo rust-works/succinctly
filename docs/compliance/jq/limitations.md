@@ -419,29 +419,43 @@ Unlike the positive case above, `?` does not suppress this one —
 [#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
 bounds check, not a failure to collect the path.
 
-A variable bound outside `reduce`/`foreach` and referenced from inside `UPDATE` is a third,
-narrower gap, found reviewing [#844](https://github.com/rust-works/succinctly/issues/844):
+A variable bound outside `reduce`/`foreach` and referenced from inside `UPDATE`/`EXTRACT`
+used to be a third, narrower gap, found reviewing
+[#844](https://github.com/rust-works/succinctly/issues/844) — closed by
+[#1440](https://github.com/rust-works/succinctly/issues/1440), which added
+`resolve_reduce`/`resolve_foreach` arms to `resolve_node` (`src/jq/eval.rs`) modeling jq's
+own `(path, value_at_path)` register, derived empirically since real jq has no fold-specific
+path machinery at all (`reduce`/`foreach` are sugar over the same variable-binding primitive
+every other construct uses). Four narrower shapes remain open, all safe (refuse only, never
+emit a *wrong* path):
 
-| Filter                                         | Input     | jq   | succinctly                                    |
-|------------------------------------------------|-----------|------|-----------------------------------------------|
-| `path(. as $x \| reduce (1,2) as $i (0; $x))`  | `{"a":1}` | `[]` | `Invalid path expression with result {"a":1}` |
-| `path(. as $x \| foreach (1,2) as $i (0; $x))` | `{"a":1}` | `[]` | `Invalid path expression with result {"a":1}` |
-
-#844 taught `resolve_node` to recognize `Expr::TrackedVar` (a variable frozen from a
-statically-verified passthrough of `.`, per that issue's own `is_identity_passthrough`) so
-that referencing such a variable inside `path(...)` stays trackable. `resolve_node` has no
-`Expr::Reduce`/`Expr::Foreach` arm of its own, though, so either one reaching `path(...)`'s
-resolver falls to `resolve_leaf`'s catch-all regardless of what its `UPDATE` expression
-does internally — a bare `$x` reference inside `UPDATE`, even a `TrackedVar` one, never gets
-the chance to reach the new arm, because `resolve_node` never descends into `Reduce`/
-`Foreach` at all. Real jq has no such gap because `reduce`/`foreach` are sugar over the same
-primitive `as`-binding/iteration machinery every other construct uses, so their own
-trackability was never a separate case to begin with. This is a read-only, safe divergence
-(succinctly never emits a *wrong* path here, only refuses a filter jq accepts) — not fixed
-here; a proper fix needs `resolve_node` to interleave path resolution with `reduce`/
-`foreach`'s own fold loop (evaluating `UPDATE` against each intermediate accumulator through
-`resolve_node` rather than the ordinary value evaluator), which is new machinery beyond a
-single arm.
+1. **Variable-rooted navigation off a mismatched accumulator** —
+   `path(. as $x \| foreach (1,2) as $i (0; $x.a; .b))` on `{"a":{"b":1},"c":2}` is
+   `["a","b"]` ×2 in jq; succinctly refuses. Same root cause as the pre-existing, unrelated
+   `path(. as $x \| 5 \| $x.a)` on `{"a":1}` (jq `["a"]`, succinctly already refuses today) —
+   `resolve_node` conflates "current input" with a variable's own bound position outside any
+   fold too, so this isn't specific to #1440's own fix.
+2. **The fold's source expression isn't path-checked** — `path(reduce (keys[]) as $k (.; .))`
+   raises in jq, succinctly accepts. `resolve_leaf`'s catch-all keeps only the *first* of a
+   multi-output untracked source (#986), so routing the source through `resolve_node` instead
+   would silently narrow a generator like `range(3)` to one element — correctness over
+   fidelity here, deliberately not attempted.
+3. **A destructuring pattern in the fold's own loop variable isn't path-checked** —
+   `path(. as $x \| reduce ({v:.a}) as {v:$v} (0; $x))` raises in jq, succinctly accepts.
+   Same class as the missing `Expr::AsPattern` resolver arm outside folds entirely.
+4. **Structural equality vs. jq's pointer identity** —
+   `path(reduce (1) as $i (.; {a:.a}))` on `{"a":1}` raises in jq (jq's own `jv_identical`
+   fails since `{a:.a}` constructs a *new* value), succinctly accepts `[]`. `OwnedValue` has
+   no stable identity to compare, so this resolver already softens the check to structural
+   equality everywhere else (`Expr::TrackedVar`'s own arm) — consistent, not a new gap.
+5. **`?//`-alternatives folds aren't path-tracked at all** —
+   `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
+   refuses. [#1365](https://github.com/rust-works/succinctly/issues/1365) (`?//`-alternatives
+   support for `reduce`/`foreach`'s own `as` clause) landed after `resolve_reduce`/
+   `resolve_foreach` were designed, adding a retry-with-rollback matrix
+   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`) neither function threads
+   path-tracking through; `resolve_node`'s dispatch arm handles only the common
+   `patterns.len() == 1` (no `?//`) case and falls to `resolve_leaf`'s catch-all otherwise.
 
 ## Refusing an allocation jq does not survive
 
