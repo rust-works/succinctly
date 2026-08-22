@@ -51802,4 +51802,111 @@ mod tests {
             }
         );
     }
+
+    // #844 review: `is_identity_passthrough` originally recognized only a
+    // bare `.` (and a chained `TrackedVar`), missing several shapes real jq
+    // still tracks. These extend the gate to `if`/`try`/`//` -- every case
+    // below is confirmed against jq 1.7.1.
+
+    /// `if C then A else B end` tracks when **both** branches are
+    /// passthrough, regardless of which one `C` actually picks -- this
+    /// predicate never evaluates `C`.
+    #[test]
+    fn test_path_tracks_if_with_both_branches_passthrough_844() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r". as $x | (if true then $x else $x end) as $y | path($y.b)"
+            ),
+            [r#"["b"]"#]
+        );
+    }
+
+    /// Negative control: an `if` where only *one* branch is passthrough
+    /// stays untracked even when the taken branch happens to be the
+    /// passthrough one -- the gate is purely syntactic, not evaluated.
+    #[test]
+    fn test_path_does_not_track_if_with_one_non_passthrough_branch_844() {
+        query!(br#"{"a":{"c":5}}"#,
+            r".a as $x | . as $y | (if true then $x else $y end) as $z | path($z.c)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "c" of {"c":5}"#
+                );
+            }
+        );
+    }
+
+    /// `try A catch B` tracks based on `A` alone -- `B` is never required
+    /// to be passthrough, since every expression this predicate recognizes
+    /// is built from primitives that cannot themselves raise, so a
+    /// recognized `A` provably never reaches `B`.
+    #[test]
+    fn test_path_tracks_try_catch_ignoring_catch_shape_844() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r#". as $x | (try $x catch "unused") as $y | path($y.b)"#
+            ),
+            [r#"["b"]"#]
+        );
+    }
+
+    /// `A // B` tracks based on `A` alone -- confirmed against the
+    /// asymmetric case: `$x // 5` tracks (`$x` truthy, `5` never used;
+    /// `5` alone would not qualify), but `5 // $x` does not (a literal
+    /// `A`, even though `$x`'s branch is provably never taken either,
+    /// stays untracked -- this predicate does not know `5` is truthy any
+    /// more than it evaluates `if`'s `C`).
+    #[test]
+    fn test_path_tracks_alternative_left_ignoring_right_shape_844() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1,"b":2}"#,
+                r". as $x | ($x // 5) as $y | path($y.b)"
+            ),
+            [r#"["b"]"#]
+        );
+        query!(br#"{"a":1,"b":2}"#, r". as $x | (5 // $x) as $y | path($y.b)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    r#"Invalid path expression near attempt to access element "b" of 5"#
+                );
+            }
+        );
+    }
+
+    /// `Expr::TrackedVar` switched from `Box` to `Rc` specifically so that
+    /// re-embedding a passthrough-bound variable into a fresh substituted
+    /// `Expr` tree on every loop iteration is an O(1) refcount bump, not an
+    /// O(document size) deep copy -- a multi-second regression on
+    /// `path(. as $root | .records[] as $rec | $root.root_marker[0])`,
+    /// found in #844's own review. That regression lives specifically in
+    /// `resolve_node`'s own `Expr::As` arm (reached because the *whole*
+    /// filter, including the inner `.records[] as $rec` loop, sits inside
+    /// `path(...)`'s own argument, not in `eval_as`/`eval_single`'s
+    /// ordinary value-position dispatch), so this pins the same shape,
+    /// still inside `path(...)`, at a size where an accidental revert to
+    /// per-iteration deep-cloning would be slow to run under `cargo test`.
+    /// Doesn't re-measure wall-clock time (too flaky for a unit test) --
+    /// just pins that this shape still resolves correctly.
+    #[test]
+    fn test_path_tracks_variable_referenced_in_a_loop_844() {
+        let mut json = String::from(r#"{"root_marker":["hit"],"records":["#);
+        for i in 0..300 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&i.to_string());
+        }
+        json.push_str("]}");
+        let paths = outputs(
+            json.as_bytes(),
+            r"path(. as $root | .records[] as $rec | $root.root_marker[0])",
+        );
+        assert_eq!(paths.len(), 300);
+        assert!(paths.iter().all(|p| p == r#"["root_marker",0]"#));
+    }
 }
