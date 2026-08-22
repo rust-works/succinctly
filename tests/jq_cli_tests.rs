@@ -11125,6 +11125,99 @@ fn test_as_pattern_no_alt_unaffected_720() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// #1366: a pattern binding the same variable name more than once used to
+// always keep the *first* occurrence -- an artifact of `substitute_bindings`
+// folding `substitute_var` (which replaces every remaining occurrence of a
+// name) over the raw, undeduped binding list in pattern order, so only the
+// first bind ever found anything left to replace. Real jq's actual rule is
+// asymmetric between the two container kinds, confirmed live against jq
+// 1.7.1 (not inferred, per CLAUDE.md's #1120 lesson that a fix matching
+// only one repro shape can encode the wrong general rule): an **array**
+// pattern keeps the *last* position's value; an **object** pattern keeps
+// the *first* field's value, tracking the pattern's own field order rather
+// than the underlying object's key order.
+// ============================================================================
+
+/// #1366: array pattern, own repro plus a 3-position variant with a
+/// distinct variable in between (confirms this isn't specific to two
+/// *adjacent* duplicate positions).
+#[test]
+fn test_array_pattern_duplicate_var_keeps_last_position_1366() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as [$a,$a] | $a"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as [$a,$b,$a] | $a"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "3");
+    Ok(())
+}
+
+/// #1366: object pattern keeps the *first* field's value, and -- the
+/// non-obvious half -- this tracks the pattern's own field order, not the
+/// object's key order. Both `{"x":1,"y":2}` and the differently-ordered
+/// `{"y":2,"x":1}` (confirmed via `keys_unsorted` to actually differ in
+/// jq's own eyes) give the same two answers for the two pattern
+/// orderings, so the object's key order is not what decides this.
+#[test]
+fn test_object_pattern_duplicate_var_keeps_first_field_by_pattern_order_1366() -> Result<()> {
+    for input in ["{\"x\":1,\"y\":2}", "{\"y\":2,\"x\":1}"] {
+        let (stdout, _stderr, code) = run_jq_full(&["-c", ". as {x:$a,y:$a} | $a"], Some(input))?;
+        assert_eq!(code, 0, "input: {input}");
+        assert_eq!(stdout.trim_end(), "1", "input: {input}");
+
+        let (stdout, _stderr, code) = run_jq_full(&["-c", ". as {y:$a,x:$a} | $a"], Some(input))?;
+        assert_eq!(code, 0, "input: {input}");
+        assert_eq!(stdout.trim_end(), "2", "input: {input}");
+    }
+    Ok(())
+}
+
+/// #1366: a nested pattern combining both container kinds -- the array
+/// sub-pattern's own last-wins resolution (`[$a,$a]` on `[1,2]` -> `2`)
+/// becomes field `x`'s single contribution to the outer object pattern,
+/// which then keeps *that* (the first field, `x`) over the second field
+/// `y`'s own `$a` binding -- confirming the two rules compose per
+/// container level rather than being flattened into one global rule.
+#[test]
+fn test_nested_pattern_duplicate_var_composes_per_container_1366() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {x:[$a,$a],y:$a} | $a"],
+        Some(r#"{"x":[1,2],"y":3}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #1366: the issue's own `reduce` repro -- `#1201`'s `substitute_bindings`
+/// call site shares the same `extract_pattern_bindings` fix, so `reduce`
+/// (and by the same code path, `foreach`) must resolve this identically
+/// to plain `. as PATTERN`.
+#[test]
+fn test_reduce_array_pattern_duplicate_var_keeps_last_position_1366() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "reduce .[] as [$a,$a] (0; $a)"], Some("[[1,2]]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #1366 regression check: an ordinary pattern with no repeated variable
+/// name must still bind each name to its own, independent value --
+/// confirms the dedup step doesn't accidentally touch distinct names.
+#[test]
+fn test_object_pattern_distinct_vars_unaffected_1366() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {x:$p,y:$q} | [$p,$q]"],
+        Some(r#"{"x":100,"y":200}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[100,200]");
+    Ok(())
+}
+
 /// yq mode does not support `?//` at all -- real yq's own parser rejects
 /// it ("lexer: invalid input text", confirmed live against yq v4.53.3) --
 /// so succinctly's shared jq/yq parser must keep erroring on it in yq mode
