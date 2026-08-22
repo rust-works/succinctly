@@ -1052,8 +1052,8 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     ///
     /// Compares raw source spans rather than decoded strings, so an
     /// ordinary object costs one span scan per key and no allocation at all
-    /// below [`INLINE_KEY_SCAN`] fields. That is exact while no key carries
-    /// a backslash: two escape-free spans are equal iff their decoded values
+    /// below `INLINE_KEY_SCAN` fields. That is exact while no key carries a
+    /// backslash: two escape-free spans are equal iff their decoded values
     /// are. A key that *does* carry one falls back to the decoded
     /// comparison, so `{"a":1,"a":2}` is still caught.
     ///
