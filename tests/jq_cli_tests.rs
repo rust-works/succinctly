@@ -5472,6 +5472,88 @@ fn test_string_interpolation_path_context_builtin_optional_is_atomic_1334() -> R
     Ok(())
 }
 
+/// Follow-up coverage for the path-context `StringInterpolation` arm's own
+/// fan-out fix (#1403 follow-up): a fanned-out string is a *fresh root*
+/// (matching the sibling `Array` arm's identical path reset), so `rest`
+/// after the interpolation must run once per combination, independently
+/// resetting path context each time -- not something the single-slot tests
+/// above exercise, since none of them have anything after the string in the
+/// same pipe.
+#[test]
+fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result<()> {
+    // Two combinations, each independently continuing through `| key` --
+    // both must see the fresh (empty) path, not the enclosing object's.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | \"\\(key, key)\" | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "null\nnull\n");
+
+    // A single slot that succeeds once before erroring: the successful
+    // combination still streams through `| key` (fresh root -> null)
+    // before the error propagates -- confirmed live against jq 1.7.1 with
+    // a plain literal standing in for `key`:
+    // `null | "\(1,error("boom"))" | length` prints `1` then errors.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, error(\"boom\"))\" | key"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "null\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // An error in a *non-outermost* slot (the first of two, since parts
+    // fan out right-to-left) must still abort every enclosing slot's loop,
+    // not just its own -- confirmed live against jq 1.7.1:
+    // `null | "\(1,error("boom"))-\(2)"` prints `"1-2"` then errors.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, error(\"boom\"))-\\(key)\""],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "\"a-a\"\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `?` wraps only the interpolation, with a downstream `| key` still
+    // needing path context -- routes through the general `Expr::Optional`
+    // arm's *other* branch (rest non-empty, needs path context), which
+    // flattens and threads `optional=true` straight into this arm instead
+    // of catching externally the way the tail-position `?` cases above do.
+    // Exercises this arm's own `optional`-gated catch directly.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (\"\\(key, error(\"boom\"))\")? | key"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "null\n");
+
+    // `rest` itself fails on a fanned-out combination with no trailing
+    // control of the interpolation's own (a plain `ManyOwned` result):
+    // the whole thing must abort at that failure, discarding output, not
+    // silently swallow it or keep trying the remaining combinations.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, key)\" | error(\"stop\")"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("stop"), "stderr: {stderr}");
+
+    // Same, but the interpolation's own result is already `Partial` (one
+    // slot fanned out twice before erroring) when `rest` also fails on one
+    // of those combinations -- exercises the `Partial` counterpart of the
+    // `ManyOwned` early-stop path above.
+    let (_stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            ".a | \"\\(key, key, error(\"boom\"))\" | error(\"stop\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("stop"), "stderr: {stderr}");
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::FuncDef` arm (#1306), so a `def`
 /// scope's own `then` continuation -- even one as simple as `def f: 5; f,
 /// key` -- never routed into path-context evaluation at all: the whole
