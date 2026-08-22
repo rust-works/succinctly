@@ -19303,6 +19303,25 @@ fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
     Ok(())
 }
 
+/// #1365: `?//`-separated pattern alternatives in `reduce`/`foreach`'s
+/// binding clause are jq-mode-only, mirroring `. as PATTERN ?//`'s own
+/// existing gate. No oracle to match here either -- real yq has neither
+/// `reduce`/`foreach` (per `test_yq_reduce_foreach_accept_full_pattern_1201`
+/// above) nor `?//` at all (`lexer: invalid input text "?// ..."`,
+/// confirmed against yq v4.53.3) -- so this pins the gate stays consistent
+/// with the ordinary (single-pattern) `reduce`/`foreach` extension yq mode
+/// already supports, rather than silently also accepting jq-only grammar.
+#[test]
+fn test_yq_reduce_foreach_reject_pattern_alternatives_1365() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".a | reduce .[] as {x:$x} ?// {y:$x} (0; . + $x)",
+        "a:\n  - x: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(exit_code, 0, "output: {output:?}");
+    Ok(())
+}
+
 /// #1298: yq-mode coverage for the same non-terminal `Iterate` fan-out
 /// fixed in jq mode (`tests/jq_cli_tests.rs`'s
 /// `test_jq_nonterminal_iterate_in_assign_path_fans_out_1298`) --

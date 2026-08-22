@@ -1535,16 +1535,11 @@ impl<'a> Parser<'a> {
         self.consume_keyword("as");
         self.skip_ws();
 
-        // Parse binding pattern -- a bare `$var`, or a full destructuring
-        // pattern (#1201). Deliberately `parse_pattern`, not the
-        // `?//`-alternative-collecting `parse_as_pattern` that `. as
-        // PATTERN` uses: real jq *does* accept `?//` here too, but retrying
-        // an alternative after the body errors means rolling the
-        // accumulator back to this element's pre-UPDATE value, which the
-        // fold in `eval_reduce`/`eval_foreach` has no way to express.
-        // Deferred rather than overlooked -- tracked by #1365.
-        let pattern = self.parse_pattern()?;
-        self.skip_ws();
+        // Parse binding pattern -- a bare `$var`, a full destructuring
+        // pattern (#1201), or `?//`-separated alternatives (#1365; the
+        // evaluator side retries an errored UPDATE with the accumulator
+        // rolled back to its pre-UPDATE value, see `eval_reduce`).
+        let patterns = self.parse_pattern_alternatives()?;
 
         // Parse (init; update)
         self.expect('(')?;
@@ -1559,7 +1554,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr::Reduce {
             input: Box::new(input),
-            pattern,
+            patterns,
             init: Box::new(init),
             update: Box::new(update),
         })
@@ -1582,16 +1577,11 @@ impl<'a> Parser<'a> {
         self.consume_keyword("as");
         self.skip_ws();
 
-        // Parse binding pattern -- a bare `$var`, or a full destructuring
-        // pattern (#1201). Deliberately `parse_pattern`, not the
-        // `?//`-alternative-collecting `parse_as_pattern` that `. as
-        // PATTERN` uses: real jq *does* accept `?//` here too, but retrying
-        // an alternative after the body errors means rolling the
-        // accumulator back to this element's pre-UPDATE value, which the
-        // fold in `eval_reduce`/`eval_foreach` has no way to express.
-        // Deferred rather than overlooked -- tracked by #1365.
-        let pattern = self.parse_pattern()?;
-        self.skip_ws();
+        // Parse binding pattern -- a bare `$var`, a full destructuring
+        // pattern (#1201), or `?//`-separated alternatives (#1365; see
+        // `eval_reduce`'s doc comment for the accumulator-rollback retry
+        // semantics `eval_foreach` shares).
+        let patterns = self.parse_pattern_alternatives()?;
 
         // Parse (init; update[; extract])
         self.expect('(')?;
@@ -1616,7 +1606,7 @@ impl<'a> Parser<'a> {
 
         Ok(Expr::Foreach {
             input: Box::new(input),
-            pattern,
+            patterns,
             init: Box::new(init),
             update: Box::new(update),
             extract,
@@ -4234,20 +4224,23 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
-    /// Parse the pattern part of an `as` binding, including any
-    /// `?//`-separated alternatives (`. as [$a] ?// {$a} | ...`).
-    /// Called after "as" has been consumed.
-    fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+    /// Parse a single pattern, plus any `?//`-separated alternatives (jq
+    /// mode only). Always returns at least one pattern -- the caller
+    /// decides what a single-element result means: `parse_as_pattern`
+    /// below still special-cases a bare `$var` into the simpler
+    /// `Expr::As` node; `reduce`/`foreach` (#1365) have no such fast path
+    /// and always keep the `Vec<Pattern>` shape.
+    ///
+    /// `?//` is real jq syntax (since jq 1.6) but real yq's own parser
+    /// rejects it outright ("lexer: invalid input text", confirmed live
+    /// against yq v4.53.3) -- gated to jq mode only so yq mode keeps
+    /// erroring on it the same way, rather than silently accepting
+    /// broader syntax than the oracle it's meant to match.
+    fn parse_pattern_alternatives(&mut self) -> Result<Vec<Pattern>, ParseError> {
         let first_pattern = self.parse_pattern()?;
         self.skip_ws();
-
-        // `?//` is real jq syntax (since jq 1.6) but real yq's own parser
-        // rejects it outright ("lexer: invalid input text", confirmed live
-        // against yq v4.53.3) -- gated to jq mode only so yq mode keeps
-        // erroring on it the same way, rather than silently accepting
-        // broader syntax than the oracle it's meant to match.
-        if self.mode == ParserMode::Jq && self.peek_str(3) == "?//" {
-            let mut patterns = vec![first_pattern];
+        let mut patterns = vec![first_pattern];
+        if self.mode == ParserMode::Jq {
             while self.peek_str(3) == "?//" {
                 self.next();
                 self.next();
@@ -4256,16 +4249,15 @@ impl<'a> Parser<'a> {
                 patterns.push(self.parse_pattern()?);
                 self.skip_ws();
             }
-            self.expect('|')?;
-            self.skip_ws();
-            let body = self.parse_expr()?;
-            return Ok(Expr::AsPattern {
-                expr: Box::new(expr),
-                patterns,
-                body: Box::new(body),
-            });
         }
+        Ok(patterns)
+    }
 
+    /// Parse the pattern part of an `as` binding, including any
+    /// `?//`-separated alternatives (`. as [$a] ?// {$a} | ...`).
+    /// Called after "as" has been consumed.
+    fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let mut patterns = self.parse_pattern_alternatives()?;
         self.expect('|')?;
         self.skip_ws();
         let body = self.parse_expr()?;
@@ -4275,15 +4267,20 @@ impl<'a> Parser<'a> {
         // in this file is unaffected by `?//`'s addition), and
         // `Expr::AsPattern` with a single-element `patterns` for `{...}`/
         // `[...]`, exactly as before this feature existed.
-        match first_pattern {
-            Pattern::Var(var) => Ok(Expr::As {
+        match patterns.as_slice() {
+            [Pattern::Var(_)] => {
+                let Pattern::Var(var) = patterns.pop().expect("checked len == 1 above") else {
+                    unreachable!("matched Pattern::Var above")
+                };
+                Ok(Expr::As {
+                    expr: Box::new(expr),
+                    var,
+                    body: Box::new(body),
+                })
+            }
+            _ => Ok(Expr::AsPattern {
                 expr: Box::new(expr),
-                var,
-                body: Box::new(body),
-            }),
-            other => Ok(Expr::AsPattern {
-                expr: Box::new(expr),
-                patterns: vec![other],
+                patterns,
                 body: Box::new(body),
             }),
         }
@@ -5144,34 +5141,35 @@ mod tests {
         assert!(matches!(
             reduce_obj,
             Expr::Reduce {
-                pattern: Pattern::Object(_),
+                ref patterns,
                 ..
-            }
+            } if matches!(patterns.as_slice(), [Pattern::Object(_)])
         ));
 
         let reduce_arr = parse("reduce .[] as [$a, $b] (0; . + $a + $b)").unwrap();
         assert!(matches!(
             reduce_arr,
             Expr::Reduce {
-                pattern: Pattern::Array(_),
+                ref patterns,
                 ..
-            }
+            } if matches!(patterns.as_slice(), [Pattern::Array(_)])
         ));
 
         let foreach_obj = parse("foreach .[] as {a: $a} (0; . + $a; .)").unwrap();
         assert!(matches!(
             foreach_obj,
             Expr::Foreach {
-                pattern: Pattern::Object(_),
+                ref patterns,
                 ..
-            }
+            } if matches!(patterns.as_slice(), [Pattern::Object(_)])
         ));
 
         // A bare `$var` still parses to `Pattern::Var`, not a regression.
         let reduce_var = parse("reduce .[] as $x (0; . + $x)").unwrap();
         assert!(matches!(
             reduce_var,
-            Expr::Reduce { pattern: Pattern::Var(ref v), .. } if v == "x"
+            Expr::Reduce { ref patterns, .. }
+                if matches!(patterns.as_slice(), [Pattern::Var(v)] if v == "x")
         ));
     }
 
