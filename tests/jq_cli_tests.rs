@@ -5331,6 +5331,28 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"b":{"c":1}}"#);
 
+    // `parent` at the document root (empty `current_path`): the
+    // yq-compatible "return an empty object" default, not a navigation
+    // failure. A leading `.` forces this through an actual `Expr::Pipe`
+    // (matching every other case in this test) -- a *bare* `parent` with
+    // no pipe operator at all doesn't route through `eval_pipe`'s own
+    // `needs_path_context` check the same way, and so wouldn't reach the
+    // arm this test means to exercise.
+    let (output, _, code) = run_jq_full(&["-c", ". | parent"], Some("1"))?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{}");
+
+    // `parent(n)` with `n` strictly greater than the current path's depth
+    // (genuinely overshoots past the root, unlike `parent(2)` above which
+    // stays within the path) -- `n == depth` is #1476's exact-boundary bug,
+    // deliberately not exercised here since it would pin the wrong answer.
+    let (output, _, code) = run_jq_full(
+        &["-c", ".a.b.c | parent(4)"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{}");
+
     Ok(())
 }
 
