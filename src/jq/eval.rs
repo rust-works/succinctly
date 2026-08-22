@@ -10037,6 +10037,10 @@ fn builtin_sub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// for their side effects before either is type-checked, so a flags-side
 /// `error()` still wins over an ordinary pattern-side type mismatch —
 /// see `eval_regex_pattern_and_flags`'s doc comment.
+///
+/// yq mode diverges entirely for the 3-arg form (`flags_expr.is_some()`)
+/// -- see [`yq_sub_arity3_empty_replace`]'s own doc comment for the
+/// oracle-verified rule (#1122).
 #[cfg(feature = "regex")]
 fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
@@ -10045,6 +10049,12 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        if let Some(_flags_expr) = flags_expr {
+            return yq_sub_arity3_empty_replace::<W, S>(re_expr, value, optional);
+        }
+    }
+
     let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
         re_expr,
         flags_expr,
@@ -10063,6 +10073,76 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         value,
         optional,
     )
+}
+
+/// yq mode's `sub(re; replacement; flags)` (arity >= 3): real yq
+/// **ignores every argument after the first** and replaces every match
+/// with the empty string -- confirmed live against yq v4.53.3 (#1122),
+/// near-certainly an upstream bug (yq's own `substitute` reading its
+/// replacement from a fixed AST slot that's empty once arity exceeds 2),
+/// not a designed feature, but this repo pins oracle behaviour rather
+/// than upstream intent (ADR-0018 rule 3: bug-for-bug fidelity by
+/// default, including the reference's own internal inconsistencies).
+///
+/// `replacement_expr`/`flags_expr` are **not evaluated at all** -- neither
+/// their side effects nor their errors are observable, confirmed live:
+/// `"abc" | sub("b"; error("boom"); "g")` prints `"ac"` in real yq, not
+/// an error, so this isn't "evaluate and discard" (which would still
+/// propagate `error(...)`), it's "never reached." Only `re_expr` is
+/// evaluated and type-checked, so `sub("[";"X";"g")` still raises the
+/// genuine regex-compile error real yq gives for an invalid pattern.
+///
+/// The result is a genuine global replace with a constant `""`, not
+/// "always returns `""`" -- confirmed live: `"abc" | sub("b";"X";"g")`
+/// is `"ac"` (only the matched `"b"` is removed), and every probed
+/// variant (non-string replacement, non-string/junk/`i` flags, 4+ args,
+/// a capture-referencing replacement) gives the identical answer, since
+/// none of those arguments are ever read. Flags are not honoured either
+/// -- `"AAA" | sub("a";"X";"i")` stays `"AAA"`, matching `re_expr`
+/// case-sensitively regardless of what a flags argument requested.
+#[cfg(feature = "regex")]
+fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
+        Ok(OwnedValue::String(s)) => s,
+        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+        Err(escape) => return escape.into(),
+    };
+
+    let input = match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow.into_owned(),
+            Err(_) if optional => return QueryResult::None,
+            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+    };
+
+    let re = match build_regex(&pattern, None) {
+        Ok(r) => r,
+        Err(_e) if optional => return QueryResult::None,
+        Err(e) => return e.into(),
+    };
+
+    let matches = global_captures(&re, &input);
+    if matches.is_empty() {
+        return QueryResult::Owned(OwnedValue::String(input));
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut last_end = 0;
+    for caps in &matches {
+        let m = caps
+            .get(0)
+            .expect("capture group 0 is always present on a match");
+        out.push_str(&input[last_end..m.start()]);
+        last_end = m.end();
+    }
+    out.push_str(&input[last_end..]);
+    QueryResult::Owned(OwnedValue::String(out))
 }
 
 /// The rest of `sub`/`gsub`'s work once the pattern string and flags string
@@ -37681,41 +37761,38 @@ mod tests {
     }
 
     /// Pins that the 3-arg `sub(re; s; flags)` form's *own* code path is
-    /// untouched by #1069's `flags.is_none()` gate -- **not** a claim that
-    /// these values match real yq. They don't: real yq's actual 3-arg
-    /// behavior is itself a separate, still-unresolved mystery (filed as
-    /// #1122 rather than guessed at here) -- live-probing found real yq
-    /// gives an *empty string* for both `sub("a";"X";"g")` and
-    /// `sub("a";"X";"")` on `"aaa"` whenever the pattern matches, not
-    /// `"XXX"`/`"Xaa"`. This test exists only to catch a *future* change
-    /// accidentally routing the 3-arg form through the new bare-2-arg
-    /// global-replace gate (it shouldn't, per the doc comment on `global`
-    /// above) -- it is a regression pin on succinctly's own current (and
-    /// separately tracked as incorrect) output, not an oracle-verified
-    /// baseline.
+    /// untouched by #1069's `flags.is_none()` gate -- that gate identifies
+    /// the bare 2-arg shape specifically (`flags == None`), and the 3-arg
+    /// form always arrives with `flags == Some(_)`, so it can't
+    /// accidentally widen onto #1069's bare-2-arg global-replace rule.
+    ///
+    /// The values asserted here *do* now match real yq (#1122, fixed):
+    /// yq's 3-arg `sub` ignores every argument after the pattern and
+    /// replaces every match with the empty string, regardless of what the
+    /// flags expression evaluates to -- `"g"`, `""`, and `null` all give
+    /// the identical `""` for `"aaa"`, confirmed live against yq v4.53.3
+    /// for all three. This was a genuine, separately-filed mystery before
+    /// #1122's fix (`yq_sub_arity3_empty_replace`, gated on `S::TAG ==
+    /// EvalTag::Yq && flags_expr.is_some()` in `builtin_sub_with_flags`,
+    /// *before* this bare-2-arg `global` gate is ever reached) -- this test
+    /// now exercises that fix's own dispatch, not just confirms it stays
+    /// off a different one.
     #[cfg(feature = "regex")]
     #[test]
-    fn test_regex_sub_flags_yq_mode_unaffected_by_1069() {
+    fn test_regex_sub_flags_yq_mode_matches_oracle_1122() {
         yq_query!(br#""aaa""#, r#"sub("a"; "X"; "g")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "XXX");
+                assert_eq!(s, "");
             }
         );
         yq_query!(br#""aaa""#, r#"sub("a"; "X"; "")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "Xaa");
+                assert_eq!(s, "");
             }
         );
-
-        // `sub(re; s; null)` specifically: `validate_regex_flags` maps a
-        // `null` flags expression to `Some(String::new())`, not `None`
-        // (confirmed at its call site above `sub_with_resolved_pattern`),
-        // so this shape also stays off the new global-replace gate --
-        // exercising the exact case the doc comment on `global` reasons
-        // through but that nothing previously asserted directly.
         yq_query!(br#""aaa""#, r#"sub("a"; "X"; null)"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "Xaa");
+                assert_eq!(s, "");
             }
         );
     }

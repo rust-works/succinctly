@@ -14028,6 +14028,127 @@ fn test_sub_yq_mode_non_string_replacement_exits_zero_1052() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// #1122: real yq's 3-arg `sub(re; replacement; flags)` ignores every
+// argument after the pattern and replaces every match with the empty
+// string -- confirmed live against yq v4.53.3, near-certainly an upstream
+// bug (ADR-0018 rule 3: bug-for-bug fidelity by default, including the
+// reference's own internal inconsistencies), not a designed feature.
+// ============================================================================
+
+/// #1122: the case that actually cracks the mystery -- a *partial* match
+/// (`"abc"`, not `"aaa"`) shows the result is a genuine per-match empty
+/// replace (`"ac"`), not "3-arg sub always returns the empty string".
+#[test]
+fn test_yq_sub_3arg_partial_match_replaces_with_empty_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("b"; "X"; "g")"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ac""#);
+    Ok(())
+}
+
+/// #1122: the issue's own original probe -- every character matches, so
+/// the empty-per-match replace happens to collapse the whole string.
+#[test]
+fn test_yq_sub_3arg_full_match_gives_empty_string_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a"; "X"; "g")"#, "\"aaa\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""""#);
+    Ok(())
+}
+
+/// #1122: the `i` (case-insensitive) flag is not honoured -- a pattern
+/// that only matches lowercase leaves an all-uppercase input untouched,
+/// same as if no flags argument were read at all.
+#[test]
+fn test_yq_sub_3arg_flags_not_honoured_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a"; "X"; "i")"#, "\"AAA\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""AAA""#);
+    Ok(())
+}
+
+/// #1122: real yq's parser accepts (and ignores) a 4th argument too --
+/// confirmed live it behaves identically to the 3-arg form, unlike jq's
+/// own hard "sub/4 is not defined" compile error. succinctly's own parser
+/// used to reject this outright even in yq mode (`expected ')', found
+/// ';'`); now accepts and discards any further `; expr` arguments in yq
+/// mode specifically, matching the oracle's own leniency.
+#[test]
+fn test_yq_sub_4_args_still_ignores_everything_past_pattern_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("b"; "X"; "g"; "h")"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ac""#);
+    Ok(())
+}
+
+/// #1122: a non-string replacement argument is still never read, so it
+/// never reaches (or needs) #1052's own non-string-replacement coercion.
+#[test]
+fn test_yq_sub_3arg_non_string_replacement_still_ignored_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("b"; 5; "g")"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ac""#);
+    Ok(())
+}
+
+/// #1122: an invalid regex *pattern* still raises the genuine compile
+/// error -- only `replacement`/`flags` are unevaluated, not `re` itself.
+#[test]
+fn test_yq_sub_3arg_invalid_pattern_still_errors_1122() -> Result<()> {
+    let (_output, code) = run_yq_stdin(r#"sub("["; "X"; "g")"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// #1122: since `replacement`/`flags` are never evaluated at all (not
+/// "evaluated and discarded"), an `error(...)` in either position does
+/// not propagate -- confirmed live this is what real yq does (prints
+/// `"ac"`, not an error).
+#[test]
+fn test_yq_sub_3arg_replacement_error_not_propagated_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#"sub("b"; error("boom"); "g")"#,
+        "\"abc\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ac""#);
+    Ok(())
+}
+
+/// #1122/#1255 interaction: this fix's replacement text is `""`, so on a
+/// zero-width-capable pattern the two issues compose -- confirmed live
+/// this already matches real yq once both fixes are in place.
+#[test]
+fn test_yq_sub_3arg_zero_width_pattern_interaction_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a*"; "X"; "g")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""bb""#);
+    Ok(())
+}
+
+/// #1122 jq-mode regression guard: jq's own 3-arg `sub(re;s;flags)` must
+/// stay untouched by this yq-only fix -- confirmed against jq 1.7.1.
+#[test]
+fn test_jq_sub_3arg_unaffected_by_1122() -> Result<()> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .arg("-c")
+        .arg(r#""AAA" | sub("a";"X";"i")"#)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(b"null")?;
+    }
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(output.status.code().unwrap_or(-1), 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "\"XAA\"");
+    Ok(())
+}
+
 /// #950: real yq treats an integer-valued float and the equivalent plain
 /// integer as genuinely distinct, non-equal types -- `2.0 == 2` is `false`
 /// (verified against pinned yq v4.53.3), unlike jq's looser convention

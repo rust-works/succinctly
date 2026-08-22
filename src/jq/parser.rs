@@ -2639,6 +2639,23 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
+                // yq mode accepts (and ignores) any further `; expr`
+                // arguments -- confirmed live against yq v4.53.3: arity 4+
+                // parses and behaves identically to arity 3 (#1122), unlike
+                // jq, where `sub/4` is a hard "not defined" compile error.
+                // Parsed and discarded here, not evaluated at all --
+                // `yq_sub_arity3_empty_replace` already never reads
+                // `replacement`/`flags` either, so a discarded 4th+ argument
+                // is consistent with that same "ignored past the first"
+                // rule, not a separate carve-out for it.
+                if self.mode == ParserMode::Yq {
+                    while self.peek() == Some(';') {
+                        self.next();
+                        self.skip_ws();
+                        self.parse_expr()?;
+                        self.skip_ws();
+                    }
+                }
                 self.expect(')')?;
                 return Ok(Some(Builtin::SubFlags(
                     Box::new(re),
