@@ -656,7 +656,7 @@ pub fn effective_fields<F: DocumentFields>(
 /// Lets a caller keep whatever zero-allocation fast path it already has for
 /// the clean case -- the `LazyKeys` cons-list arms do exactly that -- and
 /// pay for a `Vec` only on an object that actually carries a duplicate.
-/// The probe itself goes through [`census`], so answering `None` costs 8
+/// The probe itself goes through `census`, so answering `None` costs 8
 /// bytes per field rather than a materialized field list.
 pub fn collapsed_fields<F: DocumentFields>(
     fields: &F,
@@ -703,7 +703,7 @@ fn collapse_repeated<V: DocumentValue, C: DocumentCursor>(
 /// The field count an object presents under the mode's duplicate-key rule.
 ///
 /// `collapse` false is the plain field count; true counts distinct keys --
-/// via [`census`], so it never materializes the field list.
+/// via `census`, so it never materializes the field list.
 pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
     if !collapse {
         return fields.len();
