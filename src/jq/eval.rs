@@ -16370,43 +16370,35 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         return path_result(Vec::new(), init_escape);
     }
 
-    let bindings_per_element: Vec<Result<Vec<(String, OwnedValue)>, EvalError>> = input_values
+    // Fused into one `Vec` (rather than three parallel ones keyed by the
+    // same index) so the extract/update agreement is unrepresentable rather
+    // than merely unreachable-in-practice — see #1369. Each element's
+    // bindings are dropped as soon as they are consumed instead of being
+    // retained as a second full copy of the input stream for the rest of
+    // the call.
+    let substituted: Vec<Result<(Expr, Option<Expr>), EvalError>> = input_values
         .iter()
-        .map(|v| extract_pattern_bindings(pattern, v, false))
-        .collect();
-    // Same single-alternative, no-null-fill reasoning as `resolve_reduce`'s
-    // own substitution above.
-    let substituted_updates: Vec<Result<Expr, EvalError>> = bindings_per_element
-        .iter()
-        .map(|b| {
-            b.as_ref()
-                .map(|b| substitute_vars(update, as_var_refs(b)))
-                .map_err(Clone::clone)
+        .map(|v| {
+            let b = extract_pattern_bindings(pattern, v, false)?;
+            Ok((
+                substitute_vars(update, as_var_refs(&b)),
+                extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
+            ))
         })
         .collect();
-    let substituted_extracts: Option<Vec<Result<Expr, EvalError>>> = extract.map(|ext| {
-        bindings_per_element
-            .iter()
-            .map(|b| {
-                b.as_ref()
-                    .map(|b| substitute_vars(ext, as_var_refs(b)))
-                    .map_err(Clone::clone)
-            })
-            .collect()
-    });
 
     let mut out: Vec<PathBranch<'a>> = Vec::new();
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_branch in &init_branches {
         let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
         let mut aborted: Option<Control> = None;
-        'input: for (idx, substituted_update) in substituted_updates.iter().enumerate() {
+        'input: for substituted in &substituted {
             if let Some(control) = charge_budget(&mut budget, "foreach") {
                 aborted = Some(control);
                 break;
             }
-            let substituted_update = match substituted_update {
-                Ok(expr) => expr,
+            let (substituted_update, substituted_extract) = match substituted {
+                Ok((upd, ext)) => (upd, ext),
                 Err(e) => {
                     aborted = Some(Control::Error(e.clone()));
                     break;
@@ -16420,18 +16412,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 }
             };
             for update_branch in &update_branches {
-                if let Some(extracts) = &substituted_extracts {
+                if let Some(ext_expr) = substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
                         aborted = Some(control);
                         break 'input;
                     }
-                    let ext_expr = match &extracts[idx] {
-                        Ok(expr) => expr,
-                        Err(e) => {
-                            aborted = Some(Control::Error(e.clone()));
-                            break 'input;
-                        }
-                    };
                     let extract_reg = reg.advance(update_branch);
                     match extract_reg
                         .resolve::<S>(ext_expr, update_branch.value.clone().into_owned())
