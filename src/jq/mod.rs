@@ -81,6 +81,7 @@ mod parser;
 mod slice;
 pub mod stream;
 mod value;
+pub mod walk;
 
 pub use error::{BinOp, Control, EvalError};
 pub use eval::{
