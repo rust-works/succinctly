@@ -28914,19 +28914,34 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Try each `?//`-separated pattern alternative against `bound_val`, in
 /// order. The first alternative whose pattern matches *and* whose
-/// substituted body doesn't error wins. A pattern-match failure or a body
-/// `error(...)`/type error falls through to the next alternative; `break`,
-/// `halt`, and empty output do not (confirmed live: both propagate
-/// immediately, never retried). On the *last* alternative, either failure
-/// is the final outcome -- this degrades to exactly the pre-`?//` single-
-/// pattern behavior when `patterns` has one element.
+/// substituted body doesn't error wins. A pattern-match failure, a body
+/// `error(...)`/type error, or a body `break` falls through to the next
+/// alternative; `halt` and empty output do not. On the *last* alternative,
+/// any of these is the final outcome -- this degrades to exactly the
+/// pre-`?//` single-pattern behavior when `patterns` has one element.
 ///
-/// A body error's own partial output (if the body is itself a generator,
-/// e.g. `(1, error("x"))`) is *not* discarded on fallthrough -- confirmed
-/// live: each tried alternative's own partial output before its error is
-/// kept, not just the winning alternative's (or the last one's, if none
-/// win) -- so the returned `Vec<OwnedValue>` accumulates across every
-/// alternative actually attempted, not just the final one.
+/// **`break` retrying (rather than propagating immediately) is corrected
+/// behavior, not the original design** -- #1457, found and fixed while
+/// implementing `reduce`/`foreach`'s own `?//` support (#1365), whose
+/// accumulator-rollback retry loop needed the exact same break-vs-halt
+/// question answered and got it live-verified there first. This function's
+/// own prior doc comment claimed break propagates immediately just like
+/// halt, matching neither a real design decision nor a passing test --
+/// verified wrong against the pinned oracle (jq 1.7.1): `label $out | (.
+/// as {a:$x} ?// {a:$y} | if $x==1 then break $out else [$x,$y] end)` on
+/// `{"a":1}` is `[null,1]` (alt2's output), not an empty result from an
+/// uncaught break reaching `label $out`. `halt` alone was and remains
+/// correct: `. as {a:$x} ?// {a:$y} | if $x==1 then halt else [$x,$y] end`
+/// on `{"a":1}` terminates the process immediately with no output, never
+/// retried.
+///
+/// A body error's or break's own partial output (if the body is itself a
+/// generator, e.g. `(1, error("x"))` or `(1, break $out)`) is *not*
+/// discarded on fallthrough -- confirmed live for both: each tried
+/// alternative's own partial output before its error/break is kept, not
+/// just the winning alternative's (or the last one's, if none win) -- so
+/// the returned `Vec<OwnedValue>` accumulates across every alternative
+/// actually attempted, not just the final one.
 fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
@@ -29003,21 +29018,29 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 continue;
             }
-            QueryResult::Break(label) => return Ok((carried, Some(Control::Break(label)))),
+            // #1457: `Break` falls through like `Error`, not immediately
+            // like `Halt` -- verified live against the pinned oracle (jq
+            // 1.7.1), correcting this arm's own prior claim otherwise. See
+            // this function's own doc comment for the exact repro.
+            QueryResult::Break(label) => {
+                if is_last {
+                    return Ok((carried, Some(Control::Break(label))));
+                }
+                continue;
+            }
             QueryResult::Halt(code) => return Ok((carried, Some(Control::Halt(code)))),
-            QueryResult::Partial(vs, control) => match control {
-                Control::Error(e) => {
-                    carried.extend(vs);
-                    if is_last {
-                        return Ok((carried, Some(Control::Error(e))));
+            QueryResult::Partial(vs, control) => {
+                carried.extend(vs);
+                match control {
+                    Control::Error(_) | Control::Break(_) => {
+                        if is_last {
+                            return Ok((carried, Some(control)));
+                        }
+                        continue;
                     }
-                    continue;
+                    Control::Halt(_) => return Ok((carried, Some(control))),
                 }
-                Control::Break(_) | Control::Halt(_) => {
-                    carried.extend(vs);
-                    return Ok((carried, Some(control)));
-                }
-            },
+            }
         }
     }
 
