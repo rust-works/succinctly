@@ -14456,6 +14456,48 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
     }
 }
 
+/// Keep at most `n` resolved branches, dropping a trailing escape the
+/// consumer never reached — jq's own `def first(f): label $out | (f, break
+/// $out);` and `limit`'s identical `break $out` never resume `f`'s generator
+/// once `$out` is satisfied, so an error/break/halt *after* the nth output
+/// is never raised in the first place.
+///
+/// Sound only because every [`PathResolveResult`] producer upholds: **the
+/// `Err` side's prefix is exactly the branches jq's own generator emits
+/// before that escape, in order.** That is not decorative — an earlier
+/// attempt at this exact fix (PR #985, issue #972) assumed it without
+/// checking, and `resolve_index_expr`/`resolve_slice_expr`'s key/bound ×
+/// target cross product violated it: `del(limit(2; select((true,
+/// error("t")))[("x","y")]))` silently deleted both keys instead of
+/// raising, because the untruncated prefix (length 2) satisfied `limit(2)`.
+/// Both functions were fixed ahead of this helper's reinstatement (see their
+/// own doc comments) to restrict their key/bound loops to a single element
+/// once their `target` has escaped, and the invariant is now pinned by
+/// `test_path_prefix_matches_jq_before_escape_972` rather than merely
+/// asserted here.
+///
+/// Drops `Halt` along with `Error`/`Break` once satisfied. jq never reaches
+/// it either (`path(first(select((true, ("m"|halt_error(3))))))` is `[]`,
+/// exit 0, confirmed against jq 1.7.1), and the value-position twins
+/// `each_take_first`/`each_take_n` already drop it for the same consumers.
+/// `resolve_leaf`'s opposite Halt-*keeping* rule (relevant to #987) is not a
+/// counterexample: it is a terminal fallback for a value that has no path
+/// shape at all, where no consumer was ever satisfied by an earlier output.
+///
+/// This is not laziness: the resolver underneath is still eager, so a
+/// dropped escape's side effects (`stderr`, a consumed `input`, `halt_error`'s
+/// own write) have already fired by the time this runs — only the escape
+/// itself is discarded, never the work that produced it. Making the
+/// resolver stop pulling early is #987/#820's territory
+/// (`docs/plan/jq-lazy-generator-consumers.md`), not this function's.
+fn take_path_branches(result: PathResolveResult<'_>, n: usize) -> PathResolveResult<'_> {
+    match result {
+        Ok(branches) => Ok(branches.into_iter().take(n).collect()),
+        Err((prefix, _)) if prefix.len() >= n => Ok(prefix.into_iter().take(n).collect()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Peel any wrapping `Expr::Paren` down to the inner expression — `(false)`
 /// and `false` are the same node for a caller that only cares about literal
 /// shape, not surface syntax (`Expr::Alternative`'s `#845` fix, below).
@@ -14830,10 +14872,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         // parser path. Keeping both arms means it does not matter which one
         // a given call site produces.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            Ok(resolve_node::<S>(inner, value, trackable)?
-                .into_iter()
-                .take(1)
-                .collect())
+            take_path_branches(resolve_node::<S>(inner, value, trackable), 1)
         }
 
         // `if cond then a else b end`: only the branch the runtime actually
@@ -15227,10 +15266,7 @@ fn resolve_limit<'a, S: EvalSemantics>(
     if n == 0 {
         return Ok(Vec::new());
     }
-    Ok(resolve_node::<S>(expr, value, trackable)?
-        .into_iter()
-        .take(n)
-        .collect())
+    take_path_branches(resolve_node::<S>(expr, value, trackable), n)
 }
 
 /// Convert a static, non-`Identity` path component into the `OwnedValue` jq
@@ -16189,8 +16225,32 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // returns it as-is: everything already pushed before the failing
     // key/target combination, matching jq's own never-un-emit streaming
     // (#530's sibling fix).
+    //
+    // jq compiles `E[K]` as `K as $k | E | .[$k]` — target inner, key outer
+    // — so when `target` itself escapes, that escape fires while jq is
+    // still inside the *first* key's iteration; the key generator is never
+    // resumed for a second key. `target_branches` above was computed once,
+    // outside this loop, so restricting `keys` to its first element when
+    // `target` escaped is what keeps this function's `Err` prefix equal to
+    // jq's own pre-escape stream, rather than the full key × target cross
+    // product jq's generator would never actually produce. Confirmed
+    // against jq 1.7.1: `path(select((true,error("t")))[("x","y")])` on
+    // `{"x":9,"y":8}` prints only `["x"]` before raising `t` — `["y"]` is a
+    // branch jq's generator never reaches. Emitting it made this prefix
+    // longer than jq's, invisible to `path()`'s own streaming consumer
+    // (which prints it either way, escape or not) but unsound for any
+    // consumer that truncates the prefix and drops the escape (`first`/
+    // `limit`, #972) — this exact overshoot is what got PR #985 reverted:
+    // `del(limit(2; select((true,error("t")))[("x","y")]))` silently
+    // deleted both keys instead of raising, because the untruncated prefix
+    // (length 2) satisfied `limit(2)`.
+    let keys: &[OwnedValue] = if target_escape.is_some() {
+        &keys[..1]
+    } else {
+        &keys[..]
+    };
     let mut out = Vec::with_capacity(keys.len() * target_branches.len());
-    for k in &keys {
+    for k in keys {
         for PathBranch {
             path: components,
             value: target_value,
@@ -16374,9 +16434,25 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         ));
     }
 
+    // jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]` — target
+    // inner, bounds outer — so when `target` escapes, that fires inside the
+    // very first `(s, e)` pair; neither bound generator is resumed for a
+    // second pair. `target_branches` was computed once, outside this loop,
+    // so restricting `starts`/`ends` to their first element when `target`
+    // escaped keeps this function's `Err` prefix equal to jq's own
+    // pre-escape stream, mirroring `resolve_index_expr`'s identical fix
+    // (#972). Confirmed against jq 1.7.1:
+    // `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
+    // prints only `[{"start":0,"end":2}]` before raising `t`.
+    let (starts, ends): (&[ResolvedSliceBound], &[ResolvedSliceBound]) = if target_escape.is_some()
+    {
+        (&starts[..1], &ends[..1])
+    } else {
+        (&starts[..], &ends[..])
+    };
     let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
-    for (s, s_key) in &starts {
-        for (e, e_key) in &ends {
+    for (s, s_key) in starts {
+        for (e, e_key) in ends {
             // #1326: a genuinely dynamic bound (unlike a literal one, which
             // the parser's own `fold_slice_bound` handles at parse time)
             // keeps its float spelling the same way -- `Expr::SliceNumber`
@@ -16684,7 +16760,20 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // What *does* survive an escape (#1013): the escaping branch's own
     // partial output (everything it produced before hitting its escape) is
     // still threaded through every remaining dynamic stage and the tail,
-    // exactly like a branch that never escaped at all — see below.
+    // exactly like a branch that never escaped at all — see below. That is
+    // what makes this function's `Err` *prefix content* faithful to jq's
+    // own pre-escape stream even across multiple dynamic stages (unlike
+    // `resolve_index_expr`/`resolve_slice_expr`'s own pre-#972 gap, a
+    // different failure mode where the prefix was too *long*, not too
+    // short) — confirmed for `first(.[]|.[]|.[])`-shaped multi-stage pipes
+    // by `test_path_prefix_matches_jq_before_escape_972`. The stage-by-stage
+    // (not depth-first) rebuild above is still a real divergence, but only
+    // in *evaluation order*: a not-yet-reached sibling this function's own
+    // fan-out never gets to is also a sibling jq's real depth-first
+    // generator would never reach either, so no branch either side actually
+    // emits is lost — see #987/#820 for the separate, still-open question
+    // of whether a sibling that's never *reached* was nonetheless
+    // *evaluated* (side effects included) ahead of being pruned.
     let tail = &flat[last_dynamic + 1..];
     // The root branch inherits this call's own trackability: seeding it
     // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
