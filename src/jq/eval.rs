@@ -14478,19 +14478,30 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
 /// once `$out` is satisfied, so an error/break/halt *after* the nth output
 /// is never raised in the first place.
 ///
-/// Sound only because every [`PathResolveResult`] producer upholds: **the
-/// `Err` side's prefix is exactly the branches jq's own generator emits
-/// before that escape, in order.** That is not decorative — an earlier
-/// attempt at this exact fix (PR #985, issue #972) assumed it without
+/// Sound only because no [`PathResolveResult`] producer emits an `Err` side
+/// prefix *longer* than the branches jq's own generator emits before that
+/// escape. That is not decorative — an earlier attempt at this exact fix
+/// (PR #985, issue #972) assumed the stronger "exactly equal" form without
 /// checking, and `resolve_index_expr`/`resolve_slice_expr`'s key/bound ×
 /// target cross product violated it: `del(limit(2; select((true,
 /// error("t")))[("x","y")]))` silently deleted both keys instead of
 /// raising, because the untruncated prefix (length 2) satisfied `limit(2)`.
 /// Both functions were fixed ahead of this helper's reinstatement (see their
 /// own doc comments) to restrict their key/bound loops to a single element
-/// once their `target` has escaped, and the invariant is now pinned by
-/// `test_path_prefix_matches_jq_before_escape_972` rather than merely
-/// asserted here.
+/// once their `target` has escaped, and that is pinned by
+/// [`test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972`] and
+/// [`test_first_limit_path_truncation_does_not_overreach_index_fanout_972`]
+/// (both in `tests/jq_cli_tests.rs`) rather than merely asserted here.
+///
+/// **Only the "not longer" half holds universally, and only that half is
+/// what this function needs.** A prefix *shorter* than jq's is still
+/// possible — `resolve_slice_expr` drops the bound generator's own partial
+/// prefix, so `[10,20,30] | path(limit(1; .[(0,error("b")):(2,3)]))` raises
+/// here where jq answers `[{"start":0,"end":2}]`, exit 0 (pre-existing, on
+/// `main` too). A short prefix under-satisfies the `>= n` test below, so
+/// the escape propagates and the caller refuses — visibly wrong, never a
+/// false success, and never a write jq would not perform. Do not restate
+/// the invariant as "exactly equal": that is the form PR #985 assumed.
 ///
 /// Drops `Halt` along with `Error`/`Break` once satisfied. jq never reaches
 /// it either (`path(first(select((true, ("m"|halt_error(3))))))` is `[]`,
@@ -15109,24 +15120,48 @@ fn resolve_node<'a, S: EvalSemantics>(
         // `FoldRegister` for the full model, derived empirically against
         // jq 1.7.1.
         //
-        // `patterns.len() == 1` is the overwhelmingly common case (a bare
-        // `?//`-free `as` clause) and the only one `resolve_reduce`/
-        // `resolve_foreach` handle; #1365's own `?//`-alternatives retry
-        // machinery (`try_reduce_step_alternatives`/
-        // `try_foreach_step_alternatives`) landed on `main` after this
-        // arm was designed and isn't threaded through path-tracking here.
-        // Real jq still tracks a variable through a `?//`-alternatives
-        // fold (confirmed live: `path(. as $x | reduce (1) as $y ?// $z
-        // (0; $x))` is `[]`), so falling to `resolve_leaf`'s catch-all for
-        // that case is a real but safe (refuse-only, never a wrong path)
-        // divergence — documented in `docs/compliance/jq/limitations.md`.
+        // The guard is `[Pattern::Var(_)]` — exactly one alternative, and
+        // that alternative a bare `$var` — because everything outside it
+        // is a shape real jq itself refuses in path position, or one this
+        // resolver cannot model:
+        //
+        // - **A destructuring pattern** (`as [$i]`, `as {v:$v}`) is refused
+        //   by jq *unconditionally* here, even when it matches cleanly:
+        //   `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises "near
+        //   attempt to access element 0 of [1]", and the object form raises
+        //   the analogous message (both confirmed live against jq 1.7.1),
+        //   while the bare-`$var` spelling of the same fold is `[]`. So
+        //   falling through to `resolve_leaf` for a destructuring pattern
+        //   is jq's own behaviour, not a divergence — matching it here is
+        //   what keeps `resolve_reduce`/`resolve_foreach` from *accepting*
+        //   a fold jq rejects (and, on the write side, mutating a document
+        //   jq leaves untouched). The refusal matches; only the wording
+        //   does not — the catch-all names the whole fold's own value
+        //   rather than the destructuring step jq blames, which is the
+        //   pre-existing `resolve_leaf` message gap, not a new one.
+        //
+        // - **`?//`-alternatives** (`patterns.len() > 1`) are the one case
+        //   where falling through *is* a divergence: real jq still tracks a
+        //   variable through them (confirmed live: `path(. as $x | reduce
+        //   (1) as $y ?// $z (0; $x))` is `[]`). #1365's retry machinery
+        //   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`,
+        //   plus its null-fill for names the matching alternative doesn't
+        //   bind) landed on `main` after this arm was designed and isn't
+        //   threaded through path-tracking, so refusing is the safe answer
+        //   until it is — a refuse-only divergence, never a wrong path,
+        //   documented in `docs/compliance/jq/limitations.md`.
+        //
+        // Both fallbacks are pinned by
+        // `test_reduce_foreach_path_dispatch_falls_back_1440`.
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
         } => match patterns.as_slice() {
-            [pattern] => resolve_reduce::<S>(input, pattern, init, update, value, trackable),
+            [Pattern::Var(_)] => {
+                resolve_reduce::<S>(input, &patterns[0], init, update, value, trackable)
+            }
             _ => resolve_leaf::<S>(expr, value, trackable),
         },
         Expr::Foreach {
@@ -15136,9 +15171,9 @@ fn resolve_node<'a, S: EvalSemantics>(
             update,
             extract,
         } => match patterns.as_slice() {
-            [pattern] => resolve_foreach::<S>(
+            [Pattern::Var(_)] => resolve_foreach::<S>(
                 input,
-                pattern,
+                &patterns[0],
                 init,
                 update,
                 extract.as_deref(),
@@ -17286,14 +17321,14 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // `resolve_index_expr`/`resolve_slice_expr`'s own pre-#972 gap, a
     // different failure mode where the prefix was too *long*, not too
     // short) — confirmed for `first(.[]|.[]|.[])`-shaped multi-stage pipes
-    // by `test_path_prefix_matches_jq_before_escape_972`. The stage-by-stage
-    // (not depth-first) rebuild above is still a real divergence, but only
-    // in *evaluation order*: a not-yet-reached sibling this function's own
-    // fan-out never gets to is also a sibling jq's real depth-first
-    // generator would never reach either, so no branch either side actually
-    // emits is lost — see #987/#820 for the separate, still-open question
-    // of whether a sibling that's never *reached* was nonetheless
-    // *evaluated* (side effects included) ahead of being pruned.
+    // by `test_first_path_truncation_keeps_full_multistage_pipe_path_972`.
+    // The stage-by-stage (not depth-first) rebuild above is still a real
+    // divergence, but only in *evaluation order*: a not-yet-reached sibling
+    // this function's own fan-out never gets to is also a sibling jq's real
+    // depth-first generator would never reach either, so no branch either
+    // side actually emits is lost — see #987/#820 for the separate,
+    // still-open question of whether a sibling that's never *reached* was
+    // nonetheless *evaluated* (side effects included) ahead of being pruned.
     let tail = &flat[last_dynamic + 1..];
     // The root branch inherits this call's own trackability: seeding it
     // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
@@ -53423,5 +53458,75 @@ mod tests {
         );
         assert_eq!(foreach_paths.len(), 300);
         assert!(foreach_paths.iter().all(|p| p == r"[]"));
+    }
+
+    /// `resolve_node`'s fold dispatch admits exactly `[Pattern::Var(_)]`;
+    /// this pins both of its fallbacks, which have opposite reasons for
+    /// existing and would otherwise be silently re-routed into
+    /// `resolve_reduce`/`resolve_foreach` by a future widening.
+    ///
+    /// **A destructuring pattern falls back because jq refuses it too.**
+    /// Confirmed live against jq 1.7.1: `path(. as $x | reduce ([1]) as
+    /// [$i] (0; $x))` raises "Invalid path expression near attempt to
+    /// access element 0 of [1]" and the object form raises the analogous
+    /// message, even though both patterns match cleanly and the bare-`$var`
+    /// spelling of the same fold is `[]`. Widening the guard to any
+    /// single pattern would make succinctly *accept* a fold jq rejects,
+    /// and on the write side mutate a document jq leaves untouched. Only
+    /// the refusal is asserted, not the message: the catch-all says
+    /// "Invalid path expression with result ..." where jq says "near
+    /// attempt to access ...", a pre-existing `resolve_leaf` wording gap.
+    ///
+    /// **`?//`-alternatives fall back despite jq accepting them** — the one
+    /// refuse-only divergence here (confirmed live: `path(. as $x | reduce
+    /// (1) as $y ?// $z (0; $x))` is `[]` in jq), since #1365's retry +
+    /// null-fill machinery isn't threaded through path-tracking. Routing
+    /// `?//` into `resolve_reduce` with only `patterns[0]` would not error;
+    /// it would silently drop the null-fill for names the matching
+    /// alternative doesn't bind, which is why this needs a test and not
+    /// just a comment.
+    #[test]
+    fn test_reduce_foreach_path_dispatch_falls_back_1440() {
+        let refuses = |src: &str| {
+            let json: &[u8] = br#"{"a":1}"#;
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(src).unwrap();
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                QueryResult::Error(e) => assert!(
+                    e.message.starts_with("Invalid path expression"),
+                    "{src}: {}",
+                    e.message
+                ),
+                other => panic!("{src}: expected a refusal, got {other:?}"),
+            }
+        };
+
+        // Destructuring patterns: refuse, matching jq.
+        refuses("path(. as $x | reduce ([1]) as [$i] (0; $x))");
+        // Spaces after the object-pattern colons are cosmetic to jq (the
+        // spaced and unspaced spellings raise identically there) but keep
+        // clippy's `literal_string_with_formatting_args` from reading
+        // `{v:1}` as a format specifier.
+        refuses("path(. as $x | reduce ({v: 1}) as {v: $v} (0; $x))");
+        refuses("path(. as $x | foreach ([1]) as [$i] (0; $x))");
+        refuses("path(. as $x | foreach ({v: 1}) as {v: $v} (0; $x))");
+
+        // `?//` alternatives: refuse (jq accepts -- documented divergence).
+        refuses("path(. as $x | reduce (1) as $y ?// $z (0; $x))");
+        refuses("path(. as $x | foreach (1) as $y ?// $z (0; $x))");
+
+        // The admitted shape still works, so the guard didn't over-narrow.
+        assert_eq!(
+            outputs(br#"{"a":1}"#, "path(. as $x | reduce (1,2) as $i (0; $x))"),
+            [r"[]"]
+        );
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"c":2}"#,
+                "path(reduce (1,2) as $i (.a; .))"
+            ),
+            [r#"["a"]"#]
+        );
     }
 }
