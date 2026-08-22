@@ -3290,6 +3290,33 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     want_last: bool,
 ) -> GenericResult<V> {
+    // `first(f)` where `f` can consume input documents must not run `f` to
+    // completion. This module has no demand-driven sink, but `eval.rs` does,
+    // and `eval::eval_first_expr` has been wired to it since #820 Stage 2 --
+    // so hand the whole `first(...)` over rather than evaluating `inner`
+    // eagerly here (#1309).
+    //
+    // The whole node, not a `Builtin::Inputs` special case inside
+    // `first_over_comma_generic`: that would still drain for
+    // `first(inputs, 1)`, `first(1, inputs)` and `first(inputs | f)`, which
+    // this covers for free.
+    //
+    // Gated rather than unconditional because the bridge costs this subtree
+    // its cursor, and with it #607's duplicate-key fidelity. Nothing is
+    // actually lost for the CLI: a filter that gets past
+    // `input_queue_is_active` is one `jq_runner` already routed off
+    // `can_use_lazy_path`, whose `evaluate_input` re-serialises through
+    // `OwnedValue` anyway. The one-load `input_queue_is_active` check comes
+    // first specifically so yq mode, library embedders and the common
+    // `first(.[])` never pay for the AST walk.
+    if !want_last
+        && crate::jq::input_queue_is_active()
+        && crate::jq::walk::uses_input_builtins(inner)
+    {
+        let owned = to_owned_with_cursor(&value, cursor);
+        return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
+    }
+
     // `first` over a comma stops at the first sibling that yields an output,
     // so later siblings are never evaluated (#820 Stage 2b). `last` cannot
     // short-circuit -- it does not know a value is the last until the stream

@@ -94,6 +94,9 @@ pub use eval::{
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
 pub use eval::{pop_remaining_input, seed_remaining_inputs};
+// `input_queue_is_active` exists under both gates (a `const fn` returning
+// `false` without `std`), so `eval_generic` can consult it unconditionally.
+pub use eval::input_queue_is_active;
 pub use expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
     ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
