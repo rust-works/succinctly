@@ -1047,6 +1047,103 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         }
         result
     }
+
+    /// Whether any two keys denote the same name (#1385).
+    ///
+    /// Compares raw source spans rather than decoded strings, so an
+    /// ordinary object costs one span scan per key and no allocation at all
+    /// below [`INLINE_KEY_SCAN`] fields. That is exact while no key carries
+    /// a backslash: two escape-free spans are equal iff their decoded values
+    /// are. A key that *does* carry one falls back to the decoded
+    /// comparison, so `{"a":1,"a":2}` is still caught.
+    ///
+    /// Exists as a `JsonFields` inherent rather than going through the
+    /// generic `DocumentFields` detector because `print_json` writes keys
+    /// straight from `raw_bytes()` and never decodes them -- routing it
+    /// through `key_str()` would add a UTF-8 validation per key that the
+    /// output path does not pay today.
+    pub fn has_duplicate_keys(&self) -> bool {
+        /// Keys held on the stack before spilling to a `Vec`.
+        const INLINE_KEY_SCAN: usize = 24;
+
+        let mut inline: [&'a [u8]; INLINE_KEY_SCAN] = [&[]; INLINE_KEY_SCAN];
+        let mut spill: Vec<&'a [u8]> = Vec::new();
+        let mut count = 0usize;
+        let mut fields = *self;
+        while let Some((field, rest)) = fields.uncons() {
+            if let StandardJson::String(key) = field.key() {
+                let raw = key.raw_bytes();
+                let content = &raw[1..raw.len().saturating_sub(1)];
+                if content.contains(&b'\\') {
+                    return self.has_duplicate_keys_decoded();
+                }
+                if count < INLINE_KEY_SCAN {
+                    inline[count] = content;
+                } else {
+                    spill.push(content);
+                }
+                count += 1;
+            }
+            fields = rest;
+        }
+        if count < 2 {
+            return false;
+        }
+        if count <= INLINE_KEY_SCAN {
+            let keys = &inline[..count];
+            return keys
+                .iter()
+                .enumerate()
+                .any(|(i, a)| keys[i + 1..].contains(a));
+        }
+        let mut all: Vec<&[u8]> = inline.to_vec();
+        all.append(&mut spill);
+        all.sort_unstable();
+        all.windows(2).any(|w| w[0] == w[1])
+    }
+
+    /// [`has_duplicate_keys`](Self::has_duplicate_keys) for an object that
+    /// contains at least one escaped key, where raw spans no longer decide.
+    fn has_duplicate_keys_decoded(&self) -> bool {
+        let mut keys: Vec<Cow<'a, str>> = Vec::new();
+        let mut fields = *self;
+        while let Some((field, rest)) = fields.uncons() {
+            if let StandardJson::String(key) = field.key() {
+                if let Ok(decoded) = key.as_str() {
+                    keys.push(decoded);
+                }
+            }
+            fields = rest;
+        }
+        keys.sort_unstable();
+        keys.windows(2).any(|w| w[0] == w[1])
+    }
+
+    /// The fields this object presents once repeated keys collapse to their
+    /// first position holding their last value (#1385).
+    ///
+    /// Call only when [`has_duplicate_keys`](Self::has_duplicate_keys) is
+    /// true; an object with no repeat should keep iterating `self` directly.
+    pub fn collapsed(&self) -> Vec<JsonField<'a, W>> {
+        let mut order: Vec<Cow<'a, str>> = Vec::new();
+        let mut chosen: Vec<JsonField<'a, W>> = Vec::new();
+        let mut fields = *self;
+        while let Some((field, rest)) = fields.uncons() {
+            if let StandardJson::String(key) = field.key() {
+                if let Ok(name) = key.as_str() {
+                    match order.iter().position(|k| *k == name) {
+                        Some(i) => chosen[i] = field,
+                        None => {
+                            order.push(name);
+                            chosen.push(field);
+                        }
+                    }
+                }
+            }
+            fields = rest;
+        }
+        chosen
+    }
 }
 
 impl<'a, W: AsRef<[u64]>> Iterator for JsonFields<'a, W> {

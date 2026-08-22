@@ -843,6 +843,34 @@ fn test_duplicate_mapping_key_is_last_wins() -> Result<()> {
     Ok(())
 }
 
+/// #1385 moved the duplicate-key rule from the per-format `DocumentFields`
+/// trait onto `EvalSemantics`, so that jq mode could collapse a repeated key
+/// the way real jq does. yq mode must be untouched by that: real yq v4.53.3
+/// preserves every occurrence for `.`, `length`, `keys` and `to_entries`
+/// alike, which is what #442/#478/#868 established and what ADR-0018 rules 2
+/// and 3 leave standing for this mode.
+///
+/// `[.[]]` is deliberately absent: real yq *does* collapse under iteration,
+/// alone among its filters, and reproducing that lone inconsistency is
+/// #1398's job rather than this one's.
+#[test]
+fn test_duplicate_mapping_keys_unaffected_by_jq_collapse_1385() -> Result<()> {
+    let yaml = "b: 1\na: 2\nb: 3\n";
+
+    for (filter, expected) in [
+        (".", "{\"b\":1,\"a\":2,\"b\":3}\n"),
+        ("length", "3\n"),
+        ("keys", "[\"b\",\"a\",\"b\"]\n"),
+        ("to_entries|length", "3\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, yaml, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out, expected, "filter {filter}");
+    }
+
+    Ok(())
+}
+
 /// Field-lookup semantics (`.a` above, last-wins) are distinct from
 /// output/serialization semantics: on identity pass-through, real yq keeps
 /// *both* duplicate keys, in every output mode. Before #442, succinctly's
