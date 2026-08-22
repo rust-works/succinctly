@@ -486,7 +486,7 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
     if fields.len() < 2 {
         return false;
     }
-    let keys: Vec<Option<Cow<'_, str>>> = fields.iter().map(|f| f.key_str()).collect();
+    let keys: Vec<Option<Cow<'_, str>>> = fields.iter().map(DocumentField::key_str).collect();
 
     if keys.len() <= PAIRWISE_DUPLICATE_SCAN_LIMIT {
         for (i, a) in keys.iter().enumerate() {
@@ -586,7 +586,7 @@ pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<Stri
     }
     effective_fields(fields, true)
         .iter()
-        .filter_map(|f| f.key_str().map(|k| k.into_owned()))
+        .filter_map(|f| f.key_str().map(Cow::into_owned))
         .collect()
 }
 

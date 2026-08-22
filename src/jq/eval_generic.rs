@@ -5,6 +5,8 @@
 //! JSON and YAML without intermediate conversion.
 
 #[cfg(not(test))]
+use alloc::borrow::Cow;
+#[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
@@ -16,6 +18,8 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::borrow::Cow;
 #[cfg(test)]
 use std::rc::Rc;
 
@@ -721,7 +725,7 @@ fn lazy_keys_collapsed<S: EvalSemantics, V: DocumentValue>(
         _ => {
             let mut keys: Vec<String> = fields
                 .iter()
-                .filter_map(|f| f.key_str().map(|k| k.into_owned()))
+                .filter_map(|f| f.key_str().map(Cow::into_owned))
                 .collect();
             if sorted {
                 keys.sort();
