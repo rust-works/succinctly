@@ -11,12 +11,48 @@ Stage 4 remains) and [#987](https://github.com/rust-works/succinctly/issues/987)
 by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 [Follow-up issues](#follow-up-issues).
 
+| Stage | What                                                | Status                     |
+|-------|-----------------------------------------------------|----------------------------|
+| 1     | Characterization tests (the over-stopping trap set) | ✅ merged — #1386, PR #1389 |
+| 2     | `eval_each` + ten `eval.rs` consumers               | ✅ merged — #1421, PR #1424 |
+| 2b    | `eval_generic.rs`'s `first` comma walk              | ✅ merged — #1434, PR #1435 |
+| —     | `eval_each_pipe`'s owned-value arm (Stage 2 gap)    | ✅ merged — PR #1450        |
+| 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
+| 4     | `Expr::Compare`'s outer loop                        | ⬜ open — #1459             |
+| 5     | Widen the lazy arm set                              | ⬜ not yet filed            |
+| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ⬜ not yet filed            |
+
+**What actually shipped, against what this document predicted.** #820's silent data loss —
+a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
+processed — is closed, as is `halt_error`'s wrong exit code and the stderr leak in
+`isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`. Two shapes remain divergent and are pinned as
+such in `test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stderr)` (a `Pipe`,
+so Stage 2b's comma walk does not reach it — option (c)) and `[IN((2,3); 2, (5|stderr))]`
+(Stage 4). Stage 3 also leaves one residual: an un-lazified `eval_each` arm (`If`/`Try`/
+`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect for a node's own filter when
+that filter's shape isn't one of `Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — pinned as a
+known-remaining row in the same test, left to Stage 5.
+
+**One correction this document earned the hard way.** Stage 2 shipped an
+`eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
+justified in review by this document's own fallback invariant. That was a misreading: the
+invariant says an un-lazified arm cannot change *which values are delivered*, and says
+nothing about side effects — which are the entire subject here. So `isempty(1 | (1, input))`
+still destroyed a document until PR #1450 routed that arm through `eval_each_owned`. The
+behaviour tables below did not catch it; the ~1300-case systematic sweep in
+[Verification approach](#verification-approach-for-the-follow-up-implementation-prs), which
+crosses consumers against generator shapes including `(1|X)`, would have. **Run the sweep,
+not just the tables.**
+
 **Mechanism decision, already made:** an **additive sink/callback path alongside** the
 existing eager `eval_single`, not a rewrite of it. `eval_comma`, `eval_pipe` and
 `QueryResult` keep their current bodies and contracts verbatim. This document's job is to
 make that concrete and correct.
 
-**Everything below marked "verified" was run at `cedee4cbb` against the pinned oracle
+**Everything below marked "verified" was captured at `cedee4cbb`, before any stage
+landed** — so the "succinctly today" columns record the pre-fix behaviour this design set
+out to change, not current `main`. They are kept as the historical record; for what `main`
+does now, see the tests named above. Each was run against the pinned oracle
 `/usr/bin/jq` (jq-1.7.1-apple) and a `--release --features cli` build of this worktree,
 with stdout and stderr captured *separately*.** `2>&1` interleaves the two misleadingly,
 since stdout is buffered when piped and stderr is not — the convention stated at
@@ -949,17 +985,20 @@ differential gate at least as rigorous as #1282's.
 
 ## Follow-up issues
 
-**Stage 1 is filed and implemented** as #1386 (PR #1389) — it blocks nothing and depends
-on nothing, so it did not wait for this document's review. The rest follow the #1282
-convention: file one implementation issue per stage once this document is reviewed
-(mirroring #700 → #724/#725 and #1282 → #1284), linking back here.
+The status table at the top of this document is the authoritative list. Recorded here with
+the reasoning behind each placement:
 
-1. **Stage 1** — characterization tests. **Filed: #1386. Implemented: PR #1389.**
-2. **Stage 2** — `eval_each` + 10 `eval.rs` consumers. Closes #820, most of #932.
-   Depends on 1. **Implemented** (commit `a493108fc`).
-3. **Stage 2b** — `eval_generic.rs`'s `first`/`last` arm, option (b). Depends on 2. Files
-   its own follow-up for option (c). **Implemented** (commit `f78089421`).
-4. **Stage 3** — `paths(f)` producer (`each_paths_filter`) + `resolve_leaf`'s
+1. **Stage 1** — characterization tests. Filed #1386, merged PR #1389. Shipped without
+   waiting for this document's review, since it blocked nothing and was worth having even
+   if the rest were never built. It earned that: on Stage 2's first build the two tests
+   asserting the old wrong behaviour failed and the over-stopping trap set stayed green,
+   which is exactly the signal it was written to give.
+2. **Stage 2** — `eval_each` + ten `eval.rs` consumers. Filed #1421, merged PR #1424.
+3. **Stage 2b** — `eval_generic.rs`'s `first` comma walk (option (b)). Filed #1434, merged
+   PR #1435.
+4. **Stage 2 gap** — `eval_each_pipe`'s owned-value arm. Merged PR #1450. Not a planned
+   stage; see the correction note at the top.
+5. **Stage 3** — `paths(f)` producer (`each_paths_filter`) + `resolve_leaf`'s
    stop-after-first sink. Closes #987. Depends on 2. **Implemented.** `Flow::Stopped`
    gained back its `pending: Option<Control>` payload as part of this stage, exactly as
    scoped below — `resolve_leaf` is its one reader, preserving an already-triggered
@@ -969,5 +1008,14 @@ convention: file one implementation issue per stage once this document is review
    node's own filter when that filter's shape isn't one of `Comma`/`Pipe`/`Paren`/
    `Builtin::PathsFilter` — pinned as a known-remaining row in
    `test_short_circuit_side_effect_leaks_820_932_987`, left to Stage 5.
-5. **Stage 4** — `Expr::Compare`'s outer loop. Closes the rest of #932. Depends on 2.
-6. **Stage 5** — widen the arm set, one sub-issue per arm. Depends on 2.
+6. **Stage 4** — `Expr::Compare`'s outer loop. Filed **#1459**. #932 was closed when Stage 2
+   landed, which was right for its `any`/`all`/`IN(s)` thirds but left `IN(src; s)` — still
+   divergent, and pinned as such in the test suite — with no open issue. #1459 carries it.
+7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
+   `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Not yet filed.
+   One issue, not one per arm: each is a single lazy arm now that the primitive exists.
+   Under ADR-0018 rule 6 these are divergences, so they need either a fix or entries in
+   `docs/compliance/jq/limitations.md`.
+8. **Option (c)** — mirror `Demand`/`Item`/`Flow` into `eval_generic.rs` for
+   `Comma`/`Pipe`/`Paren`. Not yet filed. This is the only remaining route to
+   `first(.[] | stderr)`, which is a `Pipe` and so out of reach of Stage 2b's comma walk.
