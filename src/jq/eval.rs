@@ -27184,7 +27184,17 @@ fn extract_pattern_bindings(
                 let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value)?;
                 bindings.extend(sub_bindings);
             }
-            Ok(bindings)
+            // #1366: an object pattern binding the same variable name from
+            // more than one field (`{x:$a,y:$a}`) keeps the *first* field's
+            // value in real jq, regardless of the object's own key order --
+            // confirmed live (jq 1.7.1): `{"x":1,"y":2} | . as {y:$a,x:$a} |
+            // $a` is `2` (y's value, since y is listed first in the
+            // pattern) on both `{"x":1,"y":2}` and the differently-ordered
+            // `{"y":2,"x":1}`, so this is the *pattern's* field order, not
+            // the value's. Opposite of the Array arm below -- see
+            // `dedup_keep_first_binding`'s doc comment for why the two
+            // container kinds disagree.
+            Ok(dedup_keep_first_binding(bindings))
         }
         Pattern::Array(patterns) => {
             // Same `null`-absorbs-further-access tolerance as the Object arm
@@ -27211,9 +27221,63 @@ fn extract_pattern_bindings(
                 let sub_bindings = extract_pattern_bindings(pat, &elem_value)?;
                 bindings.extend(sub_bindings);
             }
-            Ok(bindings)
+            // #1366: an array pattern binding the same variable name at more
+            // than one position (`[$a,$a]`) keeps the *last* position's
+            // value in real jq -- confirmed live: `[1,2] | . as [$a,$a] |
+            // $a` is `2`. Opposite of the Object arm above; see
+            // `dedup_keep_last_binding`'s doc comment for why.
+            Ok(dedup_keep_last_binding(bindings))
         }
     }
+}
+
+/// Drop every binding after the first for each repeated variable name,
+/// preserving first-seen order -- the rule real jq's object-pattern
+/// destructuring uses for a name bound by more than one field of the
+/// *same* object pattern (#1366). Confirmed live (jq 1.7.1) this tracks the
+/// *pattern's* field order, not the underlying object's own key order:
+/// `{"x":1,"y":2} | . as {y:$a,x:$a} | $a` is `2` (y's value, y being
+/// listed first in the pattern) on both `{"x":1,"y":2}` and the
+/// differently-ordered `{"y":2,"x":1}` value. Also confirmed via a
+/// computed-key probe (`{("x"|debug):$a,("y"|debug):$a}`) that both
+/// fields' key expressions still evaluate in textual order -- only the
+/// *binding* silently keeps the earlier one, later same-name fields are
+/// not skipped as dead code, their bind is just a no-op.
+///
+/// This is the opposite of [`dedup_keep_last_binding`], which applies to
+/// array-position duplicates instead -- real jq's `. as [$a,$a] | $a`
+/// keeps the *last* position, not the first. Both were verified
+/// independently; nothing about `extract_pattern_bindings`'s own recursive
+/// structure predicts one direction from the other, so each is pinned by
+/// its own oracle-verified doc comment rather than inferred.
+fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
+    let mut seen = BTreeSet::new();
+    bindings
+        .into_iter()
+        .filter(|(name, _)| seen.insert(name.clone()))
+        .collect()
+}
+
+/// Drop every binding *before* the last for each repeated variable name,
+/// preserving last-seen relative order -- the rule real jq's array-pattern
+/// destructuring uses for a name bound at more than one position of the
+/// *same* array pattern (#1366). Confirmed live (jq 1.7.1): `[1,2] | . as
+/// [$a,$a] | $a` is `2`; `[1,2,3] | . as [$a,$b,$a] | $a` is `3`.
+///
+/// See [`dedup_keep_first_binding`]'s doc comment for the object-pattern
+/// counterpart, which keeps the *first* occurrence instead -- the two
+/// container kinds are independently verified, not derived from one
+/// shared mechanism.
+fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
+    let mut seen = BTreeSet::new();
+    bindings
+        .into_iter()
+        .rev()
+        .filter(|(name, _)| seen.insert(name.clone()))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 /// Evaluate function definition: `def name(params): body; then`.
