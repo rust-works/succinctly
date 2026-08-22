@@ -11204,6 +11204,59 @@ fn test_reduce_array_pattern_duplicate_var_keeps_last_position_1366() -> Result<
     Ok(())
 }
 
+/// #1366 code review: the previous test's own doc comment claims `foreach`
+/// shares the same code path "by the same code path" as `reduce` -- this
+/// pins that claim directly instead of leaving it asserted-but-untested,
+/// for both container kinds (`reduce`'s own sibling test above only
+/// covers the array case).
+#[test]
+fn test_foreach_and_reduce_object_pattern_duplicate_var_keeps_first_field_1366() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "foreach .[] as [$a,$a] (0; $a)"], Some("[[1,2]]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", "foreach .[] as {x:$a,y:$a} (0; $a)"],
+        Some(r#"[{"x":1,"y":2}]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", "reduce .[] as {x:$a,y:$a} (0; $a)"],
+        Some(r#"[{"x":1,"y":2}]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #1366 code review: `{$a: Pattern}` (#1204's key-shorthand pattern)
+/// desugars into two `PatternEntry`s sharing the key `"a"` -- an implicit
+/// whole-field bind (`{key:"a", pattern:Var("a")}`) followed by whatever
+/// the user's own nested `Pattern` does. When that nested pattern also
+/// binds `$a`, this is a same-name collision baked into one syntactic
+/// construct rather than two explicit fields, and it happens to already
+/// resolve correctly (the auto-bind is the object pattern's *first* field
+/// textually, so it wins under the plain, non-`?//` rule) -- pinned here
+/// since none of the tests above exercise this desugaring path.
+#[test]
+fn test_key_shorthand_pattern_duplicate_var_1366() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", ". as {$a: {x:$a}} | $a"], Some(r#"{"a":{"x":99}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "{\"x\":99}");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {$a: [$b,$a]} | [$a,$b]"],
+        Some(r#"{"a":[10,20]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[[10,20],10]");
+    Ok(())
+}
+
 /// #1366 regression check: an ordinary pattern with no repeated variable
 /// name must still bind each name to its own, independent value --
 /// confirms the dedup step doesn't accidentally touch distinct names.
@@ -11215,6 +11268,116 @@ fn test_object_pattern_distinct_vars_unaffected_1366() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[100,200]");
+    Ok(())
+}
+
+/// #1366 code review: a genuine `?//`-chain (2+ alternatives) *inverts*
+/// real jq's duplicate-binding dedup rule relative to a bare, non-`?//`
+/// pattern of the identical shape -- confirmed live against jq 1.7.1 and
+/// 1.8.2. This is not "which code path handles it": `eval_as_pattern`
+/// routes a bare pattern through the same `try_pattern_alternatives` as a
+/// one-element list, so `patterns.len() > 1` (a real `?//`) is the only
+/// thing that actually distinguishes the two cases, and it flips the
+/// answer for *both* container kinds.
+#[test]
+fn test_array_pattern_duplicate_var_inverts_under_alternation_1366() -> Result<()> {
+    // Bare: last position wins (`2`).
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ". as [$a,$a] | $a"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+
+    // Same pattern, trivially `?//`-chained with itself: first position
+    // wins instead (`1`).
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", ". as [$a,$a] ?// [$a,$a] | $a"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    // Holds for a 3-position pattern too, not just the 2-position case.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as [$a,$b,$a] ?// [$a,$b,$a] | $a"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #1366 code review: the object-pattern counterpart of the array
+/// inversion above -- bare keeps the *first* field, `?//` keeps the
+/// *last*.
+#[test]
+fn test_object_pattern_duplicate_var_inverts_under_alternation_1366() -> Result<()> {
+    // Bare: first field wins (`1`, x's value).
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", ". as {x:$a,y:$a} | $a"], Some(r#"{"x":1,"y":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    // Same pattern via `?//` (second alternative never taken, just needs
+    // to exist): last field wins instead (`2`, y's value).
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {x:$a,y:$a} ?// $z | $a"],
+        Some(r#"{"x":1,"y":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+
+    // Holds for a 3-field pattern too.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {z:$a,x:$a,y:$a} ?// $w | $a"],
+        Some(r#"{"x":1,"y":2,"z":3}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #1366 code review: the `?//` inversion isn't limited to the outermost
+/// container -- a nested sub-pattern's own duplicate-binding rule inverts
+/// too, at any depth, since `invert` threads unchanged through every
+/// recursive call rather than being computed once at the top.
+#[test]
+fn test_nested_pattern_duplicate_var_inverts_under_alternation_1366() -> Result<()> {
+    // Array nested inside an object, bare vs. `?//`.
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", ". as {x:[$a,$a]} | $a"], Some(r#"{"x":[1,2]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as {x:[$a,$a]} ?// $z | $a"],
+        Some(r#"{"x":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    // Object nested inside an array, bare vs. `?//`.
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as [{x:$a,y:$a}] | $a"],
+        Some(r#"[{"x":1,"y":2}]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ". as [{x:$a,y:$a}] ?// $z | $a"],
+        Some(r#"[{"x":1,"y":2}]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #1366 code review: the inversion holds even when the duplicate-bound
+/// alternative is reached via a genuine fallback (the first alternative's
+/// own pattern fails to match), not just a trivial self-`?//`.
+#[test]
+fn test_pattern_duplicate_var_inverts_via_genuine_fallback_1366() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", ". as {x:$a} ?// [$a,$a] | $a"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
     Ok(())
 }
 

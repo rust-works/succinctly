@@ -18160,7 +18160,10 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // for the whole input stream, same as `eval_reduce`.
     let bindings_per_element: Vec<Result<Vec<(String, OwnedValue)>, EvalError>> = input_values
         .iter()
-        .map(|v| extract_pattern_bindings(pattern, v))
+        // `false`: reduce/foreach's own pattern never supports `?//` (#1201
+        // has no analogue for it), so this is always the ordinary,
+        // non-alternation dedup rule.
+        .map(|v| extract_pattern_bindings(pattern, v, false))
         .collect();
     let substituted_updates: Vec<Result<Expr, EvalError>> = bindings_per_element
         .iter()
@@ -27544,11 +27547,19 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Result<(Vec<OwnedValue>, Option<Control>), EvalError> {
     let last_idx = patterns.len() - 1;
     let mut carried: Vec<OwnedValue> = Vec::new();
+    // #1366 code review: a genuine `?//`-chain (2+ patterns) inverts real
+    // jq's duplicate-binding dedup rule relative to a bare, non-`?//`
+    // pattern -- `patterns.len() > 1` is the actual test, not "did this call
+    // come through `try_pattern_alternatives`", since `eval_as_pattern`
+    // routes a bare pattern through here too as a one-element list. See
+    // `extract_pattern_bindings`'s own doc comment for the live-verified
+    // evidence.
+    let invert_dedup = patterns.len() > 1;
 
     for (i, pattern) in patterns.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, bound_val) {
+        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
             Ok(b) => b,
             Err(e) => {
                 if is_last {
@@ -27680,7 +27691,9 @@ fn substitute_pattern(
     pattern: &Pattern,
     input_val: &OwnedValue,
 ) -> Result<Expr, EvalError> {
-    let bindings = extract_pattern_bindings(pattern, input_val)?;
+    // `false`: this pattern never supports `?//` (its own caller is
+    // `eval_foreach`, per this function's own doc comment above).
+    let bindings = extract_pattern_bindings(pattern, input_val, false)?;
     Ok(substitute_bindings(expr, &bindings))
 }
 
@@ -27696,9 +27709,28 @@ fn substitute_bindings(expr: &Expr, bindings: &[(String, OwnedValue)]) -> Expr {
 }
 
 /// Extract variable bindings from a pattern matching an OwnedValue.
+/// `invert` is `false` for an ordinary, single pattern (`. as PATTERN`,
+/// `reduce`/`foreach`'s own pattern -- neither supports `?//` at all) and
+/// `true` when called for one alternative of a genuine `?// `-chain (#1366
+/// code review: `patterns.len() > 1` in `try_pattern_alternatives`, *not*
+/// "which function called this" -- `eval_as_pattern` degrades a bare,
+/// non-`?//` pattern to a one-element alternatives list and still reaches
+/// `try_pattern_alternatives`, so the caller alone can't distinguish the
+/// two cases). Real jq's own duplicate-binding rule flips depending on
+/// this, for *both* container kinds and at *every* nesting depth --
+/// confirmed live (jq 1.7.1): `[1,2] | . as [$a,$a] | $a` is `2` (last
+/// wins) but `[1,2] | . as [$a,$a] ?// [$a,$a] | $a` is `1` (first wins,
+/// same pattern, only a trivial self-alternative added); symmetrically
+/// `{"x":1,"y":2} | . as {x:$a,y:$a} | $a` is `1` (first wins) but
+/// `... ?// $z | $a` is `2` (last wins). Also confirmed at a nested
+/// depth -- `{"x":[1,2]} | . as {x:[$a,$a]} ?// $z | $a` is `1`, still
+/// inverted for the *inner* array sub-pattern too, not just the outermost
+/// container -- so `invert` threads through every recursive call
+/// unchanged, it is not computed once and only applied at the top.
 fn extract_pattern_bindings(
     pattern: &Pattern,
     value: &OwnedValue,
+    invert: bool,
 ) -> Result<Vec<(String, OwnedValue)>, EvalError> {
     match pattern {
         Pattern::Var(name) => Ok(vec![(name.clone(), value.clone())]),
@@ -27707,10 +27739,17 @@ fn extract_pattern_bindings(
             // way plain `.foo` on `null` does (`null | .foo` is `null`) --
             // every variable this pattern (and anything nested inside it)
             // would bind resolves to `null` instead of hard-erroring (#1239).
+            // Every entry binds the same `Null` value here regardless of
+            // `invert`, but still routed through the same dedup call (#1366
+            // code review) so this path upholds the same "no duplicate
+            // names in the result" invariant every other path does, rather
+            // than relying on "every value happens to be Null anyway" to
+            // paper over a skipped step.
             if matches!(value, OwnedValue::Null) {
                 let mut names = Vec::new();
                 collect_pattern_var_names(pattern, &mut names);
-                return Ok(names.into_iter().map(|n| (n, OwnedValue::Null)).collect());
+                let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
+                return Ok(dedup_object_bindings(bindings, invert));
             }
             let mut bindings = Vec::new();
             for entry in entries {
@@ -27727,7 +27766,7 @@ fn extract_pattern_bindings(
                     }
                 };
                 let field_value = obj.get(&entry.key).cloned().unwrap_or(OwnedValue::Null);
-                let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value)?;
+                let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value, invert)?;
                 bindings.extend(sub_bindings);
             }
             // #1366: an object pattern binding the same variable name from
@@ -27737,18 +27776,20 @@ fn extract_pattern_bindings(
             // $a` is `2` (y's value, since y is listed first in the
             // pattern) on both `{"x":1,"y":2}` and the differently-ordered
             // `{"y":2,"x":1}`, so this is the *pattern's* field order, not
-            // the value's. Opposite of the Array arm below -- see
-            // `dedup_keep_first_binding`'s doc comment for why the two
-            // container kinds disagree.
-            Ok(dedup_keep_first_binding(bindings))
+            // the value's. Opposite of the Array arm below, and inverted
+            // again under `?//` -- see `extract_pattern_bindings`'s own doc
+            // comment and `dedup_object_bindings`'s for why.
+            Ok(dedup_object_bindings(bindings, invert))
         }
         Pattern::Array(patterns) => {
             // Same `null`-absorbs-further-access tolerance as the Object arm
-            // above, for array-shaped destructuring (#1239).
+            // above, for array-shaped destructuring (#1239); same "route
+            // through the real dedup step anyway" reasoning too.
             if matches!(value, OwnedValue::Null) {
                 let mut names = Vec::new();
                 collect_pattern_var_names(pattern, &mut names);
-                return Ok(names.into_iter().map(|n| (n, OwnedValue::Null)).collect());
+                let bindings = names.into_iter().map(|n| (n, OwnedValue::Null)).collect();
+                return Ok(dedup_array_bindings(bindings, invert));
             }
             let mut bindings = Vec::new();
             for (i, pat) in patterns.iter().enumerate() {
@@ -27764,65 +27805,73 @@ fn extract_pattern_bindings(
                     }
                 };
                 let elem_value = arr.get(i).cloned().unwrap_or(OwnedValue::Null);
-                let sub_bindings = extract_pattern_bindings(pat, &elem_value)?;
+                let sub_bindings = extract_pattern_bindings(pat, &elem_value, invert)?;
                 bindings.extend(sub_bindings);
             }
             // #1366: an array pattern binding the same variable name at more
             // than one position (`[$a,$a]`) keeps the *last* position's
             // value in real jq -- confirmed live: `[1,2] | . as [$a,$a] |
-            // $a` is `2`. Opposite of the Object arm above; see
-            // `dedup_keep_last_binding`'s doc comment for why.
-            Ok(dedup_keep_last_binding(bindings))
+            // $a` is `2`. Opposite of the Object arm above, and inverted
+            // again under `?//`.
+            Ok(dedup_array_bindings(bindings, invert))
         }
     }
 }
 
-/// Drop every binding after the first for each repeated variable name,
-/// preserving first-seen order -- the rule real jq's object-pattern
-/// destructuring uses for a name bound by more than one field of the
-/// *same* object pattern (#1366). Confirmed live (jq 1.7.1) this tracks the
-/// *pattern's* field order, not the underlying object's own key order:
-/// `{"x":1,"y":2} | . as {y:$a,x:$a} | $a` is `2` (y's value, y being
-/// listed first in the pattern) on both `{"x":1,"y":2}` and the
-/// differently-ordered `{"y":2,"x":1}` value. Also confirmed via a
-/// computed-key probe (`{("x"|debug):$a,("y"|debug):$a}`) that both
-/// fields' key expressions still evaluate in textual order -- only the
-/// *binding* silently keeps the earlier one, later same-name fields are
-/// not skipped as dead code, their bind is just a no-op.
-///
-/// This is the opposite of [`dedup_keep_last_binding`], which applies to
-/// array-position duplicates instead -- real jq's `. as [$a,$a] | $a`
-/// keeps the *last* position, not the first. Both were verified
-/// independently; nothing about `extract_pattern_bindings`'s own recursive
-/// structure predicts one direction from the other, so each is pinned by
-/// its own oracle-verified doc comment rather than inferred.
-fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    let mut seen = BTreeSet::new();
-    bindings
-        .into_iter()
-        .filter(|(name, _)| seen.insert(name.clone()))
-        .collect()
+/// Object-pattern dedup: keep-first when `invert` is `false` (the ordinary,
+/// non-`?//` rule), keep-last when `true` (real jq's `?//`-alternative
+/// rule, confirmed the opposite -- see `extract_pattern_bindings`'s own doc
+/// comment for the live-verified evidence).
+fn dedup_object_bindings(
+    bindings: Vec<(String, OwnedValue)>,
+    invert: bool,
+) -> Vec<(String, OwnedValue)> {
+    if invert {
+        dedup_keep_last_binding(bindings)
+    } else {
+        dedup_keep_first_binding(bindings)
+    }
 }
 
-/// Drop every binding *before* the last for each repeated variable name,
-/// preserving last-seen relative order -- the rule real jq's array-pattern
-/// destructuring uses for a name bound at more than one position of the
-/// *same* array pattern (#1366). Confirmed live (jq 1.7.1): `[1,2] | . as
-/// [$a,$a] | $a` is `2`; `[1,2,3] | . as [$a,$b,$a] | $a` is `3`.
-///
-/// See [`dedup_keep_first_binding`]'s doc comment for the object-pattern
-/// counterpart, which keeps the *first* occurrence instead -- the two
-/// container kinds are independently verified, not derived from one
-/// shared mechanism.
+/// Array-pattern dedup: keep-last when `invert` is `false` (the ordinary,
+/// non-`?//` rule), keep-first when `true` (real jq's `?//`-alternative
+/// rule) -- the mirror image of [`dedup_object_bindings`].
+fn dedup_array_bindings(
+    bindings: Vec<(String, OwnedValue)>,
+    invert: bool,
+) -> Vec<(String, OwnedValue)> {
+    if invert {
+        dedup_keep_first_binding(bindings)
+    } else {
+        dedup_keep_last_binding(bindings)
+    }
+}
+
+/// Drop every binding after the first for each repeated variable name,
+/// keeping first-insertion order -- `IndexMap::entry().or_insert()` only
+/// writes a key's value the first time it's seen, exactly this rule, so
+/// this needs no bespoke seen-set bookkeeping (#1366 code review; mirrors
+/// `build_object_entries`'s own use of `IndexMap` for jq's analogous
+/// duplicate-*object-key* rule elsewhere in this file).
+fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
+    let mut map = IndexMap::new();
+    for (name, value) in bindings {
+        map.entry(name).or_insert(value);
+    }
+    map.into_iter().collect()
+}
+
+/// Drop every binding before the last for each repeated variable name --
+/// collecting into an `IndexMap` already gives "last value wins, first
+/// insertion position kept" for a repeated key (#1366 code review; the
+/// same `IndexMap` behavior `build_object_entries` documents for jq's
+/// duplicate-object-key rule), so this needs no explicit reverse/re-reverse
+/// pass either.
 fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    let mut seen = BTreeSet::new();
     bindings
         .into_iter()
-        .rev()
-        .filter(|(name, _)| seen.insert(name.clone()))
-        .collect::<Vec<_>>()
+        .collect::<IndexMap<_, _>>()
         .into_iter()
-        .rev()
         .collect()
 }
 
