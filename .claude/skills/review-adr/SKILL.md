@@ -92,6 +92,8 @@ Conformance to the format defined in ADR-0000 (or the Michael Nygard baseline):
 - **Scope** — One decision per record? Not conflating unrelated choices?
 - **File** — Named `adr-NNNN.md` with a zero-padded four-digit number (for existing ADRs)?
   Stored in the project's designated ADR directory?
+- **Code citations** — No source line-number citations (file paths and symbol names only —
+  line numbers drift as unrelated commits land)?
 
 ---
 
