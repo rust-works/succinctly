@@ -21264,20 +21264,21 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // branch, matching real jq's own `.a?`-style empty-not-null
                 // path semantics -- not `QueryResult::Owned(Null)`.
                 Ok(None) => QueryResult::None,
-                Ok(Some(result)) => {
-                    if rest.is_empty() {
-                        QueryResult::Owned(result)
-                    } else {
-                        eval_pipe_with_path_context_internal::<W, S>(
-                            rest,
-                            &result,
-                            root,
-                            file_origin,
-                            current_path,
-                            optional,
-                        )
-                    }
-                }
+                // #1313: `continue_rest_with_context` (shared with the
+                // `Expr::Object`/`Array`/`Literal` arm above and the
+                // generic fallback below) replaces the old hand-rolled
+                // "if `rest` is empty, return; else recurse" -- unlike that
+                // arm, this one keeps the enclosing `root`/`current_path`
+                // unchanged (a builtin doesn't move navigational position),
+                // so no extra clone is needed here.
+                Ok(Some(result)) => continue_rest_with_context::<W, S>(
+                    QueryResult::Owned(result),
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ),
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791).
                 Err(EvalEscape::Error(_)) if optional => QueryResult::None,
@@ -21518,20 +21519,28 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // whole construction contributes zero outputs, matching real
                 // jq -- not a spurious `null`.
                 Ok(None) => QueryResult::None,
+                // #1313: hands off to `continue_rest_with_context` (shared
+                // with the `Expr::Builtin(_)`/generic-fallback arms below)
+                // instead of hand-rolling "if `rest` is empty, return this
+                // value; else recurse" -- that helper's own base case
+                // (`eval_pipe_with_path_context_internal`'s `exprs.is_empty()`
+                // check) already produces the identical `QueryResult::
+                // Owned(result)` for an empty `rest`, one extra `.clone()`
+                // aside. `root` clones `result` rather than reusing the
+                // borrow the old code took twice for free: it's about to be
+                // moved into `intermediate` here, and this arm (unlike
+                // `Builtin`/the fallback below) needs the *new* value as
+                // `root`, not the enclosing one already in scope.
                 Ok(Some(result)) => {
-                    if rest.is_empty() {
-                        QueryResult::Owned(result)
-                    } else {
-                        // Reset path and root to the new value
-                        eval_pipe_with_path_context_internal::<W, S>(
-                            rest,
-                            &result,
-                            &result,
-                            file_origin,
-                            &[],
-                            optional,
-                        )
-                    }
+                    let root = result.clone();
+                    continue_rest_with_context::<W, S>(
+                        QueryResult::Owned(result),
+                        rest,
+                        &root,
+                        file_origin,
+                        &[],
+                        optional,
+                    )
                 }
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791).
@@ -21801,20 +21810,19 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // mismatch reached through this generic fallback) is zero
                 // outputs, matching real jq -- not a spurious `null`.
                 Ok(None) => QueryResult::None,
-                Ok(Some(result)) => {
-                    if rest.is_empty() {
-                        QueryResult::Owned(result)
-                    } else {
-                        eval_pipe_with_path_context_internal::<W, S>(
-                            rest,
-                            &result,
-                            root,
-                            file_origin,
-                            current_path,
-                            optional,
-                        )
-                    }
-                }
+                // #1313: same `continue_rest_with_context` hand-off as the
+                // `Expr::Builtin(_)` arm above -- root/current_path stay
+                // unchanged (this arm never moves navigational position
+                // either, it just loses further path *tracking* for
+                // whatever it evaluates).
+                Ok(Some(result)) => continue_rest_with_context::<W, S>(
+                    QueryResult::Owned(result),
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ),
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791).
                 Err(EvalEscape::Error(_)) if optional => QueryResult::None,
