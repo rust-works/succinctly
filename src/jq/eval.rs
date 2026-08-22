@@ -6199,8 +6199,137 @@ fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
 // Phase 6: String Interpolation & Format Strings
 // =============================================================================
 
-/// Evaluate string interpolation: `"Hello \(.name)"`
+/// Materialize a `\(...)` slot's own outputs as rendered strings, plus a
+/// deferred escape if its generator terminates in an error/break/halt.
+///
+/// Reuses [`object_outputs`] (already fully general -- it just unpacks a
+/// `QueryResult` into `(Vec<OwnedValue>, Option<Control>)` with no
+/// object-specific coupling) and stringifies each output the same way a
+/// single-valued slot already did (`owned_to_string`).
+fn string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    result: QueryResult<'_, W>,
+) -> (Vec<String>, Option<Control>) {
+    let (values, control) = object_outputs(result);
+    (values.iter().map(owned_to_string::<S>).collect(), control)
+}
+
+/// Emit one interpolated string per combination of the remaining `\(...)`
+/// slots' outputs (#1403). Real jq's string interpolation is a generator
+/// exactly like object construction (#354) is, but with the *opposite*
+/// nesting order: confirmed live against jq 1.7.1 that
+/// `"\(1,2)-\(3,4)"` yields `"1-3","2-3","1-4","2-4"` -- the *first*
+/// (leftmost) slot varies fastest, the *last* slot slowest, which is
+/// backwards from object construction's "last entry varies fastest"
+/// (`build_object_entries`'s own doc comment).
+///
+/// `parts` shrinks from the right via `split_last()` each recursive call,
+/// so the *last* slot's loop is outermost (evaluated once, checked for a
+/// trailing control only after every value it's paired with below has been
+/// tried) and the *first* slot ends up innermost -- giving exactly that
+/// observed ordering. `slots` is a fixed-size array (sized once, at the
+/// call in [`eval_string_interpolation`]) rather than a single growing
+/// `String` precisely because the loop order and the textual assembly
+/// order are opposite: each recursive call only ever overwrites its own
+/// `slots[idx]` (`idx = rest.len()`, that part's original position) before
+/// recursing deeper, so nothing needs undoing on the way back out, and the
+/// base case joins every slot in its original left-to-right order
+/// regardless of which order they were assigned in.
+///
+/// Live-verified error/break/halt semantics match object construction's
+/// own all-or-nothing backtracking exactly (just under the reversed
+/// nesting): a slot's own deferred control fires only once every
+/// combination it can still contribute to has been tried (`"\(1)-\((2,
+/// error("x")))"` -> `"1-2"` then the error, not silently dropped), and a
+/// deferred control from any level unwinds every enclosing loop
+/// immediately rather than resuming them (`"\((1,error("x")))-\(3,4)"` ->
+/// `"1-3"` then the error, never trying slot 2's second value `4`).
+fn build_string_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    parts: &[StringPart],
+    value: &StandardJson<'_, W>,
+    optional: bool,
+    slots: &mut [String],
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), Control> {
+    let Some((part, rest)) = parts.split_last() else {
+        out.push(OwnedValue::String(slots.concat()));
+        return Ok(());
+    };
+    let idx = rest.len();
+
+    match part {
+        StringPart::Literal(s) => {
+            slots[idx].clone_from(s);
+            build_string_parts::<W, S>(rest, value, optional, slots, out)
+        }
+        StringPart::Expr(expr) => {
+            let (outputs, trailing) = string_part_outputs::<W, S>(
+                eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor(),
+            );
+
+            for s in outputs {
+                slots[idx] = s;
+                build_string_parts::<W, S>(rest, value, optional, slots, out)?;
+            }
+
+            if let Some(control) = trailing {
+                return Err(control);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Evaluate string interpolation: `"Hello \(.name)"`.
+///
+/// jq mode is a genuine fan-out generator (#1403, `build_string_parts`
+/// above). yq mode is deliberately **not** — live-verified against yq
+/// v4.53.3 that `"\(.a,2)"` on `a: 1` gives only `"1"`, a single output,
+/// not the two combinations jq's model would produce
+/// (`printf 'a: 1\n' | yq '"\(.a,2)"'` -> `1`, never `2`). This mirrors
+/// #1403's own single-value-taking code exactly (kept verbatim, not
+/// reimplemented against the new generator) rather than risk a
+/// behavioral drift in code this issue never asked to touch — not
+/// recorded elsewhere until now; see
+/// [docs/compliance/yq/limitations.md](../../../docs/compliance/yq/limitations.md)
+/// for the write-up (ADR-0018 rule 6).
 fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    parts: &[StringPart],
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        return eval_string_interpolation_single_value::<W, S>(parts, value, optional);
+    }
+
+    let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
+    let mut out = Vec::new();
+
+    if let Err(control) = build_string_parts::<W, S>(parts, &value, optional, &mut slots, &mut out)
+    {
+        return match control {
+            Control::Error(e) if out.is_empty() => QueryResult::Error(e),
+            Control::Error(e) => QueryResult::Partial(out, Control::Error(e)),
+            Control::Break(label) if out.is_empty() => QueryResult::Break(label),
+            Control::Break(label) => QueryResult::Partial(out, Control::Break(label)),
+            Control::Halt(code) if out.is_empty() => QueryResult::Halt(code),
+            Control::Halt(code) => QueryResult::Partial(out, Control::Halt(code)),
+        };
+    }
+
+    owned_vec_to_result(out)
+}
+
+/// yq mode's own string interpolation: takes only the first value of each
+/// `\(...)` slot's generator, exactly as this whole function used to
+/// (#1403) before jq mode became a genuine fan-out generator above.
+/// Preserved verbatim rather than derived from the new generator, since
+/// deriving "take only the first combination" from `build_string_parts`
+/// would still need to replicate this exact per-`QueryResult`-variant
+/// dispatch (a `Partial` here discards even its own first value and
+/// propagates the control immediately, unlike jq mode's "combinations
+/// already produced travel onward") to stay byte-for-byte identical to
+/// yq's oracle-verified behavior.
+fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     parts: &[StringPart],
     value: StandardJson<'a, W>,
     optional: bool,
@@ -35010,12 +35139,14 @@ mod tests {
             // they forward their operand as a stream, not a value, so they no
             // longer belong in this list; see
             // `partial_prefix_survives_the_stream_forwarding_constructs`.
-            (
-                b"null",
-                r#""v=\((1,error("x")))""#,
-                "x",
-                r#"jq 1.7.1 prints "v=1", then fails"#,
-            ),
+            //
+            // String interpolation *used* to be listed here too
+            // (`"v=\((1,error("x")))"` collapsing straight to the error),
+            // but #1403's rewrite made jq mode a real generator like
+            // object construction's own #354 fix — it now streams "v=1"
+            // before failing, the same as jq 1.7.1. See
+            // `partial_prefix_survives_the_stream_forwarding_constructs`
+            // for its coverage.
             (
                 b"[10,20,30]",
                 r#".[(1,error("x"))]"#,
@@ -35061,8 +35192,8 @@ mod tests {
             (b"null", "[1,(2,break $out),3]"),
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
-            // `select`/`if`: see the comment in `atomic` above.
-            (b"null", r#""v=\((1,break $out))""#),
+            // `select`/`if`, string interpolation: see the comment in
+            // `atomic` above.
             (b"[10,20,30]", ".[(1,break $out)]"),
             (b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
             (br#"{"a":1}"#, "map_values((.,break $out))"),
@@ -35230,6 +35361,40 @@ mod tests {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(prefix_json(&vs), [r#"{"x":10}"#, r#"{"x":20}"#]);
                 assert_eq!(e.message, "Cannot use number (1) as object key");
+            }
+        );
+
+        // #1403: jq mode's string interpolation is now the same kind of
+        // generator object construction became under #354 -- it used to be
+        // listed in `partial_in_value_position_collapses_to_its_control`'s
+        // `atomic` table (labelled as a documented divergence from jq
+        // 1.7.1, which the old comment already recorded as printing "v=1"
+        // then failing); now that it's a real fan-out generator, it agrees
+        // with jq 1.7.1 exactly, same as object construction's own move.
+        query!(b"null", r#""v=\((1,error("x")))""#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#""v=1""#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"null", r#""v=\((1,break $out))""#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), [r#""v=1""#]);
+                assert_eq!(label, "out");
+            }
+        );
+        // A trailing control on an *earlier* slot aborts every enclosing
+        // loop outright rather than resuming it -- matches object
+        // construction's identical rule above, just under string
+        // interpolation's own reversed nesting (#1403: the *first*/
+        // leftmost slot varies fastest, the opposite of object
+        // construction's "last entry varies fastest"). jq 1.7.1 agrees the
+        // second slot's `4` is never tried once the first slot fails on
+        // its own second output.
+        query!(b"null", r#""\((1,error("x")))-\(3,4)""#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#""1-3""#]);
+                assert_eq!(e.message, "x");
             }
         );
     }

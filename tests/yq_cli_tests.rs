@@ -19777,3 +19777,27 @@ fn test_jq_gsub_zero_width_unaffected_by_1255() -> Result<()> {
     assert_eq!(stdout.trim(), r#""XbXXbX""#);
     Ok(())
 }
+
+/// #1403: jq mode's string interpolation became a genuine fan-out
+/// generator over a multi-valued `\(...)` slot, but yq mode deliberately
+/// keeps its pre-#1403 single-value-taking behavior -- live-verified
+/// against yq v4.53.3 that a multi-valued slot silently collapses to its
+/// first value alone (`printf 'a: 1\n' | yq '"\(.a,2)"'` -> `1`, never
+/// `2`), unlike jq's cartesian-product model.
+#[test]
+fn test_yq_string_interpolation_multi_valued_slot_takes_first_value_only_1403() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#""\(.a,2)""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""1""#);
+    Ok(())
+}
+
+/// Regression guard: the ordinary single-valued interpolation case (the
+/// overwhelmingly common shape) stays completely unaffected in yq mode.
+#[test]
+fn test_yq_string_interpolation_single_valued_slot_unaffected_1403() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#""Hello \(.name)""#, "name: world\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "Hello world");
+    Ok(())
+}

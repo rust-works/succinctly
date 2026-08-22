@@ -282,6 +282,22 @@ separate, still-unresolved mystery, #1439 above — #1255's fix alone wouldn't m
 oracle-correct given that deeper algorithm mismatch, so the two are deliberately decoupled
 rather than guessed at together).
 
+### String interpolation with a multi-valued `\(...)` slot — yq takes the first value only
+
+[#1403](https://github.com/rust-works/succinctly/issues/1403) fixed jq mode's `"\(...)"` string
+interpolation to fan out over a multi-valued embedded generator, matching real jq's cartesian
+product across every slot (`"\(1,2)-\(3,4)"` → 4 strings, the *first* slot varying fastest).
+yq deliberately does **not** get the same fix — live-verified against yq v4.53.3 that a
+multi-valued slot silently collapses to its first value alone, not a fan-out:
+
+```bash
+$ printf 'a: 1\n' | yq            -o=json '"\(.a,2)"'   # "1" — only one output
+$ printf 'a: 1\n' | succinctly yq -o=json '"\(.a,2)"'   # "1" — matches
+```
+
+`succinctly yq` keeps its pre-#1403 single-value-taking behavior (`eval_string_interpolation`'s
+own doc comment has the exact byte-for-byte reasoning); only jq mode became a genuine generator.
+
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't

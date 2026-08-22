@@ -6991,20 +6991,17 @@ fn test_string_interpolation_propagates_bare_halt() -> Result<()> {
 
 #[test]
 fn test_string_interpolation_propagates_halt_after_partial_output() -> Result<()> {
-    // Distinct arm from the bare-halt one above: when the `\(...)` slot's
-    // expression yields a value and *then* halts, `materialize_cursor()`
-    // returns `QueryResult::Partial(_, Control::Halt(code))`, handled here by
-    // its own two-line arm. Per this function's own doc comment ("string
-    // interpolation is atomic ... a `Partial` just surfaces its control,
-    // same as a bare one"), succinctly deliberately does NOT match real
-    // jq's behavior here: real jq forks the whole string per output of the
-    // slot's generator (`jq -n '"\(1, halt_error(9))"'` prints `"1"` to
-    // stdout *before* halting 9), but succinctly's `\(...)` embeds only the
-    // slot's single embedded value and discards the rest of a multi-output
-    // stream, so here the halt wins outright with no partial "1" on stdout.
+    // #1403 fixed jq mode's `\(...)` to be a genuine fan-out generator
+    // (matching object construction's own #354 semantics) rather than
+    // always taking just the slot's first output. This test used to pin
+    // the pre-fix divergence ("succinctly deliberately does NOT match real
+    // jq's behavior here") as expected; now that jq mode forks the whole
+    // string per output of the slot's generator, it matches real jq
+    // exactly: `jq -n '"\(1, halt_error(9))"'` prints `"1"` to stdout
+    // *before* halting 9 (live-verified), and so does succinctly now.
     let (stdout, stderr, code) = run_jq_full(&["-n", r#""\(1, halt_error(9))""#], None)?;
     assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "\"1\"\n");
     Ok(())
 }
 
@@ -16779,5 +16776,97 @@ fn test_jq_optional_component_before_iterate_suppresses_whole_write_1298() -> Re
     let (stdout, stderr, code) = run_jq_full(&["-c", ".a?.b[].c = 9"], Some("5"))?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(stdout, "5\n");
+    Ok(())
+}
+
+// =============================================================================
+// #1403: string interpolation fans out over a multi-valued `\(...)` slot
+// =============================================================================
+
+/// The issue's own repro: a single multi-valued slot must produce one
+/// string per value, not just the first.
+#[test]
+fn test_jq_string_interpolation_single_slot_fans_out_1403() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "\"\\(1,2)\""], Some("null"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "\"1\"\n\"2\"\n");
+    Ok(())
+}
+
+/// Two independent multi-valued slots must cartesian-product together --
+/// live-verified against jq 1.7.1 that the *first* (leftmost) slot varies
+/// fastest, the opposite of object construction's "last entry varies
+/// fastest" (#354).
+#[test]
+fn test_jq_string_interpolation_two_slots_cartesian_product_first_varies_fastest_1403() -> Result<()>
+{
+    let (stdout, stderr, code) = run_jq_full(&["-c", "\"\\(1,2)-\\(3,4)\""], Some("null"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "\"1-3\"\n\"2-3\"\n\"1-4\"\n\"2-4\"\n");
+    Ok(())
+}
+
+/// Three slots, to guard against an implementation that only handles the
+/// two-slot case correctly by accident.
+#[test]
+fn test_jq_string_interpolation_three_slots_cartesian_product_1403() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "\"\\(1,2)-\\(3,4)-\\(5,6)\""], Some("null"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "\"1-3-5\"\n\"2-3-5\"\n\"1-4-5\"\n\"2-4-5\"\n\"1-3-6\"\n\"2-3-6\"\n\"1-4-6\"\n\"2-4-6\"\n"
+    );
+    Ok(())
+}
+
+/// A slot's own deferred error fires only once every combination it can
+/// still contribute to has been tried, and combinations already produced
+/// travel onward first (jq's own all-or-nothing-per-generator
+/// backtracking, matching object construction's #354 semantics) --
+/// live-verified: `"\(1)-\((2,error("x")))"` prints `"1-2"` before the
+/// error, not silently dropping it.
+#[test]
+fn test_jq_string_interpolation_partial_output_before_slot_error_1403() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "\"\\(1)-\\((2,error(\"boom\")))\""], Some("null"))?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "\"1-2\"\n");
+    Ok(())
+}
+
+/// A deferred control from *any* slot unwinds every enclosing loop
+/// immediately rather than resuming them -- live-verified:
+/// `"\((1,error("x")))-\(3,4)"` prints `"1-3"` then errors, never trying
+/// slot 2's second value `4` (which a naively-independent per-slot
+/// evaluation might have attempted).
+#[test]
+fn test_jq_string_interpolation_error_aborts_all_enclosing_loops_1403() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "\"\\((1,error(\"boom\")))-\\(3,4)\""], Some("null"))?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "\"1-3\"\n");
+    Ok(())
+}
+
+/// An empty slot (zero outputs) collapses the whole interpolation to zero
+/// outputs too, not an error and not a string with a blank substituted in
+/// -- matches `empty`'s effect on any other jq generator.
+#[test]
+fn test_jq_string_interpolation_empty_slot_yields_no_output_1403() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "\"\\(empty)-\\(1,2)\""], Some("null"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// Regression guard: a single-valued slot (the overwhelmingly common case
+/// this function existed to serve before #1403) stays completely
+/// unaffected.
+#[test]
+fn test_jq_string_interpolation_single_valued_slot_unaffected_1403() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "\"Hello \\(.name)\""], Some(r#"{"name":"world"}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "\"Hello world\"\n");
     Ok(())
 }
