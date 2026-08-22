@@ -17127,15 +17127,16 @@ fn test_1331_comma_computed_key_and_static_optional_sibling_dedup() -> Result<()
 }
 
 /// #1331: two top-level comma branches each ending in a `?`-marked bare
-/// iterate. This was originally meant to exercise `delete_expr_iterate_paths`'s
-/// own `debug_assert`, but a live debug probe (#1331's second review
-/// round) found it doesn't: `resolve_node` eagerly expands `.a[]`/`.b[]?`
-/// into concrete per-element `Index` components before `flatten_delete_path`
-/// ever runs, so this actually reaches `delete_expr_array_paths` (already
-/// covered above) -- see `delete_expr_iterate_paths`'s own doc comment and
-/// #1382 for whether that function is reachable via `del()` at all. Kept
-/// as a plain correctness regression test for this realistic input shape,
-/// not as coverage for that specific debug_assert.
+/// iterate. This was originally meant to exercise the debug_assert of a
+/// dedicated `Iterate`-bucket handler this shape was expected to reach, but
+/// a live debug probe (#1331's second review round) found it doesn't:
+/// `resolve_node` eagerly expands `.a[]`/`.b[]?` into concrete per-element
+/// `Index` components before `flatten_delete_path` ever runs, so this
+/// actually reaches `delete_expr_array_paths` (already covered above).
+/// #1382 later confirmed and closed the open question that handler's own
+/// reachability posed: it was genuinely dead code, exhaustively verified
+/// and removed. Kept as a plain correctness regression test for this
+/// realistic input shape, not as coverage for any debug_assert.
 #[test]
 fn test_1331_comma_optional_iterate_siblings_clear_both_arrays() -> Result<()> {
     let (out, code) = run_yq_stdin(

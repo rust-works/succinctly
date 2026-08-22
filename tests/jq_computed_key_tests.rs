@@ -1976,14 +1976,17 @@ fn test_del_static_comma_type_error_still_errors_with_every_sibling_optional_132
 
 /// #1322 (found by `/code-review`): `delete_expr_paths_at` buckets siblings
 /// by shape and processes the indices bucket (`delete_expr_array_paths`)
-/// before the iterates bucket (`delete_expr_iterate_paths`) at the same
-/// `start`. Before this fix, if the dead `optional` gate had ever actually
-/// been live, an all-optional indices bucket would have returned early
-/// with `Ok(value)` unchanged, and processing would have continued into
-/// the iterates bucket instead of erroring here. Since `optional` is
-/// always `false` in practice this was never reachable, but pinning the
+/// before anything else at the same `start`. Before this fix, if the dead
+/// `optional` gate had ever actually been live, an all-optional indices
+/// bucket would have returned early with `Ok(value)` unchanged, and
+/// processing would have continued into whatever the `.[]?` sibling
+/// resolved to instead of erroring here. Since `optional` is always
+/// `false` in practice this was never reachable, but pinning the
 /// combination directly guards against the ordering assumption silently
-/// changing.
+/// changing. (The `.[]?` sibling itself never reaches `delete_expr_paths_at`
+/// as a literal `Expr::Iterate` at all -- #1382 confirmed and removed the
+/// dead handler that used to be its dedicated bucket; it's fanned out by
+/// `resolve_dynamic_indexes` before this function ever sees it.)
 #[test]
 fn test_del_static_comma_mixed_indices_and_iterate_buckets_still_errors_1322() {
     check(
