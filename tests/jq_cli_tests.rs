@@ -13869,6 +13869,59 @@ fn test_func_def_three_way_arity_overload_1376() -> Result<()> {
     Ok(())
 }
 
+/// #1376 known gap, tracked by #1473: forward-referencing a not-yet-
+/// defined arity from *within a def's own body* silently computes a value
+/// instead of failing, where real jq rejects it as a compile-time forward
+/// reference (`f/2 is not defined`, exit 3, oracle-verified against jq
+/// 1.7.1). `f/1`'s own body (`f(x; 99)`) textually references `f/2`, which
+/// doesn't exist yet at that lexical point -- but `expand_func_calls`'s
+/// substitution model has no concept of lexical position, so once `f/1`'s
+/// own expansion substitutes that body into `f(1)`'s call site (found
+/// while walking past `f/2`'s own definition), the result becomes
+/// indistinguishable from a call genuinely written after `f/2` and gets
+/// picked up by `f/2`'s own, later expansion pass.
+///
+/// This isn't fixable by a narrower guard in `#1376`'s own fix (see the
+/// `FuncCall` arm's own doc comment in `src/jq/eval.rs`) -- it needs the
+/// same lexical-scope tracking (or genuine compile-time/runtime
+/// resolution) #1473 already scopes. Pinning the *current* (wrong, known)
+/// behavior here so it can't silently drift further, and so this test
+/// starts failing -- correctly -- the moment #1473 lands a real fix.
+#[test]
+fn test_func_def_forward_arity_reference_in_own_body_known_gap_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): f(x; 99); def f(x; y): x + y; f(1)"],
+        Some("null"),
+    )?;
+    // NOT the correct behavior -- real jq rejects this at compile time
+    // (`f/2 is not defined`, exit 3). Pinned as documented, tracked-as-
+    // known-wrong output; see this test's own doc comment and #1473.
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "100");
+    Ok(())
+}
+
+/// #1376: `eval_pipe_with_path_context_internal`'s own `Expr::FuncDef` arm
+/// (`src/jq/eval.rs`) is a *second*, independent call site into the same
+/// `expand_func_calls`/arity-overload logic -- a query built entirely from
+/// non-path-context queries (like this file's other `_1376` tests) never
+/// reaches it, so it needs its own coverage. `path(...)` forces evaluation
+/// through the path-context evaluator; both overloads still resolve
+/// correctly there. Oracle-verified against jq 1.7.1.
+#[test]
+fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"def go(k): .[k]; def go(k;k2): path(.[k][k2]); [go("a"), go("a";"b")]"#,
+        ],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[{"b":1},["a","b"]]"#);
+    Ok(())
+}
+
 /// #998: the bare identity `.` never materializes an `OwnedValue` tree (it
 /// stays lazy, streaming straight from the cursor via `print_json`), so
 /// `eval_generic::to_owned`'s own depth guard never gets a chance to fire

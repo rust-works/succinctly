@@ -30138,6 +30138,25 @@ fn expand_func_calls(
         // or outside this one's own scope) might still resolve it, or
         // reaches `eval_func_call`'s "undefined function" fallback if none
         // ever does.
+        //
+        // **Known gap** (code review, #1473): this fallthrough can also
+        // let a call resolve that real jq would reject as a forward
+        // reference. If `func_name`'s own body (here, `body`) itself
+        // contains a call to a not-yet-defined arity of the same name
+        // (`def f(x): f(x; 99); def f(x; y): x + y; f(1)`), that call gets
+        // substituted into the tree at `f(1)`'s position -- inside `f/2`'s
+        // own `then` -- and `f/2`'s own later expansion pass then resolves
+        // it, even though at `f/1`'s own lexical position `f/2` isn't in
+        // scope yet (jq: `f/2 is not defined`, compile error; succinctly:
+        // silently computes `100`). This isn't fixable by a narrower guard
+        // here -- it needs the substitution architecture to track lexical
+        // position (or a real compile-time/runtime resolution pass), which
+        // is the same class of work #1473 already scopes. Confirmed the
+        // same root cause also explains a pre-existing, non-arity case
+        // (`def f: g; def g: 42; f` also wrongly resolves); this arm's
+        // #1376 fix didn't introduce that general gap, only re-exposed one
+        // arity-flavored sub-case of it that a since-removed blanket arity
+        // error happened to catch by accident.
         Expr::FuncCall { name, args } if name == func_name && args.len() == params.len() => {
             // #1016: a self-recursive `def` (e.g. `def deep(n): if n == 0
             // then . else [deep(n-1)] end;`) has no base case at expansion
@@ -30824,20 +30843,19 @@ fn expand_func_calls(
             then,
         } => {
             // #1376: shadowing needs the *same arity*, not just the same
-            // name -- jq supports overloading a name by arity (`def
-            // f(x): ...; def f(x;y): ...;` are distinct functions, both
-            // remain callable), and a same-name-different-arity def here
-            // doesn't touch `func_name`'s own calls at all: they live at a
-            // different arity, so they're neither redefined nor shadowed
-            // by this one. Verified live against jq 1.7.1: `f/1` stays
-            // callable from *inside* `f/2`'s own body too (`def f(x):
-            // x+1; def f(x;y): (f(x))+y; f(2;3)` is `6` = f(2)+3), so this
-            // arm must keep descending into both `inner_body` and `then`
-            // when only the name matches, exactly like the "different
-            // name entirely" case below already does -- only a genuine
-            // same-arity redefinition (which really does make the earlier
-            // definition permanently unreachable from this point on)
-            // stops expansion.
+            // name -- see the `FuncCall` arm above for why arity
+            // overloading matters and its own worked example. A same-
+            // name-different-arity def here doesn't touch `func_name`'s
+            // own calls at all: they live at a different arity, so
+            // they're neither redefined nor shadowed by this one.
+            // Verified live against jq 1.7.1: `f/1` stays callable from
+            // *inside* `f/2`'s own body too (`def f(x): x+1; def f(x;y):
+            // (f(x))+y; f(2;3)` is `6` = f(2)+3), so this arm must keep
+            // descending into both `inner_body` and `then` when only the
+            // name matches, exactly like the "different name entirely"
+            // case below already does -- only a genuine same-arity
+            // redefinition (which really does make the earlier definition
+            // permanently unreachable from this point on) stops expansion.
             if inner_name == func_name && inner_params.len() == params.len() {
                 // Don't expand in the body or then - this is a new definition
                 expr.clone()
@@ -30865,7 +30883,10 @@ fn expand_func_calls(
             }
         }
         Expr::FuncCall { name, args } => {
-            // Different function name, just expand in arguments
+            // Reached for a different function name entirely, or (#1376)
+            // a same-name call whose arity doesn't match this occurrence
+            // -- either way, not this pass's call to resolve, so just
+            // expand in arguments and leave the call itself untouched.
             Expr::FuncCall {
                 name: name.clone(),
                 args: args

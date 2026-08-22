@@ -614,6 +614,44 @@ the exit-code fix.
 succinctly also omits jq's `(at <stdin>:N)` input-location prefix, which is emitted by
 jq's CLI rather than its evaluator and is therefore outside the message the two share.
 
+## Undefined functions and arity mismatches are runtime errors, not compile errors
+
+Real jq resolves every function call at compile time, before any input is read: a call to
+an undefined function, or an undefined arity of an existing one, fails immediately and
+unconditionally — `jq: error: f/2 is not defined at <top-level>, line 1: ...`, exit **3**
+— regardless of whether that call site is ever reached at runtime, and it cannot be
+caught by `try`/`catch` or `?` (compilation fails before evaluation, and thus before
+`try`, ever begins).
+
+`succinctly jq` resolves user-defined `def` calls via `expand_func_calls`'s static AST
+substitution (`src/jq/eval.rs`), which turns an unresolvable call into an `Expr::Error`
+node rather than failing immediately. That node is then evaluated lazily like any other
+expression, so:
+
+```
+$ jq -n 'def f(x): x; if false then f(1;2;3) else 1 end'
+jq: error: f/3 is not defined at <top-level>, line 1:   # compile error, exit 3, unconditional
+$ succinctly jq -n 'def f(x): x; if false then f(1;2;3) else 1 end'
+1                                                        # exit 0 -- the branch is never reached
+$ jq -n 'def f(x): x; try f(1;2) catch "caught"'
+jq: error: f/2 is not defined ...                        # exit 3, try never runs
+$ succinctly jq -n 'def f(x): x; try f(1;2) catch "caught"'
+"caught"                                                  # exit 0
+```
+
+Exit code for the surfaced case is succinctly's general runtime-error code, 5, not jq's
+compile-error code, 3 — a different pairing from the "wrong exit code" gap just above
+(that one is 0-vs-5; this is 5-vs-3). A related, narrower symptom of the same root cause
+also lets a `def` forward-reference a not-yet-defined arity of itself and silently
+compute a value instead of failing — see
+[`test_func_def_forward_arity_reference_in_own_body_known_gap_1376`](../../../tests/jq_cli_tests.rs)
+for the pinned repro.
+
+Fixing this properly needs genuine compile-time (or runtime-call) function resolution —
+the same architectural change [#1371](https://github.com/rust-works/succinctly/issues/1371)
+already scopes for self-recursive `def`s — rather than a narrow patch to the substitution
+walker; tracked as [#1473](https://github.com/rust-works/succinctly/issues/1473).
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
