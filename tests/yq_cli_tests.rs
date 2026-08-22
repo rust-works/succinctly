@@ -19011,30 +19011,71 @@ fn test_yq_regex_flag_grammar_jq_mode_unaffected_1426() -> Result<()> {
     Ok(())
 }
 
-/// #1426: a postfix `?` on the call itself suppresses the new
-/// flag-validation error end to end. Traced (via temporary debug tracing,
-/// removed before finalizing) that this suppression happens through an
-/// *outer* mechanism, not the `optional: bool` parameter these builtins
-/// receive -- that parameter is `false` here even under `?`, matching
-/// this function's own pre-existing `build_regex`/input-type checks a
-/// few lines away, whose identical `optional`-gated arms already show 0
-/// coverage hits on `main` (confirmed via HTML coverage output, not
-/// assumed) for the same reason. Succinctly's own extended grammar
-/// accepts `?` directly after a function call in this position; real
-/// yq's narrower grammar does not (`test(...)? ` fails to lex there even
-/// though `.a?` on a path works) — this pins succinctly's own established
-/// end-to-end behavior, not a claim about real yq syntax at this exact
-/// position.
+/// #1426 (code review): the array-unpack form of `test`/`match`/`capture`
+/// (`test([pattern, flags])`, no explicit `flags_expr` at all) must stay
+/// exempt from this check -- real yq's own array-unpack support is a
+/// no-op that always succeeds regardless of what the unpacked flags
+/// element contains, live-verified against yq v4.53.3 even for a flag
+/// character (`i`) the explicit 2-arg form correctly rejects. An earlier
+/// draft of this fix applied the check unconditionally and turned this
+/// previously-matching case into a new divergence -- this is the
+/// regression guard for that.
 #[test]
-fn test_yq_regex_flag_grammar_optional_suppresses_error_1426() -> Result<()> {
-    for query in [
-        "test(\"abc\";\"z\")?",
-        "match(\"abc\";\"z\")?",
-        "capture(\"(?P<x>a)\";\"z\")?",
-    ] {
+fn test_yq_regex_flag_grammar_array_unpack_exempt_1426() -> Result<()> {
+    for query in ["test([\"abc\",\"i\"])", "test([\"nomatch\",\"i\"])"] {
         let (out, code) = run_yq_stdin(query, "abc", &["-o", "json"])?;
         assert_eq!(code, 0, "query={query} out={out}");
-        assert_eq!(out.trim(), "", "query={query}");
     }
+    Ok(())
+}
+
+/// #1426 (code review): real yq stringifies a non-string *scalar* flags
+/// value (`null`/booleans/numbers) the same way `owned_to_string` does and
+/// grammar-checks the result, rather than treating `null` as "no flags"
+/// (succinctly's own pre-existing, jq-oriented `validate_regex_flags`
+/// rule) or reporting a type-mismatch error. Every case live-verified
+/// against yq v4.53.3.
+#[test]
+fn test_yq_regex_flag_grammar_nonstring_scalar_flags_1426() -> Result<()> {
+    for (flags_literal, expected_in_message) in [("null", "null"), ("true", "true"), ("5", "5")] {
+        let query = format!("test(\"abc\";{flags_literal})");
+        let (_out, err, code) = run_yq_stdin_with_stderr(&query, "abc", &["-o", "json"])?;
+        assert_ne!(code, 0, "flags_literal={flags_literal}");
+        assert!(
+            err.contains(&format!(
+                "unrecognised match params '{expected_in_message}'"
+            )),
+            "flags_literal={flags_literal} err={err}"
+        );
+    }
+    Ok(())
+}
+
+/// #1426 (code review): real yq validates the flags grammar *before*
+/// checking the pattern argument's type, so an invalid pattern together
+/// with an invalid flags string reports the flags error, not the pattern
+/// one -- live-verified against yq v4.53.3 (`test(1;"z")` reports
+/// "unrecognised match params 'z'", not "number (1) is not a string").
+#[test]
+fn test_yq_regex_flag_grammar_precedes_pattern_type_check_1426() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr("test(1;\"z\")", "abc", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("unrecognised match params 'z'"), "err={err}");
+    Ok(())
+}
+
+/// #1426 (code review): a non-scalar (`Array`/`Object`) flags value is
+/// deliberately left out of the new yq stringify-and-validate rule --
+/// real yq's own behavior for it doesn't fit that model (`test("abc";
+/// ["g"])` returns `true` in real yq, ruling out "stringify and
+/// grammar-check" the way the scalar case works), so it must fall
+/// through unchanged to the pre-existing, jq-oriented type-mismatch
+/// error rather than being newly rejected or newly accepted by this fix.
+#[test]
+fn test_yq_regex_flag_grammar_container_flags_falls_through_unchanged_1426() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("test(\"abc\";{\"a\":1})", "abc", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("is not a string"), "err={err}");
     Ok(())
 }
