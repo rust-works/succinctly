@@ -1841,6 +1841,27 @@ enum Flow {
 /// only shrink the set of sub-expressions evaluated, never reorder or alter
 /// the values delivered. `collect_each` asserts this differentially in tests
 /// rather than leaving it asserted in prose.
+///
+/// **One arm carries a stated exception: `Expr::Compare` (#1459, Stage 4).**
+/// It has two operands, and making the outer one demand-aware necessarily
+/// *interleaves* their evaluation, where the eager `binary_fanout_core`
+/// finishes the right operand before starting the left. The delivered
+/// *values* are unchanged for side-effect-free operands — the same pairings
+/// in the same order — which is what
+/// `eval_each_with_a_never_stopping_sink_matches_eval_single_820` asserts.
+/// What changes is when each operand runs, and that is observable two ways,
+/// in both of which the lazy arm is the one that matches jq (oracle-verified
+/// against jq 1.7.1):
+///
+/// * ordering of evaluation-time I/O — `("A"|stderr) == (("B"|stderr),
+///   ("C"|stderr))` writes `B A C A` in jq, `B C A A` eagerly;
+/// * with `input`/`inputs` operands, the delivered values themselves, since
+///   which document each operand pops depends on that ordering —
+///   `(input) + (input, input)` over `"a" "b" "c" "d"` is `["ba","dc"]` in
+///   jq, `["ca","db"]` eagerly.
+///
+/// So this is not a silent weakening of the invariant: it is the one place a
+/// lazy arm is deliberately *more* faithful than the eager path it shadows.
 fn drain_result<'a, W: Clone + AsRef<[u64]>>(
     result: QueryResult<'a, W>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
@@ -1901,12 +1922,12 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
-/// Native lazy arms: `Comma`, `Pipe`, `Paren`, and `Builtin::PathsFilter`
-/// (#987, Stage 3). Everything else falls back to `eval_single` +
-/// [`drain_result`]. `Paren` is not optional cosmetics: `isempty(...)`
-/// consumes only its own parentheses, so `isempty((1, stderr))` is
-/// `IsEmpty(Paren(Comma(..)))` and without this arm the fix would be a coin
-/// flip on spelling.
+/// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
+/// (#987, Stage 3) and `Compare` (#1459, Stage 4). Everything else falls
+/// back to `eval_single` + [`drain_result`]. `Paren` is not optional
+/// cosmetics: `isempty(...)` consumes only its own parentheses, so
+/// `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and without this arm
+/// the fix would be a coin flip on spelling.
 fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -1931,6 +1952,40 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::PathsFilter(f)) => {
             each_paths_filter::<W, S>(f, value, optional, sink)
         }
+        // #1459 (Stage 4): the demand-aware twin of `eval_compare`'s fanout.
+        // [`binary_fanout_each`] owns the loop order; passing `eval_each` as
+        // the operand strategy is what makes the *right* operand — jq's outer
+        // loop — stop producing candidates the sink never asked for. That is
+        // `IN(src; s)`'s leak (#932): `builtin_upper_in_src` hands
+        // `any_all_gen_cond` a synthesized `Expr::Compare` as its generator,
+        // so without this arm the whole comparison ran to completion before
+        // the first candidate ever reached the sink.
+        //
+        // No `needs_path_context` gate here, unlike `eval_each_pipe`: the
+        // eager fallback for `Expr::Compare` is `eval_compare` ->
+        // `eval_binary_fanout` -> `eval_single` per operand, which has no
+        // path-context diversion of its own, so there is nothing to preserve
+        // — and each operand's own `eval_each` re-derives exactly the routing
+        // `eval_single` would (a `Pipe` operand still hits `eval_each_pipe`'s
+        // gate before anything else).
+        //
+        // `Expr::Arithmetic` shares [`binary_fanout_each`] but deliberately
+        // gets no lazy arm: Stage 4 is scoped to `Expr::Compare`, and
+        // arithmetic's `combine` can fail, which is its own risk surface.
+        Expr::Compare { op, left, right } => binary_fanout_each(
+            |operand, operand_sink| {
+                eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
+            },
+            left,
+            right,
+            optional,
+            |left_val, right_val| {
+                Ok(OwnedValue::Bool(apply_compare_op::<S>(
+                    *op, &left_val, &right_val,
+                )))
+            },
+            sink,
+        ),
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
@@ -2269,37 +2324,133 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 /// again for #822: two definitions of the same algorithm can drift, one
 /// does not. `eval_operand` closes over whichever evaluator its caller
 /// wants; everything downstream of an operand's `QueryResult` is unchanged.
+///
+/// **This is the eager operand strategy**, not the loop itself: the loop
+/// moved to [`binary_fanout_each`] for #1459 (Stage 4), and this is the
+/// collecting wrapper over it. `each_operand` here evaluates a whole operand
+/// up front and replays it through [`drain_result`], so both callers keep the
+/// exact "right operand evaluated to completion, *then* left re-evaluated per
+/// right value" behaviour they had when this body *was* the loop.
+/// `eval_each`'s own `Expr::Compare` arm supplies the demand-driven strategy
+/// instead — same loop, lazy operands.
 fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
-    mut eval_operand: impl FnMut(&Expr) -> QueryResult<'a, W>,
+    eval_operand: impl Fn(&Expr) -> QueryResult<'a, W>,
+    left: &Expr,
+    right: &Expr,
+    optional: bool,
+    combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+) -> QueryResult<'a, W> {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let flow = binary_fanout_each(
+        |expr, sink| drain_result(eval_operand(expr), sink),
+        left,
+        right,
+        optional,
+        combine,
+        &mut |item: Item<'a, W>| {
+            out.push(item.into_owned());
+            Demand::Continue
+        },
+    );
+
+    match flow {
+        // This sink never stops, so `Stopped` cannot occur — folded in with
+        // `Exhausted` rather than given an `unreachable!()`, the same
+        // defensive choice `any_all_gen_cond` makes for its own impossible
+        // `Stopped`: an answer built from the outputs already produced is a
+        // better failure mode than a panic.
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(out),
+        Flow::Escaped(control) => partial(out, control),
+    }
+}
+
+/// The one definition of jq's right-outer/left-inner fanout loop, written
+/// against the demand-driven sink (#1459, Stage 4 of
+/// `docs/plan/jq-lazy-generator-consumers.md`) and parameterized over *how*
+/// an operand is enumerated.
+///
+/// Two strategies exist, and only the strategy differs — never the loop:
+///
+/// * [`binary_fanout_core`] passes an eager `each_operand` (evaluate the
+///   whole operand, then replay it through [`drain_result`]), which is what
+///   `eval_arithmetic`/`eval_compare` and the path-context sibling have
+///   always done.
+/// * `eval_each`'s `Expr::Compare` arm passes [`eval_each`] itself, so the
+///   *right* operand — jq's outer loop — stops producing candidates the sink
+///   never asked for. That is what closes `IN(src; s)`'s side-effect leak
+///   (#932/#1459): a `stderr`/`halt_error` sitting past the matching
+///   candidate is no longer evaluated at all.
+///
+/// Keeping one loop is the whole point: #768 fixed a collapse-to-first-value
+/// bug here that the then-duplicated path-context copy independently
+/// re-acquired and had to be fixed again for #822. A third copy for the lazy
+/// arm would have been a third chance at the same drift.
+///
+/// `each_operand` is `Fn`, not `FnMut`, because it is called **re-entrantly**:
+/// the per-right-value call on `left` happens while the call on `right` is
+/// still on the stack.
+fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
     optional: bool,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
-) -> QueryResult<'a, W> {
-    let mut right_vals = Vec::new();
-    let right_control = push_owned_values(eval_operand(right), &mut right_vals);
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // Why the fanout ended, recorded out-of-band because the driver closure
+    // can only answer `Demand` — the same shape as `eval_each_pipe`'s
+    // `downstream` and `any_all_gen_cond`'s `probe_escape`.
+    let mut abort: Option<Flow> = None;
 
-    let mut out: Vec<OwnedValue> = Vec::new();
-    for right_val in &right_vals {
-        let mut left_vals = Vec::new();
-        let left_control = push_owned_values(eval_operand(left), &mut left_vals);
+    let outer = each_operand(right, &mut |right_item: Item<'a, W>| {
+        let right_val = right_item.into_owned();
 
-        for left_val in left_vals {
-            match combine(left_val, right_val.clone()) {
-                Ok(v) => out.push(v),
-                Err(e) => return finish_fork(out, Some(e.into()), optional),
+        let inner = each_operand(left, &mut |left_item: Item<'a, W>| {
+            match combine(left_item.into_owned(), right_val.clone()) {
+                Ok(v) => sink(Item::Owned(v)),
+                Err(e) => {
+                    // The sink-world spelling of the eager body's
+                    // `finish_fork(out, Some(e.into()), optional)`: a
+                    // `combine` error (op-application failure, e.g. `"a" + 1`)
+                    // aborts the whole fanout rather than skipping just that
+                    // pairing, the outputs already pushed stand either way,
+                    // and `optional` decides whether the failure itself
+                    // survives.
+                    abort = Some(if optional {
+                        Flow::Exhausted
+                    } else {
+                        Flow::Escaped(Control::Error(e))
+                    });
+                    Demand::Stop
+                }
+            }
+        });
+
+        // A `combine` failure has already decided; the `Stopped` it induces
+        // in the inner loop must not overwrite that verdict.
+        if abort.is_some() {
+            return Demand::Stop;
+        }
+
+        match inner {
+            Flow::Exhausted => Demand::Continue,
+            // `Escaped` is the eager body's `return partial(out, control)`:
+            // an escape partway through the *inner* operand aborts the
+            // comparison before any later output of the *outer* one is
+            // reached (#910, oracle-verified: `IN(4, error("boom"); 9, 4)`
+            // raises rather than answering `true`). `Stopped` is the
+            // consumer's own demand, which ends the outer loop for the same
+            // reason `eval_each_pipe`'s downstream stop ends stage 1.
+            other => {
+                abort = Some(other);
+                Demand::Stop
             }
         }
+    });
 
-        if let Some(control) = left_control {
-            return partial(out, control);
-        }
-    }
-
-    match right_control {
-        Some(control) => partial(out, control),
-        None => owned_vec_to_result(out),
-    }
+    // The inner verdict wins over the outer loop's `Stopped`, which is only
+    // the echo of our own driver returning `Stop`.
+    abort.unwrap_or(outer)
 }
 
 /// Shared unary fork/negate/finish core behind [`eval_negate`] and its
@@ -4273,13 +4424,13 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// own doc comment documents. Confirmed against jq 1.7.1: `IN(2,
 /// error("boom"))` on `2` is `true` (the error is never reached), `IN(3,
 /// error("boom"))` on `2` still raises it (no earlier candidate matched, so
-/// the trailing escape is the only verdict left). Known gap (#932, shared
-/// with `any`/`all`, pre-existing there): `halt_error`/`stderr` print as an
-/// immediate side effect of being *evaluated*, not of their result being
-/// consumed, so a match found before reaching one in `s` still leaks its
-/// printed bytes even though the overall answer and process-exit behavior
-/// stay correct -- `debug`/`error` don't have this problem, since neither
-/// performs I/O at evaluation time.
+/// the trailing escape is the only verdict left). #932's leak — a
+/// `halt_error`/`stderr` past the matching candidate printing anyway, because
+/// both perform I/O as a side effect of being *evaluated* rather than of
+/// being consumed — was closed for this form by #820's Stage 2, which routed
+/// the candidate loop below through `eval_each_owned`, and for the
+/// `IN(src; s)` form by Stage 4 (#1459). Both are pinned in
+/// `test_short_circuit_side_effect_shapes_already_match_jq_820`.
 fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s: &Expr,
     value: StandardJson<'a, W>,
@@ -4344,6 +4495,17 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// it correctly leaves `src` untouched entirely when `s` produces zero
 /// outputs, `IN(error("boom"); empty)` is `false`, not an error) fixes this
 /// by construction instead of re-deriving jq's evaluation order by hand.
+///
+/// #1459 (#820's Stage 4) is what makes that delegation lazy as well as
+/// correct. `any_all_gen_cond` has probed `cond` per output since Stage 2,
+/// but its `gen` here is the synthesized `Expr::Compare` below, and
+/// `eval_each` had no arm for it -- so the whole comparison ran to
+/// completion before the first candidate reached the sink, and a
+/// `stderr`/`halt_error` sitting past the matching candidate printed anyway
+/// (`[IN((2,3); 2, (5|stderr))]` leaked `5`; jq writes nothing).
+/// `eval_each`'s `Expr::Compare` arm closes that without moving the loop
+/// order back in here: it is the same [`binary_fanout_each`], driven from a
+/// demand-aware operand strategy.
 fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     src: &Expr,
     s: &Expr,
@@ -33256,6 +33418,39 @@ mod tests {
             (b"{\"a\":1,\"b\":{\"c\":2}}", "paths(true)"),
             (b"[1,2,3]", "paths(if .==2 then error(\"x\") else true end)"),
             (b"1", "paths(error(\"x\"))"),
+            // #1459, Stage 4: `Expr::Compare` gained a native lazy arm, so
+            // this differential is what guards it against drifting from
+            // `eval_compare`'s own fanout -- both now run the same loop
+            // ([`binary_fanout_each`]), but from opposite operand
+            // strategies, and only this asserts they agree.
+            //
+            // Every operand here is deliberately side-effect free. The lazy
+            // arm *interleaves* the two operands where the eager one
+            // finishes the right operand first (see [`drain_result`]'s own
+            // caveat), so a `stderr`/`input` operand would legitimately
+            // differ here while the values stayed the pairings jq produces.
+            (b"null", "(1,2) == (10,20)"),
+            (b"null", "(1,2) == 2"),
+            (b"null", "2 == (1,2)"),
+            (b"null", "(1,2) < (2,1)"),
+            (b"null", "(1,2) != 1"),
+            (b"null", "(1,2,3) >= (3,2,1)"),
+            (b"null", "empty == 1"),
+            (b"null", "1 == empty"),
+            (b"null", "empty == empty"),
+            (b"null", "(1, error(\"x\")) == (10,20)"),
+            (b"null", "(1,2) == (10, error(\"x\"))"),
+            (b"null", "error(\"x\") == (1,2)"),
+            (b"null", "label $o | ((1, break $o) == (10,20))"),
+            (b"null", "label $o | ((10,20) == (1, break $o))"),
+            (b"[1,2,3]", ".[] == 2"),
+            (b"[1,2,3]", "(.[] , 9) == (.[] , 0)"),
+            (b"{\"a\":1,\"b\":2}", ".a == (.a, .b)"),
+            // Nested inside the other lazy arms, and with the compare as a
+            // pipe stage, so the arm is reached through them too.
+            (b"null", "((1,2) == (10,20)), ((3,4) == (3,4))"),
+            (b"null", "(1,2) | . == (1,2)"),
+            (b"null", "[limit(2; (1,2,3) == (10,20))]"),
         ];
 
         for (json, src) in cases {

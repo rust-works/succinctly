@@ -2,12 +2,13 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Lazy generator consumers
 
-**Status: Stages 1, 2, 2b and 3 implemented; Stages 4-5 open.** This document is the
+**Status: Stages 1, 2, 2b, 3 and 4 implemented; Stage 5 open.** This document is the
 deliverable for [#820](https://github.com/rust-works/succinctly/issues/820), which its
 own tier review (2026-08-20) classified Tier 3 — "evaluator-architecture change, design
 doc first, in the shape of #1282". It also scopes the two issues that name #820 as their
-real fix, [#932](https://github.com/rust-works/succinctly/issues/932) (partially closed —
-Stage 4 remains) and [#987](https://github.com/rust-works/succinctly/issues/987) (closed
+real fix, [#932](https://github.com/rust-works/succinctly/issues/932) (closed — Stage 2
+took `any`/`all`/`IN(s)`, Stage 4 the remaining `IN(src; s)`) and
+[#987](https://github.com/rust-works/succinctly/issues/987) (closed
 by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 [Follow-up issues](#follow-up-issues).
 
@@ -18,20 +19,24 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | 2b    | `eval_generic.rs`'s `first` comma walk              | ✅ merged — #1434, PR #1435 |
 | —     | `eval_each_pipe`'s owned-value arm (Stage 2 gap)    | ✅ merged — PR #1450        |
 | 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
-| 4     | `Expr::Compare`'s outer loop                        | ⬜ open — #1459             |
+| 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
 | 5     | Widen the lazy arm set                              | ⬜ not yet filed            |
 | (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ⬜ not yet filed            |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
 processed — is closed, as is `halt_error`'s wrong exit code and the stderr leak in
-`isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`. Two shapes remain divergent and are pinned as
-such in `test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stderr)` (a `Pipe`,
-so Stage 2b's comma walk does not reach it — option (c)) and `[IN((2,3); 2, (5|stderr))]`
-(Stage 4). Stage 3 also leaves one residual: an un-lazified `eval_each` arm (`If`/`Try`/
-`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect for a node's own filter when
-that filter's shape isn't one of `Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — pinned as a
-known-remaining row in the same test, left to Stage 5.
+`isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`, and — since Stage 4 — `IN(src; s)` and every
+other compare reached through a lazy consumer. Three shapes remain divergent and are pinned
+as such in `test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stderr)` and
+`first((1,2) == (10, ("B"|stderr)))` (both a bare `first(...)` over a non-`Comma`, which
+Stage 2b's sibling walk does not reach — option (c)), and
+`("A"|stderr) == (("B"|stderr), ("C"|stderr))` (a *top-level* compare, which never reaches
+`eval_each` at all — #1481). Stage 3 also leaves one residual: an un-lazified
+`eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect
+for a node's own filter when that filter's shape isn't one of
+`Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — pinned as a known-remaining row in the same
+test, left to Stage 5.
 
 **One correction this document earned the hard way.** Stage 2 shipped an
 `eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
@@ -518,7 +523,7 @@ Each checked against the oracle. "already correct" means succinctly matches jq t
 | `FuncCall`/`FuncDef`                       | no                         | but `def f: (1,("B"\|stderr)); first(f)` leaks. Stage 5                                                 |
 | `FirstExpr`/`Limit`/`NthExpr` as producers | no                         | but `isempty(limit(3; 1, ("B"\|stderr)))` leaks — demand does not forward *through* a consumer. Stage 5 |
 | `Reduce`/`Foreach`                         | no                         | `reduce` has one output; `foreach`'s #534 fork machinery is a non-goal                                  |
-| **`Compare`**                              | **partially — for #932**   | see below                                                                                               |
+| **`Compare`**                              | **yes — for #932**         | Stage 4; see below                                                                                      |
 | **`Builtin::PathsFilter`**                 | **yes — for #987**         | Stage 3                                                                                                 |
 
 **Honest scoping of #932.** `builtin_upper_in` (`:3759`) synthesizes
@@ -526,8 +531,19 @@ Each checked against the oracle. "already correct" means succinctly matches jq t
 `any_all_gen_cond`. `binary_fanout_core` (`:1772`) evaluates the **right** operand to
 completion first, then re-evaluates the left per right value — jq's real nested-loop
 order, established and oracle-verified by #910. So `IN(src; s)` needs `Expr::Compare`
-demand-aware in its outer loop, or it keeps leaking. **Stage 2 closes `any`/`all`/`IN(s)`;
-`IN(src; s)` needs Stage 4.**
+demand-aware in its outer loop, or it keeps leaking. **Stage 2 closed `any`/`all`/`IN(s)`;
+Stage 4 closed `IN(src; s)`.**
+
+Stage 4 did that without moving the loop order into `builtin_upper_in`, which #910's own
+review had already rejected as a hand-rolled cross-product. `binary_fanout_core`'s body
+became `binary_fanout_each` — the same right-outer/left-inner loop, parameterized over how
+an operand is *enumerated* rather than merely evaluated. `binary_fanout_core` is now the
+collecting wrapper that supplies the eager strategy (evaluate the whole operand, replay it
+through `drain_result`), so `eval_arithmetic`, `eval_compare` and the path-context sibling
+are behaviourally untouched; `eval_each`'s new `Expr::Compare` arm supplies `eval_each`
+itself. Keeping one loop was the point: #768 fixed a collapse-to-first-value bug there that
+the then-duplicated path-context copy independently re-acquired and had to be fixed again
+for #822.
 
 ## Behaviour tables (oracle-verified at `cedee4cbb`)
 
@@ -550,6 +566,8 @@ Columns are `stdout | exit | stderr`. Input is `null` (`-cn`) unless noted.
 | `isempty(first(1, ("B"\|stderr)))`                                 | `false\|0\|`  | `false\|0\|B`    | Stage 2   |
 | `[1,2,3] \| path(paths(if .==3 then (stderr,true) else true end))` | `\|5\|<#530>` | `\|5\|3<#530>`   | Stage 3   |
 | `[IN((2,3); 2, (5\|stderr))]`                                      | `[true]\|0\|` | `[true]\|0\|5`   | Stage 4   |
+| `[isempty((1,2) == (10, ("B"\|stderr)))]`                          | `[false]\|0\|`| `[false]\|0\|B` | Stage 4   |
+| `[all((1,2) == (10, ("B"\|stderr)); .)]`                           | `[false]\|0\|`| `[false]\|0\|B` | Stage 4   |
 | `isempty(limit(3; 1, ("B"\|stderr)))`                              | `false\|0\|`  | `false\|0\|B`    | Stage 5   |
 | `first(if true then (1,("B"\|stderr)) else 9 end)`                 | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
 | `first(try (1,("B"\|stderr)) catch 9)`                             | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
@@ -846,7 +864,9 @@ because it touches the path resolver, which #1283 Part 2 C says must not be work
 concurrently with cluster A's family.
 
 **Stage 4 — `Expr::Compare`'s outer loop.** Closes #932's remaining `IN(src; s)` half.
-Must preserve #910's live-verified nested-loop order. Own oracle sweep.
+Must preserve #910's live-verified nested-loop order. Own oracle sweep. **Implemented**
+as `binary_fanout_each` (the loop, sink-driven) plus `binary_fanout_core` (the eager
+collecting wrapper, behaviourally unchanged) and an `Expr::Compare` arm in `eval_each`.
 
 **Stage 5 — widen the arm set.** `If`, `Try`/`Optional`, `Label`, `AsPattern`, `FuncCall`,
 and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`. One divergence-table row per
@@ -935,7 +955,7 @@ differential gate at least as rigorous as #1282's.
   (`:1490`, Halt arm `:1511`); the ten consumers (`:24109`, `:16984`, `:23952`, `:16890`,
   `:23884`, `:17062`, `:24024`, `:4162`, `:3759`, `:24983`); the two deliberately
   unchanged (`:17022`, `:23987`); `resolve_leaf` (`:13813`) and `builtin_paths_filter`
-  (`:19590`) for Stage 3; `binary_fanout_core` (`:1772`) for Stage 4; `write_stderr`
+  (`:19590`) for Stage 3; `binary_fanout_core`/`binary_fanout_each` for Stage 4; `write_stderr`
   (`:24928`), `builtin_stderr` (`:24961`), `builtin_halt_error` (`:24983`) — the only
   sites with evaluation-time I/O; `mod remaining_inputs` (`:21428`) for the `input` queue.
 - **`src/jq/error.rs`** — `Control` (`:54`), `EvalEscape` (`:120`) and their doc comments;
@@ -1008,9 +1028,28 @@ the reasoning behind each placement:
    node's own filter when that filter's shape isn't one of `Comma`/`Pipe`/`Paren`/
    `Builtin::PathsFilter` — pinned as a known-remaining row in
    `test_short_circuit_side_effect_leaks_820_932_987`, left to Stage 5.
-6. **Stage 4** — `Expr::Compare`'s outer loop. Filed **#1459**. #932 was closed when Stage 2
-   landed, which was right for its `any`/`all`/`IN(s)` thirds but left `IN(src; s)` — still
-   divergent, and pinned as such in the test suite — with no open issue. #1459 carries it.
+6. **Stage 4** — `Expr::Compare`'s outer loop. Filed **#1459**, implemented. #932 was
+   closed when Stage 2 landed, which was right for its `any`/`all`/`IN(s)` thirds but left
+   `IN(src; s)` — still divergent, and pinned as such in the test suite — with no open
+   issue. #1459 carried it. `binary_fanout_core`'s body became `binary_fanout_each` (one
+   loop, two operand strategies) and `eval_each` gained an `Expr::Compare` arm. Its own
+   oracle sweep — 105 shapes covering all six `CompareOp`s × operand arities, every lazy
+   consumer, terminators in either operand, `?`/`try`, and `input` — took the divergence
+   count from 18 to 5.
+
+   **Two findings it did not close, both left as separate work rather than folded in.**
+   (a) A bare `first(<non-comma>)` never reaches `eval.rs` at all, so
+   `first((1,2) == (10, ("B"|stderr)))` stays eager — the same class as
+   `first(.[] | stderr)`, i.e. option (c) below. (b) The **eager** copies of the fanout
+   loop still finish the right operand before starting the left, where jq interleaves them.
+   That is broader than #820: it affects `Expr::Arithmetic` as much as `Expr::Compare`, and
+   it lives in three places — `binary_fanout_core` (via `eval_binary_fanout`),
+   `eval_binary_fanout_with_path_context`, and `eval_generic.rs`'s own third copy in its
+   `Expr::Compare` arm, which is what a top-level `==` actually reaches. With
+   `input`/`inputs` operands it changes *values*, not just stderr ordering:
+   `(input) + (input, input)` over `"a" "b" "c" "d"` is `["ba","dc"]` in jq and
+   `["ca","db"]` here, so it is silent data loss rather than a cosmetic leak. **Filed as
+   #1481.**
 7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
    `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Not yet filed.
    One issue, not one per arm: each is a single lazy arm now that the primitive exists.
