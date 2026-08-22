@@ -1,0 +1,1 @@
+[match(("a","b")).string], [capture(("(?<p>a)","(?<q>b)"))]

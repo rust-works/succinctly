@@ -1,0 +1,1 @@
+[test(empty)], [index(empty)], [sub(empty;"X")], [gsub(empty;"X")], [scan(empty)], [splits(empty)], [match(empty)], [capture(empty)]

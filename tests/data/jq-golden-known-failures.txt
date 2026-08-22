@@ -152,3 +152,81 @@
 # calendar-week arithmetic) and %s (recomputed from the broken-down fields
 # via the same math mktime uses, not libc's TZ-dependent reinterpretation —
 # see the comment above about why that's the correct portable choice).
+
+# Reseeded by #1279/#1277 with 48 cases pinning generator-argument fan-out:
+# real jq desugars `f(x)` as `x as $b | body`, so it emits one result per
+# output of `x`, while succinctly resolves the argument to its first output
+# and discards the rest — along with any trailing break/error/halt (#1277).
+# Captured before the fix, so this block is the scoreboard for it: each stage
+# of the fix deletes its own rows, and the two-sided check means a row left
+# behind fails the build just as loudly as a missing one.
+#
+# Four kinds, in order below:
+#
+#   fan-out        one result per argument output (the #1279 repro shape)
+#   fanout-order   *which* order, for a builtin with two generator arguments.
+#                  jq has four different mechanisms here and they disagree:
+#                  a C builtin nests rightmost-outermost (setpath, test/match/
+#                  capture), a jq-level `def f($a; $b)` nests leftmost-outermost
+#                  (range, scan), a plain non-`$` filter parameter is COLLECTED
+#                  rather than fanned out (split/splits' flags — 2 outputs where
+#                  the naive nesting gives 4), and a replacement evaluated per
+#                  match transposes (sub/gsub). Getting these wrong yields the
+#                  right count in the wrong order, which nothing else catches.
+#   trailing-escape  the argument's own break/error/halt, fired after the whole
+#                  prefix — except where the builtin's own error is reached
+#                  first, which for setpath/delpaths outranks even a halt.
+#   zero-output    #1045's "zero outputs means zero results" contract, extended
+#                  to the ~16 builtins that still report a bare "no value".
+
+contains_arg_fanout                        fan-out          contains(x) uses only x's first output — #1279
+inside_arg_fanout                          fan-out          inside(x) uses only x's first output — #1279
+has_arg_fanout                             fan-out          has(x) uses only x's first output — #1279
+ltrimstr_rtrimstr_arg_fanout               fan-out          ltrimstr/rtrimstr use only the first argument output — #1279
+startswith_endswith_arg_fanout             fan-out          startswith/endswith use only the first argument output — #1279
+split_sep_arg_fanout                       fan-out          split(sep) uses only sep's first output — #1279
+join_sep_arg_fanout                        fan-out          join(sep) uses only sep's first output — #1279
+indices_index_rindex_arg_fanout            fan-out          indices/index/rindex use only the first pattern output — #1279
+getpath_arg_fanout                         fan-out          getpath(p) uses only p's first output — #1279
+flatten_depth_arg_fanout                   fan-out          flatten(depth) uses only depth's first output — #1279
+nth_index_arg_fanout                       fan-out          nth(n) uses only n's first output — #1279
+strftime_fmt_arg_fanout                    fan-out          strftime(fmt) uses only fmt's first output — #1279
+strptime_fmt_arg_fanout                    fan-out          strptime(fmt) uses only fmt's first output — #1279
+delpaths_arg_fanout                        fan-out          delpaths(ps) errors on a multi-output argument instead of fanning out — #1279
+range_one_arg_fanout                       fan-out          range(n) reports "Range bounds must be numeric" for a generator bound — #1279
+bsearch_arg_fanout                         fan-out          bsearch(t) silently produces NOTHING for a multi-output target — #1279
+pow_atan2_arg_fanout                       fan-out          pow/atan2 error on a generator argument (get_number_from_result, not result_to_owned) — #1279
+combinations_n_collected_into_range        fan-out          combinations(n) must COLLECT n's outputs into one arity, not fan out — #1279
+regex_test_re_arg_fanout                   fan-out          test(re) uses only re's first output — #1279
+regex_match_capture_re_arg_fanout          fan-out          match/capture use only the first pattern output — #1279
+regex_scan_re_arg_fanout                   fan-out          scan(re) uses only re's first output — #1279
+regex_splits_re_arg_fanout                 fan-out          splits(re) uses only re's first output — #1279
+regex_sub_gsub_re_arg_fanout               fan-out          sub/gsub use only the first pattern output — #1279
+limit_nth_stream_n_arg_fanout              fan-out          limit(n; f)/nth(n; f) use only n's first output — #1279
+path_getpath_arg_fanout                    fan-out          path(getpath(x)) reports "Invalid path expression" for 2+ outputs — #1279
+path_limit_n_arg_fanout                    fan-out          path(limit(n; f)) rejects a generator n — #1279
+
+sub_re_replacement_fanout_order            fanout-order     sub(re; str): re outer, replacement inner — #1279
+sub_re_flags_replacement_fanout_order      fanout-order     sub(re; str; flags): re outer, flags middle, replacement innermost — #1279
+match_flags_outermost_order                fanout-order     match(re; flags): flags OUTER (C builtin nests rightmost-outermost) — #1279
+test_flags_outermost_order                 fanout-order     test(re; flags): flags OUTER, same as match — #1279
+scan_re_outermost_order                    fanout-order     scan($re; $flags): re OUTER (both $-bound, leftmost-outermost) — #1279
+split_flags_collected_not_fanned           fanout-order     split(re; flags): flags are COLLECTED, not fanned — 2 outputs, not 4 — #1279
+setpath_value_outer_path_inner_order       fanout-order     setpath(p; v): VALUE outer, path inner — opposite of sub at the same arity — #1279
+range_three_arg_fanout_order               fanout-order     range(from; to; by): from outer, to middle, by inner — #1279
+gsub_replacement_transpose_absence_padded  fanout-order     gsub's multi-output replacement transposes, padded by absence not null — #840/#1279
+
+contains_arg_fanout_error_after_output     trailing-escape  the prefix is emitted before the argument's trailing error — #1277
+getpath_arg_fanout_error_after_output      trailing-escape  the prefix is emitted before the argument's trailing error — #1277
+range_from_fanout_halt_after_output        trailing-escape  range emits 1..9 before the from-bound's halt — #1277
+nth_stream_n_fanout_halt_after_output      trailing-escape  nth emits 2 before n's halt — #1277
+ltrimstr_arg_value_then_halt               trailing-escape  ltrimstr emits its result before the argument's halt — #1277
+setpath_own_error_outranks_trailing_halt   trailing-escape  setpath's own "not an array" error outranks the trailing halt (exit 5, not 6) — #1277
+delpaths_own_error_outranks_trailing_halt  trailing-escape  delpaths' own "not an array" error outranks the trailing halt (exit 5, not 9) — #1277
+ltrimstr_arg_fanout_break_after_output     trailing-escape  both fan-out results are emitted before the break unwinds — #1277
+
+combinations_empty_n_yields_empty_array    zero-output      combinations(empty) is [[]], not zero output and not "no value" — #1045/#1279
+range_empty_bound_zero_output              zero-output      range with an empty bound reports "no value" — #1045
+regex_and_search_empty_arg_zero_output     zero-output      test/index/sub/gsub/scan/splits/match/capture(empty) report "no value" — #1045
+limit_nth_empty_n_zero_output              zero-output      limit/nth with an empty n report "no value" — #1045
+bsearch_delpaths_empty_arg_zero_output     zero-output      bsearch/delpaths with an empty argument report "no value" — #1045
