@@ -117,6 +117,29 @@ pub struct EvalContext {
     pub named: IndexMap<String, OwnedValue>,
 }
 
+/// Resolve `OutputFormat::Auto` against a concrete `InputFormat` (#1493):
+/// real yq's `-o=auto` matches the input's own format -- YAML input stays
+/// YAML, JSON input becomes JSON. Anything already concrete passes through
+/// unchanged. `InputFormat::Auto` shouldn't reach here in practice
+/// (`resolve_input_format`/`detect_format_from_path` already resolve it
+/// before any source reaches this point), but it's handled the same as
+/// `InputFormat::Yaml` (Yaml is the safer default of the two either way).
+/// Real yq's own "nothing to match" case (`--null-input`, `--raw-input`,
+/// mixed-format `--slurp`) also defaults to Yaml -- confirmed live: `yq -n
+/// -p=json '{}' -o=auto` still prints YAML (with a backwards-compatibility
+/// warning), not JSON, so callers with no per-source `InputFormat` of their
+/// own should resolve against `InputFormat::Yaml` here too, not skip the
+/// call.
+fn resolve_output_format(output_format: OutputFormat, input_format: InputFormat) -> OutputFormat {
+    if output_format != OutputFormat::Auto {
+        return output_format;
+    }
+    match input_format {
+        InputFormat::Json => OutputFormat::Json,
+        InputFormat::Yaml | InputFormat::Auto => OutputFormat::Yaml,
+    }
+}
+
 /// Output configuration
 #[derive(Clone)]
 struct OutputConfig {
@@ -157,37 +180,9 @@ impl OutputConfig {
         // Compact output when indent is 0 (yq-compatible)
         let compact = args.indent == 0;
 
-        let indent_str = if compact {
-            String::new()
-        } else if args.tab {
-            "\t".to_string()
-        } else {
-            // `-I1` clamps to 2 for YAML output (#1486): real yq's YAML
-            // output at `-I1` is byte-identical to its own `-I2` output at
-            // every level, mirroring the fast-path streamer's identical
-            // clamp on `yaml_indent_spaces` below. JSON has no such quirk
-            // (verified live: `-I1 -o=json` genuinely indents 1 space per
-            // level in real yq) -- `indent_str` is shared by both formats'
-            // DOM emitters (see its use in the JSON branch of
-            // `output_value`), so the clamp only applies when `output_value`
-            // will actually take the YAML branch below, i.e.
-            // `output_format == Yaml` exactly -- matching that dispatch's
-            // own condition (`if config.output_format == OutputFormat::Yaml`),
-            // not its complement. `Auto` is *not* YAML here: this build
-            // currently routes `-o=auto` to the JSON branch regardless of
-            // input format, a separate pre-existing divergence from real
-            // yq's own "match the input format" semantics, out of scope for
-            // this fix -- but this clamp must still track whichever branch
-            // `output_value` actually takes, or `-o=auto -I=1` would get
-            // JSON content clamped as if it were YAML.
-            let width = args.indent as usize;
-            let width = if args.output_format == OutputFormat::Yaml {
-                width.max(2)
-            } else {
-                width
-            };
-            " ".repeat(width)
-        };
+        // `args.output_format` itself, not yet resolved against any
+        // source's `InputFormat` -- see `Self::for_source` below (#1493).
+        let indent_str = Self::compute_indent_str(args, args.output_format);
 
         Self {
             output_format: args.output_format,
@@ -201,6 +196,60 @@ impl OutputConfig {
             indent_str,
             use_color,
             json_sourced_floats: false,
+        }
+    }
+
+    /// `-I1` clamps to 2 for YAML output (#1486): real yq's YAML output at
+    /// `-I1` is byte-identical to its own `-I2` output at every level,
+    /// mirroring the fast-path streamer's identical clamp on
+    /// `yaml_indent_spaces` below. JSON has no such quirk (verified live:
+    /// `-I1 -o=json` genuinely indents 1 space per level in real yq) --
+    /// `indent_str` is shared by both formats' DOM emitters (see its use in
+    /// the JSON branch of `output_value`), so the clamp only applies when
+    /// `output_value` will actually take the YAML branch, i.e.
+    /// `effective_output_format == Yaml` exactly -- matching that
+    /// dispatch's own condition, not its complement.
+    ///
+    /// Takes the caller's *effective* format rather than reading
+    /// `args.output_format` directly: `Self::from_args` passes
+    /// `args.output_format` itself (nothing resolved yet), while
+    /// `Self::for_source` passes the per-source *resolved* format, so an
+    /// `Auto` that resolves to `Yaml` for a given source still gets the
+    /// clamp there, and one that resolves to `Json` doesn't (#1493) --
+    /// before that fix, `Auto` was treated as "not YAML" here
+    /// unconditionally, since `-o=auto` always rendered JSON regardless of
+    /// input format anyway.
+    fn compute_indent_str(args: &YqCommand, effective_output_format: OutputFormat) -> String {
+        if args.indent == 0 {
+            return String::new();
+        }
+        if args.tab {
+            return "\t".to_string();
+        }
+        let width = args.indent as usize;
+        let width = if effective_output_format == OutputFormat::Yaml {
+            width.max(2)
+        } else {
+            width
+        };
+        " ".repeat(width)
+    }
+
+    /// Per-source override (#1493): resolves `OutputFormat::Auto` against
+    /// this specific source's own `InputFormat` (real yq's `-o=auto`
+    /// matches the input format, confirmed live), recomputing `indent_str`
+    /// to match, and folds in the pre-existing `json_sourced_floats`
+    /// override (#978/#1398) for the same reason -- both need the
+    /// *specific* source's own format, not the invocation-wide default,
+    /// since `--input-format auto` can mix JSON and YAML sources in one
+    /// run.
+    fn for_source(&self, args: &YqCommand, input_format: InputFormat) -> Self {
+        let output_format = resolve_output_format(self.output_format, input_format);
+        Self {
+            output_format,
+            indent_str: Self::compute_indent_str(args, output_format),
+            json_sourced_floats: input_format == InputFormat::Json,
+            ..self.clone()
         }
     }
 }
@@ -3017,19 +3066,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if args.slurp {
                 anyhow::bail!("--front-matter=process and --slurp are incompatible");
             }
-            // `output_value` treats anything other than `Yaml` as JSON
-            // output (including `Auto`, which has no YAML/Markdown-file
-            // detection of its own) -- so the guard must reject everything
-            // but `Yaml`, not just the explicit `Json` variant, or `-o auto`
-            // silently slips through and wraps a JSON body in `---` fences.
-            if args.output_format != OutputFormat::Yaml {
+            // Only explicit `Json` is rejected now (#1493): front-matter
+            // content is always forced to `InputFormat::Yaml`
+            // (`apply_front_matter`), so `Auto` always resolves to `Yaml`
+            // here too (`Self::for_source`) -- accepting it is no longer
+            // the "silently slips through and wraps a JSON body in `---`
+            // fences" bug this guard was written to close, since `Auto`
+            // can no longer resolve to anything but `Yaml` in this
+            // specific context.
+            if args.output_format == OutputFormat::Json {
                 anyhow::bail!(
-                    "--front-matter=process requires YAML output (got -o/--output-format {})",
-                    if args.output_format == OutputFormat::Json {
-                        "json"
-                    } else {
-                        "auto"
-                    }
+                    "--front-matter=process requires YAML output (got -o/--output-format json)"
                 );
             }
         }
@@ -3657,6 +3704,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // this batch's own split-filename evaluation) actually occurs
             // (#791, mirrors `write_split_result`'s own `halted_before`).
             let halted_before_batch = sink.halted().is_some();
+            // No source to match against `--null-input` (#1493): real yq's
+            // own `-o=auto` here still defaults to Yaml (confirmed live),
+            // matching `Self::for_source`'s own "nothing to match" arm.
+            let null_input_output_config = output_config.for_source(&args, InputFormat::Yaml);
             for result in &results {
                 any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                 write_split_result(
@@ -3664,7 +3715,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     &CommentTree::empty(),
                     split_expr,
                     output_index,
-                    &output_config,
+                    &null_input_output_config,
                     &mut written_split_files,
                     &mut sink,
                 )?;
@@ -3701,9 +3752,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // `evaluate_input` pair for both formats -- a separate,
                 // already-tracked issue (#1343), not touched here.
                 let doc_filter = args.document.map(|target| (target, global_doc_index));
-                // Split-exp output files carry real comments when
-                // written as YAML, same as the main output path (#710).
-                let need_comments = output_config.output_format == OutputFormat::Yaml;
+                // Per-file `OutputConfig` (#978/#1398's `json_sourced_floats`,
+                // #1493's `Auto` resolution) -- both need this specific
+                // source's own `InputFormat`, not the invocation-wide
+                // default, since `--input-format auto` can mix JSON and
+                // YAML sources in one run.
+                let file_output_config = output_config.for_source(&args, *format);
+                // Split-exp output files carry real comments when written
+                // as YAML, same as the main output path (#710) -- resolved
+                // per-file now, not the invocation-wide default (#1493).
+                let need_comments = file_output_config.output_format == OutputFormat::Yaml;
                 let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
                     bytes,
                     &program.expr,
@@ -3717,17 +3775,6 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     },
                 )?;
                 global_doc_index += num_docs;
-                // A JSON-sourced float never keeps a decimal point in
-                // `-o=json` output (#978, #1398) -- see
-                // `OutputConfig::json_sourced_floats`'s own doc comment.
-                let file_output_config = if *format == InputFormat::Json {
-                    OutputConfig {
-                        json_sourced_floats: true,
-                        ..output_config.clone()
-                    }
-                } else {
-                    output_config.clone()
-                };
                 for results in doc_results {
                     // See the --null-input arm above: a halt already
                     // present when this document's batch starts
@@ -3763,7 +3810,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
         }
     } else if args.null_input {
-        // Handle --null-input
+        // Handle --null-input. No source to resolve `Auto` against
+        // (#1493): real yq's own `-o=auto` here still defaults to Yaml
+        // (confirmed live), matching `Self::for_source`'s "nothing to
+        // match" arm.
+        let output_config = output_config.for_source(&args, InputFormat::Yaml);
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
         for result in results {
@@ -3772,7 +3823,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
         }
     } else if args.raw_input {
-        // Handle --raw-input: read each line as a string instead of parsing as YAML
+        // Handle --raw-input: read each line as a string instead of
+        // parsing as YAML. Same "nothing to resolve `Auto` against" case
+        // as `--null-input` above (#1493) -- a raw line is never
+        // parsed/detected as YAML or JSON.
+        let output_config = output_config.for_source(&args, InputFormat::Yaml);
         let input_content = if input_files.is_empty() {
             read_stdin_string()?
         } else {
@@ -3910,6 +3965,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             })?;
             writeln!(writer)?;
         } else {
+            // #1493: resolve `Auto` against the uniform format of every
+            // source, if they all agree (confirmed live: an all-JSON slurp
+            // renders JSON, an all-YAML slurp renders YAML). A genuinely
+            // mixed-format slurp falls back to Yaml, the same "nothing
+            // single to match" treatment as `--null-input` above -- real
+            // yq's own mixed-format `-o=auto --slurp` renders each element
+            // in its own source format, a much deeper per-element behavior
+            // this fix doesn't attempt to replicate (pinned as a known gap
+            // in the test suite).
+            let mut source_formats = input_sources.iter().map(|(_, format, _)| *format);
+            let uniform_format = match source_formats.next() {
+                Some(first) if source_formats.all(|f| f == first) => first,
+                _ => InputFormat::Yaml,
+            };
+            let output_config = output_config.for_source(&args, uniform_format);
+
             let mut all_docs: Vec<OwnedValue> = Vec::new();
 
             // Parse all inputs and collect documents
@@ -3973,8 +4044,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `compact ||` gate short-circuits before color is checked),
             // and nothing forced color off on that path, so
             // `-C -I0 --inplace` wrote raw ANSI bytes straight into the
-            // file.
-            let mut output_config = output_config.clone();
+            // file. Also resolves `Auto` against this file's own format
+            // (#1493) -- the fast paths above require `output_format ==
+            // Json`/`== Yaml` exactly, so `Auto` always reaches this slow
+            // DOM branch regardless, same pre-existing scope limit as
+            // `--slurp`'s fast path.
+            let mut output_config = output_config.for_source(&args, format);
             output_config.use_color = false;
 
             // halt/halt_error (#791): tracks whether any *real* evaluated
@@ -4257,8 +4332,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `parse_input`/`evaluate_input` eager-`OwnedValue` path).
             let doc_filter = args.document.map(|target| (target, global_doc_index));
             // JSON output never reads `CommentTree` (see
-            // `output_value`'s JSON branch), so don't build one (#710).
-            let need_comments = output_config.output_format == OutputFormat::Yaml;
+            // `output_value`'s JSON branch), so don't build one (#710) --
+            // resolved per-source, not the invocation-wide default (#1493:
+            // `Auto` must match this source's own format).
+            let need_comments =
+                resolve_output_format(output_config.output_format, *format) == OutputFormat::Yaml;
             let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
                 bytes,
                 &program.expr,
@@ -4286,42 +4364,52 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Output all results with proper separators
         // For split_doc: add --- BETWEEN each result (not before first)
-        // For regular multi-doc: add --- before each document's results
+        // For regular multi-doc: add --- BETWEEN each document's results
+        // (not before the first -- `any_doc_output` below, #1493 review: a
+        // pre-existing gap in this "standard"/slow path specifically, only
+        // now reachable with `output_format == Yaml` for real, since any
+        // invocation that would have hit it before either took the M2 fast
+        // path instead (which already tracks this correctly, see
+        // `yaml_doc_streamed` in the fast-path arm above) or -- for
+        // `-o=auto` specifically, pre-#1493 -- never satisfied the `Yaml`
+        // check here at all).
         // For --front-matter=process: each file's own leading/closing ---
         // fences wrap its transformed front matter, followed by its
         // untouched body (carried alongside `input_sources`, gathered above).
         let mut split_doc_state = SplitDocState::new(has_split_doc);
+        let mut any_doc_output = false;
         for (file_idx, doc_results) in all_results.into_iter().enumerate() {
             let front_matter_body = input_sources
                 .get(file_idx)
                 .and_then(|(_, _, body)| body.as_ref());
-            // A JSON-sourced float never keeps a decimal point in `-o=json`
-            // output (#978, #1398) -- see `OutputConfig::json_sourced_floats`'s
-            // own doc comment. Per file/source, not global: `--input-format
-            // auto` can mix JSON and YAML sources in one invocation.
-            let file_output_config = if input_sources.get(file_idx).map(|(_, format, _)| *format)
-                == Some(InputFormat::Json)
-            {
-                OutputConfig {
-                    json_sourced_floats: true,
-                    ..output_config.clone()
-                }
-            } else {
-                output_config.clone()
-            };
+            // Per-file `OutputConfig` (#978/#1398's `json_sourced_floats`,
+            // #1493's `Auto` resolution) -- both need this specific
+            // source's own `InputFormat`, not the invocation-wide default,
+            // since `--input-format auto` can mix JSON and YAML sources in
+            // one invocation.
+            let source_format = input_sources
+                .get(file_idx)
+                .map_or(InputFormat::Yaml, |(_, format, _)| *format);
+            let file_output_config = output_config.for_source(&args, source_format);
             if front_matter_body.is_some() {
                 writeln!(writer, "---")?;
             }
             for results in doc_results {
-                // Add document separator in YAML mode for multi-doc (before each doc's results)
+                // Add document separator in YAML mode for multi-doc,
+                // between documents only, not before the first
+                // (`any_doc_output`, see this loop's own comment above) --
+                // resolved per-file, not the invocation-wide default
+                // (#1493).
                 if !has_split_doc
-                    && output_config.output_format == OutputFormat::Yaml
+                    && file_output_config.output_format == OutputFormat::Yaml
                     && !output_config.no_doc
                     && is_multi_doc
                     && front_matter_body.is_none()
+                    && any_doc_output
                 {
                     writeln!(writer, "---")?;
                 }
+                any_doc_output = true;
                 for (result, comments) in results {
                     split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));

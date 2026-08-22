@@ -2086,27 +2086,28 @@ fn test_indent_1_json_output_not_clamped_1486() -> Result<()> {
     Ok(())
 }
 
-/// #1486 review: the clamp's own predicate must track `output_value`'s real
-/// dispatch (`output_format == Yaml` decides the YAML branch; anything else,
-/// including `Auto`, currently falls through to the JSON branch here --
-/// itself a separate, pre-existing divergence from real yq's own
-/// match-the-input-format `-o=auto` semantics, out of scope for this fix,
-/// filed as #1493). A first version of this fix checked `!= Json` instead
-/// of `== Yaml`, so `-o=auto` (neither) wrongly inherited the YAML clamp
-/// even though it renders as JSON -- this pins `-o=auto`'s *content* stays
-/// self-consistent with explicit `-o=json` at the same `-I`, regardless of
-/// which pre-existing format the content itself renders as.
+/// #1486 review, updated by #1493: the clamp's own predicate must track
+/// `output_value`'s real dispatch (`effective_output_format == Yaml`
+/// decides the YAML branch, where `effective_output_format` is `Auto`
+/// resolved against the current source -- #1493 -- not the raw,
+/// unresolved `config.output_format`). A first version of #1486's fix
+/// checked `!= Json` instead of `== Yaml`, so `-o=auto` (neither, before
+/// #1493) wrongly inherited the YAML clamp even though it rendered as
+/// JSON at the time. Now that `-o=auto` on YAML input resolves to `Yaml`
+/// (#1493), this pins the *opposite* equivalence: `-o=auto`'s content
+/// (including the `-I=1` clamp) matches explicit `-o=yaml` at the same
+/// `-I`, not `-o=json`.
 #[test]
-fn test_indent_1_auto_format_matches_explicit_json_1486() -> Result<()> {
+fn test_indent_1_auto_format_matches_explicit_yaml_1486_1493() -> Result<()> {
     let yaml = "l:\n  m:\n    p: 1\n";
 
     let (auto, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=auto"])?;
     assert_eq!(code, 0);
 
-    let (json, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=json"])?;
+    let (explicit_yaml, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=yaml"])?;
     assert_eq!(code, 0);
 
-    assert_eq!(auto, json);
+    assert_eq!(auto, explicit_yaml);
 
     Ok(())
 }
@@ -11638,19 +11639,32 @@ fn test_front_matter_process_rejects_json_output() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: `output_value` treats anything other than `Yaml` as
-/// JSON output (including `Auto`), but the compat guard only checked for
-/// the explicit `Json` variant -- `-o auto` slipped through and wrapped a
-/// JSON body in `---` fences (#715 follow-up).
+/// Updated by #1493: `-o auto` used to slip through this guard and wrap a
+/// JSON body in `---` fences, back when `output_value` treated anything
+/// other than `Yaml` as JSON output (including `Auto`) -- the compat guard
+/// only checked for the explicit `Json` variant (#715 follow-up). Now that
+/// `Auto` resolves per-source (#1493), and front-matter content is always
+/// forced to `InputFormat::Yaml` (`apply_front_matter`), `-o auto` here
+/// always resolves to `Yaml` too -- it's no longer the bug this guard was
+/// written to close, so it's legitimately accepted now, matching explicit
+/// `-o yaml`'s own output byte-for-byte.
 #[test]
-fn test_front_matter_process_rejects_auto_output() -> Result<()> {
-    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+fn test_front_matter_process_accepts_auto_output_1493() -> Result<()> {
+    let (auto_output, code) = run_yq_stdin(
         ".",
         FRONT_MATTER_FIXTURE,
         &["--front-matter", "process", "-o", "auto"],
     )?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("auto"), "stderr: {stderr}");
+    assert_eq!(code, 0, "output: {auto_output:?}");
+
+    let (yaml_output, code) = run_yq_stdin(
+        ".",
+        FRONT_MATTER_FIXTURE,
+        &["--front-matter", "process", "-o", "yaml"],
+    )?;
+    assert_eq!(code, 0, "output: {yaml_output:?}");
+
+    assert_eq!(auto_output, yaml_output);
     Ok(())
 }
 
@@ -20547,5 +20561,214 @@ fn test_yq_error_value_preview_computed_whole_float_diverges_from_tostring_known
          if this now shows \"100\", the gap this test pins has been fixed; \
          update/remove this test"
     );
+    Ok(())
+}
+
+// =============================================================================
+// #1493: `-o=auto` must match the input's own format (YAML input -> YAML
+// output, JSON input -> JSON output), not always resolve to JSON. Real yq's
+// own "nothing to match" cases (`--null-input`, `--raw-input`, a genuinely
+// mixed-format `--slurp`) default to Yaml, live-verified against pinned yq
+// v4.53.3.
+
+/// The issue's own repro: `-o=auto` on YAML stdin must render YAML, not
+/// JSON.
+#[test]
+fn test_yq_auto_output_matches_yaml_input_1493() -> Result<()> {
+    let yaml = "l:\n  m:\n    p: 1\n";
+    let (output, code) = run_yq_stdin(".", yaml, &["-o=auto"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, yaml);
+    Ok(())
+}
+
+/// Same, for JSON input via `-p=json` -- `-o=auto` must still render JSON.
+#[test]
+fn test_yq_auto_output_matches_json_input_1493() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", r#"{"a":1}"#, &["-o=auto", "-p=json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(
+        output, "{\n  \"a\": 1\n}\n",
+        "auto should match JSON input's own format"
+    );
+    Ok(())
+}
+
+/// `-o=auto` resolution is per-*file*, not a single invocation-wide guess:
+/// two YAML files processed independently in one invocation (not
+/// `--slurp`, which merges them) both render as YAML, with a `---`
+/// *between* them (not before the first -- a genuine, pre-existing bug in
+/// this "standard"/slow multi-file path found and fixed alongside #1493's
+/// own change, since it was previously unreachable with `output_format ==
+/// Yaml` for any invocation that also happened to have more than one
+/// document: every such case took the M2 fast path instead, which already
+/// gets this right).
+#[test]
+fn test_yq_auto_output_resolves_per_file_1493() -> Result<()> {
+    let dir = TempDir::new()?;
+    let file1 = dir.path().join("a.yaml");
+    let file2 = dir.path().join("b.yaml");
+    std::fs::write(&file1, "a: 1\n")?;
+    std::fs::write(&file2, "b: 2\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg(".")
+        .arg(&file1)
+        .arg(&file2)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout, "a: 1\n---\nb: 2\n");
+    Ok(())
+}
+
+/// Known gap (#1493's own scope note, same reasoning as the `--slurp`
+/// mixed-format gap above): a YAML file and a JSON file processed
+/// independently (not `--slurp`) in one `-o=auto` invocation each resolve
+/// to their own format correctly, but the combined output doesn't fully
+/// match real yq's own mixed-format multi-doc rendering, which treats the
+/// whole stream as one YAML sequence with the JSON-sourced document
+/// embedded flow-style and a `---` between every document regardless of
+/// format (confirmed live: `a: 1\n---\n{"b": 2}\n`). This fix gives each
+/// document its own correct format independently, but neither inserts a
+/// separator between differently-formatted documents nor renders the
+/// JSON one in YAML's flow style -- pinning the current (correct-per-file,
+/// not fully oracle-matching) behavior.
+#[test]
+fn test_yq_auto_output_mixed_format_multi_file_known_gap_1493() -> Result<()> {
+    let dir = TempDir::new()?;
+    let yaml_file = dir.path().join("a.yaml");
+    let json_file = dir.path().join("b.json");
+    std::fs::write(&yaml_file, "a: 1\n")?;
+    std::fs::write(&json_file, r#"{"b":2}"#)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg(".")
+        .arg(&yaml_file)
+        .arg(&json_file)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    // Real yq: `a: 1\n---\n{"b": 2}\n` -- not replicated here; if this ever
+    // changes, update or remove this test.
+    assert_eq!(stdout, "a: 1\n{\n  \"b\": 2\n}\n");
+    Ok(())
+}
+
+/// `--null-input -o=auto`: no source to match, defaults to Yaml (confirmed
+/// live against real yq: `yq -n '{"a":1}' -o=auto` prints YAML).
+#[test]
+fn test_yq_auto_output_null_input_defaults_to_yaml_1493() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-n")
+        .arg("-o=auto")
+        .arg(r#"{"a":1}"#)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout, "a: 1\n");
+    Ok(())
+}
+
+/// `--slurp -o=auto` with every source sharing one format resolves to that
+/// format (confirmed live against real yq for both all-YAML and all-JSON).
+#[test]
+fn test_yq_auto_output_slurp_uniform_format_1493() -> Result<()> {
+    let dir = TempDir::new()?;
+    let file1 = dir.path().join("a.yaml");
+    let file2 = dir.path().join("b.yaml");
+    std::fs::write(&file1, "a: 1\n")?;
+    std::fs::write(&file2, "b: 2\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg("--slurp")
+        .arg(".")
+        .arg(&file1)
+        .arg(&file2)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout, "- a: 1\n- b: 2\n");
+
+    let json_file1 = dir.path().join("c.json");
+    let json_file2 = dir.path().join("d.json");
+    std::fs::write(&json_file1, r#"{"c":3}"#)?;
+    std::fs::write(&json_file2, r#"{"d":4}"#)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg("--slurp")
+        .arg(".")
+        .arg(&json_file1)
+        .arg(&json_file2)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(
+        stdout,
+        "[\n  {\n    \"c\": 3\n  },\n  {\n    \"d\": 4\n  }\n]\n"
+    );
+    Ok(())
+}
+
+/// Known gap (#1493's own scope note): a genuinely mixed-format `--slurp
+/// -o=auto` falls back to Yaml for the whole output here, where real yq
+/// renders each element in its own source format (a much deeper
+/// per-element behavior, live-verified but not replicated by this fix).
+/// Pinning the current (documented, not the real-yq-matching) behavior.
+#[test]
+fn test_yq_auto_output_slurp_mixed_format_known_gap_1493() -> Result<()> {
+    let dir = TempDir::new()?;
+    let yaml_file = dir.path().join("a.yaml");
+    let json_file = dir.path().join("b.json");
+    std::fs::write(&yaml_file, "a: 1\n")?;
+    std::fs::write(&json_file, r#"{"b":2}"#)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg("--slurp")
+        .arg(".")
+        .arg(&yaml_file)
+        .arg(&json_file)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    // Real yq: `- a: 1\n- {"b": 2}\n` (per-element format) -- not
+    // replicated here; if this ever changes, update or remove this test.
+    assert_eq!(stdout, "- a: 1\n- b: 2\n");
+    Ok(())
+}
+
+/// `--inplace -o=auto` on a YAML file must rewrite it as YAML, not JSON.
+#[test]
+fn test_yq_auto_output_inplace_matches_file_format_1493() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-o=auto")
+        .arg(".a = 2")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 2\n");
     Ok(())
 }
