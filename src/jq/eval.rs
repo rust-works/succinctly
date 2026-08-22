@@ -21872,26 +21872,25 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 
     let (first, rest) = exprs.split_first().unwrap();
 
-    // Handle PathNoArg - return the current path
+    // Handle PathNoArg - return the current path. Position unchanged, so
+    // `rest` continues against the ambient `root`/`current_path` (#1449:
+    // routed through the shared helper #1445 already extracted for this
+    // exact "keep root/current_path unchanged" pattern, instead of
+    // hand-rolling it a fourth time).
     if matches!(first, Expr::Builtin(Builtin::PathNoArg)) {
         let path_result = QueryResult::Owned(OwnedValue::Array(current_path.to_vec()));
-        if rest.is_empty() {
-            return path_result;
-        }
-        // Continue with remaining expressions
-        if let QueryResult::Owned(v) = path_result {
-            return eval_pipe_with_path_context_internal::<W, S>(
-                rest,
-                &v,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            );
-        }
+        return continue_rest_with_context::<W, S>(
+            path_result,
+            rest,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        );
     }
 
-    // Handle Key - return the last element of current path (current key)
+    // Handle Key - return the last element of current path (current key).
+    // Position unchanged (#1449).
     if matches!(first, Expr::Builtin(Builtin::Key)) {
         let key_result = if current_path.is_empty() {
             // At root - return null (yq behavior)
@@ -21900,20 +21899,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Get the last element of the path (the current key)
             QueryResult::Owned(current_path.last().unwrap().clone())
         };
-        if rest.is_empty() {
-            return key_result;
-        }
-        // Continue with remaining expressions
-        if let QueryResult::Owned(v) = key_result {
-            return eval_pipe_with_path_context_internal::<W, S>(
-                rest,
-                &v,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            );
-        }
+        return continue_rest_with_context::<W, S>(
+            key_result,
+            rest,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        );
     }
 
     // Handle FileIndex - return the origin file index of the top-level
@@ -21924,6 +21917,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     // is `None`) or once past the top level's index (defensive; `.first()`
     // always exists once inside an `--eval-all` array), matching
     // `document_index`'s existing "0 outside supported context" contract.
+    // Position unchanged (#1449).
     if matches!(first, Expr::Builtin(Builtin::FileIndex)) {
         let file_idx = current_path
             .first()
@@ -21932,54 +21926,44 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             .and_then(|i| file_origin.and_then(|origins| origins.get(i).copied()))
             .unwrap_or(0);
         let file_index_result = QueryResult::Owned(OwnedValue::Int(file_idx as i64));
-        if rest.is_empty() {
-            return file_index_result;
-        }
-        if let QueryResult::Owned(v) = file_index_result {
-            return eval_pipe_with_path_context_internal::<W, S>(
-                rest,
-                &v,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            );
-        }
+        return continue_rest_with_context::<W, S>(
+            file_index_result,
+            rest,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        );
     }
 
-    // Handle Parent - return the parent value
+    // Handle Parent - return the parent value. Unlike the three arms above,
+    // `rest` continues at the *parent's* path, not the ambient one -- still
+    // routed through the shared helper (#1449), just with a different
+    // `current_path` argument for the continuation.
     if matches!(first, Expr::Builtin(Builtin::Parent)) {
+        let parent_path = if current_path.is_empty() {
+            vec![]
+        } else {
+            current_path[..current_path.len() - 1].to_vec()
+        };
         let parent_result = if current_path.is_empty() {
             // At root - return empty object (yq behavior)
             QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
         } else {
-            // Get the parent path (all but last element)
-            let parent_path = &current_path[..current_path.len() - 1];
             // Navigate from root to parent
-            match get_value_at_owned_path(root, parent_path) {
+            match get_value_at_owned_path(root, &parent_path) {
                 Some(parent_value) => QueryResult::Owned(parent_value),
                 None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
             }
         };
-        if rest.is_empty() {
-            return parent_result;
-        }
-        if let QueryResult::Owned(v) = parent_result {
-            // Parent path is one level up
-            let parent_path = if current_path.is_empty() {
-                vec![]
-            } else {
-                current_path[..current_path.len() - 1].to_vec()
-            };
-            return eval_pipe_with_path_context_internal::<W, S>(
-                rest,
-                &v,
-                root,
-                file_origin,
-                &parent_path,
-                optional,
-            );
-        }
+        return continue_rest_with_context::<W, S>(
+            parent_result,
+            rest,
+            root,
+            file_origin,
+            &parent_path,
+            optional,
+        );
     }
 
     // Handle ParentN - return the nth parent value
@@ -22025,19 +22009,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
         };
 
-        if rest.is_empty() {
-            return parent_result;
-        }
-        if let QueryResult::Owned(v) = parent_result {
-            return eval_pipe_with_path_context_internal::<W, S>(
-                rest,
-                &v,
-                root,
-                file_origin,
-                &parent_path,
-                optional,
-            );
-        }
+        // Same "continue at the parent's path" shape as the plain `Parent`
+        // arm above (#1449).
+        return continue_rest_with_context::<W, S>(
+            parent_result,
+            rest,
+            root,
+            file_origin,
+            &parent_path,
+            optional,
+        );
     }
 
     // Evaluate first expression and update path
@@ -22653,18 +22634,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 }
             };
             let result = OwnedValue::Array(items);
-            if rest.is_empty() {
-                QueryResult::Owned(result)
-            } else {
-                eval_pipe_with_path_context_internal::<W, S>(
-                    rest,
-                    &result,
-                    &result,
-                    file_origin,
-                    &[],
-                    optional,
-                )
-            }
+            // The array just built is a fresh root with no path (#1449:
+            // routed through the same helper the `StringInterpolation` arm
+            // below already uses for its own identical reset).
+            continue_rest_with_fresh_root::<W, S>(
+                QueryResult::Owned(result),
+                rest,
+                file_origin,
+                optional,
+            )
         }
         // `"...\(key)..."` (#1334): the `Array` arm's own reasoning above,
         // applied to a string interpolation slot instead of an array
