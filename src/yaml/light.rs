@@ -2573,6 +2573,20 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// rather than the value's real one (#835) — callers that can't
     /// guarantee `self` is already resolved must resolve first themselves.
     pub fn style(&self) -> &'static str {
+        // JSON has exactly one syntactic style for every container/string --
+        // it isn't a deliberate style choice the way YAML's block/flow or
+        // plain/quoted distinction is. Reporting it here would make the
+        // writer "preserve" flow style/quoting on every JSON-sourced node
+        // regardless of what the query did, which is not what real yq does:
+        // JSON -> YAML output always uses YAML's own default (block
+        // collections, unquoted scalars where safe) rather than echoing
+        // JSON's own `{}`/`""` syntax back (#1398). Style detection stays
+        // meaningful for JSON-sourced *output*'s number canonicalization
+        // sibling, `canonicalize_numbers` -- this only suppresses the style
+        // string itself.
+        if self.index.canonicalize_numbers() {
+            return "";
+        }
         let Some(text_pos) = self.text_position() else {
             return "";
         };
