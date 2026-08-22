@@ -2184,6 +2184,19 @@ fn test_inplace_multi_doc_field_navigation() -> Result<()> {
 /// `can_use_m2_streaming`'s doc comment) and stands in instead. A two-document
 /// file also drives the DOM loop's multi-doc `---` separator logic, which a
 /// single document can't reach.
+///
+/// Expected value's leading `---` removed by #1493's review (this DOM
+/// branch had the same "leading separator before the first document" bug
+/// the standard/stdout path's own `any_yaml_doc_output` fix addresses).
+/// The *between*-results separator this test still asserts is itself a
+/// known, narrower divergence from real yq for this specific case: live
+/// oracle output for `length` on this exact input is `2\n1\n`, with no
+/// separator between the two scalar results at all (`yq -i '.' ` on the
+/// same file, by contrast, does insert one between the two full-document
+/// results -- real yq's separator convention differs by whether a result
+/// is a per-document container vs. a computed scalar, a much narrower
+/// question outside this issue's own scope of "does -o=auto match the
+/// input format").
 #[test]
 fn test_inplace_non_m2_filter_still_works() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
@@ -2199,7 +2212,7 @@ fn test_inplace_non_m2_filter_still_works() -> Result<()> {
 
     assert!(output.status.success());
     let rewritten = std::fs::read_to_string(input_file.path())?;
-    assert_eq!(rewritten, "---\n2\n---\n1\n");
+    assert_eq!(rewritten, "2\n---\n1\n");
     Ok(())
 }
 
@@ -9320,11 +9333,21 @@ fn test_inplace_halt_before_any_output_in_multi_doc_file_does_not_truncate_file(
 /// ordinary empty-output document with no halt involved at all (`empty`
 /// case below), since the separator was written speculatively regardless of
 /// whether the document that followed it ever produced anything.
+///
+/// Expected values updated by #1493's review: real yq doesn't parse
+/// `halt`/`if`/`then`/`end` the same way (no oracle to check against, per
+/// this file's own established convention for succinctly-only control
+/// flow), so these are checked for *internal consistency* with the
+/// standard/stdout path instead, which produces the identical content for
+/// the identical filter+input (confirmed live) -- neither case has a
+/// leading `---`, only fixed by #1497's review finding that this DOM
+/// branch had the same "leading separator before the very first document"
+/// bug the standard path's own `any_yaml_doc_output` fix addresses.
 #[test]
 fn test_inplace_multi_doc_no_dangling_separator_before_halting_or_empty_document() -> Result<()> {
     for (filter, want) in [
-        ("if .a == 2 then halt else . end", "---\na: 1\n"),
-        ("if .a == 2 then empty else . end", "---\na: 1\n---\na: 3\n"),
+        ("if .a == 2 then halt else . end", "a: 1\n"),
+        ("if .a == 2 then empty else . end", "a: 1\n---\na: 3\n"),
     ] {
         let mut input_file = NamedTempFile::new()?;
         write!(input_file, "a: 1\n---\na: 2\n---\na: 3\n")?;
@@ -20770,5 +20793,104 @@ fn test_yq_auto_output_inplace_matches_file_format_1493() -> Result<()> {
     assert!(output.status.success());
     let rewritten = std::fs::read_to_string(input_file.path())?;
     assert_eq!(rewritten, "a: 2\n");
+    Ok(())
+}
+
+/// #1497 review: `--eval-all` was the one output-producing branch missed
+/// by #1493's original fix -- it combines every source the same way
+/// `--slurp` does, so it needed the identical uniform-format-or-fallback
+/// treatment, not just any `for_source` call.
+#[test]
+fn test_yq_auto_output_eval_all_matches_yaml_input_1493() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--eval-all")
+        .arg("-o=auto")
+        .arg(".[0]")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout, "a: 1\n");
+    Ok(())
+}
+
+/// `--inplace -o=auto` on a multi-document YAML file must not gain a
+/// spurious leading `---` before the first document -- the same
+/// "leading, not just between" separator bug #1493's own fix uncovered in
+/// the standard/stdout path (fixed there via `any_yaml_doc_output`) also
+/// existed, unreached until now, in `--inplace`'s DOM branch (#1497
+/// review).
+#[test]
+fn test_yq_auto_output_inplace_multi_doc_no_leading_separator_1493() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1\n---\nb: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-o=auto")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\n---\nb: 2\n");
+    Ok(())
+}
+
+/// The multi-doc `---` separator decision for a mixed-format, non-slurp
+/// multi-file run must not depend on file *order* -- #1497 review found
+/// `any_doc_output` (now `any_yaml_doc_output`, tracked only for
+/// YAML-resolved documents) flipped true even for a JSON-resolved
+/// document, making a YAML document immediately after a JSON one wrongly
+/// get a leading separator while the same YAML document appearing first
+/// would not.
+#[test]
+fn test_yq_auto_output_mixed_format_separator_order_independent_1493() -> Result<()> {
+    let dir = TempDir::new()?;
+    let yaml_file = dir.path().join("a.yaml");
+    let json_file = dir.path().join("b.json");
+    std::fs::write(&yaml_file, "a: 1\n")?;
+    std::fs::write(&json_file, r#"{"b":2}"#)?;
+
+    let yaml_then_json = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg(".")
+        .arg(&yaml_file)
+        .arg(&json_file)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(yaml_then_json.status.success());
+
+    let json_then_yaml = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o=auto")
+        .arg(".")
+        .arg(&json_file)
+        .arg(&yaml_file)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(json_then_yaml.status.success());
+
+    // Neither order should insert a `---` before the lone YAML document
+    // (see the mixed-format known-gap test above for why there's no
+    // separator here at all, only order-independence is asserted).
+    let yaml_then_json_stdout = String::from_utf8(yaml_then_json.stdout)?;
+    let json_then_yaml_stdout = String::from_utf8(json_then_yaml.stdout)?;
+    assert!(
+        !yaml_then_json_stdout.contains("---"),
+        "yaml-then-json: {yaml_then_json_stdout:?}"
+    );
+    assert!(
+        !json_then_yaml_stdout.contains("---"),
+        "json-then-yaml: {json_then_yaml_stdout:?}"
+    );
     Ok(())
 }

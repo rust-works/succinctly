@@ -245,11 +245,22 @@ impl OutputConfig {
     /// run.
     fn for_source(&self, args: &YqCommand, input_format: InputFormat) -> Self {
         let output_format = resolve_output_format(self.output_format, input_format);
+        // Every other field is a plain `Copy` bool -- written out
+        // explicitly rather than `..self.clone()`, which would otherwise
+        // heap-allocate a throwaway copy of the old `indent_str` only to
+        // immediately discard it in favor of the recomputed one below.
         Self {
             output_format,
+            compact: self.compact,
+            raw_output: self.raw_output,
+            join_output: self.join_output,
+            nul_output: self.nul_output,
+            ascii_output: self.ascii_output,
+            sort_keys: self.sort_keys,
+            no_doc: self.no_doc,
             indent_str: Self::compute_indent_str(args, output_format),
+            use_color: self.use_color,
             json_sourced_floats: input_format == InputFormat::Json,
-            ..self.clone()
         }
     }
 }
@@ -3636,6 +3647,21 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             GatheredSources::ExitCode(code) => return Ok(code),
         };
 
+        // #1493 review: this branch was missed by the original fix --
+        // every other output-producing branch resolves `Auto` per-source,
+        // but `--eval-all` combines every source into one evaluation the
+        // same way `--slurp` does, so it gets the identical "uniform
+        // format across every source, falling back to Yaml if they
+        // disagree" treatment `--slurp`'s own fix already established
+        // (see that branch's own comment for the real-yq-mismatch
+        // rationale on the mixed-format case).
+        let mut source_formats = input_sources.iter().map(|(_, format, _)| *format);
+        let uniform_format = match source_formats.next() {
+            Some(first) if source_formats.all(|f| f == first) => first,
+            _ => InputFormat::Yaml,
+        };
+        let output_config = output_config.for_source(&args, uniform_format);
+
         let mut all_docs: Vec<OwnedValue> = Vec::new();
         let mut file_origin: Vec<usize> = Vec::new();
         let mut global_doc_index: usize = 0;
@@ -4184,6 +4210,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // that may already be sitting in `buf_writer` above.
                 let mut any_real_output = false;
                 let mut split_doc_state = SplitDocState::new(has_split_doc);
+                // Tracks "has any *earlier* document in this file already
+                // had real output" (#1497 review) -- `doc_had_output`
+                // below resets per document, deciding only where within
+                // *that* document's own results the separator goes, not
+                // whether this is the file's first document overall. Every
+                // invocation that would reach this multi-doc separator
+                // logic with `output_format == Yaml` used to take the M2
+                // fast path instead (which already gets this right via its
+                // own `yaml_doc_streamed` flag); `-o=auto` could never
+                // satisfy that fast path's exact-format gate pre-#1493, so
+                // this dormant "leading separator on the first document
+                // too" bug in the DOM branch went unreachable until this
+                // fix made `Auto` resolve to `Yaml` for real.
+                let mut any_doc_output_this_file = false;
                 for (local_idx, input) in inputs.iter().enumerate() {
                     let current_doc_index = global_doc_index + local_idx;
                     // Apply --doc filter if specified
@@ -4214,10 +4254,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             && !output_config.no_doc
                             && is_multi_doc
                             && front_matter_body.is_none()
+                            && any_doc_output_this_file
                         {
                             writeln!(buf_writer, "---")?;
                         }
                         doc_had_output = true;
+                        any_doc_output_this_file = true;
                         split_doc_state.write_separator(&mut buf_writer, &output_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -4364,20 +4406,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         // Output all results with proper separators
         // For split_doc: add --- BETWEEN each result (not before first)
-        // For regular multi-doc: add --- BETWEEN each document's results
-        // (not before the first -- `any_doc_output` below, #1493 review: a
-        // pre-existing gap in this "standard"/slow path specifically, only
-        // now reachable with `output_format == Yaml` for real, since any
-        // invocation that would have hit it before either took the M2 fast
-        // path instead (which already tracks this correctly, see
-        // `yaml_doc_streamed` in the fast-path arm above) or -- for
-        // `-o=auto` specifically, pre-#1493 -- never satisfied the `Yaml`
-        // check here at all).
+        // For regular multi-doc: add --- BETWEEN each YAML-resolved
+        // document's results (not before the first -- `any_yaml_doc_output`
+        // below, #1493 review: a pre-existing gap in this "standard"/slow
+        // path specifically, only now reachable with `output_format ==
+        // Yaml` for real, since any invocation that would have hit it
+        // before either took the M2 fast path instead (which already
+        // tracks this correctly, see `yaml_doc_streamed` in the fast-path
+        // arm above) or -- for `-o=auto` specifically, pre-#1493 -- never
+        // satisfied the `Yaml` check here at all).
         // For --front-matter=process: each file's own leading/closing ---
         // fences wrap its transformed front matter, followed by its
         // untouched body (carried alongside `input_sources`, gathered above).
         let mut split_doc_state = SplitDocState::new(has_split_doc);
-        let mut any_doc_output = false;
+        let mut any_yaml_doc_output = false;
         for (file_idx, doc_results) in all_results.into_iter().enumerate() {
             let front_matter_body = input_sources
                 .get(file_idx)
@@ -4396,20 +4438,32 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
             for results in doc_results {
                 // Add document separator in YAML mode for multi-doc,
-                // between documents only, not before the first
-                // (`any_doc_output`, see this loop's own comment above) --
-                // resolved per-file, not the invocation-wide default
-                // (#1493).
+                // between YAML-resolved documents only, not before the
+                // first one (`any_yaml_doc_output`, see this loop's own
+                // comment above) -- resolved per-file, not the
+                // invocation-wide default (#1493). Tracked per *this
+                // document's own resolved format*, not "any document at
+                // all": a mixed-format run's JSON documents never
+                // participate in the YAML `---` convention either way
+                // (the condition already requires `== Yaml`), so they
+                // must not count toward "has the first YAML document
+                // already appeared" -- doing so made the separator
+                // decision file-*order*-dependent (#1497 review): a
+                // YAML document immediately after a JSON one would
+                // wrongly get a leading separator, while the same YAML
+                // document appearing first would not.
                 if !has_split_doc
                     && file_output_config.output_format == OutputFormat::Yaml
                     && !output_config.no_doc
                     && is_multi_doc
                     && front_matter_body.is_none()
-                    && any_doc_output
+                    && any_yaml_doc_output
                 {
                     writeln!(writer, "---")?;
                 }
-                any_doc_output = true;
+                if file_output_config.output_format == OutputFormat::Yaml {
+                    any_yaml_doc_output = true;
+                }
                 for (result, comments) in results {
                     split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
