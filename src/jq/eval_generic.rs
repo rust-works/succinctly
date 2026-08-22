@@ -3425,10 +3425,15 @@ fn take_first_generic<V: DocumentValue>(result: GenericResult<V>) -> Option<Gene
 }
 
 /// `first(a, b, ...)` evaluated one comma sibling at a time, stopping at the
-/// first that yields an output — #820 Stage 2b.
+/// first that yields an output — #820 Stage 2b — and, since #1451, composing
+/// through `Pipe`/`Paren` too: a comma reached through a pipe stage (`first(1
+/// | (1, stderr))`), or nested inside one sibling of an outer comma
+/// (`first((1, stderr), 2)`), recurses back into this same function instead
+/// of falling through to the eager per-expression evaluator that started
+/// this whole gap.
 ///
-/// Returns `None` when `inner` is not a comma, leaving the caller on its
-/// existing eager path.
+/// Returns `None` when `inner` is neither a comma nor a (non-path-context)
+/// pipe, leaving the caller on its existing eager path.
 ///
 /// **Why this exists at all.** Stage 2 made `eval::eval_first_expr` lazy, but
 /// the CLI never reaches it for a bare `first(...)`: `jq_runner` enters
@@ -3437,34 +3442,221 @@ fn take_first_generic<V: DocumentValue>(result: GenericResult<V>) -> Option<Gene
 /// `eval.rs`. `limit`/`nth`/`isempty` have no native arm and do bounce, which
 /// is exactly why Stage 2 fixed them and left `first` leaking.
 ///
-/// This is deliberately the *narrow* fix the design's Stage 2b names as option
-/// (b): it closes `first(1, stderr)` and — the reason it is not merely
-/// cosmetic — `first(1, input)`, where the discarded branch was **consuming a
-/// document** the CLI's driver loop then never processed. It does **not**
-/// close `first(.[] | stderr)`, which is a `Pipe` and needs real per-output
-/// backtracking; that is option (c), mirroring `Demand`/`Item`/`Flow` into
-/// this module, filed as a follow-up.
+/// The original (#820 Stage 2b) fix was deliberately the *narrow* option
+/// (b) from the design doc: closing `first(1, stderr)` and — the reason it
+/// was not merely cosmetic — `first(1, input)`, where the discarded branch
+/// was **consuming a document** the CLI's driver loop then never processed.
+/// #1451 widens it to also recurse through `Pipe`'s own prefix stages: the
+/// prefix is evaluated once via the ordinary eager `eval_single` (a pipe's
+/// leading stages must run to produce the values that feed the tail either
+/// way, so this is no more eager than before), then [`first_over_pipe_prefix_result`]
+/// dispatches on every possible shape of that one evaluation's result
+/// without ever redoing it -- see its own doc comment for the full model,
+/// including why a *computed* prefix (`GenericResult::Owned`, the common
+/// case for a literal/arithmetic leading stage) needs its own
+/// `OwnedValue`-flavored twin ([`first_over_comma_owned_generic`]) rather
+/// than reusing this function directly. `needs_path_context` is checked
+/// across the *whole* pipe up front, matching the eager `Expr::Pipe` arm's
+/// own guard, so `path`/`parent`/`key` never silently see a stubbed-zero
+/// default (#715/#1302) -- a path-context pipe simply isn't attempted here
+/// and falls through to the existing bridge instead.
 fn first_over_comma_generic<S: EvalSemantics, V: DocumentValue>(
     inner: &Expr,
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> Option<GenericResult<V>> {
-    let Expr::Comma(exprs) = unwrap_paren(inner) else {
-        return None;
-    };
-    for e in exprs {
-        // Each sibling is evaluated only once the previous one has been shown
-        // to produce nothing -- so a side-effecting or input-consuming sibling
-        // past the answer is never reached, matching jq's `label $out | (f,
-        // break $out)`.
-        let result = eval_single::<S, V>(e, value.clone(), optional, cursor);
-        if let Some(first) = take_first_generic(result) {
-            return Some(first);
+    match unwrap_paren(inner) {
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                // Each sibling is evaluated only once the previous one has
+                // been shown to produce nothing -- so a side-effecting or
+                // input-consuming sibling past the answer is never reached,
+                // matching jq's `label $out | (f, break $out)`.
+                if let Some(first) = try_lazy_first_generic::<S, V>(e, value, optional, cursor) {
+                    return Some(first);
+                }
+            }
+            // Every sibling was empty, so the comma as a whole produced
+            // nothing.
+            Some(GenericResult::None)
+        }
+        Expr::Pipe(exprs) if exprs.len() >= 2 && !exprs.iter().any(needs_path_context) => {
+            let prefix_result = if exprs.len() == 2 {
+                eval_single::<S, V>(&exprs[0], value.clone(), optional, cursor)
+            } else {
+                eval_single::<S, V>(
+                    &Expr::Pipe(exprs[..exprs.len() - 1].to_vec()),
+                    value.clone(),
+                    optional,
+                    cursor,
+                )
+            };
+            let last = &exprs[exprs.len() - 1];
+            Some(first_over_pipe_prefix_result::<S, V>(
+                prefix_result,
+                last,
+                optional,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Try to get the first lazily-recognized output of `e` against `(value,
+/// cursor)`: recurse into [`first_over_comma_generic`] first, and fall back
+/// to one eager `eval_single` call only when `e` has no further
+/// `Comma`/`Pipe`/`Paren` structure of its own to be lazy about. Returns
+/// `None` when `e` produces literally nothing, so the caller (a comma
+/// sibling loop, or a pipe's per-prefix-value tail attempt) can move on to
+/// the next candidate rather than mistaking "no output" for "stop, this is
+/// the answer" -- the same normalization `first_over_comma_generic`'s own
+/// `Comma` arm already needed, factored out so the `Pipe` arm can reuse it.
+fn try_lazy_first_generic<S: EvalSemantics, V: DocumentValue>(
+    e: &Expr,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    match first_over_comma_generic::<S, V>(e, value, optional, cursor) {
+        Some(GenericResult::None) => None,
+        Some(other) => Some(other),
+        None => take_first_generic(eval_single::<S, V>(e, value.clone(), optional, cursor)),
+    }
+}
+
+/// `OwnedValue`-input twin of [`first_over_comma_generic`], for a pipe
+/// prefix stage that evaluates to a *computed* value
+/// (`GenericResult::Owned`/`ManyOwned`/`Partial`) rather than one derived
+/// from the input document. A bare literal or arithmetic result has no
+/// cursor to preserve, so `eval_single` returns it this way -- and that is
+/// the *common* case for a pipe's leading stage, not a rare one: #1451's own
+/// `first(1 | (1, stderr))` repro has an `Owned` prefix (the literal `1`),
+/// not a `One`. Mirrors `first_over_comma_generic` exactly, substituting
+/// `eval_on_owned` for `eval_single` as the base-case evaluator, and mutually
+/// recurses with the `V`-flavored functions above through
+/// [`first_over_pipe_prefix_result`] so a pipe can freely mix
+/// document-derived and computed stages without losing laziness at the
+/// boundary.
+fn first_over_comma_owned_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+) -> Option<GenericResult<V>> {
+    match unwrap_paren(inner) {
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                if let Some(first) = try_lazy_first_owned_generic::<S, V>(e, owned, optional) {
+                    return Some(first);
+                }
+            }
+            Some(GenericResult::None)
+        }
+        Expr::Pipe(exprs) if exprs.len() >= 2 && !exprs.iter().any(needs_path_context) => {
+            let prefix_result = if exprs.len() == 2 {
+                eval_on_owned::<S, V>(&exprs[0], owned.clone(), optional)
+            } else {
+                eval_on_owned::<S, V>(
+                    &Expr::Pipe(exprs[..exprs.len() - 1].to_vec()),
+                    owned.clone(),
+                    optional,
+                )
+            };
+            let last = &exprs[exprs.len() - 1];
+            Some(first_over_pipe_prefix_result::<S, V>(
+                prefix_result,
+                last,
+                optional,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `OwnedValue`-input twin of [`try_lazy_first_generic`] — see there for the
+/// full rationale; identical shape, `eval_on_owned` in place of
+/// `eval_single`.
+fn try_lazy_first_owned_generic<S: EvalSemantics, V: DocumentValue>(
+    e: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+) -> Option<GenericResult<V>> {
+    match first_over_comma_owned_generic::<S, V>(e, owned, optional) {
+        Some(GenericResult::None) => None,
+        Some(other) => Some(other),
+        None => take_first_generic(eval_on_owned::<S, V>(e, owned.clone(), optional)),
+    }
+}
+
+/// Shared continuation for both [`first_over_comma_generic`]'s and
+/// [`first_over_comma_owned_generic`]'s `Pipe` arm: dispatch on every
+/// possible shape of an already-computed prefix-stage result and try `last`
+/// (the pipe's own final stage) against it, without ever redoing the prefix
+/// evaluation itself -- redoing it on some other path would risk
+/// double-firing any side effect the prefix itself has, so every variant
+/// below is handled here rather than falling back to a broader re-evaluation
+/// for the ones this function doesn't have a lazy answer for.
+///
+/// A `One`/`OneCursor`/`Owned` prefix (exactly one value) recurses lazily
+/// into whichever of the two `try_lazy_first_*_generic` twins matches that
+/// value's own kind. A `Many`/`ManyCursor`/`ManyOwned`/`Partial` prefix
+/// (already-materialized multiple values) tries each in turn against `last`,
+/// stopping at the first that yields anything -- this is what additionally
+/// closes `first(.[] | stderr)`, which #820 Stage 2b explicitly could not
+/// (real per-output backtracking, not just literal-shape composition, was
+/// missing there). `Partial`'s trailing control only surfaces if none of its
+/// values' own tails produced anything, matching `take_first_generic`'s own
+/// "a non-empty prefix always satisfies `first`" rule.
+fn first_over_pipe_prefix_result<S: EvalSemantics, V: DocumentValue>(
+    prefix_result: GenericResult<V>,
+    last: &Expr,
+    optional: bool,
+) -> GenericResult<V> {
+    match prefix_result.materialize_lazy() {
+        GenericResult::None => GenericResult::None,
+        GenericResult::Error(e) => GenericResult::Error(e),
+        GenericResult::Break(label) => GenericResult::Break(label),
+        GenericResult::Halt(code) => GenericResult::Halt(code),
+        GenericResult::One(v) => {
+            try_lazy_first_generic::<S, V>(last, &v, optional, None).unwrap_or(GenericResult::None)
+        }
+        GenericResult::OneCursor(c) => {
+            let v = c.value();
+            try_lazy_first_generic::<S, V>(last, &v, optional, Some(c))
+                .unwrap_or(GenericResult::None)
+        }
+        GenericResult::Many(vs) => vs
+            .into_iter()
+            .find_map(|v| try_lazy_first_generic::<S, V>(last, &v, optional, None))
+            .unwrap_or(GenericResult::None),
+        GenericResult::ManyCursor(cs) => cs
+            .into_iter()
+            .find_map(|c| {
+                let v = c.value();
+                try_lazy_first_generic::<S, V>(last, &v, optional, Some(c))
+            })
+            .unwrap_or(GenericResult::None),
+        GenericResult::Owned(o) => {
+            try_lazy_first_owned_generic::<S, V>(last, &o, optional).unwrap_or(GenericResult::None)
+        }
+        GenericResult::ManyOwned(os) => os
+            .into_iter()
+            .find_map(|o| try_lazy_first_owned_generic::<S, V>(last, &o, optional))
+            .unwrap_or(GenericResult::None),
+        GenericResult::Partial(vs, control) => vs
+            .into_iter()
+            .find_map(|o| try_lazy_first_owned_generic::<S, V>(last, &o, optional))
+            .unwrap_or_else(|| match control {
+                Control::Error(e) => GenericResult::Error(e),
+                Control::Break(label) => GenericResult::Break(label),
+                Control::Halt(code) => GenericResult::Halt(code),
+            }),
+        GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_) => {
+            unreachable!("materialize_lazy() already normalized every lazy variant")
         }
     }
-    // Every sibling was empty, so the comma as a whole produced nothing.
-    Some(GenericResult::None)
 }
 
 /// Apply one resolved key to one target value.

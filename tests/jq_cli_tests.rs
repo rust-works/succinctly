@@ -17312,6 +17312,30 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
         ),
         // The side effect is in the *first* branch, which is always needed.
         (&["-cn", "first(stderr, 1)"], None, "null\n", "null", 0),
+        // #1451: the comma reached through a `Pipe`, not directly --
+        // `first_over_comma_generic`'s old literal-top-level-`Comma` check
+        // fell through to the eager fallback here, firing `stderr`
+        // unconditionally even though the pipe's own tail never needed it.
+        (
+            &["-cn", r#"first(1 | (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // #1451: the comma nested inside one sibling of an outer comma,
+        // not the comma `first` was itself called with -- the old code's
+        // per-sibling loop correctly stopped after sibling 0, but sibling
+        // 0 itself was evaluated via one non-lazy `eval_single` call that
+        // re-entered the eager `Comma` arm and fired `stderr` while
+        // evaluating that one sibling.
+        (
+            &["-cn", r#"first((1, ("B"|stderr)), 2)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
         // `n == 0` must not evaluate the operand at all.
         (&["-cn", r#"[limit(0; ("B"|stderr))]"#], None, "[]\n", "", 0),
         // Array construction is atomic in jq; laziness must not leak into it.
@@ -17330,6 +17354,13 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "B",
             0,
         ),
+        // #1451: `first(.[] | stderr)` -- a `Pipe`, not a bare `Comma` --
+        // closed by widening `first_over_comma_generic` to recurse through
+        // a pipe's own prefix stages, trying each of the (already-
+        // materialized) prefix values against the tail in turn and
+        // stopping at the first that yields anything. jq writes exactly
+        // one `1`.
+        (&["-c", "first(.[] | stderr)"], Some("[1,2]"), "1\n", "1", 0),
         // `all` short-circuits on a FALSY element, so a truthy element 1
         // means element 2 is still reached. #932's text guesses `all` leaks
         // like `any`; it does not -- real jq writes `5` here too. Only the
@@ -17670,17 +17701,6 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // `first(.[] | stderr)` is a *Pipe*, not a Comma, so Stage 2b's
-        // sibling walk does not reach it -- it needs real per-output
-        // backtracking inside `eval_generic` (design option (c), mirroring
-        // Demand/Item/Flow into that module). jq writes exactly one `1`.
-        (
-            &["-c", "first(.[] | stderr)"],
-            Some("[1,2]"),
-            "1\n",
-            "12",
-            0,
-        ),
         // Same residual as the row above, found by Stage 4's own oracle
         // sweep (#1459): a bare `first(...)` is intercepted by
         // `eval_generic`'s native `first`/`last` arm, whose Stage 2b
@@ -17787,6 +17807,136 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             (*want_out, *want_err, *want_code),
             "`{}` changed -- if a #820 stage landed, move this row into \
              `test_short_circuit_side_effect_shapes_already_match_jq_820`",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// #1451: `first_over_pipe_prefix_result` dispatches on every possible
+/// shape `eval_single`/`eval_on_owned` can hand back for a pipe's prefix
+/// stage(s) -- each case here targets one specific `GenericResult` variant
+/// that dispatch has to handle without ever re-evaluating the prefix
+/// (`eval_generic.rs`).
+#[test]
+fn test_first_over_pipe_prefix_dispatches_every_generic_result_shape_1451() -> Result<()> {
+    let cases: &[SideEffectCase] = &[
+        // A 3-stage top-level pipe: the prefix is itself a synthesized
+        // 2-stage `Expr::Pipe`, not a single expression -- exercises
+        // `first_over_comma_generic`'s own `exprs.len() > 2` branch.
+        (
+            &["-cn", r#"first(1 | 2 | (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // Same shape one level deeper: a computed prefix (`Owned`) whose
+        // tail is itself a 2-stage pipe -- exercises
+        // `first_over_comma_owned_generic`'s own `exprs.len() == 2` branch.
+        (
+            &["-cn", r#"first(1 | (2 | (1, ("B"|stderr))))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // And a 3-stage pipe as that same computed-prefix tail -- exercises
+        // `first_over_comma_owned_generic`'s own `exprs.len() > 2` branch.
+        (
+            &["-cn", r#"first(1 | (2 | 3 | (1, ("B"|stderr))))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // A computed, multi-valued prefix (`GenericResult::ManyOwned`) --
+        // each of the prefix's own values is tried against the tail in
+        // turn, same as the `Many`/`ManyCursor` document-derived case.
+        (
+            &["-cn", r#"first((1,2) | (3, ("B"|stderr)))"#],
+            None,
+            "3\n",
+            "",
+            0,
+        ),
+        // A prefix that errors after producing some values
+        // (`GenericResult::Partial`), where an earlier one of those values'
+        // own tail already satisfies `first` -- the trailing error must be
+        // dropped, matching `take_first_generic`'s "a non-empty prefix
+        // always satisfies `first`" rule.
+        (
+            &["-cn", r#"first((1,2,error("x")) | (3, ("B"|stderr)))"#],
+            None,
+            "3\n",
+            "",
+            0,
+        ),
+        // Same `Partial` prefix, but none of its values' own tails produce
+        // anything -- the trailing error must surface instead of `first`
+        // silently returning nothing.
+        (
+            &["-cn", r#"first((1,2,error("x")) | empty)"#],
+            None,
+            "",
+            "jq: error (at <unknown>): x",
+            5,
+        ),
+        // A computed-prefix tail whose first sibling produces nothing --
+        // `try_lazy_first_owned_generic` must fall through to the second
+        // sibling rather than stopping (or erroring) on the empty one.
+        (
+            &["-cn", r#"first(1 | (empty, (1, ("B"|stderr))))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // Same shape, but every sibling of the computed-prefix tail is
+        // empty -- the tail (and so the whole pipe) must report nothing
+        // rather than the loop over-running its own bounds.
+        (&["-cn", "[first(1 | (empty, empty))]"], None, "[]\n", "", 0),
+        // A bare top-level comma every one of whose siblings produces
+        // nothing -- `first_over_comma_generic`'s own `Comma` arm must fall
+        // all the way through its loop to report nothing.
+        (&["-cn", "[first(empty, empty)]"], None, "[]\n", "", 0),
+        // A top-level comma sibling that is itself a lazily-recognized
+        // (nested `Comma`) shape producing nothing -- the outer loop must
+        // treat that the same as an ordinary empty sibling and continue,
+        // not mistake "recognized but empty" for "stop, this is the
+        // answer".
+        (
+            &["-cn", r#"first((empty, empty), (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // A prefix comma containing a `break`, where none of the values
+        // produced before it satisfy the tail -- the break must still
+        // surface rather than being swallowed (unlike the `error` case
+        // above, whose first value's tail *did* satisfy `first`). Verified
+        // live to reach `label $out`'s own continuation empty, matching jq;
+        // not confirmed to specifically exercise `first_over_pipe_prefix_
+        // result`'s `Partial`-with-`Control::Break` conversion arm (a debug
+        // probe there never fired for this expression, suggesting `break`
+        // unwinds through a different path before reaching it) -- kept as a
+        // behavioral pin either way.
+        (
+            &["-cn", r"[label $out | first((1,2,break $out) | empty), 99]"],
+            None,
+            "[]\n",
+            "",
+            0,
+        ),
+    ];
+
+    for (args, stdin, want_out, want_err, want_code) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, *stdin)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end_matches('\n'), code),
+            (*want_out, *want_err, *want_code),
+            "`{}`",
             args.join(" ")
         );
     }

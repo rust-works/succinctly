@@ -21,7 +21,7 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
 | 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
 | 5     | Widen the lazy arm set                              | ⬜ open — #1462             |
-| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ⬜ open — #1461             |
+| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | 🟡 partial — #1451, rest #1461 |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
@@ -38,6 +38,23 @@ side effect for a node's own filter when that filter's shape isn't one of
 `Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — that is the `path(paths(if ...))` row, plus
 the `path(... halt_error ...)` pair Stage 4 added, whose stray `x` on stderr is the same
 un-lazified `Expr::If`.
+
+**Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
+native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
+(`isempty`/`limit`/`nth`/`any`/`all`/`IN` have no native arm in `eval_generic.rs` at all —
+see `first_over_comma_generic`'s own doc comment — so they already bridge into `eval.rs`'s
+`eval_each`-based lazy path and never needed this). #1451 widened
+`first_over_comma_generic` to recurse through a pipe's own prefix stages -- evaluating the
+prefix exactly once, then dispatching on every possible shape of that one result (a
+mutually-recursive `OwnedValue`-flavored twin, `first_over_comma_owned_generic`, handles the
+*computed*-value shapes -- `GenericResult::Owned`/`ManyOwned`, the common case for a
+literal/arithmetic leading stage -- since a bare `V`/cursor doesn't exist for those) without
+ever re-evaluating it. This closes `first(.[] | stderr)` too, not just the two narrower
+`Pipe`-composition shapes #1451 itself named, since a `Many`/`ManyCursor`/`ManyOwned`
+prefix's already-materialized values are tried against the tail one at a time, stopping at
+the first that yields anything -- real per-output backtracking, not just literal-shape
+composition, without needing the full generalized `Demand`/`Item`/`Flow` mirror this row
+originally called for.
 
 **One correction this document earned the hard way.** Stage 2 shipped an
 `eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
