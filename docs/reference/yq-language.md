@@ -243,13 +243,22 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X")'
 # "XXX" — every match replaced (unlike succinctly jq's identical-syntax "Xaa")
 
 echo '"aaa"' | succinctly yq 'gsub("a"; "X")'
-# "XXX" — same result; gsub is effectively a synonym for bare sub in yq mode
+# "XXX" — same result for a non-zero-width pattern like this one
 ```
 
 `gsub` (any arity), `scan`, and `splits` are not real yq builtins at all — real yq's own
 lexer rejects them outright (confirmed live against yq v4.53.3, #1436). succinctly's `gsub`
 support in yq mode is therefore a succinctly-only convenience, not a verified match against
-an oracle that has nothing to compare against.
+an oracle that has nothing to compare against — and, as of #1255 below, it's no longer a
+strict synonym for bare `sub` even internally: a **zero-width-capable** pattern (`a*`,
+`x?`, `""`) makes the two diverge, since bare `sub` picks up #1255's real-yq-verified
+Go-`regexp` iteration while `gsub` deliberately keeps the original jq/Oniguruma-style
+iteration (there being no oracle for `gsub` to match instead):
+
+```bash
+echo '"bab"' | succinctly yq 'sub("a*"; "X")'    # "XbXbX"  (Go-style, matches real yq)
+echo '"bab"' | succinctly yq 'gsub("a*"; "X")'   # "XbXXbX" (jq/Oniguruma-style, unchanged)
+```
 
 **Resolved (#1122):** the 3-arg `sub(re; s; flags)` form doesn't fit jq's
 model or yq's own bare-`sub` model — real yq never evaluates `replacement`
