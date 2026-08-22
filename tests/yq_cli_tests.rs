@@ -2044,6 +2044,48 @@ fn test_seq_item_anchor_deferred_indent_at_non_default_width_slurp_1484() -> Res
     Ok(())
 }
 
+/// #1486: `-I=1`'s YAML output clamps to the same 2-column step as `-I=2`
+/// in real yq (verified live against v4.53.3, byte-identical at every
+/// level -- mappings, sequences, and compact/anchor-deferred sequence
+/// items alike), not a literal 1-column step. Covers the streaming path
+/// (plain identity) and the DOM path (forced via a write, `.c = 1`).
+#[test]
+fn test_indent_1_clamps_to_2_streaming_1486() -> Result<()> {
+    let yaml = "l:\n  m:\n    p: 1\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["-I=1"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, "l:\n  m:\n    p: 1\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_indent_1_clamps_to_2_dom_1486() -> Result<()> {
+    let yaml = "l:\n  m:\n    p: 1\n";
+
+    let (dom, code) = run_yq_stdin(".c = 1", yaml, &["-I=1"])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom, "l:\n  m:\n    p: 1\nc: 1\n");
+
+    Ok(())
+}
+
+/// #1486: the clamp is YAML-specific -- real yq's `-o=json` output at
+/// `-I=1` genuinely uses a literal 1-space step (verified live), unlike
+/// YAML's clamp-to-2. `indent_str` is shared by both formats' DOM
+/// emitters, so this guards against the clamp leaking into JSON output.
+#[test]
+fn test_indent_1_json_output_not_clamped_1486() -> Result<()> {
+    let yaml = "l:\n  m:\n    p: 1\n";
+
+    let (json, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(json, "{\n \"l\": {\n  \"m\": {\n   \"p\": 1\n  }\n }\n}\n");
+
+    Ok(())
+}
+
 /// `--tab`'s fix (#733) widened `can_stream_pretty`, which also covers
 /// `keys_unsorted` (part of `can_use_m2_streaming`) — not a duplicate-key
 /// case (keys_unsorted returns an array of key names, so nothing to
