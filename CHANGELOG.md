@@ -264,6 +264,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jq`: four architectural gaps in `input`/`inputs`/`input_line_number`**
+  (#1309), all four verified against pinned jq 1.7.1 before and after.
+
+  **Calls inside an imported module are detected.** The gate deciding whether
+  to seed the shared input queue was a substring scan of the raw filter text,
+  run before `-L`/`import`/`include` module bodies are inlined. A call that
+  only a module spelled out was invisible, so the queue went unseeded and
+  every document reported spurious exhaustion — three `break` errors where jq
+  gives one. It is now an AST walk over the expanded program, which also stops
+  the scan over-reporting: `.input`, `.inputs` and an `"input"` string literal
+  no longer force the non-lazy read path.
+
+  **A truncating consumer no longer eats the whole stream.** `builtin_inputs`
+  drained the entire queue before any consumer saw a value. Unlike the eager
+  evaluator's usual over-computation, that lost data outright: the queue is
+  shared with the CLI's own per-document loop and cannot be replayed, so
+  documents past the one kept were gone from the rest of the program.
+  `., first(inputs)` on `1 2 3 4 5` printed `1 2` against jq's `1 2 3 4 5`;
+  `., any(inputs; . > 2)` printed `1 true` against `1 true 4 true`. `inputs`
+  is now a demand-driven producer on #820's existing `Demand`/`Item`/`Flow`
+  sink, fixing `limit`, `nth`, `any`, `all`, `isempty` and `IN` together, with
+  `first` handled separately since it never reaches that evaluator.
+
+  **Error locations keep the filename and follow the live read position.** The
+  queue tracked only a line number, so an error against a document read via
+  `input` reported `<stdin>` even for named files. jq tracks a single global
+  position — the file its parser has open and the line it last finished a
+  value on — rather than each value's provenance:
+  `jq '[inputs] | .[0] | error("boom")' a b c` names **c**, not `.[0]`'s own
+  **a**. succinctly now matches, without any filename crossing the library
+  seam (the queue carries an opaque source tag the CLI resolves itself).
+
+  **An exhausted stream names where it ran out.** `printf '' | jq -n 'input'`
+  reports `<stdin>:0`, and `jq -n 'input,input' one.json empty.json` reports
+  `empty.json:0`; both were `<unknown>`. `<unknown>` is now reserved for its
+  real meaning — no read has been attempted at all.
+
+  Remaining divergences, all downstream of the evaluator's eager `Pipe`/`Comma`
+  rather than of these builtins, are recorded in
+  `docs/compliance/jq/limitations.md`: `inputs | input_line_number` does not
+  interleave, `(., input) | error(...)` raises once where jq raises twice, and
+  `input_line_number` keeps its line after a failed read (jq is not
+  self-consistent there, so the reset is deliberately not reproduced).
+  `input`/`inputs` remain unsupported in `yq` mode, reporting a clear error.
+
+- **`yq`: `split_doc` hidden inside twelve builtins is detected** (#1309):
+  `contains_split_doc` was exhaustive over `Expr` but ended its inner
+  `Builtin` match in `_ => false`, so `any`/`all` (both arities), `IN`/`INDEX`
+  and their stream forms, `fromstream`, `truncate_stream`, `at_offset` and
+  `at_position` were scanned as opaque leaves and a `split_doc` inside one
+  went unreported, costing the stream its `---` separators. Both this and the
+  jq input-builtin check now route through one exhaustive, wildcard-free
+  `jq::walk` traversal, so adding a `Builtin` variant is a compile error until
+  its sub-expressions are declared, and the two predicates cannot drift apart.
+
 - **`jq`: `path()` tracks a variable referenced inside `reduce`/`foreach`'s
   `UPDATE`/`EXTRACT`** (#1440): `resolve_node` had no `Expr::Reduce`/
   `Expr::Foreach` arm at all, so `path(. as $x | reduce (1,2) as $i (0; $x))`

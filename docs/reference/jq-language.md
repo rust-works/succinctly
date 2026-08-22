@@ -385,7 +385,20 @@ See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module s
 1. **SQL-style operators** - Not in standard jq
 2. **Multi-precision integers** - Uses Rust's i64/f64
 3. **Full jq module library** - Just core builtins
-4. **`input` / `inputs` / `input_line_number`** - The succinct data structure approach builds a semi-index per document for efficient repeated queries. Streaming multiple documents within an expression conflicts with this architecture. Multiple input files are better handled at the CLI level, where each file gets its own optimized index. Users needing NDJSON/JSON Lines streaming should use standard `jq`.
+
+### `input` / `inputs` / `input_line_number`
+
+Implemented in `jq` mode since #723, with #1309 closing the module-detection, eager-drain
+and error-location gaps that shipped with it. They draw from one queue shared with the
+CLI's own per-document loop, so a document a filter reads via `input` is never also
+re-processed as a top-level invocation. Truncating consumers (`first`, `limit`, `nth`,
+`any`, `all`, `isempty`, `IN`) take only what they use and leave the rest of the stream
+for the program.
+
+Not supported in `yq` mode -- `succinctly yq` reports `... is not supported in yq mode`
+rather than accepting the syntax and returning a wrong answer. Remaining `jq`-mode
+divergences (`inputs | f` does not interleave) are recorded in
+[jq Known Limitations](../compliance/jq/limitations.md).
 
 ### Partial Implementation Notes
 
@@ -464,6 +477,7 @@ cargo test --features cli,regex --test jq_error_message_tests
 | 2026-01-19 | Added `toboolean` type conversion function (✅ complete)|
 | 2026-01-19 | Added `skip(n; expr)` iteration control - skip first n outputs (✅ complete)|
 | 2026-01-19 | Moved `input`/`inputs`/`input_line_number` to "Won't implement" - conflicts with succinct data structure architecture|
+| 2026-08-23 | Implemented `input`/`inputs`/`input_line_number` in jq mode, superseding the 2026-01-19 "Won't implement" row (#723, #1309) (✅ complete)|
 | 2026-01-19 | Verified `$__loc__` already implemented - returns `{file, line}` at source location (✅ complete)|
 | 2026-01-19 | Removed `.[::2]` step slicing from TODO - it's Python syntax, not jq|
 | 2026-01-20 | Added `label $name | expr` / `break $name` for non-local control flow (✅ complete)|
