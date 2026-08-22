@@ -32,7 +32,7 @@ as such in `test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stde
 `first((1,2) == (10, ("B"|stderr)))` (both a bare `first(...)` over a non-`Comma`, which
 Stage 2b's sibling walk does not reach — option (c)), and
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))` (a *top-level* compare, which never reaches
-`eval_each` at all — see follow-up 6). Stage 3 also leaves one residual: an un-lazified
+`eval_each` at all — #1481). Stage 3 also leaves one residual: an un-lazified
 `eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect
 for a node's own filter when that filter's shape isn't one of
 `Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — pinned as a known-remaining row in the same
@@ -1048,7 +1048,8 @@ the reasoning behind each placement:
    `Expr::Compare` arm, which is what a top-level `==` actually reaches. With
    `input`/`inputs` operands it changes *values*, not just stderr ordering:
    `(input) + (input, input)` over `"a" "b" "c" "d"` is `["ba","dc"]` in jq and
-   `["ca","db"]` here, so it is silent data loss rather than a cosmetic leak.
+   `["ca","db"]` here, so it is silent data loss rather than a cosmetic leak. **Filed as
+   #1481.**
 7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
    `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Not yet filed.
    One issue, not one per arm: each is a single lazy arm now that the primitive exists.
