@@ -16891,6 +16891,56 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             0,
         ),
         (&["-c", "IN(2, (5|stderr))"], Some("[2]"), "false\n", "5", 0),
+        // ---- Stage 4 (#1459) guard rails: `Expr::Compare`'s outer loop ----
+        // `binary_fanout_core` runs the RIGHT operand as the outer loop and
+        // re-runs the left per right value (#910's live-verified nested-loop
+        // order). So a side effect in the right operand's FIRST output is
+        // genuinely reached, and one the consumer's demand runs past is
+        // reached too. These are the rows a too-eager `Demand::Stop` breaks.
+        //
+        // The side effect is right's first output, so it precedes everything.
+        (
+            &["-cn", r#"[isempty((1,2) == ("B"|stderr, 3))]"#],
+            None,
+            "[false]\n",
+            "B",
+            0,
+        ),
+        // `limit(3)` is not satisfied by the two pairings right's first
+        // output produces, so right's second output IS demanded.
+        (
+            &["-cn", r#"[limit(3; (1,2) == (10, ("B"|stderr)))]"#],
+            None,
+            "[false,false,false]\n",
+            "B",
+            0,
+        ),
+        // No pairing is truthy, so `any` must exhaust the generator.
+        (
+            &["-cn", r#"[any((1,2) == (10, ("B"|stderr)); .)]"#],
+            None,
+            "[false]\n",
+            "B",
+            0,
+        ),
+        // #910's own case: an escape partway through the INNER operand
+        // aborts the comparison before a later output of the outer one is
+        // reached, so the match at `s`'s second output is never found.
+        (
+            &["-cn", r#"[IN(4, error("boom"); 9, 4)]"#],
+            None,
+            "",
+            "jq: error (at <unknown>): boom",
+            5,
+        ),
+        // The side effect is `s`'s FIRST candidate, before the matching one.
+        (
+            &["-cn", r"[IN((2,3); (5|stderr), 2)]"],
+            None,
+            "[true]\n",
+            "5",
+            0,
+        ),
         // Already lazy today, and must stay lazy.
         (
             &["-cn", r#"false and ("B"|stderr)"#],
@@ -17014,6 +17064,82 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "outer",
             1,
         ),
+        // ---- closed by #820 Stage 4 (#1459); these were leaking above -----
+        // `eval_each` gained a native `Expr::Compare` arm, so the RIGHT
+        // operand -- jq's outer loop -- stops producing candidates once the
+        // consumer is satisfied. #932's remaining `IN(src; s)` third: it
+        // hands `any_all_gen_cond` a synthesized `Expr::Compare` as its
+        // generator, so it inherits the laziness directly.
+        (
+            &["-cn", r"[IN((2,3); 2, (5|stderr))]"],
+            None,
+            "[true]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[IN((2,3); 2, (5|stderr), 7)]"],
+            None,
+            "[true]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"[IN((2,3); 2, ("X"|halt_error(7)))]"#],
+            None,
+            "[true]\n",
+            "",
+            0,
+        ),
+        // `src` sourced from the document rather than a literal, so the
+        // cursor path is exercised too.
+        (
+            &["-c", r"[IN(.[]; 2, (5|stderr))]"],
+            Some("[1,2]"),
+            "[true]\n",
+            "",
+            0,
+        ),
+        // Every other lazy consumer wrapped around a bare compare. Each has
+        // a matching guard-rail row above where the demand DOES reach the
+        // side effect, so these cannot be satisfied by stopping too early.
+        (
+            &["-cn", r#"[isempty((1,2) == (10, ("B"|stderr)))]"#],
+            None,
+            "[false]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"[limit(2; (1,2) == (10, ("B"|stderr)))]"#],
+            None,
+            "[false,false]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"[nth(1; (1,2) == (10, ("B"|stderr)))]"#],
+            None,
+            "[false]\n",
+            "",
+            0,
+        ),
+        // `all` short-circuits on the first falsy pairing.
+        (
+            &["-cn", r#"[all((1,2) == (10, ("B"|stderr)); .)]"#],
+            None,
+            "[false]\n",
+            "",
+            0,
+        ),
+        // `any` short-circuits on the first truthy one.
+        (
+            &["-cn", r#"[any((2,1) == (1, ("B"|stderr)); .)]"#],
+            None,
+            "[true]\n",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -17076,15 +17202,37 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "12",
             0,
         ),
-        // `IN(src; s)` synthesizes an `Expr::Compare` and hands it to
-        // `any_all_gen_cond` as `gen`, but `binary_fanout_core`'s outer loop
-        // is still eager, so the sink never sees the candidates one at a
-        // time. Closed by Stage 4. jq: no stderr.
+        // Same residual as the row above, found by Stage 4's own oracle
+        // sweep (#1459): a bare `first(...)` is intercepted by
+        // `eval_generic`'s native `first`/`last` arm, whose Stage 2b
+        // short-circuit only walks *comma* siblings -- an `Expr::Compare`
+        // argument falls through to eager `eval_single`, so `eval.rs`'s new
+        // lazy `Compare` arm is never reached. Wrapping the same compare in
+        // any consumer that does bounce into `eval.rs` (`isempty`, `limit`,
+        // `nth`, `any`, `all`, `IN`) already matches jq -- see the table
+        // above. jq: no stderr.
         (
-            &["-cn", "[IN((2,3); 2, (5|stderr))]"],
+            &["-cn", r#"[first((1,2) == (10, ("B"|stderr)))]"#],
             None,
-            "[true]\n",
-            "5",
+            "[false]\n",
+            "B",
+            0,
+        ),
+        // The eager copies of jq's right-outer/left-inner fanout loop
+        // (`binary_fanout_core` via `eval_binary_fanout`,
+        // `eval_binary_fanout_with_path_context`, and `eval_generic`'s own
+        // third copy in its `Expr::Compare` arm -- which is what a top-level
+        // `==` actually reaches) still run the right operand to completion
+        // before the left, where jq interleaves them. Stage 4 made only
+        // `eval_each`'s arm demand-aware, so a top-level compare keeps the
+        // old order. jq writes `B`, `A`, `C`, `A`; succinctly writes `B`,
+        // `C`, `A`, `A`. Tracked separately -- with `input` operands the same
+        // ordering changes *values*, not just stderr.
+        (
+            &["-cn", r#"[("A"|stderr) == (("B"|stderr), ("C"|stderr))]"#],
+            None,
+            "[false,false]\n",
+            "BCAA",
             0,
         ),
         // #987 Stage 3 closed the bare-comma spelling of this shape
