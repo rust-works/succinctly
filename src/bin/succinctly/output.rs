@@ -337,6 +337,14 @@ pub struct JsonFormatOpts<'a> {
     pub float_style: FloatStyle,
     /// Control-character escaping convention (jq vs yq).
     pub control_escape: ControlEscape,
+    /// Whether the source document was JSON (only meaningful alongside
+    /// `control_escape: Yq` — see the `Float` arm's own `json_sourced`
+    /// branch below). A JSON-sourced float never keeps a decimal point in
+    /// output, computed or not, compact or pretty (#978, #1398) — unlike
+    /// `float_style`, which only distinguishes compact/pretty for *jq*
+    /// mode (yq's own compact/pretty JSON output always agree with each
+    /// other on float formatting; see [`format_float_yq`]'s doc comment).
+    pub json_sourced: bool,
 }
 
 /// Escape a JSON string body per the opts' control-escape style and ASCII mode.
@@ -403,6 +411,15 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                     // `jq_runner.rs`'s two `LiteralFormatter` impls).
                     nonfinite_display_string::<JqSemantics>(*f).to_string()
                 }
+            } else if opts.control_escape == ControlEscape::Yq && opts.json_sourced {
+                // A JSON-sourced float never keeps a decimal point, in any
+                // output mode (#978, #1398) -- real yq's JSON-input
+                // convention is a plain re-serialize through bare `f64`
+                // `Display`, with no scientific-notation threshold at all
+                // (matching `format_float_yq`'s own doc comment on this
+                // exact exclusion, and the M2 streaming writers' identical
+                // `json_sourced_canonical_float` rule in `src/yaml/light.rs`).
+                f.to_string()
             } else if opts.control_escape == ControlEscape::Yq {
                 // yq mode: scientific notation past yq's magnitude threshold
                 // (#997), decimal-with-fraction otherwise, regardless of
@@ -962,6 +979,7 @@ mod tests {
             ascii: false,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         assert_eq!(format_json(&value, &opts), r#"{"a":2,"z":1}"#);
     }
@@ -975,6 +993,7 @@ mod tests {
             ascii: false,
             float_style,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         assert_eq!(format_json(&value, &opts(FloatStyle::Shortest)), "1");
         assert_eq!(
@@ -1022,6 +1041,7 @@ mod tests {
             ascii: false,
             float_style,
             control_escape: ControlEscape::Yq,
+            json_sourced: false,
         };
         let huge = OwnedValue::Float(1e100);
         assert_eq!(format_json(&huge, &opts(FloatStyle::Shortest)), "1e+100");
@@ -1127,6 +1147,7 @@ mod tests {
             ascii: true,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Yq,
+            json_sourced: false,
         };
         assert_eq!(
             format_json(&OwnedValue::Object(obj), &opts),
@@ -1147,6 +1168,7 @@ mod tests {
             ascii: false,
             float_style: FloatStyle::PreserveWholeFloat,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         assert_eq!(format_json(&OwnedValue::Float(f64::NAN), &opts), "null");
         assert_eq!(
@@ -1163,6 +1185,7 @@ mod tests {
         // than substituting anything).
         let yq_opts = JsonFormatOpts {
             control_escape: ControlEscape::Yq,
+            json_sourced: false,
             ..opts
         };
         assert_eq!(
@@ -1184,6 +1207,7 @@ mod tests {
             ascii: false,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         let overflowed = OwnedValue::NumberLiteral(
             succinctly::jq::NumberRepr::Float(f64::INFINITY),
@@ -1196,6 +1220,7 @@ mod tests {
         // against real yq.
         let yq_opts = JsonFormatOpts {
             control_escape: ControlEscape::Yq,
+            json_sourced: false,
             ..opts
         };
         assert_eq!(format_json(&overflowed, &yq_opts), "1e400");
@@ -1214,6 +1239,7 @@ mod tests {
             ascii: false,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         assert_eq!(format_json(&OwnedValue::Array(vec![]), &pretty), "[]");
         assert_eq!(
@@ -1236,6 +1262,7 @@ mod tests {
             ascii: true,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
         assert_eq!(
             format_json(&value, &opts),
@@ -1302,6 +1329,7 @@ mod tests {
             ascii: false,
             float_style: FloatStyle::Shortest,
             control_escape: ControlEscape::Jq,
+            json_sourced: false,
         };
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);

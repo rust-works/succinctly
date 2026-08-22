@@ -144,6 +144,22 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         ""
     }
 
+    /// Whether this cursor's document is JSON-sourced and should canonicalize
+    /// number literals rather than preserve their source spelling (#978,
+    /// #1398).
+    ///
+    /// Returns `false` by default (preserve spelling, #918's YAML behavior
+    /// and JSON-cursor evaluation's own long-standing behavior alike). Only
+    /// a `YamlCursor` whose index was
+    /// [`mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced)-
+    /// tagged overrides this — real yq's own JSON-input convention is a
+    /// JSON-sourced number never keeps its own spelling, computed or not, a
+    /// convention YAML's own `!!float`/exponent literal preservation must
+    /// not inherit just because JSON parses through the same cursor type.
+    fn canonicalize_numbers(&self) -> bool {
+        false
+    }
+
     /// Get this node's trailing same-line comment text, with the leading
     /// `#`/space stripped (the `line_comment` jq builtin, issue #710).
     ///

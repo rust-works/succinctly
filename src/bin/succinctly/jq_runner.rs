@@ -3317,6 +3317,10 @@ fn format_json(value: &OwnedValue, config: &OutputConfig) -> String {
         ascii: config.ascii_output,
         float_style: FloatStyle::Shortest,
         control_escape: ControlEscape::Jq,
+        // Only meaningful alongside `ControlEscape::Yq` (see
+        // `JsonFormatOpts::json_sourced`'s own doc comment) -- jq mode
+        // never consults it.
+        json_sourced: false,
     };
     let json = output::format_json(value, &opts);
 

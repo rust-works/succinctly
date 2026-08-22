@@ -1007,11 +1007,16 @@ fn test_duplicate_mapping_key_survives_comma_wrapped_to_entries_1168() -> Result
     Ok(())
 }
 
-/// #1168: `Expr::Array`/`Expr::Comma`'s new native arms must still dedupe a
-/// duplicate *JSON* key exactly like bare `to_entries` does (#1170) -- the
-/// wrapping fix must not disturb the format-aware dedup rule itself.
+/// #1168: `Expr::Array`/`Expr::Comma`'s new native arms must agree with bare
+/// `to_entries` on duplicate-key handling for *JSON* input too -- the
+/// wrapping fix must not disturb that rule either way. Updated for #1398:
+/// yq mode's `to_entries` preserves every duplicate key regardless of input
+/// format (real yq answers identically whether the document arrived as JSON
+/// or YAML) -- `[to_entries]`/`to_entries, to_entries` on JSON input used to
+/// collapse to the first-position/last-value entry, which was itself the
+/// #1398 format-leak bug, not a rule this wrapping fix needed to preserve.
 #[test]
-fn test_json_duplicate_key_array_comma_wrapped_to_entries_still_dedupes_1168() -> Result<()> {
+fn test_json_duplicate_key_array_comma_wrapped_to_entries_preserves_1398() -> Result<()> {
     let json = r#"{"a":1,"b":2,"a":3}"#;
     let extra_args = ["--input-format", "json", "-o=json", "-I=0"];
 
@@ -1019,14 +1024,14 @@ fn test_json_duplicate_key_array_comma_wrapped_to_entries_still_dedupes_1168() -
     assert_eq!(code, 0);
     assert_eq!(
         array_output.trim(),
-        r#"[[{"key":"a","value":3},{"key":"b","value":2}]]"#
+        r#"[[{"key":"a","value":1},{"key":"b","value":2},{"key":"a","value":3}]]"#
     );
 
     let (comma_output, code) = run_yq_stdin("to_entries, to_entries", json, &extra_args)?;
     assert_eq!(code, 0);
     assert_eq!(
         comma_output.trim(),
-        "[{\"key\":\"a\",\"value\":3},{\"key\":\"b\",\"value\":2}]\n[{\"key\":\"a\",\"value\":3},{\"key\":\"b\",\"value\":2}]"
+        "[{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2},{\"key\":\"a\",\"value\":3}]\n[{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2},{\"key\":\"a\",\"value\":3}]"
     );
     Ok(())
 }
@@ -1080,14 +1085,16 @@ fn test_yq_array_wrapped_partial_halt_discards_prefix_1168() -> Result<()> {
     Ok(())
 }
 
-/// #1170: unlike YAML's genuine duplicates (preserved unmerged above, per
-/// #443), a duplicate key on `--input-format json` input must collapse to
-/// one entry -- keeping the first occurrence's position but the last
-/// occurrence's value, matching real jq's own `to_entries` behavior on
-/// duplicate JSON keys (the two formats have opposite correct behavior
-/// here, and `to_entries`'s cursor-native walk is shared between them).
+/// Updated for #1398: real yq's `to_entries` preserves every duplicate key
+/// regardless of whether the input arrived as JSON or YAML (confirmed live
+/// against yq v4.53.3) -- unlike jq mode, where a duplicate *JSON* key does
+/// collapse (first position, last value, #1385's own separate axis). #1170
+/// originally pinned yq mode's JSON input to jq's collapsing rule; that was
+/// the `DocumentFields::keys_dedup()` format-leak #1398 fixes, not yq's
+/// actual behavior -- yq mode's `to_entries` no longer depends on input
+/// format at all.
 #[test]
-fn test_duplicate_json_key_to_entries_deduplicates_1170() -> Result<()> {
+fn test_duplicate_json_key_to_entries_preserves_1398() -> Result<()> {
     let json = r#"{"a":1,"b":2,"a":3}"#;
     let (output, code) = run_yq_stdin(
         "to_entries",
@@ -1098,7 +1105,7 @@ fn test_duplicate_json_key_to_entries_deduplicates_1170() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(
         output.trim(),
-        r#"[{"key":"a","value":3},{"key":"b","value":2}]"#
+        r#"[{"key":"a","value":1},{"key":"b","value":2},{"key":"a","value":3}]"#
     );
     Ok(())
 }
@@ -1136,14 +1143,16 @@ fn test_yq_paths_preserves_nested_duplicate_mapping_keys_868() -> Result<()> {
     Ok(())
 }
 
-/// #868: `paths` on `--input-format json` input must still apply *JSON's*
-/// own duplicate-key rule (first position, last value -- #1170) rather than
-/// YAML's preserve-every-occurrence rule, the same format-aware split
-/// `to_entries` already established. Confirms the fix's `effective_fields`
-/// call is genuinely format-aware, not a blanket switch to "always keep
-/// duplicates."
+/// Updated for #1398: `paths` on `--input-format json` input must now agree
+/// with YAML input (both preserve every duplicate-key occurrence, matching
+/// `to_entries`'s own format-independent behavior) rather than applying
+/// JSON's old collapsing rule -- there's no real-yq oracle for `paths` (a
+/// succinctly extension), so the acceptance criterion stays internal
+/// consistency: this must report the same path count as the sibling YAML
+/// test `test_yq_paths_preserves_duplicate_mapping_keys_868` above for the
+/// equivalent document, and as `to_entries` on this same JSON input.
 #[test]
-fn test_yq_paths_json_input_format_still_dedupes_868() -> Result<()> {
+fn test_yq_paths_json_input_format_preserves_1398() -> Result<()> {
     let json = r#"{"a":1,"a":2,"b":3}"#;
     let (output, code) = run_yq_stdin(
         "[paths]",
@@ -1152,7 +1161,52 @@ fn test_yq_paths_json_input_format_still_dedupes_868() -> Result<()> {
     )?;
 
     assert_eq!(code, 0, "out: {output:?}");
-    assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
+    assert_eq!(output.trim(), r#"[["a"],["a"],["b"]]"#);
+    Ok(())
+}
+
+/// #1398: the issue's own reproduction table, run against every filter it
+/// lists, on both `{"b":1,"a":2,"b":3}` (JSON) and the logically identical
+/// `b: 1\na: 2\nb: 3\n` (YAML). Every filter here must answer *identically*
+/// regardless of which format the same logical document arrived as -- the
+/// format-leak `DocumentFields::keys_dedup()` gated on input format instead
+/// of mode, which this pins directly, filter by filter. `map_values(.)`
+/// isn't included: it goes through the wildcard-bridge fallback
+/// (`eval_on_owned`), which still collapses duplicates for both formats
+/// today (#1344's scope, not fixed by this issue).
+#[test]
+fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
+    let json = r#"{"b":1,"a":2,"b":3}"#;
+    let yaml = "b: 1\na: 2\nb: 3\n";
+    let cases: &[(&str, &str)] = &[
+        (".", r#"{"b":1,"a":2,"b":3}"#),
+        ("length", "3"),
+        ("keys", r#"["b","a","b"]"#),
+        (
+            "to_entries",
+            r#"[{"key":"b","value":1},{"key":"a","value":2},{"key":"b","value":3}]"#,
+        ),
+        ("[.[]]", "[3,2]"),
+        (".b", "3"),
+    ];
+    for (filter, expected) in cases {
+        let (json_out, json_code) =
+            run_yq_stdin(filter, json, &["--input-format", "json", "-o=json", "-I=0"])?;
+        assert_eq!(json_code, 0, "filter {filter:?} on JSON input");
+        assert_eq!(
+            json_out.trim(),
+            *expected,
+            "filter {filter:?} on JSON input"
+        );
+
+        let (yaml_out, yaml_code) = run_yq_stdin(filter, yaml, &["-o=json", "-I=0"])?;
+        assert_eq!(yaml_code, 0, "filter {filter:?} on YAML input");
+        assert_eq!(
+            yaml_out.trim(),
+            *expected,
+            "filter {filter:?} on YAML input"
+        );
+    }
     Ok(())
 }
 
@@ -13611,22 +13665,50 @@ fn test_json_input_rejects_adversarial_nesting_via_m2_path_996() -> Result<()> {
     Ok(())
 }
 
-/// Companion to the above: `-P` forces the DOM path (pretty-print isn't
-/// implemented by the M2 streamers), which parses JSON input through
-/// `JsonIndex::build` (no parse-time depth guard of its own) rather than
-/// `YamlIndex::build` -- #998's own `eval_generic::to_owned`
-/// conversion-time 256 guard is the one that fires here, unchanged by
-/// #996, confirming it's still live and not dead code now that the
-/// YAML-parser guard catches the M2-eligible case earlier.
+/// Companion to the above: `--eval-all` is the one remaining trigger for
+/// `JsonIndex::build` + `eval_generic::to_owned`'s conversion-time 256
+/// guard (no parse-time depth guard of its own) -- confirming it's still
+/// live and not dead code, now that the YAML-parser guard catches every
+/// other JSON-input path earlier.
+///
+/// Updated for #1398: `-P` (this test's original trigger) no longer forces
+/// the `JsonIndex` DOM path at all -- yq mode's "Standard path" and
+/// `--split-exp` now route *every* JSON query through
+/// `YamlIndex`/`mark_json_sourced` (the same cursor-native evaluator YAML
+/// input uses), specifically so duplicate-key handling stops depending on
+/// input format. `-P --input-format json` on this same adversarial input
+/// now hits the depth-128 parse-time guard instead (exit 1, "128"), same as
+/// bare identity above -- `--eval-all`/`--slurp` are the only flags still
+/// routed through `parse_input`'s `JsonIndex`-based path (#1343 tracks
+/// unifying those too), so `--eval-all` is what still reaches this
+/// conversion-time guard.
 #[test]
-fn test_json_input_rejects_adversarial_nesting_via_dom_path_998() -> Result<()> {
+fn test_json_input_rejects_adversarial_nesting_via_eval_all_998() -> Result<()> {
+    let depth = 500;
+    let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--eval-all"])?;
+    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1398: `-P` no longer forces the `JsonIndex` DOM path (see the
+/// `--eval-all` test above) -- it now hits the same depth-128 parse-time
+/// guard as bare identity, same as every other non-`--eval-all`/`--slurp`
+/// JSON-input path.
+#[test]
+fn test_json_input_rejects_adversarial_nesting_via_pretty_print_1398() -> Result<()> {
     let depth = 500;
     let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
     let (_stdout, stderr, code) =
         run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "-P"])?;
-    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert_eq!(code, 1, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 128"),
         "stderr: {stderr:?}"
     );
     Ok(())

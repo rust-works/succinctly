@@ -130,6 +130,19 @@ struct OutputConfig {
     no_doc: bool,
     indent_str: String,
     use_color: bool,
+    /// A JSON-sourced float never keeps a decimal point in output,
+    /// computed or not, `-o=json` or `-o=yaml`, compact or pretty (#978,
+    /// confirmed live against yq v4.53.3: `-p json '. + 1'` on `1.0` gives
+    /// `2` in every output mode, where the same computation on genuine
+    /// YAML input keeps `2.0` under pretty `-o=json`). The cursor-native
+    /// evaluator (#1398) no longer routes JSON input through a text
+    /// round-trip that happened to erase the decimal point as a side
+    /// effect (`evaluate_input`'s reindex bridge), so this flag makes the
+    /// override explicit instead of relying on that accident. Per-input-
+    /// source, not global: set by the caller for the specific file/stream
+    /// currently being formatted, since `--input-format auto` can mix
+    /// JSON and YAML sources in one invocation.
+    json_sourced_floats: bool,
 }
 
 impl OutputConfig {
@@ -163,6 +176,7 @@ impl OutputConfig {
             no_doc: args.no_doc,
             indent_str,
             use_color,
+            json_sourced_floats: false,
         }
     }
 }
@@ -547,11 +561,35 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
 /// A single jq result value paired with its parallel [`CommentTree`] (issue #710).
 type ResultWithComments = (OwnedValue, CommentTree);
 
-/// Evaluate YAML input directly using the generic evaluator with per-document processing.
+/// Flags for [`evaluate_yaml_direct_filtered`], grouped into one struct
+/// rather than four bool parameters (clippy's `fn_params_excessive_bools`/
+/// `too_many_arguments`, #1398).
+struct DirectEvalOptions {
+    need_comments: bool,
+    strip_style: bool,
+    sort_keys: bool,
+    /// Route JSON input through `YamlIndex::mark_json_sourced` instead of
+    /// evaluating genuine YAML source — see the function's own doc comment.
+    mark_json_sourced: bool,
+}
+
+/// Evaluate YAML *or JSON* input directly using the generic evaluator with
+/// per-document processing.
 ///
-/// This processes YAML documents directly without intermediate OwnedValue conversion,
-/// preserving position metadata for `line` and `column` builtins. Returns results
-/// grouped by document for proper multi-doc handling (with `---` separators).
+/// This processes documents directly without intermediate `OwnedValue`
+/// conversion, preserving position metadata for `line`/`column` builtins
+/// (YAML) and, just as importantly, preserving duplicate mapping keys
+/// through builtins like `length`/`to_entries` (#1398) — `OwnedValue::Object`
+/// is `IndexMap`-backed and structurally can't represent them. JSON is a
+/// YAML subset, so `mark_json_sourced` routes JSON input through the same
+/// `YamlIndex`/cursor-native path the M2 streaming fast path already uses
+/// for JSON (`index.mark_json_sourced()` there too), rather than the
+/// eager-materializing `parse_input`/`evaluate_input` pair — this is what
+/// stops yq mode's duplicate-key behavior from depending on which format the
+/// same logical document arrived as.
+///
+/// Returns results grouped by document for proper multi-doc handling (with
+/// `---` separators).
 ///
 /// If `doc_filter` is Some((target_doc, global_offset)), only the document at global index
 /// `target_doc` will be evaluated (where global index = global_offset + local_doc_index).
@@ -561,11 +599,19 @@ fn evaluate_yaml_direct_filtered(
     expr: &Expr,
     doc_filter: Option<(usize, usize)>,
     sink: &mut ErrorSink,
-    need_comments: bool,
-    strip_style: bool,
-    sort_keys: bool,
+    opts: DirectEvalOptions,
 ) -> Result<(Vec<Vec<ResultWithComments>>, usize)> {
-    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+    let DirectEvalOptions {
+        need_comments,
+        strip_style,
+        sort_keys,
+        mark_json_sourced,
+    } = opts;
+    let mut index =
+        YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+    if mark_json_sourced {
+        index.mark_json_sourced();
+    }
     let root = index.root(bytes);
 
     // YAML documents are wrapped in a sequence at the root
@@ -1755,6 +1801,7 @@ fn output_value<W: Write>(
             } else {
                 FloatStyle::PreserveWholeFloat
             },
+            json_sourced: config.json_sourced_floats,
             control_escape: ControlEscape::Yq,
         },
     );
@@ -3599,94 +3646,75 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
             let mut global_doc_index: usize = 0;
             'files: for (bytes, format, _) in &input_sources {
-                match format {
-                    InputFormat::Yaml | InputFormat::Auto => {
-                        let doc_filter = args.document.map(|target| (target, global_doc_index));
-                        // Split-exp output files carry real comments when
-                        // written as YAML, same as the main output path (#710).
-                        let need_comments = output_config.output_format == OutputFormat::Yaml;
-                        let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
-                            bytes,
-                            &program.expr,
-                            doc_filter,
+                // Yaml/Auto and Json both go through the same cursor-native
+                // evaluator now (#1398) -- JSON is a YAML subset, and
+                // routing it through `YamlIndex`/`mark_json_sourced` here
+                // (rather than `parse_input`'s eager `OwnedValue`
+                // materialization) is what keeps duplicate-key handling
+                // consistent regardless of which format the same logical
+                // document arrived as. `--slurp`/`--eval-all`/`--inplace`'s
+                // DOM fallback still use the old `parse_input`/
+                // `evaluate_input` pair for both formats -- a separate,
+                // already-tracked issue (#1343), not touched here.
+                let doc_filter = args.document.map(|target| (target, global_doc_index));
+                // Split-exp output files carry real comments when
+                // written as YAML, same as the main output path (#710).
+                let need_comments = output_config.output_format == OutputFormat::Yaml;
+                let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+                    bytes,
+                    &program.expr,
+                    doc_filter,
+                    &mut sink,
+                    DirectEvalOptions {
+                        need_comments,
+                        strip_style: args.pretty_print,
+                        sort_keys: output_config.sort_keys,
+                        mark_json_sourced: *format == InputFormat::Json,
+                    },
+                )?;
+                global_doc_index += num_docs;
+                // A JSON-sourced float never keeps a decimal point in
+                // `-o=json` output (#978, #1398) -- see
+                // `OutputConfig::json_sourced_floats`'s own doc comment.
+                let file_output_config = if *format == InputFormat::Json {
+                    OutputConfig {
+                        json_sourced_floats: true,
+                        ..output_config.clone()
+                    }
+                } else {
+                    output_config.clone()
+                };
+                for results in doc_results {
+                    // See the --null-input arm above: a halt already
+                    // present when this document's batch starts
+                    // means every element of `results` is a
+                    // legitimate pre-halt prefix that still owes its
+                    // file, so only a *new* halt (from this batch's
+                    // own split-filename evaluation) should stop the
+                    // loop early (#791).
+                    let halted_before_batch = sink.halted().is_some();
+                    for (result, comments) in &results {
+                        any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
+                        write_split_result(
+                            result,
+                            comments,
+                            split_expr,
+                            output_index,
+                            &file_output_config,
+                            &mut written_split_files,
                             &mut sink,
-                            need_comments,
-                            args.pretty_print,
-                            output_config.sort_keys,
                         )?;
-                        global_doc_index += num_docs;
-                        for results in doc_results {
-                            // See the --null-input arm above: a halt already
-                            // present when this document's batch starts
-                            // means every element of `results` is a
-                            // legitimate pre-halt prefix that still owes its
-                            // file, so only a *new* halt (from this batch's
-                            // own split-filename evaluation) should stop the
-                            // loop early (#791).
-                            let halted_before_batch = sink.halted().is_some();
-                            for (result, comments) in &results {
-                                any_truthy |=
-                                    !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
-                                write_split_result(
-                                    result,
-                                    comments,
-                                    split_expr,
-                                    output_index,
-                                    &output_config,
-                                    &mut written_split_files,
-                                    &mut sink,
-                                )?;
-                                output_index += 1;
-                                // halt/halt_error (#791) outranks writing any
-                                // further split files or evaluating any
-                                // further documents/inputs/files.
-                                if !halted_before_batch && sink.halted().is_some() {
-                                    break 'files;
-                                }
-                            }
-                        }
-                        if sink.halted().is_some() {
+                        output_index += 1;
+                        // halt/halt_error (#791) outranks writing any
+                        // further split files or evaluating any
+                        // further documents/inputs/files.
+                        if !halted_before_batch && sink.halted().is_some() {
                             break 'files;
                         }
                     }
-                    InputFormat::Json => {
-                        let inputs = parse_input(bytes, InputFormat::Json)?;
-                        for input in inputs {
-                            if let Some(target_doc) = args.document {
-                                if global_doc_index != target_doc {
-                                    global_doc_index += 1;
-                                    continue;
-                                }
-                            }
-                            let results = evaluate_input(&input, &program.expr, &mut sink)?;
-                            // See the --null-input arm above: a pre-existing
-                            // halt means every element of `results` is a
-                            // legitimate pre-halt prefix still owed its file
-                            // (#791).
-                            let halted_before_batch = sink.halted().is_some();
-                            for result in &results {
-                                any_truthy |=
-                                    !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
-                                write_split_result(
-                                    result,
-                                    &CommentTree::empty(),
-                                    split_expr,
-                                    output_index,
-                                    &output_config,
-                                    &mut written_split_files,
-                                    &mut sink,
-                                )?;
-                                output_index += 1;
-                                if !halted_before_batch && sink.halted().is_some() {
-                                    break 'files;
-                                }
-                            }
-                            global_doc_index += 1;
-                            if sink.halted().is_some() {
-                                break 'files;
-                            }
-                        }
-                    }
+                }
+                if sink.halted().is_some() {
+                    break 'files;
                 }
             }
         }
@@ -4148,9 +4176,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
         }
     } else {
-        // Standard path: evaluate inputs
-        // For YAML inputs, use direct evaluation to preserve position metadata
-        // For JSON inputs, use the OwnedValue path
+        // Standard path: evaluate inputs. Both YAML and JSON input go
+        // through `evaluate_yaml_direct_filtered`'s cursor-native evaluator
+        // (#1398) -- see its own doc comment for why.
 
         // Collect input sources with their bytes and formats. `--front-matter`
         // is applied before validation, since the raw file bytes (e.g.
@@ -4171,70 +4199,40 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // This avoids double-parsing YAML for document counting
         // Each entry in all_results is a Vec of document results from one file.
         // Each result carries its parallel CommentTree (issue #710); JSON
-        // input has none, so it's paired with CommentTree::empty().
+        // input has none, so it's paired with CommentTree::empty()
+        // internally by `evaluate_yaml_direct_filtered`'s `need_comments`
+        // gate below.
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
         'collect: for (bytes, format, _) in &input_sources {
-            match format {
-                InputFormat::Yaml | InputFormat::Auto => {
-                    // Use direct YAML evaluation to preserve position metadata
-                    // Filter at evaluation time to avoid evaluating (and printing errors for)
-                    // documents that don't match the --doc filter
-                    let doc_filter = args.document.map(|target| (target, global_doc_index));
-                    // JSON output never reads `CommentTree` (see
-                    // `output_value`'s JSON branch), so don't build one (#710).
-                    let need_comments = output_config.output_format == OutputFormat::Yaml;
-                    let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
-                        bytes,
-                        &program.expr,
-                        doc_filter,
-                        &mut sink,
-                        need_comments,
-                        args.pretty_print,
-                        output_config.sort_keys,
-                    )?;
-                    global_doc_index += num_docs;
-                    all_results.push(doc_results);
-                    // halt/halt_error (#791) outranks evaluating any further
-                    // files — whatever was collected so far still prints below.
-                    if sink.halted().is_some() {
-                        break 'collect;
-                    }
-                }
-                InputFormat::Json => {
-                    // Use OwnedValue path for JSON
-                    let inputs = parse_input(bytes, InputFormat::Json)?;
-                    let mut json_results = Vec::new();
-                    for input in inputs {
-                        // Apply --doc filter if specified
-                        if let Some(target_doc) = args.document {
-                            if global_doc_index != target_doc {
-                                global_doc_index += 1;
-                                continue;
-                            }
-                        }
-                        let results = evaluate_input(&input, &program.expr, &mut sink)?;
-                        json_results.push(
-                            results
-                                .into_iter()
-                                .map(|v| (v, CommentTree::empty()))
-                                .collect::<Vec<_>>(),
-                        );
-                        global_doc_index += 1;
-                        // halt/halt_error (#791): stop evaluating further
-                        // inputs in this file (and, below, further files) —
-                        // whatever was collected so far still prints below.
-                        if sink.halted().is_some() {
-                            break;
-                        }
-                    }
-                    all_results.push(json_results);
-                    // halt/halt_error (#791) outranks evaluating any further
-                    // files — matches the sibling YAML arm above.
-                    if sink.halted().is_some() {
-                        break 'collect;
-                    }
-                }
+            // Yaml/Auto and Json both go through the same cursor-native
+            // evaluator now (#1398) -- see the matching comment on the
+            // `--split-exp` loop above for why (JSON is a YAML subset;
+            // routing it through `YamlIndex`/`mark_json_sourced` keeps
+            // duplicate-key handling format-independent, unlike the old
+            // `parse_input`/`evaluate_input` eager-`OwnedValue` path).
+            let doc_filter = args.document.map(|target| (target, global_doc_index));
+            // JSON output never reads `CommentTree` (see
+            // `output_value`'s JSON branch), so don't build one (#710).
+            let need_comments = output_config.output_format == OutputFormat::Yaml;
+            let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+                bytes,
+                &program.expr,
+                doc_filter,
+                &mut sink,
+                DirectEvalOptions {
+                    need_comments,
+                    strip_style: args.pretty_print,
+                    sort_keys: output_config.sort_keys,
+                    mark_json_sourced: *format == InputFormat::Json,
+                },
+            )?;
+            global_doc_index += num_docs;
+            all_results.push(doc_results);
+            // halt/halt_error (#791) outranks evaluating any further
+            // files — whatever was collected so far still prints below.
+            if sink.halted().is_some() {
+                break 'collect;
             }
         }
 
@@ -4253,6 +4251,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let front_matter_body = input_sources
                 .get(file_idx)
                 .and_then(|(_, _, body)| body.as_ref());
+            // A JSON-sourced float never keeps a decimal point in `-o=json`
+            // output (#978, #1398) -- see `OutputConfig::json_sourced_floats`'s
+            // own doc comment. Per file/source, not global: `--input-format
+            // auto` can mix JSON and YAML sources in one invocation.
+            let file_output_config = if input_sources.get(file_idx).map(|(_, format, _)| *format)
+                == Some(InputFormat::Json)
+            {
+                OutputConfig {
+                    json_sourced_floats: true,
+                    ..output_config.clone()
+                }
+            } else {
+                output_config.clone()
+            };
             if front_matter_body.is_some() {
                 writeln!(writer, "---")?;
             }
@@ -4267,9 +4279,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     writeln!(writer, "---")?;
                 }
                 for (result, comments) in results {
-                    split_doc_state.write_separator(&mut writer, &output_config)?;
+                    split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    output_value(&mut writer, &result, &comments, &output_config)?;
+                    output_value(&mut writer, &result, &comments, &file_output_config)?;
                 }
             }
             if let Some(body) = front_matter_body {
@@ -4398,6 +4410,7 @@ mod tests {
             no_doc: false,
             indent_str: String::new(),
             use_color: false,
+            json_sourced_floats: false,
         };
 
         let nan = OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into());
@@ -4475,6 +4488,7 @@ mod tests {
             no_doc: false,
             indent_str: String::new(),
             use_color: false,
+            json_sourced_floats: false,
         };
 
         let mut obj = IndexMap::new();
@@ -4700,9 +4714,12 @@ mod tests {
             expr,
             None,
             &mut ErrorSink::default(),
-            true,
-            false,
-            false,
+            DirectEvalOptions {
+                need_comments: true,
+                strip_style: false,
+                sort_keys: false,
+                mark_json_sourced: false,
+            },
         )
         .unwrap();
         groups.into_iter().flatten().collect()
@@ -4918,6 +4935,7 @@ mod tests {
             no_doc: false,
             indent_str: String::new(),
             use_color: false,
+            json_sourced_floats: false,
         };
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);

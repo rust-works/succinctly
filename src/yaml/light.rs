@@ -6001,6 +6001,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn canonicalize_numbers(&self) -> bool {
+        self.index.canonicalize_numbers()
+    }
+
+    #[inline]
     fn line_comment(&self) -> Option<String> {
         YamlCursor::line_comment(self).map(ToString::to_string)
     }
