@@ -526,6 +526,18 @@ Each checked against the oracle. "already correct" means succinctly matches jq t
 | `Reduce`/`Foreach`                         | no                         | `reduce` has one output; `foreach`'s #534 fork machinery is a non-goal                                  |
 | **`Compare`**                              | **yes — for #932**         | Stage 4; see below                                                                                      |
 | **`Builtin::PathsFilter`**                 | **yes — for #987**         | Stage 3                                                                                                 |
+| **`Builtin::Inputs`**                      | **yes — for #1309**        | Stage 3.5. The one arm that is a *correctness* fix, not an optimization — see below                     |
+
+**`Builtin::Inputs` breaks the "un-lazified is only a missed optimization" rule.**
+`drain_result`'s invariant is stated over *the values delivered to this sink*; it says
+nothing about side effects on state the sink does not own. Every other producer here
+over-*computes* at worst, and the extra values are discarded. `inputs` over-*consumes* a
+shared, destructive, non-replayable queue that the CLI's own per-document driver loop and
+every later `input` call also draw from, so a document produced for a consumer that never
+asked for it is gone from the whole program. Before #1309, `., first(inputs)` on five
+documents printed `1 2` against jq's `1 2 3 4 5`. Anything added to this table in future
+should be checked against that distinction: a producer that reads external, non-replayable
+state cannot wait for Stage 5.
 
 **Honest scoping of #932.** `builtin_upper_in` (`:3759`) synthesizes
 `gen = Expr::Compare { Eq, src, s }` for the `IN(src; s)` form and hands it to
@@ -873,6 +885,14 @@ collecting wrapper, behaviourally unchanged) and an `Expr::Compare` arm in `eval
 **Stage 5 — widen the arm set.** `If`, `Try`/`Optional`, `Label`, `AsPattern`, `FuncCall`,
 and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`. One divergence-table row per
 arm; each independently mergeable and measurable.
+
+**Option (c) — mirror the sink into `eval_generic`.** Originally scoped for
+`first(.[] | stderr)`. #1309 gave it two more owners, both now pinned in
+[`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md): `inputs | f` does
+not interleave (`inputs | input_line_number` is `3 3 3` against jq's `1 2 3`), and
+`(., input) | error(...)` raises once where jq raises twice. Both are the eager `Pipe`/
+`Comma` in that module, not the input builtins — #1309's own `first(...)` fix sidesteps it
+by delegating the whole node to `eval.rs` rather than by making this module lazy.
 
 ## Open risks for an implementer to sanity-check
 
