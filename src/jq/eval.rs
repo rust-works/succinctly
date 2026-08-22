@@ -15209,59 +15209,6 @@ fn recurse_untracked_error<'a>(value: &OwnedValue) -> (Vec<PathBranch<'a>>, Eval
     (Vec::new(), EvalError::invalid_path_expression(value).into())
 }
 
-/// #843's general safety net: reject `branches` outright if `trackable` is
-/// false, using the first branch's own value for `#530`'s classic "with
-/// result" message (an empty `branches` — e.g. `catch empty` — legitimately
-/// raises nothing, so this is a no-op then).
-///
-/// Every arm in `resolve_node` that performs *genuine navigation*
-/// (`Field`/`Index`/`Slice` via `resolve_leaf`, `Iterate`, a computed
-/// `IndexExpr`/`SliceExpr`'s own indexing step, the `recurse` family) is
-/// already gated to raise immediately on an untracked value, before ever
-/// producing a branch — see `resolve_node`'s own doc comment. So *any*
-/// branch that reaches this function while untracked is, by that
-/// invariant, guaranteed to be something else: a value merely forwarded
-/// unchanged from the untracked source (`select(cond)`, the type-filter
-/// builtins `values`/`objects`/..., `Expr::Identity`'s own path here
-/// through `resolve_leaf` already covers itself but is harmless to
-/// re-check) or the landed value of a `getpath(...)` call exempt from
-/// navigation-gating on its *own* steps but not thereby "laundered" into a
-/// trackable value (see `Builtin::GetPath`'s doc comment). None of those
-/// arms know on their own whether something *further* is about to navigate
-/// into their result (in which case they must stay silent and let that
-/// further step raise the more specific "near attempt" message —
-/// `resolve_index_expr`/`resolve_slice_expr`'s own post-target check and
-/// `resolve_static_tail` already handle that) or whether they are the
-/// final answer (in which case *this* function is what has to catch it) —
-/// only their caller knows which. `resolve_catch` is now the sole caller:
-/// a `catch` handler's result genuinely is final, because nothing in
-/// `Expr::Try`'s own shape can follow the handler within the same node.
-/// Found in review: before this existed,
-/// `try (.a, error({y:99})) catch select(true) = "X"` silently replaced
-/// the entire document with `"X"` instead of raising and writing nothing.
-///
-/// `Expr::Comma`'s arm used to call this too, per sibling. #986 Stage 2
-/// removed that: a `Comma` mid-pipe (`(.a, 1) | .c`) does have something
-/// left to navigate into, so the check was firing a position too early.
-/// Its siblings now carry their own `trackable` outward instead — see
-/// that arm's own comment, and
-/// `docs/plan/jq-path-trackability-deferral.md`.
-fn reject_if_untracked(branches: Vec<PathBranch<'_>>, trackable: bool) -> PathResolveResult<'_> {
-    // Two ways to be untracked now (#986): the whole call was made against
-    // an untracked value (`trackable == false`, #843's caught-payload case),
-    // or an individual branch carries its own `false` because
-    // `resolve_leaf`'s catch-all deferred it here. When `trackable` is false
-    // the first branch is the offender, which is exactly what this reported
-    // before — so that case is unchanged.
-    if let Some(offending) = branches.iter().find(|b| !trackable || !b.trackable) {
-        return Err((
-            Vec::new(),
-            EvalError::invalid_path_expression(&offending.value).into(),
-        ));
-    }
-    Ok(branches)
-}
-
 /// Resolve an ordinary (non-combinator) filter: keep it as one opaque path
 /// component if it is one of the four primitives `walk_path` understands
 /// bare (`Identity`/`Field`/`Index`/`Slice`), and otherwise treat it as a
@@ -15543,17 +15490,30 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// (confirmed live for both — see `resolve_node`'s doc comment on
 /// `trackable` for the full mechanism). A bare `catch .` (no navigation at
 /// all) still raises, just as the classic `#530` "with result" message
-/// instead, once `resolve_node`'s own leaf dispatch evaluates it — and the
-/// `reject_if_untracked` call below is this same rule's counterpart for
-/// every arm that isn't a leaf reached through `resolve_leaf` (`select(...)`,
-/// the type-filter builtins, `getpath(...)`'s own landed value): none of
-/// those raise on their own, since they might just as easily be an
-/// *intermediate* step something else navigates further (`resolve_index_expr`/
-/// `resolve_slice_expr`/`resolve_static_tail` already handle that case) —
-/// only this function, as the bare/non-`Comma` handler's genuinely final
-/// checkpoint, can tell the difference. Found in review:
-/// `try (.a, error({y:99})) catch select(true) = "X"` used to silently
-/// replace the whole document with `"X"` instead of raising.
+/// instead, once `resolve_node`'s own leaf dispatch evaluates it.
+///
+/// No eager rejection happens here for any *other* untracked branch
+/// (`select(...)`, the type-filter builtins, `getpath(...)`'s own landed
+/// value) — an earlier version of this function called `reject_if_untracked`
+/// on the whole result, on the premise that a `catch` handler's output is
+/// always final "because nothing in `Expr::Try`'s own shape can follow the
+/// handler within the same node" (#843). That premise is true of the `Try`
+/// node itself but ignores the *enclosing* expression: `(try error([1,2,3])
+/// catch .) | .[]` has plenty left to navigate into, and the eager check
+/// reported the generic `#530` "with result [1,2,3]" instead of ever letting
+/// `.[]` raise jq's own "near attempt to iterate through [1,2,3]" — the same
+/// fallacy `#986` Stage 2 already found and removed for `Expr::Comma` (see
+/// that arm's own comment). Fixed the same way (#1297): each branch now
+/// simply carries its own `trackable` outward, and whoever turns out to be
+/// terminal decides — `resolve_seq`'s fan-out loop / `resolve_static_tail`
+/// for a pipe continuation, `resolve_index_expr`/`resolve_slice_expr`'s own
+/// post-target check for `(try ... catch .)[K]`/`[S:T]`, or
+/// `resolve_dynamic_indexes`'s own terminal check when nothing follows at
+/// all (still raising the same `#530` message for a bare `path(try ...
+/// catch .)`, just decided one level up). Regression guard for the case
+/// that motivated the original eager check: `try (.a, error({y:99})) catch
+/// select(true) = "X"` still raises rather than silently replacing the
+/// whole document, caught now by `resolve_dynamic_indexes` instead of here.
 fn resolve_catch<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     prefix: Vec<PathBranch<'a>>,
@@ -15563,9 +15523,7 @@ fn resolve_catch<'a, S: EvalSemantics>(
         return Ok(prefix);
     };
     let mut out = prefix;
-    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false)
-        .and_then(|b| reject_if_untracked(b, false))
-    {
+    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false) {
         Ok(branches) => out.extend(branches),
         Err((branches, e)) => {
             out.extend(branches);
@@ -43844,9 +43802,11 @@ mod tests {
     /// severe variant: found via review, `try (.a, error({y:99})) catch
     /// select(true) = "X"` used to silently replace the *entire input
     /// document* with `"X"` instead of raising and writing nothing.
-    /// `reject_if_untracked` (`resolve_catch`'s own top-level check, and
-    /// `Expr::Comma`'s per-sibling one) is the general fix, not a
-    /// `select`-specific patch.
+    /// `resolve_dynamic_indexes`'s own terminal check
+    /// (`reject_untracked_at_terminal`) is the general fix, not a
+    /// `select`-specific patch — moved there from `resolve_catch`'s own
+    /// top-level check by #1297, since `resolve_catch` is not always
+    /// terminal itself (see its doc comment).
     #[test]
     fn test_path_catch_handler_bare_terminal_select_raises_with_result_843() {
         // path() form.
@@ -43898,11 +43858,12 @@ mod tests {
     /// #843 review: `select`/the type filters used as an *intermediate*
     /// step (something else navigates further into their forwarded value)
     /// must still succeed and let that further navigation raise the more
-    /// specific "near attempt" message — `reject_if_untracked` only
-    /// applies at the two genuinely-terminal checkpoints
-    /// (`Expr::Comma`/`resolve_catch`'s own top level), not here.
-    /// Confirmed live against jq 1.7.1 for both the piped and dot-chain
-    /// spellings.
+    /// specific "near attempt" message — the untracked-rejection check only
+    /// applies at a genuinely-terminal checkpoint (`resolve_dynamic_indexes`,
+    /// or `resolve_seq`/`resolve_index_expr`/`resolve_slice_expr` for a
+    /// pipe/target continuation — see #1297), not here, where `.y` is still
+    /// to come. Confirmed live against jq 1.7.1 for both the piped and
+    /// dot-chain spellings.
     #[test]
     fn test_path_catch_handler_select_as_intermediate_step_still_works_843() {
         for filter in [
@@ -43920,6 +43881,138 @@ mod tests {
                 }
             );
         }
+    }
+
+    // ============================================================================
+    // #843's untracked marker lost crossing a Pipe/target boundary (#1297)
+    // ============================================================================
+    //
+    // Every test above exercises navigation *nested inside* the catch
+    // handler's own expression (`catch .[]`, `catch .a.b`, ...) — the marker
+    // survives there because `resolve_node`'s per-arm `!trackable` checks
+    // fire before `resolve_catch` ever gets a return value back at all. The
+    // shapes below instead put the navigation *after* the whole `Try` node —
+    // a sibling element of an enclosing `Pipe`, or the target of an
+    // `IndexExpr`/`SliceExpr` — which used to lose the marker because
+    // `resolve_catch` answered "is this final?" eagerly, before the
+    // enclosing expression had a chance to say otherwise. Same fallacy #986
+    // Stage 2 already fixed for `Expr::Comma`; fixed here the same way by
+    // deleting `resolve_catch`'s own eager check and letting the branch's
+    // `trackable` flag propagate outward instead. All confirmed against jq
+    // 1.7.1.
+
+    /// The issue's own repro: `.[]` after a `Pipe` boundary must still raise
+    /// jq's "near attempt to iterate" wording, not the generic "with
+    /// result" message `resolve_catch`'s old eager check produced.
+    #[test]
+    fn test_path_catch_handler_pipe_boundary_iterate_raises_near_attempt_1297() {
+        query!(b"null", r"path((try error([1,2,3]) catch .) | .[])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to iterate through [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Same shape, a `Field` step after the boundary instead of `Iterate`.
+    #[test]
+    fn test_path_catch_handler_pipe_boundary_field_raises_near_attempt_1297() {
+        query!(b"null", r"path((try error(5) catch .) | .a)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"a\" of 5"
+                );
+            }
+        );
+    }
+
+    /// The investigation for #1297 found this bug is not exclusively a
+    /// `Pipe` boundary — `resolve_index_expr`'s own post-target check has
+    /// the identical gap for a computed index built directly on a
+    /// `try`/`catch`, no `Pipe` node in the AST at all.
+    #[test]
+    fn test_path_catch_handler_index_expr_target_boundary_raises_near_attempt_1297() {
+        query!(b"null", r"path((try error([1,2,3]) catch .)[0])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element 0 of [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Same boundary gap, `resolve_slice_expr`'s sibling check.
+    #[test]
+    fn test_path_catch_handler_slice_expr_target_boundary_raises_near_attempt_1297() {
+        query!(b"null", r"path((try error([1,2,3]) catch .)[0:2])",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element {\"start\":0,... of [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Write-side (`=`): the same boundary loss affected assignment, not
+    /// just `path()` — parens force the whole pipe to be the assignment
+    /// *target* (`=` binds tighter than `|`, so `A | B = C` would otherwise
+    /// parse as `A | (B = C)`, a different shape entirely that never
+    /// touches this machinery).
+    #[test]
+    fn test_assign_pipe_boundary_iterate_raises_near_attempt_1297() {
+        query!(b"null", r"(((try error([1,2,3]) catch .) | .[]) = 1)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to iterate through [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Write-side (`|=`), same boundary shape.
+    #[test]
+    fn test_update_assign_pipe_boundary_field_raises_near_attempt_1297() {
+        query!(b"null", r"(((try error(5) catch .) | .a) |= 5)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"a\" of 5"
+                );
+            }
+        );
+    }
+
+    /// `del()`, same boundary shape — the fourth of the four callers
+    /// `resolve_dynamic_indexes` serves (`path()`/`=`/`|=`/`del()`).
+    #[test]
+    fn test_del_pipe_boundary_field_raises_near_attempt_1297() {
+        query!(b"null", r"del((try error([1,2,3]) catch .) | .a)",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"a\" of [1,2,3]"
+                );
+            }
+        );
+    }
+
+    /// Regression guard: the original motivating case for `resolve_catch`'s
+    /// now-deleted eager check must still raise, not silently corrupt the
+    /// document — just caught one level up, by `resolve_dynamic_indexes`'s
+    /// own terminal check, instead of inside `resolve_catch` itself.
+    #[test]
+    fn test_assign_bare_terminal_select_still_raises_not_corrupts_1297() {
+        query!(br#"{"a":10}"#, r#"try (.a, error({"y":99})) catch select(true) = "X""#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"y":99}"#);
+            }
+        );
     }
 
     #[test]
