@@ -1996,6 +1996,10 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             },
             sink,
         ),
+        // The one arm here that is a correctness fix rather than an
+        // optimization -- see `each_inputs` for why the fallback below is
+        // not a safe default for this particular producer (#1309).
+        Expr::Builtin(Builtin::Inputs) => each_inputs::<W, S>(sink),
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
@@ -25853,38 +25857,6 @@ mod remaining_inputs {
         popped
     }
 
-    /// Drains every remaining document at once, for `inputs`'s eager
-    /// generator collection -- this codebase has no lazy generator
-    /// machinery at the `Builtin` dispatch level, so `inputs` doesn't
-    /// invent one for just this case.
-    ///
-    /// Correction (code review, #723): an earlier version of this comment
-    /// compared this to `range`'s own eager-with-a-cap convention and called
-    /// over-draining "the same accepted trade-off." That analogy doesn't
-    /// hold. `range`'s over-computed values are cheap to regenerate and
-    /// simply discarded -- pure wasted CPU, invisible to the rest of the
-    /// program. This queue is a *shared, destructive, non-replayable*
-    /// resource: once `first(inputs)`/`limit(1; inputs)`/`any(inputs; ...)`
-    /// (any combinator this evaluator's own eager model computes-then-
-    /// truncates rather than short-circuits) triggers a full drain, every
-    /// document past the one actually kept is gone -- not just from this
-    /// call, but from the outer per-document loop and any later `input`
-    /// call too. Confirmed live: `first(inputs)` on 5 remaining documents
-    /// silently reads and discards all 5 instead of the 1 real jq's lazy
-    /// generator would leave the rest of the program to see. Filed as
-    /// follow-up issue #1309 (same root cause as, and bundled with, the
-    /// `-L` detection gap above) -- fixing it needs either real lazy
-    /// generator support in this evaluator or a way for a truncating
-    /// combinator to push documents it doesn't end up using back onto the
-    /// front of the queue, neither of which is a small change.
-    pub fn drain_all() -> Vec<(OwnedValue, u32)> {
-        let all: alloc::vec::Vec<_> = QUEUE.with(|q| q.borrow_mut().drain(..).collect());
-        if let Some((_, line)) = all.last() {
-            LAST_LINE.with(|l| l.set(*line));
-        }
-        all
-    }
-
     pub fn last_line() -> u32 {
         LAST_LINE.with(Cell::get)
     }
@@ -25962,27 +25934,67 @@ fn builtin_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult
     }
 }
 
-/// Builtin: inputs - every remaining input document, one output each (#723).
-/// Stops cleanly (no output, no error) once exhausted -- unlike bare `input`,
-/// this never raises; real jq's own `inputs` is `try repeat(input) catch
-/// if .=="break" then empty else error end`, and this collects the
-/// equivalent eagerly (see [`remaining_inputs::drain_all`]'s doc comment for
-/// why eager, not lazy, matches this codebase's own convention).
-fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
+/// `inputs` as a demand-driven producer: pull queued documents one at a time,
+/// stopping the moment `sink` says to (#1309).
+///
+/// **This is the one arm in [`eval_each`] that is not merely an
+/// optimization.** [`drain_result`]'s invariant -- an un-lazified arm is a
+/// missed optimization, never a behaviour change -- is stated over *the values
+/// delivered to this sink*, and is silent about side effects on state the sink
+/// does not own. For every other producer, over-production costs only CPU:
+/// `range`'s extra values are cheap to regenerate and simply discarded. This
+/// queue is a shared, destructive, non-replayable resource that the CLI's own
+/// per-document driver loop and every later `input` call also draw from, so a
+/// document produced for a consumer that never asked for it is gone from the
+/// rest of the program, not just from this expression.
+///
+/// The previous eager `drain_all` therefore lost data outright:
+/// `., first(inputs)` on `1 2 3 4 5` printed `1 2` where jq 1.7.1 prints
+/// `1 2 3 4 5`, and `., any(inputs; . > 2)` printed `1 true` against jq's
+/// `1 true 4 true`. Both are now byte-identical.
+///
+/// Never raises: real jq defines `inputs` as `try repeat(input) catch if
+/// . == "break" then empty else error end`, so exhaustion ends the stream
+/// cleanly rather than surfacing bare `input`'s own `break` error.
+fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
     if let Some(e) = input_builtins_unsupported_in_yq_mode::<S>("inputs") {
-        return QueryResult::Error(e);
+        return Flow::Escaped(Control::Error(e));
     }
     #[cfg(feature = "std")]
     {
-        let docs: Vec<OwnedValue> = remaining_inputs::drain_all()
-            .into_iter()
-            .map(|(doc, _line)| doc)
-            .collect();
-        owned_vec_to_result(docs)
+        while let Some((doc, _line)) = remaining_inputs::pop() {
+            if sink(Item::Owned(doc)) == Demand::Stop {
+                // `pop` cannot fail, so nothing was raised before the stop and
+                // there is no unreached control to carry forward.
+                return Flow::Stopped { pending: None };
+            }
+        }
+        Flow::Exhausted
     }
     #[cfg(not(feature = "std"))]
     {
-        owned_vec_to_result(Vec::new())
+        Flow::Exhausted
+    }
+}
+
+/// Builtin: inputs - every remaining input document, one output each (#723).
+///
+/// The materializing face of [`each_inputs`], for callers that genuinely want
+/// the whole stream. One definition of how `inputs` produces documents, so the
+/// eager and lazy paths cannot drift -- and in particular so the yq-mode gate
+/// cannot be bypassed by whichever path a filter happens to take.
+fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
+    let mut docs: Vec<OwnedValue> = Vec::new();
+    match each_inputs::<W, S>(&mut |item| {
+        docs.push(item.into_owned());
+        Demand::Continue
+    }) {
+        // A `Continue`-only sink never stops, but the arm costs nothing and
+        // keeps this total rather than relying on that.
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(docs),
+        Flow::Escaped(control) => control_to_result(control),
     }
 }
 
