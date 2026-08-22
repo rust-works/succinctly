@@ -684,6 +684,12 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// `V::Fields`, not a slice -- so it joins the materializing fallback rather
 /// than staying lazy. That trades #724's laziness for correctness on an
 /// input that cannot use it anyway.
+///
+/// The empty-`fields` arms below are unreachable rather than dead: this
+/// function is only called once `collapsed_fields` has answered `Some`,
+/// which needs a key to have repeated, which needs at least two fields.
+/// They cannot be deleted -- `Vec::into_iter().next()` is an `Option`, and
+/// the cons-list arms they mirror do have to handle an empty object.
 fn lazy_keys_collapsed<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     fields: Vec<DocumentField<V, V::Cursor>>,

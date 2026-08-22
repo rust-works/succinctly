@@ -476,6 +476,55 @@ both, and only `reduce (keys[]) as $k (.; .)` diverges (jq raises "near attempt 
 through [\"a\"]", succinctly accepts) — tracked as
 [#1467](https://github.com/rust-works/succinctly/issues/1467).
 
+## Duplicate object keys collapse, except under `--preserve-input`
+
+jq collapses a repeated object key when it *builds* the value — first position kept, last
+value wins, exactly `IndexMap::insert` semantics. Since
+[#1385](https://github.com/rust-works/succinctly/issues/1385) `succinctly jq` does the same
+on every path, including the cursor-native ones that never materialize a value, so
+`{"b":1,"a":2,"b":3}` answers `{"b":3,"a":2}` for `.`, `2` for `length`, `["a","b"]` for
+`keys` and `[3,2]` for `[.[]]` — all captured from the pin. Default jq mode therefore has
+**no divergence to record here**; this section exists for the one flag that opts out, and
+for the one input class where "the same key" is undecidable.
+
+**`--preserve-input` preserves duplicate keys on *output only*.** The flag is a succinctly
+extension whose purpose is echoing the input's original spelling, and ADR-0018 rule 5
+exempts it because it perturbs no reference-defined filter. That exemption reaches the
+printer, not the evaluator:
+
+| filter          | `sjq`           | `sjq --preserve-input` |
+|-----------------|-----------------|------------------------|
+| `.`             | `{"b":3,"a":2}` | `{"b":1,"a":2,"b":3}`  |
+| `.x` (nested)   | `{"b":3,"a":2}` | `{"b":1,"a":2,"b":3}`  |
+| `length`        | `2`             | `2`                    |
+| `keys`          | `["a","b"]`     | `["a","b"]`            |
+| `[.[]]`         | `[3,2]`         | `[3,2]`                |
+| `to_entries`    | 2 entries       | 2 entries              |
+
+This is the split the flag already has for numbers, not a new one: `--preserve-input`
+echoes `4e4` as written while `.n + 0` still evaluates to `40000`. The flag chooses how a
+value is *spelled* on the way out; it never changes what the value model *is*. Gating the
+evaluator on it as well would mean a third `EvalSemantics` implementor and a third
+monomorphization of the whole generic evaluator, for one CLI flag — so the boundary is
+drawn at the printer deliberately, and
+`test_preserve_input_duplicate_keys_are_output_only_1385` pins both halves so it cannot
+drift silently.
+
+**A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
+validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects
+outright with `Invalid escape` / `Invalid \uXXXX\uXXXX surrogate pair escape` — still
+reaches the evaluator. Such a key has no decoded name to compare, so it participates in no
+collapse and is echoed verbatim from its source span:
+
+```
+$ echo '{"a\q":1,"b":2,"b":3}' | jq -c  .        # parse error: Invalid escape
+$ echo '{"a\q":1,"b":2,"b":3}' | sjq -c .        # {"a\q":1,"b":3}
+```
+
+`b` collapses; `a\q` survives, and `length`, `keys` and `[.[]]` all agree that the object
+has two members. Dropping it instead — which is what the first cut of #1385 did — deleted
+the field from output while `length` went on counting it.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
