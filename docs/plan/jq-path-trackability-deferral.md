@@ -188,10 +188,19 @@ The check therefore belongs only at sites that genuinely know nothing follows:
   `builtin_path` (`:18041`), `builtin_del` (`:19660`). It performs no trackability check
   today, delegating entirely to the catch-all. **This is the check's new home**, applied
   per-branch using each branch's own carried flag.
-- **`resolve_catch`** — already a genuinely terminal position by construction (nothing in
-  `Expr::Try`'s own shape can have something after the catch handler within the same node).
-  It keeps calling `reject_if_untracked`, which must itself become per-branch aware rather
-  than consulting a single scalar and `branches.first()`.
+- **Not `resolve_catch`, either — corrected by #1297.** This document originally claimed
+  `resolve_catch` was "already a genuinely terminal position by construction (nothing in
+  `Expr::Try`'s own shape can have something after the catch handler within the same
+  node)" and left its `reject_if_untracked` call in place. That is the *exact* false-premise
+  trap named two paragraphs up, just for `Try` instead of `Comma`: true of the `Try` node's
+  own shape, but silent about whatever *encloses* it. `(try error([1,2,3]) catch .) | .[]`
+  has plenty left to navigate into — jq reports "near attempt to iterate through [1,2,3]",
+  but the eager check reported the generic "with result [1,2,3]" instead, never letting
+  `.[]` run. Same bug for an `IndexExpr`/`SliceExpr` target built directly on a `try`/
+  `catch` (`(try ... catch .)[0]`), no `Pipe` involved at all. Fixed by deleting
+  `resolve_catch`'s call entirely (not by making it per-branch aware, since it has no
+  business making this call at any granularity) — `Expr::Try`'s arm now returns each
+  branch carrying its own `trackable` outward, same as `Comma`.
 - **Not `resolve_seq`, and not `Comma`.**
 
 This placement is simpler than the earlier draft *and* strictly more faithful to the
