@@ -5,11 +5,15 @@ use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::collections::BTreeMap;
 #[cfg(not(test))]
+use alloc::rc::Rc;
+#[cfg(not(test))]
 use alloc::string::String;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::rc::Rc;
 
 use super::value::{NumberRepr, OwnedValue};
 
@@ -270,7 +274,18 @@ pub enum Expr {
     /// the parser. `resolve_node`'s own arm for this variant decides
     /// path-trackability lazily, by comparing this snapshot against the
     /// ambient value it holds at the point of use (#844).
-    TrackedVar(Box<OwnedValue>),
+    ///
+    /// `Rc`, not `Box`: a `$var` bound once outside a loop and referenced
+    /// inside it gets re-embedded into a fresh substituted `Expr` tree on
+    /// every loop iteration (`substitute_var_impl`'s ordinary AST-rebuild),
+    /// and every one of those rebuilds clones this node. A `Box` clone
+    /// deep-copies the whole snapshot -- O(document size) per iteration,
+    /// measured as a genuine multi-second regression on a "bind the root
+    /// once, loop, dereference it" filter (#844 review). `Rc::clone` is an
+    /// O(1) refcount bump, so the snapshot is allocated once at the outer
+    /// binding and shared, not repeatedly re-copied, by every inner
+    /// iteration that re-embeds it.
+    TrackedVar(Rc<OwnedValue>),
 
     /// Location reference: `$__loc__`
     /// Returns `{"file": "<stdin>", "line": N}` where N is the 1-based line number
