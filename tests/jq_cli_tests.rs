@@ -16774,6 +16774,56 @@ fn test_jq_field_named_input_is_not_an_input_builtin_1309() -> Result<()> {
     Ok(())
 }
 
+// #1309 item 2: a truncating combinator over `inputs` must consume only the
+// documents it actually uses. The queue is shared with the CLI's own
+// per-document loop and is non-replayable, so an over-eager drain does not
+// merely waste work -- every document past the one kept is gone from the rest
+// of the program. Every expectation below is pinned jq 1.7.1's own output for
+// the same argv.
+
+#[test]
+fn test_jq_truncating_combinators_do_not_drain_inputs_1309() -> Result<()> {
+    let five = "1\n2\n3\n4\n5\n";
+    for (filter, expected) in [
+        // Doc 1 arrives as `.`; the combinator takes one more and leaves 3-5
+        // for the outer loop, which then repeats the pattern.
+        ("., limit(1; inputs)", "1\n2\n3\n4\n5\n"),
+        ("., nth(1; inputs)", "1\n3\n4\n"),
+        // `any` stops at its first match, `all` at its first failure.
+        ("., any(inputs; . > 2)", "1\ntrue\n4\ntrue\n"),
+        ("., all(inputs; . > 2)", "1\nfalse\n3\ntrue\n"),
+        // `isempty` needs only one output to answer; `IN` finds no match for
+        // `.` and so genuinely does exhaust the stream, leaving one iteration.
+        ("., isempty(inputs)", "1\nfalse\n3\nfalse\n5\ntrue\n"),
+        ("., IN(inputs)", "1\nfalse\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(five)).expect("truncating-combinator repro runs");
+        assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// The line-number half of the same fix: `input_line_number` reports the last
+/// document actually read, so a truncated `inputs` must leave it pointing at
+/// the document the consumer kept rather than at the end of the stream.
+///
+/// `inputs | input_line_number` (jq: `1 2 3`) is deliberately absent -- that
+/// needs the *pipe* to interleave, which is tracked separately. See
+/// `docs/compliance/jq/limitations.md`.
+#[test]
+fn test_jq_input_line_number_after_truncated_inputs_1309() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "limit(1; inputs) | input_line_number"],
+        Some("1\n2\n3\n"),
+    )
+    .expect("truncated-line repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
