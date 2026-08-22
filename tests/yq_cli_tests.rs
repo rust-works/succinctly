@@ -21063,3 +21063,75 @@ fn test_yq_comma_path_context_threads_per_output_path_1409() -> Result<()> {
     assert_eq!(output, "0\n1\n2\n");
     Ok(())
 }
+
+// ============================================================================
+// #1279: generator-argument fan-out is per-builtin in yq mode
+//
+// jq desugars `f(x)` as `x as $b | body`, so every generator-argument builtin
+// emits one result per output of `x`. Real yq does NOT do this uniformly, and
+// per ADR-0018 the *mode* decides — so `ArgFanout::yq_native::<S>()` gates the
+// builtins real yq has and does not fan out, while `contains` (which real yq
+// *does* fan out) and the builtins real yq's lexer rejects outright are
+// ungated.
+//
+// These tests are the gate. If someone implements the fan-out on the shared
+// `<S>`-generic function without threading `ArgFanout` through, jq mode gets
+// better and these fail — which is the whole point, since the jq golden corpus
+// cannot see yq mode at all.
+// ============================================================================
+
+/// `contains` is the one builtin in this family where jq and yq agree: both
+/// fan out. Live-verified against the pinned yq v4.53.3 —
+/// `[.x | contains(("a","zz"))]` on `x: abc` is `[true,false]` there, the same
+/// as jq. So it is deliberately NOT gated, and this pins that: gating it would
+/// *introduce* a divergence from real yq rather than preserve one.
+#[test]
+fn test_yq_contains_fans_out_over_a_multi_output_argument_1279() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "[.x | contains((\"a\",\"zz\"))]",
+        "x: abc\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[true,false]");
+
+    // Containers too, not just the string path — real yq gives [true,false]
+    // for both of these as well.
+    let (out, code) = run_yq_stdin(
+        "[.x | contains(([1],[9]))]",
+        "x: [1, 2, 3]\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[true,false]");
+    Ok(())
+}
+
+/// `has` is the counterpart: real yq has it and uses only the first output.
+/// Live-verified against the pinned yq v4.53.3 — `[has(("a","b"))]` on `a: 1`
+/// is `[true]` there, where jq gives `[true,false]`. Bug-for-bug per ADR-0018,
+/// so yq mode must keep truncating even though jq mode now fans out.
+#[test]
+fn test_yq_has_uses_only_the_first_argument_output_1279() -> Result<()> {
+    let (out, code) = run_yq_stdin("[has((\"a\",\"b\"))]", "a: 1\n", &["-o", "json", "-I", "0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[true]");
+    Ok(())
+}
+
+/// The gate is per-mode, not per-format: the same YAML document run through
+/// `succinctly jq` (which reads JSON, so this uses the JSON spelling) fans
+/// `has` out. Without this, a gate accidentally written against the *format*
+/// rather than `EvalSemantics` would still pass the two tests above.
+#[test]
+fn test_yq_has_gate_is_per_mode_not_per_format_1279() -> Result<()> {
+    // yq mode over JSON input: still yq semantics, still truncates.
+    let (out, code) = run_yq_stdin(
+        "[has((\"a\",\"b\"))]",
+        "{\"a\": 1}\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[true]");
+    Ok(())
+}

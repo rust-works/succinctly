@@ -1079,7 +1079,11 @@ enum ObjectEscape {
 }
 
 /// Materialize every output of a sub-expression, plus a deferred escape if its
-/// own generator terminates in an error or break.
+/// own generator terminates in an error, a break or a halt.
+///
+/// The one primitive behind every generator fan-out in this file: object
+/// construction (#354), string interpolation (#1403) and generator-argument
+/// builtins (#1279).
 ///
 /// jq doesn't stop early just because a generator is *going* to fail: `(1, 2,
 /// error("x"))` still yields `1` and `2` before the error propagates, and
@@ -1091,7 +1095,15 @@ enum ObjectEscape {
 /// once that prefix is exhausted. [`QueryResult::collect_owned`] isn't reused
 /// for the non-`Partial` cases because it would fold `Partial` down to just
 /// its prefix and silently drop the control that must fire after it.
-fn object_outputs<W: Clone + AsRef<[u64]>>(
+///
+/// A `Partial(_, Control::Halt)` gets no special case here, deliberately
+/// (#1277). Real jq emits the prefix and *then* halts — `echo '"abc"' | jq -c
+/// 'ltrimstr((1, halt_error(6)))'` prints `"abc"` on stdout, `abc` on stderr,
+/// and exits 6 — which is exactly what `(prefix, Some(Control::Halt))` plus
+/// [`partial`] produces. [`result_to_owned_full`]'s dedicated
+/// `Partial(_, Halt) => Err(Halt)` arm exists only because *that* function
+/// keeps a single value and so has no honest prefix to emit alongside it.
+fn stream_outputs<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result {
@@ -1128,7 +1140,7 @@ impl From<Control> for ObjectEscape {
 /// - the key's string-ness is checked at assembly time, after the value is in
 ///   hand, so `{(.n): empty}` with a numeric `.n` raises nothing and
 ///   `{(.n): error("VAL")}` reports `VAL` rather than the key-type error;
-/// - a key or value generator's own deferred control (see [`object_outputs`])
+/// - a key or value generator's own deferred control (see [`stream_outputs`])
 ///   is checked only after its whole prefix loop has run to completion, and
 ///   is then returned via `?` — which unwinds every enclosing loop immediately
 ///   rather than resuming them, matching jq's own all-or-nothing backtracking:
@@ -1169,14 +1181,14 @@ fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (keys, key_trailing) = match &entry.key {
         ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
         ObjectKey::Expr(key_expr) => {
-            object_outputs(eval_single::<W, S>(key_expr, value.clone(), optional))
+            stream_outputs(eval_single::<W, S>(key_expr, value.clone(), optional))
         }
     };
     let sole = sole && keys.len() == 1;
 
     for key in keys {
         let (vals, val_trailing) =
-            object_outputs(eval_single::<W, S>(&entry.value, value.clone(), optional));
+            stream_outputs(eval_single::<W, S>(&entry.value, value.clone(), optional));
         let sole = sole && vals.len() == 1;
 
         for val in vals {
@@ -1431,6 +1443,95 @@ fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, 
         }
     } else {
         QueryResult::Partial(prefix, control)
+    }
+}
+
+/// Whether a builtin's generator argument produces one call per output — jq's
+/// own `f(x)` == `x as $b | body` desugaring (#1279) — or is collapsed to its
+/// first output.
+///
+/// Per [ADR-0018](../../docs/adrs/adr-0018.md) the *mode* decides, never the
+/// input format, so this is a property of [`EvalSemantics`] rather than of the
+/// call site. Real yq has only a handful of these builtins and takes the first
+/// output for most of them; for the rest its lexer rejects the call outright,
+/// which makes jq's model unopposed there rather than a divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgFanout {
+    /// One result per argument output, as real jq does.
+    All,
+    /// Only the argument's first output is used; later ones are discarded.
+    FirstOnly,
+}
+
+impl ArgFanout {
+    /// The gate for a builtin real yq *has* and does *not* fan out.
+    ///
+    /// Live-probed against the pinned yq v4.53.3; each call site cites its own
+    /// probe. `contains` is deliberately **not** gated: it is the one shared
+    /// builtin that does fan out in real yq (`[.x | contains(("a","zz"))]` on
+    /// `abc` is `[true,false]`, matching jq), so gating it would introduce a
+    /// divergence rather than preserve one.
+    fn yq_native<S: EvalSemantics>() -> Self {
+        if S::TAG == EvalTag::Yq {
+            Self::FirstOnly
+        } else {
+            Self::All
+        }
+    }
+}
+
+/// Run `body` once per output of an already-evaluated generator argument,
+/// concatenating the results, then fire the argument's own trailing control.
+///
+/// jq desugars a generator-argument builtin call `f(x)` as roughly `x as $b |
+/// body`, and jq's `as` runs its body once per output of `x` — so `1 |
+/// [contains((1,2))]` is `[true,false]`, not `[true]` (#1279).
+///
+/// Three ordering rules, each live-verified against the pinned jq 1.7.1 and
+/// each with a golden case behind it:
+///
+/// 1. The loop runs to completion over *every* argument value first, and only
+///    then does the argument's deferred control fire: `"abcabc" | label $out |
+///    [ltrimstr(("a","b", break $out))]` is `["bcabc","abcabc"]`. This is the
+///    same rule [`build_string_parts`] (#1403) and [`build_object_entries`]
+///    (#354) already document; the difference is one loop here instead of a
+///    recursion.
+/// 2. A failure raised by `body` itself aborts the loop but *keeps* the prefix
+///    already produced: `"abc" | contains(("a", 1))` writes `true` to stdout
+///    and then raises the containment error, exiting 5.
+/// 3. Therefore `body`'s own error can outrank a trailing `halt`, and for some
+///    builtins it does — `jq -cn 'setpath((1, halt_error(6)); 1)'` exits 5 with
+///    "Path must be specified as an array", because the value `1` fails before
+///    the halt is ever reached. "Emit the prefix, then halt" is not a separate
+///    rule; it is what rule 2 produces when the loop gets that far.
+fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
+    arg: QueryResult<'a, W>,
+    fanout: ArgFanout,
+    mut body: impl FnMut(OwnedValue) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    let (mut args, trailing) = stream_outputs(arg);
+    if fanout == ArgFanout::FirstOnly {
+        args.truncate(1);
+    }
+
+    // Allocation-identical fast path for the single-output case, which is
+    // every query that predates #1279. `body`'s result is returned *verbatim*,
+    // so a borrowed `One`/`OneCursor` (`nth` -> `index_one`, `flatten` ->
+    // `builtin_flatten`) keeps the zero-copy path `finish_result`'s own `None`
+    // arm used to preserve. Without this, `[1,2,3] | nth(0)` would materialize.
+    if trailing.is_none() && args.len() == 1 {
+        return body(args.pop().expect("len() == 1 guarantees an element"));
+    }
+
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for arg in args {
+        if let Some(control) = push_owned_values(body(arg), &mut out) {
+            return partial(out, control);
+        }
+    }
+    match trailing {
+        Some(control) => partial(out, control),
+        None => owned_vec_to_result(out),
     }
 }
 
@@ -4779,15 +4880,28 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the key expression
-    let key_result = eval_single::<W, S>(key_expr, value.clone(), optional);
-    let (key_owned, trailing) = match result_to_owned_full(key_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
+    fanout_arg(
+        eval_single::<W, S>(key_expr, value.clone(), optional),
+        // Real yq *has* `has()` and does not fan it out: live-verified against
+        // the pinned v4.53.3, `[has(("a","b"))]` on `a: 1` is `[true]`, where
+        // jq gives `[true,false]`. Bug-for-bug per ADR-0018, so yq mode keeps
+        // using only the first key.
+        ArgFanout::yq_native::<S>(),
+        |key_owned| has_one_key::<W, S>(&value, key_owned, optional),
+    )
+}
 
-    let result = match (&value, &key_owned) {
+/// `has(key)`'s check for one already-resolved key — the body of
+/// [`builtin_has`], run once per output of its key generator (#1279).
+///
+/// Split out rather than inlined into the closure because the match arms below
+/// need to `return` from *this* computation, not from the fan-out loop.
+fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    key_owned: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match (value, &key_owned) {
         // jq: null | has("key") => false
         (StandardJson::Null, _) => QueryResult::Owned(OwnedValue::Bool(false)),
         // Object has string key
@@ -4853,11 +4967,10 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ if has_type_mismatch_is_permissive::<S>() => QueryResult::Owned(OwnedValue::Bool(false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_check_has(
-            type_name(&value),
+            type_name(value),
             key_owned.type_name(),
         )),
-    };
-    finish_result(result, trailing)
+    }
 }
 
 /// Builtin: in(xs)
@@ -6237,22 +6350,29 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the value to check
-    let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
-    let (b, trailing) = match result_to_owned_full(b_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
-
+    // Hoisted out of the fan-out: the input does not vary with `b`, and
+    // `to_owned` deep-copies the whole document — inside the loop, an N-output
+    // argument would pay for it N times.
     let input = to_owned(&value);
-    if jq_kind(&input) != jq_kind(&b) {
-        if optional {
-            return QueryResult::None;
-        }
-        return QueryResult::Error(EvalError::containment_check(&input, &b));
-    }
-    finish_owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)), trailing)
+    fanout_arg(
+        eval_single::<W, S>(b_expr, value.clone(), optional),
+        // Not gated to yq's first-output-only behaviour, unlike its neighbours:
+        // real yq fans `contains` out too (live-verified against the pinned
+        // v4.53.3 — `[.x | contains(("a","zz"))]` on `abc` is `[true,false]`,
+        // the same as jq), so this is the one shared builtin where the two
+        // reference tools agree.
+        ArgFanout::All,
+        |b| {
+            if jq_kind(&input) != jq_kind(&b) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::containment_check(&input, &b))
+                };
+            }
+            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)))
+        },
+    )
 }
 
 /// Check if `a` contains `b` (recursive containment check)
@@ -6994,14 +7114,14 @@ fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
 /// Materialize a `\(...)` slot's own outputs as rendered strings, plus a
 /// deferred escape if its generator terminates in an error/break/halt.
 ///
-/// Reuses [`object_outputs`] (already fully general -- it just unpacks a
+/// Reuses [`stream_outputs`] (already fully general -- it just unpacks a
 /// `QueryResult` into `(Vec<OwnedValue>, Option<Control>)` with no
 /// object-specific coupling) and stringifies each output the same way a
 /// single-valued slot already did (`owned_to_string`).
 fn string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<String>, Option<Control>) {
-    let (values, control) = object_outputs(result);
+    let (values, control) = stream_outputs(result);
     (values.iter().map(owned_to_string::<S>).collect(), control)
 }
 
@@ -21845,7 +21965,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 /// Path-context analog of `string_part_outputs`: `eval_pipe_with_path_context_internal`
 /// never produces `One`/`OneCursor`/`Many` (every `unreachable!` in this file says so),
 /// so this matches that narrower shape directly instead of going through
-/// `object_outputs`/`collect_owned`, which exist to handle the fully generic evaluator's
+/// `stream_outputs`/`collect_owned`, which exist to handle the fully generic evaluator's
 /// borrowed-cursor variants too.
 fn path_context_string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
@@ -51657,7 +51777,7 @@ mod tests {
         // `QueryResult::collect_owned`'s `Halt` arm (#791). Every internal
         // caller of `collect_owned()` in this file already intercepts
         // `QueryResult::Halt` explicitly *before* falling into the generic
-        // `other => other.collect_owned()` branch -- see `object_outputs`
+        // `other => other.collect_owned()` branch -- see `stream_outputs`
         // (matches `Halt` itself before its `other` fallback),
         // `eval_owned_multi`/`eval_owned_multi_first` (both match `Halt`
         // before their `other => Ok(other.collect_owned())` arm), and
@@ -52217,6 +52337,67 @@ mod tests {
         let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
         match result_to_owned_ctrl(result) {
             Ok((OwnedValue::String(s), None)) => assert_eq!(s, "x"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1279: `fanout_arg`'s loop over a *borrowed* multi-output argument
+    /// (`QueryResult::Many`).
+    ///
+    /// Same coverage gap as `result_to_owned_ctrl_many_arm_takes_first_borrowed_value_1164`
+    /// right above, and for the same reason: a builtin argument whose outputs
+    /// come straight from document cursors is hard to reach from the CLI,
+    /// because almost every generator a filter can write (`(1,2)`, arithmetic,
+    /// literals) produces `ManyOwned` instead. `.a, .b` over a real
+    /// `JsonIndex` is the shape that does.
+    ///
+    /// Also pins the two properties the fast path must not swallow: two
+    /// argument outputs produce two results, in argument order.
+    #[test]
+    fn fanout_arg_runs_the_body_once_per_borrowed_argument_output_1279() {
+        let json: &[u8] = br#"{"a":"x","b":"y"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a, .b").unwrap();
+        let arg = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+
+        let mut seen = Vec::new();
+        let result = fanout_arg(arg, ArgFanout::All, |v| {
+            seen.push(v.to_json());
+            QueryResult::Owned(v)
+        });
+
+        assert_eq!(seen, vec![r#""x""#, r#""y""#]);
+        match result {
+            QueryResult::ManyOwned(vs) => {
+                let rendered: Vec<String> = vs.iter().map(OwnedValue::to_json).collect();
+                assert_eq!(rendered, vec![r#""x""#, r#""y""#]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1279 companion: the same borrowed `Many` argument under
+    /// [`ArgFanout::FirstOnly`], the yq gate. The body must run exactly once,
+    /// and the result must be the single-value shape yq mode produced before
+    /// the fan-out existed -- not a one-element `ManyOwned`.
+    #[test]
+    fn fanout_arg_first_only_gate_runs_the_body_once_1279() {
+        let json: &[u8] = br#"{"a":"x","b":"y"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a, .b").unwrap();
+        let arg = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+
+        let mut calls = 0;
+        let result = fanout_arg(arg, ArgFanout::FirstOnly, |v| {
+            calls += 1;
+            QueryResult::Owned(v)
+        });
+
+        assert_eq!(calls, 1);
+        match result {
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
     }
