@@ -219,6 +219,21 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(cursor: &C, depth: usize) -> Owne
         cursor
             .explicit_tag()
             .and_then(|tag| tagged_scalar_to_owned(tag, &value))
+            .or_else(|| {
+                // A JSON-sourced number literal never keeps its own
+                // spelling (#978, #1398) -- checked before the ordinary
+                // `to_owned_at_depth` fallback below, which preserves it
+                // (correct for genuine YAML, #918). `explicit_tag` still
+                // takes precedence: a tag-forced type is a stronger,
+                // narrower signal than the document's own source format.
+                if cursor.canonicalize_numbers() {
+                    value
+                        .number_literal()
+                        .map(|literal| OwnedValue::from_number_literal_plain(&literal))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| to_owned_at_depth(&value, depth))
     }
 }
