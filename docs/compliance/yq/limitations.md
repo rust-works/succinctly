@@ -439,6 +439,39 @@ $ printf 'a: [1, 2]\n' | yq            -o=json '.a[].b = error("boom")'   # {"a"
 $ printf 'a: [1, 2]\n' | succinctly yq -o=json '.a[].b = error("boom")'   # Error: boom
 ```
 
+### `-o=auto` on a genuinely mixed-format multi-source run doesn't match per-element
+
+[#1493](https://github.com/rust-works/succinctly/issues/1493) made `-o=auto` resolve
+against the input's own format instead of always rendering JSON — YAML input renders as
+YAML, JSON input as JSON, per-source (`--split-exp`, the standard multi-file path,
+`--eval-all`, `--inplace`) or per-invocation-uniform-format (`--slurp`/`--eval-all` when
+every source agrees). A genuinely *mixed*-format run is the one case left unresolved:
+real yq treats the whole output as one YAML stream with each JSON-sourced document
+embedded flow-style, `---` between every document regardless of source format —
+succinctly instead gives each document its own correct format independently, with no
+separator between differently-formatted documents and no flow-style JSON embedding:
+
+```bash
+$ printf 'a: 1\n' > a.yaml && printf '{"b":2}' > b.json
+
+$ yq            -o=auto '.' a.yaml b.json   # a: 1
+                                             # ---
+                                             # {"b": 2}
+$ succinctly yq -o=auto '.' a.yaml b.json   # a: 1
+                                             # {
+                                             #   "b": 2
+                                             # }
+
+$ yq            -o=auto --slurp '.' a.yaml b.json   # - a: 1
+                                                      # - {"b": 2}
+$ succinctly yq -o=auto --slurp '.' a.yaml b.json    # - a: 1
+                                                       # - b: 2
+```
+
+Live-verified against yq v4.53.3. Pinned as known gaps (current, not the desired end
+state) by `test_yq_auto_output_mixed_format_multi_file_known_gap_1493` and
+`test_yq_auto_output_slurp_mixed_format_known_gap_1493` in `tests/yq_cli_tests.rs`.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
