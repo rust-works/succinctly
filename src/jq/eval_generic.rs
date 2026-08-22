@@ -3125,6 +3125,16 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     want_last: bool,
 ) -> GenericResult<V> {
+    // `first` over a comma stops at the first sibling that yields an output,
+    // so later siblings are never evaluated (#820 Stage 2b). `last` cannot
+    // short-circuit -- it does not know a value is the last until the stream
+    // is exhausted -- so it keeps the eager path below.
+    if !want_last {
+        if let Some(result) = first_over_comma_generic::<S, V>(inner, &value, optional, cursor) {
+            return result;
+        }
+    }
+
     let result = eval_single::<S, V>(inner, value, optional, cursor);
     if want_last {
         match result {
@@ -3169,43 +3179,88 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),
         }
     } else {
-        match result {
-            GenericResult::One(v) => GenericResult::One(v),
-            GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
-            GenericResult::Many(vs) => match vs.into_iter().next() {
-                Some(v) => GenericResult::One(v),
-                None => GenericResult::None,
-            },
-            GenericResult::ManyCursor(cs) => match cs.into_iter().next() {
-                Some(c) => GenericResult::OneCursor(c),
-                None => GenericResult::None,
-            },
-            GenericResult::Owned(v) => GenericResult::Owned(v),
-            GenericResult::ManyOwned(vs) => match vs.into_iter().next() {
-                Some(v) => GenericResult::Owned(v),
-                None => GenericResult::None,
-            },
-            // Same forwarding as the `want_last` branch above.
-            GenericResult::LazyKeys { fields, sorted } => {
-                GenericResult::LazyKeys { fields, sorted }
-            }
-            GenericResult::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
-            GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
-            GenericResult::None => GenericResult::None,
-            GenericResult::Error(e) => GenericResult::Error(e),
-            GenericResult::Break(label) => GenericResult::Break(label),
-            GenericResult::Halt(code) => GenericResult::Halt(code),
-            // jq's generator-based `first` never asks for values past the
-            // first (verified: `first(1,2,error("x"))` is `1`, exit 0 -- the
-            // error is never reached), so a non-empty prefix always
-            // satisfies it and the trailing control is dropped. `Partial`'s
-            // prefix is never empty by construction (matches
-            // `eval::eval_first_expr`).
-            GenericResult::Partial(vs, _control) => {
-                GenericResult::Owned(vs.into_iter().next().expect("Partial prefix non-empty"))
-            }
+        take_first_generic(result).unwrap_or(GenericResult::None)
+    }
+}
+
+/// The first output of `result`, or `None` if it produced none.
+///
+/// Extracted from `eval_first_or_last_generic`'s own `first` branch so that
+/// [`first_over_comma_generic`] can reuse it per comma sibling. `None` means
+/// "this stream was empty" — which for a bare `first(f)` is `GenericResult::None`,
+/// but for one sibling of `first(a, b)` means "try `b`".
+fn take_first_generic<V: DocumentValue>(result: GenericResult<V>) -> Option<GenericResult<V>> {
+    match result {
+        GenericResult::One(v) => Some(GenericResult::One(v)),
+        GenericResult::OneCursor(c) => Some(GenericResult::OneCursor(c)),
+        GenericResult::Many(vs) => vs.into_iter().next().map(GenericResult::One),
+        GenericResult::ManyCursor(cs) => cs.into_iter().next().map(GenericResult::OneCursor),
+        GenericResult::Owned(v) => Some(GenericResult::Owned(v)),
+        GenericResult::ManyOwned(vs) => vs.into_iter().next().map(GenericResult::Owned),
+        // Each of these is exactly one output of `inner`'s stream, forwarded
+        // unchanged so laziness survives `first(...)`; `first` only needs to
+        // know *which* output this is, never to inspect it.
+        GenericResult::LazyKeys { fields, sorted } => {
+            Some(GenericResult::LazyKeys { fields, sorted })
+        }
+        GenericResult::LazyIndexRange(len) => Some(GenericResult::LazyIndexRange(len)),
+        GenericResult::LazySeq(seq) => Some(GenericResult::LazySeq(seq)),
+        GenericResult::None => None,
+        GenericResult::Error(e) => Some(GenericResult::Error(e)),
+        GenericResult::Break(label) => Some(GenericResult::Break(label)),
+        GenericResult::Halt(code) => Some(GenericResult::Halt(code)),
+        // jq's generator-based `first` never asks for values past the first
+        // (verified: `first(1,2,error("x"))` is `1`, exit 0 -- the error is
+        // never reached), so a non-empty prefix always satisfies it and the
+        // trailing control is dropped. `Partial`'s prefix is never empty by
+        // construction (matches `eval::eval_first_expr`).
+        GenericResult::Partial(vs, _control) => Some(GenericResult::Owned(
+            vs.into_iter().next().expect("Partial prefix non-empty"),
+        )),
+    }
+}
+
+/// `first(a, b, ...)` evaluated one comma sibling at a time, stopping at the
+/// first that yields an output — #820 Stage 2b.
+///
+/// Returns `None` when `inner` is not a comma, leaving the caller on its
+/// existing eager path.
+///
+/// **Why this exists at all.** Stage 2 made `eval::eval_first_expr` lazy, but
+/// the CLI never reaches it for a bare `first(...)`: `jq_runner` enters
+/// `eval_generic::eval_with_cursor`, and `Expr::FirstExpr` has a native arm
+/// here (kept cursor-preserving for #607), so the subtree never crosses into
+/// `eval.rs`. `limit`/`nth`/`isempty` have no native arm and do bounce, which
+/// is exactly why Stage 2 fixed them and left `first` leaking.
+///
+/// This is deliberately the *narrow* fix the design's Stage 2b names as option
+/// (b): it closes `first(1, stderr)` and — the reason it is not merely
+/// cosmetic — `first(1, input)`, where the discarded branch was **consuming a
+/// document** the CLI's driver loop then never processed. It does **not**
+/// close `first(.[] | stderr)`, which is a `Pipe` and needs real per-output
+/// backtracking; that is option (c), mirroring `Demand`/`Item`/`Flow` into
+/// this module, filed as a follow-up.
+fn first_over_comma_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Expr,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let Expr::Comma(exprs) = unwrap_paren(inner) else {
+        return None;
+    };
+    for e in exprs {
+        // Each sibling is evaluated only once the previous one has been shown
+        // to produce nothing -- so a side-effecting or input-consuming sibling
+        // past the answer is never reached, matching jq's `label $out | (f,
+        // break $out)`.
+        let result = eval_single::<S, V>(e, value.clone(), optional, cursor);
+        if let Some(first) = take_first_generic(result) {
+            return Some(first);
         }
     }
+    // Every sibling was empty, so the comma as a whole produced nothing.
+    Some(GenericResult::None)
 }
 
 /// Apply one resolved key to one target value.
