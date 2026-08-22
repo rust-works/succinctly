@@ -16090,6 +16090,52 @@ fn test_discarded_generator_branch_consumes_input_documents_820() -> Result<()> 
     Ok(())
 }
 
+/// A *computed* pipe stage ahead of the comma must not defeat laziness either.
+///
+/// `eval_each_pipe`'s `Item::Owned` arm (an intermediate pipe value that is no
+/// longer borrowed from the input document -- e.g. anything past an
+/// arithmetic op, `tostring`, or a literal) originally fell back to the old
+/// eager `eval_owned_pipe` and only demand-gated *delivery* afterward, so the
+/// discarded branch's side effect -- including an `input`/`inputs` pop --
+/// still happened before the sink ever got a say. This reopened exactly the
+/// data-loss shape `test_discarded_generator_branch_consumes_input_documents_820`
+/// pins, just gated on the pipe having a computed stage before the comma
+/// (a common shape, not an edge case) -- caught in review after Stage 2/2b
+/// landed, so it is pinned here rather than folded into either stage's own
+/// test. Fixed by routing through `eval_each_owned`, which re-enters
+/// `eval_each`'s own lazy `Expr::Pipe` arm on the reindexed owned value
+/// instead of falling back to the eager evaluator.
+#[test]
+fn test_owned_pipe_stage_ahead_of_comma_stays_lazy() -> Result<()> {
+    const DOCS: &str = r#"{"id":1} {"id":2} {"id":3} {"id":4}"#;
+
+    // Control: every document is processed when nothing consumes the queue.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".id"], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "1\n2\n3\n4\n",
+        "control run must see all 4 documents"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-cn", r#"isempty(1 | (1, ("B"|stderr)))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n");
+    assert_eq!(stderr, "", "the discarded `stderr` branch must not fire");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[isempty(1|(1,input)), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "[false,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "every document must still be processed"
+    );
+
+    let (stdout, _, code) = run_jq_full(&["-cn", r#"limit(1; 1 | (1, ("B"|stderr)))"#], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
 /// A long *pipe* driven through the evaluator, not just the parser.
 ///
 /// `MAX_EXPR_DEPTH` deliberately does not charge flat pipe/comma chains
