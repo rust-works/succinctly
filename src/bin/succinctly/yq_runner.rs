@@ -162,7 +162,26 @@ impl OutputConfig {
         } else if args.tab {
             "\t".to_string()
         } else {
-            " ".repeat(args.indent as usize)
+            // `-I1` clamps to 2 for YAML output (#1486): real yq's YAML
+            // output at `-I1` is byte-identical to its own `-I2` output at
+            // every level, mirroring the fast-path streamer's identical
+            // clamp on `yaml_indent_spaces` below. JSON has no such quirk
+            // (verified live: `-I1 -o=json` genuinely indents 1 space per
+            // level in real yq) -- `indent_str` is shared by both formats'
+            // DOM emitters (see its use in the JSON branch of
+            // `output_value`), so the clamp only applies when this
+            // invocation isn't explicitly `-o=json`. `-o=auto` resolving to
+            // JSON for a JSON-formatted input is the one case this doesn't
+            // reach (the same pre-existing per-input-vs-global sharing gap
+            // `json_sourced_floats` works around elsewhere in this struct),
+            // not a new inconsistency this fix introduces.
+            let width = args.indent as usize;
+            let width = if args.output_format == OutputFormat::Json {
+                width
+            } else {
+                width.max(2)
+            };
+            " ".repeat(width)
         };
 
         Self {
@@ -3235,18 +3254,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // otherwise a special case: real `yq` treats it as "use the library
     // default" (4 spaces), and succinctly's existing (pre-#442) compact-YAML
     // fast path hardcodes 2 regardless of `-I` — preserved as-is here since
-    // reconciling that mismatch is a separate, out-of-scope issue. Every
-    // other value threads through directly, matching what the DOM path
-    // already produces (verified against `-I1` through `-I6`). JSON has no
-    // such quirk: `-I0` means compact/flow for both real yq and succinctly
-    // today.
+    // reconciling that mismatch is a separate, out-of-scope issue. `-I1`
+    // clamps to 2 (#1486): real yq's YAML output at `-I1` is byte-identical
+    // to its own `-I2` output at every level (mappings, sequences, and
+    // compact/anchor-deferred sequence items alike, verified live against
+    // v4.53.3) — every other value (`-I2` and above) threads through
+    // directly, matching what the DOM path already produces (verified
+    // against `-I1` through `-I6`). JSON has no such quirk: `-I0` means
+    // compact/flow and `-I1` genuinely means a literal 1-space step, for
+    // both real yq and succinctly today (verified live: `-I1 -o=json`
+    // indents 1/2/3 spaces per level in real yq, not clamped).
     let indent_unit: char = if args.tab { '\t' } else { ' ' };
     let yaml_indent_spaces: usize = if args.tab {
         1
     } else if args.indent == 0 {
         2
     } else {
-        args.indent as usize
+        (args.indent as usize).max(2)
     };
     let json_indent_spaces: usize = if args.tab { 1 } else { args.indent as usize };
     let yaml_indent = IndentSpec {
