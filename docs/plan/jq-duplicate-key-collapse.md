@@ -252,30 +252,42 @@ ADR-0018 rule 4 does not admit a performance exception.
 
 ## What the measurement actually cost
 
-Interleaved A/B against the merge-base, Apple M-series, release builds, 30 reps per point,
-`succinctly json generate` inputs. Output identity was gated first: A and B produce
-byte-identical bytes for `.`, `.[]`, `length` and `keys` at both sizes, compact and pretty.
-The box was not idle (a browser renderer held ~65% of one core), so min and median are both
-reported — they agree, which is what makes the number trustworthy rather than a lucky floor.
+Interleaved A/B against the merge-base, Apple M-series laptop, release builds,
+`succinctly json generate` inputs at 1 MB and 10 MB. Output identity was gated first: A and B
+produce byte-identical bytes for `.`, `.[]`, `length` and `keys` at both sizes, compact and
+pretty.
 
-Four successive versions of the probe, worst case across the five measured points:
+**Caveat on all numbers below: this was not measured on an idle machine, and not on the
+project's benchmark hosts.** The laptop carried someone else's interactive load throughout
+(a browser renderer at 30-65% of a core, load average drifting between 7 and 14), and the
+same baseline measured 142 ms at the low end and 193 ms at the high end for `10mb .`. Per
+`docs/guides/benchmarking.md` a real result wants the pinned hosts — ARM (M4 Pro) *and*
+x86_64 (7950X), memory-bound effects not porting between them — and neither was used.
+**A confirming run on both remains outstanding.**
+
+Four successive versions of the probe, worst case across five measured points, each measured
+against the same baseline binary in the same session:
 
 | version                                                        | worst regression |
 |----------------------------------------------------------------|------------------|
 | separate probe walk, `raw_bytes()` + `contains(&b'\\')`         | 10.4%            |
 | one scan per key (`raw_and_escaped`)                            |  8.8%            |
 | single field walk, collect spans, per-object `Vec`              |  6.5%            |
-| shared scratch stack + span fingerprints                        |  **3.9%**        |
+| shared scratch stack + span fingerprints                        |  **~4%**         |
 
-Final, `-c` unless noted:
+The final figure is a range, not a point. Min-of-30 and median-of-30 at load ~7 gave 3.9% and
+4.7% worst-case; a later paired-ratio run at load ~11 (A and B alternating within each
+repetition, so drift cancels, median of the per-repetition ratios) gave:
 
-| size | query    | base    | new     | delta |
-|------|----------|---------|---------|-------|
-| 1 MB | `.`      | 17.2 ms | 17.9 ms | +3.9% |
-| 1 MB | `.[]`    | 17.2 ms | 17.9 ms | +3.8% |
-| 10 MB| `.`      | 142.6 ms| 147.7 ms| +3.6% |
-| 10 MB| `.[]`    | 142.8 ms| 146.7 ms| +2.7% |
-| 10 MB| `length` | 16.7 ms | 16.8 ms | +0.2% |
+| size  | query    | median delta | p25   | p75   |
+|-------|----------|--------------|-------|-------|
+| 1 MB  | `.`      | +3.4%        | -0.4% | +7.4% |
+| 1 MB  | `.[]`    | +5.0%        | -0.0% | +10.4%|
+| 10 MB | `.`      | +6.9%        | +2.8% | +9.6% |
+| 10 MB | `.[]`    | +3.3%        | +1.9% | +5.7% |
+| 10 MB | `length` | +0.6%        | -1.4% | +2.2% |
+
+Call it **4-6% on jq-mode streaming output over object-heavy JSON, and free on `length`**.
 
 **This misses the ≤2% target.** It is shipped anyway: ADR-0018 rule 4 admits three grounds for
 diverging from the reference and performance is not among them, so the choice was never
@@ -300,8 +312,11 @@ its 88 bytes are redundant. Hoisting them would cut the buffer's memory traffic 
 
 ## Open risks for an implementer to sanity-check
 
-1. **`print_json` recursion cost** is the one genuinely open number. The detector runs per object,
-   over every object in the output. Stage 5's measurement is the decision point for `SMALL`.
+1. **The 4-6% wants confirming on the pinned hosts.** Everything above was measured on a
+   laptop under someone else's load. Re-run `succinctly bench run jq_bench` interleaved on the
+   M4 Pro and the 7950X before treating the figure as settled — and note the cost is
+   memory-traffic-shaped (a per-field buffer), which is exactly the kind that does not port
+   between architectures.
 2. **Shared-evaluator hazard.** ADR-0018 rule 2's standing warning, and a repeated failure in this
    repo: a builtin generic over `S` serves *both* modes, so a jq-motivated rewrite can silently
    regress yq. Every touched arm needs a yq-mode check.
