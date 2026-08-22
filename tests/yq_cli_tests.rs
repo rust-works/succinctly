@@ -18662,3 +18662,30 @@ fn test_yq_reduce_foreach_accept_full_pattern_1201() -> Result<()> {
     assert_eq!(output.lines().collect::<Vec<_>>(), ["3", "10"]);
     Ok(())
 }
+
+/// #1298: yq-mode coverage for the same non-terminal `Iterate` fan-out
+/// fixed in jq mode (`tests/jq_cli_tests.rs`'s
+/// `test_jq_nonterminal_iterate_in_assign_path_fans_out_1298`) --
+/// `get_path_mut` (the shared, non-generic walker both modes' `=` routes
+/// through) had no mode-specific behavior in its old `invalid path
+/// component` failure, so this confirms the fix reaches yq mode too,
+/// including yq's own scalar-target no-op (#1181) for the non-iterable
+/// case, live-verified against yq v4.53.3.
+#[test]
+fn test_yq_nonterminal_iterate_in_assign_path_fans_out_1298() -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(
+        ".a[].b = 99",
+        "a:\n  - b: 1\n  - b: 2\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#"{"a":[{"b":99},{"b":99}]}"#);
+
+    // yq's own scalar-target no-op applies here too, matching the
+    // terminal-position case #1181/#1232 already cover.
+    let (output, exit_code) = run_yq_stdin(".a[].b = 9", "a: 5\n", &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "a: 5");
+
+    Ok(())
+}
