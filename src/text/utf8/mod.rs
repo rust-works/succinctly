@@ -137,6 +137,47 @@ pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     }
 }
 
+/// Which RFC 3629 / Unicode bound (if any) a decoded code point violates for
+/// its sequence length -- shared by [`validate_utf8_scalar`] (whole-buffer
+/// scan, needs to report *which* rule failed) and
+/// [`decode_code_point`](crate::text::utf8::decode_code_point)
+/// (single-sequence decode, only needs pass/fail), so the actual bounds
+/// (0x80/0x800/0x10000/0x10FFFF/0xD800..=0xDFFF) live in exactly one place
+/// rather than silently drifting between the two, as `decode_code_point`
+/// once did (#1423, found and fixed after `decode_code_point` had already
+/// drifted from this function once).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodePointBoundsViolation {
+    Overlong,
+    Surrogate,
+    OutOfRange,
+}
+
+impl From<CodePointBoundsViolation> for Utf8ErrorKind {
+    fn from(violation: CodePointBoundsViolation) -> Self {
+        match violation {
+            CodePointBoundsViolation::Overlong => Self::OverlongEncoding,
+            CodePointBoundsViolation::Surrogate => Self::SurrogateCodepoint,
+            CodePointBoundsViolation::OutOfRange => Self::OutOfRangeCodepoint,
+        }
+    }
+}
+
+/// Check a decoded code point (from a `len`-byte sequence, `len` in
+/// `2..=4`; a 1-byte/ASCII sequence needs no check and isn't a valid input
+/// here) against the bound(s) that apply at that length. `None` means the
+/// code point is valid.
+fn code_point_bounds_violation(cp: u32, len: usize) -> Option<CodePointBoundsViolation> {
+    match len {
+        2 if cp < 0x80 => Some(CodePointBoundsViolation::Overlong),
+        3 if cp < 0x800 => Some(CodePointBoundsViolation::Overlong),
+        3 if (0xD800..=0xDFFF).contains(&cp) => Some(CodePointBoundsViolation::Surrogate),
+        4 if cp < 0x10000 => Some(CodePointBoundsViolation::Overlong),
+        4 if cp > 0x10FFFF => Some(CodePointBoundsViolation::OutOfRange),
+        _ => None,
+    }
+}
+
 /// Validate UTF-8 using a portable scalar algorithm with a broadword (SWAR)
 /// ASCII fast path.
 ///
@@ -196,11 +237,9 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
                     ));
                 }
 
-                // Check for overlong encoding (code points < 0x80 must use 1 byte)
-                // 2-byte sequences must encode U+0080 or higher
-                // Lead byte 0xC0 or 0xC1 would encode < 0x80
-                if byte <= 0xC1 {
-                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
+                let cp = ((byte as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F);
+                if let Some(violation) = code_point_bounds_violation(cp, 2) {
+                    return Err(err_at(input, pos, violation.into()));
                 }
             }
             3 => {
@@ -222,18 +261,10 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
                     ));
                 }
 
-                // Decode code point for validation
                 let cp =
                     ((byte as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
-
-                // Check for overlong encoding (code points < 0x800 must use 2 bytes)
-                if cp < 0x800 {
-                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
-                }
-
-                // Check for surrogate code points (U+D800-U+DFFF)
-                if (0xD800..=0xDFFF).contains(&cp) {
-                    return Err(err_at(input, pos, Utf8ErrorKind::SurrogateCodepoint));
+                if let Some(violation) = code_point_bounds_violation(cp, 3) {
+                    return Err(err_at(input, pos, violation.into()));
                 }
             }
             4 => {
@@ -263,20 +294,12 @@ pub fn validate_utf8_scalar(input: &[u8]) -> Result<(), Utf8Error> {
                     ));
                 }
 
-                // Decode code point for validation
                 let cp = ((byte as u32 & 0x07) << 18)
                     | ((b1 as u32 & 0x3F) << 12)
                     | ((b2 as u32 & 0x3F) << 6)
                     | (b3 as u32 & 0x3F);
-
-                // Check for overlong encoding (code points < 0x10000 must use 3 bytes)
-                if cp < 0x10000 {
-                    return Err(err_at(input, pos, Utf8ErrorKind::OverlongEncoding));
-                }
-
-                // Check for out of range (> U+10FFFF)
-                if cp > 0x10FFFF {
-                    return Err(err_at(input, pos, Utf8ErrorKind::OutOfRangeCodepoint));
+                if let Some(violation) = code_point_bounds_violation(cp, 4) {
+                    return Err(err_at(input, pos, violation.into()));
                 }
             }
             _ => unreachable!(),
@@ -449,11 +472,11 @@ pub fn sequence_length(lead_byte: u8) -> usize {
 /// including an overlong encoding (a code point spelled with more bytes
 /// than RFC 3629 requires), a surrogate-range code point (U+D800-U+DFFF,
 /// reserved for UTF-16 and never valid in UTF-8), or a 4-byte sequence
-/// decoding past Unicode's own maximum (U+10FFFF). Applies the same bounds
-/// [`validate_utf8_scalar`] already validates against on its own byte-scan
-/// path (#1423) -- kept in sync manually since the two serve different
-/// callers (whole-buffer validation vs. single-sequence decode) and don't
-/// share a helper.
+/// decoding past Unicode's own maximum (U+10FFFF). Shares
+/// `code_point_bounds_violation` with [`validate_utf8_scalar`]'s own
+/// byte-scan path, so these bounds live in exactly one place rather than
+/// silently drifting between the two, which is how this function ended up
+/// missing them in the first place (#1423).
 ///
 /// On success, returns the decoded code point and the number of bytes consumed.
 ///
@@ -496,12 +519,7 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) {
                 return None;
             }
-            let cp = ((lead as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F);
-            // Overlong: a 2-byte sequence must encode U+0080 or higher.
-            if cp < 0x80 {
-                return None;
-            }
-            cp
+            ((lead as u32 & 0x1F) << 6) | (b1 as u32 & 0x3F)
         }
         3 => {
             let b1 = input[1];
@@ -509,17 +527,7 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) || !is_continuation_byte(b2) {
                 return None;
             }
-            let cp = ((lead as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F);
-            // Overlong: a 3-byte sequence must encode U+0800 or higher.
-            if cp < 0x800 {
-                return None;
-            }
-            // Surrogate code points (U+D800-U+DFFF) are reserved for
-            // UTF-16 surrogate pairs and invalid in UTF-8.
-            if (0xD800..=0xDFFF).contains(&cp) {
-                return None;
-            }
-            cp
+            ((lead as u32 & 0x0F) << 12) | ((b1 as u32 & 0x3F) << 6) | (b2 as u32 & 0x3F)
         }
         4 => {
             let b1 = input[1];
@@ -528,22 +536,17 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
             if !is_continuation_byte(b1) || !is_continuation_byte(b2) || !is_continuation_byte(b3) {
                 return None;
             }
-            let cp = ((lead as u32 & 0x07) << 18)
+            ((lead as u32 & 0x07) << 18)
                 | ((b1 as u32 & 0x3F) << 12)
                 | ((b2 as u32 & 0x3F) << 6)
-                | (b3 as u32 & 0x3F);
-            // Overlong: a 4-byte sequence must encode U+10000 or higher.
-            if cp < 0x10000 {
-                return None;
-            }
-            // Beyond Unicode's own maximum code point.
-            if cp > 0x10FFFF {
-                return None;
-            }
-            cp
+                | (b3 as u32 & 0x3F)
         }
         _ => return None,
     };
+
+    if code_point_bounds_violation(cp, len).is_some() {
+        return None;
+    }
 
     Some((cp, len))
 }
@@ -1761,7 +1764,7 @@ mod tests {
 mod validate_utf8_differential_tests {
     #![allow(unsafe_code)] // the x86_64 test drives the raw AVX2 kernel directly
 
-    use super::{validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
+    use super::{decode_code_point, validate_utf8, validate_utf8_scalar, Utf8Error, Utf8ErrorKind};
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -1973,6 +1976,84 @@ mod validate_utf8_differential_tests {
                 validate_utf8_scalar(&bytes).is_ok(),
                 core::str::from_utf8(&bytes).is_ok(),
             );
+        }
+    }
+
+    /// #1423 review: `decode_code_point`'s Some/None verdict on a byte
+    /// buffer must agree with whether `validate_utf8_scalar` accepts that
+    /// *same* buffer, provided the buffer is exactly one sequence long
+    /// (its length equals `sequence_length` of its own first byte) — the
+    /// only case where the two functions are actually answering the same
+    /// question. A buffer longer than one sequence isn't a fair
+    /// comparison: `decode_code_point` only ever looks at the first
+    /// sequence and ignores any bytes after it, while
+    /// `validate_utf8_scalar` scans the *whole* buffer as a sequence of
+    /// characters, so extra trailing bytes it happens to reject (or a
+    /// short lead byte's true `sequence_length` not matching however long
+    /// the buffer was built to be) would make the two functions disagree
+    /// for reasons that have nothing to do with either one's own
+    /// correctness.
+    ///
+    /// Covers, exhaustively: every one of the 6 invalid-lead-byte values
+    /// (0x80-0xBF continuation-as-lead, 0xF8-0xFF) as a lone byte; every
+    /// valid multi-byte lead byte (0xC0-0xDF/0xE0-0xEF/0xF0-0xF7) paired
+    /// with continuation bytes at their two boundary extremes (0x80/0xBF)
+    /// in every position -- the overlong/surrogate/out-of-range edge cases
+    /// this issue is about all live at these extremes, e.g. an overlong
+    /// 2-byte sequence is exactly `lead in 0xC0..=0xC1` with *any*
+    /// continuation byte. Plus a random-fuzzing pass with non-boundary
+    /// continuation bytes (including invalid ones) as a second,
+    /// independent check.
+    #[test]
+    fn decode_code_point_matches_scalar_for_single_sequences() {
+        fn check(seq: &[u8]) {
+            assert_eq!(
+                decode_code_point(seq).is_some(),
+                validate_utf8_scalar(seq).is_ok(),
+                "decode_code_point/validate_utf8_scalar disagreed on {seq:02x?}"
+            );
+        }
+
+        // Invalid lead bytes: sequence_length is 0, so a lone byte is
+        // already "one full (non-)sequence" for both functions.
+        for lead in (0x80u16..=0xBF).chain(0xF8..=0xFF) {
+            check(&[lead as u8]);
+        }
+
+        let boundary_continuations = [0x80u8, 0xBF];
+        for (lead_range, len) in [(0xC0u16..=0xDF, 2), (0xE0..=0xEF, 3), (0xF0..=0xF7, 4)] {
+            for lead in lead_range {
+                let lead = lead as u8;
+                for c1 in boundary_continuations {
+                    let combos: &[&[u8]] = match len {
+                        2 => &[&[lead, c1]],
+                        3 => &[&[lead, c1, 0x80], &[lead, c1, 0xBF]],
+                        4 => &[
+                            &[lead, c1, 0x80, 0x80],
+                            &[lead, c1, 0x80, 0xBF],
+                            &[lead, c1, 0xBF, 0x80],
+                            &[lead, c1, 0xBF, 0xBF],
+                        ],
+                        _ => unreachable!(),
+                    };
+                    for seq in combos {
+                        check(seq);
+                    }
+                }
+            }
+        }
+
+        // Random-fuzzing pass: pick a random lead byte first, then fill
+        // exactly its own natural sequence_length with random continuation
+        // bytes (which may themselves be invalid) -- so every generated
+        // buffer is still a fair one-sequence comparison.
+        let mut rng = Rng(0xdec0_de5e_c0de_5eed);
+        for _ in 0..20_000 {
+            let lead = rng.below(256) as u8;
+            let len = super::sequence_length(lead).max(1);
+            let mut bytes = alloc::vec![lead];
+            bytes.extend((1..len).map(|_| (rng.next_u32() & 0xFF) as u8));
+            check(&bytes);
         }
     }
 
