@@ -24485,10 +24485,15 @@ struct DeleteStep {
 /// Flatten a resolved (fully static) `del` path into atomic steps.
 ///
 /// Mirrors `push_path_components`, but fully resolves `Optional` instead of
-/// leaving it as an opaque wrapper: [`delete_expr_paths_at`] compares steps
+/// leaving it as an opaque wrapper. Two callers, with different needs: the
+/// comma-grouped multi-path walker ([`delete_expr_paths_at`]) compares steps
 /// across sibling paths position by position, so it needs one flat sequence
-/// of `Field`/`Index`/`Iterate` rather than a tree that hides some of them
-/// behind `Optional`/`Pipe` nodes.
+/// rather than a tree that hides some components behind `Optional`/`Pipe`
+/// nodes; a `del()` path resolved this way never actually carries a literal
+/// `Iterate` component by the time it reaches that walker (#1382), only
+/// `Field`/`Index`/`Slice`. [`yq_del_slice_outcome`] is the other caller,
+/// and does need `Iterate` to survive flattening -- its trailing-slice-run
+/// scan walks a path that can genuinely still contain one.
 fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
     match expr {
         Expr::Identity => {}
@@ -24573,21 +24578,29 @@ fn delete_expr_paths_at(
             | Expr::IndexNumber { .. }
             | Expr::Slice { .. }
             | Expr::SliceNumber { .. } => indices.push(path),
-            // A bare `Expr::Iterate` (`.[]`) never reaches this position:
-            // `resolve_dynamic_indexes` only returns more than one path once
-            // it has run its computed-key prepass, and that prepass's own
-            // fan-out (`needs_fanout_pass`) always expands `.[]` into
-            // concrete per-element `Field`/`Index` components first (#1382
-            // -- exhaustively verified reachability audit; a prior handler
-            // here, `delete_expr_iterate_paths`, was removed as confirmed
-            // dead code). The single-path case (no computed key at all)
-            // takes `builtin_del`'s `paths.len() <= 1` branch instead, whose
-            // `delete_at_path` has its own, still-live `Expr::Iterate` arm.
+            // See `needs_fanout_pass`'s doc comment for why a bare
+            // `Expr::Iterate` can never reach this position (#1382). Flagged
+            // loudly in debug/test builds via `debug_assert` rather than
+            // silently -- but still falls through to the same graceful `Err`
+            // the general catch-all below returns for every other
+            // unsupported shape, not `unreachable!()`: this invariant spans
+            // several functions and a future edit anywhere in that chain
+            // could break it, and `unreachable!()` panics unconditionally in
+            // release builds too, turning a user-supplied `del()` expression
+            // into a process crash instead of an ordinary error (the same
+            // failure mode #1098 removed elsewhere in this crate).
+            Expr::Iterate => {
+                debug_assert!(
+                    false,
+                    "a bare .[] should have been fanned out into concrete Field/Index \
+                     components before reaching delete_expr_paths_at (#1382)"
+                );
+                return Err(EvalError::new("cannot use expression as delete target"));
+            }
             // `flatten_delete_path` only ever leaves Field/Index/Slice
             // components behind at a position more than one sibling path can
-            // reach; anything else (including this unreachable `Iterate`
-            // case) is a path shape `del` has never supported here, matching
-            // `delete_at_path`'s catch-all.
+            // reach; anything else is a path shape `del` has never supported
+            // here, matching `delete_at_path`'s catch-all.
             _ => return Err(EvalError::new("cannot use expression as delete target")),
         }
     }
@@ -24767,15 +24780,16 @@ fn delete_expr_array_paths(
     // (building `owned_keys` for `delete_keys`) already discarded it. Dropped,
     // not because the flag can never be `true` here (#1331's investigation
     // found the broader claim that it can't doesn't generalize past this
-    // specific dead-write site -- see `delete_expr_iterate_paths`'s own doc
-    // comment for the narrower, verified version of that claim), but because
-    // deleting a *terminal* index/slice always goes through `delete_keys`,
-    // which already silently skips a step naming nothing to delete
-    // (#415/#477) -- `optional` never had anything left to gate once it
-    // reached this merge, whether or not it was ever `true`. Order-
-    // independence for `del(.[(0,5)], .[5]?)` (either argument order) still
-    // holds: `IndexSet::insert` already dedupes a repeated `step` regardless
-    // of which occurrence's own `?` set the (now-untracked) flag.
+    // specific dead-write site -- see the `debug_assert` a little further
+    // down in this same function for the narrower, verified version of that
+    // claim), but because deleting a *terminal* index/slice always goes
+    // through `delete_keys`, which already silently skips a step naming
+    // nothing to delete (#415/#477) -- `optional` never had anything left
+    // to gate once it reached this merge, whether or not it was ever
+    // `true`. Order-independence for `del(.[(0,5)], .[5]?)` (either
+    // argument order) still holds: `IndexSet::insert` already dedupes a
+    // repeated `step` regardless of which occurrence's own `?` set the
+    // (now-untracked) flag.
     let mut terminal: IndexSet<ArrayStep> = IndexSet::new();
     let mut groups: IndexMap<ArrayStep, Vec<&[DeleteStep]>> = IndexMap::new();
     for path in paths {
@@ -24809,12 +24823,14 @@ fn delete_expr_array_paths(
         // `Expr::Optional` before any comma-grouped `del()` path reaches
         // `flatten_delete_path`, so no `DeleteStep` here can carry
         // `optional == true`. Verified (not just asserted in a comment,
-        // #1331): see `delete_expr_iterate_paths`'s matching
-        // `debug_assert` below for the full rationale, including the one
-        // confirmed exception (`yq_del_slice_outcome`'s own `wrap`
-        // closure, a different, non-comma-grouped consumer of the same
-        // field) that this crate's usual "optional never forced true"
-        // pattern (#928/#1003/#1034) doesn't cover here.
+        // #1331), with one confirmed exception this crate's usual "optional
+        // never forced true" pattern (#928/#1003/#1034) doesn't cover:
+        // `yq_del_slice_outcome`'s own `wrap` closure is a different,
+        // non-comma-grouped consumer of the same `DeleteStep.optional`
+        // field, reachable via `del(.a?[1:3])`-shaped input, where an
+        // identically-worded claim was found wrong -- so this function's
+        // own version of the claim needed its own verification, not an
+        // assumption that it generalizes.
         debug_assert!(
             !paths.iter().any(|p| p[start].optional),
             "delete_expr_array_paths: no DeleteStep here should ever carry optional == true -- \
