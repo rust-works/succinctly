@@ -1,0 +1,1 @@
+[gsub("(?<c>[ab])"; if .c=="a" then ("1","2") else "9" end)]

@@ -1,0 +1,1 @@
+[ltrimstr(("a","b"))], [rtrimstr(("c","b"))]

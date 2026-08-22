@@ -1,0 +1,1 @@
+label $out | (ltrimstr(("a","b", break $out)), "after")
