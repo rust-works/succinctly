@@ -17486,6 +17486,7 @@ fn test_nth_stream_empty_n_argument_produces_no_output_1408() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-c", "nth(empty; .a,.b)"], Some(r#"{"a":1,"b":2}"#))?;
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out, "");
+    assert_eq!(err, "");
     Ok(())
 }
 
@@ -17499,6 +17500,35 @@ fn test_nth_stream_ordinary_n_unaffected_by_1408() -> Result<()> {
     Ok(())
 }
 
+/// Control: `builtin_nth_stream`'s `n`-argument match only special-cases
+/// `QueryResult::Partial(_, Control::Halt(code))`, not `Control::Error`/
+/// `Control::Break` -- a genuinely multi-output `n` that produces one
+/// value and then errors falls into the generic `_ => Error("expected
+/// number, got null")` catch-all instead of using the first value and
+/// then propagating the trailing error, unlike real jq (`n as $n | ...`
+/// forks once per output of `n`). Pre-existing, not introduced by #1408's
+/// zero-output fix (which only added the separate bare-`QueryResult::None`
+/// arm above); same class of gap as #1277's cluster 3 (which named
+/// `eval_nth_expr`, unaware at the time that it's unreachable and
+/// `builtin_nth_stream` is the function real queries actually hit -- noted
+/// there). Pinning the current (wrong but stable) behavior, matching this
+/// file's existing precedent for `combinations`'s analogous gap
+/// (`test_combinations_n_break_semantics_documented_not_fixed_by_1164`).
+#[test]
+fn test_nth_stream_trailing_error_in_multi_output_n_documented_not_fixed_by_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"nth((1,error("boom")); .a,.b,.c)"#],
+        Some(r#"{"a":1,"b":2,"c":3}"#),
+    )?;
+    assert_ne!(code, 0);
+    // Pre-existing divergence from real jq (which prints `2` to stdout
+    // before erroring "boom", verified live) -- see this test's own doc
+    // comment.
+    assert_eq!(out, "");
+    assert!(err.contains("expected number, got null"), "err={err}");
+    Ok(())
+}
+
 /// The issue's own repro: a zero-output `n` to `combinations(n)` (e.g.
 /// `combinations(empty)`) must produce zero output for the array
 /// constructor's own `n`-many-`range` desugaring -- matching the existing
@@ -17509,6 +17539,7 @@ fn test_combinations_n_empty_argument_produces_empty_array_1408() -> Result<()> 
     let (out, err, code) = run_jq_full(&["-cn", "[1,2] | combinations(empty)"], None)?;
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out.trim(), "[]");
+    assert_eq!(err, "");
     Ok(())
 }
 
