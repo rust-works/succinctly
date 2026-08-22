@@ -18991,6 +18991,135 @@ fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #1135: yq mode validates base64 padding placement in-place (Go's
+// `encoding/base64.StdEncoding` model) instead of jq's truncate-at-first-`=`
+// model -- real yq is strict about malformed/misplaced padding where real jq
+// is lenient. Every accept/reject row below is live-verified against pinned
+// yq v4.53.3; exact byte offsets are matched where practical but not chased
+// past what the issue's own implementation plan calls for.
+
+/// The full accept side of the issue's own matrix: every row that decodes
+/// successfully in both jq and yq mode, confirming yq's own strict decoder
+/// doesn't reject anything jq's lenient one also accepts, for well-formed
+/// input.
+#[test]
+fn test_yq_base64d_accepts_well_formed_padding_variants_1135() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        (r#""QQ==""#, r#""A""#),
+        (r#""QQ=""#, r#""A""#),
+        (r#""QQ""#, r#""A""#),
+        (r#""QUJD""#, r#""ABC""#),
+        (r#""ab""#, r#""i""#),
+        (r#""YWJ""#, r#""ab""#),
+        (r#""YW""#, r#""a""#),
+    ];
+    for (input, expected) in cases {
+        let (out, code) = run_yq_stdin("@base64d", input, &["-o", "json"])?;
+        assert_eq!(code, 0, "input={input} out: {out:?}");
+        assert_eq!(out.trim(), *expected, "input={input}");
+    }
+    Ok(())
+}
+
+/// The full reject side of the issue's own matrix: every row real yq
+/// rejects but real (and succinctly's) jq mode accepts -- the actual
+/// behavioral divergence this issue exists to close. Exact byte offsets
+/// match the oracle for every one of these (confirmed live).
+#[test]
+fn test_yq_base64d_rejects_malformed_padding_placement_1135() -> Result<()> {
+    let cases: &[(&str, usize)] = &[
+        (r#""====""#, 0),     // pure padding, no real characters at all
+        (r#""=""#, 0),        // a lone `=`
+        (r#""ab==cd""#, 2),   // real content after a complete padded quantum
+        (r#""A===""#, 1),     // 1 real char + 3 padding (leading `=` at position 1)
+        (r#""a""#, 1),        // single real char, too short, nothing to pair with
+        (r#""Y""#, 1),        // same, different alphabet position
+        (r#""!!!!""#, 0),     // no real characters, and not even valid padding
+        (r#""AAAA====""#, 4), // a padding-only quantum after a complete one
+        (r#""A=""#, 1),       // 1 real char + 1 padding, still too short
+    ];
+    for (input, byte) in cases {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr("@base64d", input, &[])?;
+        assert_ne!(code, 0, "input={input} unexpectedly succeeded");
+        let expected = format!("illegal base64 data at input byte {byte}");
+        assert!(
+            stderr.contains(&expected),
+            "input={input} stderr={stderr:?} expected to contain {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Real yq only tolerates a *leading and/or trailing* run of CR/LF -- not
+/// "anywhere" the way this issue's own implementation plan originally
+/// (incorrectly) described. This is already handled entirely by the
+/// existing yq-mode `.trim()` step upstream of the padding-placement logic
+/// this issue adds; these tests pin that composition holds, not a new
+/// mechanism.
+#[test]
+fn test_yq_base64d_tolerates_only_leading_and_trailing_newlines_1135() -> Result<()> {
+    // Trailing and leading+trailing newline runs: accepted.
+    let (out, code) = run_yq_stdin("@base64d", "\"QQ==\\n\"", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""A""#);
+
+    let (out, code) = run_yq_stdin("@base64d", "\"\\n\\r\\nQQ==\\r\\n\\n\"", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""A""#);
+
+    // A newline splitting a quantum mid-way, or between two otherwise
+    // complete quanta, is rejected -- not skipped.
+    let (_out, _stderr, code) = run_yq_stdin_with_stderr("@base64d", "\"Q\\nQ==\"", &[])?;
+    assert_ne!(code, 0, "embedded newline mid-quantum should be rejected");
+
+    let (_out, _stderr, code) = run_yq_stdin_with_stderr("@base64d", "\"QUJD\\nQUJD\"", &[])?;
+    assert_ne!(
+        code, 0,
+        "embedded newline between two complete quanta should be rejected"
+    );
+    Ok(())
+}
+
+/// A `?`-guarded `@base64d` on yq's own new strict-decode path is
+/// catchable, same as every other `@base64d` error in this file.
+#[test]
+fn test_yq_base64d_malformed_padding_error_is_catchable_1135() -> Result<()> {
+    let (out, code) = run_yq_stdin("(\"====\" | @base64d)?", "null", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "");
+    Ok(())
+}
+
+/// A multi-quantum input with padding only at the very end still decodes
+/// correctly -- the padding-placement check must not fire on any of the
+/// earlier, fully-valid quanta.
+#[test]
+fn test_yq_base64d_multi_quantum_with_trailing_padding_only_1135() -> Result<()> {
+    let (out, code) = run_yq_stdin("@base64d", r#""QUJDQUJDQQ==""#, &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#""ABCABCA""#);
+    Ok(())
+}
+
+/// jq mode's own byte-for-byte-unchanged behavior on the exact inputs
+/// #1135 makes yq mode reject -- the two modes must keep genuinely
+/// diverging here, not accidentally converge.
+#[test]
+fn test_jq_base64d_still_lenient_on_inputs_yq_now_rejects_1135() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        (r#""====""#, r#""""#),
+        (r#""=""#, r#""""#),
+        (r#""ab==cd""#, r#""i""#),
+    ];
+    for (input, expected) in cases {
+        let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", input, &[])?;
+        assert_eq!(code, 0, "input={input} out: {out:?}");
+        assert_eq!(out.trim(), *expected, "input={input}");
+    }
+    Ok(())
+}
+
 /// jq mode's `@urid` lossy-UTF-8-substitution path (an invalid percent-decode
 /// like `%FF`) previously had no regression test either.
 #[test]
