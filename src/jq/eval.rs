@@ -21557,13 +21557,15 @@ fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Fold one fan-out step's result into `results`, matching the project's
 /// #400/#494 guarantee: an `Error`/`Break` produced partway through a
 /// fan-out must not discard outputs already produced by earlier steps. Every
-/// fan-out loop in `eval_pipe_with_path_context_internal` (`Iterate`, `If`'s
-/// multi-valued `cond`, `Comma`, `Select`'s continuation) and
+/// fan-out loop in `eval_pipe_with_path_context_internal` (`Iterate`,
+/// `Comma`, `Map`, `Select`'s and `If`'s continuation) and
 /// `continue_rest_with_context` shares this exact accumulate-or-stop shape;
 /// this is the one place it's implemented (#715 follow-up -- six near-copies
 /// of this loop each independently collapsed `Break`/`Partial` to a bare
 /// `None`, silently dropping both the escaping control signal and any output
-/// already produced).
+/// already produced). `If`'s own multi-valued `cond` fan-out no longer goes
+/// through this helper (#1393) -- it now shares `eval_fanout`'s own,
+/// separate accumulate-or-stop logic with the sibling `Select` arm instead.
 ///
 /// Returns `Some(result)` when the loop must stop and propagate that result
 /// immediately (an error, an escaping `break`, or a nested partial result);
