@@ -93,7 +93,7 @@ pub use eval::{
 // backing store needs `std`, and there is no meaningful "remaining input
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
-pub use eval::{pop_remaining_input, seed_remaining_inputs};
+pub use eval::{current_input_location, pop_remaining_input, seed_remaining_inputs};
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;

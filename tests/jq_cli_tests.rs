@@ -16741,6 +16741,128 @@ fn test_jq_first_without_input_builtins_keeps_the_cursor_path_1309() -> Result<(
     Ok(())
 }
 
+// #1309 items 4 and 5: where jq's `(at <file>:<line>)` marker points once
+// `input`/`inputs` are in play. jq tracks a single global position -- the file
+// its parser currently has open and the line it last finished a value on --
+// rather than each value's own provenance, and it reaches that position even
+// on a read that finds nothing. Every expectation below is pinned jq 1.7.1's
+// own output for the same argv.
+
+/// Fixtures passed here should be newline-terminated. Without a trailing
+/// newline jq itself reports `<unknown>` rather than a file position -- a
+/// pre-existing quirk on both sides (`LineCounter`/`extend_from_ends` here),
+/// unrelated to what these tests are pinning, and sidestepped the same way
+/// `test_jq_inputs_and_input_line_number_inside_user_defined_function_723`
+/// already sidesteps it.
+/// Writes each string to its own temp file, runs `args ++ paths`, and returns
+/// the run's output alongside the paths so a location can be asserted against
+/// a specific file. The `NamedTempFile` handles are held for the whole run.
+fn run_jq_over_files(
+    args: &[&str],
+    contents: &[&str],
+) -> Result<(String, String, i32, Vec<String>)> {
+    let files: Vec<NamedTempFile> = contents
+        .iter()
+        .map(|body| -> Result<NamedTempFile> {
+            let mut f = NamedTempFile::new()?;
+            write!(f, "{body}")?;
+            Ok(f)
+        })
+        .collect::<Result<_>>()?;
+    let paths: Vec<String> = files
+        .iter()
+        .map(|f| f.path().to_string_lossy().into_owned())
+        .collect();
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.extend(paths.iter().map(String::as_str));
+    let (stdout, stderr, code) = run_jq_full(&argv, None).expect("multi-file location repro runs");
+    Ok((stdout, stderr, code, paths))
+}
+
+/// The marker names the file the parser has open, not the one the value in
+/// hand came from. `[inputs] | .[0]` is the decisive case: `.[0]` is the first
+/// file's document, but by the time `error` fires the parser has reached the
+/// third -- and jq reports the third.
+#[test]
+fn test_jq_error_location_follows_the_live_input_position_1309() -> Result<()> {
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["-c", r#"[inputs] | .[0] | error("boom")"#],
+        &["1\n", "2\n", "3\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): boom", paths[2])),
+        "expected the LAST file read, not `.[0]`'s own: {stderr}"
+    );
+    assert!(!stderr.contains(&paths[0]), "{stderr}");
+    Ok(())
+}
+
+/// A filename must survive the shared queue. Before #1309 the queue carried
+/// only a line number, so every error from a document consumed via
+/// `input`/`inputs` reported `<stdin>` even for named files.
+#[test]
+fn test_jq_error_location_keeps_the_filename_1309() -> Result<()> {
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-c", r#"input | error("boom")"#], &["1\n2\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:2): boom", paths[0])),
+        "expected the real filename and the second document's line: {stderr}"
+    );
+    assert!(!stderr.contains("<stdin>"), "{stderr}");
+    Ok(())
+}
+
+/// Item 5: a read that finds nothing still moves the marker to where the
+/// parser ended up -- the last file on the command line, at line 0 when it
+/// contributed no document of its own. `<unknown>` is only for "no read has
+/// been attempted at all".
+#[test]
+fn test_jq_exhausted_input_location_1309() -> Result<()> {
+    // Empty stdin: jq reports `<stdin>:0`, not `<unknown>`.
+    let (_, stderr, code) = run_jq_full(&["-cn", "input"], Some("")).expect("empty stdin runs");
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <stdin>:0): break"), "{stderr}");
+
+    // Last file contributed nothing -> its own name, at line 0.
+    let (stdout, stderr, code, paths) = run_jq_over_files(&["-cn", "input,input"], &["1\n", ""])?;
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains(&format!("(at {}:0): break", paths[1])),
+        "{stderr}"
+    );
+
+    // Last file did contribute -> its own last line.
+    let (stdout, stderr, code, paths) =
+        run_jq_over_files(&["-cn", "input,input,input"], &["1\n", "2\n"])?;
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n");
+    assert!(
+        stderr.contains(&format!("(at {}:1): break", paths[1])),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// The other half of item 5: `<unknown>` must survive where jq keeps it. A
+/// filter that mentions `input` but never reaches it has attempted no read,
+/// and `-n` without any input builtin is unaffected entirely.
+#[test]
+fn test_jq_unknown_location_survives_when_nothing_was_read_1309() -> Result<()> {
+    for filter in [
+        r#"if false then input else error("x") end"#,
+        r#"error("x")"#,
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-cn", filter], Some("1\n")).expect("unknown-location repro runs");
+        assert_eq!(code, 5, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains("(at <unknown>): x"), "{filter}: {stderr}");
+    }
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///

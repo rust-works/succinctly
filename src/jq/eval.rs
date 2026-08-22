@@ -25829,7 +25829,10 @@ mod remaining_inputs {
     use std::collections::VecDeque;
 
     thread_local! {
-        static QUEUE: RefCell<VecDeque<(OwnedValue, u32)>> = const { RefCell::new(VecDeque::new()) };
+        // `(document, source tag, 1-based end line)`. The source tag is opaque
+        // here: the CLI assigns it and resolves it back to a file name itself,
+        // so no string ever crosses this module's boundary (#1309).
+        static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> = const { RefCell::new(VecDeque::new()) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
@@ -25839,15 +25842,26 @@ mod remaining_inputs {
         // it is false in every embedding that never seeds (yq mode, library
         // callers, the tests). See `is_active`.
         static SEEDED: Cell<bool> = const { Cell::new(false) };
+        // Where jq's `(at <file>:<line>)` marker points right now, or `None`
+        // before any read has been *attempted* -- jq's `<unknown>` (#1309).
+        static CURRENT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+        // Where the marker settles once the queue runs dry. Supplied by the
+        // CLI because only it knows the file list; see `seed`.
+        static EXHAUSTED: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
     }
 
     /// Replaces the queue's contents wholesale. Called once by the CLI driver
     /// before evaluating any filter against any document -- never mid-run,
     /// so this doesn't need to merge with whatever a prior call left behind.
-    pub fn seed(documents: Vec<(OwnedValue, u32)>) {
+    ///
+    /// `exhausted` is the `(source, line)` [`current_location`] settles on
+    /// once every document has been consumed: jq's parser position after EOF.
+    pub fn seed(documents: Vec<(OwnedValue, u32, u32)>, exhausted: (u32, u32)) {
         QUEUE.with(|q| *q.borrow_mut() = documents.into());
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
+        CURRENT.with(|c| c.set(None));
+        EXHAUSTED.with(|e| e.set(exhausted));
     }
 
     /// Whether a CLI driver has seeded the queue on this thread.
@@ -25863,17 +25877,43 @@ mod remaining_inputs {
         SEEDED.with(Cell::get)
     }
 
-    /// Pops the next queued document, recording its line for
-    /// `input_line_number`. Shared by `builtin_input`/`builtin_inputs` *and*
-    /// the CLI driver's own per-document loop (for a document the filter
+    /// Pops the next queued document, moving both `input_line_number`'s line
+    /// and the `(at ...)` marker. Shared by `builtin_input`/`each_inputs`
+    /// *and* the CLI driver's own per-document loop (for a document the filter
     /// itself never explicitly reads via `input`) -- one shared queue, not
     /// two cursors kept in sync by hand.
-    pub fn pop() -> Option<(OwnedValue, u32)> {
+    ///
+    /// A *failed* pop still moves the marker, to `EXHAUSTED`: jq's parser
+    /// reaches EOF whether or not there was anything left to read, and names
+    /// where it ended up. Oracle-verified against jq 1.7.1 --
+    /// `jq -n 'input,input' one.json empty.json` reports `empty.json:0`, not
+    /// `one.json:1`.
+    ///
+    /// `LAST_LINE` is deliberately *not* touched on a failed pop, even though
+    /// jq's own `input_line_number` does reset to 0 after a failed `input`.
+    /// jq is not self-consistent there -- after `[inputs]` has exhausted the
+    /// same stream it still reports the last document's line -- and one probe
+    /// with two readings is not a model worth encoding. Recorded as a
+    /// divergence instead; see `docs/compliance/jq/limitations.md`.
+    pub fn pop() -> Option<OwnedValue> {
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
-        if let Some((_, line)) = &popped {
-            LAST_LINE.with(|l| l.set(*line));
+        match popped {
+            Some((doc, src, line)) => {
+                LAST_LINE.with(|l| l.set(line));
+                CURRENT.with(|c| c.set(Some((src, line))));
+                Some(doc)
+            }
+            None => {
+                CURRENT.with(|c| c.set(Some(EXHAUSTED.with(Cell::get))));
+                None
+            }
         }
-        popped
+    }
+
+    /// The `(source, line)` jq's `(at ...)` marker names right now, or `None`
+    /// before any read has been attempted.
+    pub fn current_location() -> Option<(u32, u32)> {
+        CURRENT.with(Cell::get)
     }
 
     pub fn last_line() -> u32 {
@@ -25884,11 +25924,16 @@ mod remaining_inputs {
 /// Seeds the `input`/`inputs`/`input_line_number` queue (#723).
 ///
 /// The CLI driver's own entry point into the (private) `remaining_inputs`
-/// module, called once before evaluating any filter. A no-op under
-/// `no_std` (nothing to seed there).
+/// module, called once before evaluating any filter.
+///
+/// `documents` is `(value, source tag, 1-based end line)` in input order, and
+/// `exhausted` is the `(source, line)` [`current_input_location`] settles on
+/// once they run out. The source tag is opaque to this crate: the CLI assigns
+/// it and resolves it back to a file name itself, so no file name crosses
+/// this seam in either direction (#1309).
 #[cfg(feature = "std")]
-pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
-    remaining_inputs::seed(documents);
+pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32, u32)>, exhausted: (u32, u32)) {
+    remaining_inputs::seed(documents, exhausted);
 }
 
 /// Pops the next queued input document (#723).
@@ -25897,10 +25942,25 @@ pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32)>) {
 /// same queue `input`/`inputs` draw from (see `remaining_inputs::pop`'s own
 /// doc comment, `src/jq/eval.rs`, for why this must be one shared queue,
 /// not two cursors -- not doc-linkable from here since that module is
-/// private). A no-op under `no_std`.
+/// private). Moves [`current_input_location`] as a side effect, on a failed
+/// pop as well as a successful one.
 #[cfg(feature = "std")]
-pub fn pop_remaining_input() -> Option<(OwnedValue, u32)> {
+pub fn pop_remaining_input() -> Option<OwnedValue> {
     remaining_inputs::pop()
+}
+
+/// Where jq's `(at <file>:<line>)` marker points right now, as the opaque
+/// `(source tag, line)` the CLI seeded (#1309), or `None` before any read has
+/// been attempted -- jq's `<unknown>`.
+///
+/// A single global position, not per-value provenance: jq names the file its
+/// parser currently has open and the line it last finished a value on, which
+/// is not necessarily where the value in hand came from. Oracle-verified --
+/// `jq '[inputs] | .[0] | error("boom")' a b c` reports **c**, even though
+/// `.[0]` came from **b**.
+#[cfg(feature = "std")]
+pub fn current_input_location() -> Option<(u32, u32)> {
+    remaining_inputs::current_location()
 }
 
 /// Whether a CLI driver has seeded the `input`/`inputs` queue on this thread
@@ -25963,7 +26023,7 @@ fn builtin_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult
     #[cfg(feature = "std")]
     {
         match remaining_inputs::pop() {
-            Some((doc, _line)) => owned_vec_to_result(vec![doc]),
+            Some(doc) => owned_vec_to_result(vec![doc]),
             None => QueryResult::Error(EvalError::new("break")),
         }
     }
@@ -26005,7 +26065,7 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     #[cfg(feature = "std")]
     {
-        while let Some((doc, _line)) = remaining_inputs::pop() {
+        while let Some(doc) = remaining_inputs::pop() {
             if sink(Item::Owned(doc)) == Demand::Stop {
                 // `pop` cannot fail, so nothing was raised before the stop and
                 // there is no unreached control to carry forward.
