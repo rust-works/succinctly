@@ -24,6 +24,7 @@ These plans are kept for:
 | [jq-lazy-map-select.md](jq-lazy-map-select.md)                       | Partial     | `src/jq/eval_generic.rs`          | Lazy `map`/`select` chains (`LazySeq`)            |
 | [jq-path-trackability-deferral.md](jq-path-trackability-deferral.md) | Implemented | `src/jq/eval.rs`                  | Deferred path trackability checks                 |
 | [jq-lazy-generator-consumers.md](jq-lazy-generator-consumers.md)     | Partial     | `src/jq/eval.rs`                  | Demand-driven sink for short-circuiting consumers |
+| [jq-duplicate-key-collapse.md](jq-duplicate-key-collapse.md)         | Proposed    | `src/jq/`, `jq_runner.rs`         | jq-mode duplicate object key collapse             |
 
 ## Archived Plans
 
