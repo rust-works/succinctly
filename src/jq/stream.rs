@@ -156,13 +156,21 @@ impl StreamableValue for OwnedValue {
 /// This is what [`StreamableValue::stream_json`] runs, and so what `syq -o json`
 /// emits. For the `jq` convention — which #385 established is a genuinely
 /// different one, not a stricter one — see [`stream_owned_value_json_jq`].
+/// `pub(crate)` (#1055): also the yq-mode convention for a value preview
+/// embedded in an error message (`src/jq/error.rs`), called there in
+/// always-compact form (`current_indent`/`indent_spaces` 0, `sort_keys`
+/// false) the same way `stream_owned_value_json_jq` already is for jq mode
+/// — this function needs no jq-mode-error-message-specific sibling of its
+/// own, since it's already the general yq real-output convention #1008
+/// built, and that convention is exactly what a yq-mode error preview
+/// should also use.
 ///
 /// Whole floats keep their decimal point here (`format_float_with_fraction`):
 /// this is the M2 fast path for non-identity navigation queries (`.field`,
 /// `.[0]`, `.[]`) in compact mode, and it must agree with the identity
 /// streaming path and the OwnedValue/DOM pretty-printer, both of which
 /// preserve `1.0` rather than collapsing it to `1` (issue #169).
-fn stream_owned_value_json<W: core::fmt::Write>(
+pub(crate) fn stream_owned_value_json<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
     current_indent: usize,

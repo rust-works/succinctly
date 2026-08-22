@@ -19,7 +19,8 @@ use alloc::format;
 #[cfg(not(test))]
 use alloc::string::String;
 
-use super::stream::stream_owned_value_json_jq;
+use super::eval::EvalTag;
+use super::stream::{stream_owned_value_json, stream_owned_value_json_jq};
 use super::value::OwnedValue;
 
 /// Error that occurs during evaluation.
@@ -181,12 +182,31 @@ const DUMP_KEEP: usize = 11;
 /// snap back to the nearest character boundary. The two agree except when a
 /// multi-byte character straddles byte `DUMP_KEEP` of the dump — see
 /// `docs/compliance/jq/limitations.md`.
+///
+/// jq-pinned shim (#1055): delegates to [`dump_truncated_with`] fixed at
+/// [`EvalTag::Jq`]. Migrate a call site to `dump_truncated_with(S::TAG, ..)`
+/// once `S: EvalSemantics` is in scope there; this shim (and [`describe`]
+/// below) can be deleted once every call site has moved.
 fn dump_truncated(value: &OwnedValue) -> String {
+    dump_truncated_with(EvalTag::Jq, value)
+}
+
+/// Mode-aware value preview (#1055): yq mode echoes a `NumberLiteral`
+/// verbatim, the same as every other yq-mode output path (`tostring`,
+/// `@json`, ...), instead of reformatting it via jq's rules --
+/// `stream_owned_value_json` is #1008's own yq real-output convention,
+/// reused here exactly as-is (not a bespoke error-message variant): no new
+/// formatter is needed, only a dispatch. Both modes still share the same
+/// truncation budget and boundary-snapping behavior below.
+fn dump_truncated_with(tag: EvalTag, value: &OwnedValue) -> String {
     let mut sink = PreviewSink::new(DUMP_BUDGET);
     // The sink stops the writer once the dump is known to exceed the budget;
     // writing into a `String` cannot fail for any other reason, so the returned
     // `Result` carries nothing `sink.overflowed` has not already recorded.
-    let _ = stream_owned_value_json_jq(value, &mut sink);
+    let _ = match tag {
+        EvalTag::Jq => stream_owned_value_json_jq(value, &mut sink),
+        EvalTag::Yq => stream_owned_value_json(value, &mut sink, 0, 0, ' ', false),
+    };
     if !sink.overflowed {
         return sink.buf;
     }
@@ -255,8 +275,19 @@ impl core::fmt::Write for PreviewSink {
 }
 
 /// How jq names a value in an error message: `number (1)`, `string ("ab")`.
+///
+/// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment.
 fn describe(value: &OwnedValue) -> String {
-    format!("{} ({})", value.type_name(), dump_truncated(value))
+    describe_with(EvalTag::Jq, value)
+}
+
+/// Mode-aware sibling of [`describe`] (#1055): see [`dump_truncated_with`].
+fn describe_with(tag: EvalTag, value: &OwnedValue) -> String {
+    format!(
+        "{} ({})",
+        value.type_name(),
+        dump_truncated_with(tag, value)
+    )
 }
 
 /// Go-`%q`-style raw-byte quoting for [`EvalError::urid_invalid_escape`]
@@ -387,12 +418,26 @@ impl EvalError {
     /// reports jq's real `DBL_MAX` text, not `null` (#930)). Unlike `dump_truncated`,
     /// this has no length budget — `error(v)`'s message is the whole value, verbatim,
     /// same as real jq.
+    ///
+    /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
+    /// [`EvalError::from_value_in`] once `S: EvalSemantics` is in scope at the
+    /// call site.
     pub fn from_value(value: OwnedValue) -> Self {
+        Self::from_value_in(EvalTag::Jq, value)
+    }
+
+    /// Mode-aware sibling of [`EvalError::from_value`] (#1055): yq mode
+    /// echoes a `NumberLiteral` verbatim here too, matching `.a | tostring`
+    /// on the same value instead of reformatting it via jq's rules.
+    pub fn from_value_in(tag: EvalTag, value: OwnedValue) -> Self {
         let message = match &value {
             OwnedValue::String(s) => s.clone(),
             other => {
                 let mut message = String::new();
-                let _ = stream_owned_value_json_jq(other, &mut message);
+                let _ = match tag {
+                    EvalTag::Jq => stream_owned_value_json_jq(other, &mut message),
+                    EvalTag::Yq => stream_owned_value_json(other, &mut message, 0, 0, ' ', false),
+                };
                 message
             }
         };
@@ -634,8 +679,17 @@ impl EvalError {
     }
 
     /// `Cannot iterate over <type> (<value>)`.
+    ///
+    /// jq-pinned shim (#1055): see [`dump_truncated`]'s doc comment; use
+    /// [`EvalError::cannot_iterate_in`] once `S: EvalSemantics` is in scope
+    /// at the call site.
     pub fn cannot_iterate(value: &OwnedValue) -> Self {
-        Self::new(format!("Cannot iterate over {}", describe(value)))
+        Self::cannot_iterate_in(EvalTag::Jq, value)
+    }
+
+    /// Mode-aware sibling of [`EvalError::cannot_iterate`] (#1055).
+    pub fn cannot_iterate_in(tag: EvalTag, value: &OwnedValue) -> Self {
+        Self::new(format!("Cannot iterate over {}", describe_with(tag, value)))
     }
 
     /// `strptime/1 requires string inputs and arguments` (#929).
