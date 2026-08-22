@@ -23,11 +23,15 @@ The implementation covers ~95% of jq functionality and is production-ready.
 | Format strings        | Fully implemented   | 100%     |
 | Variable binding      | Fully implemented   | 100%     |
 | User functions        | Fully implemented   | 100%     |
-| Regex functions       | Fully implemented   | 100%     |
+| Regex functions       | Fully implemented*  | 100%     |
 | Module system         | Fully implemented   | 95%      |
 | I/O operations        | Won't implement     | N/A      |
 | Assignment operators  | Fully implemented   | 100%     |
 | Succinctly extensions | Fully implemented   | 100%     |
+
+\* Regex functions: two flag combinations are permanent, documented gaps, not
+"not yet implemented" — see [Partial Implementation Notes](#partial-implementation-notes)
+below and [ADR-0019](../adrs/adr-0019.md).
 
 ---
 
@@ -116,7 +120,7 @@ The implementation covers ~95% of jq functionality and is production-ready.
 - [x] `test(re)` (regex with `regex` feature; substring fallback without)
 
 ### Regular Expressions (with `regex` feature, included in `cli`)
-- [x] `match(re)` / `match(re; flags)`
+- [x] `match(re)` / `match(re; flags)` - the `l`/`n` flags have permanent, documented gaps, see [Partial Implementation Notes](#partial-implementation-notes)
 - [x] `capture(re)`
 - [x] `scan(re)`
 - [x] `splits(re)`
@@ -394,6 +398,14 @@ See [jq Remaining Work](../plan/jq-remaining.md) for incomplete CLI and module s
    the decimal literal. They agree on every value representable exactly as an
    `f64`; beyond that `9007199254740993 == 9007199254740992.0` is `true` here
    and `false` in jq
+6. **Regex `l`/`n` flags** - `l` (POSIX leftmost-longest matching) is accepted
+   as valid flag syntax but has no effect (`match("a|aa|aaa";"l")` returns
+   `"a"`, not real jq's `"aaa"`); `n` (suppress empty matches) has a narrower
+   gap for lazy quantifiers and empty-first alternations, where a non-empty
+   match exists but is only reachable via backtracking a Thompson-NFA-based
+   engine doesn't do. Both are permanent, documented limitations, not pending
+   work — [ADR-0019](../adrs/adr-0019.md) rejected swapping the regex engine
+   to close them (#920, #922)
 
 ---
 
