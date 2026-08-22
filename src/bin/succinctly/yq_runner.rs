@@ -2020,6 +2020,12 @@ fn emit_yaml_value_at_depth(
                     .map(|(i, v)| {
                         let elem_comments = comments.at_index(i);
                         if defers_to_own_block(v, elem_comments) {
+                            // Both arms below share this same 2-column
+                            // "compact" offset — the `- ` prefix's own
+                            // width, not a full `config.indent_str` step
+                            // (#785/#1362) — so it's computed once here
+                            // rather than separately in each arm.
+                            let compact_indent = format!("{indent}  ");
                             // An anchor written on the item's own line
                             // (`- &x\n  ...`) takes the slot the compact
                             // form would use, so the value stays deferred
@@ -2035,7 +2041,7 @@ fn emit_yaml_value_at_depth(
                                 // anchor on its own line still occupies that `- `
                                 // slot, so its value nests exactly as deep as an
                                 // unanchored element's would).
-                                let val_indent = format!("{indent}  ");
+                                let val_indent = compact_indent;
                                 let val = emit_yaml_value_at_depth(
                                     v,
                                     elem_comments,
@@ -2069,7 +2075,6 @@ fn emit_yaml_value_at_depth(
                             // effect `stream_yaml_value`'s cursor-based
                             // sibling gets for free from its per-field/
                             // per-element loop only indenting 2nd+ items.
-                            let compact_indent = format!("{indent}  ");
                             let rendered = emit_yaml_value_at_depth(
                                 v,
                                 elem_comments,
