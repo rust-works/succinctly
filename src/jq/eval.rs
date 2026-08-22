@@ -14292,6 +14292,14 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 /// `needs_path_prepass`, which is also called on whole (possibly
 /// un-flattened) expressions elsewhere, adding one here would be untested
 /// dead code.
+///
+/// The `Expr::Iterate => true` arm below is also load-bearing for
+/// `delete_expr_paths_at` (a comma-grouped `del()`'s multi-path walker):
+/// it's what guarantees a bare `.[]` never survives into that function's
+/// resolved paths, which is why `delete_expr_paths_at` has no `Iterate`
+/// case of its own (#1382 -- removed as confirmed-dead code once this arm
+/// was found to always fire first). Narrowing this arm would silently
+/// reopen that dead branch as a real one.
 fn needs_fanout_pass(expr: &Expr) -> bool {
     match expr {
         Expr::Iterate => true,
@@ -24551,7 +24559,6 @@ fn delete_expr_paths_at(
 
     let mut fields: Vec<&[DeleteStep]> = Vec::new();
     let mut indices: Vec<&[DeleteStep]> = Vec::new();
-    let mut iterates: Vec<&[DeleteStep]> = Vec::new();
     for &path in paths {
         match &path[start].component {
             Expr::Field(_) => fields.push(path),
@@ -24566,27 +24573,35 @@ fn delete_expr_paths_at(
             | Expr::IndexNumber { .. }
             | Expr::Slice { .. }
             | Expr::SliceNumber { .. } => indices.push(path),
-            Expr::Iterate => iterates.push(path),
-            // `flatten_delete_path` only ever leaves Field/Index/Slice/Iterate
-            // components behind; anything else is a path shape `del` has
-            // never supported, matching `delete_at_path`'s catch-all.
+            // A bare `Expr::Iterate` (`.[]`) never reaches this position:
+            // `resolve_dynamic_indexes` only returns more than one path once
+            // it has run its computed-key prepass, and that prepass's own
+            // fan-out (`needs_fanout_pass`) always expands `.[]` into
+            // concrete per-element `Field`/`Index` components first (#1382
+            // -- exhaustively verified reachability audit; a prior handler
+            // here, `delete_expr_iterate_paths`, was removed as confirmed
+            // dead code). The single-path case (no computed key at all)
+            // takes `builtin_del`'s `paths.len() <= 1` branch instead, whose
+            // `delete_at_path` has its own, still-live `Expr::Iterate` arm.
+            // `flatten_delete_path` only ever leaves Field/Index/Slice
+            // components behind at a position more than one sibling path can
+            // reach; anything else (including this unreachable `Iterate`
+            // case) is a path shape `del` has never supported here, matching
+            // `delete_at_path`'s catch-all.
             _ => return Err(EvalError::new("cannot use expression as delete target")),
         }
     }
 
     // `value` can only be one concrete type at a time, so at most one of
-    // these three actually mutates it — the others see a container of the
-    // wrong shape and take that branch's optional-vs-error path (see
-    // `delete_expr_object_paths`/`delete_expr_array_paths`). All three can
-    // be non-empty only when `value` is `null`, per the doc comment above.
+    // these two actually mutates it — the other sees a container of the
+    // wrong shape and takes that branch's optional-vs-error path (see
+    // `delete_expr_object_paths`/`delete_expr_array_paths`). Both can be
+    // non-empty only when `value` is `null`, per the doc comment above.
     if !fields.is_empty() {
         value = delete_expr_object_paths(value, &fields, start)?;
     }
     if !indices.is_empty() {
         value = delete_expr_array_paths(value, &indices, start)?;
-    }
-    if !iterates.is_empty() {
-        value = delete_expr_iterate_paths(value, &iterates, start)?;
     }
     Ok(value)
 }
@@ -24908,85 +24923,6 @@ enum ArrayStep {
     Slice(Option<i64>, Option<i64>),
 }
 
-/// [`delete_expr_paths_at`]'s `Iterate` case: every path here shares the same
-/// tail — an `Iterate` names no component of its own to differ by — so there
-/// is nothing to group. Either every path ends here, clearing the whole
-/// container, or every path continues, and each element/value recurses with
-/// the same sibling list.
-///
-/// `paths` here always traces back to [`resolve_dynamic_indexes`]'s own
-/// output, which strips every `Expr::Optional` wrapper via
-/// `strip_resolved_optional` before returning -- so `optional` below is
-/// always `false` in practice; kept as a live value (not deleted) rather
-/// than hardcoded, with a `debug_assert` verifying the invariant rather
-/// than silently trusting it (#1331 found that an identically-worded
-/// claim was wrong for a *different* consumer of the same
-/// `DeleteStep.optional` field -- [`yq_del_slice_outcome`]'s own `wrap`
-/// closure, reachable via `del(.a?[1:3])`-shaped input -- so each site's
-/// own version of the claim needs its own verification, not assumed to
-/// generalize).
-///
-/// This function itself may be entirely unreachable from `del()`'s own
-/// comma-grouped route: extensive live probing (#1331's second review
-/// round, three independent passes) found `resolve_node`'s own handling
-/// of `Expr::Iterate` eagerly expands a bare `.[]`/`.[]?` into concrete
-/// per-element `Field`/`Index` components *before* `flatten_delete_path`
-/// ever runs, for every shape tried -- meaning a literal `DeleteStep`
-/// carrying `Expr::Iterate` may never actually get constructed via
-/// `builtin_del`'s `paths.len() > 1` branch (the only external entry to
-/// `delete_expr_paths_at`) at all. Left as-is rather than removed:
-/// proving a function is *never* reachable, as opposed to not reachable
-/// via every input tried so far, needs more exhaustive verification than
-/// #1331's own scope covers -- filed as #1382 rather than assumed here.
-/// If genuinely dead, the `debug_assert` below (and the two `optional`-
-/// gated match arms further down, pre-dating this issue) are dead along
-/// with it, harmlessly.
-fn delete_expr_iterate_paths(
-    value: OwnedValue,
-    paths: &[&[DeleteStep]],
-    start: usize,
-) -> Result<OwnedValue, EvalError> {
-    let optional = paths[0][start].optional;
-    debug_assert!(
-        !optional,
-        "delete_expr_iterate_paths: DeleteStep.optional should always be false here -- \
-         resolve_dynamic_indexes strips Expr::Optional before any comma-grouped del() path \
-         reaches this function (#1331)"
-    );
-    if paths[0].len() == start + 1 {
-        return match value {
-            OwnedValue::Array(mut arr) => {
-                arr.clear();
-                Ok(OwnedValue::Array(arr))
-            }
-            OwnedValue::Object(mut map) => {
-                map.clear();
-                Ok(OwnedValue::Object(map))
-            }
-            other if optional => Ok(other),
-            other => Err(EvalError::cannot_iterate(&other)),
-        };
-    }
-    match value {
-        OwnedValue::Array(mut arr) => {
-            for elem in &mut arr {
-                let old = core::mem::replace(elem, OwnedValue::Null);
-                *elem = delete_expr_paths_at(old, paths, start + 1)?;
-            }
-            Ok(OwnedValue::Array(arr))
-        }
-        OwnedValue::Object(mut map) => {
-            for v in map.values_mut() {
-                let old = core::mem::replace(v, OwnedValue::Null);
-                *v = delete_expr_paths_at(old, paths, start + 1)?;
-            }
-            Ok(OwnedValue::Object(map))
-        }
-        other if optional => Ok(other),
-        other => Err(EvalError::cannot_iterate(&other)),
-    }
-}
-
 /// Recursively rewrite every already-static branch of `expr` with
 /// [`yq_del_slice_outcome`]'s chained-slice-parent-key rule
 /// (#1223), unwrapping and rewrapping any `Expr::Paren`/`Expr::Optional`
@@ -25107,8 +25043,12 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Computed keys resolve against the original document; each becomes one
-    // fully static path expression (Field/Index/Iterate components — see
-    // `resolve_dynamic_indexes`).
+    // fully static path expression (Field/Index/Slice components — see
+    // `resolve_dynamic_indexes`). A path with no computed key at all is
+    // returned verbatim instead and may still contain a literal `Iterate`,
+    // but is always the sole entry, so it takes the `paths.len() <= 1`
+    // branch below rather than `delete_expr_paths_at`'s comma-grouped one
+    // (#1382).
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
