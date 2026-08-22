@@ -16370,20 +16370,27 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         return path_result(Vec::new(), init_escape);
     }
 
-    // Fused into one `Vec` (rather than three parallel ones keyed by the
-    // same index) so the extract/update agreement is unrepresentable rather
-    // than merely unreachable-in-practice — see #1369. Each element's
-    // bindings are dropped as soon as they are consumed instead of being
-    // retained as a second full copy of the input stream for the rest of
-    // the call.
-    let substituted: Vec<Result<(Expr, Option<Expr>), EvalError>> = input_values
+    // `eval_foreach`'s own substitution, minus the two things this
+    // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s dispatch
+    // arm) rules out: #1365's `patterns`-matrix, and #1368's null-fill for
+    // names an alternative leaves unbound — a bare `$var` pattern binds its
+    // one name unconditionally, so there is never an unbound name to fill
+    // (same reasoning as `resolve_reduce`'s own substitution above). Fused
+    // into one `Vec` (rather than three parallel ones keyed by the same
+    // index, reusing `eval_foreach`'s own `ForeachStepAlternative` pair
+    // type) so the extract/update agreement is unrepresentable rather than
+    // merely unreachable-in-practice — see #1369. Each element's bindings
+    // are dropped as soon as they are consumed instead of being retained as
+    // a second full copy of the input stream for the rest of the call.
+    let substituted: Vec<ForeachStepAlternative> = input_values
         .iter()
         .map(|v| {
-            let b = extract_pattern_bindings(pattern, v, false)?;
-            Ok((
-                substitute_vars(update, as_var_refs(&b)),
-                extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
-            ))
+            extract_pattern_bindings(pattern, v, false).map(|b| {
+                (
+                    substitute_vars(update, as_var_refs(&b)),
+                    extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
+                )
+            })
         })
         .collect();
 
@@ -16392,12 +16399,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     for init_branch in &init_branches {
         let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
         let mut aborted: Option<Control> = None;
-        'input: for substituted in &substituted {
+        'input: for step in &substituted {
             if let Some(control) = charge_budget(&mut budget, "foreach") {
                 aborted = Some(control);
                 break;
             }
-            let (substituted_update, substituted_extract) = match substituted {
+            let (substituted_update, substituted_extract) = match step {
                 Ok((upd, ext)) => (upd, ext),
                 Err(e) => {
                     aborted = Some(Control::Error(e.clone()));
