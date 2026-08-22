@@ -19049,15 +19049,26 @@ fn test_yq_base64d_accepts_well_formed_padding_variants_1135() -> Result<()> {
 #[test]
 fn test_yq_base64d_rejects_malformed_padding_placement_1135() -> Result<()> {
     let cases: &[(&str, usize)] = &[
-        (r#""====""#, 0),     // pure padding, no real characters at all
-        (r#""=""#, 0),        // a lone `=`
-        (r#""ab==cd""#, 2),   // real content after a complete padded quantum
+        (r#""====""#, 0),   // pure padding, no real characters at all
+        (r#""=""#, 0),      // a lone `=`
+        (r#""ab==cd""#, 4), // real content after a complete padded quantum --
+        // position is one past the closed quantum (`chunk_start + 4`), not
+        // the padding's own position: a well-formed `ab==` closes cleanly,
+        // and it's the *following* data that's illegal.
         (r#""A===""#, 1),     // 1 real char + 3 padding (leading `=` at position 1)
         (r#""a""#, 1),        // single real char, too short, nothing to pair with
         (r#""Y""#, 1),        // same, different alphabet position
         (r#""!!!!""#, 0),     // no real characters, and not even valid padding
         (r#""AAAA====""#, 4), // a padding-only quantum after a complete one
         (r#""A=""#, 1),       // 1 real char + 1 padding, still too short
+        (r#""AAA=BBBB""#, 4), // 4th-position padding closes cleanly; the
+        // following quantum is what's actually illegal, at its own start.
+        (r#""QQ==AAAA""#, 4), // same shape, 3rd+4th-position padding this time.
+        (r#""A!=A""#, 1),     // an invalid character *before* a misplaced `=`
+        // is reported at its own position, not the `='s.
+        (r#""ab=!""#, 2), // a `=` tentatively closing a 2-real-char quantum,
+                          // followed by anything other than a second `=`, is illegal at the
+                          // first `='s own position, not the byte after it.
     ];
     for (input, byte) in cases {
         let (_out, stderr, code) = run_yq_stdin_with_stderr("@base64d", input, &[])?;
