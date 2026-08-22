@@ -27,16 +27,17 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
 processed — is closed, as is `halt_error`'s wrong exit code and the stderr leak in
 `isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`, and — since Stage 4 — `IN(src; s)` and every
-other compare reached through a lazy consumer. Three shapes remain divergent and are pinned
-as such in `test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stderr)` and
-`first((1,2) == (10, ("B"|stderr)))` (both a bare `first(...)` over a non-`Comma`, which
-Stage 2b's sibling walk does not reach — option (c)), and
-`("A"|stderr) == (("B"|stderr), ("C"|stderr))` (a *top-level* compare, which never reaches
-`eval_each` at all — #1481). Stage 3 also leaves one residual: an un-lazified
+other compare reached through a lazy consumer. Five shapes remain divergent, all pinned as
+such in `test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)`
+family: `first(.[] | stderr)` and `first((1,2) == (10, ("B"|stderr)))`, both a `first(...)`
+over a non-`Comma`, which Stage 2b's sibling walk does not reach — option (c). One is
+`("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
+`eval_each` at all — #1481. The remaining two are Stage 5's own residual: an un-lazified
 `eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect
 for a node's own filter when that filter's shape isn't one of
-`Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — pinned as a known-remaining row in the same
-test, left to Stage 5.
+`Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — that is the `path(paths(if ...))` row, plus
+the `path(... halt_error ...)` pair Stage 4 added, whose stray `x` on stderr is the same
+un-lazified `Expr::If`.
 
 **One correction this document earned the hard way.** Stage 2 shipped an
 `eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
@@ -551,29 +552,30 @@ Columns are `stdout | exit | stderr`. Input is `null` (`-cn`) unless noted.
 
 ### Divergent today — the fix's targets
 
-| Query                                                              | jq 1.7.1      | succinctly today | Closed by |
-|--------------------------------------------------------------------|---------------|------------------|-----------|
-| `isempty(1, ("B"\|stderr))`                                        | `false\|0\|`  | `false\|0\|B`    | Stage 2   |
-| `isempty((1, ("B"\|stderr)))`                                      | `false\|0\|`  | `false\|0\|B`    | Stage 2   |
-| `first(1, ("B"\|stderr))`                                          | `1\|0\|`      | `1\|0\|B`        | Stage 2b  |
-| `limit(1; 1, ("B"\|stderr))`                                       | `1\|0\|`      | `1\|0\|B`        | Stage 2   |
-| `nth(0; 1, ("B"\|stderr))`                                         | `1\|0\|`      | `1\|0\|B`        | Stage 2   |
-| `"o" \| halt_error(1, ("B"\|stderr))`                              | `\|1\|o`      | `\|1\|Bo`        | Stage 2   |
-| `"outer" \| halt_error(1, ("inner"\|halt_error(2)))`               | `\|1\|outer`  | `\|2\|inner`     | Stage 2   |
-| `2 \| any(2, (5\|stderr); .==2)`                                   | `true\|0\|`   | `true\|0\|5`     | Stage 2   |
-| `2 \| IN(2, (5\|stderr))`                                          | `true\|0\|`   | `true\|0\|5`     | Stage 2   |
-| `[1,2] \| first(.[] \| stderr)`                                    | `1\|0\|1`     | `1\|0\|12`       | Stage 2b  |
-| `isempty(first(1, ("B"\|stderr)))`                                 | `false\|0\|`  | `false\|0\|B`    | Stage 2   |
-| `[1,2,3] \| path(paths(if .==3 then (stderr,true) else true end))` | `\|5\|<#530>` | `\|5\|3<#530>`   | Stage 3   |
-| `[IN((2,3); 2, (5\|stderr))]`                                      | `[true]\|0\|` | `[true]\|0\|5`   | Stage 4   |
-| `[isempty((1,2) == (10, ("B"\|stderr)))]`                          | `[false]\|0\|`| `[false]\|0\|B` | Stage 4   |
-| `[all((1,2) == (10, ("B"\|stderr)); .)]`                           | `[false]\|0\|`| `[false]\|0\|B` | Stage 4   |
-| `isempty(limit(3; 1, ("B"\|stderr)))`                              | `false\|0\|`  | `false\|0\|B`    | Stage 5   |
-| `first(if true then (1,("B"\|stderr)) else 9 end)`                 | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
-| `first(try (1,("B"\|stderr)) catch 9)`                             | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
-| `first(label $o \| (1,("B"\|stderr)))`                             | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
-| `first(1 as $x \| (1,("B"\|stderr)))`                              | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
-| `def f: (1,("B"\|stderr)); first(f)`                               | `1\|0\|`      | `1\|0\|B`        | Stage 5   |
+| Query                                                              | jq 1.7.1       | succinctly today | Closed by |
+|--------------------------------------------------------------------|----------------|------------------|-----------|
+| `isempty(1, ("B"\|stderr))`                                        | `false\|0\|`   | `false\|0\|B`    | Stage 2   |
+| `isempty((1, ("B"\|stderr)))`                                      | `false\|0\|`   | `false\|0\|B`    | Stage 2   |
+| `first(1, ("B"\|stderr))`                                          | `1\|0\|`       | `1\|0\|B`        | Stage 2b  |
+| `limit(1; 1, ("B"\|stderr))`                                       | `1\|0\|`       | `1\|0\|B`        | Stage 2   |
+| `nth(0; 1, ("B"\|stderr))`                                         | `1\|0\|`       | `1\|0\|B`        | Stage 2   |
+| `"o" \| halt_error(1, ("B"\|stderr))`                              | `\|1\|o`       | `\|1\|Bo`        | Stage 2   |
+| `"outer" \| halt_error(1, ("inner"\|halt_error(2)))`               | `\|1\|outer`   | `\|2\|inner`     | Stage 2   |
+| `2 \| any(2, (5\|stderr); .==2)`                                   | `true\|0\|`    | `true\|0\|5`     | Stage 2   |
+| `2 \| IN(2, (5\|stderr))`                                          | `true\|0\|`    | `true\|0\|5`     | Stage 2   |
+| `[1,2] \| first(.[] \| stderr)`                                    | `1\|0\|1`      | `1\|0\|12`       | Stage 2b  |
+| `isempty(first(1, ("B"\|stderr)))`                                 | `false\|0\|`   | `false\|0\|B`    | Stage 2   |
+| `[1,2,3] \| path(paths(if .==3 then (stderr,true) else true end))` | `\|5\|<#530>`  | `\|5\|3<#530>`   | Stage 3   |
+| `[IN((2,3); 2, (5\|stderr))]`                                      | `[true]\|0\|`  | `[true]\|0\|5`   | Stage 4   |
+| `[isempty((1,2) == (10, ("B"\|stderr)))]`                          | `[false]\|0\|` | `[false]\|0\|B`  | Stage 4   |
+| `[isempty(.id == (1, input)), .id]` over 4 docs                    | `ids 1-4\|0\|` | `ids 1,3\|0\|`   | Stage 4   |
+| `[all((1,2) == (10, ("B"\|stderr)); .)]`                           | `[false]\|0\|` | `[false]\|0\|B`  | Stage 4   |
+| `isempty(limit(3; 1, ("B"\|stderr)))`                              | `false\|0\|`   | `false\|0\|B`    | Stage 5   |
+| `first(if true then (1,("B"\|stderr)) else 9 end)`                 | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
+| `first(try (1,("B"\|stderr)) catch 9)`                             | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
+| `first(label $o \| (1,("B"\|stderr)))`                             | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
+| `first(1 as $x \| (1,("B"\|stderr)))`                              | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
+| `def f: (1,("B"\|stderr)); first(f)`                               | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
 
 Plus the data-loss shapes in [Problem](#this-is-no-longer-a-cosmetic-leak--it-causes-silent-data-loss),
 closed by Stage 2 (`isempty`) and Stage 2b (`first`).
@@ -1050,6 +1052,25 @@ the reasoning behind each placement:
    `(input) + (input, input)` over `"a" "b" "c" "d"` is `["ba","dc"]` in jq and
    `["ca","db"]` here, so it is silent data loss rather than a cosmetic leak. **Filed as
    #1481.**
+
+   **Two things review added afterwards.** (i) #1459's own severity line — "Low (stray
+   stderr write; no wrong output, no data loss)" — is true of its `IN(src; s)` repro and
+   false of the arm the fix adds. Once a compare's operands can pop `input`, the eager
+   fanout's discarded candidates eat documents the CLI's per-document driver loop then
+   never processes: `[isempty(.id == (1, input)), .id]` over four documents printed two
+   before Stage 4 and prints four after, matching jq. That is the same silent data loss
+   #820 was filed for, so Stage 4 closes a `Comma`-arm-equivalent hole in the `Compare`
+   arm, not just a stderr leak — pinned separately from the stderr tables in
+   `test_compare_operand_consuming_input_documents_1459`, because every stderr row would
+   stay green if the arm regressed to eager only for document-popping operands.
+   (ii) `binary_fanout_each` has two operands and so can be handed two `Flow::Stopped`
+   `pending`s; `abort.unwrap_or(outer)` keeps the *inner* one and drops the *outer* one.
+   `resolve_leaf` is the only consumer that reads `pending`, so the effect is confined to
+   a `Halt` under `path(...)`, and the drop is the half that lands on jq's verdict (jq's
+   `path()` is lazy end to end and never evaluates the trailing `halt_error` at all).
+   Left and right therefore answer differently, deliberately: both rows are pinned in
+   `test_short_circuit_side_effect_leaks_820_932_987`, and `Flow::Stopped`'s own doc
+   comment now records this as its one stated exception.
 7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
    `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Not yet filed.
    One issue, not one per arm: each is a single lazy arm now that the primitive exists.
