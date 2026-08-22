@@ -12599,6 +12599,18 @@ fn set_path(
             // For chained paths like .a.b.c, navigate to parent and set at last element
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value, scalar_noop, container_noop)
+            } else if let Some(split) = split_at_iterate(exprs) {
+                match get_path_mut(root, &split.before, scalar_noop)? {
+                    None => Ok(()),
+                    Some(target) => set_path_through_iterate(
+                        target,
+                        split.optional,
+                        &split.tail,
+                        new_value,
+                        scalar_noop,
+                        container_noop,
+                    ),
+                }
             } else if let Some(split) = split_at_slice(exprs) {
                 match get_path_mut(root, &split.before, scalar_noop)? {
                     None => Ok(()),
@@ -13063,6 +13075,129 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
             Expr::Pipe(rest)
         },
     })
+}
+
+/// Where a chained path crosses a *non-terminal* `Iterate` (`.[]`), as
+/// [`split_at_iterate`] found it.
+struct IterateSplit {
+    /// The components to navigate before reaching the `Iterate`.
+    before: Vec<Expr>,
+    /// Whether the `Iterate` itself carried a `?` (`.a[]?[0] = 9`).
+    optional: bool,
+    /// Everything left to apply to *each* fanned-out element, as one
+    /// expression.
+    tail: Expr,
+}
+
+/// Split a chained path at its first *non-terminal* `Iterate`, if it has
+/// one.
+///
+/// `.[]` names every element/value in a container, not one slot, so
+/// `get_path_mut` cannot navigate through it the way it does a `Field`/
+/// `Index` — `.a[][0] = 9` has to fan out and apply `[0] = 9` independently
+/// to each of `.a`'s own elements, not find one shared parent slot to hand
+/// back (#1298). A *terminal* `Iterate` (`.a[] = 9`, nothing left after it)
+/// needs none of this: it already reaches `set_path`'s own top-level
+/// `Iterate` arm correctly via the ordinary `parent_path`/`last_path`
+/// split, so this function deliberately returns `None` for that shape —
+/// `at == flat.len() - 1` below is exactly that check.
+///
+/// Checked *before* [`split_at_slice`] in `set_path`'s `Pipe` arm: an
+/// `Iterate` fans out into independent per-element writes, each of which
+/// then re-resolves whatever slice/index/field remains in its own
+/// recursive `set_path` call — including a slice that comes *after* the
+/// `Iterate` in the chain (`.a[][0:2] = v`). A slice that comes *before*
+/// the `Iterate` is the opposite ordering, and is deliberately left to
+/// `split_at_slice` instead: this function bails (`None`) whenever a slice
+/// exists earlier in the flattened chain than the `Iterate` it would
+/// otherwise split on, so `split_at_slice` runs first, hands the residual
+/// `Iterate` to `through_slice`'s own closure as part of its `tail`, and
+/// this function gets a fresh, slice-free look at it on the next
+/// recursive `set_path` call. Without that check, this function's own
+/// `before` could itself contain the earlier slice — a component
+/// `get_path_mut` (which this function's caller navigates `before` with)
+/// cannot walk through any more than it can walk through an `Iterate`.
+///
+/// Flattens via [`push_path_components`] first, same as `split_at_slice`,
+/// so a `.[]` nested inside a parenthesized sub-path (`(.a[])[0] = 9`) is
+/// still found.
+fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
+    // Cheap common-case guard, mirroring `split_at_slice`'s own: skip the
+    // flatten entirely when nothing here could possibly hide an `Iterate`.
+    if exprs.iter().all(|e| {
+        let component = unwrap_path_component(e).0;
+        !matches!(component, Expr::Iterate | Expr::Pipe(_))
+    }) {
+        return None;
+    }
+    let mut flat = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        push_path_components(&mut flat, e);
+    }
+    let at = flat
+        .iter()
+        .position(|e| matches!(unwrap_path_component(e).0, Expr::Iterate))?;
+    if at == flat.len() - 1 {
+        // Terminal position -- not this function's case.
+        return None;
+    }
+    if flat[..at]
+        .iter()
+        .any(|e| unwrap_path_component(e).0.is_slice())
+    {
+        // An earlier slice takes precedence -- see the doc comment above.
+        return None;
+    }
+    let (_, optional) = unwrap_path_component(&flat[at]);
+    let rest = flat.split_off(at + 1);
+    flat.truncate(at);
+    Some(IterateSplit {
+        before: flat,
+        optional,
+        // `rest` can never be empty here: the terminal-position check above
+        // already excluded `at == flat.len() - 1`, so there is always at
+        // least one component left after the `Iterate`.
+        tail: Expr::Pipe(rest),
+    })
+}
+
+/// Fan a `=` write out over every element/value of `target` — the
+/// non-terminal `Iterate` case [`split_at_iterate`] found (#1298).
+/// `get_path_mut` can only ever return one mutable slot, so a mid-chain
+/// `.[]` can't reuse its loop the way `Field`/`Index` do; each element
+/// instead gets its own independent recursive `set_path` call against
+/// `split.tail`. Mirrors `set_path`'s own top-level `Expr::Iterate` arm
+/// (the terminal-position case, #1181) for the yq-only null-to-`[]`
+/// autovivify and the scalar-target no-op — deliberately the same rules, a
+/// mid-chain `.[]` isn't semantically different from a terminal one, just
+/// followed by more path.
+fn set_path_through_iterate(
+    target: &mut OwnedValue,
+    optional: bool,
+    tail: &Expr,
+    new_value: OwnedValue,
+    scalar_noop: bool,
+    container_noop: bool,
+) -> Result<(), EvalError> {
+    if scalar_noop {
+        autovivify_array(target);
+    }
+    match target {
+        OwnedValue::Array(arr) => {
+            for elem in arr.iter_mut() {
+                set_path(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
+            }
+            Ok(())
+        }
+        OwnedValue::Object(map) => {
+            for (_, elem) in map.iter_mut() {
+                set_path(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
+            }
+            Ok(())
+        }
+        _ if optional || (scalar_noop && is_yq_field_index_noop_scalar(target)) => Ok(()),
+        _ => Err(EvalError::cannot_iterate(target)),
+    }
 }
 
 /// Get a mutable reference to the parent named by `path_parts`, or `None` if

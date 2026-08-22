@@ -15858,3 +15858,108 @@ fn test_long_pipe_and_comma_chains_evaluate_without_overflowing() -> Result<()> 
 
     Ok(())
 }
+
+/// #1298: a non-terminal `Iterate` (`.[]` with more path after it) in a
+/// plain `=` assignment target fans out and writes into every element,
+/// matching jq -- previously `invalid path component`, since `get_path_mut`
+/// (the walker `=`'s `Pipe` arm delegates non-terminal navigation to) can
+/// only ever return one mutable slot, and had no way to represent "apply
+/// the rest of the path independently to each of N elements". `|=`/`del()`
+/// already handled this correctly (their own recursive-descent walkers
+/// naturally support fan-out); this is `=`/`set_path`'s own gap, split off
+/// from #1292 (which fixed the sibling `Slice` case). Every shape
+/// live-verified against pinned jq 1.7.1.
+#[test]
+fn test_jq_nonterminal_iterate_in_assign_path_fans_out_1298() -> Result<()> {
+    // The issue's own repro: a parenthesized `.[]` ahead of an index.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(.a[])[0] = 9"], Some(r#"{"a":[[1,2],[3,4]]}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":[[9,2],[9,4]]}\n");
+
+    // No parens needed -- the gap is `get_path_mut`'s, not paren-specific.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a[].b = 99"], Some(r#"{"a":[{"b":1},{"b":2}]}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":[{\"b\":99},{\"b\":99}]}\n");
+
+    // Fans out over object values too, not just array elements.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a[].b = 9"],
+        Some(r#"{"a":{"x":{"b":1},"y":{"b":2}}}"#),
+    )?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":{\"x\":{\"b\":9},\"y\":{\"b\":9}}}\n");
+
+    // `.[]?` on the Iterate itself still suppresses a non-iterable target,
+    // same as the terminal-position `.a[]? = v` already does.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a[]?.b = 9"], Some(r#"{"a":5}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":5}\n");
+
+    // Without `?`, the same non-iterable target still errors -- this fix
+    // must not accidentally suppress that.
+    let (_stdout, stderr, code) = run_jq_full(&["-c", ".a[].b = 9"], Some(r#"{"a":5}"#))?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot iterate"), "stderr={stderr}");
+
+    Ok(())
+}
+
+/// #1298: an `Iterate` interleaved with a `Slice` on either side of it must
+/// resolve in the order jq itself does -- a `Slice` before the `Iterate`
+/// slices first and fans the `Iterate` out over *that* sub-range only; a
+/// `Slice` after the `Iterate` re-resolves independently inside each
+/// fanned-out element. `split_at_iterate` deliberately defers to
+/// `split_at_slice` when a slice sits earlier in the chain (its own doc
+/// comment explains why): without that ordering check, `.a[0:2][][0] = 9`
+/// would have handed `get_path_mut` a `before` list that still contained
+/// the earlier slice, which it cannot navigate through either.
+#[test]
+fn test_jq_iterate_slice_ordering_in_assign_path_1298() -> Result<()> {
+    // Slice before Iterate: slice first, fan out over the sliced range.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a[0:2][][0] = 9"],
+        Some(r#"{"a":[[1,2],[3,4],[5,6]]}"#),
+    )?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":[[9,2],[9,4],[5,6]]}\n");
+
+    // Iterate before slice: fan out first, each element resolves its own
+    // slice independently.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a[][0:2] = [9,9]"],
+        Some(r#"{"a":[[1,2,3],[4,5,6]]}"#),
+    )?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":[[9,9,3],[9,9,6]]}\n");
+
+    Ok(())
+}
+
+/// #1298: an `Iterate` that genuinely *is* the last path component must
+/// still reach `set_path`'s own top-level `Iterate` arm (#1181's original,
+/// unaffected implementation) rather than this fix's new mid-chain
+/// fan-out — `split_at_iterate` returns `None` for that shape precisely so
+/// this stays a regression guard, not new coverage.
+#[test]
+fn test_jq_terminal_iterate_in_assign_path_unaffected_by_1298() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a[] = 9"], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":[9,9]}\n");
+    Ok(())
+}
+
+/// #1298: a `?` earlier in the chain than the non-terminal `Iterate` — not
+/// on the `Iterate` itself — suppresses the whole write when *that*
+/// component fails to navigate, exercising `get_path_mut`'s `Ok(None)`
+/// return from `split.before`'s own walk (`set_path`'s `Ok(())` fallback
+/// for it, distinct from `set_path_through_iterate`'s own fan-out logic,
+/// which never runs at all here).
+#[test]
+fn test_jq_optional_component_before_iterate_suppresses_whole_write_1298() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a?.b[].c = 9"], Some("5"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "5\n");
+    Ok(())
+}
