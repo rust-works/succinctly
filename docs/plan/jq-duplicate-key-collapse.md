@@ -310,6 +310,85 @@ The remaining lever, unexplored: `PreparedField` stores two whole `JsonCursor`s 
 a cursor's `text` and `index` members are invariant across the entire document — roughly 48 of
 its 88 bytes are redundant. Hoisting them would cut the buffer's memory traffic by half.
 
+## What code review found afterwards
+
+Five defects survived the staged delivery above. All are fixed; each is recorded because the
+design predicted the *shape* of three of them and still shipped them.
+
+**1. The collapse itself was quadratic.** `PAIRWISE_SPAN_SCAN_LIMIT` bounded *detection* and
+nothing bounded the rebuild, which picked each surviving slot by scanning the keys accepted so
+far. One duplicate in a wide root object:
+
+| fields | before this issue | as first shipped | after the fix | real jq |
+|--------|-------------------|------------------|---------------|---------|
+| 10K    | 0.00 s            | 0.09 s           | 0.00 s        | 0.00 s  |
+| 50K    | 0.01 s            | 1.92 s           | 0.01 s        | 0.02 s  |
+| 100K   | 0.02 s            | **8.54 s**       | 0.03 s        | 0.04 s  |
+| 300K   | —                 | —                | 0.09 s        | 0.14 s  |
+
+This is the same failure the section above congratulates itself on catching ("*not a tuning
+knob* … 1240% on a 10 MB document"). The guard just landed on the wrong half, and
+`document.rs`'s `IndexMap` counterpart — which was already right — sat next to it as the
+model. Both now key the surviving slot off a map. `test_duplicate_keys_collapse_is_linear_1385`
+would not finish in the quadratic form.
+
+**2. A key that would not decode was silently dropped from output.** Open risk 4 named exactly
+this hazard, checked `document.rs` for it, and missed the runner's own copy of the same loop.
+`{"a\q":1,"b":2}` printed as `{"b":2}` — data loss on the one path that previously echoed such
+a key verbatim — while `length` and `[.[]]` went on counting it, re-creating the incoherence
+this issue exists to remove. Both copies now keep an unnamed key where it stands: it has no
+name to collapse *on*, so it can neither absorb a field nor be absorbed.
+
+**3. `--preserve-input` stopped being self-consistent.** The non-goal above ("continues to
+preserve, by design") is true of the printer, which is gated on `jq_compat`, and false of the
+evaluator, which is gated on a const the flag cannot reach — so `.` preserved three keys while
+`length` answered 2. Making the flag reach the evaluator needs a third `EvalSemantics`
+implementor and a third monomorphization of the generic evaluator, which is a worse trade than
+the split itself: the flag governs *spelling*, exactly as it does for `4e4` vs `.n + 0`. The
+split is now written down in `docs/compliance/jq/limitations.md` and pinned by
+`test_preserve_input_duplicate_keys_are_output_only_1385`.
+
+**4. Memory, which the measurement plan never asked for.** Every figure above is a time. Peak
+RSS on a 16 MB, 1M-field object (no duplicates anywhere):
+
+| filter   | before this issue | as first shipped | after the fix |
+|----------|-------------------|------------------|---------------|
+| `length` | 28.2 MB           | 198.2 MB         | 38.0 MB       |
+| `.`      | 28.1 MB           | 128.8 MB         | 82.9 MB       |
+
+`length` and the `LazyKeys` probe both materialized a four-cursor `DocumentField` per field
+(152 bytes) to answer a question about *keys*. They now take a census that keeps one 64-bit
+fingerprint per field (8 bytes) and owns a `String` only for keys whose fingerprints actually
+collide — so a collision costs work, never a wrong answer. The printer's buffer took the
+"remaining lever" this document identified and left unexplored: a `JsonCursor`'s `text` and
+`index` are invariant across the document, so the buffer keeps two `bp_pos` and rebuilds
+cursors against one hoisted pair, 88 bytes per field down to 40. On a realistic 10 MB document
+`.` went 24.5 MB → 21.9 MB against an 18.5 MB baseline.
+
+This document predicted that hoisting would also *speed things up* ("cut the buffer's memory
+traffic by half"). It did not. Interleaved A/B of all five fixes against the tip that
+preceded them, same laptop and same caveats as every number above — 21 paired repetitions,
+median of the per-repetition ratio:
+
+| input               | filter   | median | p25   | p75   |
+|---------------------|----------|--------|-------|-------|
+| 1 MB `json generate`| `.`      | +0.8%  | -1.5% | +1.9% |
+| 1 MB `json generate`| `.[]`    | +1.2%  | -0.3% | +2.2% |
+| 10 MB               | `.`      | +1.0%  | -0.0% | +2.2% |
+| 10 MB               | `.[]`    | +1.1%  | +0.5% | +1.4% |
+| 10 MB               | `length` | -0.2%  | -1.9% | +0.8% |
+
+About +1% on the printer paths, free on `length` — three of the five straddle zero at p25, so
+the honest reading is "at most a point, possibly nothing". The memory win is real and the
+speed win predicted alongside it was not; rebuilding a cursor is cheap but so was copying one.
+
+**5. `JsonFields::has_duplicate_keys`/`collapsed` were dead on arrival.** The design specified
+them for `print_json`, which then grew its own span-based copies; nothing ever called the
+originals, and being `pub` they drew no `dead_code` lint. 96 lines deleted — they were also
+why patch coverage on `src/json/light.rs` read 15%. `raw_and_escaped`, from the same stage, is
+genuinely used and stays. Deleting them also left exactly one pairwise-scan threshold in the
+tree rather than three.
+
 ## Open risks for an implementer to sanity-check
 
 1. **The 4-6% wants confirming on the pinned hosts.** Everything above was measured on a
@@ -324,18 +403,22 @@ its 88 bytes are redundant. Hoisting them would cut the buffer's memory traffic 
    without decoding keys; the deduped answer needs the key text. This arm gets slower by
    construction — quantify it rather than assuming it is lost in the noise.
 4. **Non-string keys.** `key_str()` returns `None` for a YAML alias or complex key.
-   `effective_fields` currently *drops* such fields on the deduping path (they never reach the
-   `IndexMap`). yq is gated off so this is not newly reachable, but the detector must not
-   introduce the same drop for JSON, where every key is a string by grammar.
+   `effective_fields` used to *drop* such fields on the deduping path (they never reached the
+   `IndexMap`). Answered by defect 2 above: both collapse paths now keep them. Reachable for
+   JSON after all, through a key whose escape will not decode — semi-indexing admits input a
+   validating parser rejects.
+5. **Memory has no line in the measurement plan above, and needed one.** Defect 4 was found by
+   measuring peak RSS, which nothing in "Measurement plan" asks for. A change that buys time
+   with a per-field buffer should report both.
 
 ## Critical files
 
 | File                              | Role                                                          |
 |-----------------------------------|---------------------------------------------------------------|
 | `src/jq/eval.rs`                  | `EvalSemantics` + the two impls; `Expr::Iterate`, `builtin_length` |
-| `src/jq/document.rs`              | `DocumentFields`, `keys_dedup`, `effective_fields`, new detector |
+| `src/jq/document.rs`              | `DocumentFields`, `keys_dedup`, `effective_fields`, the key census |
 | `src/jq/eval_generic.rs`          | `Iterate`, `Length`, `Keys`/`KeysUnsorted`, `LazyKeys`, `collect_paths_generic` |
-| `src/json/light.rs`               | `JsonFields` impl, `JsonStr::as_str`, new `has_duplicate_keys` |
+| `src/json/light.rs`               | `JsonFields` impl, `JsonStr::as_str`/`raw_and_escaped`, `JsonCursor::text`/`index` |
 | `src/yaml/light.rs`               | `YamlFields`' `keys_dedup` impl (deleted)                      |
 | `src/bin/succinctly/jq_runner.rs` | `print_json` object arm, `LazyKeysArray`, `evaluate_input`     |
 | `src/jq/lazy.rs`                  | `JqValue` length sites, `write_json`, `lazy_keys_array_to_owned` |

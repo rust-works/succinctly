@@ -2390,7 +2390,7 @@ fn test_duplicate_keys_collapse_last_wins_1385() -> Result<()> {
         ("[paths]", r#"[["b"],["a"]]"#),
         ("to_entries|length", "2"),
     ] {
-        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "filter {filter}");
         assert_eq!(out.trim(), expected, "filter {filter}");
     }
@@ -2425,19 +2425,18 @@ fn test_duplicate_keys_collapse_through_navigation_1385() -> Result<()> {
 /// path cannot see, so it falls back to comparing decoded keys.
 #[test]
 fn test_duplicate_keys_collapse_nested_and_escaped_1385() -> Result<()> {
-    let (out, code) = run_jq_stdin(
-        ".",
-        r#"{"x":{"b":1,"a":2,"b":3},"y":[{"a":1,"a":2}]}"#,
-        &["-c"],
+    let (out, _, code) = run_jq_full(
+        &["-c", "."],
+        Some(r#"{"x":{"b":1,"a":2,"b":3},"y":[{"a":1,"a":2}]}"#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"x":{"b":3,"a":2},"y":[{"a":2}]}"#);
 
-    let (pretty, code) = run_jq_stdin(".", r#"{"a":1,"a":2}"#, &[])?;
+    let (pretty, _, code) = run_jq_full(&["."], Some(r#"{"a":1,"a":2}"#))?;
     assert_eq!(code, 0);
     assert_eq!(pretty, "{\n  \"a\": 2\n}\n");
 
-    let (escaped, code) = run_jq_stdin(".", r#"{"a\/b":1,"a/b":2}"#, &["-c"])?;
+    let (escaped, _, code) = run_jq_full(&["-c", "."], Some(r#"{"a\/b":1,"a/b":2}"#))?;
     assert_eq!(code, 0);
     assert_eq!(escaped.trim(), r#"{"a/b":2}"#);
 
@@ -2456,7 +2455,7 @@ fn test_duplicate_keys_collapse_wide_object_1385() -> Result<()> {
     }
     input.push_str("\"k0\":999}");
 
-    let (out, code) = run_jq_stdin("length", &input, &["-c"])?;
+    let (out, _, code) = run_jq_full(&["-c", "length"], Some(&input))?;
     assert_eq!(code, 0);
     assert_eq!(
         out.trim(),
@@ -2464,10 +2463,200 @@ fn test_duplicate_keys_collapse_wide_object_1385() -> Result<()> {
         "the repeated k0 must not be counted twice"
     );
 
-    let (first, code) = run_jq_stdin(".k0", &input, &["-c"])?;
+    let (first, _, code) = run_jq_full(&["-c", ".k0"], Some(&input))?;
     assert_eq!(code, 0);
     assert_eq!(first.trim(), "999", "last occurrence wins");
 
+    // `.` is what drives the *printer*'s span scan, which has its own
+    // pairwise-vs-sorted split; `length` and `.k0` never reach it. Without
+    // this the sorted branch went untested.
+    let (printed, _, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0);
+    let expected: String = core::iter::once(String::from("{\"k0\":999"))
+        .chain((1..40).map(|i| format!(",\"k{i}\":{i}")))
+        .chain(core::iter::once(String::from("}")))
+        .collect();
+    assert_eq!(
+        printed.trim(),
+        expected,
+        "k0 keeps its first position and its last value"
+    );
+
+    Ok(())
+}
+
+/// #1385 review: collapsing must be linear in the field count. Picking each
+/// surviving key by scanning the keys accepted so far made a single
+/// duplicate in a 100K-field object take 8.5 s where not collapsing at all
+/// took 0.02 s -- a quadratic blowup on exactly the input shape this crate
+/// exists to handle well.
+///
+/// 20K fields is small enough to stay a unit test and large enough that the
+/// quadratic form would not finish in any reasonable time (it is 400M key
+/// comparisons; the linear form is 20K hash lookups).
+#[test]
+fn test_duplicate_keys_collapse_is_linear_1385() -> Result<()> {
+    const FIELDS: usize = 20_000;
+    let mut input = String::from("{");
+    for i in 0..FIELDS {
+        input.push_str(&format!("\"k{i}\":{i},"));
+    }
+    input.push_str("\"k0\":999}");
+
+    let (out, _, code) = run_jq_full(&["-c", "length"], Some(&input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), FIELDS.to_string());
+
+    let (printed, _, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0);
+    assert!(
+        printed.starts_with("{\"k0\":999,\"k1\":1,"),
+        "got {printed:.40}"
+    );
+    assert!(printed
+        .trim()
+        .ends_with(&format!("\"k{}\":{}}}", FIELDS - 1, FIELDS - 1)));
+
+    Ok(())
+}
+
+/// #1385 review: a key that will not decode has no name to collapse *on*,
+/// so it takes part in no collapse and is echoed from its raw source span.
+/// Skipping it instead deleted the field from output -- `{"a\q":1,"b":2}`
+/// printed as `{"b":2}` -- while `length`, `keys` and `[.[]]` went on
+/// counting it, which is the very incoherence #1385 set out to remove.
+///
+/// Real jq rejects all of these at parse time (`Invalid escape`, `Invalid
+/// \uXXXX\uXXXX surrogate pair escape`); succinctly semi-indexes rather
+/// than validates, so they reach the evaluator and must at least be
+/// self-consistent. See `docs/compliance/jq/limitations.md`.
+#[test]
+fn test_undecodable_keys_are_not_duplicates_1385() -> Result<()> {
+    for (input, printed, length, values) in [
+        (r#"{"a\q":1,"b":2}"#, r#"{"a\q":1,"b":2}"#, "2", "[1,2]"),
+        (
+            r#"{"\ud800":1,"\ud800":2}"#,
+            r#"{"\ud800":1,"\ud800":2}"#,
+            "2",
+            "[1,2]",
+        ),
+        // A genuine duplicate alongside one: `b` collapses, the
+        // undecodable key stays exactly where it was.
+        (
+            r#"{"a\q":1,"b":2,"b":3}"#,
+            r#"{"a\q":1,"b":3}"#,
+            "2",
+            "[1,3]",
+        ),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "input {input}");
+        assert_eq!(out.trim(), printed, "input {input}");
+
+        let (len, _, code) = run_jq_full(&["-c", "length"], Some(input))?;
+        assert_eq!(code, 0, "input {input}");
+        assert_eq!(len.trim(), length, "input {input}");
+
+        let (vals, _, code) = run_jq_full(&["-c", "[.[]]"], Some(input))?;
+        assert_eq!(code, 0, "input {input}");
+        assert_eq!(vals.trim(), values, "input {input}");
+    }
+    Ok(())
+}
+
+/// #1385 review: `--preserve-input` preserves duplicate keys on *output*
+/// and nowhere else. The exemption ADR-0018 rule 5 grants that extension
+/// reaches the printer, which is gated on `jq_compat`; the evaluator is
+/// gated on `JqSemantics::COLLAPSE_DUPLICATE_KEYS`, a const the flag cannot
+/// reach. Both halves are pinned here so the split stays a documented
+/// contract rather than drifting into a silent inconsistency.
+///
+/// It is the same split the flag already has for numbers, asserted below:
+/// `4e4` is echoed as written while `. + 0` evaluates it.
+#[test]
+fn test_preserve_input_duplicate_keys_are_output_only_1385() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"b":3}"#;
+
+    // Output: every occurrence, at the top level and nested.
+    let (out, _, code) = run_jq_full(&["-c", "--preserve-input", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), input);
+
+    let (nested, _, code) = run_jq_full(
+        &["-c", "--preserve-input", ".x"],
+        Some(&format!(r#"{{"x":{input}}}"#)),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(nested.trim(), input, "the printer gate is per-object");
+
+    // Evaluation: jq's value model, flag or no flag.
+    for (filter, expected) in [
+        ("length", "2"),
+        ("keys", r#"["a","b"]"#),
+        ("[.[]]", "[3,2]"),
+        ("to_entries|length", "2"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // The number spelling the flag exists for, split the same way.
+    let (spelled, _, code) = run_jq_full(&["-c", "--preserve-input", ".n"], Some(r#"{"n":4e4}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(spelled.trim(), "4e4");
+    let (evaluated, _, code) =
+        run_jq_full(&["-c", "--preserve-input", ".n + 0"], Some(r#"{"n":4e4}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(evaluated.trim(), "40000");
+
+    Ok(())
+}
+
+/// #1385 review: the `LazyKeys` collapsed fast path (`lazy_keys_collapsed`
+/// in `eval_generic.rs`) mirrors the cons-list arms one-for-one, and every
+/// one of its arms was reached only when the object carries a duplicate --
+/// so none of them was covered. Each filter here lands on a different arm.
+#[test]
+fn test_duplicate_keys_lazy_keys_fast_paths_1385() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"b":3}"#;
+    let with_empty = r#"{"b":1,"a":2,"b":3,"n":{}}"#;
+    for (filter, expected) in [
+        ("keys_unsorted|length", "2"),            // Length
+        ("[keys_unsorted[]]", r#"["b","a"]"#),    // Iterate
+        ("keys_unsorted[0]", r#""b""#),           // Index, positive
+        ("keys_unsorted[-1]", r#""a""#),          // Index, negative
+        ("keys_unsorted[-9]", "null"),            // Index, out of range below
+        ("keys_unsorted[9]", "null"),             // Index, out of range above
+        ("keys_unsorted|first", r#""b""#),        // First
+        ("keys_unsorted|last", r#""a""#),         // Last
+        ("keys_unsorted|map(.)", r#"["b","a"]"#), // materializing fallback
+        ("keys|length", "2"),                     // sorted: fallback, not the arms
+        ("keys[0]", r#""a""#),
+        // `first`/`last` wrapping the whole `keys` result forward the lazy
+        // variant untouched rather than consuming it, so the collapse has
+        // to survive that hop too.
+        ("first(keys_unsorted)", r#"["b","a"]"#),
+        ("last(keys_unsorted)", r#"["b","a"]"#),
+        ("first(keys)", r#"["a","b"]"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // An empty nested object still prints as `{}` on the cursor path -- the
+    // one object branch the collapse machinery must not reach -- and the
+    // duplicate outside it is unaffected.
+    for (filter, expected) in [
+        (".n", "{}"),
+        ("keys_unsorted|length", "3"),
+        (".", r#"{"b":3,"a":2,"n":{}}"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(with_empty))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
     Ok(())
 }
 

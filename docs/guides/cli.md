@@ -576,6 +576,11 @@ SUCCINCTLY_PRESERVE_INPUT=1 succinctly jq . input.json
 
 See [Environment Variables](../reference/environment-variables.md) for the accepted values.
 
+`--preserve-input` governs how a value is *spelled* on output, not what the value is: it
+echoes `4e4` as written, and likewise keeps every occurrence of a duplicated object key,
+while the evaluator still follows jq (`length` on `{"a":1,"a":2}` is `1` either way). See
+[jq Limitations](../compliance/jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input).
+
 ### Input Options
 
 - `-n, --null-input`: Don't read any input; use null as the single input value
