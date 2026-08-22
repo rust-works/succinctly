@@ -10930,11 +10930,23 @@ fn test_container_anchor_tag_alias_round_trip_1132() -> Result<()> {
 // *synthesized* empty value, not for a literal empty string in the source,
 // which stays `""` on both sides -- confirmed live, so this isn't a general
 // quoting-convention change. (2) `stream_yaml_sequence`'s doc comment
-// overclaimed exact byte-for-byte parity with `stream_yaml_value`; #1077's
-// deferred-absent-anchor handling is unreachable through `--slurp`'s own
-// construction (a slurped document's own scalar is never deferred to a
-// sibling), so this is a doc-only fix with no behavior change to pin -- the
-// `--slurp` test below is that proof.
+// overclaimed exact byte-for-byte parity with `stream_yaml_value` -- true
+// for its container branch (fixed alongside #1132 above) but not its
+// scalar branch, a fourth, still-unfixed copy of the same anchor-only
+// pattern that code review found, including a genuine `--slurp` repro (a
+// source document that is itself nothing but an anchored/tagged scalar
+// deferred to EOF) the doc comment's first draft claimed didn't exist.
+//
+// Code review of this PR itself then found two further regressions in the
+// fixes above, both confirmed live against real yq and fixed before merge:
+// `write_yaml_child_inline`'s tag write was gated on `is_container()` alone,
+// so a value that was both explicitly tagged *and* absent
+// (`{a: !!str , b: 1}`) lost its tag entirely -- worse than before this PR,
+// which at least preserved the tag (with the wrong `""` quote style) by
+// falling through to the ordinary scalar dispatch. And `stream_yaml_sequence`'s
+// scalar branch (the fourth copy mentioned above) needed the same
+// `write_deferred_value` routing its `stream_yaml_value` counterpart already
+// had. Both are covered below alongside the original findings.
 
 /// The tag half of the issue's finding: a flow-style anchored container's
 /// explicit tag used to be silently dropped.
@@ -10984,13 +10996,59 @@ fn test_flow_anchor_alias_round_trip_1115() -> Result<()> {
     Ok(())
 }
 
-/// `--slurp`'s output is unaffected by #1115's Part 2 (a doc-comment-only
-/// correction, since the shape it describes has no repro reachable through
-/// `--slurp`'s own construction) -- proof the doc-only change didn't alter
-/// behavior, using an anchored container item as the most adjacent shape to
-/// the one the (corrected) doc comment now names as unreachable.
+/// Regression guard (found by code review before merge): an early build of
+/// the quote-style fix gated the tag write on `is_container()` alone, so a
+/// value that was both explicitly tagged *and* absent lost its tag
+/// entirely -- worse than no fix at all, since the pre-fix code at least
+/// preserved the tag (with the wrong `""` quote style) via the ordinary
+/// scalar dispatch. The tag must survive alongside the corrected `''`.
 #[test]
-fn test_slurp_anchored_container_item_unaffected_by_1115_part2() -> Result<()> {
+fn test_flow_tagged_absent_value_keeps_tag_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: !!str , b: 1}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: !!str '', b: 1}\n");
+    Ok(())
+}
+
+/// Same regression, combined with an anchor -- anchor, tag, and the
+/// synthesized `''` must all appear, in that order.
+#[test]
+fn test_flow_tagged_absent_value_with_anchor_keeps_tag_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: &anc !!str , b: 1}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc !!str '', b: 1}\n");
+    Ok(())
+}
+
+/// Same regression again, in flow-sequence-item position rather than
+/// flow-mapping-value position -- `write_yaml_child_inline` is shared by
+/// both.
+#[test]
+fn test_flow_sequence_item_tagged_absent_value_keeps_tag_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a: [!!str , 2]\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: [!!str '', 2]\n");
+    Ok(())
+}
+
+/// An empty flow container with an explicit tag -- the case
+/// `write_yaml_child_inline`'s own comment cites as the reason it checks
+/// `is_container()` rather than `is_yaml_cursor_container` (which excludes
+/// empty containers).
+#[test]
+fn test_flow_anchor_keeps_tag_on_empty_container_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "{a: &anc !!mytag {}}\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{a: &anc !!mytag {}}\n");
+    Ok(())
+}
+
+/// `--slurp`'s container branch (already routed through
+/// `write_deferred_prefix` alongside #1132's fix above) is unaffected by
+/// the scalar-branch fix below -- an anchored container item renders
+/// identically to before.
+#[test]
+fn test_slurp_anchored_container_item_unaffected_1115() -> Result<()> {
     let mut file_a = NamedTempFile::new()?;
     writeln!(file_a, "- &anc\n  a: 1")?;
     let mut file_b = NamedTempFile::new()?;
@@ -11008,6 +11066,45 @@ fn test_slurp_anchored_container_item_unaffected_by_1115_part2() -> Result<()> {
 
     assert!(output.status.success());
     assert_eq!(stdout, "- - &anc\n    a: 1\n- - b: 2\n");
+    Ok(())
+}
+
+/// The issue's own missing shape, now fixed: a `--slurp`d source document
+/// that is itself nothing but an anchored/tagged scalar deferred to EOF
+/// (no sibling within that source to float to) used to drop the tag and
+/// synthesize a spurious `null` (`- &anc null` instead of `- &anc !!mytag`)
+/// -- `stream_yaml_sequence`'s scalar branch was a fourth, unfixed copy of
+/// the #1132 anchor-only pattern until this test was added.
+#[test]
+fn test_slurp_top_level_deferred_tagged_scalar_keeps_tag_1115() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "&anc !!mytag")?;
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "foo: bar")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg(".")
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "- &anc !!mytag\n- foo: bar\n");
+    Ok(())
+}
+
+/// Same shape as above, exercised through `stream_yaml_value`'s own
+/// Sequence-loop container branch instead of `--slurp`'s mirror -- a plain
+/// block-sequence item with both an anchor and a tag.
+#[test]
+fn test_block_sequence_item_anchor_and_tag_1115() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- &anc !!mytag\n  a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- &anc !!mytag\n  a: 1\n");
     Ok(())
 }
 

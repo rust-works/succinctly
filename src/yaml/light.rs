@@ -6669,16 +6669,27 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
         out.write_str(anchor)?;
         out.write_char(' ')?;
     }
-    // The flow-style twin of #1132's block-style tag loss: a container
-    // value's own `stream_yaml_value` dispatch below doesn't write an
-    // explicit tag itself, unlike a *scalar* value's, which already does
-    // (verified live: `{a: &anc !!str 1}` already round-trips its tag
-    // correctly, so this must stay container-only or a scalar's tag would
-    // be written twice). `is_container()`, not `is_yaml_cursor_container`
-    // (which excludes an *empty* container): `{a: &anc !!mytag {}}` drops
-    // its tag today too, same bug, and there's no separate scalar dispatch
-    // for an empty container to collide with.
-    if value.is_container() {
+    // Computed once and reused below: a container value's tag is written
+    // here (its own `stream_yaml_value` dispatch doesn't write one), and an
+    // absent value's tag must *also* be written here, since the early
+    // `''`-synthesis return below skips straight past that same dispatch --
+    // including its scalar arm, which is the only other place a tag would
+    // otherwise get written (verified live: `{a: &anc !!str 1}` already
+    // round-trips its tag correctly through that arm, so this check must
+    // stay container-or-absent-only or a *non-absent* scalar's tag would be
+    // written twice). Review found the absent half of this missing: an
+    // early build of this fix gated the tag write on `is_container()` alone,
+    // so a tagged *and* absent value (`{a: !!str , b: 1}`) silently lost its
+    // tag entirely -- worse than before this fix existed, when the absent
+    // case had no special handling at all and fell through to the scalar
+    // dispatch, which at least preserved the tag (with the wrong `""` quote
+    // style this fix corrects below).
+    let absent = is_deferred_value_absent(&value);
+    // `is_container()`, not `is_yaml_cursor_container` (which excludes an
+    // *empty* container): `{a: &anc !!mytag {}}` drops its tag today too,
+    // same bug, and there's no separate scalar dispatch for an empty
+    // container to collide with.
+    if value.is_container() || absent {
         if let Some(tag) = value.explicit_tag() {
             out.write_str(tag)?;
             out.write_char(' ')?;
@@ -6696,7 +6707,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // difference (#1115's own survey found every other empty-string
     // position -- block value, flow/block sequence item, flow mapping key
     // -- already matches real yq's `""`), just this one synthesized case.
-    if is_deferred_value_absent(&value) {
+    if absent {
         return out.write_str("''");
     }
     value.stream_yaml_value(out, "", 0, unit, sort_keys, false)
@@ -6763,16 +6774,20 @@ fn write_flow_last_item_comment<Out: core::fmt::Write>(
 /// Mirrors the `Sequence` block/flow-style rendering in `stream_yaml_value`
 /// (same container-vs-scalar branching, same empty-sequence `"[]"`
 /// shortcut, same `#785` compact-form handling, same anchor/tag handling
-/// via `write_deferred_prefix`, and per-item trailing-comment write) so
-/// multi-document slurped output matches single-document M2 streaming --
-/// with one known exception: #1077's deferred-and-absent-value handling
-/// (an item's value materializing as nothing at all, e.g. `a:` with
-/// nothing following) is `stream_yaml_value`-only. A slurped document's own
-/// top-level scalar is never "deferred to a sibling" the way a
-/// mapping-field/sequence-item value can be — no repro reaching that shape
-/// through `--slurp`'s own construction has been found (#1115) — so this
-/// function doesn't special-case it. If one ever turns up, route through
-/// `write_deferred_value` here too.
+/// via `write_deferred_prefix`/`write_deferred_value`, and per-item
+/// trailing-comment write) so multi-document slurped output matches
+/// single-document M2 streaming byte-for-byte, including #1077's
+/// deferred-and-absent-value handling: an earlier draft of this comment
+/// claimed that case was unreachable through `--slurp`'s own construction
+/// (reasoning a slurped document's own top-level scalar is never "deferred
+/// to a sibling" the way a mapping-field/sequence-item value can be) and
+/// left it unhandled here. #1115's review found that reasoning missed a
+/// case: a source document can itself be nothing but an anchored/tagged
+/// scalar deferred to EOF (e.g. a file containing only `&anc !!mytag`),
+/// which `--slurp` reaches directly — reproduced live (`- &anc null`
+/// instead of `- &anc !!mytag`, the tag silently dropped and a spurious
+/// `null` value synthesized) and fixed by routing this branch through
+/// `write_deferred_value` the same as its `stream_yaml_value` counterpart.
 pub fn stream_yaml_sequence<'a, W, I, Out>(
     cursors: I,
     out: &mut Out,
@@ -6853,21 +6868,23 @@ where
                 }
                 write_line_comment(out, cursor.line_comment_raw())?;
             } else {
-                out.write_str("- ")?;
-                if let Some(anchor) = cursor.anchor() {
-                    out.write_char('&')?;
-                    out.write_str(anchor)?;
-                    out.write_char(' ')?;
-                }
-                let child_indent = deeper_yaml_indent("", current_indent + indent_spaces, unit);
-                cursor.stream_yaml_value(
-                    out,
-                    &child_indent,
-                    indent_spaces,
-                    unit,
-                    sort_keys,
-                    false,
-                )?;
+                // Review (#1115) found this branch was the fourth,
+                // still-unfixed copy of the #1132 anchor-only pattern --
+                // hand-writing the anchor and never checking
+                // `explicit_tag()`, unlike its container-branch sibling
+                // just above (fixed via `write_deferred_prefix`) and
+                // `stream_yaml_value`'s own equivalent Sequence-loop scalar
+                // branch (fixed via `write_deferred_value`). It also drops
+                // the tag on a genuinely deferred-and-absent top-level
+                // scalar, e.g. a slurped source document that's nothing but
+                // `&anc !!mytag` -- a shape the doc comment above this
+                // function claimed had no `--slurp` repro; one was found
+                // live (`- &anc null` instead of `- &anc !!mytag`), so this
+                // now routes through the same `write_deferred_value` helper
+                // instead of hand-writing the anchor.
+                let own_indent = deeper_yaml_indent("", current_indent, unit);
+                out.write_char('-')?;
+                write_deferred_value(out, &cursor, &own_indent, indent_spaces, unit, sort_keys)?;
                 write_line_comment(out, cursor.line_comment_raw())?;
             }
         }
