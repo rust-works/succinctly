@@ -2,13 +2,14 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Lazy generator consumers
 
-**Status: design only, not implemented.** This document is the deliverable for
-[#820](https://github.com/rust-works/succinctly/issues/820), which its own tier review
-(2026-08-20) classified Tier 3 — "evaluator-architecture change, design doc first, in the
-shape of #1282". It also scopes the two issues that name #820 as their real fix,
-[#932](https://github.com/rust-works/succinctly/issues/932) and
-[#987](https://github.com/rust-works/succinctly/issues/987). No code has been changed;
-see [Follow-up issues](#follow-up-issues).
+**Status: Stages 1, 2, 2b and 3 implemented; Stages 4-5 open.** This document is the
+deliverable for [#820](https://github.com/rust-works/succinctly/issues/820), which its
+own tier review (2026-08-20) classified Tier 3 — "evaluator-architecture change, design
+doc first, in the shape of #1282". It also scopes the two issues that name #820 as their
+real fix, [#932](https://github.com/rust-works/succinctly/issues/932) (partially closed —
+Stage 4 remains) and [#987](https://github.com/rust-works/succinctly/issues/987) (closed
+by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
+[Follow-up issues](#follow-up-issues).
 
 **Mechanism decision, already made:** an **additive sink/callback path alongside** the
 existing eager `eval_single`, not a rewrite of it. `eval_comma`, `eval_pipe` and
@@ -955,9 +956,18 @@ convention: file one implementation issue per stage once this document is review
 
 1. **Stage 1** — characterization tests. **Filed: #1386. Implemented: PR #1389.**
 2. **Stage 2** — `eval_each` + 10 `eval.rs` consumers. Closes #820, most of #932.
-   Depends on 1.
+   Depends on 1. **Implemented** (commit `a493108fc`).
 3. **Stage 2b** — `eval_generic.rs`'s `first`/`last` arm, option (b). Depends on 2. Files
-   its own follow-up for option (c).
-4. **Stage 3** — `paths(f)` producer + `resolve_leaf` sink. Closes #987. Depends on 2.
+   its own follow-up for option (c). **Implemented** (commit `f78089421`).
+4. **Stage 3** — `paths(f)` producer (`each_paths_filter`) + `resolve_leaf`'s
+   stop-after-first sink. Closes #987. Depends on 2. **Implemented.** `Flow::Stopped`
+   gained back its `pending: Option<Control>` payload as part of this stage, exactly as
+   scoped below — `resolve_leaf` is its one reader, preserving an already-triggered
+   `Halt` from an eager-fallback arm rather than downgrading it into a catchable path
+   error. One residual, documented rather than closed: an un-lazified `eval_each` arm
+   (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect for a
+   node's own filter when that filter's shape isn't one of `Comma`/`Pipe`/`Paren`/
+   `Builtin::PathsFilter` — pinned as a known-remaining row in
+   `test_short_circuit_side_effect_leaks_820_932_987`, left to Stage 5.
 5. **Stage 4** — `Expr::Compare`'s outer loop. Closes the rest of #932. Depends on 2.
 6. **Stage 5** — widen the arm set, one sub-issue per arm. Depends on 2.

@@ -16410,6 +16410,26 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "5",
             0,
         ),
+        // #987 Stage 3 closed the bare-comma spelling of this shape
+        // (`path(paths((true,(stderr|true))))`, now in the "already match"
+        // table above) but not this `If`-wrapped one: `eval_each` has no
+        // native `Expr::If` arm, so node `[0]`'s own filter still falls
+        // back to eager `drain_result(eval_single(...))` for that one
+        // sub-expression, and the whole `If` runs to completion (both
+        // comma branches of its `then`) before `path()`'s stop-after-first
+        // sink ever sees `[0]`'s first truthy output. jq: no stderr, since
+        // its own generator never even reaches the `stderr` half of the
+        // comma before `path()` is satisfied by the `true` half.
+        (
+            &[
+                "-c",
+                "path(paths(if .==1 then (true,(stderr|true)) else false end))",
+            ],
+            Some("[1,2,3]"),
+            "",
+            "1jq: error (at <stdin>:0): Invalid path expression with result [0]",
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -16425,13 +16445,19 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     Ok(())
 }
 
-/// #987: `path(paths(f))` runs `f` against a node real jq never visits.
+/// #987 (Stage 3, `each_paths_filter`): `path(paths(f))` used to run `f`
+/// against a node real jq never visits, because `resolve_leaf`'s catch-all
+/// evaluated `paths(f)`'s whole generator eagerly before ever checking
+/// whether its first output was even path-shaped.
 ///
 /// jq's `path()` demands only `paths(f)`'s FIRST output and aborts on it, so
-/// node `3` is never reached and nothing is written. Note this is not comma
-/// laziness -- jq evaluates both branches of the `(stderr, true)` comma too.
+/// node `3` is never reached and nothing is written — `resolve_leaf`'s
+/// catch-all is now a stop-after-first sink over a genuinely lazy
+/// `each_paths_filter`, so node `3`'s `stderr` is no longer even evaluated.
+/// Note this is not comma laziness -- jq evaluates both branches of the
+/// `(stderr, true)` comma too, once a node is actually visited.
 #[test]
-fn test_path_paths_filter_leaks_a_never_visited_node_987() -> Result<()> {
+fn test_path_paths_filter_does_not_leak_a_never_visited_node_987() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -16441,14 +16467,86 @@ fn test_path_paths_filter_leaks_a_never_visited_node_987() -> Result<()> {
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    // jq writes only the diagnostic; succinctly prefixes the leaked `3`.
-    assert!(
-        stderr.starts_with('3'),
-        "expected the leaked `3` before the diagnostic; stderr: {stderr:?}"
+    assert_eq!(
+        stderr.trim_end(),
+        "jq: error (at <stdin>:0): Invalid path expression with result [0]"
     );
-    assert!(
-        stderr.contains("Invalid path expression with result [0]"),
-        "stderr: {stderr:?}"
+    Ok(())
+}
+
+/// #987 over-stop trap: a satisfied `path()` consumer must not suppress a
+/// side effect the *matching* node's own filter genuinely produces before
+/// its truthy output — only never-reached later nodes/candidates should go
+/// unevaluated. Confirmed against jq 1.7.1: node `[0]`'s `stderr` still
+/// fires (it is what makes `[0]` the first, satisfying output), but the
+/// subsequent nodes are never visited at all.
+#[test]
+fn test_path_paths_filter_still_evaluates_the_satisfying_node_987() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(paths(if .==1 then (stderr,true) else false end))",
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.trim_end(),
+        "1jq: error (at <stdin>:0): Invalid path expression with result [0]"
+    );
+    Ok(())
+}
+
+/// #987 zero-surviving trap: when no candidate's filter is ever truthy,
+/// `path()` is never satisfied, so every node genuinely is visited — this
+/// is not a laziness regression, it's jq's own `recurse`-then-`select`
+/// behavior when `select` never once succeeds. Confirmed against jq 1.7.1:
+/// the root pre-check's own `stderr` fires first (`paths(node_filter)`
+/// always runs `node_filter` against the root, even though the root's own
+/// path is excluded from the result), then both non-root nodes' `stderr`
+/// fire too — no path output, exit 0.
+#[test]
+fn test_path_paths_filter_visits_every_node_when_none_survive_987() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(paths((stderr|false)))"], Some("[1,2]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), "[1,2]12");
+    Ok(())
+}
+
+/// #987: `path()`'s laziness fix reaches every caller that resolves paths
+/// through `resolve_dynamic_indexes` (`path()` itself, `del()`, `=`, `|=`),
+/// since they all share the same `resolve_node`/`resolve_leaf` resolver —
+/// not just the `path(...)` spelling the issue's own repro used. Confirmed
+/// against jq 1.7.1: both raise identically to `path(...)`'s own case,
+/// with node `3`'s `stderr` never reached.
+#[test]
+fn test_paths_filter_laziness_reaches_del_and_assign_987() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "del(paths(if .==3 then (stderr,true) else true end))"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.trim_end(),
+        "jq: error (at <stdin>:0): Invalid path expression with result [0]"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "(paths(if .==3 then (stderr,true) else true end)) = 9",
+        ],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.trim_end(),
+        "jq: error (at <stdin>:0): Invalid path expression with result [0]"
     );
     Ok(())
 }

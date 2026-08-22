@@ -1770,18 +1770,20 @@ enum Flow {
     Exhausted,
     /// A sink returned [`Demand::Stop`].
     ///
-    /// Carries no payload. The design (`docs/plan/jq-lazy-generator-consumers.md`)
-    /// specifies a `pending: Option<Control>` here, for a control an *eager
-    /// fallback* had already raised before the stop — reachable only when
+    /// `pending` is `Some(control)` only when an *eager fallback* had
+    /// already raised a control before the stop — reachable only when
     /// [`drain_result`] stops part-way through a `Partial`'s prefix, never
-    /// from a natively-lazy arm, which simply never evaluates that far. Every
-    /// consumer rewired in Stage 2 **drops** that control (oracle-confirmed:
-    /// `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0), so nothing reads it
-    /// yet and carrying it would be dead weight. `resolve_leaf` is the one
-    /// consumer that must *keep* a `Halt` — its own comment argues at length
-    /// that an already-triggered halt must not be downgraded into a catchable
-    /// error — so Stage 3 reintroduces the payload when the reader arrives.
-    Stopped,
+    /// from a natively-lazy arm, which simply never evaluates that far.
+    /// Every consumer rewired in Stage 2 (`each_take_first`, `each_take_n`,
+    /// `each_take_nth`, `builtin_isempty`, `any_all_gen_cond`,
+    /// `builtin_upper_in`, `eval_limit`/`builtin_limit`) **drops** it —
+    /// oracle-confirmed: `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0 —
+    /// so those sites match `Flow::Stopped { .. }` without reading the
+    /// field. `resolve_leaf` is the one consumer (Stage 3, #987) that must
+    /// *keep* a `Halt`: its own comment argues at length that an
+    /// already-triggered halt must not be downgraded into a catchable path
+    /// error, which is exactly what discarding `pending` would do for it.
+    Stopped { pending: Option<Control> },
     /// Terminated in a control. Everything produced before it was already
     /// delivered to the sink.
     Escaped(Control),
@@ -1808,16 +1810,16 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::One(v) => match sink(Item::Borrowed(v)) {
             Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped,
+            Demand::Stop => Flow::Stopped { pending: None },
         },
         QueryResult::Owned(v) => match sink(Item::Owned(v)) {
             Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped,
+            Demand::Stop => Flow::Stopped { pending: None },
         },
         QueryResult::Many(vs) => {
             for v in vs {
                 if sink(Item::Borrowed(v)) == Demand::Stop {
-                    return Flow::Stopped;
+                    return Flow::Stopped { pending: None };
                 }
             }
             Flow::Exhausted
@@ -1825,7 +1827,7 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::ManyOwned(vs) => {
             for v in vs {
                 if sink(Item::Owned(v)) == Demand::Stop {
-                    return Flow::Stopped;
+                    return Flow::Stopped { pending: None };
                 }
             }
             Flow::Exhausted
@@ -1835,13 +1837,21 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
         // `partial()` guarantees the prefix is produced *before* the control
         // and is never empty, so it is delivered first — exactly as
-        // `push_owned_values` already delivers it. A sink that stops part-way
-        // through drops the control it never reached, which is what every
-        // consumer rewired in Stage 2 wants (see `Flow::Stopped`).
+        // `push_owned_values` already delivers it. A sink that stops
+        // part-way through carries the control it never reached forward as
+        // `pending`, rather than dropping it outright: this is the one
+        // `Flow::Stopped` shape that can carry a real payload (see
+        // `Flow::Stopped`'s own doc comment) — an eager fallback like this
+        // one has already computed/raised `control` by the time the sink
+        // says stop, so `resolve_leaf` (#987) needs it to keep an
+        // already-triggered `Halt` from being downgraded into a catchable
+        // path error. Every other consumer still drops it.
         QueryResult::Partial(vs, control) => {
             for v in vs {
                 if sink(Item::Owned(v)) == Demand::Stop {
-                    return Flow::Stopped;
+                    return Flow::Stopped {
+                        pending: Some(control),
+                    };
                 }
             }
             Flow::Escaped(control)
@@ -1851,11 +1861,12 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
-/// Only `Comma`, `Pipe` and `Paren` have native lazy arms; everything else
-/// falls back to `eval_single` + [`drain_result`]. `Paren` is not optional
-/// cosmetics: `isempty(...)` consumes only its own parentheses, so
-/// `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and without this arm
-/// the fix would be a coin flip on spelling.
+/// Native lazy arms: `Comma`, `Pipe`, `Paren`, and `Builtin::PathsFilter`
+/// (#987, Stage 3). Everything else falls back to `eval_single` +
+/// [`drain_result`]. `Paren` is not optional cosmetics: `isempty(...)`
+/// consumes only its own parentheses, so `isempty((1, stderr))` is
+/// `IsEmpty(Paren(Comma(..)))` and without this arm the fix would be a coin
+/// flip on spelling.
 fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -1877,6 +1888,9 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         Expr::Pipe(exprs) => eval_each_pipe::<W, S>(exprs, value, optional, sink),
         Expr::Paren(inner) => eval_each::<W, S>(inner, value, optional, sink),
+        Expr::Builtin(Builtin::PathsFilter(f)) => {
+            each_paths_filter::<W, S>(f, value, optional, sink)
+        }
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
@@ -1903,7 +1917,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let Some((first, rest)) = exprs.split_first() else {
         return match sink(Item::Borrowed(value)) {
             Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped,
+            Demand::Stop => Flow::Stopped { pending: None },
         };
     };
     if rest.is_empty() {
@@ -1991,7 +2005,7 @@ fn each_take_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Demand::Stop
     });
     match flow {
-        Flow::Stopped | Flow::Exhausted => Ok(first),
+        Flow::Stopped { .. } | Flow::Exhausted => Ok(first),
         // The sink always stops on its first item, so an escape can only mean
         // nothing was ever produced. The `Some` guard keeps that reasoning
         // local rather than relying on it from a distance.
@@ -2049,7 +2063,7 @@ fn each_take_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     });
     match flow {
-        Flow::Stopped | Flow::Exhausted => Ok(wanted),
+        Flow::Stopped { .. } | Flow::Exhausted => Ok(wanted),
         Flow::Escaped(control) => match wanted {
             Some(item) => Ok(Some(item)),
             None => Err(control),
@@ -2074,7 +2088,7 @@ fn eval_each_owned<S: EvalSemantics>(
         return match result {
             Ok(Some(v)) => match sink(v) {
                 Demand::Continue => Flow::Exhausted,
-                Demand::Stop => Flow::Stopped,
+                Demand::Stop => Flow::Stopped { pending: None },
             },
             Ok(None) => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -4230,7 +4244,7 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(OwnedValue::Bool(true));
     }
     match flow {
-        Flow::Exhausted | Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(false)),
+        Flow::Exhausted | Flow::Stopped { .. } => QueryResult::Owned(OwnedValue::Bool(false)),
         Flow::Escaped(control) => control_to_result(control),
     }
 }
@@ -4682,7 +4696,9 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // returned above, so reaching this arm as `Stopped` is impossible
         // today -- but a defensible identity answer is a better failure mode
         // than a panic if a future sink grows a third stop reason.
-        Flow::Exhausted | Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(!target_truthy)),
+        Flow::Exhausted | Flow::Stopped { .. } => {
+            QueryResult::Owned(OwnedValue::Bool(!target_truthy))
+        }
         // No earlier output matched, so `gen`'s own terminator is the only
         // verdict left -- oracle-verified: `IN(3, error("boom"))` on `2` raises.
         Flow::Escaped(control) => control_to_result(control),
@@ -15364,14 +15380,14 @@ fn reject_if_untracked(branches: Vec<PathBranch<'_>>, trackable: bool) -> PathRe
 ///
 /// `trackable == false` (#843) additionally makes `Field`/`Index`/`Slice`
 /// raise the "near attempt to access element ... of ..." error immediately,
-/// *before* `eval_owned_multi` below ever runs — so this fires even where
-/// the underlying access would merely be an ordinary type error (confirmed
+/// *before* either sink below ever runs — so this fires even where the
+/// underlying access would merely be an ordinary type error (confirmed
 /// live: `path(try (.a, error("oops")) catch .foo)` on a caught *string*
 /// reports "near attempt to access element \"foo\" of \"oops\"", never the
 /// ordinary "Cannot index string with string \"foo\""). `Identity` is
 /// deliberately left out of that early check — it performs no navigation at
 /// all, so it falls through to the same eval-then-check path a non-primitive
-/// filter takes below (via the `trackable &&` guard just past it), which is
+/// filter takes below (via the `is_primitive` guard just past it), which is
 /// exactly what makes a bare `catch .` raise `#530`'s classic "with result"
 /// message instead (confirmed live) rather than the "near attempt" one.
 fn resolve_leaf<'a, S: EvalSemantics>(
@@ -15387,31 +15403,9 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             ));
         }
     }
-    // `eval_owned_multi_keep_partial`, not `eval_owned_multi`: a later output
-    // of `expr` erroring or breaking must not retroactively un-produce an
-    // earlier one it already yielded (#842's precedent for `recurse`'s own
-    // fan-out, applying equally here) — see the "streams as it goes" case
-    // below (#861).
-    let (mut values, trailing) = eval_owned_multi_keep_partial::<S>(expr, value);
-    // Halt is never swallowed, however many outputs `expr` already produced:
-    // it is an unconditional process-termination signal (`EvalEscape::Halt`'s
-    // own doc comment), not an ordinary catchable failure. Break/Error below
-    // are provably safe to fold into an ordinary path error instead —
-    // confirmed live against jq 1.7.1, real jq's own `path(...)` never even
-    // reaches a later output's break/error here (see the `1 =>` arm's
-    // comment below) — but that same "real jq never gets there" argument
-    // does not rescue Halt: a script relying on `halt_error` as a hard,
-    // uncatchable abort must not have it silently downgraded into a
-    // `try`/`catch`-able "Invalid path expression" just because this
-    // resolver's own evaluation of `expr` is eager rather than jq's lazy
-    // per-output generator (unlike jq, `eval_owned_multi_keep_partial`
-    // already ran the candidate that halted, side effects included, by the
-    // time control reaches here — the only question left is whether that
-    // already-triggered halt still takes effect, and it must).
-    if let Some(EvalEscape::Halt(code)) = &trailing {
-        return Err((Vec::new(), EvalEscape::Halt(*code)));
-    }
-    if trackable
+
+    // Purely syntactic, decided before either sink below runs.
+    let is_primitive = trackable
         && matches!(
             expr,
             Expr::Identity
@@ -15420,8 +15414,42 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 | Expr::IndexNumber { .. }
                 | Expr::Slice { .. }
                 | Expr::SliceNumber { .. }
-        )
-    {
+        );
+
+    if is_primitive {
+        // This arm needs every output, not just the first: `values.len()`
+        // (0 vs 1 vs many) decides which of three different outcomes this
+        // returns below, a distinction a stop-after-first sink would
+        // destroy — so this keeps an always-`Continue` sink. That makes it
+        // provably byte-identical to the eager `eval_owned_multi_keep_partial`
+        // this replaced: `eval_each_owned`/`drain_result` mirror
+        // `eval_owned_input`/`push_owned_values` exactly when the sink never
+        // answers `Stop` (`drain_result`'s own doc comment states that
+        // invariant).
+        let mut values = Vec::new();
+        let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+            values.push(v);
+            Demand::Continue
+        });
+        // `Flow::Stopped` cannot actually occur here — this sink never
+        // answers `Stop` — but folded to "no trailing control" rather than
+        // `unreachable!()`, mirroring `any_all_gen_cond`'s own "a defensible
+        // answer beats a panic" precedent for the same shape.
+        let trailing = match flow {
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+            Flow::Escaped(control) => Some(EvalEscape::from(control)),
+        };
+        // Halt is never swallowed, however many outputs `expr` already
+        // produced: it is an unconditional process-termination signal
+        // (`EvalEscape::Halt`'s own doc comment), not an ordinary catchable
+        // failure — a script relying on `halt_error` as a hard, uncatchable
+        // abort must not have it silently downgraded into a `try`/`catch`-able
+        // "Invalid path expression" just because this resolver's own
+        // evaluation of `expr` already ran the candidate that halted, side
+        // effects included, by the time control reaches here.
+        if let Some(EvalEscape::Halt(code)) = &trailing {
+            return Err((Vec::new(), EvalEscape::Halt(*code)));
+        }
         let mut components = Vec::new();
         push_path_components(&mut components, expr);
         return match values.len() {
@@ -15429,7 +15457,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             // been one because evaluating `expr` itself broke/errored (Halt
             // excluded, handled above) before producing anything.
             0 => path_result(Vec::new(), trailing),
-            // Guarded by the `trackable &&` on this whole arm.
+            // Guarded by `is_primitive` above.
             1 => Ok(vec![PathBranch::new(
                 components,
                 Cow::Owned(values.pop().expect("len checked")),
@@ -15447,38 +15475,62 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             )),
         };
     }
-    match values.len() {
-        // No output prunes the branch — unless there never would have been
-        // one because evaluating `expr` itself broke/errored (Halt excluded,
-        // handled above) before producing anything. Same rule as the
-        // `trackable`-primitive branch above, for the general non-primitive
-        // case this arm covers.
-        0 => path_result(Vec::new(), trailing),
-        // Real jq's `path(...)` checks each output as it streams: the first
-        // non-path-shaped value raises "Invalid path expression" immediately,
-        // before a later output of the same expression is ever produced —
-        // even one that would itself error or break (confirmed live:
-        // `path(range(3))` raises on `0` alone, never reaching `1`/`2`; #861's
-        // own repro, `path(paths(if type=="string" then break $out else true
-        // end))` on `[1,"x",2]`, raises on `[0]` alone, never reaching the
-        // second candidate where the `break` sits). `values[0]` is that first
-        // output regardless of how many outputs there actually were (#891 —
-        // one arm covers both the single- and multi-output case, since real
-        // jq's own per-output check treats them identically: it never even
-        // learns whether a second output would have existed) or of whether
-        // `trailing` still carries a Break/Error from evaluating further
-        // here — real jq never reaches whatever would have caused it, so
-        // it's discarded rather than propagated (Halt is the one exception,
-        // already handled above).
-        //
-        // Still doesn't cover every context: when this same value is being
-        // used as an assignment *target* for further indexing rather than
-        // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`, or the
-        // single-output `(1 | .[("x","y")]) = 9`), real jq instead raises
-        // the "near attempt to access element ... of ..." wording (confirmed
-        // live for both) — `resolve_leaf` has no way to tell that context
-        // apart from `path(...)`'s own leaf today; filed as #989 rather than
-        // attempted here.
+
+    // General non-primitive case (#987): real jq's `path(...)` checks each
+    // output as it streams — the first non-path-shaped value raises
+    // "Invalid path expression" immediately, before a later output of the
+    // same expression is ever produced, even one that would itself error or
+    // break (confirmed live: `path(range(3))` raises on `0` alone, never
+    // reaching `1`/`2`; #861's own repro, `path(paths(if type=="string" then
+    // break $out else true end))` on `[1,"x",2]`, raises on `[0]` alone,
+    // never reaching the second candidate where the `break` sits) — and
+    // never even *asks the generator for that later value at all*, so any
+    // side effect embedded in it (`stderr`, a consumed `input`) must not
+    // fire either. `eval_owned_multi_keep_partial` (the eager evaluator this
+    // used to call) runs `expr`'s whole subtree to completion regardless, so
+    // a later output's side effect fired anyway even though its value was
+    // then discarded — the bug #987 tracked. A stop-after-first sink via
+    // `eval_each_owned` is what actually prevents the generator from being
+    // asked at all, for every arm `eval_each` has a native lazy path for
+    // (`Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`) — confirmed live:
+    // `path(paths(if . == 3 then (stderr,true) else true end))` on `[1,2,3]`
+    // no longer writes `3` to stderr. An un-lazified arm still falls back to
+    // `drain_result(eval_single(...))`, which is eager for that one
+    // sub-expression (a residual, documented divergence, not fixed by this
+    // change).
+    //
+    // Still doesn't cover every context: when this same value is being used
+    // as an assignment *target* for further indexing rather than
+    // `path(...)`'s own leaf (`(range(3) | .[("x","y")]) = 9`, or the
+    // single-output `(1 | .[("x","y")]) = 9`), real jq instead raises the
+    // "near attempt to access element ... of ..." wording (confirmed live
+    // for both) — `resolve_leaf` has no way to tell that context apart from
+    // `path(...)`'s own leaf today; filed as #989 rather than attempted
+    // here.
+    let mut first: Option<OwnedValue> = None;
+    let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
+        first = Some(v);
+        Demand::Stop
+    });
+
+    // Halt-first, exactly as the eager version checked `trailing` first —
+    // an already-triggered halt (whether it escaped bare, or is `pending`
+    // on a `Stopped` from an eager fallback that had already computed it
+    // before this sink was satisfied) must never be downgraded into a
+    // catchable path error, matching the primitive branch's identical rule
+    // above.
+    let halt = match &flow {
+        Flow::Escaped(Control::Halt(code))
+        | Flow::Stopped {
+            pending: Some(Control::Halt(code)),
+        } => Some(*code),
+        _ => None,
+    };
+    if let Some(code) = halt {
+        return Err((Vec::new(), EvalEscape::Halt(code)));
+    }
+
+    match first {
         // #986: *defer*, don't raise. Whether a non-path-shaped value is an
         // error depends on whether anything after it still has to navigate
         // into it, and only this branch's consumer knows that: `path(1)` is
@@ -15487,14 +15539,21 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // untracked lets each of those be decided where the answer is
         // actually known (`resolve_dynamic_indexes`'s terminal check,
         // `resolve_static_tail`, `resolve_index_expr`'s post-target check),
-        // instead of guessing here.
-        //
-        // Only `values[0]` survives, for the streaming reason spelled out
-        // above: real jq checks each output as it is produced and never
-        // learns whether a second one existed.
-        _ => Ok(vec![PathBranch::untracked(Cow::Owned(
-            values.swap_remove(0),
-        ))]),
+        // instead of guessing here. Any trailing Break/Error past this first
+        // output — whether a bare `Escaped` the sink never had a chance to
+        // avoid, or `pending` on a `Stopped` from an eager fallback — is
+        // dropped: real jq never reaches whatever would have caused it.
+        Some(v) => Ok(vec![PathBranch::untracked(Cow::Owned(v))]),
+        // No output prunes the branch — unless there never would have been
+        // one because evaluating `expr` itself broke/errored (Halt excluded,
+        // handled above) before producing anything. `Flow::Stopped` with no
+        // `first` cannot actually occur (this sink always sets `first`
+        // before answering `Stop`); folded to `Ok(Vec::new())` rather than
+        // `unreachable!()` for the same reason as the primitive branch above.
+        None => match flow {
+            Flow::Exhausted | Flow::Stopped { .. } => Ok(Vec::new()),
+            Flow::Escaped(control) => Err((Vec::new(), EvalEscape::from(control))),
+        },
     }
 }
 
@@ -19815,7 +19874,7 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // $out` fires here, so nothing past that point is ever reached and a
         // trailing control from an eager fallback is dropped, exactly as the
         // excess *values* beyond `n` already were.
-        Flow::Stopped => result,
+        Flow::Stopped { .. } => result,
         Flow::Exhausted => result,
         // Fewer than `n` were produced, so the generator's own terminator is
         // what `limit` actually reaches (`[limit(3; 1,2,error("x"),4)]`
@@ -22618,6 +22677,109 @@ fn builtin_paths<W: Clone + AsRef<[u64]>>(
     owned_vec_to_result(paths)
 }
 
+/// Lazy producer for `paths(filter)` (`Builtin::PathsFilter`) — pushes each
+/// path whose value matches `filter` into `sink`, stopping as soon as `sink`
+/// says to (#987, Stage 3 of `docs/plan/jq-lazy-generator-consumers.md`).
+/// `builtin_paths_filter` is a thin collecting wrapper around this; `eval_each`'s
+/// own `Builtin::PathsFilter` arm dispatches here directly, so
+/// `path(paths(f))` — the shape #987 named — stops pulling from this
+/// generator exactly where jq's own generator would.
+///
+/// jq's own `paths(node_filter)` evaluates `node_filter` against every node
+/// `recurse` visits, root included — `recurse` always yields `.` before
+/// descending into children — even though the root's own path is later
+/// filtered out of the result (`length > 0`); confirmed live: `1 |
+/// [paths(error("x"))]` raises in real jq, though a scalar has no non-root
+/// paths at all. The loop below only visits non-root paths, so without this
+/// root pre-check, `paths(node_filter)` on a scalar/null/empty container
+/// never runs `filter` at all -- and (#850) even on a non-empty root, an
+/// error/break on the root itself must abort before any non-root path is
+/// produced, not just be missed. **This pre-check stays eager and
+/// unconditional even for a demand-driven sink**: nothing has been pushed
+/// yet at this point, so it is a bare `Error`/`Break`/`Halt`, never a
+/// `Partial`, and jq itself always runs it before any consumer could stop
+/// — confirmed against jq 1.7.1: `[1] | path(paths(stderr))` writes `[1]`
+/// to stderr even though `path()` stops the moment the first (root-excluded)
+/// path arrives. Uses `eval_owned_expr_ctrl` rather than its
+/// `eval_owned_expr` twin because this call site needs a `Control`-typed
+/// error, not `EvalEscape`. Confirmed against jq 1.7.1: `{"a":1} |
+/// paths(if type=="object" then error("x") else true end)` raises
+/// immediately with no output (not `["a"]`), and `label $out |
+/// [paths(break $out)]` on `1` produces no output and exits 0.
+///
+/// jq's `paths(node_filter)` is `path(recurse|select(node_filter))`, and
+/// `select(f)` is `if f then . else empty end` -- `if` forks over every
+/// output `f` produces, so a multi-output node_filter must be checked
+/// per-output, not collapsed into one value first. Confirmed against jq
+/// 1.7.1: `{"a":1,"b":{"c":2}} | [paths(false,false)]` is `[]`, and
+/// `[paths(true,true)]` duplicates every path, `[["a"],["a"], ["b"],["b"],
+/// ["b","c"],["b","c"]]` -- not each path once (#773). This per-node fan-out
+/// is itself demand-aware, not just the outer path loop: once `sink` is
+/// satisfied, this node's own `filter` is never asked for a second truthy
+/// output either. Confirmed against jq 1.7.1 (#987 review): `[1,2,3] |
+/// path(paths(if .==1 then (true,(stderr|true)) else false end))` writes
+/// nothing to stderr — `path()` stops right after node `[0]`'s first truthy
+/// output, so its second is never produced — while `[paths(<same>)]` (no
+/// consumer stop) writes `1` to stderr and yields `[[0],[0]]`.
+///
+/// Once credited, any control signal -- `halt` (#791), or an ordinary
+/// error/break -- aborts the whole generator instead of being swallowed and
+/// moving on to the next node (#850). This matches real jq:
+/// `paths(node_filter)` is `path(recurse|select(node_filter))`, and an
+/// uncaught error/break inside `select`'s fan-out aborts the entire
+/// generator, not just the current node. Confirmed against jq 1.7.1:
+/// `[1,"x",2] | paths(if type=="string" then error("bad") else true end)`
+/// streams `[0]` then raises, never reaching index 2. `break $label` also
+/// correctly unwinds to a `label` lexically enclosing the whole
+/// `paths(...)` call: `eval_each_owned` (like `eval_owned_input` before it)
+/// never collapses `Control::Break` into a "not in label" error. This does
+/// not extend to `path(paths(node_filter))`'s own trackable-path machinery
+/// treating this builtin's output as *path-shaped* -- that is a separate,
+/// still-open divergence (filed as #861).
+///
+/// `optional` (this function's own parameter, not a hardcoded `false`) must
+/// reach the per-node evaluation too, so a real `?` the caller wrote inside
+/// `node_filter` itself (e.g. `paths(.foo?, true)`) suppresses that node's
+/// own error the same way it would anywhere else, instead of a hardcoded
+/// `false` silently ignoring it. See `test_isvalid_paths_filter_node_error_not_swallowed_881`
+/// for the #881 regression this must keep passing.
+fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    filter: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let owned = to_owned(&value);
+
+    if let Err(control) = eval_owned_expr_ctrl::<S>(filter, &owned, optional) {
+        return Flow::Escaped(control);
+    }
+
+    let mut all_paths = Vec::new();
+    collect_paths(&owned, &[], &mut all_paths);
+
+    for path in all_paths {
+        let OwnedValue::Array(path_arr) = &path else {
+            continue;
+        };
+        let Some(val_at_path) = get_value_at_path(&owned, path_arr) else {
+            continue;
+        };
+        let flow = eval_each_owned::<S>(filter, &val_at_path, optional, &mut |v| {
+            if v.is_truthy() {
+                sink(Item::Owned(path.clone()))
+            } else {
+                Demand::Continue
+            }
+        });
+        match flow {
+            Flow::Exhausted => {}
+            stopped_or_escaped => return stopped_or_escaped,
+        }
+    }
+    Flow::Exhausted
+}
+
 /// Builtin: paths(filter) - paths to values matching filter
 /// Returns each path as a separate output (streaming), matching jq behavior
 fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -22625,133 +22787,15 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = to_owned(&value);
-
-    // jq's own `paths(node_filter)` evaluates `node_filter` against every
-    // node `recurse` visits, root included — `recurse` always yields `.`
-    // before descending into children — even though the root's own path is
-    // later filtered out of the result (`length > 0`); confirmed live:
-    // `1 | [paths(error("x"))]` raises in real jq, though a scalar has no
-    // non-root paths at all. The loop below only visits non-root paths, so
-    // without this, `paths(node_filter)` on a scalar/null/empty container
-    // never runs `filter` at all -- and (#850) even on a non-empty root, an
-    // error/break on the root itself must abort before any non-root path is
-    // produced, not just be missed. Nothing has been credited to
-    // `filtered_paths` yet at this point, so any escape here is a bare
-    // `Error`/`Break`/`Halt`, never a `Partial`. Uses `eval_owned_expr_ctrl`
-    // rather than its `eval_owned_expr` twin because this call site needs a
-    // `Control`-typed error to pass straight to `partial(...)` below --
-    // `eval_owned_expr` now propagates a bare `break` correctly too (#833),
-    // but still returns `EvalEscape`, not `Control`. Confirmed against jq 1.7.1: `{"a":1} |
-    // paths(if type=="object" then error("x") else true end)` raises
-    // immediately with no output (not `["a"]`), and `label $out |
-    // [paths(break $out)]` on `1` produces no output and exits 0.
-    if let Err(control) = eval_owned_expr_ctrl::<S>(filter, &owned, optional) {
-        return partial(Vec::new(), control);
+    let mut paths = Vec::new();
+    let flow = each_paths_filter::<W, S>(filter, value, optional, &mut |item| {
+        paths.push(item.into_owned());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(paths),
+        Flow::Escaped(control) => partial(paths, control),
     }
-
-    let mut all_paths = Vec::new();
-    collect_paths(&owned, &[], &mut all_paths);
-
-    let mut filtered_paths = Vec::new();
-    for path in all_paths {
-        if let OwnedValue::Array(path_arr) = &path {
-            // Get the value at this path
-            if let Some(val_at_path) = get_value_at_path(&owned, path_arr) {
-                // jq's `paths(node_filter)` is `path(recurse|select(node_filter))`,
-                // and `select(f)` is `if f then . else empty end` -- `if` forks
-                // over every output `f` produces, so a multi-output node_filter
-                // must be checked per-output, not collapsed into one value
-                // first. Confirmed against jq 1.7.1:
-                // `{"a":1,"b":{"c":2}} | [paths(false,false)]` is `[]`, and
-                // `[paths(true,true)]` duplicates every path, `[["a"],["a"],
-                // ["b"],["b"],["b","c"],["b","c"]]` -- not each path once
-                // (#773).
-                //
-                // `paths(node_filter)`'s own definition is `select(node_filter)`'s
-                // fan-out (`path(recurse|select(node_filter))`), and
-                // `push_truthiness` is the exact helper this codebase
-                // already uses for that fan-out shape (it backs `eval_if`/
-                // `builtin_select` via `eval_fanout`) -- collect one
-                // truthiness bit per output instead of collapsing them
-                // (matching `eval_owned_expr_fork`'s "keep every output"
-                // idiom that `reduce`/`foreach`/`while`/`until` build on,
-                // not the shared `eval_owned_multi` helper used by ~19
-                // *other* callers, whose contract collapses a `Partial`
-                // straight to `Err` and discards the outputs already
-                // produced -- correct there, #694, wrong here). A node's
-                // own truthy output(s) produced before an error/break/halt
-                // in the *same* node_filter fan-out must still be kept and
-                // counted once each. Confirmed against jq 1.7.1: `[1,"x",2]
-                // | paths(if type=="string" then (true, error("bad")) else
-                // true end)` streams `[0]`, `[1]`, then raises -- not just
-                // `[0]`.
-                //
-                // Once credited, any control signal -- `halt` (#791), or an
-                // ordinary error/break -- aborts the whole builtin instead of
-                // being swallowed and moving on to the next node (#850).
-                // This matches real jq: `paths(node_filter)` is
-                // `path(recurse|select(node_filter))`, and an uncaught
-                // error/break inside `select`'s fan-out aborts the entire
-                // generator, not just the current node. Confirmed against jq
-                // 1.7.1: `[1,"x",2] | paths(if type=="string" then
-                // error("bad") else true end)` streams `[0]` then raises,
-                // never reaching index 2. `break $label` also now correctly
-                // unwinds to a `label` lexically enclosing the whole
-                // `paths(...)` call: `eval_owned_input` never collapses
-                // `Control::Break` into a "not in label" error -- unlike
-                // `result_to_owned`/`eval_owned_expr` for their own
-                // still-open `Partial` case (#833's follow-up), this path
-                // has no such gap, since `push_truthiness` already threads
-                // a trailing `Break` through intact regardless of how many
-                // truthy outputs preceded it, so once this loop stops
-                // swallowing it, propagation just works. Confirmed: `label
-                // $out | paths(if type=="string"
-                // then break $out else true end)` on `[1,"x",2]` now matches
-                // real jq exactly (streams `[0]`, exit 0), including when
-                // the matching node is nested. This does not extend to
-                // `path(paths(node_filter))` -- wrapping this builtin's own
-                // output in `path(...)`'s trackable-path machinery is a
-                // separate, still-open divergence (filed as #861).
-                //
-                // `optional` (this builtin's own parameter, not a
-                // hardcoded `false`) must reach this per-node evaluation
-                // too, so a real `?` the caller wrote inside `node_filter`
-                // itself (e.g. `paths(.foo?, true)`) suppresses that node's
-                // own error the same way it would anywhere else, instead of
-                // a hardcoded `false` silently ignoring it.
-                //
-                // #881 update: prior to that fix, `isvalid(EXPR)` forced
-                // `optional=true` all the way down through this parameter
-                // too (not via the `?`/`try` path, which never forces it
-                // here per #693, but via `builtin_isvalid` calling
-                // `eval_single` with `true` directly) -- so
-                // `{"a":1,"b":2} | isvalid(paths(.foo, true))` used to
-                // report `true`, with `.foo`'s error on each scalar node
-                // silently swallowed by that forcing rather than by any `?`
-                // the caller actually wrote. `isvalid` no longer forces
-                // `optional`, so that swallowing no longer happens here:
-                // the same expression is `false` now, matching real jq
-                // (`{"a":1,"b":2} | [paths(.foo, true)]` itself errors
-                // there) -- see `test_isvalid_paths_filter_node_error_not_swallowed_881`.
-                let mut truthiness = Vec::new();
-                let control = push_truthiness(
-                    eval_owned_input::<Vec<u64>, S>(filter, &val_at_path, optional),
-                    &mut truthiness,
-                );
-                for &truthy in &truthiness {
-                    if truthy {
-                        filtered_paths.push(path.clone());
-                    }
-                }
-                if let Some(control) = control {
-                    return partial(filtered_paths, control);
-                }
-            }
-        }
-    }
-    // Stream individual paths instead of wrapping in array
-    owned_vec_to_result(filtered_paths)
 }
 
 /// Helper to get value at a path (alias for convenience)
@@ -27068,7 +27112,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let satisfied = taken.len() >= n;
     let values: Vec<OwnedValue> = taken.into_iter().map(Item::into_owned).collect();
     match flow {
-        Flow::Stopped | Flow::Exhausted => owned_vec_to_result(values),
+        Flow::Stopped { .. } | Flow::Exhausted => owned_vec_to_result(values),
         Flow::Escaped(control) => {
             if satisfied {
                 owned_vec_to_result(values)
@@ -27213,7 +27257,7 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // answers `false` regardless. Oracle-confirmed for all three shapes:
         // `isempty(1, error("x"))`, `isempty(1, ("m"|halt_error(3)))` and
         // `label $o | isempty(1, break $o)` all answer `false`, exit 0.
-        Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(false)),
+        Flow::Stopped { .. } => QueryResult::Owned(OwnedValue::Bool(false)),
 
         // `g` ran to exhaustion without ever calling the sink.
         Flow::Exhausted => QueryResult::Owned(OwnedValue::Bool(true)),
@@ -32141,7 +32185,7 @@ mod tests {
         });
         let result = items_to_result(items);
         match flow {
-            Flow::Exhausted | Flow::Stopped => result,
+            Flow::Exhausted | Flow::Stopped { .. } => result,
             Flow::Escaped(control) => {
                 let mut prefix = Vec::new();
                 push_owned_values(result, &mut prefix);
@@ -32202,6 +32246,19 @@ mod tests {
             (b"{\"a\":{\"b\":7}}", ".a.b, .a, ."),
             (b"{\"a\":{\"b\":7}}", ".a | .b, .b"),
             (b"{\"a\":1}", ".a, .missing, .a"),
+            // #987, Stage 3: `Builtin::PathsFilter` gained a native lazy arm
+            // (`each_paths_filter`) alongside `resolve_leaf`'s own switch to
+            // a demand-driven sink — this differential is what guards
+            // `each_paths_filter` against drifting from the eager
+            // `builtin_paths_filter` it replaced, the same way it already
+            // guards the lazy `Comma`/`Pipe`/`Paren` arms above.
+            (b"[1,2,3]", "paths(true)"),
+            (b"[1,2,3]", "paths(false)"),
+            (b"[1,2,3]", "paths(.==2)"),
+            (b"[1,2,3]", "paths(true,true)"),
+            (b"{\"a\":1,\"b\":{\"c\":2}}", "paths(true)"),
+            (b"[1,2,3]", "paths(if .==2 then error(\"x\") else true end)"),
+            (b"1", "paths(error(\"x\"))"),
         ];
 
         for (json, src) in cases {
@@ -43616,32 +43673,95 @@ mod tests {
         );
     }
 
-    /// Halt sibling of the fix above: switching `resolve_leaf` to
-    /// `eval_owned_multi_keep_partial` means a later `Break`/`Error` no
-    /// longer erases an already-produced prefix, but `Halt` must never be
-    /// folded into that same "discard the escape, raise an ordinary path
-    /// error" treatment. `EvalEscape::Halt`'s own doc: "Must reach the CLI
-    /// unconditionally; never catchable, never suppressible." Two
-    /// legitimate outputs (`[0]`, `[1]`, from the two number candidates)
-    /// are produced before the third candidate halts — unlike `break`, real
-    /// jq's own laziness never even reaches this halt either (it would
-    /// raise on `[0]` alone, same as #861's own repro), but this resolver's
-    /// evaluation is eager, not lazy, so by the time `resolve_leaf` sees
-    /// the escape, `halt_error`'s side effect has already run and its exit
-    /// code must still take effect rather than being silently downgraded
-    /// into a catchable "Invalid path expression".
+    /// Halt sibling of the fix above, flipped by #987's Stage 3: with
+    /// `resolve_leaf`'s catch-all now a stop-after-first sink over
+    /// `each_paths_filter` (a genuinely lazy producer, not just a
+    /// keep-partial one), `path(...)` stops pulling from `paths(...)`'s
+    /// generator the moment its first output arrives — node `[0]`'s value
+    /// `1` is type "number", so the filter's `else true` branch fires and
+    /// `[0]` becomes that first, computed (non-navigated) output. `path()`'s
+    /// terminal check raises on it directly, exactly as #861's sibling
+    /// break-based repro does — the halting third candidate (`"trigger"`)
+    /// is never reached at all, matching real jq's own laziness exactly
+    /// rather than merely not downgrading an already-fired halt. Confirmed
+    /// against jq 1.7.1: both queries below give "Invalid path expression
+    /// with result [0]", exit 5, with no halt and no `halt_error` side
+    /// effect.
+    ///
+    /// A halt genuinely reachable at the *first* candidate is a distinct,
+    /// still-uncatchable case — `EvalEscape::Halt`'s own doc: "Must reach
+    /// the CLI unconditionally; never catchable, never suppressible" — and
+    /// is covered by [`test_path_paths_filter_halts_when_the_first_candidate_halts_987`].
     #[test]
     fn test_path_paths_filter_never_swallows_a_later_halt() {
         query!(
             br#"[1,2,"trigger"]"#,
             r#"path(paths(if type=="string" then (.|halt_error) else true end))"#,
-            QueryResult::Halt(_) => {}
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result [0]");
+            }
         );
-        // Wrapping in try/catch must not change this: halt is uncatchable.
+        // `try`/`catch` now genuinely catches it, since it's an ordinary
+        // path error, not a halt.
         query!(
             br#"[1,2,"trigger"]"#,
             r#"try path(paths(if type=="string" then (.|halt_error) else true end)) catch "caught""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "caught");
+            }
+        );
+    }
+
+    /// #987: a halt genuinely reachable at `paths(...)`'s *first* candidate
+    /// — not merely one that used to be reached by the old eager evaluator
+    /// — is still uncatchable and still fires, matching real jq exactly
+    /// (jq's own laziness also reaches it, since it's the first candidate).
+    /// Confirmed against jq 1.7.1: `path(paths(if type=="number" then
+    /// (.|halt_error) else true end))` on `[1,2,"trigger"]` halts with exit
+    /// 5 (`halt_error`'s own default code) and `1` on stderr, both with and
+    /// without a wrapping `try`/`catch`.
+    #[test]
+    fn test_path_paths_filter_halts_when_the_first_candidate_halts_987() {
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"path(paths(if type=="number" then (.|halt_error) else true end))"#,
             QueryResult::Halt(_) => {}
+        );
+        query!(
+            br#"[1,2,"trigger"]"#,
+            r#"try path(paths(if type=="number" then (.|halt_error) else true end)) catch "caught""#,
+            QueryResult::Halt(_) => {}
+        );
+    }
+
+    /// #987: `path(paths(f))`'s three basic output-count shapes, pinned as a
+    /// trio since they exercise `resolve_leaf`'s stop-after-first sink
+    /// against each of `values.len()`'s three possible outcomes (0 / 1 /
+    /// many) — a distinction the sink's caller still has to make explicitly
+    /// even once evaluation is lazy. See `jq_cli_tests.rs` for the
+    /// side-effecting, CLI-level over-stop traps this can't observe. All
+    /// three confirmed against jq 1.7.1.
+    #[test]
+    fn test_path_paths_filter_output_count_shapes_987() {
+        // Zero surviving candidates: silent prune, no output, no error.
+        query!(br"[1,2,3]", "path(paths(false))",
+            QueryResult::None => {}
+        );
+        // One surviving candidate: `paths()`'s own output (`[1]`, a plain
+        // array) is itself a *computed* value, never further path-trackable
+        // (#861) — so even the sole survivor still raises, naming its own
+        // value rather than succeeding.
+        query!(br"[1,2,3]", "path(paths(.==2))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result [1]");
+            }
+        );
+        // Many candidates would survive if fully evaluated, but `path()`
+        // only ever asks for the first: `[0]`, never `[1]`/`[2]`.
+        query!(br"[1,2,3]", "path(paths(true))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result [0]");
+            }
         );
     }
 
