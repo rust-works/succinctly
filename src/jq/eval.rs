@@ -19,6 +19,11 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use std::borrow::Cow;
 
+#[cfg(not(test))]
+use alloc::rc::Rc;
+#[cfg(test)]
+use std::rc::Rc;
+
 use core::cell::Cell;
 
 use indexmap::{IndexMap, IndexSet};
@@ -14900,19 +14905,9 @@ fn resolve_node<'a, S: EvalSemantics>(
         // completing — not nothing.
         Expr::As { expr, var, body } => {
             let (bound_values, trailing) = eval_owned_expr_fork::<S>(expr, value, false);
-            // #844: same bind-time gate as `eval_as` -- only a
-            // statically-verified passthrough of `.` is even a candidate
-            // for path()-trackability through this binding. The actual
-            // trackability decision is made lazily by `resolve_node`'s own
-            // `Expr::TrackedVar` arm, at each use site.
-            let wrap_tracked = is_identity_passthrough(expr);
             let mut out = Vec::new();
             for bound in bound_values {
-                let substituted = if wrap_tracked {
-                    substitute_var_tracked(body, var, &bound)
-                } else {
-                    substitute_var(body, var, &bound)
-                };
+                let substituted = substitute_bound_var(expr, body, var, &bound);
                 match resolve_node::<S>(&substituted, value, trackable) {
                     Ok(branches) => out.extend(branches),
                     Err((body_prefix, escape)) => {
@@ -16971,26 +16966,61 @@ where
     result
 }
 
-/// True if `expr` is nothing but `.`, statically -- gates whether an
-/// `as`-bound value is wrapped in `Expr::TrackedVar` at all (#844).
+/// True if `expr` is statically guaranteed to evaluate to `.` unchanged, in
+/// every case this function recognizes -- gates whether an `as`-bound value
+/// is wrapped in `Expr::TrackedVar` at all (#844). This check is
+/// deliberately syntactic, not "does the value happen to match" -- that
+/// runtime check happens separately, in `resolve_node`'s own
+/// `Expr::TrackedVar` arm, once a marker actually reaches a use site. So
+/// widening this predicate can never make `resolve_node` emit a *wrong*
+/// path (the runtime check still has the final say); it only changes which
+/// bindings even become trackability *candidates*.
 ///
-/// Real jq only ever preserves `path()` trackability through a variable
-/// bound from `.` itself, never from a literal, field access, or any other
-/// computation, regardless of what value it evaluates to (confirmed live:
-/// `0 as $x | path($x)` on input `0` still raises `Invalid path expression`
-/// in real jq, even though the bound value trivially equals `.` there). So
-/// this check is deliberately syntactic, not "does the value happen to
-/// match" -- that runtime check happens separately, in `resolve_node`'s own
-/// `Expr::TrackedVar` arm, once a marker actually reaches a use site.
+/// Recognizes, confirmed live against jq 1.7.1:
+/// - `Expr::Identity`/`Expr::TrackedVar` (the base cases -- the latter lets
+///   a chain of pure bindings compose: `. as $x | $x as $y | path($y|...)`
+///   still tracks `$y`, since by the time this predicate sees `$y`'s bind
+///   source it has already been substituted into a `TrackedVar` from the
+///   outer binding).
+/// - `Expr::Paren` (peeled via `unwrap_paren`; purely syntactic grouping).
+/// - `if C then A else B end`, when **both** `A` and `B` recognize as
+///   passthrough -- `C` decides which one runs, but either answer is `.`
+///   unchanged, so the branch actually taken doesn't need to be known
+///   statically (`. as $x | (if true then $x else $x end) as $y | ...`).
+///   A branch that *isn't* recognized (e.g. `if c then $x else $y end`
+///   where `$y` was itself bound from real navigation) makes the whole
+///   `if` untracked, even when `c` happens to always pick the recognized
+///   branch -- this predicate does not evaluate `c`.
+/// - `try A catch B`, requiring **only** `A` -- unlike `if`, `B` can be
+///   ignored rather than also required: every expression this predicate
+///   recognizes is built from primitives that cannot themselves raise, so
+///   a recognized `A` provably never reaches `B` at all
+///   (`. as $x | (try $x catch "whatever") as $y | ...` still tracks `$y`
+///   even though `"whatever"` alone would not qualify on its own).
+/// - `A // B`, requiring **only** `A` -- `B` only runs when `A` is
+///   null/false/absent, which a recognized `A` (e.g. bare `.`) can
+///   genuinely be at runtime, so this is a deliberate, safe
+///   under-approximation: `false // $x` tracks in real jq but not here,
+///   because whether `A`'s *value* ends up falsy isn't something this
+///   static check can see. Matches the confirmed case
+///   (`. as $x | ($x // 5) as $y | ...`, where `$x` is truthy and thus
+///   always the value actually used) without over-claiming the reverse.
 ///
-/// `Expr::TrackedVar` counts as passthrough too, so a chain of pure
-/// bindings composes: `. as $x | $x as $y | path($y | ...)` still tracks
-/// `$y`, because by the time this predicate sees `$y`'s bind source, it has
-/// already been substituted into a `TrackedVar` from the outer binding.
+/// Not recognized, deliberately: a plain literal/computation, even one
+/// whose *value* happens to equal `.` at runtime (confirmed live: `0 as $x
+/// | path($x)` on input `0` still raises `Invalid path expression` in real
+/// jq, even though the bound value trivially equals `.` there) -- matching
+/// jq's actual rule takes a syntactic passthrough, not mere value equality.
 fn is_identity_passthrough(expr: &Expr) -> bool {
-    match expr {
+    match unwrap_paren(expr) {
         Expr::Identity | Expr::TrackedVar(_) => true,
-        Expr::Paren(inner) => is_identity_passthrough(inner),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => is_identity_passthrough(then_branch) && is_identity_passthrough(else_branch),
+        Expr::Try { expr, .. } => is_identity_passthrough(expr),
+        Expr::Alternative(left, _) => is_identity_passthrough(left),
         _ => false,
     }
 }
@@ -17014,6 +17044,27 @@ fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue)
     substitute_var_impl(expr, var_name, replacement, true)
 }
 
+/// Substitute `bound` for `$var_name` in `body`, choosing between
+/// `substitute_var`/`substitute_var_tracked` based on whether `bind_expr`
+/// (the `as`-binding's own source expression) is a statically-verified
+/// passthrough of `.` (`is_identity_passthrough`).
+///
+/// Shared by `eval_as` (value-position `E as $x | body`) and
+/// `resolve_node`'s `Expr::As` arm (path-position, when the whole binding
+/// sits inside `path(...)`'s own argument) -- the two independent call
+/// sites #844 fixed. Extracted so a future refinement of the gate only has
+/// to change this one place to stay in sync at both; the two arms
+/// duplicating this `if` verbatim was flagged in #844's own review as
+/// exactly the kind of two-call-site asymmetry the issue was filed to fix
+/// in the first place.
+fn substitute_bound_var(bind_expr: &Expr, body: &Expr, var_name: &str, bound: &OwnedValue) -> Expr {
+    if is_identity_passthrough(bind_expr) {
+        substitute_var_tracked(body, var_name, bound)
+    } else {
+        substitute_var(body, var_name, bound)
+    }
+}
+
 /// Substitute a variable in an expression with a value.
 /// Returns a new expression with the variable replaced. `mark_trackable`
 /// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
@@ -17029,7 +17080,7 @@ fn substitute_var_impl(
     match expr {
         Expr::Var(name) if name == var_name => {
             if mark_trackable {
-                Expr::TrackedVar(Box::new(replacement.clone()))
+                Expr::TrackedVar(Rc::new(replacement.clone()))
             } else {
                 owned_to_expr(replacement)
             }
@@ -18630,19 +18681,8 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // For each bound value, substitute and evaluate the body
     let mut all_results: Vec<OwnedValue> = Vec::new();
 
-    // #844: only a statically-verified passthrough of `.` is even a
-    // candidate for path()-trackability through this binding -- see
-    // `is_identity_passthrough`'s own doc comment. `resolve_node`'s
-    // `Expr::TrackedVar` arm still gates the actual trackability decision
-    // at use time, so wrapping here never risks emitting a wrong path.
-    let wrap_tracked = is_identity_passthrough(expr);
-
     for bound_val in bound_values {
-        let substituted_body = if wrap_tracked {
-            substitute_var_tracked(body, var, &bound_val)
-        } else {
-            substitute_var(body, var, &bound_val)
-        };
+        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => all_results.push(to_owned(&v)),
             QueryResult::OneCursor(_) => unreachable!(),
@@ -29501,9 +29541,15 @@ fn expand_func_calls(
         ),
         Expr::Format(f) => Expr::Format(f.clone()),
         Expr::Var(v) => Expr::Var(v.clone()),
-        // Never produced by the parser or by `def` inlining -- only by
-        // variable substitution during evaluation, which runs after this
-        // pass. Trivial pass-through kept for exhaustiveness (#844).
+        // Genuinely reachable, not just a totality formality: this
+        // function re-runs on every `Expr::FuncDef` *evaluation* (its own
+        // call site inlines `def`s at the point they execute, not once at
+        // parse time), and a `def`'s own body can already contain a
+        // `TrackedVar` from an enclosing `as`-binding -- confirmed live,
+        // `. as $x | def f: $x | .b; path(f)` reaches this arm. `v.clone()`
+        // is an O(1) `Rc` refcount bump, not a deep copy of the frozen
+        // snapshot, so re-inlining a `def` that closes over a large
+        // passthrough-bound value on every call stays cheap (#844).
         Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
         Expr::Loc { line } => Expr::Loc { line: *line },
         Expr::Env => Expr::Env,
@@ -29905,9 +29951,13 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),
         Expr::Var(_) => expr.clone(),
-        // Never produced by the parser or by `def` inlining -- only by
-        // variable substitution during evaluation, which runs after this
-        // pass. Trivial pass-through kept for exhaustiveness (#844).
+        // Genuinely reachable, not just a totality formality: called from
+        // `expand_func_calls` to bind a `def`'s own `$`-parameters at every
+        // call site, and the `def`'s body can already contain a
+        // `TrackedVar` from an enclosing `as`-binding unrelated to `param`
+        // -- see `expand_func_calls`'s own `Expr::TrackedVar` arm for the
+        // confirmed repro. `v.clone()` is an `Rc` refcount bump, not a
+        // deep copy (#844).
         Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
         Expr::Loc { line } => Expr::Loc { line: *line },
         Expr::Env => Expr::Env,
