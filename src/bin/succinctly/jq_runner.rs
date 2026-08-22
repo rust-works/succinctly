@@ -18,7 +18,7 @@ use succinctly::jq::{
     self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
     OwnedValue, Program,
 };
-use succinctly::json::light::{JsonCursor, StandardJson};
+use succinctly::json::light::{JsonCursor, JsonField, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
@@ -529,6 +529,108 @@ impl OutputConfig {
             && !self.seq
             && !self.jq_compat
     }
+}
+
+use std::borrow::Cow as PreparedCow;
+
+/// jq's duplicate-key rule over an object's already-walked fields (#1385):
+/// a repeated key collapses to its *first* position holding its *last*
+/// value.
+///
+/// Returns `None` when no key repeats, which lets the caller print straight
+/// from the list it already has. Only an object that genuinely carries a
+/// duplicate allocates.
+///
+/// Keys compare by raw source span while nothing is escaped -- two
+/// escape-free spans are equal exactly when their decoded values are. A
+/// document that escapes any key falls back to comparing decoded strings, so
+/// `{"a\/b":1,"a/b":2}` still collapses even though its two spans differ.
+type PreparedField<'a, W> = (JsonField<'a, W>, &'a [u8], bool);
+
+/// Above this many fields, [`spans_repeat`] sorts instead of comparing every
+/// pair.
+///
+/// Objects in real documents are small, and below the threshold the pairwise
+/// loop needs no allocation. Above it the pairwise loop is quadratic, which
+/// is not a tuning question but a correctness-of-scale one: on a 10 MB
+/// document whose root object is wide, leaving it unbounded measured 1240%
+/// slower than not collapsing at all.
+const PAIRWISE_SPAN_SCAN_LIMIT: usize = 16;
+
+/// A cheap discriminator for a key's raw span: its length plus its first and
+/// last content bytes, packed into one word.
+///
+/// Distinct fingerprints prove distinct keys, so the pairwise scan below
+/// compares words and only falls back to comparing bytes when two collide.
+/// Keys within one object almost always differ in length or in their first
+/// byte, which makes the byte comparison rare enough to disappear from the
+/// profile -- comparing the spans directly instead measured ~3% of
+/// `sjq '.'` on a 10 MB document.
+#[inline]
+fn span_fingerprint(raw: &[u8]) -> u64 {
+    let n = raw.len();
+    let first = if n > 2 { raw[1] } else { 0 };
+    let last = if n > 3 { raw[n - 2] } else { 0 };
+    ((n as u64) << 16) | ((first as u64) << 8) | last as u64
+}
+
+/// Whether any two key spans are byte-identical.
+fn spans_repeat<W: Clone + AsRef<[u64]>>(prepared: &[PreparedField<'_, W>]) -> bool {
+    if prepared.len() <= PAIRWISE_SPAN_SCAN_LIMIT {
+        let mut marks = [0u64; PAIRWISE_SPAN_SCAN_LIMIT];
+        for (slot, (_, raw, _)) in marks.iter_mut().zip(prepared) {
+            *slot = span_fingerprint(raw);
+        }
+        return (0..prepared.len()).any(|i| {
+            ((i + 1)..prepared.len())
+                .any(|j| marks[i] == marks[j] && prepared[i].1 == prepared[j].1)
+        });
+    }
+    // Sorting keeps the wide case out of the quadratic loop: on a 10 MB
+    // document whose root object is wide, an unbounded pairwise scan
+    // measured 1240% slower than not collapsing at all.
+    let mut spans: Vec<&[u8]> = prepared.iter().map(|(_, raw, _)| *raw).collect();
+    spans.sort_unstable();
+    spans.windows(2).any(|w| w[0] == w[1])
+}
+
+fn collapse_duplicate_fields<'a, W: Clone + AsRef<[u64]>>(
+    prepared: &[PreparedField<'a, W>],
+) -> Option<Vec<PreparedField<'a, W>>> {
+    if prepared.len() < 2 {
+        return None;
+    }
+    let any_escaped = prepared.iter().any(|(_, _, escaped)| *escaped);
+    if !any_escaped && !spans_repeat(prepared) {
+        return None;
+    }
+
+    let decoded: Vec<Option<PreparedCow<'_, str>>> = prepared
+        .iter()
+        .map(|(field, _, _)| match field.key() {
+            StandardJson::String(k) => k.as_str().ok(),
+            _ => None,
+        })
+        .collect();
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut chosen: Vec<PreparedField<'a, W>> = Vec::new();
+    for (i, item) in prepared.iter().enumerate() {
+        let Some(name) = decoded[i].as_deref() else {
+            continue;
+        };
+        match order.iter().position(|k| *k == name) {
+            Some(at) => chosen[at] = *item,
+            None => {
+                order.push(name);
+                chosen.push(*item);
+            }
+        }
+    }
+    if chosen.len() == prepared.len() {
+        return None;
+    }
+    Some(chosen)
 }
 
 /// Trim leading and trailing ASCII whitespace from a byte slice.
@@ -2528,9 +2630,9 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // For preserve mode (!jq_compat), use the preserve formatter (keeps original number format)
     if !config.sort_keys && !config.color_output {
         if config.jq_compat {
-            print_json(out, value, &JqCompatFormatter, config, 0)?;
+            print_json(out, value, &JqCompatFormatter, config, 0, &mut Vec::new())?;
         } else {
-            print_json(out, value, &PreserveFormatter, config, 0)?;
+            print_json(out, value, &PreserveFormatter, config, 0, &mut Vec::new())?;
         }
     } else {
         // For complex output (pretty-print, sort_keys, colors), materialize first
@@ -2726,12 +2828,13 @@ impl LiteralFormatter for PreserveFormatter {
 /// `Result` and already threads a `level` parameter (previously used only
 /// for indentation, reused here as the depth counter), so there's no reason
 /// to give up the clean failure mode the way `to_owned` had to.
-fn print_json<F, Out, Wrd>(
+fn print_json<'a, F, Out, Wrd>(
     out: &mut Out,
-    value: &JqValue<'_, Wrd>,
+    value: &JqValue<'a, Wrd>,
     formatter: &F,
     config: &OutputConfig,
     level: usize,
+    scratch: &mut Vec<PreparedField<'a, Wrd>>,
 ) -> Result<()>
 where
     F: LiteralFormatter,
@@ -2812,7 +2915,7 @@ where
                                 out.write_all(b",")?;
                             }
                             let child_value = JqValue::Cursor(child_cursor);
-                            print_json(out, &child_value, formatter, config, level + 1)?;
+                            print_json(out, &child_value, formatter, config, level + 1, scratch)?;
                         }
                         out.write_all(b"]")?;
                     } else {
@@ -2825,7 +2928,7 @@ where
                             }
                             out.write_all(next_indent.as_bytes())?;
                             let child_value = JqValue::Cursor(child_cursor);
-                            print_json(out, &child_value, formatter, config, level + 1)?;
+                            print_json(out, &child_value, formatter, config, level + 1, scratch)?;
                         }
                         out.write_all(separator.as_bytes())?;
                         out.write_all(current_indent.as_bytes())?;
@@ -2834,108 +2937,149 @@ where
                 }
                 StandardJson::Object(fields) => {
                     use succinctly::json::light::StandardJson as SJ;
-                    let mut is_first = true;
-                    // #1385: jq collapses a repeated key to its first
-                    // position holding its last value, so the printer -- the
-                    // only place a cursor-backed object ever reaches output
-                    // -- must too. This is what makes `.`, `.[0]`,
-                    // `first(.[])` and `last(.[])` agree with jq at once:
-                    // they all diverged solely because the value reaching
-                    // here was still a cursor.
-                    //
-                    // `--preserve-input` (`!jq_compat`) keeps every
-                    // occurrence: preserving the input verbatim is that
-                    // extension's whole purpose, and ADR-0018 rule 5 allows
-                    // it since no reference-defined filter is perturbed.
-                    //
-                    // The probe is a raw-span scan with no allocation for an
-                    // ordinary object; only one that genuinely repeats a key
-                    // builds the collapsed list.
-                    let collapsed = if config.jq_compat && fields.has_duplicate_keys() {
-                        Some(fields.collapsed())
-                    } else {
-                        None
-                    };
-                    let fields_iter = || -> Box<dyn Iterator<Item = _>> {
-                        match &collapsed {
-                            Some(v) => Box::new(v.iter().copied()),
-                            None => Box::new(fields),
-                        }
-                    };
                     if fields.is_empty() {
                         out.write_all(b"{}")?;
-                    } else if compact {
-                        out.write_all(b"{")?;
-                        for field in fields_iter() {
-                            if !is_first {
-                                out.write_all(b",")?;
-                            }
-                            is_first = false;
-                            if let SJ::String(k) = field.key() {
-                                // Zero-copy for keys without escapes
-                                let raw = k.raw_bytes();
-                                let content = &raw[1..raw.len().saturating_sub(1)];
-                                if !config.ascii_output && !content.contains(&b'\\') {
-                                    out.write_all(raw)?;
-                                    out.write_all(b":")?;
-                                } else if let Ok(decoded) = k.as_str() {
-                                    out.write_all(b"\"")?;
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                    out.write_all(b"\":")?;
-                                } else {
-                                    out.write_all(raw)?;
-                                    out.write_all(b":")?;
-                                }
-                            }
-                            let child_value = JqValue::Cursor(field.value_cursor());
-                            print_json(out, &child_value, formatter, config, level + 1)?;
-                        }
-                        out.write_all(b"}")?;
                     } else {
-                        out.write_all(b"{")?;
-                        out.write_all(separator.as_bytes())?;
-                        for field in fields_iter() {
-                            if !is_first {
-                                out.write_all(b",")?;
-                                out.write_all(separator.as_bytes())?;
-                            }
-                            is_first = false;
-                            out.write_all(next_indent.as_bytes())?;
-                            if let SJ::String(k) = field.key() {
-                                // Zero-copy for keys without escapes
-                                let raw = k.raw_bytes();
-                                let content = &raw[1..raw.len().saturating_sub(1)];
-                                if !config.ascii_output && !content.contains(&b'\\') {
-                                    out.write_all(raw)?;
-                                    out.write_all(b":")?;
-                                    out.write_all(space_after_colon.as_bytes())?;
-                                } else if let Ok(decoded) = k.as_str() {
-                                    out.write_all(b"\"")?;
-                                    let escaped = if config.ascii_output {
-                                        escape_json_string_ascii(&decoded)
-                                    } else {
-                                        escape_json_string(&decoded)
-                                    };
-                                    out.write_all(escaped.as_bytes())?;
-                                    out.write_all(b"\":")?;
-                                    out.write_all(space_after_colon.as_bytes())?;
-                                } else {
-                                    out.write_all(raw)?;
-                                    out.write_all(b":")?;
-                                    out.write_all(space_after_colon.as_bytes())?;
-                                }
-                            }
-                            let child_value = JqValue::Cursor(field.value_cursor());
-                            print_json(out, &child_value, formatter, config, level + 1)?;
+                        // #1385: jq collapses a repeated key to its first
+                        // position holding its last value, so the printer --
+                        // the only place a cursor-backed object reaches
+                        // output -- must too. That one change settles `.`,
+                        // `.[0]`, `first(.[])` and `last(.[])` together: they
+                        // diverged only because the value arriving here was
+                        // still a cursor.
+                        //
+                        // `--preserve-input` (`!jq_compat`) keeps every
+                        // occurrence. Reproducing the input verbatim is that
+                        // extension's purpose, and ADR-0018 rule 5 allows it
+                        // because no reference-defined filter is perturbed.
+                        //
+                        // The field list is walked exactly once. `uncons` is
+                        // BP navigation -- two sibling hops per field -- so
+                        // re-walking it purely to probe for duplicates cost
+                        // 8-9% of `sjq '.'` over a 10 MB document, an order
+                        // more than the key text scan did. Recording each
+                        // key's span on the way past costs nothing extra and
+                        // hands the write loops below a span they no longer
+                        // have to find for themselves.
+                        //
+                        // `scratch` is one buffer shared by the whole
+                        // recursion, used as a stack: this object's fields
+                        // occupy `base..end`, a nested object appends past
+                        // `end` and truncates back on the way out. A fresh
+                        // `Vec` per object instead measured ~3% on the same
+                        // document -- small objects are the common case, so
+                        // the allocator traffic showed up rather than the
+                        // copying.
+                        let base = scratch.len();
+                        for field in fields {
+                            let (raw, escaped) = match field.key() {
+                                SJ::String(k) => k.raw_and_escaped(),
+                                _ => (&b""[..], false),
+                            };
+                            scratch.push((field, raw, escaped));
                         }
-                        out.write_all(separator.as_bytes())?;
-                        out.write_all(current_indent.as_bytes())?;
-                        out.write_all(b"}")?;
+                        let collapsed = if config.jq_compat {
+                            collapse_duplicate_fields(&scratch[base..])
+                        } else {
+                            None
+                        };
+                        let count = collapsed.as_ref().map_or(scratch.len() - base, Vec::len);
+
+                        let mut is_first = true;
+                        if compact {
+                            out.write_all(b"{")?;
+                            for i in 0..count {
+                                let (field, raw, escaped) = match &collapsed {
+                                    Some(list) => list[i],
+                                    None => scratch[base + i],
+                                };
+                                if !is_first {
+                                    out.write_all(b",")?;
+                                }
+                                is_first = false;
+                                if let SJ::String(k) = field.key() {
+                                    if !config.ascii_output && !escaped {
+                                        out.write_all(raw)?;
+                                        out.write_all(b":")?;
+                                    } else if let Ok(decoded) = k.as_str() {
+                                        out.write_all(b"\"")?;
+                                        let text = if config.ascii_output {
+                                            escape_json_string_ascii(&decoded)
+                                        } else {
+                                            escape_json_string(&decoded)
+                                        };
+                                        out.write_all(text.as_bytes())?;
+                                        out.write_all(b"\":")?;
+                                    } else {
+                                        out.write_all(raw)?;
+                                        out.write_all(b":")?;
+                                    }
+                                }
+                                let child_value = JqValue::Cursor(field.value_cursor());
+                                print_json(
+                                    out,
+                                    &child_value,
+                                    formatter,
+                                    config,
+                                    level + 1,
+                                    scratch,
+                                )?;
+                            }
+                            out.write_all(b"}")?;
+                        } else {
+                            out.write_all(b"{")?;
+                            out.write_all(separator.as_bytes())?;
+                            for i in 0..count {
+                                let (field, raw, escaped) = match &collapsed {
+                                    Some(list) => list[i],
+                                    None => scratch[base + i],
+                                };
+                                if !is_first {
+                                    out.write_all(b",")?;
+                                    out.write_all(separator.as_bytes())?;
+                                }
+                                is_first = false;
+                                out.write_all(next_indent.as_bytes())?;
+                                if let SJ::String(k) = field.key() {
+                                    if !config.ascii_output && !escaped {
+                                        out.write_all(raw)?;
+                                        out.write_all(b":")?;
+                                        out.write_all(space_after_colon.as_bytes())?;
+                                    } else if let Ok(decoded) = k.as_str() {
+                                        out.write_all(b"\"")?;
+                                        let text = if config.ascii_output {
+                                            escape_json_string_ascii(&decoded)
+                                        } else {
+                                            escape_json_string(&decoded)
+                                        };
+                                        out.write_all(text.as_bytes())?;
+                                        out.write_all(b"\":")?;
+                                        out.write_all(space_after_colon.as_bytes())?;
+                                    } else {
+                                        out.write_all(raw)?;
+                                        out.write_all(b":")?;
+                                        out.write_all(space_after_colon.as_bytes())?;
+                                    }
+                                }
+                                let child_value = JqValue::Cursor(field.value_cursor());
+                                print_json(
+                                    out,
+                                    &child_value,
+                                    formatter,
+                                    config,
+                                    level + 1,
+                                    scratch,
+                                )?;
+                            }
+                            out.write_all(separator.as_bytes())?;
+                            out.write_all(current_indent.as_bytes())?;
+                            out.write_all(b"}")?;
+                        }
+                        // Hand this object's slots back to the shared stack.
+                        // Without it the buffer would keep every field of
+                        // every object printed so far, growing with the whole
+                        // document rather than with its nesting depth.
+                        scratch.truncate(base);
                     }
                 }
                 StandardJson::Error(_) => out.write_all(b"null")?,
@@ -2960,7 +3104,7 @@ where
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    print_json(out, v, formatter, config, level + 1)?;
+                    print_json(out, v, formatter, config, level + 1, scratch)?;
                 }
                 out.write_all(b"]")?;
             } else {
@@ -2972,7 +3116,7 @@ where
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1)?;
+                    print_json(out, v, formatter, config, level + 1, scratch)?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
@@ -2996,7 +3140,7 @@ where
                     };
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
-                    print_json(out, v, formatter, config, level + 1)?;
+                    print_json(out, v, formatter, config, level + 1, scratch)?;
                 }
                 out.write_all(b"}")?;
             } else {
@@ -3017,7 +3161,7 @@ where
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
                     out.write_all(space_after_colon.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1)?;
+                    print_json(out, v, formatter, config, level + 1, scratch)?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;

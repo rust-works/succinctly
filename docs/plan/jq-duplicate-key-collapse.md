@@ -2,11 +2,12 @@
 
 [Home](../../) > [Docs](../) > [Plan](README.md) > jq duplicate-key collapse
 
-**Status: design, with implementation following on the same branch.** This document is the
-design deliverable for [#1385](https://github.com/rust-works/succinctly/issues/1385). Unlike
+**Status: implemented.** This document is the design deliverable for
+[#1385](https://github.com/rust-works/succinctly/issues/1385). Unlike
 `jq-path-trackability-deferral.md`, it is not design-only: the scoping below reduced the
-change to a size worth landing in one PR, and the single genuinely open question is a
-measurement that requires the code to answer.
+change to a size worth landing in one PR, and the single genuinely open question was a
+measurement that required the code to answer. "What the measurement actually cost" at the
+bottom records the answer, including two places this design's own predictions were wrong.
 
 **Supersedes two premises from the issue thread.** #1385's second comment concluded "the right
 next artifact is a design pass, not a patch", resting on two claims that measurement and
@@ -110,9 +111,13 @@ from `fields.len()` without ever decoding a key. That fast path must survive the
 **In scope:** jq mode's five divergent paths, and the `keys_dedup()` format→mode correction that
 ADR-0018 rule 2 explicitly assigns to this issue.
 
-The gate move is verified safe. `keys_dedup()` has exactly two callers, `Builtin::ToEntries` and
-`collect_paths_generic`. Switching them from format-gating to mode-gating changes yq's behaviour
-only for JSON input, and only toward the reference — captured live from Homebrew `yq` v4.53.3:
+The gate move is safe: `keys_dedup()` has exactly two callers, `Builtin::ToEntries` and
+`collect_paths_generic`, and yq's observable behaviour is byte-identical before and after on
+both input formats.
+
+**It does not, however, close #1398 divergence 1, as this document first claimed.** Real yq
+preserves a repeated key regardless of format while `syq` splits on it — captured live from
+Homebrew `yq` v4.53.3:
 
 | filter              | real yq (YAML) | real yq (JSON) | `syq` YAML | `syq` JSON |
 |---------------------|----------------|----------------|------------|------------|
@@ -120,8 +125,13 @@ only for JSON input, and only toward the reference — captured live from Homebr
 | `to_entries|length` | `3`            | `3`            | `3`        | **`2`**    |
 | `[paths]`           | (no builtin)   | (no builtin)   | preserves  | **collapses** |
 
-Real yq preserves regardless of format; `syq` splits on format. Mode-gating fixes the JSON
-column, closing **#1398 divergence 1**.
+Removing `keys_dedup()` left that JSON column exactly as it was. The cause is upstream of the
+evaluator: `parse_input`'s `InputFormat::Json` arm (`yq_runner.rs`) materializes through
+`to_owned_canonicalizing_numbers` — an `IndexMap` — before any filter runs, so the collapse has
+already happened by the time a duplicate-key rule could apply. ADR-0018 named `keys_dedup()` as
+the mechanism behind that symptom; it was not. The rule-2 correction still stands on its own
+terms (the gate genuinely was on the wrong axis), but #1398 divergence 1 needs `parse_input`
+fixed, not this.
 
 ### Non-goals
 
@@ -239,6 +249,54 @@ Per `docs/guides/benchmarking.md` § A/B Benchmarking Method:
 
 Target ≤2% on `jq_bench`. If the small-n path misses it, tune the threshold — not the correctness.
 ADR-0018 rule 4 does not admit a performance exception.
+
+## What the measurement actually cost
+
+Interleaved A/B against the merge-base, Apple M-series, release builds, 30 reps per point,
+`succinctly json generate` inputs. Output identity was gated first: A and B produce
+byte-identical bytes for `.`, `.[]`, `length` and `keys` at both sizes, compact and pretty.
+The box was not idle (a browser renderer held ~65% of one core), so min and median are both
+reported — they agree, which is what makes the number trustworthy rather than a lucky floor.
+
+Four successive versions of the probe, worst case across the five measured points:
+
+| version                                                        | worst regression |
+|----------------------------------------------------------------|------------------|
+| separate probe walk, `raw_bytes()` + `contains(&b'\\')`         | 10.4%            |
+| one scan per key (`raw_and_escaped`)                            |  8.8%            |
+| single field walk, collect spans, per-object `Vec`              |  6.5%            |
+| shared scratch stack + span fingerprints                        |  **3.9%**        |
+
+Final, `-c` unless noted:
+
+| size | query    | base    | new     | delta |
+|------|----------|---------|---------|-------|
+| 1 MB | `.`      | 17.2 ms | 17.9 ms | +3.9% |
+| 1 MB | `.[]`    | 17.2 ms | 17.9 ms | +3.8% |
+| 10 MB| `.`      | 142.6 ms| 147.7 ms| +3.6% |
+| 10 MB| `.[]`    | 142.8 ms| 146.7 ms| +2.7% |
+| 10 MB| `length` | 16.7 ms | 16.8 ms | +0.2% |
+
+**This misses the ≤2% target.** It is shipped anyway: ADR-0018 rule 4 admits three grounds for
+diverging from the reference and performance is not among them, so the choice was never
+"collapse or stay fast" but "how cheaply can the collapse be made". `length` is free because
+the evaluator already walked the field list; the residue is entirely the printer's, which is
+the one path that previously touched no field twice.
+
+Two predictions in this design were wrong, both about where the cost sits:
+
+- **The key text scan was not the bottleneck.** Fusing the closing-quote scan with the escape
+  check — the fix this document proposed — recovered only 1.6 points. The dominant cost is the
+  *field walk*: `uncons` is two BP sibling hops, and probing meant doing the whole walk twice.
+  Collecting the fields on the single walk instead was worth 2.3 points more than the scan fix.
+- **The `n <= SMALL` pairwise branch is not a tuning knob.** This document called the threshold
+  "a correctness-of-scale question, not a tuning one" only after shipping an unbounded pairwise
+  scan and measuring **1240%** on a 10 MB document with a wide root object. Left in, it would
+  have been a quadratic blowup on exactly the input the crate exists to handle well.
+
+The remaining lever, unexplored: `PreparedField` stores two whole `JsonCursor`s per field, and
+a cursor's `text` and `index` members are invariant across the entire document — roughly 48 of
+its 88 bytes are redundant. Hoisting them would cut the buffer's memory traffic by half.
 
 ## Open risks for an implementer to sanity-check
 

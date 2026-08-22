@@ -187,9 +187,19 @@ $ yq            -o=json -I=0 '[.[]]' dup.yaml    # [3,2]   — iteration collaps
 $ succinctly yq -o=json -I=0 '[.[]]' dup.yaml    # [1,2,3]
 ```
 
-ADR-0018 rule 2 identifies the cause — `DocumentFields::keys_dedup()`
-([src/jq/document.rs](../../../src/jq/document.rs)) gates on input *format* where the
-reference tools decide on *mode*.
+ADR-0018 rule 2 attributed the format leak to `DocumentFields::keys_dedup()`, which gated on
+input *format* where the reference tools decide on *mode*. **That attribution was wrong, and
+#1385 disproved it by removing the predicate:** `keys_dedup()` no longer exists — the rule now
+rides `EvalSemantics::COLLAPSE_DUPLICATE_KEYS`, on the mode axis rule 2 asks for — and the JSON
+column above did not move.
+
+The real cause is upstream of the evaluator. `parse_input`'s `InputFormat::Json` arm
+([src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)) materializes JSON
+input through `to_owned_canonicalizing_numbers`, an `IndexMap`, before any filter runs, so a
+repeated key has already collapsed by the time a duplicate-key rule could apply. Closing the
+format leak means giving that arm a cursor-native path, not adjusting a predicate.
+
+The iteration divergence (`[.[]]`) is unrelated to both and remains open on its own terms.
 
 **Both divergences above are [#1398](https://github.com/rust-works/succinctly/issues/1398).**
 [#1385](https://github.com/rust-works/succinctly/issues/1385) is scoped to **jq mode** (its
