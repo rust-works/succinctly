@@ -17070,11 +17070,28 @@ pub fn substitute_vars<'a, I>(expr: &Expr, vars: I) -> Expr
 where
     I: IntoIterator<Item = (&'a str, &'a OwnedValue)>,
 {
-    let mut result = expr.clone();
-    for (name, value) in vars {
+    let mut iter = vars.into_iter();
+    let Some((name, value)) = iter.next() else {
+        return expr.clone();
+    };
+    let mut result = substitute_var(expr, name, value);
+    for (name, value) in iter {
         result = substitute_var(&result, name, value);
     }
     result
+}
+
+/// Adapt an owned `(name, value)` binding list into the `(&str,
+/// &OwnedValue)` pairs [`substitute_vars`](substitute_vars) needs -- pattern
+/// bindings are stored owned (`extract_pattern_bindings` clones each name
+/// and value out of the matched document), while `substitute_vars`'s public
+/// contract takes references, matching its other caller
+/// (`--arg`/`--argjson` substitution, which already holds refs into
+/// `EvalContext`). Named so this one-line, logic-free projection has a
+/// single place to read rather than 4 identical copies of it (#1368 code
+/// review).
+fn as_var_refs(bindings: &[(String, OwnedValue)]) -> impl Iterator<Item = (&str, &OwnedValue)> {
+    bindings.iter().map(|(n, v)| (n.as_str(), v))
 }
 
 /// True if `expr` is statically guaranteed to evaluate to `.` unchanged, in
@@ -19033,13 +19050,22 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .iter()
                 .map(|pattern| {
                     let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
-                    let mut substituted = substitute_bindings(update, &bindings);
-                    for var_name in &all_var_names {
-                        if !bindings.iter().any(|(name, _)| name == var_name) {
-                            substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
-                        }
-                    }
-                    Ok(substituted)
+                    // #1368: bound and null-filled names never overlap (the
+                    // filter below excludes anything `bindings` already
+                    // covers), so fold order between the two groups can't
+                    // matter -- one `substitute_vars` call via `as_var_refs`
+                    // replaces the old `substitute_bindings` call plus a
+                    // separate manual null-fill loop.
+                    let null_value = OwnedValue::Null;
+                    Ok(substitute_vars(
+                        update,
+                        as_var_refs(&bindings).chain(
+                            all_var_names
+                                .iter()
+                                .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                                .map(|name| (name.as_str(), &null_value)),
+                        ),
+                    ))
                 })
                 .collect()
         })
@@ -19563,15 +19589,23 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .iter()
                 .map(|pattern| {
                     let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+                    // #1368: bound and null-filled names never overlap (the
+                    // filter below excludes anything `bindings` already
+                    // covers), so fold order between the two groups can't
+                    // matter -- one `substitute_vars` call via `as_var_refs`
+                    // replaces the old `substitute_bindings` call plus a
+                    // separate manual null-fill loop.
+                    let null_value = OwnedValue::Null;
                     let null_fill = |expr: &Expr| {
-                        let mut substituted = substitute_bindings(expr, &bindings);
-                        for var_name in &all_var_names {
-                            if !bindings.iter().any(|(name, _)| name == var_name) {
-                                substituted =
-                                    substitute_var(&substituted, var_name, &OwnedValue::Null);
-                            }
-                        }
-                        substituted
+                        substitute_vars(
+                            expr,
+                            as_var_refs(&bindings).chain(
+                                all_var_names
+                                    .iter()
+                                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                                    .map(|name| (name.as_str(), &null_value)),
+                            ),
+                        )
                     };
                     Ok((null_fill(update), extract.map(null_fill)))
                 })
@@ -28925,17 +28959,24 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         };
 
-        let mut substituted_body = body.clone();
-        let mut bound_names: Vec<&str> = Vec::with_capacity(bindings.len());
-        for (var_name, var_value) in &bindings {
-            substituted_body = substitute_var(&substituted_body, var_name, var_value);
-            bound_names.push(var_name.as_str());
-        }
-        for var_name in all_var_names {
-            if !bound_names.contains(&var_name.as_str()) {
-                substituted_body = substitute_var(&substituted_body, var_name, &OwnedValue::Null);
-            }
-        }
+        // #1368 code review: this and `eval_reduce`/`eval_foreach`'s own
+        // step-alternative matrices are the same clone-then-fold-
+        // `substitute_var` shape `substitute_vars` already implements once.
+        // Bound and null-filled names never overlap (the filter below
+        // excludes anything `bindings` already covers), so fold order
+        // between the two groups can't matter -- safe to combine into one
+        // `substitute_vars` call instead of hand-rolling two separate loops
+        // over the same `substituted_body`.
+        let null_value = OwnedValue::Null;
+        let substituted_body = substitute_vars(
+            body,
+            as_var_refs(&bindings).chain(
+                all_var_names
+                    .iter()
+                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                    .map(|name| (name.as_str(), &null_value)),
+            ),
+        );
 
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => {
@@ -29004,19 +29045,10 @@ fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
     }
 }
 
-/// Apply an already-extracted set of pattern bindings to `expr`, one
-/// `substitute_var` call per binding -- shared by
-/// `try_reduce_step_alternatives` and `try_foreach_step_alternatives`,
-/// which each call `extract_pattern_bindings` once per alternative
-/// attempted and reuse the result across both null-fill and (for
-/// `foreach`) UPDATE/EXTRACT.
-fn substitute_bindings(expr: &Expr, bindings: &[(String, OwnedValue)]) -> Expr {
-    let mut result = expr.clone();
-    for (name, val) in bindings {
-        result = substitute_var(&result, name, val);
-    }
-    result
-}
+// #1368: this used to be `substitute_bindings`, a private fold over
+// `bindings` that was body-for-body the existing `substitute_vars` --
+// removed. `eval_reduce`/`eval_foreach`'s step-alternative matrices call
+// `substitute_vars(expr, as_var_refs(&bindings))` directly instead.
 
 /// Extract variable bindings from a pattern matching an OwnedValue.
 /// `invert` is `false` for an ordinary, single pattern (`. as PATTERN`,
@@ -32348,6 +32380,18 @@ mod tests {
             // jq's own canonical spelling, not Rust's f64 Display -- #1035.
             ["1E+100"]
         );
+    }
+
+    /// #1368: `substitute_vars` on an empty binding list must return `expr`
+    /// unchanged (the early-return path, since `substitute_var` is never
+    /// called at all in that case -- there's no first binding to seed
+    /// `result` from).
+    #[test]
+    fn test_substitute_vars_empty_bindings_returns_expr_unchanged_1368() {
+        let expr = parse("$n + 1").unwrap();
+        let empty: [(&str, &OwnedValue); 0] = [];
+        let substituted = substitute_vars(&expr, empty);
+        assert_eq!(substituted, expr);
     }
 
     #[test]
