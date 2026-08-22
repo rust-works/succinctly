@@ -19801,3 +19801,142 @@ fn test_yq_string_interpolation_single_valued_slot_unaffected_1403() -> Result<(
     assert_eq!(output.trim(), "Hello world");
     Ok(())
 }
+
+/// #1403 follow-up: `key`/`parent`/`file_index` route `\(...)` through a
+/// *second*, separate string-interpolation evaluator
+/// (`eval_pipe_with_path_context_internal`'s own `StringInterpolation` arm)
+/// that also needed the same jq-mode-only gate the plain-evaluator carve-out
+/// above already has -- yq mode must keep taking only the first value of a
+/// multi-valued slot here too, live-verified this crate's own already-fixed
+/// jq mode fans out the structurally identical query instead.
+#[test]
+fn test_yq_string_interpolation_path_context_multi_valued_slot_first_value_only_1403() -> Result<()>
+{
+    let (output, code) = run_yq_stdin(r#".[] | "\(1,2)-\(key)""#, "- 1\n- 2\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "\"1-0\"\n\"1-1\"\n");
+    Ok(())
+}
+
+/// Same gate, for the atomic-discard-on-error behavior: yq mode's
+/// path-context arm must still discard the whole string on an uncaught
+/// error (no partial output survives), unlike jq mode's now-streaming
+/// behavior for the identical shape.
+#[test]
+fn test_yq_string_interpolation_path_context_error_is_atomic_1403() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        r#".a | "\(key)-\(error("boom"))""#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(output, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `?` swallows the error into empty output, same atomicity.
+    let (output, code) = run_yq_stdin(
+        r#".a | "\(key)-\(error("boom"))"?"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "");
+    Ok(())
+}
+
+/// A yq-mode path-context string is still a fresh root for whatever
+/// follows it in the pipe, same as jq mode's identical reset.
+#[test]
+fn test_yq_string_interpolation_path_context_resets_root_for_rest_1403() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#".a | "\(key)" | key"#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "null");
+    Ok(())
+}
+
+/// A slot that legitimately yields nothing (`empty`) substitutes an empty
+/// string, same as the pre-#1403 flat loop always did -- yq mode has no
+/// fan-out/short-circuit concept at this level, unlike jq mode's own
+/// zero-outputs-short-circuits-everything model for the identical shape.
+#[test]
+fn test_yq_string_interpolation_path_context_empty_slot_1403() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#".a | "k=\(key)-\(empty)""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""k=a-""#);
+    Ok(())
+}
+
+/// `break`/`halt_error` from a path-context slot in yq mode still discard
+/// the whole string atomically, whether or not an earlier slot already
+/// produced output -- exercising every remaining arm of the yq-only match
+/// this crate's `eval_pipe_with_path_context_internal` kept verbatim.
+#[test]
+fn test_yq_string_interpolation_path_context_control_flow_is_atomic_1403() -> Result<()> {
+    // Bare `break`, no prior output within the slot.
+    let (output, code) = run_yq_stdin(
+        r#"label $out | ((.a | "\(key | break $out)"), "reached")"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // `break` after a prior successful value in the same slot.
+    let (output, code) = run_yq_stdin(
+        r#"label $out | ((.a | "\(key, break $out)"), "reached")"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // Bare `halt_error`, no prior output within the slot.
+    let (output, code) = run_yq_stdin(
+        r#".a | "\(key | halt_error(9))""#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 9, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // `halt_error` after a prior successful value in the same slot.
+    let (output, code) =
+        run_yq_stdin(r#".a | "\(key, halt_error(9))""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 9, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // An uncaught error *after* a prior successful value in the same slot
+    // (a `Partial(_, Control::Error(_))` at the slot level, distinct from
+    // the bare-`Error` two-separate-slots case in
+    // `test_yq_string_interpolation_path_context_error_is_atomic_1403`).
+    let (output, code) =
+        run_yq_stdin(r#".a | "\(key, error("boom"))""#, "a: 1\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert_eq!(output, "");
+
+    Ok(())
+}
+
+/// `?` wraps only the interpolation, with a downstream `| key` still
+/// needing path context -- flattens through the general `Expr::Optional`
+/// arm's rest-non-empty branch, threading `optional=true` straight into
+/// this yq-only match, exercising its own `if optional` arm directly.
+/// Unlike the jq-mode counterpart
+/// (`test_string_interpolation_path_context_fanout_continues_rest_1403`'s
+/// final case, which still runs `| key` against the fanned-out result),
+/// this arm's `if optional` catch returns `QueryResult::None` as the whole
+/// match arm's result -- `rest` (the flattened-in `key`) never runs at
+/// all, since there is no separate rest-continuation step here the way
+/// `continue_rest_with_fresh_root` gives the jq-mode path: confirmed live
+/// that the query below is empty, not `null`.
+#[test]
+fn test_yq_string_interpolation_path_context_optional_threaded_through_rest_1403() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        r#".a | ("\(key)-\(error("boom"))")? | key"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "");
+    Ok(())
+}
