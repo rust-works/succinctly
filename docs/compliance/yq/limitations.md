@@ -168,59 +168,67 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
-### Duplicate mapping keys
+### Duplicate mapping keys — the format leak and `.[]` collapse are resolved; four narrower gaps remain
 
-The subject of [ADR-0018](../../adrs/adr-0018.md)'s worked example. Real yq preserves
-duplicate keys almost everywhere but collapses them under iteration, and succinctly matches
-neither side consistently — and, worse, answers differently depending on whether the same
-logical document arrived as JSON or YAML:
+The subject of [ADR-0018](../../adrs/adr-0018.md)'s worked example.
+[#1398](https://github.com/rust-works/succinctly/issues/1398) resolved the two divergences it
+was filed against: real yq preserves duplicate keys almost everywhere but collapses them
+under iteration, and succinctly used to match neither side consistently — worse, it answered
+differently depending on whether the same logical document arrived as JSON or YAML:
 
 ```bash
 $ printf '{"b":1,"a":2,"b":3}' > dup.json
 $ printf 'b: 1\na: 2\nb: 3\n'   > dup.yaml
 
 $ yq            -o=json -I=0 'length' dup.json   # 3
-$ succinctly yq -o=json -I=0 'length' dup.json   # 2   <- format leaking into behaviour
+$ succinctly yq -o=json -I=0 'length' dup.json   # 3   (was 2 -- format no longer leaks)
 $ succinctly yq -o=json -I=0 'length' dup.yaml   # 3
 
 $ yq            -o=json -I=0 '[.[]]' dup.yaml    # [3,2]   — iteration collapses
-$ succinctly yq -o=json -I=0 '[.[]]' dup.yaml    # [1,2,3]
+$ succinctly yq -o=json -I=0 '[.[]]' dup.yaml    # [3,2]   (was [1,2,3])
 ```
 
 ADR-0018 rule 2 attributed the format leak to `DocumentFields::keys_dedup()`, which gated on
-input *format* where the reference tools decide on *mode*. **That attribution was wrong, and
-#1385 disproved it by removing the predicate:** `keys_dedup()` no longer exists — the rule now
-rides `EvalSemantics::COLLAPSE_DUPLICATE_KEYS`, on the mode axis rule 2 asks for — and the JSON
-column above did not move.
+input *format* where the reference tools decide on *mode*. **That attribution was wrong**:
+[#1385](https://github.com/rust-works/succinctly/issues/1385) removed the predicate entirely —
+the collapse rule now rides `EvalSemantics::COLLAPSE_DUPLICATE_KEYS`, on the mode axis rule 2
+asks for — and the JSON column above did not move, confirming the leak sat upstream of the
+evaluator the whole time.
 
-The real cause is upstream of the evaluator. `parse_input`'s `InputFormat::Json` arm
-([src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)) materializes JSON
-input through `to_owned_canonicalizing_numbers`, an `IndexMap`, before any filter runs, so a
-repeated key has already collapsed by the time a duplicate-key rule could apply. Closing the
-format leak means giving that arm a cursor-native path, not adjusting a predicate.
+The real cause was `parse_input`'s `InputFormat::Json` arm
+([src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)): it materialized
+JSON input through `to_owned_canonicalizing_numbers`, an `IndexMap`, before any filter ran, so a
+repeated key had already collapsed by the time a duplicate-key rule could apply. #1398 closes it
+by giving that arm a cursor-native path instead — JSON input now routes through the same
+`evaluate_yaml_direct_filtered`/`YamlIndex::mark_json_sourced` cursor evaluator YAML input (and
+JSON's own M2 fast path) already used, JSON being a syntactic subset of YAML's flow grammar.
 
-The iteration divergence (`[.[]]`) is unrelated to both and remains open on its own terms.
+The iteration divergence (`[.[]]`) is a separate axis: real yq collapses under `.[]`/`map(f)`
+traversal alone, an inconsistency `COLLAPSE_DUPLICATE_KEYS` deliberately doesn't reproduce (it's
+`false` for yq, matching every *other* builtin's preserve behavior) — its own doc comment names
+this exact gap as #1398's to fix, not its own. #1398 makes `.[]`/`map(f)` collapse
+unconditionally in both modes instead, reusing #1385's `effective_fields`/`collapsed_fields`
+rather than adding a second mechanism; the change lands on shared `eval_generic.rs` code, so it
+also fixes jq mode's own `[.[]]` as a side effect — one of #1385's five listed jq-mode gaps
+(`.`, `length`, `keys`, `keys_unsorted` remain open there).
 
-**Both divergences above are [#1398](https://github.com/rust-works/succinctly/issues/1398).**
-[#1385](https://github.com/rust-works/succinctly/issues/1385) is scoped to **jq mode** (its
-own body: *"In jq mode, `succinctly jq` emits duplicate JSON object keys verbatim"*) and
-names [#1342](https://github.com/rust-works/succinctly/issues/1342) (`paths(node_filter)`),
-[#1343](https://github.com/rust-works/succinctly/issues/1343) (`-s`/`--eval-all`/`-i` bypass
-the fix) and [#1344](https://github.com/rust-works/succinctly/issues/1344)
-(`tostream`/`walk`/`recurse`) as the yq-side continuation. None of the four covers the format
-leak or the missing `.[]` collapse, which is why #1398 exists — recording them here is the
-first half of ADR-0018 rule 6, and filing them is the second.
+Four narrower gaps this fix deliberately left alone remain open, each already filed before
+#1398 landed:
 
-Object slicing (`.[S:E]` on an object, [#1102](https://github.com/rust-works/succinctly/issues/1102))
-is another surface this same root cause reaches: it must materialize the target object into
-an `OwnedValue::Object` (an `IndexMap`) to build yq's AST-child-list view before slicing it,
-which silently collapses a genuine duplicate key the same way `to_owned()` does everywhere
-else in this list — `a: 1\nb: 2\na: 3` sliced with `.[0:6]` real yq returns `["a",1,"b",2,"a",3]`
-(6 children, both `a` entries present); succinctly returns `["a",3,"b",2]` (4 elements, the
-first `a`/`1` pair gone). Unlike the other surfaces above, there is no cursor-preserving
-alternative available here — the operation inherently needs to reorder/slice the entries, not
-just stream them — so this one is a real limit of `OwnedValue::Object`'s representation, not
-a missed wiring like #1343/#1344.
+- [#1342](https://github.com/rust-works/succinctly/issues/1342) — `paths(node_filter)` still
+  collapses (a YAML-only DOM-representation gap, unrelated to the format leak).
+- [#1343](https://github.com/rust-works/succinctly/issues/1343) — `-s`/`--eval-all`/`-i`'s DOM
+  fallback still routes through `parse_input`/`OwnedValue` for *both* formats (a pre-existing,
+  format-symmetric bug, not a new one #1398 introduced).
+- [#1344](https://github.com/rust-works/succinctly/issues/1344) — `del`/`with_entries`/
+  `map_values`/`tostream`/`walk`/`recurse` fall through `eval_generic.rs`'s wildcard bridge
+  (`eval_on_owned`), which still materializes via an `IndexMap` and collapses duplicates for
+  both formats today.
+- [#1102](https://github.com/rust-works/succinctly/issues/1102) — object slicing (`.[S:E]` on
+  an object) must materialize into an `OwnedValue::Object` to build yq's AST-child-list view
+  before slicing it, with no cursor-preserving alternative available (the operation inherently
+  needs to reorder/slice entries, not just stream them) — a real representation limit, not a
+  missed wiring like the three above.
 
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478) and
