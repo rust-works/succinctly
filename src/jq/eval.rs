@@ -10049,10 +10049,8 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if S::TAG == EvalTag::Yq {
-        if let Some(_flags_expr) = flags_expr {
-            return yq_sub_arity3_empty_replace::<W, S>(re_expr, value, optional);
-        }
+    if S::TAG == EvalTag::Yq && flags_expr.is_some() {
+        return yq_sub_arity3_empty_replace::<W, S>(re_expr, value, optional);
     }
 
     let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
@@ -10089,8 +10087,12 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `"abc" | sub("b"; error("boom"); "g")` prints `"ac"` in real yq, not
 /// an error, so this isn't "evaluate and discard" (which would still
 /// propagate `error(...)`), it's "never reached." Only `re_expr` is
-/// evaluated and type-checked, so `sub("[";"X";"g")` still raises the
-/// genuine regex-compile error real yq gives for an invalid pattern.
+/// evaluated, so `sub("[";"X";"g")` still raises the genuine
+/// regex-compile error real yq gives for an invalid pattern. A
+/// *non-string* pattern (e.g. `sub(1;"X";"g")`) is a separate, pre-existing
+/// divergence shared by `test`/`match`/`capture`/2-arg `sub` in yq mode
+/// (real yq coerces it to a string; succinctly errors) -- not specific to
+/// this arity-3 path and not fixed here, see #1443.
 ///
 /// The result is a genuine global replace with a constant `""`, not
 /// "always returns `""`" -- confirmed live: `"abc" | sub("b";"X";"g")`

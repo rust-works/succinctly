@@ -218,23 +218,40 @@ Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/44
 deliberately made output *preserve* duplicate keys. They stand for yq mode; ADR-0018 rules 2
 and 3 revise them for jq mode only.
 
-### 3-argument `sub(re; s; flags)`, and a `split(re; flags)` sibling mystery
+### `gsub`, `scan`, `splits` are not real yq builtins at all
 
-The bare 2-arg form matches (see the next section). The 3-arg form does not, and real yq's
-own behaviour here has resisted every hypothesis tried
-([#1122](https://github.com/rust-works/succinctly/issues/1122)) — it returns an empty string
-for a `"g"` flag and ignores `"i"` entirely, and its `gsub` does not accept a third argument
-at all — indeed does not exist as a builtin at all, along with `scan`/`splits`
-([#1436](https://github.com/rust-works/succinctly/issues/1436), found during #1426's own
-investigation below):
+Confirmed via the pinned binary's lexer rejecting all three outright, at any arity
+([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg `gsub`
+diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:
+
+```bash
+$ echo '"aaa"' | yq 'gsub("a";"X")'      # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\")"
+$ echo '"aaa"' | yq 'gsub("a";"X";"g")'  # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\";\"g\"..."
+$ echo '"aaa"' | yq 'scan("a")'          # Error: 1:1: lexer: invalid input text "scan(\"a\")"
+```
 
 | Filter on `"aaa"` | real yq | succinctly |
 |---|---|---|
-| `sub("a";"X";"g")` | `""` | `"XXX"` |
-| `sub("A";"X";"i")` | `"aaa"` | `"Xaa"` |
 | `gsub("a";"X";"g")` | `Error: 1:1: lexer: invalid input text` | `"XXX"` |
 
-`split`'s 2-arg `split(re; flags)` form has an unrelated, equally unexplained mystery of its
+### 3-argument `sub(re; s; flags)` — resolved, real yq ignores everything past the pattern
+
+[#1122](https://github.com/rust-works/succinctly/issues/1122) resolved what had looked like an
+inconsistent mystery: real yq's `sub(re; replacement; flags)` never evaluates `replacement` or
+`flags` at all (near-certainly an upstream Go implementation bug reading its replacement from a
+fixed AST slot that's empty once arity exceeds 2, not a designed feature) — it always performs a
+global replace-with-empty-string using only the pattern. Confirmed live: an `error(...)` placed
+in either `replacement` or `flags` never fires. Per [ADR-0018](../../adrs/adr-0018.md) rule 3,
+succinctly now reproduces this bug-for-bug rather than "fixing" it into jq's model:
+
+```bash
+$ echo '"aaa"' | yq            'sub("a";"X";"g")'   # ""   (global match, empty replace)
+$ echo '"aaa"' | succinctly yq 'sub("a";"X";"g")'   # ""   (matches)
+$ echo '"aaa"' | yq            'sub("A";"X";"i")'   # "aaa" (flags never read, no match)
+$ echo '"aaa"' | succinctly yq 'sub("A";"X";"i")'   # "aaa" (matches)
+```
+
+`split`'s 2-arg `split(re; flags)` form has an unrelated, still-unresolved mystery of its
 own ([#1439](https://github.com/rust-works/succinctly/issues/1439)) — it doesn't do a regex
 split at all:
 
@@ -243,7 +260,7 @@ $ echo '"a1b2c"' | yq            -o=json 'split("[0-9]";"g")'   # ["a","1","b","
 $ echo '"a1b2c"' | succinctly yq -o=json 'split("[0-9]";"g")'   # ["a","b","c"] -- jq-modeled regex split
 ```
 
-### Regex flag grammar — `test`/`match`/`capture` fixed, three siblings still open
+### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't
 use jq's flag grammar at all for `test`/`match`/`capture` — only `g` is a real flag; every
@@ -263,8 +280,12 @@ ordering against a simultaneously-invalid pattern type (`test(1;"z")` reports th
 error, matching real yq, not `succinctly`'s own "number (1) is not a string").
 
 Deliberately **not** extended to:
-- `sub`/`split` (see the mysteries just above — applying this rule there without first
-  understanding their actual argument semantics would be a new, unverified guess).
+- `sub` — moot rather than unverified now that #1122 resolved its mystery: 3-arg `sub`
+  never evaluates its `flags` argument at all, so there is no flags *grammar* to check in
+  the first place, valid or garbage.
+- `split` — its own mystery (#1439, above) is still genuinely unresolved; applying this
+  rule there without first understanding its actual argument semantics would be a new,
+  unverified guess.
 - `gsub`/`scan`/`splits` (not real yq builtins at all, per #1436 — flag validation is moot
   for a call real yq would reject before ever reaching it).
 - The array-unpack form (`test(["abc","i"])`, no explicit flags argument) — real yq's own
