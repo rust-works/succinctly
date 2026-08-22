@@ -13763,21 +13763,109 @@ cover(1)"#,
     Ok(())
 }
 
-/// #1016 patch-coverage: `expand_func_calls`'s arity-mismatch check (right
-/// above the depth guard this PR adds, in the same `FuncCall` match arm)
-/// had zero direct test coverage anywhere in this crate before this PR --
-/// confirmed by grepping for its exact message. Calling a `def` with the
-/// wrong number of arguments must still surface that pre-existing, clean
-/// `EvalError` rather than reaching (or being masked by) the new depth
-/// guard added just below it in the same arm.
+/// #1016 patch-coverage: calling a `def` with the wrong number of
+/// arguments must still surface a clean, catchable `EvalError` (exit 5),
+/// not a crash or a silently wrong result.
+///
+/// #1376 changed *which* error this is and *where* it comes from.
+/// `expand_func_calls`'s `FuncCall` arm used to hard-error the moment it
+/// found a name-matching, arity-mismatched call, with a dedicated
+/// "function f takes 1 arguments, got 2" message -- but that broke arity
+/// overloading (`def f(x): ...; def f(x;y): ...;`), since a 2-arg call
+/// reached while expanding the 1-arg `f` would error out instead of being
+/// left alone for the 2-arg `f`'s own expansion to find. The arity check
+/// is now folded into that arm's own match guard, so an arity-mismatched
+/// call (with no other overload anywhere to resolve it, as here) falls
+/// through unexpanded and reaches `eval_func_call`'s "undefined function"
+/// fallback instead -- still a clean `EvalError`, now naming the arity too
+/// (`f/2`) rather than the dedicated check's own wording.
 #[test]
 fn test_func_call_arity_mismatch_reports_clean_error_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def f(x): x; f(1;2)"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("function f takes 1 arguments, got 2"),
+        stderr.contains("undefined function: f/2"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #1376: `succinctly jq` now supports arity overloading, matching real
+/// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
+/// (`f/1` and `f/2`), and both stay callable after the second definition.
+/// The issue's own repro, oracle-verified against jq 1.7.1.
+#[test]
+fn test_func_def_arity_overload_both_callable_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x + 1; def f(x; y): x + y; [f(1), f(2;3)]"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[2,5]");
+    Ok(())
+}
+
+/// #1376: the earlier-defined arity stays callable from *inside* the
+/// later, different-arity overload's own body too -- not just from code
+/// that comes after both definitions. Oracle-verified against jq 1.7.1:
+/// `f(2;3)` is `f(2)+3` = `3+3` = `6`.
+#[test]
+fn test_func_def_arity_overload_visible_inside_other_arity_body_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x+1; def f(x;y): (f(x)) + y; f(2;3)"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "6");
+    Ok(())
+}
+
+/// #1376 regression guard: a genuine *same-arity* redefinition must still
+/// shadow (the later definition completely replaces the earlier one, not
+/// an overload) -- arity overloading must not weaken this pre-existing,
+/// oracle-verified rule. `f(x): x+1` becomes permanently unreachable once
+/// `f(x): x+100` redefines it at the same arity.
+#[test]
+fn test_func_def_same_arity_redefinition_still_shadows_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x+1; def f(x): x+100; f(5)"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "105");
+    Ok(())
+}
+
+/// #1376 regression guard: calling an arity that no overload defines still
+/// errors cleanly, rather than silently matching the wrong overload or
+/// succeeding with a wrong value.
+#[test]
+fn test_func_def_arity_overload_unmatched_arity_still_errors_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x+1; def f(x;y): x+y; f(1;2;3)"],
+        Some("null"),
+    )?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("undefined function: f/3"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1376: a three-way arity overload (0, 1, and 2 arguments), each
+/// remaining independently callable. Oracle-verified against jq 1.7.1.
+#[test]
+fn test_func_def_three_way_arity_overload_1376() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def f: 1; def f(x): x+1; def f(x;y): x+y; [f, f(2), f(3;4)]",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,3,7]");
     Ok(())
 }
 

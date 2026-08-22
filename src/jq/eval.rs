@@ -30123,16 +30123,22 @@ fn expand_func_calls(
     chain_depth: usize,
 ) -> Expr {
     match expr {
-        Expr::FuncCall { name, args } if name == func_name => {
-            // Check arity
-            if args.len() != params.len() {
-                return expansion_error(format!(
-                    "function {} takes {} arguments, got {}",
-                    func_name,
-                    params.len(),
-                    args.len()
-                ));
-            }
+        // #1376: the arity check used to live *inside* this arm, matching
+        // on name alone and erroring on any arity mismatch -- which broke
+        // arity-based overloading (`def f(x): ...; def f(x;y): ...;`),
+        // since a 2-arg call reached while expanding the 1-arg `f` would
+        // hard-error instead of being left alone for the 2-arg `f`'s own
+        // expansion pass to find. Folding the arity check into the guard
+        // itself means a name-matching, arity-mismatched call falls
+        // through to the generic `Expr::FuncCall` arm below instead (which
+        // just recurses into `args`, leaving the call itself untouched) --
+        // exactly the same "not this occurrence's problem" treatment a
+        // different-*name* call already gets, so it stays available for
+        // whatever other def (a different arity of the same name, inside
+        // or outside this one's own scope) might still resolve it, or
+        // reaches `eval_func_call`'s "undefined function" fallback if none
+        // ever does.
+        Expr::FuncCall { name, args } if name == func_name && args.len() == params.len() => {
             // #1016: a self-recursive `def` (e.g. `def deep(n): if n == 0
             // then . else [deep(n-1)] end;`) has no base case at expansion
             // time -- expansion is static AST substitution, run before any
@@ -30817,8 +30823,22 @@ fn expand_func_calls(
             body: inner_body,
             then,
         } => {
-            // If this defines the same function name, it shadows our function
-            if inner_name == func_name {
+            // #1376: shadowing needs the *same arity*, not just the same
+            // name -- jq supports overloading a name by arity (`def
+            // f(x): ...; def f(x;y): ...;` are distinct functions, both
+            // remain callable), and a same-name-different-arity def here
+            // doesn't touch `func_name`'s own calls at all: they live at a
+            // different arity, so they're neither redefined nor shadowed
+            // by this one. Verified live against jq 1.7.1: `f/1` stays
+            // callable from *inside* `f/2`'s own body too (`def f(x):
+            // x+1; def f(x;y): (f(x))+y; f(2;3)` is `6` = f(2)+3), so this
+            // arm must keep descending into both `inner_body` and `then`
+            // when only the name matches, exactly like the "different
+            // name entirely" case below already does -- only a genuine
+            // same-arity redefinition (which really does make the earlier
+            // definition permanently unreachable from this point on)
+            // stops expansion.
+            if inner_name == func_name && inner_params.len() == params.len() {
                 // Don't expand in the body or then - this is a new definition
                 expr.clone()
             } else {
@@ -32653,13 +32673,28 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
 
 /// Evaluate a function call to an undefined function.
 /// This is an error case - the function was not defined.
+///
+/// #1376: includes arity (`name/N`), not just `name` -- an arity-mismatched
+/// call to an *existing* def (e.g. `def f(x): x; f(1;2)`) now reaches this
+/// same fallback rather than a dedicated arity-check error, since
+/// `expand_func_calls`'s `FuncCall` arm folds its arity check into its own
+/// match guard (so arity overloading -- a different arity of the same name
+/// defined elsewhere -- can still resolve the call, rather than hard-
+/// erroring the moment one non-matching-arity def is found). Naming the
+/// arity here keeps that merged case's error at least as informative as
+/// the dedicated check it replaced, and edges closer to real jq's own
+/// `name/arity is not defined` wording without fully matching its
+/// compile-time-error format.
 fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
     name: &str,
-    _args: &[Expr],
+    args: &[Expr],
     _value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    QueryResult::Error(EvalError::new(format!("undefined function: {name}")))
+    QueryResult::Error(EvalError::new(format!(
+        "undefined function: {name}/{}",
+        args.len()
+    )))
 }
 
 #[cfg(test)]
