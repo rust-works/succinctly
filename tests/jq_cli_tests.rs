@@ -13173,6 +13173,63 @@ fn test_self_recursive_def_boundary_is_exactly_49_1016() -> Result<()> {
     Ok(())
 }
 
+/// #1381: chaining several small recursive `def`s, each calling the
+/// previous one as its base case, used to multiply size ~50x per chained
+/// level (`r0`'s occurrence inside `r1`'s own body gets fully expanded
+/// *before* `r1`'s own self-reference loop runs, so every one of `r1`'s
+/// own budget-bounded hits clones a `body` that already embeds `r0`'s
+/// entire expansion) -- confirmed live pre-fix at 4+ GB peak RSS for the
+/// 3-def repro below. The weighted-cost guard now throttles `r1`'s (and
+/// `r2`'s) own hit count down to a small handful once their `body` has
+/// absorbed a prior chained `def`'s expansion, so this now fails cleanly
+/// and fast instead of exhausting memory -- see
+/// `MAX_FUNC_EXPANSION_WEIGHTED_COST`'s own doc comment (`src/jq/eval.rs`)
+/// for the full mechanism.
+#[test]
+fn test_chained_self_recursive_defs_bounded_by_weighted_cost_1381() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def r0(n): if n==0 then . else [r0(n-1)] end; \
+             def r1(n): if n==0 then r0(n) else [r1(n-1)] end; \
+             def r2(n): if n==0 then r1(n) else [r2(n-1)] end; \
+             r2(45)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("recursion depth exceeds limit of 50"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1381 regression guard: the weighted-cost check must not fire before an
+/// *ordinary, non-chained* recursive `def` reaches its own
+/// `MAX_FUNC_EXPANSION_DEPTH` budget -- `deep(49)` (a thin single-argument
+/// body, ~300 chars `Debug`-formatted, well under the guard's calibrated
+/// 30_000 threshold at 49 hits) must still succeed exactly as it did before
+/// this fix, matching `test_self_recursive_def_boundary_is_exactly_49_1016`
+/// above but specifically pinning that #1381's new check doesn't change
+/// this boundary.
+#[test]
+fn test_weighted_cost_guard_does_not_regress_ordinary_recursion_1381() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(49)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!("{}null{}", "[".repeat(49), "]".repeat(49))
+    );
+    Ok(())
+}
+
 /// A zero-argument self-recursive `def` (no growing argument expression to
 /// substitute) is the *cheapest possible* case for `expand_func_calls`'s own
 /// recursion, yet still crashed at only ~383 levels in a debug build before

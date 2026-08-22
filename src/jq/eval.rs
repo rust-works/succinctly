@@ -29386,6 +29386,61 @@ const MAX_FUNC_EXPANSION_DEPTH: usize = 50;
 /// covers.
 const MAX_FUNC_EXPANSION_CHAIN_DEPTH: usize = 300;
 
+/// Caps *total substitution cost, weighted by `body`'s own size* -- the
+/// narrower stopgap #1381 (see `MAX_FUNC_EXPANSION_DEPTH`'s own doc
+/// comment, "Also known to not close") describes for the gap neither
+/// `MAX_FUNC_EXPANSION_DEPTH` nor `MAX_FUNC_EXPANSION_CHAIN_DEPTH` closes:
+/// chaining several small recursive `def`s, each calling the previous as
+/// its base case.
+///
+/// `MAX_FUNC_EXPANSION_DEPTH` bounds *hit count* -- a flat "1 per
+/// self-reference" charge, regardless of how large `body` actually is at
+/// that hit. That's fine standing alone: for an ordinary, un-chained
+/// recursive `def`, `body` is a fixed, small size throughout its own
+/// resolution. But for `def r1(n): if n==0 then r0(n) else [r1(n-1)] end;`
+/// coming right after `def r0(n): ...;`, `r0`'s own occurrence *inside*
+/// `r1`'s body gets fully expanded (up to `MAX_FUNC_EXPANSION_DEPTH`
+/// clones of `r0`'s body) *before* `r1`'s own self-reference loop ever
+/// runs -- so by the time that loop starts, the `body` it clones on every
+/// one of its own (still flat-"1 per hit") 50 allowed hits is no longer
+/// `r1`'s small original body, but `r1`'s body *with `r0`'s entire
+/// expansion embedded in it*. Each further chained `def` repeats this,
+/// compounding roughly 50x per level -- confirmed live, 3 chained `def`s
+/// (`r0`..`r2`) hit 4+ GB peak RSS.
+///
+/// This charges each hit `body`'s own `{:?}`-formatted length instead of a
+/// flat `1`, and caps the *cumulative* weighted total -- so a hit against
+/// an already-inflated `body` costs proportionally more, and naturally
+/// throttles down to far fewer than `MAX_FUNC_EXPANSION_DEPTH` hits once
+/// `body` has absorbed a prior chained `def`'s own expansion. A `Debug`-
+/// string length is a deliberately weak, approximate size proxy rather
+/// than an exact AST node count: `Expr`'s `Debug` impl is a plain
+/// `#[derive]`, which -- unlike a hand-matched node-counter needing an arm
+/// per one of `Expr`'s 55 variants -- cannot silently undercount when the
+/// AST gains a new variant, at the cost of being only roughly proportional
+/// to the tree's real memory footprint rather than exact. Computed fresh
+/// from `body` (already an available parameter) at each hit rather than
+/// threaded through as a new parameter -- redundant work across a single
+/// occurrence's hits (`body` doesn't change within one), but bounded by
+/// this very guard: once `body` is large, only a couple of hits are ever
+/// allowed before this check trips, so the redundant re-formatting cost
+/// stays small in practice.
+///
+/// Calibrated so an ordinary, non-chained `def`'s `MAX_FUNC_EXPANSION_DEPTH`
+/// budget is unaffected: measured `Debug`-string lengths for a handful of
+/// representative single-argument recursive bodies (this crate's usual
+/// live-measurement methodology for `MAX_*` ceilings) were 299-301 chars
+/// for thin bodies (`MAX_FUNC_EXPANSION_DEPTH`'s own doc example, `r0`) and
+/// 515 for a moderately-sized arithmetic body (`fact`). `50 * 600 =
+/// 30_000` -- comfortably above every measured size, so `hits_so_far *
+/// body_debug_len` never reaches this cap before `hits_so_far` itself
+/// reaches `MAX_FUNC_EXPANSION_DEPTH` for any of them (no regression for
+/// the common case #1016 already covers) -- while still throttling a
+/// chained `def`'s inflated `body` (tens of thousands of chars after just
+/// one prior expansion) down to a small handful of further hits, keeping
+/// total blowup additive across a chain rather than multiplicative.
+const MAX_FUNC_EXPANSION_WEIGHTED_COST: usize = 30_000;
+
 /// Builds an `Expr::Error` node carrying a plain string message, evaluated
 /// via [`eval_error`]'s `Expr::Error` arm the same way a real `error("...")`
 /// call would be -- the mechanism `expand_func_calls` uses to report a
@@ -29478,6 +29533,16 @@ fn expand_func_calls(
             let cell = budget.unwrap_or(&fresh_cell);
             let hits_so_far = cell.get();
             if hits_so_far >= MAX_FUNC_EXPANSION_DEPTH {
+                return expansion_error(format!(
+                    "function {func_name} recursion depth exceeds limit of {MAX_FUNC_EXPANSION_DEPTH} while expanding"
+                ));
+            }
+            // #1381: `hits_so_far` alone doesn't catch a chained `def`
+            // whose `body` has already absorbed a prior chained `def`'s
+            // own full expansion -- see `MAX_FUNC_EXPANSION_WEIGHTED_COST`'s
+            // own doc comment for the full mechanism and calibration.
+            let body_debug_len = format!("{body:?}").len();
+            if hits_so_far.saturating_mul(body_debug_len) >= MAX_FUNC_EXPANSION_WEIGHTED_COST {
                 return expansion_error(format!(
                     "function {func_name} recursion depth exceeds limit of {MAX_FUNC_EXPANSION_DEPTH} while expanding"
                 ));
