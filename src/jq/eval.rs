@@ -18878,8 +18878,8 @@ fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
 ///   independently here: `label $out | (. as {a:$x} ?// {a:$y} | if
 ///   $x==1 then break $out else [$x,$y] end)` on `{"a":1}` is `[null,1]`
 ///   (alt2's output), not an uncaught break reaching `label $out`. That
-///   existing doc comment appears itself to be wrong; see #1365's filed
-///   follow-up rather than trusting it without live-checking, per this
+///   existing doc comment appears itself to be wrong; see #1457, filed
+///   as a follow-up, rather than trusting it without live-checking, per this
 ///   codebase's "never state a jq/yq behaviour from memory" rule.
 /// - `Halt` alone always propagates immediately, never retried.
 /// - The last alternative propagates its failure instead of falling
@@ -19386,7 +19386,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// EXTRACT call's own input). That interaction is substantially stranger
 /// than anything else `?//` does elsewhere in this codebase and reads as
 /// an accidental byproduct of jq's bytecode compilation rather than a
-/// designed behavior; reproducing it is left as a follow-up (#1365) rather
+/// designed behavior; reproducing it is left as a follow-up (#1458) rather
 /// than blocking this one on fully reverse-engineering it.
 ///
 /// Appends every EXTRACT (or bare UPDATE, when EXTRACT is absent) output
