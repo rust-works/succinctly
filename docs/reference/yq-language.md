@@ -246,11 +246,22 @@ echo '"aaa"' | succinctly yq 'gsub("a"; "X")'
 # "XXX" — same result; gsub is effectively a synonym for bare sub in yq mode
 ```
 
-**Known gap:** the 3-arg `sub(re; s; flags)` form's real-yq semantics don't
-fit jq's model, yq's own bare-`sub` model, or a couple of other hypotheses
-tried so far — see #1122. succinctly's 3-arg form currently matches jq's
-model (global only when the flags string contains `"g"`), which is not
-confirmed to match real yq.
+`gsub` (any arity), `scan`, and `splits` are not real yq builtins at all — real yq's own
+lexer rejects them outright (confirmed live against yq v4.53.3, #1436). succinctly's `gsub`
+support in yq mode is therefore a succinctly-only convenience, not a verified match against
+an oracle that has nothing to compare against.
+
+**Resolved (#1122):** the 3-arg `sub(re; s; flags)` form doesn't fit jq's
+model or yq's own bare-`sub` model — real yq never evaluates `replacement`
+or `flags` at all, and always does a global replace with the empty string
+using only the pattern (near-certainly an upstream Go bug, not a designed
+feature). succinctly now reproduces this bug-for-bug per
+[ADR-0018](../adrs/adr-0018.md) rule 3:
+
+```bash
+echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
+# "" — replacement and flags are never read; every match is deleted
+```
 
 ### Date/Time Extensions
 

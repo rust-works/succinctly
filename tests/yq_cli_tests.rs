@@ -14068,6 +14068,22 @@ fn test_yq_sub_3arg_flags_not_honoured_1122() -> Result<()> {
     Ok(())
 }
 
+/// #1122: a syntactically-invalid flags string (one `build_regex` would
+/// reject as "not a valid modifier string" if it were ever read) is
+/// silently ignored too -- confirmed live against yq v4.53.3, which never
+/// evaluates or validates `flags` for this form at all. Pins this
+/// specifically because every other flags value this file tests (`"g"`,
+/// `""`, `null`, `"i"`) happens to be one `build_regex` would accept even
+/// if honoured, so none of them would catch a regression that reintroduces
+/// flags validation on this path.
+#[test]
+fn test_yq_sub_3arg_garbage_flags_still_ignored_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("b"; "X"; "zzz")"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), r#""ac""#);
+    Ok(())
+}
+
 /// #1122: real yq's parser accepts (and ignores) a 4th argument too --
 /// confirmed live it behaves identically to the 3-arg form, unlike jq's
 /// own hard "sub/4 is not defined" compile error. succinctly's own parser
