@@ -15599,6 +15599,66 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // ---- closed by #820 Stage 2 (#1421); these were leaking above -----
+        // `isempty`/`limit`/`nth` now stop the generator on the output that
+        // satisfies them, so a later `stderr` is never evaluated.
+        (
+            &["-cn", r#"isempty(1, ("B"|stderr))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // The paren spelling: `isempty(...)` consumes only its own parens, so
+        // this is `IsEmpty(Paren(Comma(..)))` and needs `Expr::Paren`'s own
+        // lazy arm. Without it the fix would be a coin flip on spelling.
+        (
+            &["-cn", r#"isempty((1, ("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        (&["-cn", r#"limit(1; 1, ("B"|stderr))"#], None, "1\n", "", 0),
+        (&["-cn", r#"nth(0; 1, ("B"|stderr))"#], None, "1\n", "", 0),
+        // Reached through a subtree that has already bounced into `eval.rs`,
+        // so `eval_first_expr`'s own rewrite is what closes this one -- unlike
+        // a bare `first(...)`, which `eval_generic` still intercepts natively
+        // until Stage 2b.
+        (
+            &["-cn", r#"isempty(first(1, ("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // #932's `any`/`IN(s)` half.
+        (
+            &["-c", "any(2, (5|stderr); .==2)"],
+            Some("2"),
+            "true\n",
+            "",
+            0,
+        ),
+        (&["-c", "IN(2, (5|stderr))"], Some("2"), "true\n", "", 0),
+        // `halt_error`'s own exit-code argument: the only `result_to_owned`
+        // call site that may take a stopping sink, and only because its body
+        // terminates the process (see the `ltrimstr` test for why the other
+        // nineteen may not).
+        (
+            &["-cn", r#""o" | halt_error(1, ("B"|stderr))"#],
+            None,
+            "",
+            "o",
+            1,
+        ),
+        (
+            &["-cn", r#""outer" | halt_error(1, ("inner"|halt_error(2)))"#],
+            None,
+            "",
+            "outer",
+            1,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -15650,34 +15710,14 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // #820's own repro. jq: stderr empty.
-        (
-            &["-cn", r#"isempty(1, ("B"|stderr))"#],
-            None,
-            "false\n",
-            "B",
-            0,
-        ),
-        // The paren spelling, mentioned in no issue: `isempty(...)` eats only
-        // its own parens, so this is `IsEmpty(Paren(Comma(..)))`. jq: empty.
-        (
-            &["-cn", r#"isempty((1, ("B"|stderr)))"#],
-            None,
-            "false\n",
-            "B",
-            0,
-        ),
-        // jq: stderr empty for all three.
+        // `first(f)` has a NATIVE arm in `eval_generic.rs`
+        // (`eval_first_or_last_generic`, kept cursor-preserving for #607), and
+        // the CLI always enters `eval_generic` first -- so an `eval.rs`-only
+        // fix never reaches it. `limit`/`nth`/`isempty` have no generic arm
+        // and bounce to `eval.rs`, which is why they are fixed in the test
+        // above while these two are not. Closed by Stage 2b. jq: no stderr.
         (&["-cn", r#"first(1, ("B"|stderr))"#], None, "1\n", "B", 0),
-        (
-            &["-cn", r#"limit(1; 1, ("B"|stderr))"#],
-            None,
-            "1\n",
-            "B",
-            0,
-        ),
-        (&["-cn", r#"nth(0; 1, ("B"|stderr))"#], None, "1\n", "B", 0),
-        // jq: stderr exactly one write (`1`), not two.
+        // jq writes exactly one `1`; the generic Comma arm runs both.
         (
             &["-c", "first(.[] | stderr)"],
             Some("[1,2]"),
@@ -15685,49 +15725,16 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "12",
             0,
         ),
-        // Reached through a subtree that has already bounced to eval.rs.
-        (
-            &["-cn", r#"isempty(first(1, ("B"|stderr)))"#],
-            None,
-            "false\n",
-            "B",
-            0,
-        ),
-        // #932. jq: stderr empty for both.
-        (
-            &["-c", "any(2, (5|stderr); .==2)"],
-            Some("2"),
-            "true\n",
-            "5",
-            0,
-        ),
-        (&["-c", "IN(2, (5|stderr))"], Some("2"), "true\n", "5", 0),
+        // `IN(src; s)` synthesizes an `Expr::Compare` and hands it to
+        // `any_all_gen_cond` as `gen`, but `binary_fanout_core`'s outer loop
+        // is still eager, so the sink never sees the candidates one at a
+        // time. Closed by Stage 4. jq: no stderr.
         (
             &["-cn", "[IN((2,3); 2, (5|stderr))]"],
             None,
             "[true]\n",
             "5",
             0,
-        ),
-        // #820's halt_error repro. jq: stderr `o`, exit 1 -- the leaked `B`
-        // is written before the outer message.
-        (
-            &["-cn", r#""o" | halt_error(1, ("B"|stderr))"#],
-            None,
-            "",
-            "Bo",
-            1,
-        ),
-        // The same repro's nested form. #820's text reports `innerouter` /
-        // exit 1, which is STALE: #791's `Partial(_, Control::Halt)` arm in
-        // `result_to_owned_full` now fires before `builtin_halt_error` writes,
-        // so the inner halt wins outright. jq: `outer`, exit 1.
-        (
-            &["-cn", r#""outer" | halt_error(1, ("inner"|halt_error(2)))"#],
-            None,
-            "",
-            "inner",
-            2,
         ),
     ];
 
@@ -15794,27 +15801,35 @@ fn test_discarded_generator_branch_consumes_input_documents_820() -> Result<()> 
         "control run must see all 4 documents"
     );
 
-    // `input` in a discarded branch eats every other document.
-    // jq: [false,1] [false,2] [false,3] [false,4].
+    // FIXED by #820 Stage 2 (#1421): `isempty` stops the generator on its
+    // first output, so the discarded `input` branch is never evaluated and
+    // never pops a document. Matches jq exactly.
     let (stdout, _, code) = run_jq_full(&["-c", "[isempty(1, input), .id]"], Some(DOCS))?;
     assert_eq!(code, 0);
     assert_eq!(
-        stdout, "[false,1]\n[false,3]\n",
-        "documents 2 and 4 were consumed"
+        stdout, "[false,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "every document must still be processed"
     );
 
-    // Same for `first`, which reaches it via `eval_generic`'s own arm.
-    // jq: [1,1] [1,2] [1,3] [1,4].
-    let (stdout, _, code) = run_jq_full(&["-c", "[first(1, input), .id]"], Some(DOCS))?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "[1,1]\n[1,3]\n", "documents 2 and 4 were consumed");
-
-    // `inputs` (plural) drains the WHOLE queue from one discarded branch, so
-    // the loss scales with input size: N documents in, exactly 1 processed.
-    // jq: [false,1] [false,2] [false,3] [false,4].
+    // Likewise for `inputs`, which previously drained the whole queue from a
+    // single discarded branch -- N documents in, exactly 1 processed.
     let (stdout, _, code) = run_jq_full(&["-c", "[isempty(1, inputs), .id]"], Some(DOCS))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "[false,1]\n", "documents 2-4 were all consumed");
+    assert_eq!(
+        stdout, "[false,1]\n[false,2]\n[false,3]\n[false,4]\n",
+        "every document must still be processed"
+    );
+
+    // STILL divergent until Stage 2b: `first(f)` is intercepted by
+    // `eval_generic`'s own native arm (kept cursor-preserving for #607), so it
+    // never reaches `eval.rs`'s now-lazy `eval_first_expr`.
+    // jq: [1,1] [1,2] [1,3] [1,4].
+    let (stdout, _, code) = run_jq_full(&["-c", "[first(1, input), .id]"], Some(DOCS))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[1,1]\n[1,3]\n", 0),
+        "documents 2 and 4 are still consumed -- Stage 2b"
+    );
 
     Ok(())
 }

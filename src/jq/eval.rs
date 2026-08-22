@@ -1695,6 +1695,434 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
     None
 }
 
+// The demand-driven sink (#820, `docs/plan/jq-lazy-generator-consumers.md`).
+//
+// `eval_single` and friends materialize a whole `QueryResult` before any
+// consumer sees it, so a side-effecting builtin in a later comma branch
+// (`stderr`, `halt_error`, and — destructively — `input`/`inputs`) fires even
+// when the consumer only ever needed an earlier value. Real jq never asks the
+// generator for that value at all: its `first`/`isempty`/`limit` are defined
+// with an internal `break $out` that unwinds mid-generator.
+//
+// This is the second, opt-in entry point that models that `break`. It lives
+// *alongside* the eager path: `eval_single`, `eval_comma` and `eval_pipe` keep
+// their bodies and contracts verbatim, and any `Expr` variant without a native
+// lazy arm below falls back to `eval_single` + [`drain_result`]. That fallback
+// is what makes the change incremental — see [`drain_result`] for the exact
+// invariant.
+
+/// What a sink wants after receiving one output.
+///
+/// `Stop` models the `break $out` in jq's own definitions (`def first(f):
+/// label $out | (f, break $out);`): not "an error happened", but "the consumer
+/// has what it came for, and jq's generator would never have been asked for
+/// another value".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Demand {
+    Continue,
+    Stop,
+}
+
+/// One output on its way to a sink.
+///
+/// Two variants, not one: `eval_first_expr`/`eval_limit` return
+/// `QueryResult::One`/`Many` when their input was borrowed, and collapsing
+/// that to `OwnedValue` would lose the zero-copy path #295/#353 exist to
+/// protect. There is no `Cursor` variant — every producer calls
+/// `materialize_cursor()` first, exactly as `eval_comma`/`eval_pipe` do.
+enum Item<'a, W = Vec<u64>> {
+    Borrowed(StandardJson<'a, W>),
+    Owned(OwnedValue),
+}
+
+impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
+    /// Materialize, for the owned-surface bridge ([`eval_each_owned`]) and for
+    /// consumers that were going to `to_owned` anyway.
+    fn into_owned(self) -> OwnedValue {
+        match self {
+            Item::Borrowed(v) => to_owned(&v),
+            Item::Owned(v) => v,
+        }
+    }
+}
+
+/// How a generator stopped producing.
+///
+/// This is `Partial`'s information re-factored for a pushed rather than a
+/// collected world: the pushes *are* the prefix, so only the terminator needs
+/// a representation. Kept as an enum rather than
+/// `(bool, Option<Control>)` for the reason `EvalEscape`'s own doc comment
+/// gives for splitting `Error`/`Break`/`Halt` — it makes "escaped" and
+/// "stopped, with a control the consumer must still rule on" structurally
+/// distinct, so the wrong one cannot be written by accident.
+enum Flow {
+    /// Ran to exhaustion; every output was delivered.
+    Exhausted,
+    /// A sink returned [`Demand::Stop`].
+    ///
+    /// Carries no payload. The design (`docs/plan/jq-lazy-generator-consumers.md`)
+    /// specifies a `pending: Option<Control>` here, for a control an *eager
+    /// fallback* had already raised before the stop — reachable only when
+    /// [`drain_result`] stops part-way through a `Partial`'s prefix, never
+    /// from a natively-lazy arm, which simply never evaluates that far. Every
+    /// consumer rewired in Stage 2 **drops** that control (oracle-confirmed:
+    /// `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0), so nothing reads it
+    /// yet and carrying it would be dead weight. `resolve_leaf` is the one
+    /// consumer that must *keep* a `Halt` — its own comment argues at length
+    /// that an already-triggered halt must not be downgraded into a catchable
+    /// error — so Stage 3 reintroduces the payload when the reader arrives.
+    Stopped,
+    /// Terminated in a control. Everything produced before it was already
+    /// delivered to the sink.
+    Escaped(Control),
+}
+
+/// Drain an already-materialized [`QueryResult`] into a sink, checking demand
+/// between values. The fallback for every `Expr` variant with no lazy arm.
+///
+/// **The invariant that makes the whole design incremental:** for a sink that
+/// always answers [`Demand::Continue`], this delivers exactly the values
+/// [`push_owned_values`] would collect, in the same order, and reports the
+/// same terminal [`Control`]. It *is* `push_owned_values` plus a demand check
+/// between values, minus the `to_owned` on borrowed items. So an un-lazified
+/// arm is a missed optimization, never a behaviour change — and a lazy arm can
+/// only shrink the set of sub-expressions evaluated, never reorder or alter
+/// the values delivered. `collect_each` asserts this differentially in tests
+/// rather than leaving it asserted in prose.
+fn drain_result<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'a, W>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match result.materialize_cursor() {
+        QueryResult::None => Flow::Exhausted,
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::One(v) => match sink(Item::Borrowed(v)) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped,
+        },
+        QueryResult::Owned(v) => match sink(Item::Owned(v)) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped,
+        },
+        QueryResult::Many(vs) => {
+            for v in vs {
+                if sink(Item::Borrowed(v)) == Demand::Stop {
+                    return Flow::Stopped;
+                }
+            }
+            Flow::Exhausted
+        }
+        QueryResult::ManyOwned(vs) => {
+            for v in vs {
+                if sink(Item::Owned(v)) == Demand::Stop {
+                    return Flow::Stopped;
+                }
+            }
+            Flow::Exhausted
+        }
+        QueryResult::Error(e) => Flow::Escaped(Control::Error(e)),
+        QueryResult::Break(label) => Flow::Escaped(Control::Break(label)),
+        QueryResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
+        // `partial()` guarantees the prefix is produced *before* the control
+        // and is never empty, so it is delivered first — exactly as
+        // `push_owned_values` already delivers it. A sink that stops part-way
+        // through drops the control it never reached, which is what every
+        // consumer rewired in Stage 2 wants (see `Flow::Stopped`).
+        QueryResult::Partial(vs, control) => {
+            for v in vs {
+                if sink(Item::Owned(v)) == Demand::Stop {
+                    return Flow::Stopped;
+                }
+            }
+            Flow::Escaped(control)
+        }
+    }
+}
+
+/// Drain a `QueryResult` produced against a *different*, locally-built
+/// document (so it carries no borrow of `'a`) into an `Item<'a, W>` sink.
+///
+/// `eval_owned_pipe`/`eval_owned_input` normalize every output to
+/// `Owned`/`ManyOwned` precisely because their values borrow from an index
+/// built inside the call, so only the owned-family variants are reachable —
+/// the same assumption `eval_pipe`'s own `Owned` arm already makes.
+fn drain_owned_result<'a, W: Clone + AsRef<[u64]>, W2: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W2>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match result {
+        QueryResult::None => Flow::Exhausted,
+        QueryResult::Owned(v) => match sink(Item::Owned(v)) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped,
+        },
+        QueryResult::ManyOwned(vs) => {
+            for v in vs {
+                if sink(Item::Owned(v)) == Demand::Stop {
+                    return Flow::Stopped;
+                }
+            }
+            Flow::Exhausted
+        }
+        QueryResult::Error(e) => Flow::Escaped(Control::Error(e)),
+        QueryResult::Break(label) => Flow::Escaped(Control::Break(label)),
+        QueryResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
+        QueryResult::Partial(vs, control) => {
+            for v in vs {
+                if sink(Item::Owned(v)) == Demand::Stop {
+                    return Flow::Stopped;
+                }
+            }
+            Flow::Escaped(control)
+        }
+        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+            unreachable!("owned-input evaluation normalizes to the owned-family variants")
+        }
+    }
+}
+
+/// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
+///
+/// Only `Comma`, `Pipe` and `Paren` have native lazy arms; everything else
+/// falls back to `eval_single` + [`drain_result`]. `Paren` is not optional
+/// cosmetics: `isempty(...)` consumes only its own parentheses, so
+/// `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and without this arm
+/// the fix would be a coin flip on spelling.
+fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match expr {
+        // Mirrors `eval_comma` exactly, minus the accumulator: the sink *is*
+        // the accumulator, so #353's borrowed/owned promotion has nothing to
+        // promote here.
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                match eval_each::<W, S>(e, value.clone(), optional, sink) {
+                    Flow::Exhausted => {}
+                    stopped_or_escaped => return stopped_or_escaped,
+                }
+            }
+            Flow::Exhausted
+        }
+        Expr::Pipe(exprs) => eval_each_pipe::<W, S>(exprs, value, optional, sink),
+        Expr::Paren(inner) => eval_each::<W, S>(inner, value, optional, sink),
+        _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
+    }
+}
+
+/// Slice-based twin of [`eval_each`]'s `Pipe` arm, so recursion walks `&rest`
+/// without rebuilding an `Expr::Pipe` per value (mirrors `eval_pipe`).
+fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    exprs: &[Expr],
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // `eval_pipe` diverts to `eval_pipe_with_path_context` whenever *any*
+    // stage needs path context. `needs_path_context` recurses through
+    // Pipe/Paren/Comma/Array/If/Try/Label, so this is a whole-pipe property
+    // and cannot be decided per stage. Delegate to the eager path rather than
+    // re-deriving it: getting this wrong silently stubs `key`/`parent`/
+    // `file_index` to their zero defaults (the #715/#1302 failure class),
+    // which produces wrong output rather than an error.
+    if exprs.iter().any(needs_path_context) {
+        return drain_result(eval_pipe::<W, S>(exprs, value, optional), sink);
+    }
+
+    let Some((first, rest)) = exprs.split_first() else {
+        return match sink(Item::Borrowed(value)) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped,
+        };
+    };
+    if rest.is_empty() {
+        return eval_each::<W, S>(first, value, optional, sink);
+    }
+
+    // Whatever ended the *downstream* stages, recorded out-of-band because the
+    // driver closure can only answer `Demand`. A downstream stop or escape has
+    // to stop stage 1 too -- that is the whole point of the lazy `Pipe` arm --
+    // but the two cases surface differently to our own caller.
+    let mut downstream: Option<Flow> = None;
+    let upstream = {
+        let mut driver = |item: Item<'a, W>| -> Demand {
+            let flow = match item {
+                Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, v, optional, &mut *sink),
+                // Mirrors `eval_pipe`'s own `Owned`/`ManyOwned` arms, which
+                // route through `eval_owned_pipe` -> `eval_owned_input`. Same
+                // serialize-and-reindex bridge, same cost, no behaviour
+                // change; laziness simply stops here, which the fallback
+                // invariant permits.
+                Item::Owned(v) => drain_owned_result::<W, Vec<u64>>(
+                    eval_owned_pipe::<Vec<u64>, S>(rest, v, optional),
+                    &mut *sink,
+                ),
+            };
+            match flow {
+                Flow::Exhausted => Demand::Continue,
+                other => {
+                    downstream = Some(other);
+                    Demand::Stop
+                }
+            }
+        };
+        eval_each::<W, S>(first, value, optional, &mut driver)
+    };
+
+    match downstream {
+        // Downstream decided. Its verdict wins over stage 1's `Stopped`,
+        // which is only the echo of our own driver returning `Stop`.
+        Some(flow) => flow,
+        // Stage 1 ended on its own terms; every value it produced was piped
+        // through cleanly.
+        None => upstream,
+    }
+}
+
+/// Collect a sink's items back into a `QueryResult`, reproducing
+/// `eval_comma`'s borrowed/owned promotion (#353): stay borrowed while every
+/// item is, and the moment one owned item appears promote the whole ordered
+/// batch, so no operand's position is lost.
+fn items_to_result<'a, W: Clone + AsRef<[u64]>>(items: Vec<Item<'a, W>>) -> QueryResult<'a, W> {
+    if items.iter().all(|i| matches!(i, Item::Borrowed(_))) {
+        let borrowed: Vec<StandardJson<'a, W>> = items
+            .into_iter()
+            .map(|i| match i {
+                Item::Borrowed(v) => v,
+                Item::Owned(_) => unreachable!("checked above"),
+            })
+            .collect();
+        return borrowed_vec_to_result(borrowed);
+    }
+    owned_vec_to_result(items.into_iter().map(Item::into_owned).collect())
+}
+
+/// Pull at most one output, then stop the generator — jq's
+/// `def first(f): label $out | (f, break $out);`.
+///
+/// `Err` is returned only for a *bare* escape (the generator's very first
+/// "output" was itself an error/break/halt). Once an output exists the
+/// consumer is satisfied, and jq — whose `break $out` has already fired —
+/// never reaches whatever came after, so any trailing control is dropped.
+/// Oracle-confirmed: `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0.
+fn each_take_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> Result<Option<Item<'a, W>>, Control> {
+    let mut first: Option<Item<'a, W>> = None;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        first = Some(item);
+        Demand::Stop
+    });
+    match flow {
+        Flow::Stopped | Flow::Exhausted => Ok(first),
+        // The sink always stops on its first item, so an escape can only mean
+        // nothing was ever produced. The `Some` guard keeps that reasoning
+        // local rather than relying on it from a distance.
+        Flow::Escaped(control) => match first {
+            Some(item) => Ok(Some(item)),
+            None => Err(control),
+        },
+    }
+}
+
+/// Pull at most `n` outputs, then stop the generator — jq's `limit`.
+///
+/// Returns the items alongside the terminating [`Flow`], because `limit`'s
+/// trailing-control rule depends on *why* it stopped: once `n` outputs exist
+/// jq never asks for more and the control is dropped, but a generator that
+/// ended early still surfaces it (`[limit(3; 1,2,error("x"),4)]` raises,
+/// `limit(2; 1,2,error("x"))` does not).
+fn each_take_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    n: usize,
+) -> (Vec<Item<'a, W>>, Flow) {
+    let mut taken: Vec<Item<'a, W>> = Vec::new();
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        taken.push(item);
+        if taken.len() >= n {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    (taken, flow)
+}
+
+/// Pull outputs until index `n`, keeping only that one — jq's `nth`, which it
+/// defines as `last(limit($n + 1; f))`, so it stops there exactly as `limit`
+/// would.
+fn each_take_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    n: usize,
+) -> Result<Option<Item<'a, W>>, Control> {
+    let mut seen = 0usize;
+    let mut wanted: Option<Item<'a, W>> = None;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        if seen == n {
+            wanted = Some(item);
+            seen += 1;
+            Demand::Stop
+        } else {
+            seen += 1;
+            Demand::Continue
+        }
+    });
+    match flow {
+        Flow::Stopped | Flow::Exhausted => Ok(wanted),
+        Flow::Escaped(control) => match wanted {
+            Some(item) => Ok(Some(item)),
+            None => Err(control),
+        },
+    }
+}
+
+/// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
+///
+/// The sink takes `OwnedValue`, not `Item`: values produced against the
+/// locally-built index cannot outlive this call, which is the same reason
+/// `eval_owned_input` normalizes `One`/`Many` to `Owned`/`ManyOwned`. This is
+/// what lets one primitive serve the owned-surface consumers (`any`/`all`,
+/// `IN`) as well as the cursor ones.
+fn eval_each_owned<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if let Some(result) = eval_owned_fast_path::<S>(expr, input, optional) {
+        return match result {
+            Ok(Some(v)) => match sink(v) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped,
+            },
+            Ok(None) => Flow::Exhausted,
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        };
+    }
+
+    // Same round trip, and the same `to_json_for_reindex` reasoning (#561), as
+    // `eval_owned_input`.
+    let json_str = input.to_json_for_reindex::<S>();
+    let json_bytes = json_str.as_bytes();
+
+    use crate::json::JsonIndex;
+    let index = JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
+
+    eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
+        sink(item.into_owned())
+    })
+}
+
 /// Evaluate `body(bit)` once per truthy-bit of a condition stream, merging
 /// the results in order. Shared by `eval_if` and `builtin_select` so a
 /// multi-output condition (`if (true,false) then "a" else "b" end` /
@@ -3807,18 +4235,31 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    let current = to_owned(&value);
-    let (candidates, trailing) = eval_owned_expr_fork::<S>(s, &current, false);
+    // #932: `IN(s)` is jq's `any(s == .; .)`, so it stops at the first equal
+    // candidate rather than evaluating every one and then testing the
+    // collected results -- which had already fired any side effect in a
+    // candidate past the match.
+    //
     // `owned_value_eq::<S>`, not `Vec::contains`/plain `==`: this builtin's
     // own doc comment states it matches jq's `any(s == .; .)`, so it must
     // agree with `==`'s own yq-mode strict Int/Float distinction (#950
     // review) rather than silently falling back to widening equality.
-    if candidates.iter().any(|c| owned_value_eq::<S>(c, &current)) {
+    let current = to_owned(&value);
+    let mut found = false;
+    let flow = eval_each_owned::<S>(s, &current, false, &mut |candidate| {
+        if owned_value_eq::<S>(&candidate, &current) {
+            found = true;
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    if found {
         return QueryResult::Owned(OwnedValue::Bool(true));
     }
-    match trailing {
-        Some(control) => control_to_result(control),
-        None => QueryResult::Owned(OwnedValue::Bool(false)),
+    match flow {
+        Flow::Exhausted | Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(false)),
+        Flow::Escaped(control) => control_to_result(control),
     }
 }
 
@@ -4212,18 +4653,67 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
+    // #932: `gen` used to be evaluated to completion by
+    // `eval_owned_expr_fork` before the first `cond` probe ran, so a
+    // `stderr`/`halt_error` in a later, never-needed output had already
+    // printed by the time a match was found. `cond` is now probed per output
+    // *as `gen` produces it*, and a match stops `gen` outright.
+    //
+    // Still `to_owned` + the owned bridge, not `eval_each` on `value`
+    // directly: `eval_owned_expr_fork` -> `eval_owned_input` is what ran
+    // before, and switching to the cursor path here would silently change
+    // duplicate-key and number-spelling fidelity.
+    //
+    // `target_truthy` decides which answer a single element can settle, and
+    // `any_all_probe_element` already folds that direction in -- so `all`
+    // still reaches a later side-effecting element whenever no element has
+    // decided the answer yet. Confirmed against jq 1.7.1:
+    // `all(2, (5|stderr); .==2)` writes `5` there too, and is pinned by
+    // `test_short_circuit_side_effect_shapes_already_match_jq_820`.
     let owned = to_owned(&value);
-    let (gen_outputs, gen_trailing) = eval_owned_expr_fork::<S>(gen, &owned, optional);
-    for elem in &gen_outputs {
-        match any_all_probe_element::<S>(cond, elem, target_truthy) {
-            Ok(true) => return QueryResult::Owned(OwnedValue::Bool(target_truthy)),
-            Ok(false) => {}
-            Err(control) => return control_to_result(control),
-        }
+
+    let mut matched = false;
+    // `cond`'s own escape is not `gen`'s, so it travels out-of-band rather
+    // than as `Flow::Escaped`; this preserves the existing precedence, where
+    // a `cond` escape wins over `gen`'s trailing control.
+    let mut probe_escape: Option<Control> = None;
+
+    let flow = eval_each_owned::<S>(
+        gen,
+        &owned,
+        optional,
+        &mut |elem| match any_all_probe_element::<S>(cond, &elem, target_truthy) {
+            Ok(true) => {
+                matched = true;
+                Demand::Stop
+            }
+            Ok(false) => Demand::Continue,
+            Err(control) => {
+                probe_escape = Some(control);
+                Demand::Stop
+            }
+        },
+    );
+
+    if let Some(control) = probe_escape {
+        return control_to_result(control);
     }
-    match gen_trailing {
-        Some(control) => control_to_result(control),
-        None => QueryResult::Owned(OwnedValue::Bool(!target_truthy)),
+    if matched {
+        return QueryResult::Owned(OwnedValue::Bool(target_truthy));
+    }
+    match flow {
+        // `gen` exhausted with no match: the answer is the identity element
+        // (`false` for `any`, `true` for `all`).
+        //
+        // `Stopped` is folded in here rather than given an `unreachable!()`:
+        // every `Stop` this sink issues sets `matched` or `probe_escape`, both
+        // returned above, so reaching this arm as `Stopped` is impossible
+        // today -- but a defensible identity answer is a better failure mode
+        // than a panic if a future sink grows a third stop reason.
+        Flow::Exhausted | Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(!target_truthy)),
+        // No earlier output matched, so `gen`'s own terminator is the only
+        // verdict left -- oracle-verified: `IN(3, error("boom"))` on `2` raises.
+        Flow::Escaped(control) => control_to_result(control),
     }
 }
 
@@ -17682,47 +18172,31 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    // Evaluate expr and take first n
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result {
-        QueryResult::One(v) if n >= 1 => QueryResult::One(v),
-        QueryResult::Many(vs) => {
-            let taken: Vec<_> = vs.into_iter().take(n).collect();
-            borrowed_vec_to_result(taken)
-        }
-        QueryResult::Owned(v) if n >= 1 => QueryResult::Owned(v),
-        QueryResult::ManyOwned(vs) => {
-            let taken: Vec<_> = vs.into_iter().take(n).collect();
-            owned_vec_to_result(taken)
-        }
-        QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        // A break used to be silently swallowed here (fell into the old
-        // wildcard arm below) instead of reaching its label — fixed
-        // alongside #494, the same "limit drops what it shouldn't" family.
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // jq's generator-based `limit` never asks its operand for values
-        // past `n` (verified: `limit(2; 1,2,error("boom"))` is `1`, `2`,
-        // exit 0 — the error is never even reached). So once `n` outputs are
-        // available in the prefix, the trailing control is dropped entirely,
-        // mirroring how excess *values* beyond `n` are already silently
-        // ignored above. Only when fewer than `n` were produced does the
-        // control still surface (`limit(3; 1,2,error("boom"),4)` is `1`,
-        // `2`, then the error — the existing golden case).
-        QueryResult::Partial(vs, control) => {
-            let satisfied = vs.len() >= n;
-            let taken: Vec<_> = vs.into_iter().take(n).collect();
+    // Pull at most `n`, then stop the generator. Was: evaluate to completion
+    // and `.take(n)` the result, which had already run the branches past `n`
+    // and fired their side effects (#820).
+    let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
+    let satisfied = taken.len() >= n;
+    let result = items_to_result(taken);
+    match flow {
+        // Stopped because `n` outputs arrived: jq's own `foreach ... break
+        // $out` fires here, so nothing past that point is ever reached and a
+        // trailing control from an eager fallback is dropped, exactly as the
+        // excess *values* beyond `n` already were.
+        Flow::Stopped => result,
+        Flow::Exhausted => result,
+        // Fewer than `n` were produced, so the generator's own terminator is
+        // what `limit` actually reaches (`[limit(3; 1,2,error("x"),4)]`
+        // raises; `limit(2; 1,2,error("x"))` does not).
+        Flow::Escaped(control) => {
             if satisfied {
-                owned_vec_to_result(taken)
+                result
             } else {
-                partial(taken, control)
+                let mut prefix = Vec::new();
+                push_owned_values(result, &mut prefix);
+                partial(prefix, control)
             }
         }
-        QueryResult::OneCursor(_) => unreachable!("eval_single never produces OneCursor"),
-        QueryResult::One(_) | QueryResult::Owned(_) => unreachable!(
-            "n >= 1 here (n == 0 returned above), so the `if n >= 1` guards above always match"
-        ),
     }
 }
 
@@ -17732,35 +18206,14 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result.materialize_cursor() {
-        QueryResult::One(v) => QueryResult::One(v),
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => {
-            if let Some(first) = vs.into_iter().next() {
-                QueryResult::One(first)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::Owned(v) => QueryResult::Owned(v),
-        QueryResult::ManyOwned(vs) => {
-            if let Some(first) = vs.into_iter().next() {
-                QueryResult::Owned(first)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // jq's generator-based `first` never asks for values past the
-        // first (verified: `first(1,2,error("x"))` is `1`, exit 0 — the
-        // error is never reached), so a non-empty prefix always satisfies
-        // it and the trailing control is dropped. `Partial`'s prefix is
-        // never empty by construction.
-        QueryResult::Partial(vs, _control) => QueryResult::Owned(vs.into_iter().next().unwrap()),
+    // Was: evaluate `expr` to completion, then take `.next()` off the result.
+    // That answered correctly but had already run every later branch, firing
+    // any `stderr`/`halt_error` and consuming any `input` in them (#820).
+    match each_take_first::<W, S>(expr, value, optional) {
+        Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
+        Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
+        Ok(None) => QueryResult::None,
+        Err(control) => control_to_result(control),
     }
 }
 
@@ -17821,44 +18274,13 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) => return e.into(),
     };
 
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result.materialize_cursor() {
-        QueryResult::One(v) if n == 0 => QueryResult::One(v),
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::One(_) => QueryResult::None,
-        QueryResult::Many(vs) => {
-            if let Some(item) = vs.into_iter().nth(n) {
-                QueryResult::One(item)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::Owned(v) if n == 0 => QueryResult::Owned(v),
-        QueryResult::Owned(_) => QueryResult::None,
-        QueryResult::ManyOwned(vs) => {
-            if let Some(item) = vs.into_iter().nth(n) {
-                QueryResult::Owned(item)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // Like `first`/`limit`, `nth` never asks for values past index `n`
-        // (verified: `nth(1; 1,2,error("x"))` is `2`, exit 0, but
-        // `nth(5; 1,2,error("x"))` raises — index 5 was never reached). So
-        // the trailing control is dropped once the prefix reaches index `n`,
-        // and surfaces otherwise.
-        QueryResult::Partial(vs, control) => match vs.into_iter().nth(n) {
-            Some(item) => QueryResult::Owned(item),
-            None => match control {
-                Control::Error(e) => QueryResult::Error(e),
-                Control::Break(label) => QueryResult::Break(label),
-                Control::Halt(code) => QueryResult::Halt(code),
-            },
-        },
+    // Pull only as far as index `n`, then stop -- jq defines `nth` as
+    // `last(limit($n + 1; f))`, so it stops there too (#820).
+    match each_take_nth::<W, S>(expr, value, optional, n) {
+        Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
+        Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
+        Ok(None) => QueryResult::None,
+        Err(control) => control_to_result(control),
     }
 }
 
@@ -24978,35 +25400,19 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    // Evaluate expr and take at most n results
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result {
-        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
-        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
-        QueryResult::Owned(v) => QueryResult::Owned(v),
-        QueryResult::Many(results) => {
-            let limited: Vec<OwnedValue> =
-                results.into_iter().take(n).map(|v| to_owned(&v)).collect();
-            owned_vec_to_result(limited)
-        }
-        QueryResult::ManyOwned(results) => {
-            let limited: Vec<OwnedValue> = results.into_iter().take(n).collect();
-            owned_vec_to_result(limited)
-        }
-        QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // Same semantics as `eval_limit`: jq's generator-based `limit` never
-        // asks for values past `n`, so a prefix that already reaches `n`
-        // drops the trailing control; only a shorter prefix still surfaces it.
-        QueryResult::Partial(vs, control) => {
-            let satisfied = vs.len() >= n;
-            let taken: Vec<_> = vs.into_iter().take(n).collect();
+    // `Builtin::Limit` is the internal spelling of the same `limit(n; f)`,
+    // differing from `eval_limit` only in always materializing its answer.
+    // Same sink, same trailing-control rule (#820).
+    let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
+    let satisfied = taken.len() >= n;
+    let values: Vec<OwnedValue> = taken.into_iter().map(Item::into_owned).collect();
+    match flow {
+        Flow::Stopped | Flow::Exhausted => owned_vec_to_result(values),
+        Flow::Escaped(control) => {
             if satisfied {
-                owned_vec_to_result(taken)
+                owned_vec_to_result(values)
             } else {
-                partial(taken, control)
+                partial(values, control)
             }
         }
     }
@@ -25018,32 +25424,13 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result {
-        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
-        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
-        QueryResult::Owned(v) => QueryResult::Owned(v),
-        QueryResult::Many(results) => {
-            if let Some(first) = results.into_iter().next() {
-                QueryResult::Owned(to_owned(&first))
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::ManyOwned(results) => {
-            if let Some(first) = results.into_iter().next() {
-                QueryResult::Owned(first)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // Same semantics as `eval_first_expr`: a non-empty prefix always
-        // satisfies `first`, so the trailing control is dropped.
-        QueryResult::Partial(vs, _control) => QueryResult::Owned(vs.into_iter().next().unwrap()),
+    // `Builtin::FirstStream` is the internal spelling of the same `first(f)`;
+    // it differs from `eval_first_expr` only in always materializing its
+    // answer, which is preserved here.
+    match each_take_first::<W, S>(expr, value, optional) {
+        Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
+        Ok(None) => QueryResult::None,
+        Err(control) => control_to_result(control),
     }
 }
 
@@ -25129,43 +25516,12 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
 
-    // Evaluate expr and get the nth result
-    let result = eval_single::<W, S>(expr, value, optional);
-    match result {
-        QueryResult::One(v) if n == 0 => QueryResult::Owned(to_owned(&v)),
-        QueryResult::OneCursor(c) if n == 0 => QueryResult::Owned(to_owned(&c.value())),
-        QueryResult::Owned(v) if n == 0 => QueryResult::Owned(v),
-        QueryResult::Many(results) => {
-            if let Some(nth) = results.into_iter().nth(n) {
-                QueryResult::Owned(to_owned(&nth))
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::ManyOwned(results) => {
-            if let Some(nth) = results.into_iter().nth(n) {
-                QueryResult::Owned(nth)
-            } else {
-                QueryResult::None
-            }
-        }
-        QueryResult::One(_)
-        | QueryResult::OneCursor(_)
-        | QueryResult::Owned(_)
-        | QueryResult::None => QueryResult::None,
-        QueryResult::Error(e) => QueryResult::Error(e),
-        QueryResult::Break(label) => QueryResult::Break(label),
-        QueryResult::Halt(code) => QueryResult::Halt(code),
-        // Same semantics as `eval_nth_expr`: the trailing control is dropped
-        // once the prefix reaches index `n`, and surfaces otherwise.
-        QueryResult::Partial(vs, control) => match vs.into_iter().nth(n) {
-            Some(item) => QueryResult::Owned(item),
-            None => match control {
-                Control::Error(e) => QueryResult::Error(e),
-                Control::Break(label) => QueryResult::Break(label),
-                Control::Halt(code) => QueryResult::Halt(code),
-            },
-        },
+    // Same sink as `eval_nth_expr`, differing only in always materializing
+    // its answer (#820).
+    match each_take_nth::<W, S>(expr, value, optional, n) {
+        Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
+        Ok(None) => QueryResult::None,
+        Err(control) => control_to_result(control),
     }
 }
 
@@ -25175,44 +25531,38 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single::<W, S>(expr, value, optional);
-    let is_empty = match result {
-        QueryResult::None => true,
-        QueryResult::Many(ref v) if v.is_empty() => true,
-        QueryResult::ManyOwned(ref v) if v.is_empty() => true,
-        // A bare, uncaught error must propagate, not be answered as `true`
-        // (#882) - real jq's `isempty` has no `try`/`catch` around its
-        // argument, so `isempty(error("x"))` genuinely fails (exit 5) rather
-        // than reporting the argument as "empty". Same asymmetry as `Halt`/
-        // `Break` below, and the same laziness reason (see the `Break` arm's
-        // comment): confirmed via oracle, `isempty(1, error("x"))` answers
-        // `false` in real jq 1.7.1, so `Partial(_, Control::Error(_))`
-        // correctly stays on the wildcard arm below.
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // A halt with zero prior outputs must propagate rather than answer
-        // `false` — but a `Partial`'s halt always has a non-empty prefix (see
-        // `partial`), meaning `g` already produced an output before halting,
-        // so the wildcard arm below correctly still answers `false` for that
-        // case, same as it already does for `Partial(_, Control::Error(_))`
-        // (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        // Same reasoning for `break`, and the same asymmetry: a bare `Break`
-        // (zero prior output) must propagate — `isempty(break $out)` in real
-        // jq produces no output and exits 0, matching real jq's own `def
-        // isempty(g): label $out | (g|false,break $out), true;`, which never
-        // even asks `g` for a value at all when `g`'s very first "output" is
-        // itself a break. `Partial(_, Control::Break(_))` (`g` already
-        // produced a value before the break) must NOT propagate, though:
-        // real jq's laziness means `g`'s second output is never requested
-        // once the first already answered `isempty`'s own internal `break
-        // $out` — confirmed via oracle (`isempty(1, break $out)` answers
-        // `false` in real jq 1.7.1, same as `isempty(1, halt_error(3))`
-        // above) — so the wildcard arm correctly still answers `false` for
-        // that shape too (#867 follow-up).
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        _ => false,
-    };
-    QueryResult::Owned(OwnedValue::Bool(is_empty))
+    // jq: `def isempty(g): label $out | (g|false, break $out), true;`
+    //
+    // The `break $out` fires on `g`'s *first* output, so `g` is never asked
+    // for a second one — that `break` is exactly `Demand::Stop` (#820). Before
+    // the sink existed this ran `g` to completion first, which meant a
+    // `stderr`/`halt_error` in a later, never-needed branch had already
+    // printed, and an `input`/`inputs` there had already *consumed* a document
+    // the CLI's driver loop then never processed.
+    //
+    // The three arms below replace an eight-arm case analysis (#882, #791,
+    // #867) whose every oracle fact now falls out of `Flow`'s shape instead of
+    // being re-derived per `QueryResult` variant.
+    match eval_each::<W, S>(expr, value, optional, &mut |_item| Demand::Stop) {
+        // `g` produced an output and we stopped it right there.
+        //
+        // `pending` is deliberately dropped: it is only ever `Some` when an
+        // eager fallback had already raised a trailing control before the
+        // stop, and real jq — which would never have evaluated that far —
+        // answers `false` regardless. Oracle-confirmed for all three shapes:
+        // `isempty(1, error("x"))`, `isempty(1, ("m"|halt_error(3)))` and
+        // `label $o | isempty(1, break $o)` all answer `false`, exit 0.
+        Flow::Stopped => QueryResult::Owned(OwnedValue::Bool(false)),
+
+        // `g` ran to exhaustion without ever calling the sink.
+        Flow::Exhausted => QueryResult::Owned(OwnedValue::Bool(true)),
+
+        // A *bare* escape: `g`'s very first "output" was itself an
+        // error/break/halt, so there is nothing to answer with and all three
+        // must propagate rather than be reported as "empty" (#882, #791,
+        // #867). `control_to_result` preserves `Halt`/`Break` by construction.
+        Flow::Escaped(control) => control_to_result(control),
+    }
 }
 
 /// The YAML type tag (`!!str`, `!!int`, `!!float`, ...) `builtin_delpaths`'s
@@ -26051,8 +26401,27 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let code = match code_expr {
         Some(expr) => {
-            let n_result = eval_single::<W, S>(expr, value.clone(), optional);
-            match result_to_owned(n_result) {
+            // #820: `result_to_owned(eval_single(..))` ran the whole argument
+            // first, so `halt_error(1, ("inner"|halt_error(2)))` fired the
+            // inner halt -- printing its message and winning the exit code --
+            // where real jq prints only `outer` and exits 1.
+            //
+            // This is the ONE `result_to_owned` call site that may take a
+            // stopping sink, and not for `first`/`limit`'s reason. jq's
+            // generator-argument backtracking normally *resumes* into the
+            // argument after the body runs (`"abcabc" | ltrimstr(("a",
+            // ("B"|stderr)))` prints `B` in real jq, pinned by
+            // `test_generator_argument_backtracking_still_evaluates_the_tail_1279`),
+            // so converting the other 19 call sites would be wrong. It is
+            // sound here only because this body terminates the process, so
+            // control can never return to the generator.
+            let first = each_take_first::<W, S>(expr, value.clone(), optional);
+            let n_result: Result<OwnedValue, EvalEscape> = match first {
+                Ok(Some(item)) => Ok(item.into_owned()),
+                Ok(None) => Err(EvalEscape::Error(EvalError::new("no value"))),
+                Err(control) => Err(control.into()),
+            };
+            match n_result {
                 // Clamped into `0..=i32::MAX`, not wrapped, to match real jq:
                 // verified live against jq 1.7.1 that an out-of-range
                 // positive exit code clamps to `i32::MAX` (e.g.
@@ -29915,6 +30284,105 @@ mod tests {
     use super::*;
     use crate::jq::{parse, parse_with_mode, ParserMode};
     use crate::json::JsonIndex;
+
+    /// Collect an [`eval_each`] stream back into a `QueryResult`, so the
+    /// sink path can be diffed against the eager one. Test-only: production
+    /// consumers each shape their own answer from `Flow` directly.
+    fn collect_each<'a, W: Clone + AsRef<[u64]>>(
+        run: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+    ) -> QueryResult<'a, W> {
+        let mut items: Vec<Item<'a, W>> = Vec::new();
+        let flow = run(&mut |item| {
+            items.push(item);
+            Demand::Continue
+        });
+        let result = items_to_result(items);
+        match flow {
+            Flow::Exhausted | Flow::Stopped => result,
+            Flow::Escaped(control) => {
+                let mut prefix = Vec::new();
+                push_owned_values(result, &mut prefix);
+                partial(prefix, control)
+            }
+        }
+    }
+
+    /// Normalize a `QueryResult` to a comparable shape: the owned values it
+    /// carries, plus a tag for however it terminated.
+    fn normalize<W: Clone + AsRef<[u64]>>(r: QueryResult<'_, W>) -> (Vec<OwnedValue>, String) {
+        let mut out = Vec::new();
+        let control = push_owned_values(r, &mut out);
+        let tag = match control {
+            None => "ok".to_string(),
+            Some(Control::Error(e)) => format!("error:{}", e.message),
+            Some(Control::Break(l)) => format!("break:{l}"),
+            Some(Control::Halt(c)) => format!("halt:{c}"),
+        };
+        (out, tag)
+    }
+
+    /// **The invariant the whole #820 design rests on**: with a sink that
+    /// never stops, [`eval_each`] delivers exactly what `eval_single` would,
+    /// in the same order, terminating the same way.
+    ///
+    /// That is what makes an un-lazified `Expr` arm a missed optimization
+    /// rather than a behaviour change — and it is asserted here differentially
+    /// rather than left as prose in the design doc, because the lazy `Comma`
+    /// and `Pipe` arms are a second implementation of semantics `eval_comma`
+    /// and `eval_pipe` already own, and two implementations drift.
+    #[test]
+    fn eval_each_with_a_never_stopping_sink_matches_eval_single_820() {
+        // Deliberately mixes the lazified arms (comma, pipe, paren) with
+        // arms that fall back, and covers empty/error/break/halt terminators,
+        // borrowed and owned outputs, and nesting of the three.
+        let cases: &[(&[u8], &str)] = &[
+            (b"null", "1, 2, 3"),
+            (b"null", "(1, 2), (3, 4)"),
+            (b"null", "((1, 2))"),
+            (b"null", "empty"),
+            (b"null", "1, empty, 2"),
+            (b"null", "(1, 2) | . + 10"),
+            (b"null", "(1, 2) | (., .)"),
+            (b"null", "1 | 2 | 3"),
+            (b"null", "[1, 2] | .[]"),
+            (b"null", "(1, error(\"x\"), 3)"),
+            (b"null", "(1, 2) | if . == 1 then \"a\" else \"b\" end"),
+            (b"null", "label $o | (1, break $o, 3)"),
+            (b"null", "[limit(2; 1, 2, 3)]"),
+            (b"null", "{a: 1} | .a, .a"),
+            (b"null", "\"x\" | ., ."),
+            (b"[1,2,3]", "."),
+            (b"[1,2,3]", ".[]"),
+            (b"[1,2,3]", ".[] , .[]"),
+            (b"[1,2,3]", ".[] | . * 2"),
+            (b"[1,2,3]", "(.[] | select(. > 1)), 99"),
+            (b"{\"a\":{\"b\":7}}", ".a.b, .a, ."),
+            (b"{\"a\":{\"b\":7}}", ".a | .b, .b"),
+            (b"{\"a\":1}", ".a, .missing, .a"),
+        ];
+
+        for (json, src) in cases {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(src).unwrap();
+
+            let eager = normalize(eval_single::<Vec<u64>, JqSemantics>(
+                &expr,
+                cursor.value(),
+                false,
+            ));
+            let lazy = normalize(collect_each(|sink| {
+                eval_each::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false, sink)
+            }));
+
+            assert_eq!(
+                eager,
+                lazy,
+                "eval_each diverged from eval_single for `{src}` on {}",
+                core::str::from_utf8(json).unwrap()
+            );
+        }
+    }
 
     /// Helper macro to run a query and match the result.
     macro_rules! query {
