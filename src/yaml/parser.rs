@@ -1021,9 +1021,19 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Decodes via [`crate::text::utf8::decode_code_point`] instead,
     /// against the byte slice starting at `offset` (not just the one byte
     /// `self.peek()`/`self.input[offset]` would give, which isn't enough to
-    /// decode a multi-byte sequence). Falls back to `'\0'` on EOF or
-    /// invalid UTF-8 at `offset`, matching the old code's EOF fallback
-    /// exactly and treating a malformed sequence the same way.
+    /// decode a multi-byte sequence).
+    ///
+    /// Three cases, matching the old per-site fallbacks exactly rather than
+    /// collapsing them together: true EOF (`offset` past the end) is `'\0'`,
+    /// same as the old `self.peek().map_or('\0', ...)`. A byte that *is*
+    /// present but doesn't decode as valid UTF-8 there (a lone continuation
+    /// byte, an invalid lead byte, or a sequence truncated by EOF) falls
+    /// back to the old Latin-1 cast of that one byte, not `'\0'` -- an
+    /// earlier version of this helper used `'\0'` for this case too, which
+    /// silently embedded a literal NUL byte into the error string for any
+    /// malformed (not just missing) input, something the old per-site code
+    /// never did (a raw byte cast never fails). Only a byte that decodes
+    /// correctly gets the real, corrected character.
     ///
     /// Takes `offset` explicitly rather than reading `self.pos`: the one
     /// site with a genuinely different call shape
@@ -1031,12 +1041,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// via a local scan cursor, before `self.pos` itself has advanced past
     /// it.
     fn err_unexpected_char(&self, offset: usize, context: &'static str) -> YamlError {
-        let char = self
-            .input
-            .get(offset..)
-            .and_then(text::utf8::decode_code_point)
-            .and_then(|(cp, _len)| char::from_u32(cp))
-            .unwrap_or('\0');
+        let char = match self.input.get(offset) {
+            None => '\0',
+            Some(&byte) => self
+                .input
+                .get(offset..)
+                .and_then(text::utf8::decode_code_point)
+                .and_then(|(cp, _len)| char::from_u32(cp))
+                .unwrap_or(byte as char),
+        };
         YamlError::UnexpectedCharacter {
             offset,
             char,

@@ -64,6 +64,36 @@ fn run_yq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
+/// `run_yq_stdin_with_stderr`'s raw-bytes counterpart, for input that isn't
+/// valid UTF-8 -- deliberately not `unsafe { str::from_utf8_unchecked(...) }`
+/// over an invalid byte sequence, which is real UB even when the only thing
+/// done with the resulting `&str` is write its bytes back out (#1187).
+fn run_yq_stdin_bytes_with_stderr(
+    filter: &str,
+    input: &[u8],
+    extra_args: &[&str],
+) -> Result<(String, String, i32)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(extra_args)
+        .arg(filter)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(input)?;
+    }
+
+    let output = cmd.wait_with_output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok((stdout, stderr, exit_code))
+}
+
 /// jq-mode counterpart of `run_yq_stdin_with_stderr` -- this file otherwise
 /// hand-rolls `Command::new(...).arg("jq")` boilerplate per jq-mode test
 /// (#1146: introduced to avoid compounding that duplication for its own
@@ -7022,11 +7052,35 @@ fn test_trailing_content_after_flow_collection_reports_real_utf8_char_1187() -> 
     Ok(())
 }
 
-/// The other 7 `err_unexpected_char` call sites, none previously exercised
+/// Review round: `err_unexpected_char`'s first cut fell back to `'\0'` not
+/// just at true EOF but for *any* byte that isn't valid UTF-8 at that
+/// offset -- silently embedding a literal NUL byte into the error string
+/// for a malformed (not just missing) byte, something the old
+/// `byte as char` cast never did (a raw cast never fails). A single
+/// non-UTF-8 byte (`0xFF`, never a valid lead byte) must still render as
+/// the same visible Latin-1 character the old code showed, not `'\0'`.
+#[test]
+fn test_err_unexpected_char_invalid_byte_does_not_embed_nul_1187() -> Result<()> {
+    let (_, stderr, code) =
+        run_yq_stdin_bytes_with_stderr(".", b"a: [1, 2] \xff\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("unexpected character '\u{FF}'"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\0'),
+        "must not embed a literal NUL byte in the error text: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// The other 6 `err_unexpected_char` call sites, none previously exercised
 /// by any test in this file -- each needs a real repro reaching that exact
 /// branch, not just an obviously-malformed document (this parser is
 /// forgiving in ways that make many "obviously wrong" inputs still parse).
-/// The 8th (`reject_trailing_flow_content`) is covered above; a 9th
+/// The 7th (`reject_trailing_flow_content`) is covered above; the 8th
 /// (`parse_block_scalar_header`'s catch-all) is unreachable via any input
 /// at all -- see that function's own comment for why.
 #[test]
@@ -7047,13 +7101,22 @@ fn test_err_unexpected_char_remaining_call_sites_1187() -> Result<()> {
     // `parse_mapping_entry`: same shape, block-mapping alias key, but with a
     // comma instead of a space -- the alias-name scanner's terminator set
     // stops at flow indicators (including `,`), while the lookahead that
-    // approved this as a mapping entry doesn't.
+    // approved this as a mapping entry doesn't. A bare `contains("expected
+    // ':' after key")` alone couldn't tell this call site apart from
+    // `parse_compact_mapping_entry`'s sibling above ("expected ':' after
+    // key in compact mapping" contains it as a literal prefix), so also
+    // assert that longer variant is absent -- together the two pin this
+    // input to `parse_mapping_entry` specifically.
     let (_, stderr, code) =
         run_yq_stdin_with_stderr(".", "x: &a 1\n*a,b: 2\n", &["-o", "json", "-I0"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("expected ':' after key"),
         "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("expected ':' after key in compact mapping"),
+        "must reach parse_mapping_entry, not parse_compact_mapping_entry: {stderr}"
     );
 
     // `parse_implicit_flow_mapping_entry`: a `!tag` prefix on a bare
@@ -7064,6 +7127,18 @@ fn test_err_unexpected_char_remaining_call_sites_1187() -> Result<()> {
     assert_ne!(code, 0);
     assert!(
         stderr.contains("expected ':' in implicit flow mapping entry"),
+        "stderr: {stderr}"
+    );
+
+    // `parse_flow_sequence_inner`: a quoted element followed by another
+    // element with no comma between them -- valid flow-sequence value
+    // syntax stops at the space, leaving the next token where `,`/`]` was
+    // expected.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: [\"x\" b]\n", &["-o", "json", "-I0"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("expected ',' or ']' in flow sequence"),
         "stderr: {stderr}"
     );
 
