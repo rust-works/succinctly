@@ -1849,48 +1849,6 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Drain a `QueryResult` produced against a *different*, locally-built
-/// document (so it carries no borrow of `'a`) into an `Item<'a, W>` sink.
-///
-/// `eval_owned_pipe`/`eval_owned_input` normalize every output to
-/// `Owned`/`ManyOwned` precisely because their values borrow from an index
-/// built inside the call, so only the owned-family variants are reachable —
-/// the same assumption `eval_pipe`'s own `Owned` arm already makes.
-fn drain_owned_result<'a, W: Clone + AsRef<[u64]>, W2: Clone + AsRef<[u64]>>(
-    result: QueryResult<'_, W2>,
-    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
-) -> Flow {
-    match result {
-        QueryResult::None => Flow::Exhausted,
-        QueryResult::Owned(v) => match sink(Item::Owned(v)) {
-            Demand::Continue => Flow::Exhausted,
-            Demand::Stop => Flow::Stopped,
-        },
-        QueryResult::ManyOwned(vs) => {
-            for v in vs {
-                if sink(Item::Owned(v)) == Demand::Stop {
-                    return Flow::Stopped;
-                }
-            }
-            Flow::Exhausted
-        }
-        QueryResult::Error(e) => Flow::Escaped(Control::Error(e)),
-        QueryResult::Break(label) => Flow::Escaped(Control::Break(label)),
-        QueryResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
-        QueryResult::Partial(vs, control) => {
-            for v in vs {
-                if sink(Item::Owned(v)) == Demand::Stop {
-                    return Flow::Stopped;
-                }
-            }
-            Flow::Escaped(control)
-        }
-        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-            unreachable!("owned-input evaluation normalizes to the owned-family variants")
-        }
-    }
-}
-
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
 /// Only `Comma`, `Pipe` and `Paren` have native lazy arms; everything else
@@ -1957,19 +1915,23 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // to stop stage 1 too -- that is the whole point of the lazy `Pipe` arm --
     // but the two cases surface differently to our own caller.
     let mut downstream: Option<Flow> = None;
+    // Built once, outside the driver closure, so an Owned item mid-pipe
+    // doesn't re-clone `rest` per value.
+    let rest_pipe = Expr::Pipe(rest.to_vec());
     let upstream = {
         let mut driver = |item: Item<'a, W>| -> Demand {
             let flow = match item {
                 Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, v, optional, &mut *sink),
-                // Mirrors `eval_pipe`'s own `Owned`/`ManyOwned` arms, which
-                // route through `eval_owned_pipe` -> `eval_owned_input`. Same
-                // serialize-and-reindex bridge, same cost, no behaviour
-                // change; laziness simply stops here, which the fallback
-                // invariant permits.
-                Item::Owned(v) => drain_owned_result::<W, Vec<u64>>(
-                    eval_owned_pipe::<Vec<u64>, S>(rest, v, optional),
-                    &mut *sink,
-                ),
+                // Re-enters `eval_each`'s own `Expr::Pipe` arm on the
+                // reindexed owned value (same serialize-and-reindex bridge as
+                // `eval_owned_pipe`/`eval_owned_input`, same cost), so
+                // laziness -- and thus `input`/`inputs` demand -- continues
+                // through the rest of the pipe instead of stopping here
+                // (#820: an eager fallback here silently drained inputs a
+                // downstream sink never asked for).
+                Item::Owned(v) => {
+                    eval_each_owned::<S>(&rest_pipe, &v, optional, &mut |o| sink(Item::Owned(o)))
+                }
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
