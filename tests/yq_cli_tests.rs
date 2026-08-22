@@ -19802,6 +19802,44 @@ fn test_yq_string_interpolation_single_valued_slot_unaffected_1403() -> Result<(
     Ok(())
 }
 
+/// `eval_string_interpolation_single_value`'s own `Halt`/`Partial` arms,
+/// unexercised by any pre-#1403 test: before #1403 split jq and yq mode
+/// into separate functions, jq-mode tests for this exact code (shared by
+/// both modes at the time) covered these arms; post-split, jq mode takes
+/// the new fan-out path instead, so this yq-only function needs its own
+/// coverage for the cases that aren't a plain slot value or a bare,
+/// no-prior-output `Error`/`Break`.
+#[test]
+fn test_yq_string_interpolation_atomic_control_flow_1403() -> Result<()> {
+    // Bare `halt_error`, no prior output within the slot.
+    let (output, code) = run_yq_stdin(r#".a | "\(halt_error(9))""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 9, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // An uncaught error after a prior successful value in the *same* slot
+    // (a `Partial(_, Control::Error(_))`, distinct from the bare-`Error`
+    // two-separate-slots shape already covered elsewhere).
+    let (output, code) = run_yq_stdin(r#".a | "\(., error("boom"))""#, "a: 1\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert_eq!(output, "");
+
+    // `break` after a prior successful value in the same slot.
+    let (output, code) = run_yq_stdin(
+        r#"label $out | ((.a | "\(., break $out)"), "reached")"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "");
+
+    // `halt_error` after a prior successful value in the same slot.
+    let (output, code) = run_yq_stdin(r#".a | "\(., halt_error(9))""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 9, "output: {output:?}");
+    assert_eq!(output, "");
+
+    Ok(())
+}
+
 /// #1403 follow-up: `key`/`parent`/`file_index` route `\(...)` through a
 /// *second*, separate string-interpolation evaluator
 /// (`eval_pipe_with_path_context_internal`'s own `StringInterpolation` arm)
