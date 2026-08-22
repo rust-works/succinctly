@@ -6839,7 +6839,15 @@ where
         }
         out.write_char(']')
     } else {
-        // Block style
+        // Block style. `current_indent`/`unit` never vary across the loop
+        // below (this function is never itself called recursively -- it's
+        // only ever the outermost entry point, the `--slurp` array itself
+        // -- so `current_indent` has no inherited compact "extra spaces"
+        // baggage of its own yet), so both the plain and compact-adjusted
+        // forms of this level's indent are computed once here rather than
+        // separately per branch per item.
+        let own_indent = deeper_yaml_indent("", current_indent, unit);
+        let child_indent = compact_yaml_indent(&own_indent);
         let mut first = true;
         for cursor in iter {
             if !first {
@@ -6849,13 +6857,7 @@ where
             first = false;
             // Mirrors `stream_yaml_value`'s `Sequence` block-style arm
             // exactly, including its `#785` compact-form handling (see the
-            // comment there). This function is never itself called
-            // recursively (it's only ever the outermost entry point - the
-            // `--slurp` array itself), so `current_indent` has no inherited
-            // compact "extra spaces" baggage of its own yet - converting it
-            // to a plain `unit`-repeated string here before handing off to
-            // `stream_yaml_value` (which *is* recursive and needs the
-            // general string form) is exact, not an approximation.
+            // comment there).
             let style = cursor.style();
             if is_yaml_cursor_container(&cursor) && style != "flow" {
                 let anchor = cursor.anchor();
@@ -6871,8 +6873,6 @@ where
                     // `stream_yaml_value`'s own Sequence arm -- the anchor/
                     // tag prefix occupies the `- ` slot on its own line, but
                     // that doesn't change how deep its value nests).
-                    let own_indent = deeper_yaml_indent("", current_indent, unit);
-                    let child_indent = compact_yaml_indent(&own_indent);
                     out.write_str(&child_indent)?;
                     cursor.stream_yaml_value(
                         out,
@@ -6884,8 +6884,6 @@ where
                     )?;
                 } else {
                     out.write_str("- ")?;
-                    let own_indent = deeper_yaml_indent("", current_indent, unit);
-                    let child_indent = compact_yaml_indent(&own_indent);
                     cursor.stream_yaml_value(
                         out,
                         &child_indent,
@@ -6911,7 +6909,6 @@ where
                 // live (`- &anc null` instead of `- &anc !!mytag`), so this
                 // now routes through the same `write_deferred_value` helper
                 // instead of hand-writing the anchor.
-                let own_indent = deeper_yaml_indent("", current_indent, unit);
                 out.write_char('-')?;
                 write_deferred_value(out, &cursor, &own_indent, indent_spaces, unit, sort_keys)?;
                 write_line_comment(out, cursor.line_comment_raw())?;
@@ -8353,8 +8350,9 @@ mod tests {
         // step deeper -- it still occupies the `- ` slot, so the value nests
         // exactly as deep as `compact_yaml_indent` puts a non-anchored
         // element (2 columns), never `indent_spaces` columns. Verified
-        // against real yq v4.53.3, which puts `a` at column 6 here, not the
-        // pre-fix column 8 a bare `deeper_yaml_indent` step produced.
+        // against real yq v4.53.3, which puts `a` at column 2 here (this
+        // fixture has no outer nesting), not the pre-fix column 4 a bare
+        // `deeper_yaml_indent` step produced.
         let yaml = b"- &x\n  a: 1\n  b: 2\n";
         let index = YamlIndex::build(yaml).unwrap();
         let mut out = String::new();
