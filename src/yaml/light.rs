@@ -6864,7 +6864,15 @@ where
                     out.write_char('-')?;
                     write_deferred_prefix(out, None, anchor, tag)?;
                     out.write_char('\n')?;
-                    let child_indent = deeper_yaml_indent("", current_indent + indent_spaces, unit);
+                    // Same "compact" rule as the non-anchored `else` arm
+                    // below: the value's own content aligns under the `- `
+                    // prefix's width, not a full indent step (#1484, the
+                    // `--slurp` counterpart of #1362's fix to
+                    // `stream_yaml_value`'s own Sequence arm -- the anchor/
+                    // tag prefix occupies the `- ` slot on its own line, but
+                    // that doesn't change how deep its value nests).
+                    let own_indent = deeper_yaml_indent("", current_indent, unit);
+                    let child_indent = compact_yaml_indent(&own_indent);
                     out.write_str(&child_indent)?;
                     cursor.stream_yaml_value(
                         out,
@@ -8314,6 +8322,26 @@ mod tests {
 
         let mut out = String::new();
         stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_anchor_deferred_value_uses_compact_width_at_non_default_indent_slurp_1484(
+    ) {
+        // #1484: the `--slurp` counterpart of the
+        // `..._1362` test below -- `stream_yaml_sequence`'s own
+        // anchor/tag-deferred branch had the identical full-step-instead-
+        // of-compact-width bug, invisible at the default `indent_spaces=2`
+        // (where `deeper_yaml_indent`'s full step and `compact_yaml_indent`'s
+        // fixed 2-column width coincide) but real at any wider setting.
+        // Verified against real yq v4.53.3, which puts `a` at column 2 here
+        // regardless of `indent_spaces`, not the pre-fix column 4.
+        let bytes_a = b"&x\n  a: 1\n  b: 2\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+
+        let mut out = String::new();
+        stream_yaml_sequence([cursor_a], &mut out, 0, 4, ' ', false).unwrap();
         assert_eq!(out, "- &x\n  a: 1\n  b: 2");
     }
 
