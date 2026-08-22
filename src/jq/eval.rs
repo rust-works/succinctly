@@ -23019,6 +23019,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // (#715 follow-up: previously there was no explicit `If` arm
             // here, so it fell into the generic fallback below and lost
             // path context for anything nested in cond/then/else).
+            //
+            // Forks on `cond`'s truthiness via the shared `eval_fanout`
+            // (#1393), the same helper the sibling `Select` arm above
+            // already uses -- this arm used to hand-roll the identical
+            // "unpack cond into values + trailing control, loop dispatching
+            // a branch per value, accumulate via `accumulate_path_context_step`"
+            // shape independently, the exact "duplicated predicates diverge
+            // silently" pattern this project's own CLAUDE.md warns about.
             let cond_result = eval_pipe_with_path_context_internal::<W, S>(
                 core::slice::from_ref(cond),
                 value,
@@ -23027,55 +23035,17 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
             );
-            // Unpack `cond_result` into its truthy/falsy values plus any
-            // trailing control (#400/#494) -- `cond` itself can produce more
-            // than one value (e.g. `if .[] then ... end`) and/or end in an
-            // error/break after producing some, and both must still drive a
-            // branch evaluation per value with the control propagated after.
-            let (cond_values, cond_control): (Vec<OwnedValue>, Option<Control>) = match cond_result
-            {
-                QueryResult::Owned(v) => (vec![v], None),
-                QueryResult::ManyOwned(vs) => (vs, None),
-                QueryResult::None => (Vec::new(), None),
-                QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
-                QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
-                QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
-                QueryResult::Partial(vs, control) => (vs, Some(control)),
-                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                    unreachable!(
-                        "eval_pipe_with_path_context_internal only ever produces \
-                         Owned/ManyOwned/None/Error/Break/Partial"
-                    )
-                }
-            };
-            let mut results = Vec::new();
-            let mut stopped = None;
-            for v in cond_values {
-                let branch = if v.is_truthy() {
-                    then_branch
-                } else {
-                    else_branch
-                };
-                let step = eval_pipe_with_path_context_internal::<W, S>(
+            let branch_result = eval_fanout(cond_result, |truthy| {
+                let branch = if truthy { then_branch } else { else_branch };
+                eval_pipe_with_path_context_internal::<W, S>(
                     core::slice::from_ref(branch),
                     value,
                     root,
                     file_origin,
                     current_path,
                     optional,
-                );
-                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
-                    stopped = Some(stop);
-                    break;
-                }
-            }
-            let branch_result = if let Some(stop) = stopped {
-                stop
-            } else if let Some(control) = cond_control {
-                partial(results, control)
-            } else {
-                owned_vec_to_result(results)
-            };
+                )
+            });
             if rest.is_empty() {
                 return branch_result;
             }
