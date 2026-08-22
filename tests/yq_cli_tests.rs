@@ -20006,3 +20006,38 @@ fn test_yq_string_interpolation_path_context_optional_threaded_through_rest_1403
     assert_eq!(output, "");
     Ok(())
 }
+
+/// #1408's three fixes (`builtin_nth_stream`, `builtin_combinations_n`,
+/// `builtin_halt_error`) all live on `EvalSemantics`-generic functions
+/// shared verbatim between `succinctly jq` and `succinctly yq` -- pin
+/// yq-mode parity for each, so a future mode-specific edit to any of them
+/// has real CI signal here rather than only in `jq_cli_tests.rs`.
+#[test]
+fn test_yq_nth_stream_empty_n_argument_produces_no_output_1408() -> Result<()> {
+    let (output, stderr, code) =
+        run_yq_stdin_with_stderr("nth(empty; .a,.b)", "a: 1\nb: 2\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(output, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_combinations_n_empty_argument_produces_empty_array_1408() -> Result<()> {
+    let (output, stderr, code) =
+        run_yq_stdin_with_stderr("combinations(empty)", "[1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(output.trim(), "[]");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+#[test]
+fn test_yq_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()> {
+    let (output, stderr, code) =
+        run_yq_stdin_with_stderr(r#""x" | halt_error(empty)"#, "", &["-n"])?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(output, "");
+    assert_eq!(stderr, "");
+    Ok(())
+}

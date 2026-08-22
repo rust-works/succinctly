@@ -20645,7 +20645,11 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match result_to_owned_full(n_result) {
         Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::Int(i), _))) if i >= 0 => i as usize,
+        Ok(Some((OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _), _)))
+            if i >= 0 =>
+        {
+            i as usize
+        }
         Ok(Some(_)) => {
             return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
         }
@@ -52558,6 +52562,27 @@ mod tests {
         match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
             QueryResult::Halt(code) => assert_eq!(code, 11),
             other => panic!("expected Halt(11), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_nth_expr_zero_output_n_argument_produces_no_output_1408() {
+        // Same unreachable-from-CLI function as the halt-propagation tests
+        // above (see `eval_nth_expr_n_argument_propagates_halt`'s doc
+        // comment for why `Expr::NthExpr` needs a direct call). This pins
+        // #1408's own fix for this function: `result_to_owned_full`'s
+        // `Ok(None)` arm (a zero-output `n`) must make the whole call
+        // produce `QueryResult::None`, not fall through to the
+        // non-negative-integer type error a `None` would previously have
+        // hit via the old `result_to_owned` + hard "no value" error.
+        let json_bytes: &[u8] = br"[1, 2, 3]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = parse("empty").unwrap();
+        let expr = Expr::Identity;
+        match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
         }
     }
 
