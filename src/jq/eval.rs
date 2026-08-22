@@ -6262,9 +6262,8 @@ fn build_string_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             build_string_parts::<W, S>(rest, value, optional, slots, out)
         }
         StringPart::Expr(expr) => {
-            let (outputs, trailing) = string_part_outputs::<W, S>(
-                eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor(),
-            );
+            let (outputs, trailing) =
+                string_part_outputs::<W, S>(eval_single::<W, S>(expr, value.clone(), optional));
 
             for s in outputs {
                 slots[idx] = s;
@@ -6306,14 +6305,7 @@ fn eval_string_interpolation<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     if let Err(control) = build_string_parts::<W, S>(parts, &value, optional, &mut slots, &mut out)
     {
-        return match control {
-            Control::Error(e) if out.is_empty() => QueryResult::Error(e),
-            Control::Error(e) => QueryResult::Partial(out, Control::Error(e)),
-            Control::Break(label) if out.is_empty() => QueryResult::Break(label),
-            Control::Break(label) => QueryResult::Partial(out, Control::Break(label)),
-            Control::Halt(code) if out.is_empty() => QueryResult::Halt(code),
-            Control::Halt(code) => QueryResult::Partial(out, Control::Halt(code)),
-        };
+        return partial(out, control);
     }
 
     owned_vec_to_result(out)
@@ -21545,6 +21537,76 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Continue evaluating `rest` for each output of an already-computed
+/// intermediate `QueryResult`, treating each output as a *fresh root* with
+/// an empty path -- the counterpart to `continue_rest_with_context` for a
+/// construct that builds a brand new value disconnected from any enclosing
+/// container position (a `"\(...)"`, `[...]`, or `{...}` literal) rather
+/// than a mid-pipe computation that stays "at" its enclosing position.
+/// Mirrors the `Array` arm's own inline `&result, &result, file_origin,
+/// &[], optional` reset a few dozen lines up, generalized to a
+/// multi-valued `intermediate` the way `continue_rest_with_context`
+/// generalizes the non-resetting case -- needed once a `\(...)` slot can
+/// fan out (#1403 follow-up: the path-context `StringInterpolation` arm is
+/// the first path-context construct with genuine multi-valued output of
+/// its own to reach this).
+fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    intermediate: QueryResult<'a, W>,
+    rest: &[Expr],
+    file_origin: Option<&[usize]>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match intermediate {
+        QueryResult::Owned(v) if rest.is_empty() => QueryResult::Owned(v),
+        QueryResult::ManyOwned(vs) if rest.is_empty() => owned_vec_to_result(vs),
+        QueryResult::Owned(v) => {
+            eval_pipe_with_path_context_internal::<W, S>(rest, &v, &v, file_origin, &[], optional)
+        }
+        QueryResult::ManyOwned(vs) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    &v,
+                    file_origin,
+                    &[],
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            owned_vec_to_result(results)
+        }
+        QueryResult::None => QueryResult::None,
+        QueryResult::Error(e) => QueryResult::Error(e),
+        QueryResult::Break(label) => QueryResult::Break(label),
+        QueryResult::Halt(code) => QueryResult::Halt(code),
+        QueryResult::Partial(vs, outer_control) => {
+            let mut results = Vec::new();
+            for v in vs {
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    &v,
+                    file_origin,
+                    &[],
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            partial(results, outer_control)
+        }
+        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => unreachable!(
+            "eval_pipe_with_path_context_internal only ever produces \
+             Owned/ManyOwned/None/Error/Break/Partial"
+        ),
+    }
+}
+
 /// Path-context analog of `eval_binary_fanout` (#768/#822): evaluate `left op
 /// right` over every pairing jq's cartesian fanout produces (right operand
 /// outer / left operand inner), routed through
@@ -21584,6 +21646,107 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         optional,
         combine,
     )
+}
+
+/// Path-context analog of `string_part_outputs`: `eval_pipe_with_path_context_internal`
+/// never produces `One`/`OneCursor`/`Many` (every `unreachable!` in this file says so),
+/// so this matches that narrower shape directly instead of going through
+/// `object_outputs`/`collect_owned`, which exist to handle the fully generic evaluator's
+/// borrowed-cursor variants too.
+fn path_context_string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    result: QueryResult<'_, W>,
+) -> (Vec<String>, Option<Control>) {
+    match result {
+        QueryResult::Owned(v) => (alloc::vec![owned_to_string::<S>(&v)], None),
+        QueryResult::ManyOwned(vs) => (vs.iter().map(owned_to_string::<S>).collect(), None),
+        QueryResult::None => (Vec::new(), None),
+        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
+        QueryResult::Partial(vs, control) => {
+            (vs.iter().map(owned_to_string::<S>).collect(), Some(control))
+        }
+        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+            unreachable!(
+                "eval_pipe_with_path_context_internal only ever produces \
+                 Owned/ManyOwned/None/Error/Break/Partial"
+            )
+        }
+    }
+}
+
+/// Path-context analog of `build_string_parts` (#1403 follow-up): the plain evaluator's
+/// own fan-out fix for `\(...)` never reached this evaluator, since it's a wholly
+/// separate function that never calls `build_string_parts` -- this is the same
+/// recursive cartesian-product algorithm, but each slot is evaluated through
+/// `eval_pipe_with_path_context_internal` instead of `eval_single`, so `key`/`parent`/
+/// `file_index` nested in a slot still resolves against
+/// `root`/`current_path`/`file_origin`.
+///
+/// Each slot's own evaluation is forced to `optional=false`, mirroring the sibling
+/// `Array` arm's identical reasoning (a few dozen lines up in
+/// `eval_pipe_with_path_context_internal`): passing the ambient `optional` straight
+/// through would let a genuine error self-swallow at some leaf's own `if optional`
+/// check before ever reaching this function's own accounting, corrupting
+/// `"\(key, error("boom"))"?` into silently dropping the error's very existence instead
+/// of the caller matching it against `optional` itself.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors eval_pipe_with_path_context_internal's
+                                     // own root/file_origin/current_path threading.
+fn build_string_parts_with_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    parts: &[StringPart],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    slots: &mut [String],
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), Control> {
+    let Some((part, rest)) = parts.split_last() else {
+        out.push(OwnedValue::String(slots.concat()));
+        return Ok(());
+    };
+    let idx = rest.len();
+    match part {
+        StringPart::Literal(s) => {
+            slots[idx].clone_from(s);
+            build_string_parts_with_context::<W, S>(
+                rest,
+                value,
+                root,
+                file_origin,
+                current_path,
+                slots,
+                out,
+            )
+        }
+        StringPart::Expr(expr) => {
+            let slot_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                false,
+            );
+            let (outputs, trailing) = path_context_string_part_outputs::<W, S>(slot_result);
+            for s in outputs {
+                slots[idx] = s;
+                build_string_parts_with_context::<W, S>(
+                    rest,
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    slots,
+                    out,
+                )?;
+            }
+            if let Some(control) = trailing {
+                return Err(control);
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Internal helper that also tracks the root value for parent navigation,
@@ -22371,84 +22534,114 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // the string via the plain, context-less `eval_string_interpolation`
         // regardless) never gave it a chance to resolve.
         //
-        // Matches `eval_string_interpolation`'s own existing "embed just
-        // the first output" convention for a multi-valued slot exactly --
-        // real jq instead fans out a `\(...)` slot's generator into one
-        // string per value, a separate, pre-existing, unrelated gap (not
-        // this fix's to close, #1403).
-        //
-        // Each slot's inner evaluation is deliberately run with `optional`
-        // forced to `false`, not the ambient value (#1302's `?`-atomicity
-        // lesson, carried over from the start rather than rediscovered
-        // here): otherwise a genuine error inside a slot could
-        // self-swallow at its own leaf-level `if optional` check before
-        // ever reaching this arm's own construction, corrupting
-        // `"a\(key, error("x"))"?` into a partial string instead of the
-        // whole interpolation being caught atomically. Forcing `false`
-        // lets a genuine error surface as a real `Error`/`Partial(_,
-        // Error)`, caught below using *this* arm's own `optional` -- the
-        // same evaluate-then-catch shape as the `Array` arm above.
+        // jq mode fans out a multi-valued slot into one string per
+        // combination via `build_string_parts_with_context`, the same
+        // cartesian-product algorithm `build_string_parts` gave the plain
+        // evaluator for #1403 -- that fix never reached here, since this is
+        // a wholly separate function with its own inlined (and, until now,
+        // still pre-#1403) string-building loop (found in review of #1403
+        // itself). yq mode keeps the pre-#1403 "embed just the first
+        // output" behavior verbatim, matching `eval_string_interpolation`'s
+        // own yq carve-out -- confirmed live that `key`/`parent`/
+        // `file_index` are reachable in yq mode too (`succinctly yq`'s own
+        // `--eval-all`), so this arm needs the identical mode gate its
+        // plain-evaluator counterpart already has.
         Expr::StringInterpolation(parts) if string_interpolation_needs_path_context(parts) => {
-            let mut rendered = String::new();
-            for part in parts {
-                let inner = match part {
-                    StringPart::Literal(s) => {
-                        rendered.push_str(s);
-                        continue;
-                    }
-                    StringPart::Expr(inner) => inner,
+            if S::TAG == EvalTag::Yq {
+                let mut rendered = String::new();
+                for part in parts {
+                    let inner = match part {
+                        StringPart::Literal(s) => {
+                            rendered.push_str(s);
+                            continue;
+                        }
+                        StringPart::Expr(inner) => inner,
+                    };
+                    let slot = eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(inner),
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        false,
+                    );
+                    let s = match slot {
+                        QueryResult::Owned(v) => owned_to_string::<S>(&v),
+                        QueryResult::ManyOwned(vs) => {
+                            vs.first().map(owned_to_string::<S>).unwrap_or_default()
+                        }
+                        QueryResult::None => String::new(),
+                        QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
+                            if optional =>
+                        {
+                            return QueryResult::None;
+                        }
+                        QueryResult::Error(e) => return QueryResult::Error(e),
+                        QueryResult::Break(label) => return QueryResult::Break(label),
+                        QueryResult::Halt(code) => return QueryResult::Halt(code),
+                        QueryResult::Partial(_, Control::Error(e)) => {
+                            return QueryResult::Error(e);
+                        }
+                        QueryResult::Partial(_, Control::Break(label)) => {
+                            return QueryResult::Break(label);
+                        }
+                        QueryResult::Partial(_, Control::Halt(code)) => {
+                            return QueryResult::Halt(code);
+                        }
+                        QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                            unreachable!(
+                                "eval_pipe_with_path_context_internal only ever produces \
+                                 Owned/ManyOwned/None/Error/Break/Partial"
+                            )
+                        }
+                    };
+                    rendered.push_str(&s);
+                }
+                let result = OwnedValue::String(rendered);
+                return if rest.is_empty() {
+                    QueryResult::Owned(result)
+                } else {
+                    eval_pipe_with_path_context_internal::<W, S>(
+                        rest,
+                        &result,
+                        &result,
+                        file_origin,
+                        &[],
+                        optional,
+                    )
                 };
-                let slot = eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(inner),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    false,
-                );
-                let s = match slot {
-                    QueryResult::Owned(v) => owned_to_string::<S>(&v),
-                    QueryResult::ManyOwned(vs) => {
-                        vs.first().map(owned_to_string::<S>).unwrap_or_default()
-                    }
-                    QueryResult::None => String::new(),
-                    QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
-                        if optional =>
-                    {
-                        return QueryResult::None;
-                    }
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-                    QueryResult::Partial(_, Control::Break(label)) => {
-                        return QueryResult::Break(label);
-                    }
-                    QueryResult::Partial(_, Control::Halt(code)) => {
-                        return QueryResult::Halt(code);
-                    }
-                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                        unreachable!(
-                            "eval_pipe_with_path_context_internal only ever produces \
-                             Owned/ManyOwned/None/Error/Break/Partial"
-                        )
-                    }
-                };
-                rendered.push_str(&s);
             }
-            let result = OwnedValue::String(rendered);
-            if rest.is_empty() {
-                QueryResult::Owned(result)
-            } else {
-                eval_pipe_with_path_context_internal::<W, S>(
-                    rest,
-                    &result,
-                    &result,
-                    file_origin,
-                    &[],
-                    optional,
-                )
-            }
+
+            let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
+            let mut out = Vec::new();
+            let intermediate = match build_string_parts_with_context::<W, S>(
+                parts,
+                value,
+                root,
+                file_origin,
+                current_path,
+                &mut slots,
+                &mut out,
+            ) {
+                Ok(()) => owned_vec_to_result(out),
+                // `?` swallows only a genuine error, and -- unlike the
+                // `Array` arm's atomic catch above -- string
+                // interpolation's own already-produced output survives the
+                // swallow: live-verified `"\(1,error("x"))"?` => `"1"`
+                // against jq 1.7.1, matching `{a:(1,error("x"))}?` =>
+                // `{"a":1}`, not `[1,error("x")]?`'s empty result.
+                // `Break`/`Halt` are never caught by `?`, matching every
+                // other `?` site in this file.
+                Err(Control::Error(_)) if optional => owned_vec_to_result(out),
+                Err(control) => partial(out, control),
+            };
+            // Each fanned-out string is a fresh root with no path, same as
+            // the single-valued `Array` arm above -- `rest`'s own
+            // `key`/`parent` must resolve against the *string just built*,
+            // not the array/object this interpolation was evaluated inside
+            // of (verified live: `.a | "\(key)" | key` is `null`, not `"a"`
+            // again).
+            continue_rest_with_fresh_root::<W, S>(intermediate, rest, file_origin, optional)
         }
         // `def name(params): body; then` (#1306): the plain evaluator's own
         // `eval_func_def` expands every call to `name` within `then` into

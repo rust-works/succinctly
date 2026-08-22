@@ -5319,30 +5319,29 @@ fn test_string_interpolation_path_context_builtins_1334() -> Result<()> {
     Ok(())
 }
 
-/// Exercises the non-`Owned` arms of the new `StringInterpolation` slot
-/// match -- mirrors #1302's identical `Array`-arm coverage
-/// (`test_array_wrapped_path_context_builtin_control_flow_1302`), one slot
-/// at a time. A slot construction is atomic *per slot*, not across the
-/// whole string: unlike `Array`'s single collection point, each `\(...)`
-/// slot embeds independently, so `break`/`halt`/an uncaught error from any
-/// one slot still aborts the entire surrounding string (nothing partial is
-/// ever embedded), matching `eval_string_interpolation`'s own existing
-/// early-return-on-control-signal behavior for the plain (non-path-context)
-/// case.
+/// Exercises the non-`Owned` arms of the `StringInterpolation` slot match,
+/// mirroring #1302's identical `Array`-arm coverage
+/// (`test_array_wrapped_path_context_builtin_control_flow_1302`). Originally
+/// written against the pre-fix, single-value-collapsing version of this arm
+/// (before #1403's fan-out fix reached it); every case below was
+/// re-verified against jq 1.7.1 using a plain literal in place of `key`
+/// (e.g. `"[\(1,1)]"`, `"\(1,break $out)"`) to confirm the *fanned-out*
+/// expectations here, not just re-derived from #1403's own model.
 #[test]
 fn test_string_interpolation_path_context_builtin_control_flow_1334() -> Result<()> {
     // A multi-valued slot (`key, key`, a `Comma` of two path-context
-    // builtins) -- embeds just the *first* output, matching
-    // `eval_string_interpolation`'s own existing convention (the
-    // `QueryResult::ManyOwned` arm).
+    // builtins) fans out into one embedding per value, same as any other
+    // jq-mode `\(...)` slot since #1403 -- confirmed live that
+    // `null | "[\(1,1)]"` likewise yields `"[1]"` twice, not deduplicated.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | \"[\\(key, key)]\""], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#""[a]""#);
+    assert_eq!(stdout, "\"[a]\"\n\"[a]\"\n");
 
     // A bare `break` out of a slot (no prior output within that slot)
     // aborts the whole string construction and unwinds past it to the
     // enclosing label -- the comma's second branch ("reached") must never
-    // run.
+    // run. Unaffected by the fan-out fix: there is nothing produced yet to
+    // preserve.
     let (stdout, _, code) = run_jq_full(
         &[
             "-c",
@@ -5361,8 +5360,12 @@ fn test_string_interpolation_path_context_builtin_control_flow_1334() -> Result<
 
     // Same, but with real output already produced within that one slot's
     // own generator first (`key` succeeds with "a" before `break` fires) --
-    // exercises the `Partial(_, Control::Break(_))` arm rather than the
-    // bare one above.
+    // exercises the `Partial(_, Control::Break(_))` arm. Confirmed live
+    // that jq streams the already-produced output before a mid-generator
+    // `break` (`label $out | (("\(1, break $out)"), "reached")` => `"1"`),
+    // matching object construction's identical #354 precedent -- the
+    // pre-#1403 code here discarded it instead; #1403's own fix never
+    // reached this arm.
     let (stdout, _, code) = run_jq_full(
         &[
             "-c",
@@ -5371,11 +5374,11 @@ fn test_string_interpolation_path_context_builtin_control_flow_1334() -> Result<
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "\"a\"\n");
 
     // `halt_error(n)` from a slot, as that slot's very first output (no
     // successful output preceding it within the slot), propagates its own
-    // exit code as a bare halt.
+    // exit code as a bare halt with nothing on stdout.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | \"\\(key | halt_error(9))\""],
         Some(r#"{"a":1}"#),
@@ -5384,38 +5387,55 @@ fn test_string_interpolation_path_context_builtin_control_flow_1334() -> Result<
     assert_eq!(stdout, "");
 
     // Same, but with real output already produced within that slot first --
-    // exercises the `Partial(_, Control::Halt(_))` arm rather than the bare
-    // one above.
+    // exercises the `Partial(_, Control::Halt(_))` arm. Confirmed live
+    // (`null | "\(1, halt_error(9))"` prints `"1"` then halts) that the
+    // already-produced output survives the halt, matching
+    // `test_jq_string_interpolation_partial_output_before_slot_error_1403`'s
+    // non-path-context counterpart.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | \"\\(key, halt_error(9))\""],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 9);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "\"a\"\n");
 
     // A comma-grouped slot where real output is produced before an
     // uncaught error -- exercises the `Partial(_, Control::Error(_))` arm
     // (the un-guarded one, `optional == false`) rather than the bare
-    // `Error` arm the atomicity test below already covers.
-    let (_stdout, stderr, code) = run_jq_full(
+    // `Error` arm the atomicity test below already covers. Now also checks
+    // stdout, not just the error: the successfully-produced "a" must
+    // stream before the error, mirroring the plain evaluator's own
+    // #1403 fix.
+    let (stdout, stderr, code) = run_jq_full(
         &["-c", ".a | \"\\(key, error(\"boom\"))\""],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5);
+    assert_eq!(stdout, "\"a\"\n");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     Ok(())
 }
 
-/// `?`-atomicity for the new `StringInterpolation` arm, built in from the
-/// start per #1302's own review lesson (its first cut needed a follow-up,
-/// #1333, to force the inner slot's `optional` to `false` so a genuine
-/// error surfaces for this arm's own catch instead of self-swallowing at
-/// the leaf) rather than left to be independently rediscovered here.
+/// `?`-atomicity for the `StringInterpolation` arm. The first two cases
+/// still look fully atomic post-#1403, but not because string
+/// interpolation is atomic in general (it isn't -- see the fan-out cases in
+/// `test_string_interpolation_path_context_builtin_control_flow_1334`
+/// above): the *error slot* here has no output of its own to contribute, so
+/// its own generator short-circuits every slot to its right before this
+/// arm's fan-out ever runs, the same "an entry with zero outputs
+/// short-circuits every entry to its right" rule `build_object_entries`'s
+/// own doc comment describes for `{a: empty, b: error("boom")}` -- verified
+/// live that a plain (non-path-context) `"k=\(1)-\(error("boom"))"` is
+/// identically empty on `?`, both against jq 1.7.1 and this crate's own
+/// already-fixed plain evaluator.
 #[test]
 fn test_string_interpolation_path_context_builtin_optional_is_atomic_1334() -> Result<()> {
-    // A slot that succeeds (`key`) before a later slot errors: `?` must
-    // discard the whole string, not embed a partial one.
+    // A slot that succeeds (`key`) before a later slot errors, with no
+    // output of its own: the error slot's own zero outputs short-circuit
+    // the whole interpolation before `key`'s successful value is ever
+    // combined in, so `?` (or the bare uncaught error below) has nothing to
+    // preserve.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | \"k=\\(key)-\\(error(\"boom\"))\"?"],
         Some(r#"{"a":1}"#),
@@ -5423,22 +5443,31 @@ fn test_string_interpolation_path_context_builtin_optional_is_atomic_1334() -> R
     assert_eq!(code, 0);
     assert_eq!(stdout, "");
 
-    // Without `?`, the same query still hard-errors.
-    let (_stdout, stderr, code) = run_jq_full(
+    // Without `?`, the same query still hard-errors, with nothing on stdout
+    // (confirmed live against jq 1.7.1: `"k=\(1)-\(error("boom"))"` prints
+    // nothing before erroring, unlike a same-slot `"\(1,error("boom"))"`,
+    // which does).
+    let (stdout, stderr, code) = run_jq_full(
         &["-c", ".a | \"k=\\(key)-\\(error(\"boom\"))\""],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5);
+    assert_eq!(stdout, "");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    // A genuinely nested `?` *inside* a slot must still work on its own
-    // terms, independent of the interpolation's own (here absent) `?`.
+    // A genuinely nested `?` *inside* a slot swallows its own error into
+    // zero outputs for that slot (`(error("boom"))?` alone is `empty`, not
+    // `""`) -- which, same as the two cases above, short-circuits the
+    // *whole* interpolation to zero outputs rather than substituting an
+    // empty string, confirmed live against jq 1.7.1
+    // (`"k=\(1)-\((error("boom"))?)"` is empty, not `"k=1-"`) and against
+    // this crate's own already-fixed plain evaluator.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | \"k=\\(key)-\\((error(\"boom\"))?)\""],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#""k=a-""#);
+    assert_eq!(stdout, "");
 
     Ok(())
 }
