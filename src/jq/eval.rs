@@ -740,7 +740,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Many(results)
             }
             _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+            _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
         },
 
         // `.[EXPR]?`/`.[S:E]?`: jq's `?` here guards only the *final*
@@ -3495,7 +3495,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if optional {
         QueryResult::None
     } else {
-        QueryResult::Error(EvalError::from_value(payload))
+        QueryResult::Error(EvalError::from_value_in(S::TAG, payload))
     }
 }
 
@@ -4424,7 +4424,7 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             map_over::<W, S>(f, fields.map(|fld| fld.value()), optional)
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -4528,7 +4528,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // so a non-object/array input fails the same way any other bare
         // `.[]` does. Confirmed live: `5 | map_values(.)` raises "Cannot
         // iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -4543,7 +4543,7 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     };
     if items.is_empty() {
         return QueryResult::Owned(OwnedValue::Null);
@@ -4662,7 +4662,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     };
     for elem in &elements {
         match any_all_probe_element::<S>(cond, elem, target_truthy) {
@@ -4947,7 +4947,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `.[]`/`length` on a non-array/non-object gets, not a bespoke
         // "expected array" wording. Confirmed live: `5 | min_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -4998,7 +4998,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #929: same wording as min_by's own scalar arm above -- confirmed
         // live: `5 | max_by(.)` raises "Cannot iterate over number (5)" in
         // jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -5494,7 +5494,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(mut fields) => fields.try_fold(None, |acc, f| {
             join_step::<S>(acc, to_owned(&f.value()), &sep)
         }),
-        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     };
 
     match result {
@@ -5857,7 +5857,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #995: same "Cannot iterate over" wording min_by/max_by/unique_by's
         // own scalar arm uses -- confirmed live: `5 | group_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -5894,7 +5894,7 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             EvalError::pair_cannot_be_sorted,
         ),
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -5949,7 +5949,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #929: same "Cannot iterate over" wording min_by/max_by's own
         // scalar arm uses -- confirmed live: `5 | unique_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -6016,7 +6016,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #995: same "Cannot iterate over" wording min_by/max_by/unique_by/
         // group_by's own scalar arm uses -- confirmed live: `5 | sort_by(.)`
         // raises "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -14040,7 +14040,7 @@ fn update_path<S: EvalSemantics>(
                     Ok(())
                 }
                 _ if optional || noop_scalar => Ok(()),
-                _ => Err(EvalError::cannot_iterate(root).into()),
+                _ => Err(EvalError::cannot_iterate_in(S::TAG, root).into()),
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
@@ -14111,7 +14111,7 @@ fn update_path<S: EvalSemantics>(
                             Ok(())
                         }
                         _ if here || noop_scalar => Ok(()),
-                        _ => Err(EvalError::cannot_iterate(root).into()),
+                        _ => Err(EvalError::cannot_iterate_in(S::TAG, root).into()),
                     },
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
                     // when a branch resolved to more than one component, so
@@ -15083,7 +15083,10 @@ fn resolve_node<'a, S: EvalSemantics>(
                         PathBranch::new(vec![Expr::Field(k.clone())], Cow::Borrowed(v), true)
                     })
                     .collect()),
-                other => Err((Vec::new(), EvalError::cannot_iterate(other).into())),
+                other => Err((
+                    Vec::new(),
+                    EvalError::cannot_iterate_in(S::TAG, other).into(),
+                )),
             }
         }
 
@@ -22305,7 +22308,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     }
                 }
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
+                _ => return QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, value)),
             }
             owned_vec_to_result(results)
         }
@@ -22635,7 +22638,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     .map(|(k, v)| (OwnedValue::String(k.clone()), v.clone()))
                     .collect(),
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_iterate(value)),
+                _ => return QueryResult::Error(EvalError::cannot_iterate_in(S::TAG, value)),
             };
             let mut results = Vec::new();
             let mut stopped = None;

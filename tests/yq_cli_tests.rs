@@ -20398,3 +20398,76 @@ fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result
     assert!(n_form.contains(r#""a": 1"#), "output: {n_form:?}");
     Ok(())
 }
+
+// =============================================================================
+// #1055: a `NumberLiteral`'s spelling inside a yq-mode error-message preview
+// (`error(v)`/`EvalError::from_value`, and constructors that embed a preview
+// via `describe`/`dump_truncated`, e.g. `cannot_iterate`) must match the
+// spelling `tostring` produces for the same value -- not jq's reformatting
+// rules. Real yq's own oracle is largely inconclusive for these error paths
+// (per the issue's own verification caveat), so the acceptance criterion is
+// this internal consistency, not external parity: each case below is
+// checked against `tostring`'s own output for the identical input, not a
+// hard-coded expected string.
+
+/// The issue's own repro, via `error(v)` (`EvalError::from_value_in`).
+/// Compares each error preview against `tostring`'s own output for the
+/// identical input, not a hard-coded literal string, per the plan's own
+/// recommendation -- a plain string-match against the source text would
+/// give a false failure for a case like `-0`, where `tostring` itself
+/// normalizes the spelling away from the literal (both the preview and
+/// `tostring` agree with *each other*, just not with the source text).
+#[test]
+fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
+    let cases: &[&str] = &["1e2", "1E5", "1.5e-10", "100", "1e400", "-0"];
+    for literal in cases {
+        let input = format!("a: {literal}\n");
+        let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
+        assert_eq!(code, 0, "literal={literal} tostring out: {tostring_out:?}");
+        let expected = tostring_out.trim();
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a | error", &input, &[])?;
+        assert_ne!(code, 0, "literal={literal} unexpectedly succeeded");
+        assert!(
+            stderr.contains(expected),
+            "literal={literal} tostring={tostring_out:?} error preview stderr={stderr:?} \
+             expected to contain tostring's own spelling {expected:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Same internal-consistency check via a `describe`/`dump_truncated`-backed
+/// constructor (`cannot_iterate`, triggered by iterating a scalar) rather
+/// than `error(v)` directly -- a different call path through the same
+/// `EvalTag`-dispatched core.
+#[test]
+fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
+    let cases: &[&str] = &["1e2", "1E5", "1.5e-10", "1e400"];
+    for literal in cases {
+        let input = format!("a: {literal}\n");
+        let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
+        assert_eq!(code, 0, "literal={literal} tostring out: {tostring_out:?}");
+        let expected = tostring_out.trim();
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a[]", &input, &[])?;
+        assert_ne!(code, 0, "literal={literal} unexpectedly iterated a scalar");
+        assert!(
+            stderr.contains(expected),
+            "literal={literal} tostring={tostring_out:?} \
+             cannot_iterate stderr={stderr:?} expected to contain tostring's own spelling"
+        );
+    }
+    Ok(())
+}
+
+/// Regression guard: jq mode's error-preview wording is byte-for-byte
+/// unaffected by #1055 -- it still reformats via jq's own rules, unlike yq.
+#[test]
+fn test_jq_error_value_preview_still_reformats_number_literal_1055() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_with_stderr(".a | error", r#"{"a":[1e2,"x"]}"#, &[])?;
+    assert_ne!(code, 0, "unexpectedly succeeded");
+    assert!(
+        stderr.contains("1E+2") && !stderr.contains("1e2,"),
+        "jq mode should still reformat, not echo verbatim: stderr={stderr:?}"
+    );
+    Ok(())
+}
