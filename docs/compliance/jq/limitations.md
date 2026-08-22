@@ -419,6 +419,30 @@ Unlike the positive case above, `?` does not suppress this one —
 [#498](https://github.com/rust-works/succinctly/issues/498) — because it is a write-time
 bounds check, not a failure to collect the path.
 
+A variable bound outside `reduce`/`foreach` and referenced from inside `UPDATE` is a third,
+narrower gap, found reviewing [#844](https://github.com/rust-works/succinctly/issues/844):
+
+| Filter                                         | Input     | jq   | succinctly                                    |
+|------------------------------------------------|-----------|------|-----------------------------------------------|
+| `path(. as $x \| reduce (1,2) as $i (0; $x))`  | `{"a":1}` | `[]` | `Invalid path expression with result {"a":1}` |
+| `path(. as $x \| foreach (1,2) as $i (0; $x))` | `{"a":1}` | `[]` | `Invalid path expression with result {"a":1}` |
+
+#844 taught `resolve_node` to recognize `Expr::TrackedVar` (a variable frozen from a
+statically-verified passthrough of `.`, per that issue's own `is_identity_passthrough`) so
+that referencing such a variable inside `path(...)` stays trackable. `resolve_node` has no
+`Expr::Reduce`/`Expr::Foreach` arm of its own, though, so either one reaching `path(...)`'s
+resolver falls to `resolve_leaf`'s catch-all regardless of what its `UPDATE` expression
+does internally — a bare `$x` reference inside `UPDATE`, even a `TrackedVar` one, never gets
+the chance to reach the new arm, because `resolve_node` never descends into `Reduce`/
+`Foreach` at all. Real jq has no such gap because `reduce`/`foreach` are sugar over the same
+primitive `as`-binding/iteration machinery every other construct uses, so their own
+trackability was never a separate case to begin with. This is a read-only, safe divergence
+(succinctly never emits a *wrong* path here, only refuses a filter jq accepts) — not fixed
+here; a proper fix needs `resolve_node` to interleave path resolution with `reduce`/
+`foreach`'s own fold loop (evaluating `UPDATE` against each intermediate accumulator through
+`resolve_node` rather than the ordinary value evaluator), which is new machinery beyond a
+single arm.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
