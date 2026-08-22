@@ -7032,7 +7032,7 @@ fn format_base64<S: EvalSemantics>(
 /// rather than needing its own early return. jq mode is unaffected: it
 /// keeps erroring on every non-string type, unchanged from before.
 ///
-/// The decode algorithm matches real jq's exactly (see the
+/// jq mode's decode algorithm matches real jq's exactly (see the
 /// truncate-at-first-`=` comment inside), and validates every character of
 /// every trailing group (2, 3, or 4 bytes long) the same way, so embedded
 /// whitespace anywhere before the first `=` is caught regardless of
@@ -7040,8 +7040,9 @@ fn format_base64<S: EvalSemantics>(
 /// checked" gap an earlier version of this fix had, now that #1120's
 /// truncate-then-decode-every-length rewrite validates the whole prefix
 /// uniformly). Real yq is *stricter* than real jq for malformed/excess
-/// padding (e.g. `"===="` errors in yq, decodes to `""` in jq) — a
-/// separate, narrower divergence not addressed here, filed as #1135.
+/// padding (e.g. `"===="` errors in yq, decodes to `""` in jq) — yq mode
+/// takes an entirely separate, dedicated decode path below for exactly
+/// this (#1135), rather than sharing jq's truncate-at-first-`=` loop.
 fn format_base64d<S: EvalSemantics>(
     value: &OwnedValue,
     optional: bool,
@@ -7114,80 +7115,108 @@ fn format_base64d<S: EvalSemantics>(
     }
 
     // yq mode (#1135): validate padding placement in place instead of jq's
-    // truncate-at-first-`=` model below. Confirmed live against yq v4.53.3:
-    // real yq processes the input (already whitespace-trimmed above) in
-    // strict 4-character quanta over the base64 alphabet, where `=` is
-    // legal only within the *final* quantum -- as its 3rd character (with
-    // the 4th then required to be `=` or simply the end of input) or its
-    // 4th character -- and any other placement (a leading `=`, `=` in a
-    // non-final quantum, or real content after a complete padded quantum)
-    // is rejected outright, unlike jq's lenient truncate-and-ignore-the-rest
-    // model. This issue originally described a "CR/LF skipped anywhere"
-    // rule too, but that turned out (on closer live verification) to be
-    // nothing more than this function's own yq-mode `.trim()` step above
-    // already stripping a *leading or trailing* run of whitespace before
-    // this code ever runs -- a `\n` genuinely embedded between real
-    // characters is rejected here like any other invalid byte, matching
-    // the oracle (`"Q\nQ==" | @base64d` errors in real yq even though the
-    // same characters minus the `\n` decode cleanly). Exact byte offsets in
-    // the emitted error deliberately don't chase Go's own streaming-decoder
-    // accounting (per this issue's own recommendation) -- only the
-    // accept/reject verdict and any decoded bytes need to match.
+    // truncate-at-first-`=` model below. Confirmed live against yq v4.53.3
+    // (including a 1468-case differential fuzz against the oracle during
+    // code review, which caught a first version of this fix reasoning
+    // about `=` position *within a fixed 4-byte input window* -- real yq's
+    // actual model has no such window: it's a genuine single left-to-right
+    // pass that only cares how many *real* characters have accumulated
+    // since the last quantum closed, not where a byte falls modulo 4 in
+    // the original string) --
+    //
+    // - A real alphabet character always just accumulates into the current
+    //   quantum; a full 4 flushes it and starts a fresh one (more quanta
+    //   may follow -- a 4-character group never itself ends the stream).
+    // - A `=` with fewer than 2 real characters accumulated is a leading
+    //   padding error, reported at the `=` itself (`"A==="` -> byte 1,
+    //   `"=QQ="`/`"===="` -> byte 0).
+    // - A `=` with exactly 2 real characters accumulated is a *tentative*
+    //   close: if the input ends right there, or the very next byte is
+    //   also `=` (consumed too), the quantum closes with 2 real characters
+    //   (1 decoded byte) and the stream is marked finished; otherwise
+    //   (some other byte follows) it's an error reported at *this* `=`'s
+    //   own position, not the byte after it (`"ab=!"` -> byte 2, not 3).
+    // - A `=` with exactly 3 real characters accumulated always closes the
+    //   quantum (3 real characters, 2 decoded bytes) and finishes the
+    //   stream (`"YWI=Q"`'s `=` closes `YWI` at byte 3; the `Q` after it
+    //   then hits the "finished" check below).
+    // - Once finished (a padded quantum has closed), any further byte at
+    //   all is an error reported at *its own* position, not the padding's
+    //   (`"ab==cd"` -> byte 4, `"AA==BBBB"` -> byte 4, `"AAA=BBBB"` -> byte
+    //   4, `"QQ==AAAA"` -> byte 4 -- all confirmed live; a naive "reject
+    //   at the `=`'s own position" reading of this rule, which an earlier
+    //   version of this fix used, gives byte 2/2/3/2 instead, which is
+    //   wrong even though it agrees on the reject verdict).
+    // - End of input with 2 or 3 real characters pending and no padding at
+    //   all closes the same way a padded close would (`"QQ"`/`"YWJ"`).
+    // - End of input with exactly 1 real character pending is an error,
+    //   reported one *past* it if that character is itself valid
+    //   (`"a"`/`"Y"` -> byte 1, `"false"` -> byte 5), or *at* it if it
+    //   isn't (`"abcd!"` -> byte 4, not 5 -- this arises naturally here
+    //   from the character-validity check happening before it can ever
+    //   accumulate as "1 pending", not as a separate case).
+    //
+    // This issue originally described a "CR/LF skipped anywhere" rule too,
+    // but that turned out (on closer live verification) to be nothing more
+    // than this function's own yq-mode `.trim()` step above already
+    // stripping a *leading or trailing* run of whitespace before this code
+    // ever runs -- a `\n` genuinely embedded between real characters is
+    // rejected here like any other invalid byte, matching the oracle
+    // (`"Q\nQ==" | @base64d` errors in real yq even though the same
+    // characters minus the `\n` decode cleanly). Exact byte offsets are
+    // matched wherever the rules above pin them down; Go's own internal
+    // streaming-decoder accounting isn't chased past that (per this
+    // issue's own recommendation) -- only the accept/reject verdict and
+    // any decoded bytes need to match beyond what's stated above.
     if S::TAG == EvalTag::Yq {
         let bytes = trimmed.as_bytes();
-        let chunks: Vec<&[u8]> = bytes.chunks(4).collect();
-        let last_chunk_index = chunks.len().checked_sub(1);
         let mut result = Vec::new();
+        let mut quantum: Vec<u8> = Vec::with_capacity(4);
+        let mut finished = false;
+        let mut i = 0;
 
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-            let chunk_start = chunk_index * 4;
-            let is_last = Some(chunk_index) == last_chunk_index;
-            let eq_pos = chunk.iter().position(|&b| b == b'=');
-
-            let real_len = match eq_pos {
-                None => chunk.len(),
-                Some(pos) => {
-                    if !is_last {
-                        return Err(EvalError::base64_illegal_data(chunk_start + pos));
+        while i < bytes.len() {
+            if finished {
+                return Err(EvalError::base64_illegal_data(i));
+            }
+            let b = bytes[i];
+            if b == b'=' {
+                match quantum.len() {
+                    0 | 1 => return Err(EvalError::base64_illegal_data(i)),
+                    2 => {
+                        if i + 1 < bytes.len() && bytes[i + 1] != b'=' {
+                            return Err(EvalError::base64_illegal_data(i));
+                        }
+                        push_decoded_group(&mut result, &quantum);
+                        quantum.clear();
+                        finished = true;
+                        i += if i + 1 < bytes.len() { 2 } else { 1 };
+                        continue;
                     }
-                    if pos < 2 {
-                        // A leading `=` (1st or 2nd position) has too few
-                        // real characters before it to pair with.
-                        return Err(EvalError::base64_illegal_data(chunk_start + pos));
+                    3 => {
+                        push_decoded_group(&mut result, &quantum);
+                        quantum.clear();
+                        finished = true;
+                        i += 1;
+                        continue;
                     }
-                    if pos == 2 && chunk.len() == 4 && chunk[3] != b'=' {
-                        // 3rd-position `=` requires the 4th to also be `=`
-                        // (or simply be absent -- the string ends at 3
-                        // characters).
-                        return Err(EvalError::base64_illegal_data(chunk_start + 3));
-                    }
-                    pos
+                    _ => unreachable!("a full quantum always flushes before a 5th byte arrives"),
                 }
-            };
-
-            if real_len == 1 {
-                // A lone trailing character is either genuinely too short
-                // (a valid base64 character with nothing left to pair it
-                // with -- position one past it, confirmed live: `"a"` ->
-                // byte 1, `"false"` -> byte 5) or itself an invalid
-                // character (position at it, not past it: `"abcd!"` ->
-                // byte 4, not 5) -- the same distinction jq mode's own
-                // trailing-remainder arm below already makes (#1146).
-                return Err(if decode_char(chunk[0]).is_some() {
-                    EvalError::base64_illegal_data(chunk_start + real_len)
-                } else {
-                    EvalError::base64_illegal_data(chunk_start)
-                });
             }
-
-            let mut vals: Vec<u8> = Vec::with_capacity(real_len);
-            for (i, &b) in chunk[..real_len].iter().enumerate() {
-                vals.push(
-                    decode_char(b)
-                        .ok_or_else(|| EvalError::base64_illegal_data(chunk_start + i))?,
-                );
+            let val = decode_char(b).ok_or_else(|| EvalError::base64_illegal_data(i))?;
+            quantum.push(val);
+            i += 1;
+            if quantum.len() == 4 {
+                push_decoded_group(&mut result, &quantum);
+                quantum.clear();
             }
-            push_decoded_group(&mut result, &vals);
+        }
+
+        match quantum.len() {
+            0 => {}
+            2 | 3 => push_decoded_group(&mut result, &quantum),
+            1 => return Err(EvalError::base64_illegal_data(i)),
+            _ => unreachable!("a full quantum always flushes before the loop can exit here"),
         }
 
         return Ok(owned_string_from_decoded_bytes(result));

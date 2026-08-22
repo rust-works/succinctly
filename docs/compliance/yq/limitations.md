@@ -472,6 +472,7 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 |---|---|---|
 | Bare 2-arg `sub(re; s)` | first match only (`"aaa"` → `"Xaa"`) | **every** match (`"aaa"` → `"XXX"`) |
 | `@uri`/`@base64`/`@html` on a container | JSON-encodes first (`[1,2]` → `"%5B1%2C2%5D"`) | errors, as real yq does |
+| `@base64d` on malformed/misplaced padding | truncates at the first `=`, decodes the rest (`"===="` → `""`) | validates padding placement in place, rejects anything else (`"===="` → error) |
 | `keys` | sorted | document order (yq's `keys` *is* `keys_unsorted`) |
 | Integer overflow | converts to float | wraps |
 | Division by zero | errors | infinity |
@@ -486,12 +487,12 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 
 Ten of these rows are `EvalSemantics` constants, each carrying its live-verification note in
 the trait's doc comments — `7 + null` / `null - 7` is one row over two constants,
-`ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE` and `SUB_LEFT_NULL_IS_IDENTITY`. **Three are not.**
-Bare `sub` and container `@uri`/`@base64` are `S::TAG == EvalTag::Yq` tests at their call
-sites in [src/jq/eval.rs](../../../src/jq/eval.rs), and `keys` is rewritten to
-`KeysUnsorted` at parse time under `ParserMode::Yq`
-([src/jq/parser.rs](../../../src/jq/parser.rs)). More than forty `S::TAG` sites exist in
-`src/` in total.
+`ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE` and `SUB_LEFT_NULL_IS_IDENTITY`. **Four are not.**
+Bare `sub`, container `@uri`/`@base64`, and `@base64d`'s malformed-padding strictness are all
+`S::TAG == EvalTag::Yq` tests at their call sites in
+[src/jq/eval.rs](../../../src/jq/eval.rs), and `keys` is rewritten to `KeysUnsorted` at parse
+time under `ParserMode::Yq` ([src/jq/parser.rs](../../../src/jq/parser.rs)). More than forty
+`S::TAG` sites exist in `src/` in total.
 
 That split is the debt ADR-0018 rule 2 is aimed at, not a counterexample to it: a constant is
 discoverable from the trait definition, whereas a call-site test is discoverable only by
