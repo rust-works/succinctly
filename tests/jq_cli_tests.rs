@@ -13199,7 +13199,7 @@ fn test_chained_self_recursive_defs_bounded_by_weighted_cost_1381() -> Result<()
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of 50"),
+        stderr.contains("substitution cost exceeds limit of 250000"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -13209,8 +13209,8 @@ fn test_chained_self_recursive_defs_bounded_by_weighted_cost_1381() -> Result<()
 /// *ordinary, non-chained* recursive `def` reaches its own
 /// `MAX_FUNC_EXPANSION_DEPTH` budget -- `deep(49)` (a thin single-argument
 /// body, ~300 chars `Debug`-formatted, well under the guard's calibrated
-/// 30_000 threshold at 49 hits) must still succeed exactly as it did before
-/// this fix, matching `test_self_recursive_def_boundary_is_exactly_49_1016`
+/// 250_000 threshold at 49 hits) must still succeed exactly as it did
+/// before this fix, matching `test_self_recursive_def_boundary_is_exactly_49_1016`
 /// above but specifically pinning that #1381's new check doesn't change
 /// this boundary.
 #[test]
@@ -13227,6 +13227,31 @@ fn test_weighted_cost_guard_does_not_regress_ordinary_recursion_1381() -> Result
         stdout.trim_end(),
         format!("{}null{}", "[".repeat(49), "]".repeat(49))
     );
+    Ok(())
+}
+
+/// #1381 regression guard (code review, first calibration pass): a
+/// moderately-complex-but-entirely-ordinary recursive `def` body (an
+/// `if`/`else` building a small object literal with several fields, one
+/// nested array, one string literal -- ~1400-1600 chars `Debug`-formatted)
+/// must still succeed through its own natural depth. The *first*
+/// calibration of `MAX_FUNC_EXPANSION_WEIGHTED_COST` (`50 * 600 = 30_000`,
+/// based on only two thin example bodies) regressed this exact shape --
+/// code review measured live that `deep(20)` failed where pre-#1381 `main`
+/// succeeded through `deep(45)`+. Recalibrating to `50 * 5_000 = 250_000`
+/// fixed it; this pins the fix so a future recalibration doesn't
+/// silently reintroduce the same regression.
+#[test]
+fn test_weighted_cost_guard_does_not_regress_moderately_complex_body_1381() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"def deep(n): if n==0 then . else {a: deep(n-1), b: n, c:(n*2), d:[n,n+1,n+2,n+3,n+4], e:"somewhat longer string literal to pad body size", f:(n+n+n)} end; deep(45) | .b"#,
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "45");
     Ok(())
 }
 
