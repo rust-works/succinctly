@@ -12774,6 +12774,39 @@ fn test_split_doc_hides_in_has_argument() -> Result<()> {
     Ok(())
 }
 
+/// #1309: `contains_split_doc` used to end its inner `Builtin` match in
+/// `_ => false`, so twelve sub-expression-carrying builtins were scanned as
+/// opaque leaves and a `split_doc` inside one of them went unreported. Each
+/// filter below hides `split_doc` in one of those twelve and pairs it with a
+/// second, multi-result branch so the missing `---` separators are visible.
+///
+/// No oracle rows here, deliberately: real yq v4.53.3 rejects every one of
+/// these shapes at its own lexer (`any(...; ...)`, `IN`, `INDEX`,
+/// `fromstream`, `truncate_stream`) or does not have the builtin at all
+/// (`at_offset`/`at_position` are succinctly extensions). What is pinned is
+/// the predicate's own contract -- "does this tree mention `split_doc`
+/// anywhere" -- which the wildcard answered wrongly by construction.
+#[test]
+fn test_split_doc_hides_in_the_builtins_the_wildcard_skipped_1309() -> Result<()> {
+    let yaml = "a: 1\nb: 2\n";
+    for filter in [
+        ".[], any(split_doc; .)",
+        ".[], all(split_doc; .)",
+        ".[], any(split_doc)",
+        ".[], all(split_doc)",
+        ".[], IN(split_doc)",
+        ".[], IN(split_doc; .)",
+    ] {
+        let (output, code) = run_yq_stdin(filter, yaml, &[])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(
+            output, "1\n---\n2\n---\ntrue\n",
+            "{filter} should separate every top-level result"
+        );
+    }
+    Ok(())
+}
+
 /// #791 follow-up: the M2 fast path's *real-files* loop (`'m2_files: for
 /// file_path in &input_files`, a separate copy of the loop body from the
 /// stdin case right above it) needed its own halt check after
