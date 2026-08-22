@@ -273,9 +273,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fold-specific path machinery — `reduce`/`foreach` are sugar over the same
   variable-binding primitive every other construct uses): the register
   resets between source-element iterations of the same fold but carries
-  forward within one fold step from `UPDATE` into `EXTRACT`. Four narrower,
-  safe (refuse-only) divergences remain, documented in
-  `docs/compliance/jq/limitations.md`.
+  forward within one fold step from `UPDATE` into `EXTRACT`. A destructuring
+  loop variable (`as [$i]`, `as {v:$v}`) falls back to the old refusal on
+  purpose — jq refuses every such fold in path position too, even one whose
+  pattern matches cleanly. Three narrower divergences remain, documented in
+  `docs/compliance/jq/limitations.md`; **two are refuse-only, but the third
+  (structural equality standing in for jq's pointer identity, #1466) accepts
+  where jq refuses, so `=`/`|=`/`del()` through it write a document jq leaves
+  untouched.**
 
 - **`jq`: `path(paths(f))` stops pulling from `f` once `path()` is
   satisfied** (#987): `resolve_leaf`'s fallback for `path()`'s non-primitive
