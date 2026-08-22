@@ -2405,7 +2405,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_in(
+                GenericResult::Error(EvalError::cannot_iterate_with(
                     S::TAG,
                     &to_owned_with_cursor(&value, cursor),
                 ))
@@ -4139,7 +4139,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_in(
+                GenericResult::Error(EvalError::cannot_iterate_with(
                     S::TAG,
                     &to_owned_with_cursor(&value, cursor),
                 ))

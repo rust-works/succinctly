@@ -20400,17 +20400,37 @@ fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result
 }
 
 // =============================================================================
-// #1055: a `NumberLiteral`'s spelling inside a yq-mode error-message preview
-// (`error(v)`/`EvalError::from_value`, and constructors that embed a preview
-// via `describe`/`dump_truncated`, e.g. `cannot_iterate`) must match the
-// spelling `tostring` produces for the same value -- not jq's reformatting
-// rules. Real yq's own oracle is largely inconclusive for these error paths
-// (per the issue's own verification caveat), so the acceptance criterion is
-// this internal consistency, not external parity: each case below is
-// checked against `tostring`'s own output for the identical input, not a
-// hard-coded expected string.
+// #1055: a finite `NumberLiteral`'s spelling inside a yq-mode error-message
+// preview (`error(v)`/`EvalError::from_value`, and constructors that embed a
+// preview via `describe`/`dump_truncated`, e.g. `cannot_iterate`) must match
+// the spelling `tostring` produces for the same value -- not jq's
+// reformatting rules. Real yq's own oracle is largely inconclusive for these
+// error paths (per the issue's own verification caveat), so the acceptance
+// criterion is this internal consistency, not external parity: each case
+// below is checked against `tostring`'s own output for the identical input,
+// not a hard-coded expected string.
+//
+// Scope note (added during #1495's review): this fix is specifically about
+// `NumberLiteral` spelling. A non-finite `Float`/`NumberLiteral` (`.nan`,
+// `.inf`) or a *computed* (non-source-literal) whole float in a yq-mode
+// error preview still doesn't match `tostring` -- both go through
+// `stream_owned_value_json`'s `-o json`/round-trip-safe formatters (`null`
+// for non-finite, forced `.0` for a whole float) rather than `tostring`'s own
+// `numeric_display_string`/`nonfinite_display_string`. Fixing that properly
+// needs either a bespoke non-JSON-output preview formatter or making
+// `stream_owned_value_json_with_at_depth`'s currently-hardcoded NaN handling
+// pluggable too (it's the one non-finite case that isn't already a function
+// parameter) -- real, but separate, follow-up work; see the two
+// `_known_gap_1495` tests below, and #1494. A value large enough to overflow
+// `f64` on parse (e.g. `1e400`) isn't a case that exercises either the fixed
+// or the gap path: this codebase's own scalar resolver falls back to a plain
+// `string` type for it before a `NumberLiteral`/`Float` is ever produced
+// (confirmed live: `.a | type` on `a: 1e400` is `"string"`, not `"number"`),
+// so it's deliberately not included in the cases below -- it would only test
+// string passthrough, giving false confidence that the overflow-to-infinite
+// path is covered when it never runs.
 
-/// The issue's own repro, via `error(v)` (`EvalError::from_value_in`).
+/// The issue's own repro, via `error(v)` (`EvalError::from_value_with`).
 /// Compares each error preview against `tostring`'s own output for the
 /// identical input, not a hard-coded literal string, per the plan's own
 /// recommendation -- a plain string-match against the source text would
@@ -20419,7 +20439,7 @@ fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result
 /// `tostring` agree with *each other*, just not with the source text).
 #[test]
 fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
-    let cases: &[&str] = &["1e2", "1E5", "1.5e-10", "100", "1e400", "-0"];
+    let cases: &[&str] = &["1e2", "1E5", "1.5e-10", "100", "-0"];
     for literal in cases {
         let input = format!("a: {literal}\n");
         let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
@@ -20442,7 +20462,7 @@ fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -
 /// `EvalTag`-dispatched core.
 #[test]
 fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
-    let cases: &[&str] = &["1e2", "1E5", "1.5e-10", "1e400"];
+    let cases: &[&str] = &["1e2", "1E5", "1.5e-10"];
     for literal in cases {
         let input = format!("a: {literal}\n");
         let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
@@ -20468,6 +20488,63 @@ fn test_jq_error_value_preview_still_reformats_number_literal_1055() -> Result<(
     assert!(
         stderr.contains("1E+2") && !stderr.contains("1e2,"),
         "jq mode should still reformat, not echo verbatim: stderr={stderr:?}"
+    );
+    Ok(())
+}
+
+/// Known gap (#1495's own review, not fixed here -- see the scope note
+/// above and #1494): a non-finite `Float` in a yq-mode error preview
+/// renders as JSON's `null` substitution (`stream_owned_value_json`'s
+/// `-o json`/round-trip convention), not yq's own `.nan`/`.inf`/`-.inf`
+/// spelling `tostring` uses. Pinning the current (imperfect but stable)
+/// behavior so a future incidental change doesn't silently flip it without
+/// review -- this is *not* the desired end state, just what #1495 actually
+/// ships.
+#[test]
+fn test_yq_error_value_preview_nonfinite_float_diverges_from_tostring_known_gap_1495() -> Result<()>
+{
+    for (literal, tostring_expected) in [(".inf", ".inf"), (".nan", ".nan")] {
+        let input = format!("a: {literal}\n");
+        let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
+        assert_eq!(code, 0, "literal={literal} tostring out: {tostring_out:?}");
+        assert_eq!(tostring_out.trim(), tostring_expected, "literal={literal}");
+
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a | error", &input, &[])?;
+        assert_ne!(code, 0, "literal={literal} unexpectedly succeeded");
+        // Pre-existing divergence from `tostring` (see doc comment above) --
+        // not `tostring_expected`, `null`.
+        assert!(
+            stderr.contains("null"),
+            "literal={literal} stderr={stderr:?} expected the current (wrong) \
+             null-substitution behavior -- if this now shows {tostring_expected:?}, \
+             the gap this test pins has been fixed; update/remove this test"
+        );
+    }
+    Ok(())
+}
+
+/// Known gap (#1495's own review, not fixed here -- see the scope note
+/// above and #1494): a *computed* whole float in a yq-mode error preview
+/// gains a spurious forced `.0` (`stream_owned_value_json`'s `-o json`
+/// round-trip-safe float formatter), where `tostring` drops it. Same
+/// pinning rationale as the non-finite case above.
+#[test]
+fn test_yq_error_value_preview_computed_whole_float_diverges_from_tostring_known_gap_1495(
+) -> Result<()> {
+    let input = "a: 50.0\n";
+    let (tostring_out, code) = run_yq_stdin("(.a * 2) | tostring", input, &[])?;
+    assert_eq!(code, 0, "tostring out: {tostring_out:?}");
+    assert_eq!(tostring_out.trim(), "100");
+
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("(.a * 2) | error", input, &[])?;
+    assert_ne!(code, 0, "unexpectedly succeeded");
+    // Pre-existing divergence from `tostring` (see doc comment above) -- not
+    // "100", "100.0".
+    assert!(
+        stderr.contains("100.0"),
+        "stderr={stderr:?} expected the current (wrong) forced-.0 behavior -- \
+         if this now shows \"100\", the gap this test pins has been fixed; \
+         update/remove this test"
     );
     Ok(())
 }
