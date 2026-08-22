@@ -295,11 +295,28 @@ narrower, already-fixed-write case where only the RHS-discard *optimization* is 
 (`0 as $k | .[$k] = error("boom")` on a scalar root still raises `boom` where real yq no-ops
 silently, even though the write itself — `.[$k] = 99` — already correctly no-ops).
 
-Separately, `get_path_mut` (the walker #1232 widened) has no `Expr::Iterate` arm at all, so
-a mid-chain `.[]` under plain `=` (`.a[].b = 99`) always errors "invalid path component" —
-in both jq and yq mode, and predating #1232 entirely (`|=`/`+=`/`-=`/`*=`/`del()` are
-unaffected). Filed as
-[#1418](https://github.com/rust-works/succinctly/issues/1418).
+**Fixed by [#1298](https://github.com/rust-works/succinctly/issues/1298):** `get_path_mut`
+(the walker #1232 widened) used to have no `Expr::Iterate` arm at all, so a mid-chain `.[]`
+under plain `=` (`.a[].b = 99`) always errored "invalid path component" — in both jq and yq
+mode, and predating #1232 entirely (`|=`/`+=`/`-=`/`*=`/`del()` were unaffected, their own
+recursive-descent walkers already supported fan-out). #1298 added `split_at_iterate`/
+`set_path_through_iterate` so `=` fans out per element like every other operator, and gave
+`navigate_read_only`'s prefix walk (`yq_assign_is_total_noop`'s own eager-RHS-discard
+pre-check, #1232's `PrefixNavOutcome`) an `Expr::Iterate` arm too — but only for the
+narrowest case, `.a` itself being a genuine scalar (`.a[].b = error("boom")` on `a: 5` now
+no-ops silently, RHS never evaluated, matching real yq).
+
+**Still open ([#1432](https://github.com/rust-works/succinctly/issues/1432)):** real yq's
+actual RHS-discard rule for a mid-chain `Iterate` is broader — a real container whose own
+elements *all* individually no-op also discards the RHS, and so does an empty or
+null-autovivified container (vacuously). The underlying *write* already gets all of these
+right (verified against real yq); only the RHS-discard optimization is narrower than real
+yq's own rule:
+
+```bash
+$ printf 'a: [1, 2]\n' | yq            -o=json '.a[].b = error("boom")'   # {"a":[1,2]}, no-op
+$ printf 'a: [1, 2]\n' | succinctly yq -o=json '.a[].b = error("boom")'   # Error: boom
+```
 
 ### Other categories
 

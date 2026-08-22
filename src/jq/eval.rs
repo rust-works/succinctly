@@ -11701,6 +11701,37 @@ fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> PrefixNavOutc
                 _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
                 _ => return PrefixNavOutcome::Absent,
             },
+            // #1298: `Iterate` fans out into every element/value of a real
+            // container -- unlike `Field`/`Index`, there is no single next
+            // `current` to continue this loop with, so a real container
+            // here can only ever mean "give up and defer" (`Absent`), same
+            // as this function already does for a component it can't
+            // interpret at all. A genuine scalar, though, is exactly
+            // `set_path_through_iterate`'s own no-op fallback (`.a[].b = v`
+            // on scalar `.a` no-ops the whole write, transitively, whatever
+            // the rest of the path was going to do) -- so that case still
+            // reports `HitScalar`, closing the gap where `yq_assign_is_
+            // total_noop` used to fall through this arm's old absence to
+            // the generic catch-all below and eagerly evaluate an RHS the
+            // real write was always going to discard.
+            //
+            // Deliberately incomplete, not just conservative: live-verified
+            // that real yq's actual rule is broader than "the iterated
+            // value is itself a scalar" -- `a: [1, 2]` (a real container
+            // whose own elements are *all* scalars `.b` would no-op into)
+            // also discards the RHS, and so does an empty or
+            // null-autovivified container (vacuously -- zero elements to
+            // check). Reporting `HitScalar` for those too would need
+            // recursively checking every element against the *rest* of the
+            // path, not just this one step -- effectively a read-only dry
+            // run of `set_path_through_iterate` itself. Left as `Absent`
+            // (correct, just not optimal) rather than attempted here; see
+            // #1432.
+            Expr::Iterate => match current {
+                OwnedValue::Array(_) | OwnedValue::Object(_) => return PrefixNavOutcome::Absent,
+                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
+                _ => return PrefixNavOutcome::Absent,
+            },
             _ => return PrefixNavOutcome::Absent,
         };
     }
@@ -13001,14 +13032,26 @@ struct SliceSplit {
     tail: Expr,
 }
 
+/// Flatten `exprs` via [`push_path_components`] — shared by [`split_at_slice`]
+/// and [`split_at_iterate`], which both need the identical flatten before
+/// their own scan (the first for the first `Slice`, the second for the
+/// first non-terminal `Iterate`).
+fn flatten_path_components(exprs: &[Expr]) -> Vec<Expr> {
+    let mut flat = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        push_path_components(&mut flat, e);
+    }
+    flat
+}
+
 /// Split a chained path at its first slice, if it has one.
 ///
 /// A slice names a *range*, not a slot, so `get_path_mut` cannot navigate
 /// through one — `.a[1:2][0] = 9` would fail on the middle component — and the
 /// walker has to hand off to [`through_slice`] there instead.
 ///
-/// Flattens via [`push_path_components`] before scanning, so a slice nested
-/// inside a parenthesized sub-path that is itself only one of several
+/// Flattens via [`flatten_path_components`] before scanning, so a slice
+/// nested inside a parenthesized sub-path that is itself only one of several
 /// top-level components — `(.a[0:1])[0] = 9`, where `(.a[0:1])` arrives as a
 /// single `Expr::Pipe([Field("a"), Slice{..}])` slot — is still found (#1292).
 /// A single-element Pipe never reaches here: `set_path`'s own `Paren`/`Pipe`
@@ -13047,10 +13090,7 @@ fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
     }) {
         return None;
     }
-    let mut flat = Vec::with_capacity(exprs.len());
-    for e in exprs {
-        push_path_components(&mut flat, e);
-    }
+    let mut flat = flatten_path_components(exprs);
     let at = flat
         .iter()
         .position(|e| unwrap_path_component(e).0.is_slice())?;
@@ -13118,7 +13158,7 @@ struct IterateSplit {
 /// `get_path_mut` (which this function's caller navigates `before` with)
 /// cannot walk through any more than it can walk through an `Iterate`.
 ///
-/// Flattens via [`push_path_components`] first, same as `split_at_slice`,
+/// Flattens via [`flatten_path_components`] first, same as `split_at_slice`,
 /// so a `.[]` nested inside a parenthesized sub-path (`(.a[])[0] = 9`) is
 /// still found.
 fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
@@ -13130,10 +13170,7 @@ fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
     }) {
         return None;
     }
-    let mut flat = Vec::with_capacity(exprs.len());
-    for e in exprs {
-        push_path_components(&mut flat, e);
-    }
+    let mut flat = flatten_path_components(exprs);
     let at = flat
         .iter()
         .position(|e| matches!(unwrap_path_component(e).0, Expr::Iterate))?;
@@ -13151,12 +13188,17 @@ fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
     let (_, optional) = unwrap_path_component(&flat[at]);
     let rest = flat.split_off(at + 1);
     flat.truncate(at);
+    // `rest` can never be empty here: the terminal-position check above
+    // already excluded `at == flat.len() - 1`, so there is always at least
+    // one component left after the `Iterate` -- self-checking rather than
+    // relying on a reader trusting this comment, since `SliceSplit`'s own
+    // `tail` (two structs above) visibly branches on an empty `rest`
+    // instead and it would be an easy, silently-wrong "fix" to copy that
+    // branch here by analogy.
+    debug_assert!(!rest.is_empty());
     Some(IterateSplit {
         before: flat,
         optional,
-        // `rest` can never be empty here: the terminal-position check above
-        // already excluded `at == flat.len() - 1`, so there is always at
-        // least one component left after the `Iterate`.
         tail: Expr::Pipe(rest),
     })
 }

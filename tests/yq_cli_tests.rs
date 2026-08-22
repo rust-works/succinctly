@@ -18689,3 +18689,62 @@ fn test_yq_nonterminal_iterate_in_assign_path_fans_out_1298() -> Result<()> {
 
     Ok(())
 }
+
+/// #1298 (code review): the write-level no-op above isn't the whole story
+/// -- `yq_assign_is_total_noop`'s own pre-check (`navigate_read_only`,
+/// #1232's `PrefixNavOutcome`) had no `Expr::Iterate` arm at all, so a
+/// mid-chain `.[]` never reached the eager-RHS-discard optimization
+/// `.a.b.c = error(...)`-shaped paths already get: the write correctly
+/// no-op'd, but the RHS still evaluated for real and any error it raised
+/// still surfaced. `.a[].b = error("boom")` on `a: 5` now no-ops silently
+/// (RHS never runs), matching real yq exactly (live-verified against
+/// v4.53.3).
+///
+/// This only closes the narrowest case -- `current` (`.a` itself) being a
+/// genuine scalar. Real yq's actual rule turned out broader once
+/// live-probed further: `a: [1, 2]` (a real *container*, but every one of
+/// its own elements is itself a scalar `.b` would no-op into) *also*
+/// discards the RHS in real yq, and so does an empty/null-autovivified
+/// container (vacuously -- zero elements to check). Neither of those is
+/// implemented here; `navigate_read_only`'s new `Iterate` arm deliberately
+/// reports `Absent` (defer to normal evaluation) for *any* real
+/// `Array`/`Object`, so those broader cases still eagerly evaluate the
+/// RHS where real yq wouldn't -- filed as #1432 rather than expanded here.
+/// The second case below (`a: [1, {}]`, a genuinely *mixed* target where
+/// one element really does write) is the regression guard for what this
+/// fix must *not* accidentally suppress.
+#[test]
+fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: 5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": 5\n}");
+
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        ".a[].b = error(\"boom\")",
+        "a:\n  - 1\n  - {}\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    Ok(())
+}
+
+/// #1298 (code review, #1432): a `Null` target for the `Iterate` -- neither
+/// a real container nor a genuine scalar -- falls to `navigate_read_only`'s
+/// `Iterate` arm's final `_ => Absent` catch-all, so the RHS still
+/// evaluates here even though real yq's own null-autovivify-to-`[]`
+/// behavior means the fan-out ends up empty and real yq discards the RHS
+/// too (`a: null` becomes `a: []` there, with the RHS never running --
+/// live-verified against yq v4.53.3). This is the exact gap #1432 tracks;
+/// pinned here as a known-divergent case, not a regression to fix in this
+/// PR.
+#[test]
+fn test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: null\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
