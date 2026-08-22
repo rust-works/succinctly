@@ -256,10 +256,25 @@ $ echo '"abc"' | yq            -o=json 'test("abc";"l")'   # Error: unrecognised
 $ echo '"abc"' | succinctly yq -o=json 'test("abc";"l")'   # was: true (silently accepted); now: the same error
 ```
 
-Deliberately **not** extended to `sub`/`split` (see the mysteries just above — applying this
-rule there without first understanding their actual argument semantics would be a new,
-unverified guess) or to `gsub`/`scan`/`splits` (not real yq builtins at all, per #1436 —
-flag validation is moot for a call real yq would reject before ever reaching it).
+Also covers, live-verified: a non-string *scalar* flags value (`test("abc";null)`,
+`test("abc";true)`, `test("abc";5)` — real yq stringifies these the same way `tostring`
+does and grammar-checks the result, rather than treating `null` as "no flags"), and
+ordering against a simultaneously-invalid pattern type (`test(1;"z")` reports the flags
+error, matching real yq, not `succinctly`'s own "number (1) is not a string").
+
+Deliberately **not** extended to:
+- `sub`/`split` (see the mysteries just above — applying this rule there without first
+  understanding their actual argument semantics would be a new, unverified guess).
+- `gsub`/`scan`/`splits` (not real yq builtins at all, per #1436 — flag validation is moot
+  for a call real yq would reject before ever reaching it).
+- The array-unpack form (`test(["abc","i"])`, no explicit flags argument) — real yq's own
+  array-unpack support for these three builtins is a no-op that always succeeds regardless
+  of the unpacked flags element's content, live-verified even for a flag character (`i`)
+  the explicit 2-arg form correctly rejects.
+- A non-scalar (`Array`/`Object`) flags value (`test("abc";["g"])`) — real yq returns
+  `true` here with no error at all, ruling out "stringify and grammar-check" the way the
+  scalar case works; its actual behavior for a container flags value is unconfirmed and
+  left as a known, undocumented-elsewhere gap rather than guessed at.
 
 ### Presentation metadata lost on two whole output routes
 
