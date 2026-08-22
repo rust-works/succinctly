@@ -2028,8 +2028,11 @@ fn emit_yaml_value_at_depth(
                             let compact_indent = format!("{indent}  ");
                             // An anchor written on the item's own line
                             // (`- &x\n  ...`) takes the slot the compact
-                            // form would use, so the value stays deferred
-                            // to its own full-indent line — mirroring
+                            // form would otherwise put the value's first
+                            // field/element in, so the value defers to its
+                            // own line below — at the same 2-column compact
+                            // width as an unanchored compact element (#1362),
+                            // not a full indent step — mirroring
                             // `stream_yaml_value`'s sequence arm in
                             // `light.rs`, which real yq is pinned against
                             // (#763).

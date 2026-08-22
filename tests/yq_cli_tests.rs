@@ -2024,6 +2024,26 @@ fn test_seq_item_anchor_deferred_indent_at_non_default_width_dom_1362() -> Resul
     Ok(())
 }
 
+/// #1484: the `--slurp` counterpart of the two tests above, exercised
+/// end-to-end through the CLI's own `--slurp` argument wiring rather than
+/// calling `stream_yaml_sequence` directly — `stream_yaml_value`/
+/// `emit_yaml_value_at_depth` (fixed by #1362) and `stream_yaml_sequence`
+/// (fixed by this issue) are three independently hand-maintained
+/// implementations of the same compact-width rule, so this pins the
+/// `--slurp`-specific argument path in addition to the unit-level coverage
+/// in `src/yaml/light.rs`. Expected output verified live against real yq
+/// v4.53.3 (`yq ea -I=4 '[.]'`).
+#[test]
+fn test_seq_item_anchor_deferred_indent_at_non_default_width_slurp_1484() -> Result<()> {
+    let yaml = "&x\np: 1\n---\n7\n";
+
+    let (slurped, code) = run_yq_stdin(".", yaml, &["--slurp", "-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(slurped, "- &x\n  p: 1\n- 7\n");
+
+    Ok(())
+}
+
 /// `--tab`'s fix (#733) widened `can_stream_pretty`, which also covers
 /// `keys_unsorted` (part of `can_use_m2_streaming`) — not a duplicate-key
 /// case (keys_unsorted returns an array of key names, so nothing to
