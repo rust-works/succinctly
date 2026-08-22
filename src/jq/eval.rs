@@ -20636,11 +20636,17 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n
+    // Evaluate n. `result_to_owned_full`, not `result_to_owned` (#1408):
+    // `nth(n; expr)`'s one-arg sibling `builtin_nth` was already migrated
+    // for exactly this -- a zero-output `n` (e.g. `nth(empty; .a,.b)`)
+    // must make the whole call produce zero output, matching real jq's
+    // `n as $n | ...` desugaring, not this call site's own leftover
+    // `result_to_owned` hard-erroring with "no value" instead.
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match result_to_owned(n_result) {
-        Ok(OwnedValue::Int(i)) if i >= 0 => i as usize,
-        Ok(_) => {
+    let n = match result_to_owned_full(n_result) {
+        Ok(None) => return QueryResult::None,
+        Ok(Some((OwnedValue::Int(i), _))) if i >= 0 => i as usize,
+        Ok(Some(_)) => {
             return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
         }
         Err(e) => return e.into(),
@@ -27679,19 +27685,30 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get n
-    let n = match result_to_owned(eval_single::<W, S>(n_expr, value.clone(), optional)) {
-        Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) if i >= 0 => {
+    // Get n. `result_to_owned_full`, not `result_to_owned` (#1408): a
+    // zero-output `n` (e.g. `combinations(empty)`) must not hard-error --
+    // but unlike a plain `x as $x | ...` zero-fanout ("propagate
+    // QueryResult::None"), `n` here feeds an internal array constructor
+    // (real jq's own model is roughly `[range(n)|$dot] | combinations`),
+    // so a zero-output `n` desugars the same way `n=0` already does below
+    // (zero fan-out arrays either way) -- `Owned([])`, not `None`.
+    let n = match result_to_owned_full(eval_single::<W, S>(n_expr, value.clone(), optional)) {
+        Ok(None) => return QueryResult::Owned(OwnedValue::Array(Vec::new())),
+        Ok(Some((OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _), _)))
+            if i >= 0 =>
+        {
             i as usize
         }
-        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) if optional => {
+        Ok(Some((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _)))
+            if optional =>
+        {
             return QueryResult::None
         }
-        Ok(OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)) => {
+        Ok(Some((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _))) => {
             return QueryResult::Error(EvalError::new("combinations(n): n must be non-negative"))
         }
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::type_error("number", "n")),
+        Ok(Some(_)) if optional => return QueryResult::None,
+        Ok(Some(_)) => return QueryResult::Error(EvalError::type_error("number", "n")),
         Err(e) => return e.into(),
     };
 
@@ -28159,6 +28176,10 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // a type error (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        // #1408: a zero-output `n` (e.g. `nth(empty; .a,.b)`) must make the
+        // whole call produce zero output, matching real jq's `n as $n | ...`
+        // desugaring -- not fall into the generic type-error catch-all below.
+        QueryResult::None => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
 
@@ -29064,7 +29085,13 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let first = each_take_first::<W, S>(expr, value.clone(), optional);
             let n_result: Result<OwnedValue, EvalEscape> = match first {
                 Ok(Some(item)) => Ok(item.into_owned()),
-                Ok(None) => Err(EvalEscape::Error(EvalError::new("no value"))),
+                // #1408: a zero-output code expression (`halt_error(empty)`)
+                // must make the whole call produce zero output -- matching
+                // real jq's own `x as $x | ...` desugaring, the same fix
+                // already applied to the other instances of this bug class
+                // (#1045/#1280/#1313) -- not this call site's own leftover
+                // hard error.
+                Ok(None) => return QueryResult::None,
                 Err(control) => Err(control.into()),
             };
             match n_result {

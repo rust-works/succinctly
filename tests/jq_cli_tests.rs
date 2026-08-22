@@ -17475,3 +17475,74 @@ fn test_jq_string_interpolation_single_valued_slot_unaffected_1403() -> Result<(
     assert_eq!(stdout, "\"Hello world\"\n");
     Ok(())
 }
+
+/// The issue's own repro: `nth(n; expr)`'s two-arg (stream) form parses to
+/// `Builtin::NthStream`/`builtin_nth_stream`, not `Expr::NthExpr` -- a
+/// zero-output `n` (e.g. `nth(empty; .a,.b)`) must make the whole call
+/// produce zero output, matching real jq's `n as $n | ...` desugaring, not
+/// `builtin_nth_stream`'s prior catch-all "expected number, got null" error.
+#[test]
+fn test_nth_stream_empty_n_argument_produces_no_output_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", "nth(empty; .a,.b)"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// Regression guard: `nth(n; expr)` with an ordinary single-valued `n`
+/// stays completely unaffected by the new zero-output arm.
+#[test]
+fn test_nth_stream_ordinary_n_unaffected_by_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", "nth(1; .[])"], Some("[10,20,30]"))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "20");
+    Ok(())
+}
+
+/// The issue's own repro: a zero-output `n` to `combinations(n)` (e.g.
+/// `combinations(empty)`) must produce zero output for the array
+/// constructor's own `n`-many-`range` desugaring -- matching the existing
+/// `n == 0` case (`Owned([])`), not `builtin_combinations_n`'s prior
+/// "no value" hard error.
+#[test]
+fn test_combinations_n_empty_argument_produces_empty_array_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2] | combinations(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// Regression guard: `combinations(n)` with an ordinary `n` stays
+/// completely unaffected by the new zero-output arm.
+#[test]
+fn test_combinations_n_ordinary_n_unaffected_by_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "[1,2] | [combinations(2)]"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[[1,1],[1,2],[2,1],[2,2]]");
+    Ok(())
+}
+
+/// The issue's own repro: a zero-output code expression to `halt_error`
+/// (e.g. `halt_error(empty)`) must make the whole call produce zero
+/// output -- matching the same `x as $x | ...` desugaring already applied
+/// to every other instance of this bug class (#1045/#1280/#1313), not
+/// `builtin_halt_error`'s prior "no value" hard error.
+#[test]
+fn test_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-cn", "\"x\" | halt_error(empty)"], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
+    assert_eq!(err, "");
+    Ok(())
+}
+
+/// Regression guard: `halt_error(code)` with an ordinary exit-code
+/// expression stays completely unaffected by the new zero-output arm --
+/// still writes the message to stderr and exits with that code.
+#[test]
+fn test_halt_error_ordinary_code_unaffected_by_1408() -> Result<()> {
+    let (_out, err, code) = run_jq_full(&["-cn", "\"msg\" | halt_error(7)"], None)?;
+    assert_eq!(code, 7);
+    assert_eq!(err, "msg");
+    Ok(())
+}
