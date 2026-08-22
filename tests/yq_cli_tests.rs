@@ -19702,6 +19702,43 @@ fn test_yq_gsub_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
     Ok(())
 }
 
+/// `scan` is not a real yq builtin at all (#1436) -- same non-fix as
+/// `gsub` above, guarding `scan_with_resolved_pattern`'s hardcoded
+/// `JqSemantics` call specifically (code review flagged that only `gsub`
+/// had a guard test here, not `scan`/`split`/`splits`).
+#[test]
+fn test_yq_scan_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"[scan("a*")]"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!(["", "a", "", ""]));
+    Ok(())
+}
+
+/// `split(re;flags)` *is* a real yq builtin, but has its own separate,
+/// unresolved algorithm mismatch (#1439) -- #1255 deliberately doesn't
+/// touch it. Guards `builtin_split_regex`'s hardcoded `JqSemantics` call.
+#[test]
+fn test_yq_split_regex_keeps_jq_style_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"split("a*"; "g")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!(["", "b", "", "b", ""]));
+    Ok(())
+}
+
+/// `splits` is not a real yq builtin at all (#1436) -- same non-fix as
+/// `scan`/`gsub`. Guards `splits_with_resolved_pattern`'s hardcoded
+/// `JqSemantics` call.
+#[test]
+fn test_yq_splits_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"[splits("a*")]"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!(["", "b", "", "b", ""]));
+    Ok(())
+}
+
 /// jq-mode regression guard: jq's own `gsub` (Oniguruma-style) must stay
 /// completely untouched by this yq-only fix.
 #[test]

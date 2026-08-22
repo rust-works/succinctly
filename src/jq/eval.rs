@@ -9258,9 +9258,11 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// One step of a forward regex search: the leftmost match of `re` at or
 /// after byte offset `start`, whether it satisfies the `n` flag's policy
-/// (`re.suppress_empty` implies non-empty), and the offset to resume
-/// searching from for the next match. `first_captures` and
-/// `global_captures` are both this step driven in a loop — the former
+/// (`re.suppress_empty` implies non-empty), the offset to resume searching
+/// from for the next match, and the match's own `(start, end)` bounds
+/// (callers that need them would otherwise have to re-derive them from
+/// `caps.get(0)`, which this function already did internally). `first_captures`
+/// and `global_captures` are both this step driven in a loop — the former
 /// stops at the first accepted match, the latter collects every accepted
 /// one — so the acceptance test and the empty-match advance-by-one-codepoint
 /// arithmetic exist in exactly one place rather than two copies that could
@@ -9271,7 +9273,7 @@ fn next_match_step<'h>(
     re: &JqRegex,
     input: &'h str,
     start: usize,
-) -> Option<(regex::Captures<'h>, bool, usize)> {
+) -> Option<(regex::Captures<'h>, bool, usize, usize, usize)> {
     if start > input.len() {
         return None;
     }
@@ -9289,7 +9291,7 @@ fn next_match_step<'h>(
             None => m_end + 1,
         }
     };
-    Some((caps, accepted, next_start))
+    Some((caps, accepted, next_start, m_start, m_end))
 }
 
 /// Leftmost match of `re` in `input` satisfying the `n` flag
@@ -9306,7 +9308,7 @@ fn next_match_step<'h>(
 fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h>> {
     let mut start = 0usize;
     loop {
-        let (caps, accepted, next_start) = next_match_step(re, input, start)?;
+        let (caps, accepted, next_start, _m_start, _m_end) = next_match_step(re, input, start)?;
         if accepted {
             return Some(caps);
         }
@@ -9338,17 +9340,26 @@ fn first_captures<'h>(re: &JqRegex, input: &'h str) -> Option<regex::Captures<'h
 /// regex engine. `next_match_step` already advances by one rune on an empty
 /// match regardless of this skip, so the skip only ever changes whether a
 /// match is *emitted*, never the scan position.
+///
+/// **`S` here means "which zero-width iteration algorithm," not "which
+/// mode is this query running in"** — the two axes aren't always the same:
+/// `sub_with_resolved_pattern` (this function's caller for both bare `sub`
+/// and `gsub`) is itself generic over its own ambient mode, but explicitly
+/// picks `YqSemantics`/`JqSemantics` for *this* call based on which builtin
+/// invoked it, not on that ambient mode — yq-mode `gsub` deliberately stays
+/// on `JqSemantics` here (no real yq builtin to diverge from, per #1436)
+/// even when every other part of that call is running in yq mode. Do not
+/// "simplify" any hardcoded `global_captures::<JqSemantics>(...)` call site
+/// to `global_captures::<S>(...)` just because `S` happens to already be in
+/// scope there — check that call site's own comment first.
 #[cfg(feature = "regex")]
 fn global_captures<'h, S: EvalSemantics>(re: &JqRegex, input: &'h str) -> Vec<regex::Captures<'h>> {
     let mut results = Vec::new();
     let mut start = 0usize;
     let mut last_match_end: Option<usize> = None;
-    while let Some((caps, accepted, next_start)) = next_match_step(re, input, start) {
+    while let Some((caps, accepted, next_start, m_start, m_end)) = next_match_step(re, input, start)
+    {
         if accepted {
-            let m = caps
-                .get(0)
-                .expect("capture group 0 is always present on a match");
-            let (m_start, m_end) = (m.start(), m.end());
             let is_empty_match = m_start == m_end;
             let repeats_previous_match_end = last_match_end == Some(m_start);
             let go_style_skip =
