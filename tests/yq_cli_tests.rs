@@ -2086,6 +2086,31 @@ fn test_indent_1_json_output_not_clamped_1486() -> Result<()> {
     Ok(())
 }
 
+/// #1486 review: the clamp's own predicate must track `output_value`'s real
+/// dispatch (`output_format == Yaml` decides the YAML branch; anything else,
+/// including `Auto`, currently falls through to the JSON branch here --
+/// itself a separate, pre-existing divergence from real yq's own
+/// match-the-input-format `-o=auto` semantics, out of scope for this fix,
+/// filed as #1493). A first version of this fix checked `!= Json` instead
+/// of `== Yaml`, so `-o=auto` (neither) wrongly inherited the YAML clamp
+/// even though it renders as JSON -- this pins `-o=auto`'s *content* stays
+/// self-consistent with explicit `-o=json` at the same `-I`, regardless of
+/// which pre-existing format the content itself renders as.
+#[test]
+fn test_indent_1_auto_format_matches_explicit_json_1486() -> Result<()> {
+    let yaml = "l:\n  m:\n    p: 1\n";
+
+    let (auto, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=auto"])?;
+    assert_eq!(code, 0);
+
+    let (json, code) = run_yq_stdin(".", yaml, &["-I=1", "-o=json"])?;
+    assert_eq!(code, 0);
+
+    assert_eq!(auto, json);
+
+    Ok(())
+}
+
 /// `--tab`'s fix (#733) widened `can_stream_pretty`, which also covers
 /// `keys_unsorted` (part of `can_use_m2_streaming`) — not a duplicate-key
 /// case (keys_unsorted returns an array of key names, so nothing to

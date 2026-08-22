@@ -169,17 +169,22 @@ impl OutputConfig {
             // (verified live: `-I1 -o=json` genuinely indents 1 space per
             // level in real yq) -- `indent_str` is shared by both formats'
             // DOM emitters (see its use in the JSON branch of
-            // `output_value`), so the clamp only applies when this
-            // invocation isn't explicitly `-o=json`. `-o=auto` resolving to
-            // JSON for a JSON-formatted input is the one case this doesn't
-            // reach (the same pre-existing per-input-vs-global sharing gap
-            // `json_sourced_floats` works around elsewhere in this struct),
-            // not a new inconsistency this fix introduces.
+            // `output_value`), so the clamp only applies when `output_value`
+            // will actually take the YAML branch below, i.e.
+            // `output_format == Yaml` exactly -- matching that dispatch's
+            // own condition (`if config.output_format == OutputFormat::Yaml`),
+            // not its complement. `Auto` is *not* YAML here: this build
+            // currently routes `-o=auto` to the JSON branch regardless of
+            // input format, a separate pre-existing divergence from real
+            // yq's own "match the input format" semantics, out of scope for
+            // this fix -- but this clamp must still track whichever branch
+            // `output_value` actually takes, or `-o=auto -I=1` would get
+            // JSON content clamped as if it were YAML.
             let width = args.indent as usize;
-            let width = if args.output_format == OutputFormat::Json {
-                width
-            } else {
+            let width = if args.output_format == OutputFormat::Yaml {
                 width.max(2)
+            } else {
+                width
             };
             " ".repeat(width)
         };
