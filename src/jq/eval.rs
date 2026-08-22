@@ -21681,6 +21681,45 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Resolve the value `n` levels up from `current_path` -- `parent` is this
+/// with `n = 1`, `parent(n)` with whatever `n` evaluates to. Returns both
+/// the ancestor's own path (for `rest`'s continuation, via
+/// `continue_rest_with_context`) and its resolved value.
+///
+/// Shared by both the `Parent` and `ParentN` arms below: they used to
+/// independently hand-roll this same arithmetic, and that duplication is
+/// exactly what caused #1476 -- `ParentN`'s own copy had a subtly
+/// different, wrong boundary condition (`n >= current_path.len()`
+/// conflating "landed exactly on the root" with "overshot past it") that
+/// `Parent`'s copy never had reason to get wrong, since it only ever steps
+/// up by one. `current_path.len().checked_sub(n)` makes the distinction
+/// direct: `None` means `n` exceeds the path's depth (overshoot, nothing
+/// to resolve); `Some(len)` (including `len == 0`, landing exactly on
+/// root) means `&current_path[..len]` is a real path to resolve via
+/// `get_value_at_owned_path`, which already returns `root` itself for an
+/// empty path.
+fn resolve_ancestor_path<'a, 'p, W: Clone + AsRef<[u64]>>(
+    root: &OwnedValue,
+    current_path: &'p [OwnedValue],
+    n: usize,
+) -> (&'p [OwnedValue], QueryResult<'a, W>) {
+    match current_path.len().checked_sub(n) {
+        None => (
+            &[],
+            // Gone past root - return empty object
+            QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
+        ),
+        Some(len) => {
+            let ancestor_path = &current_path[..len];
+            let result = match get_value_at_owned_path(root, ancestor_path) {
+                Some(v) => QueryResult::Owned(v),
+                None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
+            };
+            (ancestor_path, result)
+        }
+    }
+}
+
 /// Path-context analog of `eval_binary_fanout` (#768/#822): evaluate `left op
 /// right` over every pairing jq's cartesian fanout produces (right operand
 /// outer / left operand inner), routed through
@@ -21951,24 +21990,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     // routed through the shared helper (#1449), just with a different
     // `current_path` argument for the continuation.
     if matches!(first, Expr::Builtin(Builtin::Parent)) {
-        // `parent_path` borrows straight from `current_path` -- both this
-        // and `continue_rest_with_context` only ever need a `&[OwnedValue]`
-        // slice, never an owned one, so there's nothing to clone here
-        // (code review, #1449: routing this arm through the shared helper
-        // had accidentally turned the old code's on-demand `.to_vec()`,
-        // paid only when `rest` was non-empty, into an unconditional one).
-        let (parent_path, parent_result): (&[OwnedValue], _) = if current_path.is_empty() {
-            // At root - return empty object (yq behavior)
-            (&[], QueryResult::Owned(OwnedValue::Object(IndexMap::new())))
-        } else {
-            let parent_path = &current_path[..current_path.len() - 1];
-            // Navigate from root to parent
-            let parent_result = match get_value_at_owned_path(root, parent_path) {
-                Some(parent_value) => QueryResult::Owned(parent_value),
-                None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
-            };
-            (parent_path, parent_result)
-        };
+        let (parent_path, parent_result) = resolve_ancestor_path::<W>(root, current_path, 1);
         return continue_rest_with_context::<W, S>(
             parent_result,
             rest,
@@ -22005,42 +22027,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             Err(escape) => return escape.into(),
         };
 
-        // Calculate parent path (n levels up). A borrowed slice, same
-        // zero-allocation reasoning as the plain `Parent` arm above
-        // (#1449).
-        //
-        // #1476: landing *exactly* on the root (`n == current_path.len()`)
-        // must resolve to the root value, same as chaining bare `parent`
-        // `n` times would -- `.a | parent` and `.a | parent(1)` must agree.
-        // The old `n >= current_path.len()` guard conflated that case with
-        // genuinely overshooting *past* the root (`n > current_path.len()`,
-        // where there's nothing left to resolve), so `parent(1)` on a
-        // depth-1 path wrongly gave `{}` instead of the root. Testing
-        // `n > current_path.len()` directly distinguishes the two: at
-        // exactly `n == len`, `parent_path` is the empty slice and
-        // `get_value_at_owned_path(root, &[])` already resolves to `root`
-        // itself, so no separate root-shortcut is needed here (unlike the
-        // plain `Parent` arm, which has no "past root" case of its own to
-        // guard against and so never needed this distinction).
-        let overshoot = n > current_path.len();
-        let parent_path: &[OwnedValue] = if overshoot {
-            &[]
-        } else {
-            &current_path[..current_path.len() - n]
-        };
-
-        let parent_result = if overshoot {
-            // Gone past root - return empty object
-            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
-        } else {
-            match get_value_at_owned_path(root, parent_path) {
-                Some(parent_value) => QueryResult::Owned(parent_value),
-                None => QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
-            }
-        };
-
-        // Same "continue at the parent's path" shape as the plain `Parent`
-        // arm above (#1449).
+        // Same shared helper as the plain `Parent` arm above (`n = 1`'s
+        // special case) -- unified by #1476's own review, which found the
+        // two arms had each hand-rolled this arithmetic separately, and
+        // that divergence (a subtly different boundary condition in this
+        // arm alone) was the exact bug #1476 fixed.
+        let (parent_path, parent_result) = resolve_ancestor_path::<W>(root, current_path, n);
         return continue_rest_with_context::<W, S>(
             parent_result,
             rest,

@@ -5358,10 +5358,11 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 /// `parent(n)` must agree with chaining bare `parent` `n` times, including
 /// exactly *at* the root boundary (#1476): `n == current_path.len()` lands
 /// on the root and must resolve to it, distinct from `n >
-/// current_path.len()` (#5349 above), which genuinely overshoots past the
-/// root into an empty object. The old code conflated the two (both produce
-/// an empty `parent_path`), so `.a | parent(1)` on a depth-1 document
-/// wrongly gave `{}` instead of the root.
+/// current_path.len()` (the genuine-overshoot case
+/// `test_path_context_builtins_across_pipe_stages_554`'s own `parent(4)`
+/// case already covers), which produces an empty object instead. The old
+/// code conflated the two (both produce an empty `parent_path`), so `.a |
+/// parent(1)` on a depth-1 document wrongly gave `{}` instead of the root.
 #[test]
 fn test_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result<()> {
     let (chained, _, code) = run_jq_full(&["-c", ".a | parent"], Some(r#"{"a":1}"#))?;
@@ -10827,6 +10828,29 @@ fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Resu
     Ok(())
 }
 
+/// Same swallow as the test above, but with a trailing `| key` that still
+/// needs path context, so `optional=true` threads straight into `ParentN`'s
+/// own `n` evaluation (`eval_owned_expr_opt`) instead of being caught by an
+/// external `Expr::Optional` wrapper (the `rest.is_empty()` case the test
+/// above exercises). `error(...)`'s own evaluation (`eval_error`) already
+/// self-swallows to `QueryResult::None` whenever the ambient `optional` is
+/// true -- before the error ever reaches `eval_owned_expr_opt`'s own
+/// `Err(EvalEscape::Error(_)) if optional` guard -- so this still confirms
+/// the observable swallow-through-rest behavior, even though (per
+/// investigation) that specific guard line appears unreachable today: no
+/// error-raising path in this evaluator currently propagates an `Err` all
+/// the way up while `optional` is `true`.
+#[test]
+fn test_parent_n_argument_error_swallow_threaded_through_rest() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a.b | (parent(has(error("x"))))? | key"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
 /// Companion to `test_path_context_optional_does_not_swallow_halt_in_builtin_arm`:
 /// that test proves a halt escapes `eval_pipe_with_path_context_internal`'s
 /// `Expr::Builtin` arm even under `?`.
@@ -16008,6 +16032,25 @@ fn test_path_context_parent_n_argument_wrong_type_optional_1280() -> Result<()> 
     )?;
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out.trim(), "\"b\"");
+    Ok(())
+}
+
+/// Same `Ok(Some(_)) if optional` swallow as the test above, but reached
+/// via `Expr::Optional`'s *other* routing branch: `key` after the `?`
+/// still needs path context, so `optional=true` threads straight into
+/// `ParentN`'s own match instead of being caught by an external wrapper
+/// (mirrors `test_string_interpolation_path_context_fanout_continues_rest_1403`'s
+/// identical `? | key`-shaped case for the sibling `StringInterpolation`
+/// arm).
+#[test]
+fn test_path_context_parent_n_argument_wrong_type_optional_threaded_through_rest_1280() -> Result<()>
+{
+    let (out, err, code) = run_jq_full(
+        &["-c", r#".a.b | (parent("x"))? | key"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "");
     Ok(())
 }
 
