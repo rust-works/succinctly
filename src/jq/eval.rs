@@ -18886,31 +18886,37 @@ fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
 ///   through, whatever `state` it leaves behind is irrelevant (the caller
 ///   never observes it once a `Control` aborts the fold).
 ///
-/// Charges `budget` once per alternative whose pattern actually bound (not
+/// Charges `budget` once per alternative whose UPDATE actually runs (not
 /// once per element, and not for a pattern-match failure, which never
-/// reaches UPDATE) -- each successful bind is a genuine extra evaluator
-/// invocation (#695).
+/// reaches UPDATE) -- each run is a genuine extra evaluator invocation
+/// (#695).
+///
+/// Takes each alternative's UPDATE *already* destructured and substituted
+/// (`substituted_updates`, one entry per pattern, `Err` if that pattern
+/// failed to match `input_val`) rather than the raw `patterns`/`update` --
+/// this is independent of any accumulator/INIT fork, so the caller hoists
+/// it once per input element outside the INIT-fork loop, restoring the
+/// pre-#1365 single-pattern code's own #695 hoist (which a first version
+/// of this function lost by redoing the bind on every call: code review
+/// flagged this as an efficiency regression for every ordinary,
+/// non-`?//` `reduce`/`foreach` call with more than one INIT output).
 fn try_reduce_step_alternatives<S: EvalSemantics>(
-    patterns: &[Pattern],
-    all_var_names: &[String],
-    update: &Expr,
-    input_val: &OwnedValue,
+    substituted_updates: &[Result<Expr, EvalError>],
     acc_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
 ) -> (OwnedValue, Option<Control>) {
-    let invert_dedup = patterns.len() > 1;
-    let last_idx = patterns.len() - 1;
+    let last_idx = substituted_updates.len() - 1;
     let mut state = acc_input;
 
-    for (i, pattern) in patterns.iter().enumerate() {
+    for (i, substituted) in substituted_updates.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, input_val, invert_dedup) {
-            Ok(b) => b,
+        let substituted = match substituted {
+            Ok(expr) => expr,
             Err(e) => {
                 if is_last {
-                    return (state, Some(Control::Error(e)));
+                    return (state, Some(Control::Error(e.clone())));
                 }
                 continue;
             }
@@ -18920,15 +18926,8 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
             return (state, Some(control));
         }
 
-        let mut substituted = substitute_bindings(update, &bindings);
-        for var_name in all_var_names {
-            if !bindings.iter().any(|(name, _)| name == var_name) {
-                substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
-            }
-        }
-
         let (update_vals, update_control) =
-            eval_owned_expr_fork::<S>(&substituted, &state, optional);
+            eval_owned_expr_fork::<S>(substituted, &state, optional);
         // Unconditional, mirroring the pre-#1365 single-pattern fold's own
         // "acc = update_vals.into_iter().last()" -- run even when
         // `update_control` is `Some(..)`, since a retried alternative
@@ -18942,7 +18941,7 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
     }
 
     unreachable!(
-        "patterns is non-empty by construction; the loop always returns on its last iteration"
+        "substituted_updates is non-empty by construction; the loop always returns on its last iteration"
     )
 }
 
@@ -19008,17 +19007,43 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Every name any alternative could bind (#1365) -- a name unbound by
     // whichever alternative actually matches defaults to `null` in UPDATE,
     // matching `eval_as_pattern`'s identical convention for `. as PATTERN
-    // ?//`. Patterns-only, so this is independent of both `input_values`
-    // and the INIT-fork loop -- hoisted the same way the pre-#1365 single-
-    // pattern destructuring was, just narrower (it can no longer also hoist
-    // the *destructuring itself*, since which alternative wins now depends
-    // on the accumulator UPDATE reads via `.`, which varies per INIT fork).
+    // ?//`.
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
         collect_pattern_var_names(pattern, &mut all_var_names);
     }
     all_var_names.sort_unstable();
     all_var_names.dedup();
+
+    // Per input element, this element's UPDATE pre-destructured and
+    // substituted against *every* alternative pattern (`Err` if that
+    // pattern fails to match). Which alternative's bindings apply is
+    // decided purely by destructuring `input_val` -- independent of any
+    // accumulator/INIT fork -- so this whole matrix is hoisted outside the
+    // INIT-fork loop below, restoring the pre-#1365 single-pattern code's
+    // own #695 hoist ("pays for the AST rebuild once per input element,
+    // not N times") generalized across N alternatives. Only the actual
+    // UPDATE *evaluation* (inside the fold loop, via
+    // `try_reduce_step_alternatives`) depends on the accumulator.
+    let invert_dedup = patterns.len() > 1;
+    let substituted_updates_matrix: Vec<Vec<Result<Expr, EvalError>>> = input_values
+        .iter()
+        .map(|input_val| {
+            patterns
+                .iter()
+                .map(|pattern| {
+                    let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+                    let mut substituted = substitute_bindings(update, &bindings);
+                    for var_name in &all_var_names {
+                        if !bindings.iter().any(|(name, _)| name == var_name) {
+                            substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
+                        }
+                    }
+                    Ok(substituted)
+                })
+                .collect()
+        })
+        .collect();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // Shared across every INIT fork (#695), the same "whole tree, not
@@ -19027,16 +19052,9 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for init_val in init_values {
         let mut acc = init_val;
         let mut aborted: Option<Control> = None;
-        for input_val in &input_values {
-            let (new_acc, step_control) = try_reduce_step_alternatives::<S>(
-                patterns,
-                &all_var_names,
-                update,
-                input_val,
-                acc,
-                optional,
-                &mut budget,
-            );
+        for row in &substituted_updates_matrix {
+            let (new_acc, step_control) =
+                try_reduce_step_alternatives::<S>(row, acc, optional, &mut budget);
             acc = new_acc;
             if let Some(control) = step_control {
                 aborted = Some(control);
@@ -19343,7 +19361,6 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Evaluate `foreach`: `foreach EXPR as $var (INIT; UPDATE)` or `foreach EXPR as $var (INIT; UPDATE; EXTRACT)`.
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
 /// step, in order, against a single `input_val`.
 ///
@@ -19377,30 +19394,34 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// already produced don't vanish", #494) and charges `budget` once per
 /// UPDATE bind attempted plus once per EXTRACT call, matching the
 /// pre-#1365 accounting.
-#[allow(clippy::too_many_arguments)]
+///
+/// Takes each alternative already destructured and substituted
+/// (`substituted_steps`, one `(UPDATE, EXTRACT)` pair per pattern, `Err`
+/// if that pattern failed to match `input_val`) rather than the raw
+/// `patterns`/`update`/`extract` -- same reasoning as
+/// [`try_reduce_step_alternatives`]'s own matrix parameter: this is
+/// independent of any accumulator/INIT fork, so the caller hoists it once
+/// per input element outside the INIT-fork loop (#695).
+type ForeachStepAlternative = Result<(Expr, Option<Expr>), EvalError>;
+
 fn try_foreach_step_alternatives<S: EvalSemantics>(
-    patterns: &[Pattern],
-    all_var_names: &[String],
-    update: &Expr,
-    extract: Option<&Expr>,
-    input_val: &OwnedValue,
+    substituted_steps: &[ForeachStepAlternative],
     state_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
     outputs: &mut Vec<OwnedValue>,
 ) -> (OwnedValue, Option<Control>) {
-    let invert_dedup = patterns.len() > 1;
-    let last_idx = patterns.len() - 1;
+    let last_idx = substituted_steps.len() - 1;
     let mut state = state_input;
 
-    for (i, pattern) in patterns.iter().enumerate() {
+    for (i, step) in substituted_steps.iter().enumerate() {
         let is_last = i == last_idx;
 
-        let bindings = match extract_pattern_bindings(pattern, input_val, invert_dedup) {
-            Ok(b) => b,
+        let (substituted_update, substituted_extract) = match step {
+            Ok(pair) => pair,
             Err(e) => {
                 if is_last {
-                    return (state, Some(Control::Error(e)));
+                    return (state, Some(Control::Error(e.clone())));
                 }
                 continue;
             }
@@ -19410,19 +19431,8 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             return (state, Some(control));
         }
 
-        let null_fill = |expr: &Expr| {
-            let mut substituted = substitute_bindings(expr, &bindings);
-            for var_name in all_var_names {
-                if !bindings.iter().any(|(name, _)| name == var_name) {
-                    substituted = substitute_var(&substituted, var_name, &OwnedValue::Null);
-                }
-            }
-            substituted
-        };
-        let substituted_update = null_fill(update);
-
         let (update_vals, update_control) =
-            eval_owned_expr_fork::<S>(&substituted_update, &state, optional);
+            eval_owned_expr_fork::<S>(substituted_update, &state, optional);
         // Unconditional, mirroring `try_reduce_step_alternatives`'s own
         // rule -- a retried alternative resumes from exactly this value.
         state = update_vals.last().cloned().unwrap_or(OwnedValue::Null);
@@ -19437,9 +19447,8 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
         // a partial attempt's own already-extracted output survives even
         // when that same attempt goes on to fail and fall through to the
         // next alternative; see this function's own doc comment).
-        let substituted_extract = extract.map(null_fill);
         for update_val in &update_vals {
-            if let Some(ext_expr) = &substituted_extract {
+            if let Some(ext_expr) = substituted_extract {
                 // Charged separately from the UPDATE bind above: a single
                 // UPDATE can fan out into far more EXTRACT evals than
                 // there are source elements (#695), and that width needs
@@ -19466,7 +19475,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     }
 
     unreachable!(
-        "patterns is non-empty by construction; the loop always returns on its last iteration"
+        "substituted_steps is non-empty by construction; the loop always returns on its last iteration"
     )
 }
 
@@ -19535,14 +19544,40 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // Every name any alternative could bind (#1365) -- same convention as
-    // `eval_reduce`'s own hoist; see there for why this can no longer also
-    // hoist the destructuring itself.
+    // `eval_reduce`'s own hoist.
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
         collect_pattern_var_names(pattern, &mut all_var_names);
     }
     all_var_names.sort_unstable();
     all_var_names.dedup();
+
+    // Same matrix hoist as `eval_reduce`'s own (#695) -- see there for the
+    // full rationale -- generalized to also carry EXTRACT alongside
+    // UPDATE, since both are destructured against the same bindings.
+    let invert_dedup = patterns.len() > 1;
+    let substituted_steps_matrix: Vec<Vec<ForeachStepAlternative>> = input_values
+        .iter()
+        .map(|input_val| {
+            patterns
+                .iter()
+                .map(|pattern| {
+                    let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+                    let null_fill = |expr: &Expr| {
+                        let mut substituted = substitute_bindings(expr, &bindings);
+                        for var_name in &all_var_names {
+                            if !bindings.iter().any(|(name, _)| name == var_name) {
+                                substituted =
+                                    substitute_var(&substituted, var_name, &OwnedValue::Null);
+                            }
+                        }
+                        substituted
+                    };
+                    Ok((null_fill(update), extract.map(null_fill)))
+                })
+                .collect()
+        })
+        .collect();
 
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // Shared across every INIT fork (#695), the same "whole tree, not
@@ -19551,18 +19586,9 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for init_val in init_values {
         let mut state = init_val;
         let mut aborted: Option<Control> = None;
-        for input_val in &input_values {
-            let (new_state, step_control) = try_foreach_step_alternatives::<S>(
-                patterns,
-                &all_var_names,
-                update,
-                extract,
-                input_val,
-                state,
-                optional,
-                &mut budget,
-                &mut outputs,
-            );
+        for row in &substituted_steps_matrix {
+            let (new_state, step_control) =
+                try_foreach_step_alternatives::<S>(row, state, optional, &mut budget, &mut outputs);
             state = new_state;
             if let Some(control) = step_control {
                 aborted = Some(control);
