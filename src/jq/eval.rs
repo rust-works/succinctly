@@ -10114,6 +10114,16 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(escape) => return escape.into(),
     };
 
+    // The three `if optional` guards below mirror every sibling builtin's own
+    // `_ if optional => QueryResult::None` arm (see `format_base64` above)
+    // for consistency, but are very likely unreachable dead code post-#693:
+    // `Expr::Optional` forces the inner evaluation's ambient `optional` to
+    // `false` and catches the resulting `Error` itself, rather than letting
+    // a builtin's own internal `optional` flag see `true`. Confirmed via
+    // `cargo llvm-cov`: `sub(...; ...; ...)?` on a non-string input or an
+    // invalid pattern still returns empty output (proving `?` itself works),
+    // but does so via the outer wrapper catching the arms below that ignore
+    // `optional`, not via these guards.
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),

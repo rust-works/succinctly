@@ -14117,6 +14117,66 @@ fn test_yq_sub_3arg_invalid_pattern_still_errors_1122() -> Result<()> {
     Ok(())
 }
 
+/// #1122/#1443: a non-string *pattern* still errors -- confirmed this is
+/// a real, pre-existing divergence from real yq (which coerces `1` to
+/// `"1"` and matches literally) shared by the whole regex builtin family
+/// in yq mode, tracked separately as #1443 rather than fixed here. Pinned
+/// as succinctly's current behaviour for this arity-3 path specifically.
+#[test]
+fn test_yq_sub_3arg_non_string_pattern_errors_1122() -> Result<()> {
+    let (_output, code) = run_yq_stdin(r#"sub(1; "X"; "g")"#, "\"a1c\"\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// #1122: a non-string *input* value errors, same as the shared jq/yq sub
+/// path -- `re_expr` is still evaluated against the input regardless of
+/// its type, so this arm is reached before any regex work happens.
+#[test]
+fn test_yq_sub_3arg_non_string_input_errors_1122() -> Result<()> {
+    let (_output, code) = run_yq_stdin(r#"sub("a"; "X"; "g")"#, "1\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
+/// #1122: `?` makes a non-string input a silent no-output rather than an
+/// error -- `?` itself is a succinctly extension (real yq's own parser
+/// rejects it as a lexer error). Per #693, `?` catches the `Error` this
+/// function returns at the outer `Expr::Optional` wrapper rather than
+/// making the function's own internal `optional` guard see `true` -- this
+/// pins the observable, extension-level behaviour, not that internal arm.
+#[test]
+fn test_yq_sub_3arg_non_string_input_optional_is_silent_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("a"; "X"; "g")?"#, "1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "");
+    Ok(())
+}
+
+/// #1122: `?` on an invalid regex *pattern* is likewise silent rather than
+/// an error, same #693 outer-wrapper mechanism as the non-`?` case above.
+#[test]
+fn test_yq_sub_3arg_invalid_pattern_optional_is_silent_1122() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub("["; "X"; "g")?"#, "\"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "");
+    Ok(())
+}
+
+/// #1122: an `error(...)` in `re_expr` itself, unlike `replacement`/
+/// `flags`, DOES propagate -- confirmed live this matches real yq (only
+/// the pattern is ever evaluated).
+#[test]
+fn test_yq_sub_3arg_error_in_pattern_propagates_1122() -> Result<()> {
+    let (_output, code) = run_yq_stdin(
+        r#"sub(error("boom"); "X"; "g")"#,
+        "\"abc\"\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    Ok(())
+}
+
 /// #1122: since `replacement`/`flags` are never evaluated at all (not
 /// "evaluated and discarded"), an `error(...)` in either position does
 /// not propagate -- confirmed live this is what real yq does (prints
