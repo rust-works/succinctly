@@ -1928,7 +1928,13 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 out.write_char('-')?;
                                 write_deferred_prefix(out, None, anchor, tag)?;
                                 out.write_char('\n')?;
-                                let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                                // Same "compact" rule as the non-anchored `else`
+                                // arm below: the value's own content aligns
+                                // under the `- ` prefix's width, not a full
+                                // indent step (#1362 -- the anchor/tag prefix
+                                // occupies the `- ` slot on its own line, but
+                                // that doesn't change how deep its value nests).
+                                let child_indent = compact_yaml_indent(indent);
                                 out.write_str(&child_indent)?;
                                 cursor.stream_yaml_value(
                                     out,
@@ -8308,6 +8314,26 @@ mod tests {
 
         let mut out = String::new();
         stream_yaml_sequence([cursor_a], &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "- &x\n  a: 1\n  b: 2");
+    }
+
+    #[test]
+    fn test_stream_yaml_sequence_item_anchor_deferred_value_uses_compact_width_at_non_default_indent_1362(
+    ) {
+        // #1362: at a non-default `--indent`, the anchor/tag deferred to its
+        // own line (`- &x\n  ...`) must not push its value a full indent
+        // step deeper -- it still occupies the `- ` slot, so the value nests
+        // exactly as deep as `compact_yaml_indent` puts a non-anchored
+        // element (2 columns), never `indent_spaces` columns. Verified
+        // against real yq v4.53.3, which puts `a` at column 6 here, not the
+        // pre-fix column 8 a bare `deeper_yaml_indent` step produced.
+        let yaml = b"- &x\n  a: 1\n  b: 2\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let mut out = String::new();
+        index
+            .root(yaml)
+            .stream_yaml_document(&mut out, IndentSpec::spaces(4), false)
+            .unwrap();
         assert_eq!(out, "- &x\n  a: 1\n  b: 2");
     }
 

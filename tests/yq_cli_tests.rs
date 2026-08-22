@@ -1994,6 +1994,36 @@ fn test_compact_seq_item_tab_self_consistent_nested_785() -> Result<()> {
     Ok(())
 }
 
+/// #1362: at a non-default `-I` width, a sequence item whose anchor sits on
+/// its own line (`- &x\n  ...`) must indent its value by the `- ` prefix's
+/// own 2-column width, not a full indent step — the anchor occupies that
+/// slot the same way a non-anchored element's first field would. Covers
+/// both the streaming path (plain identity) and the DOM path (forced via a
+/// write, `.c = 1`, since `map(.)` loses the anchor's `CommentTree` entry
+/// and so can't stand in as a DOM-forcer here). Expected output verified
+/// live against real yq v4.53.3.
+#[test]
+fn test_seq_item_anchor_deferred_indent_at_non_default_width_streaming_1362() -> Result<()> {
+    let yaml = "l:\n  - &x\n    p: 1\n  - *x\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, "l:\n    - &x\n      p: 1\n    - *x\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_seq_item_anchor_deferred_indent_at_non_default_width_dom_1362() -> Result<()> {
+    let yaml = "l:\n  - &x\n    p: 1\n  - *x\n";
+
+    let (dom, code) = run_yq_stdin(".c = 1", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom, "l:\n    - &x\n      p: 1\n    - *x\nc: 1\n");
+
+    Ok(())
+}
+
 /// `--tab`'s fix (#733) widened `can_stream_pretty`, which also covers
 /// `keys_unsorted` (part of `can_use_m2_streaming`) — not a duplicate-key
 /// case (keys_unsorted returns an array of key names, so nothing to

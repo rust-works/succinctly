@@ -2028,7 +2028,14 @@ fn emit_yaml_value_at_depth(
                             // `light.rs`, which real yq is pinned against
                             // (#763).
                             if let Some(anchor) = elem_comments.declared_anchor() {
-                                let val_indent = format!("{indent}{}", config.indent_str);
+                                // Same "compact" rule as the plain block-sequence
+                                // element below: the value's own content aligns
+                                // under the `- ` prefix's 2-column width, not a
+                                // full `config.indent_str` step (#1362 -- an
+                                // anchor on its own line still occupies that `- `
+                                // slot, so its value nests exactly as deep as an
+                                // unanchored element's would).
+                                let val_indent = format!("{indent}  ");
                                 let val = emit_yaml_value_at_depth(
                                     v,
                                     elem_comments,
