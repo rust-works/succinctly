@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
-use succinctly::jq::document::DocumentFields;
+use succinctly::jq::document::{collapsed_fields, effective_keys};
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
@@ -2214,8 +2214,12 @@ fn evaluate_input(
         // dispatch before it gets here — so this only fires for `keys`/
         // `keys_unsorted` alone, or piped into something else (`map`,
         // `select`, ...). Sort iff `sorted` (#683), matching eager `Keys`.
-        GenericResult::LazyKeys { fields, sorted } => {
-            let mut keys = fields.keys();
+        GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => {
+            let mut keys = effective_keys(&fields, collapse);
             if sorted {
                 keys.sort();
             }
@@ -2346,15 +2350,34 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // sorted `keys` result must never be routed there (#683) — it
         // materializes and sorts here instead, same as eager `Keys` always
         // did.
+        // #1385: a duplicate key would be emitted twice by the lazy
+        // writer, which streams raw key bytes without a collapse step. Probe
+        // first and stay lazy only when the object is clean -- a repeated
+        // key materializes the collapsed list instead, keeping the fast path
+        // for every ordinary document.
         GenericResult::LazyKeys {
             fields,
             sorted: false,
-        } => vec![JqValue::LazyKeysArray(fields)],
+            collapse,
+        } if !collapse || collapsed_fields(&fields).is_none() => {
+            vec![JqValue::LazyKeysArray(fields)]
+        }
+        GenericResult::LazyKeys {
+            fields,
+            sorted: false,
+            collapse,
+        } => vec![JqValue::from_owned(OwnedValue::Array(
+            effective_keys(&fields, collapse)
+                .into_iter()
+                .map(OwnedValue::String)
+                .collect(),
+        ))],
         GenericResult::LazyKeys {
             fields,
             sorted: true,
+            collapse,
         } => {
-            let mut keys = fields.keys();
+            let mut keys = effective_keys(&fields, collapse);
             keys.sort();
             vec![JqValue::from_owned(OwnedValue::Array(
                 keys.into_iter().map(OwnedValue::String).collect(),

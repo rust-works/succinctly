@@ -1920,10 +1920,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
     fn is_empty(&self) -> bool {
         JsonFields::is_empty(self)
     }
-
-    fn keys_dedup(&self) -> bool {
-        true
-    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {

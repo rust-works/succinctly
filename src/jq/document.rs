@@ -421,48 +421,20 @@ pub trait DocumentFields: Sized + Clone {
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 
-    /// Whether a repeated key collapses to one field (`true`) or every
-    /// occurrence is kept, distinct (`false`).
-    ///
-    /// Must agree with [`find`](Self::find)/[`find_cursor`](Self::find_cursor)'s
-    /// own per-format contract: JSON dedupes (`true`), YAML doesn't
-    /// (`false`) -- duplicate mapping keys are semantically distinct there.
-    /// Backs [`effective_fields`](Self::effective_fields) (#1170).
-    fn keys_dedup(&self) -> bool;
-
-    /// Walk every field, applying this format's own duplicate-key rule (see
-    /// [`keys_dedup`](Self::keys_dedup)): a deduping format collapses a
-    /// repeated key to its first position but *last*-seen value (#1170,
-    /// matching real jq's own `.foo`/`to_entries` behavior on duplicate
-    /// JSON keys); a non-deduping format keeps every occurrence, in
+    /// Walk every field, keeping every occurrence of a repeated key in
     /// document order.
     ///
-    /// The default implementation is the shared, format-agnostic algorithm;
-    /// individual formats only need to answer `keys_dedup`, not reimplement
-    /// the walk.
-    fn effective_fields(&self) -> Vec<DocumentField<Self::Value, Self::Cursor>> {
+    /// Callers that must honour the evaluation mode's duplicate-key rule
+    /// should use the free [`effective_fields`] instead; this is the raw
+    /// walk it builds on.
+    fn all_fields(&self) -> Vec<DocumentField<Self::Value, Self::Cursor>> {
+        let mut out = Vec::new();
         let mut fields = self.clone();
-        if !self.keys_dedup() {
-            let mut out = Vec::new();
-            while let Some((field, rest)) = fields.uncons() {
-                out.push(field);
-                fields = rest;
-            }
-            return out;
-        }
-        // `IndexMap::insert` on an existing key retains its original
-        // position but replaces the stored value -- exactly "first
-        // position, last value", so a plain walk-and-insert already
-        // implements the whole rule.
-        let mut by_key: IndexMap<String, DocumentField<Self::Value, Self::Cursor>> =
-            IndexMap::new();
         while let Some((field, rest)) = fields.uncons() {
-            if let Some(key) = field.key_str() {
-                by_key.insert(key.into_owned(), field);
-            }
+            out.push(field);
             fields = rest;
         }
-        by_key.into_values().collect()
+        out
     }
 
     /// Count the number of fields.
@@ -488,6 +460,134 @@ pub trait DocumentFields: Sized + Clone {
         }
         keys
     }
+}
+
+/// Above this many fields, duplicate detection sorts an index vector
+/// instead of comparing every pair.
+///
+/// Real objects are small, and below the threshold the pairwise loop needs
+/// no allocation beyond the borrowed key slice it already holds. The exact
+/// value is a tuning knob, not a correctness boundary -- both branches
+/// answer identically.
+const PAIRWISE_DUPLICATE_SCAN_LIMIT: usize = 16;
+
+/// Whether any key occurs more than once among already-walked fields.
+///
+/// Borrows the keys rather than owning them: [`DocumentField::key_str`]
+/// hands back a `Cow::Borrowed` for any key that needs no escape decoding,
+/// so the common case allocates only the index vector, and only above
+/// [`PAIRWISE_DUPLICATE_SCAN_LIMIT`].
+///
+/// A field whose key does not stringify at all (a YAML alias or complex
+/// key, where `key_str` answers `None`) never compares equal to anything,
+/// including another such field -- it cannot participate in a collapse
+/// because there is no name to collapse *on*.
+fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C>]) -> bool {
+    if fields.len() < 2 {
+        return false;
+    }
+    let keys: Vec<Option<Cow<'_, str>>> = fields.iter().map(|f| f.key_str()).collect();
+
+    if keys.len() <= PAIRWISE_DUPLICATE_SCAN_LIMIT {
+        for (i, a) in keys.iter().enumerate() {
+            let Some(a) = a else { continue };
+            if keys[i + 1..]
+                .iter()
+                .any(|b| b.as_ref().is_some_and(|b| b == a))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    let mut order: Vec<usize> = (0..keys.len()).filter(|&i| keys[i].is_some()).collect();
+    order.sort_unstable_by(|&a, &b| keys[a].as_deref().cmp(&keys[b].as_deref()));
+    order.windows(2).any(|w| keys[w[0]] == keys[w[1]])
+}
+
+/// Apply the evaluation mode's duplicate-key rule to an object's fields.
+///
+/// When `collapse` is false (yq, `--preserve-input`) every occurrence is
+/// kept, in document order. When true (jq) a repeated key collapses to its
+/// *first* position holding its *last* value -- see
+/// `EvalSemantics::COLLAPSE_DUPLICATE_KEYS` for the reference behaviour,
+/// and #1385 for why the rule sits on the mode axis rather than on this
+/// per-format trait, where it lived until ADR-0018 rule 2.
+///
+/// The rebuild runs only when a key actually repeats. That matters: the
+/// unconditional `IndexMap<String, _>` this replaced cost ~896 ns/field
+/// against a ~54 ns/field bare walk, because it allocated a `String` per
+/// key and stored a four-cursor `DocumentField` per entry whether or not
+/// the object had any duplicate at all.
+pub fn effective_fields<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Vec<DocumentField<F::Value, F::Cursor>> {
+    if !collapse {
+        return fields.all_fields();
+    }
+    let all = fields.all_fields();
+    if keys_repeat(&all) {
+        collapse_repeated(all)
+    } else {
+        all
+    }
+}
+
+/// The collapsed field list, or `None` when no key repeats.
+///
+/// Lets a caller keep whatever zero-allocation fast path it already has for
+/// the clean case -- the `LazyKeys` cons-list arms do exactly that -- and
+/// pay for a `Vec` only on an object that actually carries a duplicate.
+pub fn collapsed_fields<F: DocumentFields>(
+    fields: &F,
+) -> Option<Vec<DocumentField<F::Value, F::Cursor>>> {
+    let all = fields.all_fields();
+    if keys_repeat(&all) {
+        Some(collapse_repeated(all))
+    } else {
+        None
+    }
+}
+
+/// Collapse fields known to contain at least one repeated key.
+fn collapse_repeated<V: DocumentValue, C: DocumentCursor>(
+    all: Vec<DocumentField<V, C>>,
+) -> Vec<DocumentField<V, C>> {
+    // `IndexMap::insert` on an existing key retains its original position
+    // but replaces the stored value -- exactly "first position, last
+    // value", so a plain walk-and-insert already implements the whole rule.
+    let mut by_key: IndexMap<String, DocumentField<V, C>> = IndexMap::new();
+    for field in all {
+        if let Some(key) = field.key_str() {
+            let key = key.into_owned();
+            by_key.insert(key, field);
+        }
+    }
+    by_key.into_values().collect()
+}
+
+/// The field count an object presents under the mode's duplicate-key rule.
+///
+/// `collapse` false is the plain field count; true counts distinct keys.
+pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
+    if !collapse {
+        return fields.len();
+    }
+    effective_fields(fields, true).len()
+}
+
+/// An object's field names under the mode's duplicate-key rule, in
+/// document order (first position of each key).
+pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<String> {
+    if !collapse {
+        return fields.keys();
+    }
+    effective_fields(fields, true)
+        .iter()
+        .filter_map(|f| f.key_str().map(|k| k.into_owned()))
+        .collect()
 }
 
 /// A single field from an object.
