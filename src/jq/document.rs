@@ -396,6 +396,19 @@ pub trait DocumentValue: Sized + Clone {
         self.as_str()
     }
 
+    /// This value's raw source bytes when it is a string key whose span
+    /// needs no decoding -- byte-identical to what
+    /// [`key_string`](Self::key_string) would return.
+    ///
+    /// Lets the duplicate-key probe hash a key without decoding it (#1514);
+    /// see `ascii_key_hash` for why that substitution is sound. Defaults to
+    /// `None`, which sends the caller to `key_string`. JSON overrides it for
+    /// an escape-free string span; YAML does not -- yq keeps every
+    /// occurrence, so no probe runs there at all.
+    fn key_raw_unescaped(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Try to get as object fields.
     fn as_object(&self) -> Option<Self::Fields>;
 
@@ -528,34 +541,40 @@ pub trait DocumentFields: Sized + Clone {
     }
 }
 
-/// A 64-bit hash of a key, for grouping candidates cheaply.
+/// A 64-bit hash of a key, and whether every byte of it was ASCII.
 ///
-/// Mixes eight bytes per multiply rather than one, then runs a
-/// splitmix64 finalizer so the low bits [`KeyHashes`] indexes on are as
-/// well distributed as the high ones. No dependency and no `HashMap`
-/// (this module is `no_std` + `alloc`), and deterministic across runs.
+/// Mixes eight bytes per multiply rather than one, then runs a splitmix64
+/// finalizer so the low bits [`KeyHashes`] indexes on are as well
+/// distributed as the high ones. No dependency and no `HashMap` (this
+/// module is `no_std` + `alloc`), and deterministic across runs.
 ///
 /// Hash quality only affects *speed* -- every routine below resolves a
 /// shared hash by comparing the keys themselves, so a collision costs
 /// work, never a wrong answer.
-pub fn key_hash(key: &[u8]) -> u64 {
+///
+/// The ASCII flag rides the same loop: `high` accumulates every word and
+/// one test at the end reads its `0x80` bits, so there is no branch per
+/// word. [`ascii_key_hash`] is what needs it.
+fn key_hash_checked(key: &[u8]) -> (u64, bool) {
     const PRIME: u64 = 0x9e37_79b9_7f4a_7c15;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
     let mut acc = 0xcbf2_9ce4_8422_2325 ^ (key.len() as u64);
+    let mut high = 0u64;
     let mut chunks = key.chunks_exact(8);
     for chunk in &mut chunks {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
-        acc = (acc ^ u64::from_le_bytes(word))
-            .wrapping_mul(PRIME)
-            .rotate_left(31);
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(chunk);
+        let word = u64::from_le_bytes(bytes);
+        high |= word;
+        acc = (acc ^ word).wrapping_mul(PRIME).rotate_left(31);
     }
     let tail = chunks.remainder();
     if !tail.is_empty() {
-        let mut word = [0u8; 8];
-        word[..tail.len()].copy_from_slice(tail);
-        acc = (acc ^ u64::from_le_bytes(word))
-            .wrapping_mul(PRIME)
-            .rotate_left(31);
+        let mut bytes = [0u8; 8];
+        bytes[..tail.len()].copy_from_slice(tail);
+        let word = u64::from_le_bytes(bytes);
+        high |= word;
+        acc = (acc ^ word).wrapping_mul(PRIME).rotate_left(31);
     }
     // splitmix64 finalizer: without it the low bits carry too little of
     // the input, and `& mask` would cluster short keys into one run.
@@ -563,7 +582,50 @@ pub fn key_hash(key: &[u8]) -> u64 {
     acc = acc.wrapping_mul(0xff51_afd7_ed55_8ccd);
     acc ^= acc >> 33;
     acc = acc.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    acc ^ (acc >> 33)
+    (acc ^ (acc >> 33), high & HIGH_BITS == 0)
+}
+
+/// A 64-bit hash of a key, for grouping candidates cheaply.
+pub fn key_hash(key: &[u8]) -> u64 {
+    key_hash_checked(key).0
+}
+
+/// The hash of a key's *raw source span*, or `None` if the span is not
+/// pure ASCII.
+///
+/// A JSON key whose span carries no escape decodes to its own bytes, so
+/// hashing the span directly skips `JsonString::as_str`'s two extra scans
+/// (closing quote, then backslash) and its UTF-8 validation, plus the
+/// `Cow` around the result. On `wide/10mb` that decode is most of what the
+/// probe costs per key once the walk itself is gone (#1514).
+///
+/// The ASCII test is what makes the substitution *safe*, not just fast.
+/// Two guarantees have to hold, and ASCII gives both: an ASCII span is
+/// valid UTF-8, so [`DocumentValue::key_string`] would have answered
+/// `Some` with these exact bytes -- keeping the keyed/unkeyed split
+/// [`census`] counts on identical -- and equal decoded keys still hash
+/// equal, because a non-ASCII or escaped key takes the `key_string`
+/// fallback and can never decode to the same bytes as an ASCII span
+/// without being that span. It is free: [`key_hash_checked`] already
+/// computes it.
+fn ascii_key_hash(key: &[u8]) -> Option<u64> {
+    let (hash, ascii) = key_hash_checked(key);
+    ascii.then_some(hash)
+}
+
+/// The hash a field's key compares under, or `None` when the key does not
+/// stringify at all (a YAML alias or complex key, or a JSON escape that
+/// will not decode).
+///
+/// Prefers the raw span (see [`ascii_key_hash`]) and falls back to the
+/// decoded key, which is what every exact resolution downstream uses.
+fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, C>) -> Option<u64> {
+    if let Some(raw) = field.key.key_raw_unescaped() {
+        if let Some(hash) = ascii_key_hash(raw) {
+            return Some(hash);
+        }
+    }
+    field.key_str().map(|key| key_hash(key.as_bytes()))
 }
 
 /// An open-addressed set of key hashes: "has any key repeated?" in one
@@ -757,8 +819,8 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut unkeyed = 0usize;
     let mut walk = fields.clone();
     while let Some((field, rest)) = walk.uncons() {
-        match field.key_str() {
-            Some(key) => hashes.push(key_hash(key.as_bytes())),
+        match field_key_hash(&field) {
+            Some(hash) => hashes.push(hash),
             None => unkeyed += 1,
         }
         walk = rest;
@@ -787,9 +849,14 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut colliding: Vec<String> = Vec::new();
     let mut walk = fields.clone();
     while let Some((field, rest)) = walk.uncons() {
-        if let Some(key) = field.key_str() {
-            if shared.binary_search(&key_hash(key.as_bytes())).is_ok() {
-                colliding.push(key.into_owned());
+        // `field_key_hash` answers `Some` only for a key that stringifies,
+        // so the inner `key_str` is how the owned spelling is obtained
+        // here, not a second filter that could drop a counted field.
+        if let Some(hash) = field_key_hash(&field) {
+            if shared.binary_search(&hash).is_ok() {
+                if let Some(key) = field.key_str() {
+                    colliding.push(key.into_owned());
+                }
             }
         }
         walk = rest;
@@ -825,11 +892,9 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
         return false;
     }
     let mut seen = KeyHashes::with_capacity(fields.len());
-    fields.iter().any(|field| {
-        field
-            .key_str()
-            .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
-    })
+    fields
+        .iter()
+        .any(|field| field_key_hash(field).is_some_and(|hash| seen.insert(hash)))
 }
 
 /// Apply the evaluation mode's duplicate-key rule to an object's fields.
@@ -940,11 +1005,10 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
         }
         let (field, tail) = self.rest.uncons()?;
         self.rest = tail;
-        let repeat = self.seen.as_mut().is_some_and(|seen| {
-            field
-                .key_str()
-                .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
-        });
+        let repeat = self
+            .seen
+            .as_mut()
+            .is_some_and(|seen| field_key_hash(&field).is_some_and(|hash| seen.insert(hash)));
         if repeat {
             match collapsed_fields(&self.all) {
                 Some(fields) => {
@@ -1206,5 +1270,46 @@ mod key_hash_tests {
         // Perfectly uniform is 256 per bucket; allow a wide margin so this
         // pins "not degenerate", not the exact hash function.
         assert!(lo > 150 && hi < 400, "buckets {buckets:?}");
+    }
+}
+
+#[cfg(test)]
+mod raw_key_hash_tests {
+    use super::{ascii_key_hash, key_hash};
+
+    /// The raw-span shortcut must agree with the decoded path exactly, or
+    /// two spellings of one key would land in different buckets and the
+    /// probe would miss a real duplicate.
+    #[test]
+    fn ascii_key_hash_agrees_with_key_hash_1514() {
+        for key in [
+            &b""[..],
+            b"a",
+            b"key",
+            b"exactly8",
+            b"nine_char",
+            b"a rather longer key than one word",
+            b"k1234567",
+        ] {
+            assert_eq!(
+                ascii_key_hash(key),
+                Some(key_hash(key)),
+                "{:?}",
+                core::str::from_utf8(key)
+            );
+        }
+    }
+
+    /// A non-ASCII span declines the shortcut, so the caller falls back to
+    /// the decoded key. Without this the keyed/unkeyed split `census`
+    /// counts on could shift on input a validating parser would reject.
+    #[test]
+    fn ascii_key_hash_declines_non_ascii_1514() {
+        assert_eq!(ascii_key_hash("café".as_bytes()), None);
+        assert_eq!(ascii_key_hash("日本".as_bytes()), None);
+        assert_eq!(ascii_key_hash(&[b'a', 0x80, b'b']), None);
+        // The high byte in the *tail* word, past the 8-byte stride, is the
+        // case a chunk-only check would miss.
+        assert_eq!(ascii_key_hash("aaaaaaaaé".as_bytes()), None);
     }
 }
