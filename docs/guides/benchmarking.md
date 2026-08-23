@@ -159,6 +159,24 @@ GitHub Actions runs `rank_select` benchmarks on every PR/push for smoke testing:
 
 **Note**: CI does not run full benchmark suite (too time-consuming).
 
+**Perf Regression Guard** (issue #1523): a separate CI job measures `succinctly
+jq`/`yq` instruction counts via `valgrind --tool=cachegrind` (`scripts/perf-guard.py`)
+for a fixed query/shape matrix, and fails if any drifts more than 5% from the
+checked-in baseline (`tests/data/perf-guard-baseline.json`). Deterministic
+instruction counts, not wall-clock time, are what make a tight threshold viable on a
+shared, noisy CI runner — this exists because #1385's 2-3x regression shipped through
+`rank_select`-only smoke testing unnoticed. Runs on x86_64 and ARM64-Linux only
+(valgrind has no Apple Silicon support); currently a non-required check while it
+builds a track record. To deliberately update the baseline after a real, understood
+cost change:
+
+```bash
+cargo build --release --features cli
+scripts/perf-guard.py --binary target/release/succinctly --arch x86_64 --update-baseline
+```
+
+(run once per arch you can reach; state the reason in the commit message).
+
 ---
 
 ## How to Run Benchmarks
