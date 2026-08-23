@@ -1,0 +1,7 @@
+- id: 0
+  meta:
+    city: sydney
+    tier: 1
+  scores:
+    - 1
+    - 2
