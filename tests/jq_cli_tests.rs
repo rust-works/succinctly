@@ -19553,3 +19553,157 @@ fn test_halt_error_ordinary_code_unaffected_by_1408() -> Result<()> {
     assert_eq!(err, "msg");
     Ok(())
 }
+
+// =============================================================================
+// #1558: `--validate` (RFC 8259 strict validation before processing) had zero
+// test coverage in this file. `--validate` checks that the *whole input* is
+// exactly one JSON document -- it has no awareness of jq's own multi-value
+// stream semantics, so it rejects a perfectly valid multi-line/multi-value-
+// per-line jq input stream just as readily as it rejects malformed JSON;
+// `--slurp` combining several documents into one array happens *after*
+// validation, not instead of it. Confirmed live against this binary before
+// writing these down (succinctly-only flag; no jq/yq oracle to check against
+// -- this is #1385/#1520/#1547's own new RFC 8259 validator, not a
+// jq-compatibility surface).
+// =============================================================================
+
+#[test]
+fn test_validate_passes_through_a_single_valid_document_1558() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "{\"a\":1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_validate_reports_unterminated_object_1558() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(r#"{"a":1"#))?;
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "", "no output once validation fails");
+    assert!(
+        stderr.contains("validation error"),
+        "expected a validation error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("<stdin>"),
+        "stdin input should be labeled <stdin> in the error location: {stderr}"
+    );
+    Ok(())
+}
+
+/// `--validate` treats the whole input as exactly one RFC 8259 document, so
+/// a genuinely valid *jq* multi-value stream (two JSON values, one per line)
+/// still fails it -- `--validate` has no concept of jq's own multi-value
+/// parsing, only "is this one JSON text." Live-verified: the same input
+/// without `--validate` succeeds and produces two outputs.
+#[test]
+fn test_validate_rejects_a_valid_multi_value_stream_1558() -> Result<()> {
+    let input = "{\"a\":1}\n{\"b\":2}\n";
+
+    let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(input))?;
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("trailing content after JSON value"),
+        "expected a trailing-content error, got: {stderr}"
+    );
+
+    // Contrast: without --validate, the same two-value stream is accepted
+    // and produces one output per value, confirming the rejection above is
+    // specific to --validate's single-document rule, not a parser bug.
+    let (stdout2, stderr2, code2) = run_jq_full(&["-c", "."], Some(input))?;
+    assert_eq!(code2, 0, "stderr={stderr2}");
+    assert_eq!(stdout2, "{\"a\":1}\n{\"b\":2}\n");
+    Ok(())
+}
+
+/// A single JSON document stays valid under `--slurp` too -- `--slurp`'s
+/// array-wrapping happens after validation succeeds, it doesn't change what
+/// counts as "one document."
+#[test]
+fn test_validate_with_slurp_passes_a_single_document_1558() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "-s", "."], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "[{\"a\":1}]\n");
+    Ok(())
+}
+
+/// The issue's own repro, pinned as a regression test: two JSON values
+/// separated by a space on one line -- exactly the multi-value-per-line
+/// shape `--slurp` exists to combine -- still fails `--validate` before
+/// `--slurp` ever gets a chance to combine anything.
+#[test]
+fn test_validate_with_slurp_rejects_multi_value_per_line_1558() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--validate", "-c", "-s", "."],
+        Some("{\"a\":1} {\"b\":2}\n"),
+    )?;
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("trailing content after JSON value"),
+        "expected a trailing-content error, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Multi-file: an earlier file's validation failure stops before any later
+/// file is even read, and is labeled with that file's own name (not
+/// `<stdin>`) in the error location.
+#[test]
+fn test_validate_multi_file_first_invalid_stops_before_second_1558() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    writeln!(file1, r#"{{"bad""#)?;
+    let mut file2 = NamedTempFile::new()?;
+    writeln!(file2, r#"{{"ok":1}}"#)?;
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "--validate",
+            "-c",
+            ".",
+            file1.path().to_str().unwrap(),
+            file2.path().to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3);
+    assert_eq!(stdout, "", "no output from the second, never-reached file");
+    assert!(
+        stderr.contains(file1.path().to_str().unwrap()),
+        "error location should name the failing file, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Multi-file: a *later* file's validation failure does not discard output
+/// already produced for an earlier, valid file -- confirming per-file
+/// validation is interleaved with processing, not a whole-run pre-pass.
+#[test]
+fn test_validate_multi_file_second_invalid_keeps_first_files_output_1558() -> Result<()> {
+    let mut file1 = NamedTempFile::new()?;
+    writeln!(file1, r#"{{"ok":1}}"#)?;
+    let mut file2 = NamedTempFile::new()?;
+    writeln!(file2, r#"{{"bad""#)?;
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "--validate",
+            "-c",
+            ".",
+            file1.path().to_str().unwrap(),
+            file2.path().to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 3);
+    assert_eq!(
+        stdout, "{\"ok\":1}\n",
+        "the first file's valid output survives"
+    );
+    assert!(
+        stderr.contains(file2.path().to_str().unwrap()),
+        "error location should name the failing (second) file, got: {stderr}"
+    );
+    Ok(())
+}
