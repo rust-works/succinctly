@@ -1508,41 +1508,56 @@ impl ArgFanout {
 /// CLAUDE.md's #106 lesson ("duplicated predicates diverge silently — one
 /// definition, plus a test that the call sites agree") warns about (#1537).
 ///
-/// `trailing` is passed in — read, never written — because
-/// [`ArgFanout::FirstOnly`] has to reconcile the two against each other
-/// rather than gate the values alone; see its arm below (#1534).
+/// `trailing` is passed in — read, never written — because both yq gates
+/// have to reconcile the values against it rather than gate the values
+/// alone; see the shared escape arm below (#1534, #1533).
 fn apply_arg_fanout(
     fanout: ArgFanout,
     args: &mut Vec<OwnedValue>,
     trailing: &Option<Control>,
 ) -> Result<(), EvalError> {
     match fanout {
+        // jq's rule 1: every value is used, and the argument's own control
+        // fires *after* them (#1279). Only the yq gates below reconcile.
         ArgFanout::All => Ok(()),
-        // An escape anywhere in the argument takes the *whole* call down with
-        // no output at all -- it does not yield the first output and then
-        // raise. Live-verified against the pinned yq v4.53.3, which is the
-        // only mode this gate is reachable from (`ArgFanout::yq_native`):
+
+        // Both yq gates share one rule: an escape anywhere in the argument
+        // takes the whole call down, with no output and no substituted
+        // message of our own. Live-captured from the pinned yq v4.53.3:
         //
         //   $ printf 'a: 1\n' | yq 'has(("a","b", error("boom")))'
-        //   Error: boom            <- stderr; stdout is empty, exit 1
+        //   Error: boom      <- stderr only; stdout empty, exit 1
+        //   $ printf 'null'  | yq 'setpath((1,2,error("boom")); 1)'
+        //   Error: boom
         //
-        // and identically for `split`/`join`, the other two builtins gated
-        // here. succinctly used to print `true` (or the split/join result)
-        // to stdout *and* raise, because the truncation dropped the later
-        // values while the control they escaped through still fired (#1534).
+        // succinctly used to get each of these wrong in its own way, which
+        // is why they were filed separately but fix together here:
+        //
+        //   * `FirstOnly` truncated to the first *value* while the control
+        //     the later ones escaped through still fired, so it printed
+        //     `true` to stdout and *then* raised (#1534).
+        //   * `RejectMany` tested `args.len() > 1` before ever looking at
+        //     `trailing`, so a real `error(...)` was masked by the generic
+        //     "expected a single result but found 2" (#1533).
         //
         // Clearing the values rather than the control is what makes the
         // caller's own `match trailing` arm emit a bare `Error`/`Break`/
-        // `Halt`: `partial` normalizes an empty prefix down to one.
-        //
-        // The `trailing.is_none()` case still truncates, which is the gate's
-        // ordinary job -- `has(("a","b"))` is `true` in real yq, not an error.
+        // `Halt`: `partial` normalizes an empty prefix down to one. Doing it
+        // the other way round -- dropping the control -- would swallow an
+        // escape that happened *before* any output (`has(error("boom"))`),
+        // which both gates must still propagate.
+        ArgFanout::FirstOnly | ArgFanout::RejectMany if trailing.is_some() => {
+            args.clear();
+            Ok(())
+        }
+
+        // No escape: each gate does its ordinary job. `has(("a","b"))` is
+        // `true` in real yq, and `setpath((["a"],["b"]); 1)` is a count
+        // error. (succinctly's wording for that count error differs from
+        // yq's own `SETPATH: expected single path but found 2 results
+        // instead`; that gap predates #1279 and is out of scope here.)
         ArgFanout::FirstOnly => {
-            if trailing.is_some() {
-                args.clear();
-            } else {
-                args.truncate(1);
-            }
+            args.truncate(1);
             Ok(())
         }
         ArgFanout::RejectMany if args.len() > 1 => {
