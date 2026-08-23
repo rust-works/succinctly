@@ -29,8 +29,9 @@ processed — is closed, as is `halt_error`'s wrong exit code and the stderr lea
 `isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`, and — since Stage 4 — `IN(src; s)` and every
 other compare reached through a lazy consumer. **Six** shapes remain divergent, all pinned
 as such in `test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)`
-family: `first(.[] | stderr)` and `first((1,2) == (10, ("B"|stderr)))`, both a `first(...)`
-over a non-`Comma`, which Stage 2b's sibling walk does not reach — option (c), #1461. One is
+family: `first(.[] | stderr)` (see "Option (c), scoped" below) and
+`first((1,2) == (10, ("B"|stderr)))`, both a `first(...)` over a non-`Comma`, which Stage 2b's
+sibling walk does not reach — option (c), #1461. One is
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
 `eval_each` at all — #1481. The remaining **three** are Stage 5's own residual (#1462): an
 un-lazified `eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a
@@ -43,18 +44,32 @@ un-lazified `Expr::If`.
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
 (`isempty`/`limit`/`nth`/`any`/`all`/`IN` have no native arm in `eval_generic.rs` at all —
 see `first_over_comma_generic`'s own doc comment — so they already bridge into `eval.rs`'s
-`eval_each`-based lazy path and never needed this). #1451 widened
-`first_over_comma_generic` to recurse through a pipe's own prefix stages -- evaluating the
-prefix exactly once, then dispatching on every possible shape of that one result (a
-mutually-recursive `OwnedValue`-flavored twin, `first_over_comma_owned_generic`, handles the
-*computed*-value shapes -- `GenericResult::Owned`/`ManyOwned`, the common case for a
-literal/arithmetic leading stage -- since a bare `V`/cursor doesn't exist for those) without
-ever re-evaluating it. This closes `first(.[] | stderr)` too, not just the two narrower
-`Pipe`-composition shapes #1451 itself named, since a `Many`/`ManyCursor`/`ManyOwned`
-prefix's already-materialized values are tried against the tail one at a time, stopping at
-the first that yields anything -- real per-output backtracking, not just literal-shape
-composition, without needing the full generalized `Demand`/`Item`/`Flow` mirror this row
-originally called for.
+`eval_each`-based lazy path and never needed this). #1451 widened `first_over_comma_generic`
+to recurse through a pipe's own *2-stage* prefix: the leading stage is evaluated exactly
+once, then [`first_over_pipe_prefix_result`](../../src/jq/eval_generic.rs) dispatches on
+every possible shape of that one result (a mutually-recursive `OwnedValue`-flavored twin,
+`first_over_comma_owned_generic`, handles the *computed*-value shapes —
+`GenericResult::Owned`/`ManyOwned`/`Partial`, the common case for a literal/arithmetic
+leading stage — since a bare `V`/cursor doesn't exist for those) without ever re-evaluating
+it. This closes the two narrower `Pipe`-composition shapes #1451 itself named
+(`first(1 | (1, stderr))`, `first((1, stderr), 2)`).
+
+An earlier version of this fix additionally tried real per-output backtracking over a
+`Many`/`ManyCursor` (document-derived, e.g. `.[]`) prefix's already-materialized values —
+which would have also closed `first(.[] | stderr)` — but review (#1503) found this
+regressed two properties only a *whole, unsplit* pipe evaluation preserves:
+`eval_single`'s own multi-stage `ManyCursor` handling, which threads a cursor through the
+*entire* remaining pipe together rather than stage-by-stage (a `.[] | select(...) | line`
+query lost its `line` cursor under the per-value split), and `LazySeq`'s own #724/#725
+composability (`first(map(f) | .[0])` started forcing full materialization instead of
+short-circuiting). Both regressions trace to the same root cause: splitting a pipe into an
+eagerly-evaluated prefix plus a separately-dispatched tail is only safe when the prefix is a
+*single* value (nothing to lose by handling it apart from the rest of the pipe) — a
+`Many`/`ManyCursor`/`LazyKeys`/`LazyIndexRange`/`LazySeq` prefix is deferred back to the
+existing whole-pipe fallback instead (safe to redo, since none of those shapes have run any
+side effect yet), leaving `first(.[] | stderr)` a known, still-pinned divergence rather than
+a second, deeper thing option (c) closes. The full generalized `Demand`/`Item`/`Flow` mirror
+this row originally called for remains the only way to close it soundly — filed as **#1461**.
 
 **One correction this document earned the hard way.** Stage 2 shipped an
 `eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
@@ -543,6 +558,20 @@ Each checked against the oracle. "already correct" means succinctly matches jq t
 | `Reduce`/`Foreach`                         | no                         | `reduce` has one output; `foreach`'s #534 fork machinery is a non-goal                                  |
 | **`Compare`**                              | **yes — for #932**         | Stage 4; see below                                                                                      |
 | **`Builtin::PathsFilter`**                 | **yes — for #987**         | Stage 3                                                                                                 |
+
+**A caveat Stage 5 needs to carry, not just `eval.rs`.** Every `first(...)`-based example
+in the table above is a bare CLI call — and, per "Option (c), scoped" above, the CLI's
+`first`/`last` never reach `eval.rs`'s `eval_each` at all (`eval_generic.rs`'s own native
+`Expr::FirstExpr`/`LastExpr` arm intercepts first, kept cursor-preserving for #607).
+Widening `eval_each`'s native arm set to cover `If`/`Try`/`Label`/`AsPattern`/`FuncCall`
+will *not*, by itself, close any of the `first(...)`-shaped rows above through the CLI —
+`first_over_comma_generic`/`first_over_comma_owned_generic` (`eval_generic.rs`) fall back to
+one eager `eval_single`/`eval_on_owned` call for exactly this fallback-shape residual
+(see [`try_lazy_first_generic`](../../src/jq/eval_generic.rs)'s own doc comment), same as
+before Stage 5. Closing these for the CLI needs the identical widening applied a second
+time there, or `first`/`last` no longer shadowing `eval.rs` for these shapes specifically --
+worth folding into **#1462**'s own scope rather than rediscovering as a surprise gap once
+that issue's `eval.rs` half ships.
 
 **Honest scoping of #932.** `builtin_upper_in` (`:3759`) synthesizes
 `gen = Expr::Compare { Eq, src, s }` for the `IN(src; s)` form and hands it to
