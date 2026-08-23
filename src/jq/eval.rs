@@ -2954,10 +2954,13 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // jq's own `path()` is lazy end to end, never evaluates the trailing
     // `halt_error`, and raises its "Invalid path expression" instead:
     //
-    //     path(1 == (if true then (1, ("x"|halt_error(3))) else empty end))
+    //     path(1 == (foreach (1,2,3) as $x (null; $x;
+    //         if $x==1 then $x else ("x"|halt_error(3)) end)))
     //         jq       exit 5, the path error       (nothing on stderr)
-    //         this     exit 5, the path error       (stray `x`: Stage 5)
-    //     path((if true then (1, ("x"|halt_error(3))) else empty end) == 1)
+    //         this     exit 5, the path error       (stray `x`: `foreach`
+    //                                                 has no Stage 5 arm)
+    //     path((foreach (1,2,3) as $x (null; $x;
+    //         if $x==1 then $x else ("x"|halt_error(3)) end)) == 1)
     //         jq       exit 5, the path error
     //         this     exit 3, the halt wins        <- inner keeps `pending`
     //
@@ -2965,8 +2968,16 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // by accident; both rows are pinned in
     // `test_short_circuit_side_effect_leaks_820_932_987`. Preserving the
     // outer `pending` instead would move the first row back to exit 3, away
-    // from jq. The residual `x` on both is Stage 5's (`Expr::If` has no lazy
-    // arm), not this loop's.
+    // from jq.
+    //
+    // The example above uses `foreach` rather than `if`: this asymmetry
+    // needs an operand that still falls back to eager `eval_single`, and
+    // Stage 5 (#1462) gave `Expr::If` its own native lazy arm, so an
+    // `if`-wrapped `halt_error` no longer reaches this eager fallback at
+    // all -- both such rows now agree with jq outright (moved into
+    // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
+    // `foreach` has no Stage 5 arm and still falls back the same way this
+    // comment always meant to illustrate.
     abort.unwrap_or(outer)
 }
 

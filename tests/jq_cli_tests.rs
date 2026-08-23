@@ -18244,6 +18244,48 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "BCAA",
             0,
         ),
+        // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry -------
+        // (code review, #1462): `resolve_leaf` is the one consumer that
+        // reads `Flow::Stopped`'s `pending`, and this pair pins the
+        // left/right asymmetry that falls out of `binary_fanout_each`'s
+        // `abort.unwrap_or(outer)` -- an already-triggered `Halt` an eager
+        // fallback operand raised survives from the INNER (left) operand and
+        // is dropped from the OUTER (right) one. The original pair pinning
+        // this (an `if`-wrapped `halt_error`) stopped demonstrating it once
+        // Stage 5 gave `Expr::If` a native lazy arm -- `if` no longer falls
+        // back to eager `eval_single` at all, so `halt_error` is never
+        // reached and both rows now agree with jq (moved into
+        // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
+        // `foreach` has no Stage 5 arm and still falls back the same way, so
+        // it reproduces the identical asymmetry live.
+        //
+        // Right operand (outer): pending dropped, so the path error wins --
+        // jq's own exit code and message, plus the stray `x` this eager
+        // fallback still leaks (jq's own `path()` never evaluates the
+        // trailing `halt_error` at all).
+        (
+            &[
+                "-cn",
+                r#"path(1 == (foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)))"#,
+            ],
+            None,
+            "",
+            "xjq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
+        // Left operand (inner): pending kept, so the already-triggered halt
+        // wins and the path error is never raised. jq: exit 5, same message
+        // as the row above.
+        (
+            &[
+                "-cn",
+                r#"path((foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)) == 1)"#,
+            ],
+            None,
+            "",
+            "x",
+            3,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
