@@ -64,8 +64,8 @@ jobs:
   # Required-context jobs (Test x86/ARM/macOS, Clippy, Format, Documentation)
   # always run so their contexts always report `success`; on the fast path every
   # step is skipped, which is a genuine passing job — not a `skipped` conclusion
-  # whose branch-protection semantics vary. Non-required jobs (bench, coverage)
-  # below skip wholesale via a job-level `if`.
+  # whose branch-protection semantics vary. Non-required jobs (bench, coverage,
+  # perf-guard) below skip wholesale via a job-level `if`.
   test-x86:
     name: Test (x86_64)
     needs: gate
@@ -362,7 +362,7 @@ jobs:
   # above stays on `stable` so we don't triple CI minutes. `beta` gates CI;
   # `nightly` is advisory (`continue-on-error`) because it is the flakiest. Not a
   # required status context, so it skips wholesale on the docs-only fast path
-  # (job-level `if`, like bench/coverage) rather than run-and-skip-steps. Also
+  # (job-level `if`, like bench/coverage/perf-guard) rather than run-and-skip-steps. Also
   # skipped on `merge_group` (#310): it is advisory, not required, so running it
   # per queue entry would just add latency to every merge without gating it.
   test-x86-upstream:

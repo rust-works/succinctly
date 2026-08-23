@@ -45,6 +45,20 @@ Fixtures are generated fresh each run (`succinctly json generate --seed
 without growing the repo -- generation is deterministic per pattern/seed, so
 the *content* measured is stable run to run.
 
+Known scope limits, deliberate for this minimum-viable-set v1 rather than
+oversights -- worth revisiting once this guard has a track record:
+
+- One fixed size (2mb) per query, not a scaling curve across sizes. Catches
+  the #1514 shape (a regression visible at a realistic size) but not one
+  that only shows up at a different scale.
+- The CI job builds with `cargo build --release --features cli`, which does
+  not enable the `simd` feature -- so a regression confined to
+  `BalancedParens`'s SIMD-accelerated rank/select index build (`src/trees/
+  bp.rs`'s NEON/SSE4.1 L1/L2 index builders, gated behind `feature = "simd"`)
+  or `src/bits/popcount.rs`'s explicit intrinsics is invisible here, the same
+  split `bench`'s own default/simd/portable-popcount 3-way matrix exists to
+  separate for `rank_select`.
+
 Standard library only; no third-party dependencies.
 """
 
@@ -66,7 +80,9 @@ FIXTURE_SEED = 20260101
 # (id, generate-pattern, size, mode, filter) -- ids are the baseline file's
 # keys, so renaming one here orphans its old baseline entry (caught by
 # `--check`'s own "missing baseline entry" error) rather than silently
-# comparing against the wrong row.
+# comparing against the wrong row. Several rows share a (pattern, size) --
+# `measure_all` below generates each distinct (pattern, size) fixture once
+# and reuses it, rather than regenerating an identical file per row.
 QUERIES = [
     ("wide_keys_unsorted", "wide", "2mb", "jq", "keys_unsorted"),
     ("wide_identity", "wide", "2mb", "jq", "."),
@@ -80,12 +96,35 @@ IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
 
 DEFAULT_THRESHOLD = 5.0
 
+# argparse wants a plain string for `epilog`; keeping it as a real constant
+# (not a slice of `__doc__`) means reflowing the module docstring above can
+# never silently truncate or misplace `--help` output.
+EPILOG = (
+    "The query/shape matrix is #1523's own \"minimum viable set\": #1514's two "
+    "regressions were complementary and each was invisible to the other's own "
+    "signal (one showed only in a `wide`-shaped `keys_unsorted` query, the "
+    "other only in a plain `.` identity query and would have looked like an "
+    "*improvement* under `keys_unsorted` alone) -- so this covers both queries "
+    "against both a `wide` (many top-level keys, no nesting) and a `users` "
+    "(typical small-record) shape, plus an `arrays` shape (no objects, "
+    "isolates whether a regression is object-specific) and one `yq`-mode "
+    "query (the shared evaluator's cost is otherwise unverified in yq mode "
+    "at all)."
+)
+
+
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
+    return value
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="CI instruction-count regression guard for succinctly jq/yq.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__.split("\n\n", 1)[1],
+        epilog=EPILOG,
     )
     p.add_argument("--binary", required=True, help="path to the succinctly binary (release build)")
     p.add_argument("--baseline", default="tests/data/perf-guard-baseline.json",
@@ -98,7 +137,8 @@ def parse_args(argv=None):
     p.add_argument("--valgrind-bin", default="valgrind", help="path to valgrind")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                     help="max allowed instruction-count drift, in percent")
-    p.add_argument("--reps", type=int, default=3, help="measurement repetitions per query (median reported)")
+    p.add_argument("--reps", type=positive_int, default=3,
+                    help="measurement repetitions per query (median reported)")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="compare against the baseline; exit 1 on drift")
     mode.add_argument("--update-baseline", action="store_true", help="overwrite the baseline file")
@@ -106,10 +146,10 @@ def parse_args(argv=None):
 
 
 def generate_fixture(binary, pattern, size, seed, out_path):
-    subprocess.run(
-        [binary, "json", "generate", size, "-p", pattern, "-s", str(seed), "-o", out_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
-    )
+    cmd = [binary, "json", "generate", size, "-p", pattern, "-s", str(seed), "-o", out_path]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        sys.exit(f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}")
 
 
 def run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path):
@@ -121,28 +161,80 @@ def run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path):
             f"--cachegrind-out-file={cg_out}",
             binary, mode, filter_expr, fixture_path,
         ]
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # `--log-file` captures valgrind's own diagnostics; the *traced*
+        # binary's stderr is separate and captured too (not discarded) so a
+        # failure -- the traced binary erroring on a query it always used to
+        # handle, for instance -- reports why, not just an opaque nonzero
+        # exit. `LC_ALL=C` pins cachegrind's number formatting so a locale
+        # change on the runner can't silently alter how IR_PATTERN below
+        # needs to parse it.
+        env = {**os.environ, "LC_ALL": "C"}
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        if result.returncode != 0:
+            sys.exit(
+                f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}"
+            )
+        # A query that silently starts producing no output (a bug that
+        # changes correctness, not just cost) would look exactly like a
+        # legitimate speedup -- catch that before the instruction count is
+        # ever trusted, rather than only checking the exit code.
+        if not result.stdout.strip():
+            sys.exit(
+                f"'{' '.join(cmd)}' exited 0 but produced no output -- refusing to trust "
+                f"its instruction count (a correctness regression can look exactly like a "
+                f"speedup)"
+            )
+        if not os.path.exists(log):
+            sys.exit(f"'{' '.join(cmd)}' exited 0 but wrote no cachegrind log at {log}")
         with open(log) as f:
             text = f.read()
-        if result.returncode != 0:
-            sys.exit(f"'{' '.join(cmd)}' exited {result.returncode}; cachegrind log:\n{text}")
         m = IR_PATTERN.search(text)
         if not m:
             sys.exit(f"could not find instruction count in cachegrind output:\n{text}")
         return int(m.group(1).replace(",", ""))
 
 
-def measure_query(args, query_id, pattern, size, mode, filter_expr):
+def measure_query(valgrind_bin, binary, mode, filter_expr, fixture_path, reps):
+    counts = [
+        run_cachegrind_once(valgrind_bin, binary, mode, filter_expr, fixture_path)
+        for _ in range(reps)
+    ]
+    # `statistics.median` returns a float for an even-length input (the
+    # average of the two middle values) but an int for odd-length -- round
+    # to a plain int either way so the baseline file's schema doesn't flip
+    # between int/float purely as a side effect of --reps's parity.
+    return round(statistics.median(counts))
+
+
+def measure_all(binary, valgrind_bin, reps):
+    """Generate each distinct (pattern, size) fixture exactly once -- several
+    `QUERIES` rows share one, and regenerating an identical file per row
+    would be pure waste -- then measure every query against its fixture.
+    Returns {query_id: median instruction count}."""
     with tempfile.TemporaryDirectory() as tmp:
-        # `yq` accepts JSON input directly (auto-detects by content), so every
-        # fixture is plain JSON regardless of which CLI mode measures it.
-        fixture_path = os.path.join(tmp, f"{query_id}.json")
-        generate_fixture(args.binary, pattern, size, FIXTURE_SEED, fixture_path)
-        counts = [
-            run_cachegrind_once(args.valgrind_bin, args.binary, mode, filter_expr, fixture_path)
-            for _ in range(args.reps)
-        ]
-    return statistics.median(counts)
+        fixture_paths = {}
+        for _, pattern, size, _, _ in QUERIES:
+            shape = (pattern, size)
+            if shape not in fixture_paths:
+                # `succinctly json generate` always writes JSON; the `.json`
+                # extension matters for the `yq`-mode query above -- `yq`'s
+                # input-format auto-detection is by file extension, not
+                # content sniffing, so this is what makes it resolve to JSON
+                # rather than falling through to YAML's own default.
+                path = os.path.join(tmp, f"{pattern}_{size}.json")
+                generate_fixture(binary, pattern, size, FIXTURE_SEED, path)
+                fixture_paths[shape] = path
+
+        measured = {}
+        print(f"{'query':<26} {'instructions':>16}")
+        print("-" * 44)
+        for query_id, pattern, size, mode, filter_expr in QUERIES:
+            ir = measure_query(valgrind_bin, binary, mode, filter_expr, fixture_paths[(pattern, size)], reps)
+            measured[query_id] = ir
+            print(f"{query_id:<26} {ir:>16,.0f}")
+            sys.stdout.flush()
+        print()
+    return measured
 
 
 def load_baseline_file(path):
@@ -150,7 +242,11 @@ def load_baseline_file(path):
     if not os.path.exists(path):
         return {}
     with open(path) as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError as e:
+            sys.exit(f"{path} is not valid JSON ({e}) -- a stale conflict marker from a bad "
+                     f"rebase/merge, or a truncated write?")
 
 
 def save_baseline_file(path, data):
@@ -171,6 +267,8 @@ def main(argv=None):
         )
     if not os.path.exists(args.binary):
         sys.exit(f"binary not found: {args.binary}")
+    if not os.access(args.binary, os.X_OK):
+        sys.exit(f"binary is not executable: {args.binary} (lost its execute bit in transit?)")
 
     # Fail fast on a missing/incomplete baseline before running any of the
     # (expensive, cachegrind-instrumented) measurements below. Instruction
@@ -189,15 +287,7 @@ def main(argv=None):
                 f"-- run with --update-baseline first (and commit the result)."
             )
 
-    measured = {}
-    print(f"{'query':<26} {'instructions':>16}")
-    print("-" * 44)
-    for query_id, pattern, size, mode, filter_expr in QUERIES:
-        ir = measure_query(args, query_id, pattern, size, mode, filter_expr)
-        measured[query_id] = ir
-        print(f"{query_id:<26} {ir:>16,.0f}")
-        sys.stdout.flush()
-    print()
+    measured = measure_all(args.binary, args.valgrind_bin, args.reps)
 
     if args.update_baseline:
         baseline_file[args.arch] = measured
@@ -228,10 +318,13 @@ def main(argv=None):
         for query_id, drift in failed:
             print(f"  {query_id}: {drift:+.1f}%")
         print()
-        print("If this is a real, understood regression (e.g. new correctness work that "
-              "genuinely costs more), re-run with --update-baseline and say why in the "
-              "commit message. If it's unexpected, that's exactly what this guard exists "
-              "to catch -- see docs/guides/benchmarking.md for how to investigate.")
+        print("A drift in either direction fails: a genuine improvement needs the same "
+              "conscious baseline update as a regression, so a stale baseline can't quietly "
+              "keep passing. If this is real and understood (new correctness work that "
+              "genuinely costs more, or an optimization that genuinely costs less), re-run "
+              "with --update-baseline and say why in the commit message. If it's unexpected, "
+              "that's exactly what this guard exists to catch -- see "
+              "docs/guides/benchmarking.md for how to investigate.")
         return 1
 
     print("OK: all queries within threshold")
