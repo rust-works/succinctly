@@ -21,7 +21,7 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
 | 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
 | 5     | Widen the lazy arm set                              | ✅ merged — closes #1462    |
-| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | 🟡 partial — #1451, rest #1461 |
+| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ✅ merged — #1451, #1461    |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
