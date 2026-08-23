@@ -1467,6 +1467,12 @@ fn get_inputs(
             .collect(),
     );
 
+    // `--slurp`'s single combined value has no content of its own to name a
+    // line in -- jq instead names the *last source*'s own newline count at
+    // EOF (#1520), computed here from `raw_inputs` while it's still whole,
+    // before either branch below consumes it.
+    let slurp_eof_line = raw_inputs.last().map_or(0, |(_, raw)| newline_count(raw));
+
     // jq -R -s: the entire input (all files concatenated) becomes a single
     // string; no line splitting and no array wrap.
     if args.raw_input && args.slurp && args.input_dsv.is_none() {
@@ -1474,9 +1480,10 @@ fn get_inputs(
         for (_, raw) in &raw_inputs {
             combined.push_str(raw);
         }
-        // One value spanning everything: jq names its last content line.
-        locations.push(0, content_lines(&combined));
-        return Ok(Ok((vec![OwnedValue::String(combined)], locations)));
+        return Ok(Ok((
+            vec![OwnedValue::String(combined)],
+            InputLocations::single(locations.slurp_eof(slurp_eof_line)),
+        )));
     }
 
     // Process based on input mode
@@ -1547,12 +1554,9 @@ fn get_inputs(
 
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
-        // One value covering every input: jq names the line the last of them
-        // ended on.
-        let last = locations.last();
         Ok(Ok((
             vec![OwnedValue::Array(values)],
-            InputLocations::single(last),
+            InputLocations::single(locations.slurp_eof(slurp_eof_line)),
         )))
     } else {
         Ok(Ok((values, locations)))
@@ -1561,10 +1565,22 @@ fn get_inputs(
 
 /// 1-based number of the last line carrying content.
 ///
-/// What jq's marker reports for modes that collapse the whole input into one
-/// value (`-R -s`): a trailing newline does not open a new line.
+/// Used only as `extend_from_ends`'s ends/values-mismatch fallback -- *not*
+/// what `--slurp` reports at EOF (#1520 found that assumption wrong; see
+/// [`newline_count`] instead, which is what jq's own marker actually counts
+/// there).
 fn content_lines(raw: &str) -> usize {
     raw.lines().count().max(1)
+}
+
+/// Number of `\n` bytes in `raw` -- what jq's own `(at ...)` marker counts
+/// for `--slurp`'s single combined value (#1520), once every input is
+/// exhausted. Unlike [`content_lines`], an empty input and one with content
+/// but no trailing newline both count as `0` here, matching jq (oracle-
+/// verified: an empty file and a `"1 2"`-with-no-newline file both report
+/// line `0`, where `content_lines` would report `1` for the latter).
+fn newline_count(raw: &str) -> usize {
+    raw.bytes().filter(|&b| b == b'\n').count()
 }
 
 /// Exclusive end offsets of the RS-delimited records in a `--seq` stream.
@@ -1670,11 +1686,6 @@ impl InputLocations {
         }
     }
 
-    /// Location of the last value, or `<unknown>` if there were none.
-    fn last(&self) -> InputLocation {
-        self.get(self.per_value.len().saturating_sub(1))
-    }
-
     /// Location of the value at `idx`.
     pub fn get(&self, idx: usize) -> InputLocation {
         match self.per_value.get(idx) {
@@ -1739,6 +1750,20 @@ impl InputLocations {
             Some(&(src, line)) if src == last_src => (last_src, line),
             _ => (last_src, 0),
         })
+    }
+
+    /// Where `--slurp`'s single combined value's `(at ...)` marker points
+    /// (#1520): the last source on the command line, at `eof_line` -- that
+    /// source's own newline count ([`newline_count`]).
+    ///
+    /// The same "last source" rule as [`exhausted`](Self::exhausted), but
+    /// slurp collapses every input into one value up front, so there is no
+    /// per-value table afterward to fall back on the way `exhausted` does --
+    /// the caller must compute `eof_line` directly from the last source's
+    /// raw text before it's consumed, and pass it in.
+    fn slurp_eof(&self, eof_line: usize) -> InputLocation {
+        let last_src = self.files.len().saturating_sub(1) as u32;
+        self.resolve(last_src, eof_line as u32)
     }
 }
 
