@@ -20,6 +20,12 @@ The `yq` command provides YAML querying using jq-compatible syntax. It supports 
 | Multi-document support    | Fully implemented | 100%     |
 | Anchors/aliases           | Fully implemented | 95%      |
 
+"All jq features" means the full jq language is available; a subset of jq's
+*builtins* that real yq's own lexer rejects (`paths`, `getpath`, `limit`,
+`gsub`/`scan`/`splits`, `leaf_paths`, etc.) is off by default and requires
+`--jq-extensions` — see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)
+below.
+
 ---
 
 ## Performance
@@ -244,22 +250,23 @@ confirmed against yq v4.53.3):
 echo '"aaa"' | succinctly yq 'sub("a"; "X")'
 # "XXX" — every match replaced (unlike succinctly jq's identical-syntax "Xaa")
 
-echo '"aaa"' | succinctly yq 'gsub("a"; "X")'
+echo '"aaa"' | succinctly yq --jq-extensions 'gsub("a"; "X")'
 # "XXX" — same result for a non-zero-width pattern like this one
 ```
 
 `gsub` (any arity), `scan`, and `splits` are not real yq builtins at all — real yq's own
 lexer rejects them outright (confirmed live against yq v4.53.3, #1436). succinctly's `gsub`
-support in yq mode is therefore a succinctly-only convenience, not a verified match against
-an oracle that has nothing to compare against — and, as of #1255 below, it's no longer a
-strict synonym for bare `sub` even internally: a **zero-width-capable** pattern (`a*`,
-`x?`, `""`) makes the two diverge, since bare `sub` picks up #1255's real-yq-verified
-Go-`regexp` iteration while `gsub` deliberately keeps the original jq/Oniguruma-style
-iteration (there being no oracle for `gsub` to match instead):
+support in yq mode is therefore a succinctly-only convenience, gated behind
+`--jq-extensions` since #1512 (see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)
+below) rather than a verified match against an oracle that has nothing to compare against —
+and, as of #1255 below, it's no longer a strict synonym for bare `sub` even internally: a
+**zero-width-capable** pattern (`a*`, `x?`, `""`) makes the two diverge, since bare `sub`
+picks up #1255's real-yq-verified Go-`regexp` iteration while `gsub` deliberately keeps the
+original jq/Oniguruma-style iteration (there being no oracle for `gsub` to match instead):
 
 ```bash
-echo '"bab"' | succinctly yq 'sub("a*"; "X")'    # "XbXbX"  (Go-style, matches real yq)
-echo '"bab"' | succinctly yq 'gsub("a*"; "X")'   # "XbXXbX" (jq/Oniguruma-style, unchanged)
+echo '"bab"' | succinctly yq 'sub("a*"; "X")'                     # "XbXbX"  (Go-style, matches real yq)
+echo '"bab"' | succinctly yq --jq-extensions 'gsub("a*"; "X")'    # "XbXXbX" (jq/Oniguruma-style, unchanged)
 ```
 
 **Resolved (#1122):** the 3-arg `sub(re; s; flags)` form doesn't fit jq's
@@ -350,6 +357,44 @@ succinctly yq 'at_offset(10)' config.yaml
 succinctly yq 'at_position(5; 3)' config.yaml
 ```
 
+### Gated jq Builtins (--jq-extensions)
+
+Real yq's own lexer rejects a chunk of the jq language outright — these
+builtins have no yq token at all, confirmed live against yq v4.53.3. Rather
+than silently accepting broader syntax than the reference it's meant to
+match, `succinctly yq` rejects them too by default (a parse error naming
+`--jq-extensions`); passing the flag opts back into the jq-compatible
+surface (#1512):
+
+| Builtin                                           | Description                               |
+|---------------------------------------------------|-------------------------------------------|
+| `paths`, `paths(f)`, `leaf_paths`                 | Paths to every node / every leaf node     |
+| `getpath(path)`                                   | Value at a path array                     |
+| `tostream`, `fromstream(f)`, `truncate_stream(f)` | Streaming event representation            |
+| `IN(s)`, `IN(src; s)`                             | Membership test                           |
+| `ltrimstr(s)`                                     | Strip a leading string prefix             |
+| `limit(n; f)`                                     | First `n` outputs of `f`                  |
+| `isempty(f)`                                      | True if `f` produces no output            |
+| `debug`, `debug(msg)`                             | Print to stderr, pass value through       |
+| `infinite`, `isnan`                               | IEEE 754 infinity literal / NaN test      |
+| `gsub(re; s)`, `scan(re)`, `splits(re)`           | Not real yq builtins at any arity (#1436) |
+
+```bash
+echo '{}' | succinctly yq 'paths'
+# Error: parse error: ... "paths" is not part of yq's syntax; pass --jq-extensions ...
+
+echo '{"a":1}' | succinctly yq --jq-extensions -o=json 'paths'
+# ["a"]
+```
+
+Real yq's own extensions (`sub`, `split`, the merge-flag suffixes on `*`/`*=`,
+date/time and format encoders above) are unaffected — they're already yq
+surface, not part of this gate. `leaf_paths` is a succinctly-only invention
+modeled on a jq community recipe (real jq itself rejects it too, see the
+[jq Language Reference](jq-language.md#succinctly-extensions)); it's grouped
+here because, from `succinctly yq`'s syntax-surface point of view, it's the
+same kind of thing as the rest of this table — extra, off by default.
+
 ---
 
 ## CLI Options
@@ -365,6 +410,7 @@ succinctly yq 'at_position(5; 3)' config.yaml
 | `--doc N`             | Select Nth document (0-indexed)                  |
 | `--eval-all`, `--ea`  | Combine docs/files into one eval context (below) |
 | `--front-matter MODE` | Extract/process YAML front matter (below)        |
+| `--jq-extensions`     | Accept jq-only builtins yq's lexer lacks (above) |
 
 ### Output Options
 
