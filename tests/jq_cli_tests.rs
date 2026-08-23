@@ -5457,9 +5457,16 @@ fn test_path_context_fanout_preserves_output_before_break_or_error_715() -> Resu
 /// updated path when *they* have a non-empty `rest` to recurse into, so
 /// isolating them first meant `rest` always saw the stale path (#1409).
 /// Fixed by combining each branch with `rest` into one recursive call
-/// instead (`,` distributes over `|` in jq, live-verified against jq
-/// 1.7.1), so `Field`/`Iterate` inside `rest` build `new_path` in the same
-/// call chain as the branch that produced their input.
+/// instead, so `Field`/`Iterate` inside `rest` build `new_path` in the same
+/// call chain as the branch that produced their input. This relies on `,`
+/// distributing over `|` in jq (`(a, b) | rest` is `(a | rest), (b |
+/// rest)`) -- live-verified against real jq 1.7.1 using plain constructs
+/// with no path-context builtins (e.g. `(1, error("x")) | tostring` vs.
+/// `(1|tostring), (error("x")|tostring)`), since that identity is what the
+/// fix depends on. `key`/`parent` themselves have no real-jq equivalent
+/// (succinctly extensions), so every assertion *in this test* pins
+/// internal consistency against that already-verified identity, not a
+/// separate oracle claim about `key` specifically.
 #[test]
 fn test_comma_path_context_threads_per_output_path_1409() -> Result<()> {
     // The issue's own repro: `.[]` isolated inside a comma used to report
@@ -5495,6 +5502,35 @@ fn test_comma_path_context_threads_per_output_path_1409() -> Result<()> {
     )?;
     assert_eq!(stdout, "0\n1\n2\n");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
+/// Side effect of combining each branch with `rest` (#1409 code review):
+/// a later branch's own body (including any of its own side effects) is
+/// no longer entered at all once an earlier branch's combined
+/// `branch | rest` recursion has already stopped on an error -- unlike the
+/// old isolate-then-continue shape, which always fully evaluated *every*
+/// branch (running its side effects) before `rest` was ever applied to
+/// any of them. Live-verified this matches real jq's own generator
+/// semantics for the identical shape with a plain (non-path-context)
+/// value in place of `key`: `(1, ("m"|stderr)) | if .==1 then error("x")
+/// else . end` prints no `m` in jq 1.7.1 either, since jq's own pipe
+/// never visits a later comma branch once an earlier one already failed
+/// downstream.
+#[test]
+fn test_comma_path_context_skips_unreached_later_branch_side_effects_1409() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[".a | (.[], (\"MARKER_RAN\" | stderr)) | if . == 2 then error(\"boom\") else key end"],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("MARKER_RAN"),
+        "the never-reached second branch's stderr side effect must not fire: {stderr}"
+    );
     assert_eq!(code, 5);
 
     Ok(())
