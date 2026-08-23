@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Lazy generator consumers
 
-**Status: Stages 1, 2, 2b, 3 and 4 implemented; Stage 5 open.** This document is the
+**Status: Stages 1, 2, 2b, 3, 4 and 5 implemented.** This document is the
 deliverable for [#820](https://github.com/rust-works/succinctly/issues/820), which its
 own tier review (2026-08-20) classified Tier 3 — "evaluator-architecture change, design
 doc first, in the shape of #1282". It also scopes the two issues that name #820 as their
@@ -20,25 +20,39 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | —     | `eval_each_pipe`'s owned-value arm (Stage 2 gap)    | ✅ merged — PR #1450        |
 | 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
 | 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
-| 5     | Widen the lazy arm set                              | ⬜ open — #1462             |
+| 5     | Widen the lazy arm set                              | ✅ merged — closes #1462    |
 | (c)   | Mirror the sink into `eval_generic` for `Pipe`      | 🟡 partial — #1451, rest #1461 |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
 processed — is closed, as is `halt_error`'s wrong exit code and the stderr leak in
 `isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`, and — since Stage 4 — `IN(src; s)` and every
-other compare reached through a lazy consumer. **Six** shapes remain divergent, all pinned
-as such in `test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)`
-family: `first(.[] | stderr)` (see "Option (c), scoped" below) and
-`first((1,2) == (10, ("B"|stderr)))`, both a `first(...)` over a non-`Comma`, which Stage 2b's
-sibling walk does not reach — option (c), #1461. One is
+other compare reached through a lazy consumer. Since Stage 5, `eval_each` also carries native
+`If`, `Try`/`Optional`, `Label`, `As`, `AsPattern` and `Limit` arms, closing the
+demand-forwarding gap for a generator nested inside any of them (`isempty(limit(3; 1,
+("B"|stderr)))`, `isempty(if true then (1,("B"|stderr)) else 9 end)`, and the rest of the
+family the same shape). **Three** shapes remain divergent, all pinned as such in
+`test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)` family:
+`first(.[] | stderr)` (see "Option (c), scoped" below) and
+`first((1,2) == (10, ("B"|stderr)))`, both a `first(...)` over a
+non-`Comma`, which Stage 2b's sibling walk does not reach — option (c), #1461. This is a
+*separate* obstacle from Stage 5's own arms: a bare `first(...)`/`last(...)` never even
+reaches `eval.rs` for a non-`Comma` argument, because `eval_generic.rs`'s own native
+`first`/`last` routing intercepts it first (confirmed live while implementing Stage 5, below);
+`isempty`, `limit`, `nth`, `path`, `any`, `all` and `IN` have no such native `eval_generic` arm
+and so reach every one of Stage 5's new arms correctly. The third divergent shape is
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
-`eval_each` at all — #1481. The remaining **three** are Stage 5's own residual (#1462): an
-un-lazified `eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a
-side effect for a node's own filter when that filter's shape isn't one of
-`Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — that is the `path(paths(if ...))` row, plus
-the `path(... halt_error ...)` pair Stage 4 added, whose stray `x` on stderr is the same
-un-lazified `Expr::If`.
+`eval_each` at all — #1481.
+
+**One divergence Stage 5's own oracle sweep found and did not attempt.** `?//`-alternatives
+wrapped in a short-circuiting consumer: real jq's builtins are macro-expanded `label $out |
+... break $out` definitions, and its `?//` operator retries the next alternative on *any*
+escaping break, including one addressed to a label entirely outside the `?//` — so
+`isempty(1 as $x ?// $y | 5)` is `false` **twice** in real jq (a three-alternative chain,
+three times), where succinctly's native, non-macro-expanded `?//` resolution always answers
+once. Confirmed pre-existing (unaffected by Stage 5's changes) and orthogonal to this
+document's own scope — filed as [#1519](https://github.com/rust-works/succinctly/issues/1519)
+rather than folded in.
 
 **Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
@@ -835,7 +849,7 @@ pass it through via their existing `other => other` fallthrough — is unaffecte
 | 2b    | one narrowing arm in `eval_generic.rs`                                                                                                        | 1                       |
 | 3     | `Builtin::PathsFilter` lazy arm                                                                                                               | 2                       |
 | 4     | demand-aware outer loop                                                                                                                       | 3                       |
-| 5     | 6 more lazy arms                                                                                                                              | `eval_each` only        |
+| 5     | six new arms (`each_if`, `each_try`, `each_label`, `each_as`, `each_as_pattern`, `each_pattern_alternatives`, `each_limit`) + one inline arm  | `eval_each` only        |
 
 ### What does **not** change
 
@@ -928,9 +942,15 @@ Must preserve #910's live-verified nested-loop order. Own oracle sweep. **Implem
 as `binary_fanout_each` (the loop, sink-driven) plus `binary_fanout_core` (the eager
 collecting wrapper, behaviourally unchanged) and an `Expr::Compare` arm in `eval_each`.
 
-**Stage 5 — widen the arm set.** `If`, `Try`/`Optional`, `Label`, `AsPattern`, `FuncCall`,
-and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`. One divergence-table row per
-arm; each independently mergeable and measurable.
+**Stage 5 — widen the arm set.** Closes #1462. **Implemented** as six new native arms —
+`each_if`, `each_try` (also reached from `Expr::Optional`), `each_label`, `each_as` (the
+bare-`$var` bind node the parser actually builds for `EXPR as $x | body`), `each_as_pattern`
+(its destructuring/`?//` sibling, `Expr::AsPattern`) and `each_limit` (`Expr::Limit`'s own
+demand-*forwarding* gap) — plus one inline arm for `Expr::FuncDef` (pure AST substitution via
+the existing `expand_func_calls`, then `eval_each` on the expanded tree — no new function
+needed). `Expr::FuncCall` and `Expr::FirstExpr`/`NthExpr` turned out to need no arm at all; see
+[Follow-up issues](#follow-up-issues) for why, and for two more findings its own oracle sweep
+made along the way.
 
 **Option (c) — mirror the sink into `eval_generic`.** Originally scoped for
 `first(.[] | stderr)`. #1309 gave it two more owners, both now pinned in
@@ -1137,13 +1157,38 @@ the reasoning behind each placement:
    Left and right therefore answer differently, deliberately: both rows are pinned in
    `test_short_circuit_side_effect_leaks_820_932_987`, and `Flow::Stopped`'s own doc
    comment now records this as its one stated exception.
-7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
-   `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Filed **#1462**,
-   which re-rates it Medium rather than the low-priority tail this document predicted: the
-   wrappers destroy `input` documents, they do not merely leak stderr.
-   One issue, not one per arm: each is a single lazy arm now that the primitive exists.
-   Under ADR-0018 rule 6 these are divergences, so they need either a fix or entries in
-   `docs/compliance/jq/limitations.md`.
+7. **Stage 5** — widen the lazy arm set. Filed **#1462**, which re-rated it Medium rather
+   than the low-priority tail this document predicted: the wrappers destroy `input`
+   documents, they do not merely leak stderr. **Implemented** as `each_if`, `each_try`
+   (shared by `Expr::Try` and `Expr::Optional`), `each_label`, `each_as` (`Expr::As`, the
+   bare-`$var` bind node), `each_as_pattern` (`Expr::AsPattern`, its destructuring/`?//`
+   sibling) and `each_limit` (`Expr::Limit`, the one arm needed purely for
+   demand-*forwarding* — `FirstExpr`/`NthExpr` needed none, since both already emit at most
+   one downstream output and Stage 2's `each_take_first`/`each_take_nth` already drive that
+   through their own `eval_each` call). `Expr::FuncDef` needed no new function at all: it is
+   pure AST substitution (`expand_func_calls`), so routing the expanded tree through
+   `eval_each` instead of `eval_single` is the whole fix. `Expr::FuncCall` needed no arm
+   either — `eval_func_call` is unconditionally `"undefined function"`, since every real call
+   is resolved by `FuncDef`'s substitution before evaluation ever reaches it.
+
+   **Two things this stage's own oracle sweep found that the original plan didn't
+   anticipate.** (i) The parser builds `Expr::As`, not `Expr::AsPattern`, for the bare-`$var`
+   form — the plan's own `first(1 as $x | (1,("B"|stderr)))` repro is therefore an `Expr::As`
+   case, and needed `each_as` specifically; `AsPattern`/`each_as_pattern` covers only
+   destructuring and `?//`-chains. (ii) Every repro in this section's own divergence table
+   wraps its generator in a bare `first(...)`, but `eval_generic.rs`'s native `first`/`last`
+   routing intercepts a bare `first(...)`/`last(...)` before it ever reaches `eval.rs`'s
+   `eval_each` — so **none of Stage 5's new arms is reachable through a bare
+   `first(...)`/`last(...)` at the CLI**; that gap is option (c)/#1461, not this stage. Every
+   other short-circuiting consumer (`isempty`, `limit`, `nth`, `path`, `any`, `all`, `IN`) has
+   no such native `eval_generic` arm and reaches Stage 5's new arms correctly — confirmed via
+   `isempty(...)`-wrapped CLI tests instead.
+
+   **One divergence found and deliberately not attempted**: `?//`-alternatives wrapped in a
+   short-circuiting consumer re-run once per alternative in real jq (a macro-expansion/`?//`
+   retry-on-break interaction, unrelated to demand-forwarding) but not in succinctly. Confirmed
+   pre-existing, unaffected by this stage, and a materially larger design question — filed
+   separately as **#1519** rather than folded in.
 8. **Option (c)** — mirror `Demand`/`Item`/`Flow` into `eval_generic.rs` for
    `Comma`/`Pipe`/`Paren`. Filed **#1461**, also Medium for the same reason (`first(1 | (1,
    input))` consumes documents), with the narrower `first_over_comma_generic` gap it sits
