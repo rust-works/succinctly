@@ -180,9 +180,6 @@
 #                  to the ~16 builtins that still report a bare "no value".
 
 
-sub_re_replacement_fanout_order            fanout-order     sub(re; str): re outer, replacement inner — #1279
-sub_re_flags_replacement_fanout_order      fanout-order     sub(re; str; flags): re outer, flags middle, replacement innermost — #1279
-gsub_replacement_transpose_absence_padded  fanout-order     gsub's multi-output replacement transposes, padded by absence not null — #840/#1279
 
 delpaths_own_error_outranks_trailing_halt  eager-argument   exit code and stdout now match jq; the residual is stderr — succinctly evaluates the whole argument generator up front, so halt_error's own output leaks even though jq never reaches it — #820
 

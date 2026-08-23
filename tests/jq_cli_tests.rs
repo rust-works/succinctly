@@ -8288,36 +8288,47 @@ fn test_sub_with_flags_global_replacement_wrong_type_errors() -> Result<()> {
     Ok(())
 }
 
-/// `eval_sub_replacement`'s multi-output stopgap (#826): a replacement
-/// filter that yields more than one value for a single match (a real jq
-/// feature -- jq 1.7.1 forks the whole `sub`/`gsub` call, producing one
-/// whole-string output per replacement value, verified live: `jq -c
-/// 'sub("a"; "x","y")'` on `"abc"` prints `"xbc"` then `"ybc"`) is not fully
-/// implemented here; `eval_sub_replacement` instead takes the first value,
-/// via `result_to_owned`'s policy, matching what the pre-#826 code already
-/// did when it pre-evaluated the whole replacement once. This is a
-/// deliberate, documented divergence (see that function's doc comment and
-/// follow-up #840), not a golden-fixture case (there is no single jq output
-/// to pin against). What this test guards against is a *regression* off
-/// that stopgap: earlier in #826's own review cycle, routing the
-/// per-match evaluation through `eval_owned_expr` (which array-collapses a
-/// multi-output filter) turned this into a hard type-mismatch error instead.
+/// A replacement filter that yields more than one value for a single match
+/// forks the whole `sub`/`gsub` call, one whole-string output per value:
+/// `jq -c 'sub("a"; "x","y")'` on `"abc"` prints `"xbc"` then `"ybc"`.
+///
+/// This test used to assert only `"xbc"`, pinning the #826 stopgap where
+/// `eval_sub_replacement` took the first value via `result_to_owned`. #1279
+/// replaced that with `stitch_replacement_rows`, closing the #840 divergence.
+/// It still guards the regression #826's own review cycle hit: routing the
+/// per-match evaluation through a helper that array-collapses a multi-output
+/// filter turns this into a hard type-mismatch error instead.
 #[test]
-fn test_sub_replacement_multi_value_takes_first_value() -> Result<()> {
+fn test_sub_replacement_multi_value_forks_the_call_840() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"sub("a"; "x","y")"#], Some(r#""abc""#))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"xbc\"\n");
+    assert_eq!(stdout, "\"xbc\"\n\"ybc\"\n");
     Ok(())
 }
 
-/// `gsub` counterpart to the test above, routed through
-/// `stitch_replacements_evaluated` rather than `builtin_sub_with_flags`'s
-/// single-match arm -- a distinct call site for the same stopgap (#826).
+/// `gsub` counterpart, and the case that shows the fork is a **transpose**
+/// rather than a cross product: two matches each yielding two values give two
+/// outputs (`"xx"`, `"yy"`), not four. Row *k* takes each match's *k*-th
+/// value, so the values line up positionally across matches.
 #[test]
-fn test_gsub_replacement_multi_value_takes_first_value() -> Result<()> {
+fn test_gsub_replacement_multi_value_transposes_840() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"gsub("a"; "x","y")"#], Some(r#""aa""#))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "\"xx\"\n");
+    assert_eq!(stdout, "\"xx\"\n\"yy\"\n");
+
+    // Uneven lists are padded by *absence*, not by null: the shorter match
+    // contributes nothing to the rows past its own length, dropping its own
+    // preceding gap along with its text. `"a-b"` with `a -> ("1","2")` and
+    // `b -> "9"` gives `["1-9","2"]` -- row 1 is `"2"`, not `"2-"`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"[gsub("(?<c>[ab])"; if .c=="a" then ("1","2") else "9" end)]"#,
+        ],
+        Some(r#""a-b""#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"1-9\",\"2\"]\n");
     Ok(())
 }
 

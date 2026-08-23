@@ -11062,72 +11062,98 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re: &JqRegex,
     caps: &regex::Captures,
     optional: bool,
-) -> Result<Option<OwnedValue>, QueryResult<'a, W>> {
+) -> Result<Vec<OwnedValue>, QueryResult<'a, W>> {
     let captures = capture_object(re, caps);
-    // `eval_owned_input` never returns a bare `QueryResult::Many` -- its own
-    // body converts every borrowed `Many` to `ManyOwned` before returning --
-    // so only `None`/`ManyOwned([])` need checking here, not `Many([])`.
-    let materialized =
-        eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
-    let stream_is_empty = matches!(&materialized, QueryResult::None)
-        || matches!(&materialized, QueryResult::ManyOwned(vs) if vs.is_empty());
-    if stream_is_empty {
-        return Ok(None);
-    }
+    // Every output, not just the first (#1279): jq drains this match's
+    // replacement generator completely before moving on, and the per-match
+    // lists are then transposed -- see `stitch_replacement_rows`. An empty
+    // stream is a legitimate answer here (`Ok(vec![])`), not an error: #840's
+    // rule that a zero-output replacement drops the match's own text *and* its
+    // preceding gap.
+    //
     // #1034: no type check here -- any successfully-evaluated value is
     // returned as-is. jq's real `sub`/`gsub` (`src/builtin.jq`) never checks
     // the replacement's type either; it hands the raw value straight to
     // `$gap + $inserts[$ix]`, so a non-string replacement surfaces jq's own
     // `+`-operator wording (`"string (...) and number (...) cannot be
-    // added"`) rather than a bespoke message. The callers below (which
-    // already hold the gap text) are what perform that `+`, via `arith_add`.
-    result_to_owned(materialized).map(Some).map_err(Into::into)
+    // added"`) rather than a bespoke message. `stitch_replacement_rows`
+    // (which holds the gap text) is what performs that `+`, via `arith_add`.
+    let materialized =
+        eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
+    let (values, trailing) = stream_outputs(materialized);
+    if let Some(control) = trailing {
+        return Err(partial(Vec::new(), control));
+    }
+    Ok(values)
 }
 
-/// Replace every match in `matches` (already trailing-newline-aware, e.g.
-/// from `global_captures`) within `input`, re-evaluating `replacement_expr`
-/// against each match's own captures (see [`eval_sub_replacement`]). Mirrors
-/// `Regex::replace_all`, but driven by a match list computed ourselves — see
-/// `stitch_split`'s doc comment for why — and by a real per-match jq
-/// evaluation rather than a static template string.
+/// Apply `replacement_expr` at every match and produce **one output string per
+/// transposed row** (#1279).
 ///
-/// Implements jq's all-matches-empty rule (#840, see `eval_sub_replacement`):
-/// if every match produces a zero-output replacement, `input` is returned
-/// completely unchanged rather than with every match individually deleted.
-/// Tracked with a running flag instead of a separate up-front pass, so this
-/// stays a single loop over `matches` -- see `combine_sub_gap`'s doc comment
-/// for why a single loop matters (#1034 review).
+/// jq drains each match's replacement generator completely, in match order,
+/// before producing anything; the per-match lists are then transposed. Row
+/// count is the longest list, and a match with no *k*-th output contributes
+/// nothing to row *k* — dropping its own text **and its own preceding gap**,
+/// which is why the gap is baked into each cell rather than added later.
+/// Live-verified against the pinned jq 1.7.1:
+///
+/// ```text
+/// "ab"    | [gsub("(?<c>[ab])"; if .c=="a" then ("1","2","3") else ("8","9") end)]
+///   => ["18","29","3"]
+/// "aXbXc" | [gsub("(?<c>[ab])"; if .c=="a" then ("1","2","3") else "9" end)]
+///   => ["1X9Xc","2Xc","3Xc"]        <- row 1 loses b's "X" gap with b's cell
+/// ```
+///
+/// The trailing text after the last match is appended to every row.
+///
+/// Zero rows — no matches at all, or every match's replacement empty — means a
+/// single output: the input unchanged. That is #840's rule, and it also covers
+/// non-global `sub`, which reaches this with a one-element `matches`.
+///
+/// Errors abort at the match that produced them, before any later match's
+/// replacement is evaluated at all — #1050's ordering, preserved because
+/// `combine_sub_gap` runs inside this loop rather than over a completed table.
 #[cfg(feature = "regex")]
-fn stitch_replacements_evaluated<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     replacement_expr: &Expr,
     re: &JqRegex,
     input: &str,
     matches: &[regex::Captures],
     optional: bool,
-) -> Result<String, QueryResult<'a, W>> {
-    let mut out = String::with_capacity(input.len());
+) -> Result<Vec<String>, QueryResult<'a, W>> {
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(matches.len());
     let mut last_end = 0;
-    let mut any_nonempty = false;
     for caps in matches {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
-        let replacement = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
-        // A zero-output match drops both its own text and its own preceding
-        // gap (jq 1.7.1, verified) -- distinct from the all-empty case,
-        // resolved below once every match has been considered.
-        if let Some(replacement) = replacement {
-            any_nonempty = true;
-            let gap = &input[last_end..m.start()];
-            out.push_str(&combine_sub_gap::<W, S>(gap, replacement)?);
+        let outputs = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
+        let gap = &input[last_end..m.start()];
+        let mut cell = Vec::with_capacity(outputs.len());
+        for replacement in outputs {
+            cell.push(combine_sub_gap::<W, S>(gap, replacement)?);
         }
+        cells.push(cell);
         last_end = m.end();
     }
-    if !any_nonempty {
-        return Ok(input.to_string());
+
+    let rows = cells.iter().map(Vec::len).max().unwrap_or(0);
+    if rows == 0 {
+        return Ok(vec![input.to_string()]);
     }
-    out.push_str(&input[last_end..]);
-    Ok(out)
+    let tail = &input[last_end..];
+    Ok((0..rows)
+        .map(|row| {
+            let mut out = String::with_capacity(input.len());
+            for cell in &cells {
+                if let Some(piece) = cell.get(row) {
+                    out.push_str(piece);
+                }
+            }
+            out.push_str(tail);
+            out
+        })
+        .collect())
 }
 
 /// Combine a `sub`/`gsub` match's preceding gap text with its (already
@@ -11639,57 +11665,25 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let is_bare_sub = S::TAG == EvalTag::Yq && flags.is_none();
     let global = flags.is_some_and(|f| f.contains('g')) || is_bare_sub;
 
-    if global {
-        let matches = if is_bare_sub {
+    // Both arities share one stitcher (#1279): non-global `sub` is the
+    // one-match case of the same transpose, and its two former special cases
+    // fall out of it -- no match at all, and a zero-output replacement on the
+    // only match, both reach `rows == 0` and yield the input unchanged. The
+    // replacement is still never evaluated when nothing matched, since the
+    // loop has no match to evaluate it for.
+    let matches: Vec<regex::Captures> = if global {
+        if is_bare_sub {
             global_captures::<YqSemantics>(&re, &input)
         } else {
             global_captures::<JqSemantics>(&re, &input)
-        };
-        return match stitch_replacements_evaluated::<W, S>(
-            replacement_expr,
-            &re,
-            &input,
-            &matches,
-            optional,
-        ) {
-            Ok(result) => QueryResult::Owned(OwnedValue::String(result)),
-            Err(qr) => qr,
-        };
-    }
-
-    // Replace first match. `replacement_expr` is evaluated once, only if
-    // there is a match — jq never evaluates the replacement when nothing
-    // matched (and there is no capture object to bind `.` to in that case).
-    match re.captures(&input) {
-        Some(caps) => {
-            let m = caps
-                .get(0)
-                .expect("capture group 0 is always present on a match");
-            let replacement =
-                match eval_sub_replacement::<W, S>(replacement_expr, &re, &caps, optional) {
-                    Ok(r) => r,
-                    Err(qr) => return qr,
-                };
-            match replacement {
-                // #1034: gap + replacement via `combine_sub_gap`, same
-                // reasoning as `stitch_replacements_evaluated`.
-                Some(replacement) => {
-                    match combine_sub_gap::<W, S>(&input[..m.start()], replacement) {
-                        Ok(mut out) => {
-                            out.push_str(&input[m.end()..]);
-                            QueryResult::Owned(OwnedValue::String(out))
-                        }
-                        Err(qr) => qr,
-                    }
-                }
-                // The single-match specialization of the all-matches-empty
-                // rule `stitch_replacements_evaluated` implements for gsub
-                // (#840): a zero-output replacement on the one match `sub`
-                // ever considers leaves the input unchanged.
-                None => QueryResult::Owned(OwnedValue::String(input)),
-            }
         }
-        None => QueryResult::Owned(OwnedValue::String(input)),
+    } else {
+        re.captures(&input).into_iter().collect()
+    };
+
+    match stitch_replacement_rows::<W, S>(replacement_expr, &re, &input, &matches, optional) {
+        Ok(rows) => owned_vec_to_result(rows.into_iter().map(OwnedValue::String).collect()),
+        Err(qr) => qr,
     }
 }
 

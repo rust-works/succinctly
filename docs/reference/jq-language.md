@@ -349,15 +349,14 @@ Two precedence divergences from jq remain:
 
 **Note:** Array slicing with steps (`.[::2]`) is intentionally not supported - it's Python syntax, not jq. Use `[range(0; length; 2) as $i | .[$i]]` instead.
 
-**Multi-output expressions in non-fanout positions** parse but don't fan out
-the way jq does. Some silently take only the first output: `"\(1,2)"`,
-`{a: (1,2)}`, and `select(.==1, .==3)` (the condition's second branch is
-never evaluated) all yield one result where jq yields one per output. Others
-error instead of fanning out: `range(1,2; 4)` reports `Range bounds must be
-numeric` and a computed object key `{(("a","b")): 1}` reports `key must be a
-string`, rather than jq's one result per output. Before #462 several of these
-were parse errors rather than wrong answers, since the comma could not be
-written without parens.
+**Multi-output expressions fan out** the way jq does. This was a standing
+limitation for a long time — some positions silently took only the first
+output, others reported an error instead — and every case that section named is
+now fixed and pinned by a golden: string interpolation `"\(1,2)"` (#1403),
+object values `{a: (1,2)}` (#354), computed object keys `{(("a","b")): 1}`,
+`select(.==1, .==3)` (#378), `range(1,2; 4)` and every other generator-argument
+builtin (#1279). Before #462 several of these were parse errors rather than
+wrong answers, since the comma could not be written without parens.
 
 **Computed keys in brackets** (#360) accept any expression, but two jq behaviours are not reproduced:
 
@@ -372,7 +371,7 @@ A *negated* literal looks like an exception and is not one: `path(.[-1.0])` is `
 
 A **float slice bound keeps its own spelling** too, matching jq (#1326, following #1088): `path(.[1.5:3.5])` is `[{"start":1.5,"end":3.5}]`, not the resolved `[{"start":1,"end":4}]` — each bound is reported *as written*, independently of the other (`path(.[1.5:3])` is `[{"start":1.5,"end":3}]`). This holds for a literal bound, a whole-valued one (`.[1.0:3.0]`), a dynamic one (`.[$a:$b]`), and an open bound (`.[-1.5:]` is `[{"start":-1.5,"end":null}]`) alike. The same negation caveat as the index case applies — `path(.[-1.0:-3.0])`'s whole-valued bounds render bare (`-1`/`-3`), not `.0`-suffixed, since negation already destroyed their literal spelling before the slice was built; a *non-whole* negated bound (`.[-1.5:-3.5]`) still keeps its `.5`. The slice itself is unaffected either way — every spelling above still reads `[2,3,4]`.
 
-A computed key **after a multi-output path component** — `path(.. | .[.k])`, `path(recurse | .[.k])`, `path(.. | objects | .[.k])` — resolves per branch, same as `path(.[] | .[.k])` (#412: `..` and bare `recurse` share one resolver, `recurse(f)`/`recurse(f; cond)` follow the value path's stack, and the typeof filters (`select`, `objects`, `arrays`, `values`, ...) each got a path-tracking arm). A multi-output component with none of those shapes — an arbitrary generator like `range(3)`, or `getpath` with a computed argument — is still refused, since naming the path components it produces would mean tracking components for a genuinely arbitrary expression; bare in `path(...)` this reports the same `Invalid path expression with result <v>` wording (#891) real jq itself uses, naming the first output (jq's own per-output check never even learns whether a second output would have existed) — used as an assignment *target* for further indexing, jq instead uses its "near attempt to access element ... of ..." wording, not yet reproduced here (#989).
+A computed key **after a multi-output path component** — `path(.. | .[.k])`, `path(recurse | .[.k])`, `path(.. | objects | .[.k])` — resolves per branch, same as `path(.[] | .[.k])` (#412: `..` and bare `recurse` share one resolver, `recurse(f)`/`recurse(f; cond)` follow the value path's stack, and the typeof filters (`select`, `objects`, `arrays`, `values`, ...) each got a path-tracking arm). `getpath` with a multi-output argument resolves per output too, since #1279 gave `resolve_node`'s `GetPath` arm one branch per output: `path(getpath((["a"],["b"])))` is `["a"]` then `["b"]`, and writes through it (`|=`, `=`, `del`) reach both. A multi-output component with none of those shapes — an arbitrary generator like `range(3)` — is still refused, since naming the path components it produces would mean tracking components for a genuinely arbitrary expression; bare in `path(...)` this reports the same `Invalid path expression with result <v>` wording (#891) real jq itself uses, naming the first output (jq's own per-output check never even learns whether a second output would have existed) — used as an assignment *target* for further indexing, jq instead uses its "near attempt to access element ... of ..." wording, not yet reproduced here (#989).
 
 `recurse(f)` for an `f` that keeps yielding null stops rather than descending, matching `[recurse(f)]` and bounding a walk jq does not bound at all: `recurse(.a?)` over `{"a":null}` reads null from null forever, and jq runs until it cannot allocate. In the other direction, `[recurse(f)]` descends into an array `f` returns where jq stops at the array itself; in a *path* context succinctly stops at the array, i.e. follows jq rather than its own value path.
 
