@@ -103,7 +103,8 @@ pub use expr::{
 };
 pub use lazy::JqValue;
 pub use parser::{
-    parse, parse_program, parse_program_with_mode, parse_with_mode, ParseError, ParserMode,
+    parse, parse_program, parse_program_with_mode, parse_program_with_mode_and_extensions,
+    parse_with_mode, parse_with_mode_and_extensions, ParseError, ParserMode,
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{

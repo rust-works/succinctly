@@ -1123,7 +1123,7 @@ fn test_duplicate_json_key_to_entries_preserves_1398() -> Result<()> {
 #[test]
 fn test_yq_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
     let yaml = "a: 1\na: 2\nb: 3\n";
-    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0", "--jq-extensions"])?;
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["a"],["a"],["b"]]"#);
@@ -1136,7 +1136,7 @@ fn test_yq_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
 #[test]
 fn test_yq_paths_preserves_nested_duplicate_mapping_keys_868() -> Result<()> {
     let yaml = "x:\n  a: 1\n  a: 2\n  b: 3\n";
-    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin("[paths]", yaml, &["-o=json", "-I=0", "--jq-extensions"])?;
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["x"],["x","a"],["x","a"],["x","b"]]"#);
@@ -1157,7 +1157,13 @@ fn test_yq_paths_json_input_format_preserves_1398() -> Result<()> {
     let (output, code) = run_yq_stdin(
         "[paths]",
         json,
-        &["--input-format", "json", "-o=json", "-I=0"],
+        &[
+            "--input-format",
+            "json",
+            "-o=json",
+            "-I=0",
+            "--jq-extensions",
+        ],
     )?;
 
     assert_eq!(code, 0, "out: {output:?}");
@@ -1216,7 +1222,11 @@ fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
 #[test]
 fn test_yq_leaf_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
     let yaml = "a: 1\na: 2\nb: 3\n";
-    let (output, code) = run_yq_stdin("[leaf_paths]", yaml, &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        "[leaf_paths]",
+        yaml,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["a"],["a"],["b"]]"#);
@@ -1230,7 +1240,11 @@ fn test_yq_leaf_paths_preserves_duplicate_mapping_keys_868() -> Result<()> {
 #[test]
 fn test_yq_leaf_paths_leaf_definition_unaffected_by_868() -> Result<()> {
     let yaml = "a: {}\nb: []\nc: null\nd: 5\n";
-    let (output, code) = run_yq_stdin("[leaf_paths]", yaml, &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        "[leaf_paths]",
+        yaml,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["a"],["b"],["c"],["d"]]"#);
@@ -1247,6 +1261,40 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
+    Ok(())
+}
+
+/// #1512: `succinctly yq` rejects jq-only builtins real yq's lexer lacks by
+/// default -- a parse error mentioning `--jq-extensions`, not the CLI
+/// silently accepting broader syntax than the reference it's meant to
+/// match. Covers both `try_parse_builtin`'s ordinary gate (`paths`,
+/// `getpath`) and `limit`'s special-cased one in `parse_primary`.
+#[test]
+fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
+    for filter in ["paths", "getpath([])", "limit(1; .)"] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
+        assert!(
+            stderr.contains("--jq-extensions"),
+            "filter {filter:?} stderr should mention --jq-extensions, got: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #1512: the CLI flag actually reaches the parser -- `--jq-extensions`
+/// makes the same three filters succeed end to end through the real
+/// `succinctly yq` binary, not just through the parser's own unit tests.
+#[test]
+fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
+    for filter in ["paths", "getpath([])", "limit(1; .)"] {
+        let (_out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
+        assert_eq!(
+            code, 0,
+            "filter {filter:?} should succeed with --jq-extensions, stderr: {stderr}"
+        );
+    }
     Ok(())
 }
 
@@ -3332,7 +3380,11 @@ fn test_yaml_assign_then_debug_through_anchor_updates_alias() -> Result<()> {
     // `debug` passes its input through unchanged (aside from the stderr
     // side effect), so it must not block the sync either.
     let input = "a: &x 1\nb: *x\n";
-    let (output, exit_code) = run_yq_stdin(".a = 99 | debug", input, &["-o=json", "-I=0"])?;
+    let (output, exit_code) = run_yq_stdin(
+        ".a = 99 | debug",
+        input,
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), r#"{"a":99,"b":99}"#);
     Ok(())
@@ -15132,7 +15184,7 @@ fn test_object_slice_getpath_path_round_trip_1102() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "getpath(path(.[0:2]))",
         r#"{"a":1,"b":2,"c":3}"#,
-        &["-o", "json", "-I0"],
+        &["-o", "json", "-I0", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"["a",1]"#);
@@ -15141,7 +15193,7 @@ fn test_object_slice_getpath_path_round_trip_1102() -> Result<()> {
     let (out, code) = run_yq_stdin(
         "getpath(path(.[(1-1):(1+1)]))",
         r#"{"a":1,"b":2,"c":3}"#,
-        &["-o", "json", "-I0"],
+        &["-o", "json", "-I0", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"["a",1]"#);
@@ -15157,7 +15209,7 @@ fn test_object_slice_getpath_malformed_descriptor_errors_1102() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         r#"getpath([{"start":"bad","end":2}])"#,
         r#"{"a":1,"b":2}"#,
-        &["-o", "json"],
+        &["-o", "json", "--jq-extensions"],
     )?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(
@@ -16536,7 +16588,8 @@ fn test_1197_add_builtin_inherits_right_null_gating_consistently() -> Result<()>
 /// rather than relying on `arith_add` to keep always producing a String.
 #[test]
 fn test_1119_gsub_array_flags_still_errors_cleanly_not_panics() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(r#"gsub("t"; "x"; [])"#, "\"test\"", &[])?;
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr(r#"gsub("t"; "x"; [])"#, "\"test\"", &["--jq-extensions"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("cannot be added"),
@@ -20176,10 +20229,15 @@ fn test_yq_sub_3arg_zero_width_interaction_1255_1122() -> Result<()> {
 
 /// `gsub` is not a real yq builtin at any arity (#1436) -- confirm it
 /// deliberately does NOT get #1255's fix (stays on jq/Oniguruma-style
-/// iteration, since there's no yq oracle for it to match).
+/// iteration, since there's no yq oracle for it to match). Gated behind
+/// `--jq-extensions` since #1512.
 #[test]
 fn test_yq_gsub_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"gsub("a*"; "X")"#, "\"bab\"\n", &["-o", "json"])?;
+    let (output, code) = run_yq_stdin(
+        r#"gsub("a*"; "X")"#,
+        "\"bab\"\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {output:?}");
     assert_eq!(output.trim(), r#""XbXXbX""#);
     Ok(())
@@ -20188,10 +20246,15 @@ fn test_yq_gsub_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
 /// `scan` is not a real yq builtin at all (#1436) -- same non-fix as
 /// `gsub` above, guarding `scan_with_resolved_pattern`'s hardcoded
 /// `JqSemantics` call specifically (code review flagged that only `gsub`
-/// had a guard test here, not `scan`/`split`/`splits`).
+/// had a guard test here, not `scan`/`split`/`splits`). Gated behind
+/// `--jq-extensions` since #1512.
 #[test]
 fn test_yq_scan_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"[scan("a*")]"#, "\"bab\"\n", &["-o", "json"])?;
+    let (output, code) = run_yq_stdin(
+        r#"[scan("a*")]"#,
+        "\"bab\"\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {output:?}");
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v, serde_json::json!(["", "a", "", ""]));
@@ -20212,10 +20275,14 @@ fn test_yq_split_regex_keeps_jq_style_zero_width_1255() -> Result<()> {
 
 /// `splits` is not a real yq builtin at all (#1436) -- same non-fix as
 /// `scan`/`gsub`. Guards `splits_with_resolved_pattern`'s hardcoded
-/// `JqSemantics` call.
+/// `JqSemantics` call. Gated behind `--jq-extensions` since #1512.
 #[test]
 fn test_yq_splits_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"[splits("a*")]"#, "\"bab\"\n", &["-o", "json"])?;
+    let (output, code) = run_yq_stdin(
+        r#"[splits("a*")]"#,
+        "\"bab\"\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {output:?}");
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v, serde_json::json!(["", "b", "", "b", ""]));

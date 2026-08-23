@@ -177,6 +177,11 @@ struct Parser<'a> {
     input: &'a str,
     pos: usize,
     mode: ParserMode,
+    /// Whether yq mode accepts jq-only surface real yq's lexer rejects
+    /// (`paths`, `getpath`, `limit`, `gsub`/`scan`/`splits`, etc.), gated
+    /// behind `--jq-extensions` (#1512). Ignored in jq mode, which always
+    /// accepts this surface.
+    jq_extensions: bool,
     /// Current `Pattern` recursion depth; see [`MAX_PATTERN_DEPTH`].
     pattern_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
@@ -190,16 +195,18 @@ impl<'a> Parser<'a> {
             input,
             pos: 0,
             mode: ParserMode::Jq,
+            jq_extensions: false,
             pattern_depth: 0,
             expr_depth: 0,
         }
     }
 
-    fn with_mode(input: &'a str, mode: ParserMode) -> Self {
+    fn with_mode_and_extensions(input: &'a str, mode: ParserMode, jq_extensions: bool) -> Self {
         Parser {
             input,
             pos: 0,
             mode,
+            jq_extensions,
             pattern_depth: 0,
             expr_depth: 0,
         }
@@ -290,6 +297,26 @@ impl<'a> Parser<'a> {
         }
         let next_char = self.input[after..].chars().next();
         !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
+    }
+
+    /// Real yq's lexer has no token for jq-only surface like `paths`,
+    /// `getpath`, `limit`, `gsub`/`scan`/`splits`, etc. -- gated behind
+    /// `--jq-extensions` (#1512) so yq mode matches that rejection by
+    /// default, the same way `?//` is gated to jq mode only in
+    /// `parse_pattern_alternatives` below. Call sites must invoke this
+    /// before consuming the keyword, so a rejected keyword's position is
+    /// still where the caller expects.
+    fn reject_unless_jq_extensions(&self, name: &str) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Yq && !self.jq_extensions {
+            return Err(ParseError::new(
+                format!(
+                    "\"{name}\" is not part of yq's syntax; pass --jq-extensions to enable \
+                     succinctly's jq-compatible builtin surface"
+                ),
+                self.pos,
+            ));
+        }
+        Ok(())
     }
 
     /// Scan a run of yq merge-flag characters (`+ ? n d c`, any order,
@@ -1351,6 +1378,7 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("foreach") {
                     self.parse_foreach_expr()
                 } else if self.matches_keyword("limit") {
+                    self.reject_unless_jq_extensions("limit")?;
                     self.parse_limit_expr()
                 } else if self.matches_keyword("until") {
                     self.parse_until_expr()
@@ -2470,6 +2498,7 @@ impl<'a> Parser<'a> {
         // IN(s) - true if any output of s equals the current value
         // IN(src; s) - true if any output of src equals any output of s
         if self.matches_keyword("IN") {
+            self.reject_unless_jq_extensions("IN")?;
             self.consume_keyword("IN");
             self.skip_ws();
             self.expect('(')?;
@@ -2498,6 +2527,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::AsciiUpcase));
         }
         if self.matches_keyword("ltrimstr") {
+            self.reject_unless_jq_extensions("ltrimstr")?;
             self.consume_keyword("ltrimstr");
             self.skip_ws();
             self.expect('(')?;
@@ -2539,6 +2569,7 @@ impl<'a> Parser<'a> {
         }
         // Check splits before split since split is a prefix of splits
         if self.matches_keyword("splits") {
+            self.reject_unless_jq_extensions("splits")?;
             self.consume_keyword("splits");
             self.skip_ws();
             self.expect('(')?;
@@ -2658,6 +2689,7 @@ impl<'a> Parser<'a> {
         }
         // gsub function - replace all matches
         if self.matches_keyword("gsub") {
+            self.reject_unless_jq_extensions("gsub")?;
             self.consume_keyword("gsub");
             self.skip_ws();
             self.expect('(')?;
@@ -2685,6 +2717,7 @@ impl<'a> Parser<'a> {
         }
         // scan function - find all matches
         if self.matches_keyword("scan") {
+            self.reject_unless_jq_extensions("scan")?;
             self.consume_keyword("scan");
             self.skip_ws();
             self.expect('(')?;
@@ -2924,10 +2957,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::FromJsonStream));
         }
         if self.matches_keyword("tostream") {
+            self.reject_unless_jq_extensions("tostream")?;
             self.consume_keyword("tostream");
             return Ok(Some(Builtin::ToStream));
         }
         if self.matches_keyword("fromstream") {
+            self.reject_unless_jq_extensions("fromstream")?;
             self.consume_keyword("fromstream");
             self.skip_ws();
             self.expect('(')?;
@@ -2938,6 +2973,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::FromStream(Box::new(f))));
         }
         if self.matches_keyword("truncate_stream") {
+            self.reject_unless_jq_extensions("truncate_stream")?;
             self.consume_keyword("truncate_stream");
             self.skip_ws();
             self.expect('(')?;
@@ -2948,6 +2984,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::TruncateStream(Box::new(f))));
         }
         if self.matches_keyword("getpath") {
+            self.reject_unless_jq_extensions("getpath")?;
             self.consume_keyword("getpath");
             self.skip_ws();
             self.expect('(')?;
@@ -3043,11 +3080,13 @@ impl<'a> Parser<'a> {
         }
         // leaf_paths - must check before paths
         if self.matches_keyword("leaf_paths") {
+            self.reject_unless_jq_extensions("leaf_paths")?;
             self.consume_keyword("leaf_paths");
             return Ok(Some(Builtin::LeafPaths));
         }
         // paths or paths(filter)
         if self.matches_keyword("paths") {
+            self.reject_unless_jq_extensions("paths")?;
             self.consume_keyword("paths");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -3232,6 +3271,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::IsInfinite));
         }
         if self.matches_keyword("isnan") {
+            self.reject_unless_jq_extensions("isnan")?;
             self.consume_keyword("isnan");
             return Ok(Some(Builtin::IsNan));
         }
@@ -3244,6 +3284,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::IsFinite));
         }
         if self.matches_keyword("infinite") {
+            self.reject_unless_jq_extensions("infinite")?;
             self.consume_keyword("infinite");
             return Ok(Some(Builtin::Infinite));
         }
@@ -3254,6 +3295,7 @@ impl<'a> Parser<'a> {
 
         // Phase 10: Debug
         if self.matches_keyword("debug") {
+            self.reject_unless_jq_extensions("debug")?;
             self.consume_keyword("debug");
             self.skip_ws();
             if self.peek() == Some('(') {
@@ -3586,6 +3628,7 @@ impl<'a> Parser<'a> {
 
         // isempty(expr) - returns true if expr produces no outputs
         if self.matches_keyword("isempty") {
+            self.reject_unless_jq_extensions("isempty")?;
             self.consume_keyword("isempty");
             self.skip_ws();
             self.expect('(')?;
@@ -4726,9 +4769,25 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
 
 /// Parse a jq expression with a specific parser mode.
 ///
-/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`.
+/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
+/// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
+/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
+/// [`parse_with_mode_and_extensions`] to accept them (#1512).
 pub fn parse_with_mode(input: &str, mode: ParserMode) -> Result<Expr, ParseError> {
-    let mut parser = Parser::with_mode(input, mode);
+    parse_with_mode_and_extensions(input, mode, false)
+}
+
+/// Parse a jq expression with a specific parser mode, optionally accepting
+/// jq-only builtins real yq's lexer rejects (`--jq-extensions`, #1512).
+///
+/// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
+/// surface.
+pub fn parse_with_mode_and_extensions(
+    input: &str,
+    mode: ParserMode,
+    jq_extensions: bool,
+) -> Result<Expr, ParseError> {
+    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
     let expr = parser.parse_expr()?;
 
     // Ensure we consumed all input
@@ -4774,9 +4833,26 @@ pub fn parse_program(input: &str) -> Result<Program, ParseError> {
 
 /// Parse a complete jq program with a specific parser mode.
 ///
-/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`.
+/// Use `ParserMode::Yq` to allow kebab-case identifiers like `.my-key`. In
+/// `Yq` mode, jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
+/// `limit`, `gsub`/`scan`/`splits`, etc.) are rejected too; use
+/// [`parse_program_with_mode_and_extensions`] to accept them (#1512).
 pub fn parse_program_with_mode(input: &str, mode: ParserMode) -> Result<Program, ParseError> {
-    let mut parser = Parser::with_mode(input, mode);
+    parse_program_with_mode_and_extensions(input, mode, false)
+}
+
+/// Parse a complete jq program with a specific parser mode, optionally
+/// accepting jq-only builtins real yq's lexer rejects (`--jq-extensions`,
+/// #1512).
+///
+/// `jq_extensions` is ignored in `ParserMode::Jq`, which always accepts this
+/// surface.
+pub fn parse_program_with_mode_and_extensions(
+    input: &str,
+    mode: ParserMode,
+    jq_extensions: bool,
+) -> Result<Program, ParseError> {
+    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
     let program = parser.parse_program()?;
 
     // Ensure we consumed all input
@@ -6552,6 +6628,56 @@ mod tests {
         );
     }
 
+    /// #1512: yq mode rejects jq-only builtins real yq's lexer lacks by
+    /// default, and `parse_program_with_mode_and_extensions(.., true)`
+    /// (the `--jq-extensions` CLI flag's parser-level counterpart) accepts
+    /// them. jq mode is unaffected either way -- it already accepts this
+    /// whole surface unconditionally, gate or no gate.
+    #[test]
+    fn test_yq_mode_rejects_jq_only_builtins_unless_jq_extensions_1512() {
+        let cases: &[(&str, &str)] = &[
+            ("IN", "IN(1)"),
+            ("ltrimstr", r#"ltrimstr("a")"#),
+            ("splits", r#"splits(",")"#),
+            ("gsub", r#"gsub("a";"b")"#),
+            ("scan", r#"scan("a")"#),
+            ("tostream", "tostream"),
+            ("fromstream", "fromstream(.)"),
+            ("truncate_stream", "truncate_stream(.)"),
+            ("getpath", "getpath([])"),
+            ("leaf_paths", "leaf_paths"),
+            ("paths", "paths"),
+            ("isnan", "isnan"),
+            ("infinite", "infinite"),
+            ("debug", "debug"),
+            ("isempty", "isempty(empty)"),
+            ("limit", "limit(1; .)"),
+        ];
+
+        for (name, filter) in cases {
+            let rejected = parse_program_with_mode(filter, ParserMode::Yq);
+            assert!(
+                rejected.is_err(),
+                "`{name}` should be rejected in yq mode by default, got: {rejected:?}"
+            );
+            let message = &rejected.unwrap_err().message;
+            assert!(
+                message.contains("--jq-extensions"),
+                "`{name}`'s rejection message should mention --jq-extensions, got: {message}"
+            );
+
+            assert!(
+                parse_program_with_mode_and_extensions(filter, ParserMode::Yq, true).is_ok(),
+                "`{name}` should parse in yq mode once --jq-extensions is enabled"
+            );
+
+            assert!(
+                parse_program_with_mode(filter, ParserMode::Jq).is_ok(),
+                "`{name}` should parse in jq mode regardless of the yq-only gate"
+            );
+        }
+    }
+
     #[test]
     fn test_jq_mode_kebab_case_is_subtraction() {
         // In Jq mode (default), .foo-bar is parsed as .foo minus bar
@@ -6772,10 +6898,10 @@ mod tests {
 
     /// `Parser::new` (kept for tests and future use, per its own
     /// `#[allow(dead_code)]`; `parse`/`parse_with_mode` both go through
-    /// `Parser::with_mode` instead) initializes `pattern_depth` to `0` the
-    /// same as `with_mode`, and a parser built through it can still parse a
-    /// pattern -- #1240's new field didn't leave this alternate constructor
-    /// broken.
+    /// `Parser::with_mode_and_extensions` instead) initializes
+    /// `pattern_depth` to `0` the same as `with_mode_and_extensions`, and a
+    /// parser built through it can still parse a pattern -- #1240's new
+    /// field didn't leave this alternate constructor broken.
     #[test]
     fn test_parser_new_initializes_pattern_depth_1240() {
         let mut parser = Parser::new(". as {$a} | $a");

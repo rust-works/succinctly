@@ -1041,6 +1041,13 @@ pub struct YqCommand {
     #[arg(long)]
     pub validate: bool,
 
+    /// Accept jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
+    /// `limit`, `gsub`/`scan`/`splits`, `leaf_paths`, etc.) as a succinctly
+    /// extension. Off by default so `succinctly yq` matches real yq's
+    /// syntax surface (#1512).
+    #[arg(long)]
+    pub jq_extensions: bool,
+
     /// Input format type [auto, yaml, json] (default: auto)
     #[arg(
         short = 'p',

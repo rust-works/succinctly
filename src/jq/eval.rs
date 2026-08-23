@@ -33617,7 +33617,7 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jq::{parse, parse_with_mode, ParserMode};
+    use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
     use crate::json::JsonIndex;
 
     /// Collect an [`eval_each`] stream back into a `QueryResult`, so the
@@ -33785,12 +33785,17 @@ mod tests {
     /// `JsonIndex`: arithmetic/merge operate purely on `OwnedValue` after
     /// document conversion, so JSON input exercises the same code path YAML
     /// input would (see `eval_generic.rs`'s `to_owned` conversion).
+    ///
+    /// Always parses with jq extensions enabled: this macro tests
+    /// *evaluator* semantics under `YqSemantics`, not the parser's default
+    /// rejection of jq-only builtins real yq's lexer lacks (#1512) — that
+    /// policy has its own dedicated test coverage in `parser.rs`.
     macro_rules! yq_query {
         ($json:expr, $expr:expr, $pattern:pat $(if $guard:expr)? => $body:expr) => {{
             let json_bytes: &[u8] = $json;
             let index = JsonIndex::build(json_bytes);
             let cursor = index.root(json_bytes);
-            let expr = parse_with_mode($expr, ParserMode::Yq).unwrap();
+            let expr = parse_with_mode_and_extensions($expr, ParserMode::Yq, true).unwrap();
             match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
                 $pattern $(if $guard)? => $body,
                 other => panic!("unexpected result: {:?}", other),
