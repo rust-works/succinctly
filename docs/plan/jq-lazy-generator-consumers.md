@@ -20,21 +20,21 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | —     | `eval_each_pipe`'s owned-value arm (Stage 2 gap)    | ✅ merged — PR #1450        |
 | 3     | `paths(f)` producer + `resolve_leaf` sink           | ✅ merged — closes #987     |
 | 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
-| 5     | Widen the lazy arm set                              | ⬜ not yet filed            |
-| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ⬜ not yet filed            |
+| 5     | Widen the lazy arm set                              | ⬜ open — #1462             |
+| (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ⬜ open — #1461             |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
 processed — is closed, as is `halt_error`'s wrong exit code and the stderr leak in
 `isempty`/`first`/`limit`/`nth`/`any`/`IN(s)`, and — since Stage 4 — `IN(src; s)` and every
-other compare reached through a lazy consumer. Five shapes remain divergent, all pinned as
-such in `test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)`
+other compare reached through a lazy consumer. **Six** shapes remain divergent, all pinned
+as such in `test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)`
 family: `first(.[] | stderr)` and `first((1,2) == (10, ("B"|stderr)))`, both a `first(...)`
-over a non-`Comma`, which Stage 2b's sibling walk does not reach — option (c). One is
+over a non-`Comma`, which Stage 2b's sibling walk does not reach — option (c), #1461. One is
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
-`eval_each` at all — #1481. The remaining two are Stage 5's own residual: an un-lazified
-`eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a side effect
-for a node's own filter when that filter's shape isn't one of
+`eval_each` at all — #1481. The remaining **three** are Stage 5's own residual (#1462): an
+un-lazified `eval_each` arm (`If`/`Try`/`Label`/`AsPattern`/`FuncCall`, ...) still leaks a
+side effect for a node's own filter when that filter's shape isn't one of
 `Comma`/`Pipe`/`Paren`/`Builtin::PathsFilter` — that is the `path(paths(if ...))` row, plus
 the `path(... halt_error ...)` pair Stage 4 added, whose stray `x` on stderr is the same
 un-lazified `Expr::If`.
@@ -1072,10 +1072,14 @@ the reasoning behind each placement:
    `test_short_circuit_side_effect_leaks_820_932_987`, and `Flow::Stopped`'s own doc
    comment now records this as its one stated exception.
 7. **Stage 5** — widen the lazy arm set (`If`, `Try`/`Optional`, `Label`, `AsPattern`,
-   `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Not yet filed.
+   `FuncCall`, and demand-forwarding through `FirstExpr`/`Limit`/`NthExpr`). Filed **#1462**,
+   which re-rates it Medium rather than the low-priority tail this document predicted: the
+   wrappers destroy `input` documents, they do not merely leak stderr.
    One issue, not one per arm: each is a single lazy arm now that the primitive exists.
    Under ADR-0018 rule 6 these are divergences, so they need either a fix or entries in
    `docs/compliance/jq/limitations.md`.
 8. **Option (c)** — mirror `Demand`/`Item`/`Flow` into `eval_generic.rs` for
-   `Comma`/`Pipe`/`Paren`. Not yet filed. This is the only remaining route to
+   `Comma`/`Pipe`/`Paren`. Filed **#1461**, also Medium for the same reason (`first(1 | (1,
+   input))` consumes documents), with the narrower `first_over_comma_generic` gap it sits
+   next to filed separately as **#1451**. This is the only remaining route to
    `first(.[] | stderr)`, which is a `Pipe` and so out of reach of Stage 2b's comma walk.
