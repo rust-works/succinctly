@@ -16329,6 +16329,25 @@ struct PathBranch<'a> {
     /// navigate into it, which only its consumer knows. See
     /// `docs/plan/jq-path-trackability-deferral.md`.
     trackable: bool,
+    /// Whether this branch's value is a *frozen variable snapshot* rather
+    /// than something freshly constructed (#1466).
+    ///
+    /// Set only by `resolve_node`'s `Expr::TrackedVar` arm, for the case
+    /// where the snapshot could not be certified against the ambient input
+    /// (so `trackable` is `false`) — the invariant is that `snapshot`
+    /// implies `!trackable`, since a certified snapshot already resolves to
+    /// a real path and needs no second marker.
+    ///
+    /// Only `FoldRegister` reads it. jq's own per-emission check is
+    /// `jv_identical(current_input, value_at_path)`, which for a string,
+    /// array or object is *pointer* identity — a `$x` reference hands back
+    /// the very same `jv`, while `{a:.a}` builds a new one. `OwnedValue`
+    /// has no such identity, so this flag records the one provenance
+    /// succinctly can prove: the value came from a snapshot that was never
+    /// rebuilt, so jq would still be holding the same pointer. Without it
+    /// `FoldRegister` could only compare values, which promoted every
+    /// reconstruction that happened to land on the same value (#1466).
+    snapshot: bool,
 }
 
 impl<'a> PathBranch<'a> {
@@ -16354,6 +16373,7 @@ impl<'a> PathBranch<'a> {
             path,
             value,
             trackable,
+            snapshot: false,
         }
     }
 
@@ -16367,6 +16387,48 @@ impl<'a> PathBranch<'a> {
             path: Vec::new(),
             value,
             trackable: false,
+            snapshot: false,
+        }
+    }
+
+    /// Build an untracked branch that is nonetheless a *frozen variable
+    /// snapshot*, not a reconstruction — see the `snapshot` field (#1466).
+    fn snapshot(value: Cow<'a, OwnedValue>) -> Self {
+        Self {
+            path: Vec::new(),
+            value,
+            trackable: false,
+            snapshot: true,
+        }
+    }
+
+    /// Rebuild as `untracked`/`snapshot` according to `snapshot`, for the
+    /// sites that demote a branch but must not lose its provenance — see
+    /// `FoldRegister::relocate` and `resolve_foreach`'s own emission (#1466).
+    fn demoted(snapshot: bool, value: Cow<'a, OwnedValue>) -> Self {
+        if snapshot {
+            Self::snapshot(value)
+        } else {
+            Self::untracked(value)
+        }
+    }
+
+    /// Mark this branch as a frozen variable snapshot — unless it already
+    /// resolved to a real path, which needs no second marker and must keep
+    /// the type's `snapshot` implies `!trackable` invariant (#1466).
+    ///
+    /// The guard is why this lives here rather than inline at its one call
+    /// site (`resolve_node`'s `Expr::TrackedVar` arm): that site can prove
+    /// today that `resolve_leaf` hands back an untracked branch for a
+    /// `TrackedVar` — the expression is not one of the six `is_primitive`
+    /// shapes, so only the non-primitive `PathBranch::untracked` path is
+    /// reachable — but that is a fact about `resolve_leaf`, not about this
+    /// type, and it should not be the thing keeping the invariant true.
+    fn into_snapshot(self) -> Self {
+        if self.trackable {
+            self
+        } else {
+            Self::snapshot(self.value)
         }
     }
 
@@ -16377,6 +16439,7 @@ impl<'a> PathBranch<'a> {
             path: self.path,
             value: Cow::Owned(self.value.into_owned()),
             trackable: self.trackable,
+            snapshot: self.snapshot,
         }
     }
 }
@@ -16664,6 +16727,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                              path: components,
                              value: v,
                              trackable,
+                             snapshot,
                          }| {
                             let inner_path = if components.len() == 1 {
                                 components.into_iter().next().expect("len checked")
@@ -16683,10 +16747,13 @@ fn resolve_node<'a, S: EvalSemantics>(
                             };
                             PathBranch {
                                 // Wrapping in `?` navigates nothing, so it
-                                // neither grants nor removes trackability.
+                                // neither grants nor removes trackability —
+                                // nor, for the same reason, the snapshot
+                                // provenance a `$x` inside it carries (#1466).
                                 path: vec![Expr::Optional(Box::new(inner_path))],
                                 value: v,
                                 trackable,
+                                snapshot,
                             }
                         },
                     )
@@ -17150,6 +17217,16 @@ fn resolve_node<'a, S: EvalSemantics>(
         // trackability (fall back to untracked), never emit a wrong path:
         // `getpath(value, [])` trivially equals `value`, so `path=[]` is a
         // sound witness whenever the snapshot and the ambient value agree.
+        //
+        // When that comparison *fails*, the branch is still marked
+        // `snapshot` (#1466). Failing here only means the snapshot could not
+        // be certified against *this* use site's ambient input — it does not
+        // mean the value was rebuilt. Real jq is still holding the very same
+        // `jv` the binding froze, which is what its own `jv_identical` check
+        // compares by pointer, so a `FoldRegister` whose register sits
+        // somewhere other than the ambient input can still recognise it.
+        // Nothing outside `FoldRegister` reads the flag, so this cannot
+        // widen acceptance anywhere else.
         Expr::TrackedVar(marker_value) => {
             if trackable && marker_value.as_ref() == value {
                 Ok(vec![PathBranch::new(
@@ -17158,7 +17235,15 @@ fn resolve_node<'a, S: EvalSemantics>(
                     true,
                 )])
             } else {
-                resolve_leaf::<S>(expr, value, trackable)
+                // Still `resolve_leaf`, not a hand-rolled branch, so this
+                // arm keeps inheriting whatever that function decides for a
+                // non-primitive filter; only the provenance mark is added.
+                resolve_leaf::<S>(expr, value, trackable).map(|branches| {
+                    branches
+                        .into_iter()
+                        .map(PathBranch::into_snapshot)
+                        .collect()
+                })
             }
         }
 
@@ -17796,10 +17881,9 @@ impl FoldRegister {
     /// input, relocating every resulting branch through this register.
     ///
     /// Mirrors jq's own per-emission `jv_identical(current_input,
-    /// value_at_path)` check, softened to structural equality since
-    /// `OwnedValue` has no stable identity to compare — the same softening
-    /// `Expr::TrackedVar`'s own arm already makes. `input` is always
-    /// resolved as `Cow::Owned` (via [`resolve_against_cow`]) since the
+    /// value_at_path)` check — see [`FoldRegister::identical`] for how that
+    /// check is modeled without a stable identity to compare. `input` is
+    /// always resolved as `Cow::Owned` (via [`resolve_against_cow`]) since the
     /// accumulator is always a freshly-computed `OwnedValue`, never a
     /// literal subpart of the original document, mirroring
     /// `eval_owned_expr_fork`'s identical convention in the value-position
@@ -17816,6 +17900,39 @@ impl FoldRegister {
         }
     }
 
+    /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value
+    /// type that has no pointer to compare (#1466).
+    ///
+    /// `jv_identical` is **not** structural equality. It compares the two
+    /// `jv`s' kind/offset/size and then, for the three heap kinds — string,
+    /// array, object — their *pointers*; for a number it compares the raw
+    /// representation, which a reconstruction never reproduces (confirmed
+    /// live against jq 1.7.1: `path(reduce (1) as $i (.a; 1))` on `{"a":1}`
+    /// raises, even though `1 == 1`). Only `null`/`true`/`false` fall to its
+    /// `default: r = 1` arm, where having the same kind *is* being identical
+    /// — for those, and only those, structural equality is exact rather than
+    /// an approximation (confirmed live: the same filter with `null` on
+    /// `{"a":null}`, and with `false` on `{"a":false}`, both answer `["a"]`,
+    /// while `true` against `{"a":false}` raises).
+    ///
+    /// So a branch is identical to this register when it is either
+    ///
+    /// - a [`PathBranch::snapshot`] — a frozen `. as $x` binding jq is still
+    ///   holding by the very same pointer — carrying this register's value, or
+    /// - a `null`/`true`/`false` equal to it.
+    ///
+    /// A *trackable* branch never needs this: it navigated to a real path and
+    /// `relocate`'s first arm already places it. Before #1466 this compared
+    /// values alone, which promoted any reconstruction that happened to land
+    /// on the register's value — so `path(reduce (1) as $i (.; {a:.a}))`
+    /// answered `[]` where jq raises, and `=`/`|=`/`del()` through it wrote
+    /// to a document jq leaves untouched.
+    fn identical(&self, branch: &PathBranch<'_>) -> bool {
+        self.trackable
+            && *branch.value == self.value
+            && (branch.snapshot || matches!(*branch.value, OwnedValue::Null | OwnedValue::Bool(_)))
+    }
+
     fn relocate<'a>(&self, branches: Vec<PathBranch<'a>>) -> Vec<PathBranch<'a>> {
         branches
             .into_iter()
@@ -17824,10 +17941,16 @@ impl FoldRegister {
                     let mut path = self.path.clone();
                     path.extend(b.path);
                     PathBranch::new(path, b.value, true)
-                } else if self.trackable && *b.value == self.value {
+                } else if self.identical(&b) {
                     PathBranch::new(self.path.clone(), b.value, true)
                 } else {
-                    PathBranch::untracked(b.value)
+                    // Demoting must not erase the snapshot mark: a fold
+                    // nested inside another one has its own, untrackable
+                    // register, and the *outer* register is the one that can
+                    // still recognise the value (confirmed live,
+                    // `path(. as $x | reduce (1) as $i (0; reduce (1) as $j
+                    // (0; $x)))` is `[]`). #1466.
+                    PathBranch::demoted(b.snapshot, b.value)
                 }
             })
             .collect()
@@ -17939,6 +18062,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `null` (#534), and `.take()` below moves it out without a clone
         // since nothing reads the old value again once UPDATE has run.
         let mut acc: Option<OwnedValue> = Some(acc);
+        // What the *last* UPDATE step's own surviving branch turned out to
+        // be, carried alongside `acc` so final emission can ask about the
+        // accumulator's provenance instead of re-guessing it from the value
+        // (#1466). `at_register` is read off the already-relocated branch, so
+        // it folds in every clause `FoldRegister::identical` admits; the
+        // register's own seeding (`enter`) is the `acc == reg.value` case,
+        // which is a genuine navigation to the register's own path.
+        let mut acc_at_register = init_branch.trackable;
+        let mut acc_snapshot = init_branch.snapshot;
         let mut aborted: Option<Control> = None;
         for substituted in &substituted_updates {
             if let Some(control) = charge_budget(&mut budget, "reduce") {
@@ -17957,13 +18089,26 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 Ok(branches) => {
                     // Only the last output of a multi-output UPDATE
                     // becomes the new accumulator (same rule as
-                    // `eval_reduce`) — trackability is discarded here, not
-                    // just the path: it is re-derived from scratch against
-                    // the same fixed `reg` at every subsequent step and at
-                    // final emission below, never carried forward as a
+                    // `eval_reduce`) — the *path* is discarded here: it is
+                    // re-derived from scratch against the same fixed `reg`
+                    // at every subsequent step, never carried forward as a
                     // value flows from one step to the next (see this
                     // function's own doc comment and `FoldRegister`'s).
-                    acc = branches.into_iter().last().map(|b| b.value.into_owned());
+                    //
+                    // What is carried forward is only whether jq would still
+                    // be holding this exact value at the register — its
+                    // provenance, not its path (#1466). `b.trackable &&
+                    // b.path == reg.path` is precisely that, because
+                    // `relocate` has already folded every clause
+                    // `FoldRegister::identical` admits into this shape: a
+                    // navigation that landed back on the register, a frozen
+                    // snapshot, or a `null`/`true`/`false` that matched.
+                    let last = branches.into_iter().last();
+                    acc_at_register = last
+                        .as_ref()
+                        .is_some_and(|b| b.trackable && b.path == reg.path);
+                    acc_snapshot = last.as_ref().is_some_and(|b| b.snapshot);
+                    acc = last.map(|b| b.value.into_owned());
                 }
                 Err((_prefix, e)) => {
                     // Whatever this step's UPDATE partially resolved
@@ -17985,8 +18130,30 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // iterations above, so a transient trackable result from
                 // the last UPDATE step does not automatically survive
                 // (confirmed live, see this function's own doc comment).
+                //
+                // The re-check is on the accumulator's *provenance*, not on
+                // its value (#1466): a value comparison promoted any
+                // reconstruction that happened to land on the register's
+                // value, which is exactly what jq's pointer-based
+                // `jv_identical` refuses. The branch handed to `relocate` is
+                // therefore built *relative* to the register — an empty path
+                // for "still at the register", which `relocate` then extends
+                // by `reg.path` exactly once — rather than absolute, which
+                // would prepend `reg.path` a second time.
                 let acc = acc.unwrap_or(OwnedValue::Null);
-                out.extend(reg.relocate(vec![PathBranch::untracked(Cow::Owned(acc))]));
+                let final_branch = if acc_at_register {
+                    PathBranch::new(Vec::new(), Cow::Owned(acc), true)
+                } else {
+                    // `demoted`, not `untracked`: an accumulator that is
+                    // still a frozen snapshot stays recognisable to an
+                    // *outer* register when this fold is itself nested
+                    // inside another one, and to `relocate`'s own
+                    // `identical` check just below when this register is
+                    // trackable but the last UPDATE never navigated back
+                    // to it.
+                    PathBranch::demoted(acc_snapshot, Cow::Owned(acc))
+                };
+                out.extend(reg.relocate(vec![final_branch]));
             }
         }
     }
@@ -18093,7 +18260,15 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         true,
                     ));
                 } else {
-                    out.push(PathBranch::untracked(update_branch.value.clone()));
+                    // `demoted`, not `untracked`: an emitted value that is
+                    // still a frozen snapshot must stay recognisable to an
+                    // outer register when this `foreach` is nested inside
+                    // another fold (#1466) — same rule as `relocate`'s own
+                    // demotion arm.
+                    out.push(PathBranch::demoted(
+                        update_branch.snapshot,
+                        update_branch.value.clone(),
+                    ));
                 }
             }
             // Only the last UPDATE output carries forward as state for the
@@ -18469,10 +18644,14 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     let mut pending_error: Option<EvalEscape> = None;
 
     while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
+        // `snapshot` is uniformly `false` across this walk — the seed above
+        // is a `PathBranch::new` and every child below is reached by genuine
+        // navigation, so no frozen variable snapshot can enter it (#1466).
         let PathBranch {
             path: prefix,
             value: current,
             trackable: node_trackable,
+            ..
         } = stack.pop().unwrap();
         // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
         // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
@@ -18487,6 +18666,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             // (#1023's `MAX_ITEMS` triplication is what the other way looks
             // like). See #986's Stage 3 open risk.
             trackable: node_trackable,
+            snapshot: false,
         });
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
@@ -18524,6 +18704,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             path: child_components,
             value: child_value,
             trackable: child_trackable,
+            ..
         } in children
         {
             let mut path = prefix.clone();
@@ -18547,6 +18728,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                             path,
                             value: child_value,
                             trackable: node_trackable && child_trackable,
+                            snapshot: false,
                         });
                     }
                 }
@@ -18575,6 +18757,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                                 path: path.clone(),
                                 value: child_value.clone(),
                                 trackable: node_trackable && child_trackable,
+                                snapshot: false,
                             });
                         })
                     {
@@ -19262,6 +19445,7 @@ fn apply_static_tail<'a, S: EvalSemantics>(
         path: mut prefix,
         value: current,
         trackable,
+        snapshot,
     } in branches
     {
         // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
@@ -19295,6 +19479,11 @@ fn apply_static_tail<'a, S: EvalSemantics>(
             // A non-empty tail navigated successfully, which is only
             // reachable when `trackable` held; an empty one changes nothing.
             trackable,
+            // An empty tail hands `current` straight back, so a frozen
+            // variable snapshot survives it unchanged; a non-empty one
+            // navigated *into* the value and so produced a different one,
+            // which is no longer the snapshot (#1466).
+            snapshot: snapshot && tail.is_empty(),
         });
     }
     Ok(out)
@@ -19415,6 +19604,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
             path: prefix,
             value: current,
             trackable: branch_trackable,
+            ..
         } in branches
         {
             // #986: each branch carries its own trackability now, so this
@@ -19429,6 +19619,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         path: components,
                         value: resulting,
                         trackable: step_trackable,
+                        snapshot: step_snapshot,
                     } in resolved
                     {
                         let mut path = prefix.clone();
@@ -19444,6 +19635,12 @@ fn resolve_seq<'a, S: EvalSemantics>(
                             // reverse (#985's revert is what the reverse
                             // looks like).
                             trackable: branch_trackable && step_trackable,
+                            // Unlike `trackable`, this comes from the *step*
+                            // alone: the value leaving this stage is the
+                            // step's own output, so `.a | $x` still hands
+                            // back the frozen snapshot whatever `.a` was,
+                            // and `$x | .a` no longer is one (#1466).
+                            snapshot: step_snapshot,
                         });
                     }
                 }
@@ -19452,6 +19649,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         path: components,
                         value: resulting,
                         trackable: step_trackable,
+                        snapshot: step_snapshot,
                     } in partial
                     {
                         let mut path = prefix.clone();
@@ -19460,6 +19658,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                             path,
                             value: resulting,
                             trackable: branch_trackable && step_trackable,
+                            snapshot: step_snapshot,
                         });
                     }
                     // Keep whatever this branch produced before its escape,
@@ -55009,6 +55208,327 @@ mod tests {
                 "path(reduce (1,2) as $i (.a; .))"
             ),
             [r#"["a"]"#]
+        );
+    }
+
+    // =========================================================================
+    // #1466: `FoldRegister`'s register check models jq's *pointer-identity*
+    // `jv_identical`, not structural equality. Every case below confirmed live
+    // against jq 1.7.1.
+    // =========================================================================
+
+    /// The issue's own repro, on `path()` and on all three write spellings:
+    /// a *reconstructed* value that happens to equal the register's is not
+    /// identical to it, so jq refuses — and refusing is what keeps `=`/`|=`/
+    /// `del()` from mutating a document jq leaves untouched.
+    ///
+    /// Before this fix `FoldRegister` compared values alone, so `{a: .a}` —
+    /// which builds a *new* object — was promoted to the register's own path
+    /// and all four of these answered instead of raising.
+    ///
+    /// The space after each object-construction colon is cosmetic to jq (the
+    /// spaced and unspaced spellings behave identically), and keeps clippy's
+    /// `literal_string_with_formatting_args` from reading `{a:.a}` as a
+    /// format specifier — the same accommodation
+    /// `test_reduce_foreach_path_dispatch_falls_back_1440` already makes. The
+    /// golden fixtures keep the issue's own unspaced spelling verbatim.
+    #[test]
+    fn test_fold_register_rejects_reconstruction_1466() {
+        for filter in [
+            "path(reduce (1) as $i (.; {a: .a}))",
+            "(reduce (1) as $i (.; {a: .a})) = 9",
+            "del(reduce (1) as $i (.; {a: .a}))",
+            "(reduce (1) as $i (.; {a: .a})) |= 9",
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, r#"Invalid path expression with result {"a":1}"#,
+                        "{filter}"
+                    );
+                }
+            );
+        }
+        // Nested, so the refusal is not an artifact of the register sitting
+        // at the root: jq raises naming `.a`'s own value here.
+        query!(
+            br#"{"a":{"b":1}}"#,
+            "(reduce (1) as $i (.a; {b: .b})) = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":1}"#);
+            }
+        );
+    }
+
+    /// The rule is per *value kind*, because that is what `jv_identical`
+    /// itself keys on: `null`/`true`/`false` fall to its `default: r = 1`
+    /// arm, where sharing a kind *is* being identical, so a reconstruction
+    /// of one is accepted; every other kind compares representation or
+    /// pointer and refuses. A reconstructed number refuses too — `1` is not
+    /// identical to a `1` that came from the document, even though they are
+    /// equal.
+    #[test]
+    fn test_fold_register_identity_by_value_kind_1466() {
+        // Accepted: the register's value is `null`/`true`/`false` and the
+        // reconstruction matches it.
+        for (json, filter) in [
+            (&br#"{"a":null}"#[..], "path(reduce (1) as $i (.a; null))"),
+            (&br#"{"a":true}"#[..], "path(reduce (1) as $i (.a; true))"),
+            (&br#"{"a":false}"#[..], "path(reduce (1) as $i (.a; false))"),
+            (&br#"{"a":null}"#[..], "path(reduce (1,2) as $i (.a; null))"),
+            (&br#"{"a":true}"#[..], "path(foreach (1) as $i (.a; true))"),
+            // ...including through `foreach`'s own EXTRACT, and at
+            // `reduce`'s final emission when UPDATE produced nothing at all
+            // (#534's unbound accumulator, read back as `null`).
+            (
+                &br#"{"a":null}"#[..],
+                "path(foreach (1) as $i (.a; 1; null))",
+            ),
+            (&br#"{"a":null}"#[..], "path(reduce (1) as $i (.a; empty))"),
+        ] {
+            assert_eq!(outputs(json, filter), [r#"["a"]"#], "{filter}");
+        }
+
+        // Refused: every other kind, plus a mismatched bool and a `null`
+        // against a non-`null` register.
+        for (json, filter, result) in [
+            (&br#"{"a":1}"#[..], "path(reduce (1) as $i (.a; 1))", "1"),
+            (&br#"{"a":1}"#[..], "path(reduce (1) as $i (.a; .+0))", "1"),
+            (
+                &br#"{"a":"s"}"#[..],
+                r#"path(reduce (1) as $i (.a; "s"))"#,
+                r#""s""#,
+            ),
+            (
+                &br#"{"a":[1]}"#[..],
+                "path(reduce (1) as $i (.a; [1]))",
+                "[1]",
+            ),
+            (&br#"{"a":[]}"#[..], "path(reduce (1) as $i (.a; []))", "[]"),
+            (
+                &br#"{"a":""}"#[..],
+                r#"path(reduce (1) as $i (.a; ""))"#,
+                r#""""#,
+            ),
+            (
+                &br#"{"a":false}"#[..],
+                "path(reduce (1) as $i (.a; true))",
+                "true",
+            ),
+            (
+                &br#"{"a":1}"#[..],
+                "path(reduce (1) as $i (.a; null))",
+                "null",
+            ),
+            (
+                &br#"{"a":1}"#[..],
+                "path(reduce (1) as $i (.a; empty))",
+                "null",
+            ),
+        ] {
+            query!(json, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message,
+                        format!("Invalid path expression with result {result}"),
+                        "{filter}"
+                    );
+                }
+            );
+        }
+    }
+
+    /// A *navigated* value is still accepted, and the surrounding document
+    /// having an equal value elsewhere changes nothing either way — the
+    /// check is about how the value was reached, never about how many
+    /// places hold one like it.
+    #[test]
+    fn test_fold_register_accepts_navigation_1466() {
+        let json = br#"{"a":{"b":1},"c":{"b":1}}"#;
+        assert_eq!(
+            outputs(json, "path(reduce (1) as $i (.a; .))"),
+            [r#"["a"]"#]
+        );
+        query!(json, "path(reduce (1) as $i (.a; {b: .b}))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"b":1}"#);
+            }
+        );
+    }
+
+    /// The other half of the rule: a frozen `. as $x` snapshot *is* the same
+    /// value jq holds by pointer, so it stays accepted even where the
+    /// accumulator has moved off the register — the case `Expr::TrackedVar`'s
+    /// own arm cannot certify, since it compares against the ambient input
+    /// rather than the register. This is what a value-blind provenance model
+    /// would have lost; these are all `[]` in jq.
+    #[test]
+    fn test_fold_register_accepts_variable_snapshot_1466() {
+        let json = br#"{"a":1}"#;
+        for filter in [
+            // One source element, so the accumulator is still INIT's own
+            // computed `0` when `$x` is resolved — `tr` is false and only
+            // the snapshot mark can carry it.
+            "path(. as $x | reduce (1) as $i (0; $x))",
+            "path(. as $x | reduce (1) as $i (0; ($x)))",
+            "path(. as $x | reduce (1) as $i (0; $x as $y | $y))",
+            "path(. as $x | reduce (1) as $i (0; if true then $x else 0 end))",
+            "path(. as $x | reduce (1) as $i (0; ($x,empty)))",
+            // Through a pipe stage and a builtin: `resolve_seq` rebuilds
+            // the branch but takes the mark from the *step*, so a pipe
+            // whose last stage is the snapshot still is one.
+            "path(. as $x | reduce (1) as $i (0; $x|.))",
+            "path(. as $x | reduce (1) as $i (0; first($x)))",
+            // Through a nested fold, whose own register is untrackable and
+            // so must demote without erasing the mark.
+            "path(. as $x | reduce (1) as $i (0; reduce (1) as $j (0; $x)))",
+            "path(. as $x | reduce (1) as $i (0; foreach (1) as $j (0; $x)))",
+        ] {
+            assert_eq!(outputs(json, filter), [r"[]"], "{filter}");
+        }
+        assert_eq!(
+            outputs(
+                json,
+                "path(. as $x | foreach (1) as $i (0; reduce (1) as $j (0; $x)))"
+            ),
+            [r"[]"]
+        );
+        // A non-`object` snapshot too, so the acceptance is not the
+        // `null`/`bool` clause in disguise — and its reconstructed twin
+        // still refuses.
+        assert_eq!(
+            outputs(br#""s""#, "path(. as $x | reduce (1) as $i (0; $x))"),
+            [r"[]"]
+        );
+        assert_eq!(
+            outputs(br"5", "path(. as $x | reduce (1) as $i (0; $x))"),
+            [r"[]"]
+        );
+        query!(br#""s""#, r#"path(. as $x | reduce (1) as $i (0; "s"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result "s""#);
+            }
+        );
+        query!(br"5", "path(. as $x | reduce (1) as $i (0; 5))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 5");
+            }
+        );
+        // A snapshot that is *rebuilt* — same value, new object — refuses,
+        // which is the whole point of keeping the mark on the branch rather
+        // than inferring it from the value.
+        query!(br#"{"a":1}"#, "path(. as $x | reduce (1) as $i (0; {a: $x.a}))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+    }
+
+    /// Shapes real jq accepts that succinctly now refuses — the cost of
+    /// having no pointer to compare, all of it refuse-only (exit 5, no
+    /// document written), and all of it the *safe* direction: #985's revert
+    /// is what the other direction looks like. Pinned so the set cannot
+    /// grow silently, and so closing any of them is a visible edit here.
+    ///
+    /// Two distinct causes:
+    ///
+    /// - A variable bound from a *navigated* position (`.a as $y`) is not
+    ///   `is_identity_passthrough`, so it never becomes an
+    ///   `Expr::TrackedVar` and carries no snapshot mark at all. jq holds
+    ///   the document's own `.a` pointer there and accepts. This is
+    ///   `limitations.md`'s divergence 1 — "current input conflated with a
+    ///   variable's own bound position" — which the old value comparison
+    ///   happened to paper over inside folds.
+    /// - An `Expr::Identity` resolved against an already-untrackable input
+    ///   rebuilds the branch as a plain computed one, losing the mark. (A
+    ///   pipe stage or a builtin does *not*: `resolve_seq` takes the mark
+    ///   from the step it just ran, so `$x|.` and `first($x)` both survive
+    ///   — asserted in `test_fold_register_accepts_variable_snapshot_1466`.)
+    ///
+    /// jq's own answers, confirmed live, are in the comments.
+    #[test]
+    fn test_fold_register_known_refusals_1466() {
+        // jq: ["a"] — `$y` is the document's own `.a`.
+        for filter in [
+            "path(.a as $y | reduce (1) as $i (.a; $y))",
+            "path(.a as $y | foreach (1) as $i (.a; $y))",
+        ] {
+            query!(br#"{"a":{"b":1}}"#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, r#"Invalid path expression with result {"b":1}"#,
+                        "{filter}"
+                    );
+                }
+            );
+        }
+        // jq: [] — `+`/`*` with an empty right operand are jq *artifacts*:
+        // an empty merge hands back its left operand's pointer unchanged.
+        // The mirrored `{} + $x` refuses in jq too (asserted below), so
+        // there is no rule to model here, only an implementation detail.
+        // The nested-fold row is the second cause: UPDATE `.` is an
+        // `Expr::Identity` resolved against an already-untrackable input,
+        // which rebuilds the branch as a plain computed one.
+        for filter in [
+            "path(. as $x | reduce (1) as $i (0; $x + {}))",
+            "path(. as $x | reduce (1) as $i (0; $x * {}))",
+            "path(. as $x | reduce (1) as $i (0; $x + null))",
+            "path(. as $x | reduce (1) as $i (0; reduce (1) as $j ($x; .)))",
+        ] {
+            query!(br#"{"a":1}"#, filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, r#"Invalid path expression with result {"a":1}"#,
+                        "{filter}"
+                    );
+                }
+            );
+        }
+        // Already refused before #1466 and still refused — `{} + $x` is the
+        // asymmetric half jq itself rejects, so this one *matches* jq.
+        query!(br#"{"a":1}"#, "path(. as $x | reduce (1) as $i (0; {} + $x))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+    }
+
+    /// `PathBranch::into_snapshot` keeps the type's `snapshot` implies
+    /// `!trackable` invariant, which is the whole reason it is a method
+    /// rather than an inline `PathBranch::snapshot(b.value)` at its one call
+    /// site. That site cannot reach the trackable case today, so this is the
+    /// only thing holding the guard honest.
+    #[test]
+    fn into_snapshot_marks_only_an_untracked_branch_1466() {
+        let untracked = PathBranch::untracked(Cow::Owned(OwnedValue::Int(1))).into_snapshot();
+        assert!(untracked.snapshot && !untracked.trackable);
+
+        let navigated = PathBranch::new(
+            vec![Expr::Field("a".into())],
+            Cow::Owned(OwnedValue::Int(1)),
+            true,
+        )
+        .into_snapshot();
+        assert!(navigated.trackable && !navigated.snapshot);
+        assert_eq!(navigated.path, vec![Expr::Field("a".into())]);
+    }
+
+    /// An empty fold emits INIT's own accumulator without ever running a
+    /// step, so final emission's provenance has to come from INIT's own
+    /// branch rather than from a last-step result that never existed.
+    #[test]
+    fn test_fold_register_empty_fold_final_emission_1466() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1},"c":2}"#,
+                "path(reduce empty as $i (.a; .))"
+            ),
+            [r#"["a"]"#]
+        );
+        query!(br#"{"a":{"b":1},"c":2}"#, "path(reduce empty as $i (0; .))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 0");
+            }
         );
     }
 }

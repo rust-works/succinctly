@@ -424,18 +424,26 @@ used to be a third, narrower gap, found reviewing
 `resolve_reduce`/`resolve_foreach` arms to `resolve_node` (`src/jq/eval.rs`) modeling jq's
 own `(path, value_at_path)` register, derived empirically since real jq has no fold-specific
 path machinery at all (`reduce`/`foreach` are sugar over the same variable-binding primitive
-every other construct uses). Three narrower shapes remain open. **They are not all the
-same kind of divergence, and the difference matters on the write path:** #1 and #2 are
-refuse-only (succinctly declines a filter jq accepts — visible, and no document is
-touched), while #3 is the opposite — succinctly *accepts* a filter jq rejects, so
-`=`/`|=`/`del()` through it mutate a document jq leaves untouched.
+every other construct uses). Three narrower shapes remain open, **all of them refuse-only**
+— succinctly declines a filter jq accepts, visibly (exit 5) and without touching any
+document. There used to be a fourth that ran the other way, accepting a filter jq rejects so
+that `=`/`|=`/`del()` wrote where jq raises;
+[#1466](https://github.com/rust-works/succinctly/issues/1466) closed it, and shape #3 below
+is the price it paid. Refusing is the safe direction: [#985](https://github.com/rust-works/succinctly/issues/985)
+is the revert that established what the other one costs.
 
-1. **Variable-rooted navigation off a mismatched accumulator** (refuse-only) —
+1. **Variable-rooted navigation off a mismatched accumulator** —
    `path(. as $x \| foreach (1,2) as $i (0; $x.a; .b))` on `{"a":{"b":1},"c":2}` is
    `["a","b"]` ×2 in jq; succinctly refuses. Same root cause as the pre-existing, unrelated
    `path(. as $x \| 5 \| $x.a)` on `{"a":1}` (jq `["a"]`, succinctly already refuses today) —
    `resolve_node` conflates "current input" with a variable's own bound position outside any
-   fold too, so this isn't specific to #1440's own fix.
+   fold too, so this isn't specific to #1440's own fix. `Expr::TrackedVar` witnesses only
+   `path=[]`, which is why `substitute_var_tracked` is gated on `is_identity_passthrough`:
+   a variable bound from a *navigated* position (`.a as $y`) carries no marker at all, so
+   `path(.a as $y \| reduce (1) as $i (.a; $y))` — jq `["a"]` — refuses too. Tracked as
+   [#1573](https://github.com/rust-works/succinctly/issues/1573), which proposes carrying the
+   binding's own path on the marker; goldens `fold_register_var_from_navigated_binding` and
+   `fold_register_snapshot_via_nested_init`.
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
    refuses. [#1365](https://github.com/rust-works/succinctly/issues/1365) (`?//`-alternatives
@@ -444,18 +452,29 @@ touched), while #3 is the opposite — succinctly *accepts* a filter jq rejects,
    (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`) neither function threads
    path-tracking through. `resolve_node`'s dispatch arm admits exactly `[Pattern::Var(_)]`
    and falls to `resolve_leaf`'s catch-all otherwise.
-3. **Structural equality vs. jq's pointer identity** (**accepts where jq refuses, including
-   on the write path**) — `path(reduce (1) as $i (.; {a:.a}))` on `{"a":1}` raises in jq
-   (its own `jv_identical` fails since `{a:.a}` constructs a *new* value), succinctly
-   answers `[]`; `(reduce (1) as $i (.; {a:.a})) = 9` therefore writes `9` where jq raises
-   and leaves the input untouched. `OwnedValue` carries no identity, so jq's exact check is
-   not available and only an approximation is — `FoldRegister`'s value comparison is the
-   over-approximating one. `Expr::TrackedVar`'s own arm softens the same check, but is
-   additionally gated on the node *being* a tracked variable, whereas
-   `FoldRegister::relocate` and `resolve_reduce`'s final emission gate on equality alone, so
-   an object literal or any other reconstruction reaching the same value is promoted too.
-   Tracked as [#1466](https://github.com/rust-works/succinctly/issues/1466); do not read
-   this row as "safe".
+3. **jq's pointer-identity artifacts on `*`/`+` with an empty operand** —
+   `path(. as $x \| reduce (1) as $i (0; $x + {}))` on `{"a":1}` is `[]` in jq; succinctly
+   refuses (likewise `$x * {}` and `$x + null`). This is not a rule jq implements but an
+   artifact of how it is written: merging an *empty* right operand returns the left
+   operand's pointer unchanged, so `jv_identical` still holds. The mirrored `{} + $x`
+   refuses in jq itself, which is what shows there is nothing here to model. Golden
+   `fold_register_empty_merge_artifact`; not planned for closure.
+
+`FoldRegister`'s own register check models jq's `jv_identical` since
+[#1466](https://github.com/rust-works/succinctly/issues/1466), and that check is **not**
+structural equality. jq compares the two `jv`s' kind, then — for a string, array or object —
+their *pointers*, and for a number its raw representation, which a reconstruction never
+reproduces; only `null`/`true`/`false` reach its "same kind is identical" arm. So
+`path(reduce (1) as $i (.a; 1))` on `{"a":1}` raises even though `1 == 1`, while
+`path(reduce (1) as $i (.a; null))` on `{"a":null}` is `["a"]`. `OwnedValue` has no pointer
+to compare, so a `PathBranch` instead carries a `snapshot` mark for the one provenance
+succinctly can prove — a frozen `. as $x` binding that was never rebuilt, which is the same
+value jq is still holding — and `FoldRegister::identical` admits a branch that either
+navigated back to the register, is such a snapshot, or is a `null`/`true`/`false` equal to
+it. Before #1466 the check compared values alone, so any reconstruction landing on the
+register's value was promoted: `(reduce (1) as $i (.; {a:.a})) = 9` wrote `9` where jq
+raises and leaves the input untouched. That was the one divergence in this section that ran
+in the unsafe direction, and it is closed.
 
 The fold's own **loop-variable destructuring pattern** (`as [$i]`, `as {v:$v}`) is *not* a
 behavioural divergence: real jq refuses every such fold in path position, even when the
