@@ -1902,6 +1902,28 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    /// The span's content bytes, quotes stripped, when it carries no
+    /// escape -- in which case they *are* the decoded key, so the
+    /// duplicate-key probe can hash them without going through `as_str`
+    /// (#1514). `raw_and_escaped` reports both from the one scan it makes
+    /// for the closing quote, so the escape test is free.
+    fn key_raw_unescaped(&self) -> Option<&[u8]> {
+        match self {
+            StandardJson::String(s) => {
+                let (raw, escaped) = s.raw_and_escaped();
+                // A well-formed span is `"..."`; anything shorter than the
+                // two quotes is a truncated document, and has no content to
+                // hand back.
+                if escaped || raw.len() < 2 {
+                    None
+                } else {
+                    Some(&raw[1..raw.len() - 1])
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             StandardJson::Object(fields) => Some(*fields),
