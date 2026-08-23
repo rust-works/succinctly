@@ -22808,24 +22808,35 @@ fn continue_rest_with_borrowed_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     eval_pipe_with_path_context_internal::<W, S>(rest, v, root, file_origin, current_path, optional)
 }
 
-/// One `Expr::Iterate` element's full step: append `key` to `current_path`,
+/// One container element's full step: append `key` to `current_path`,
 /// continue `rest` from `v` at that new path, and fold the result into
-/// `results` -- the one piece the array and object loop bodies in the
-/// `Iterate` arm share verbatim, differing only in what `key` is and how
-/// they walk their own container (#1477 follow-up to #1548's `Iterate`
-/// conversion, which left this duplication in place). Kept as a shared
-/// per-element step rather than a shared iterator over both container
-/// kinds -- unifying the *iteration* itself would need either a
-/// heap-allocated `Box<dyn Iterator>` or a hand-rolled either-style
-/// wrapper, neither of which is warranted just to remove five duplicated
-/// lines, and this exact function has a documented history of perf
-/// regressions from exactly this kind of well-intentioned consolidation
-/// (#1548's own review caught an unconditional clone this shape can
-/// introduce if done carelessly).
+/// `results` -- the one piece the array and object loop bodies share
+/// verbatim in both `Expr::Iterate` and `Builtin::Map(f)`, differing only
+/// in what `key` is and how they walk their own container (#1477 follow-up
+/// to #1548's `Iterate` conversion, which left this duplication in place).
+/// `Builtin::Map(f)`'s two arms call this with `rest =
+/// core::slice::from_ref(f)` -- a slice that's always length 1, so
+/// `continue_rest_with_borrowed_value`'s own `rest.is_empty()` fast path
+/// never fires there and it degenerates to the same
+/// `eval_pipe_with_path_context_internal` call `map(f)` needs directly, one
+/// shared helper rather than two near-identical ones.
+///
+/// Kept as a shared per-element step rather than a shared iterator over
+/// both container kinds -- unifying the *iteration* itself would need
+/// either a heap-allocated `Box<dyn Iterator>` or a hand-rolled
+/// either-style wrapper, neither of which is warranted just to remove a
+/// few duplicated lines, and this exact function has a documented history
+/// of perf regressions from exactly this kind of well-intentioned
+/// consolidation (#1548's own review caught an unconditional clone this
+/// shape can introduce if done carelessly).
 ///
 /// Returns `Some(result)` when the caller must stop and propagate
 /// immediately, mirroring [`accumulate_path_context_step`]'s own contract.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors eval_pipe_with_path_context_internal's
+                                     // own root/file_origin/current_path/optional threading,
+                                     // used unbundled at every one of its ~15 call sites in this
+                                     // file; a context struct here alone would diverge from that
+                                     // established pattern rather than simplify it.
 fn iterate_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     key: OwnedValue,
     v: &OwnedValue,
@@ -22840,42 +22851,6 @@ fn iterate_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     new_path.push(key);
     let step =
         continue_rest_with_borrowed_value::<W, S>(v, rest, root, file_origin, &new_path, optional);
-    accumulate_path_context_step(results, step)
-}
-
-/// One `map(f)` element's full step: append `key` to `current_path`,
-/// evaluate `f` against `v` at that new path, and fold the result into
-/// `results` -- [`iterate_element_step`]'s sibling for `Builtin::Map`
-/// (#1477). Not the same helper: a map function has no "rest is empty"
-/// fast path to skip the way `Expr::Iterate`'s continuation does, so this
-/// calls `eval_pipe_with_path_context_internal` directly on `f` rather than
-/// going through `continue_rest_with_borrowed_value`. Taking `v: &OwnedValue`
-/// (borrowed straight from the source container) instead of an owned value
-/// lets both the array and object arms below iterate their container
-/// natively, the way `Expr::Iterate`'s own two arms do, rather than the
-/// eager `.clone()` per element the un-unified version paid to first
-/// homogenize both containers into one `Vec<(OwnedValue, OwnedValue)>`.
-#[allow(clippy::too_many_arguments)]
-fn map_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    key: OwnedValue,
-    v: &OwnedValue,
-    f: &Expr,
-    root: &OwnedValue,
-    file_origin: Option<&[usize]>,
-    current_path: &[OwnedValue],
-    optional: bool,
-    results: &mut Vec<OwnedValue>,
-) -> Option<QueryResult<'a, W>> {
-    let mut new_path = current_path.to_vec();
-    new_path.push(key);
-    let step = eval_pipe_with_path_context_internal::<W, S>(
-        core::slice::from_ref(f),
-        v,
-        root,
-        file_origin,
-        &new_path,
-        optional,
-    );
     accumulate_path_context_step(results, step)
 }
 
@@ -23768,21 +23743,30 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // surfacing a partial one, verified: `[1,error("x"),3]`
             // produces no output at all).
             //
-            // Iterates each container natively via `map_element_step`,
-            // mirroring `Expr::Iterate`'s own two arms (#1477), rather than
-            // eagerly homogenizing into one `Vec<(OwnedValue, OwnedValue)>`
-            // first the way this arm used to -- that cloned every element
-            // up front even though the loop only ever needs a borrow,
-            // doubling peak memory for a large array/object being mapped.
-            let mut results = Vec::new();
+            // Iterates each container natively via `iterate_element_step`
+            // (shared with `Expr::Iterate`, #1477), mirroring its own two
+            // arms, rather than eagerly homogenizing into one
+            // `Vec<(OwnedValue, OwnedValue)>` first the way this arm used
+            // to -- that cloned every element up front even though the loop
+            // only ever needs a borrow, doubling peak memory for a large
+            // array/object being mapped. `rest = core::slice::from_ref(f)`
+            // is always length 1, so `iterate_element_step`'s own
+            // "rest is empty" fast path never fires here -- it degenerates
+            // to exactly the `eval_pipe_with_path_context_internal` call
+            // `map(f)` needs, no separate helper required.
+            let mut results = Vec::with_capacity(match value {
+                OwnedValue::Array(arr) => arr.len(),
+                OwnedValue::Object(entries) => entries.len(),
+                _ => 0,
+            });
             let mut stopped = None;
             match value {
                 OwnedValue::Array(arr) => {
                     for (i, v) in arr.iter().enumerate() {
-                        if let Some(stop) = map_element_step::<W, S>(
+                        if let Some(stop) = iterate_element_step::<W, S>(
                             OwnedValue::Int(i as i64),
                             v,
-                            f,
+                            core::slice::from_ref(f),
                             root,
                             file_origin,
                             current_path,
@@ -23796,10 +23780,10 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 }
                 OwnedValue::Object(entries) => {
                     for (key, v) in entries {
-                        if let Some(stop) = map_element_step::<W, S>(
+                        if let Some(stop) = iterate_element_step::<W, S>(
                             OwnedValue::String(key.clone()),
                             v,
-                            f,
+                            core::slice::from_ref(f),
                             root,
                             file_origin,
                             current_path,
@@ -49814,8 +49798,8 @@ mod tests {
 
     /// Object-input mirror of [`test_map_element_partial_error_propagates_with_path_context`]
     /// -- the array branch already covers the mid-element error path, but
-    /// the object branch (sharing `map_element_step` since #1477) had no
-    /// equivalent.
+    /// the object branch (sharing `iterate_element_step` since #1477) had
+    /// no equivalent.
     #[test]
     fn test_map_element_partial_error_propagates_with_path_context_object() {
         match eval_all_result(
