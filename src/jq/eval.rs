@@ -30947,6 +30947,19 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// just the winning alternative's (or the last one's, if none win) -- so
 /// the returned `Vec<OwnedValue>` accumulates across every alternative
 /// actually attempted, not just the final one.
+///
+/// **A *pattern-match* failure on the last alternative must carry `carried`
+/// forward too** (code review, #1462) -- it is just another way this
+/// function's own last alternative can fail, exactly like a body
+/// error/break/halt, and every one of those already returns
+/// `Ok((carried, Some(control)))` rather than discarding the prefix. This
+/// arm alone used to `return Err(e)`, silently dropping `carried` and
+/// diverging from real jq (confirmed live, jq 1.7.1: `[1] as [$a] ?// {b:$c}
+/// | ($a, error("boom"))` prints `1` then the error) -- and, since Stage 5
+/// added a sink-based twin of this exact loop (`each_pattern_alternatives`,
+/// which never had anywhere to drop a prefix already pushed to its sink),
+/// the same jq expression was answering two different ways in the same
+/// binary depending on which evaluator reached it.
 fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
@@ -30973,7 +30986,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(b) => b,
             Err(e) => {
                 if is_last {
-                    return Err(e);
+                    return Ok((carried, Some(Control::Error(e))));
                 }
                 continue;
             }
@@ -34251,6 +34264,15 @@ mod tests {
             (b"null", "[1, 2] as [$a, $b] | ($a, $b)"),
             (b"null", "1 as $x ?// $y | ($x, $x)"),
             (b"null", "(1, [2]) as $x ?// [$y] | ($x, $y)"),
+            // #1462 code review: an earlier alternative's body produces
+            // output before erroring, *and* the final alternative's own
+            // pattern fails to match -- `try_pattern_alternatives`'s
+            // pattern-match-failure arm used to `return Err(e)` here,
+            // dropping that earlier output, while `each_pattern_alternatives`
+            // never had anywhere to drop it from (already pushed to its
+            // sink). Fixed to agree with each other and with jq (1.7.1,
+            // confirmed live: prints `1` then the error).
+            (b"null", "[1] as [$a] ?// {b:$c} | ($a, error(\"x\"))"),
             (b"null", "def f: 1, 2, 3; f"),
             (b"null", "def f: 1, 2; def g: f, f; g"),
             (b"null", "def f(x): x, x + 1; f(5)"),

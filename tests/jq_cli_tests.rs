@@ -17934,6 +17934,20 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // #1462 code review: `try_pattern_alternatives`'s pattern-match-
+        // failure arm used to `return Err(e)` on the last `?//` alternative,
+        // silently dropping the output an earlier alternative's body had
+        // already produced -- diverging from jq (which keeps it) for the
+        // *bare* spelling specifically, since the new `each_pattern_alternatives`
+        // never had anywhere to drop that output from (already pushed to its
+        // sink). Fixed so both agree with jq (1.7.1, confirmed live).
+        (
+            &["-cn", r#"[1] as [$a] ?// {b:$c} | ($a, error("x"))"#],
+            None,
+            "1\n",
+            r#"jq: error (at <unknown>): Cannot index array with string "b""#,
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
