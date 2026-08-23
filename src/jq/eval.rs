@@ -2212,6 +2212,35 @@ fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Materialize a bind expression's own `QueryResult` into the values
+/// [`each_as`]/[`each_as_pattern`] loop the shared `body`/pattern-match logic
+/// over, plus the control the bind itself trails (`#400`/`#494`: a
+/// `Partial` bind still has its produced prefix bound and run through the
+/// body, exactly as `eval_as`/`eval_as_pattern` already do). `Err(flow)`
+/// carries the caller's own early return for a bind that produced no
+/// values at all, or that raised without producing any.
+///
+/// Shared by both (code review, #1462) -- this exact `QueryResult` ->
+/// `(Vec<OwnedValue>, Option<Control>)` unpacking was already duplicated
+/// between the eager `eval_as`/`eval_as_pattern`; this collapses all four
+/// copies (the eager pair plus their two new lazy twins) into one.
+fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
+    bound_result: QueryResult<'_, W>,
+) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
+    match bound_result.materialize_cursor() {
+        QueryResult::One(v) => Ok((vec![to_owned(&v)], None)),
+        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+        QueryResult::Many(vs) => Ok((vs.iter().map(to_owned).collect(), None)),
+        QueryResult::Owned(v) => Ok((vec![v], None)),
+        QueryResult::ManyOwned(vs) => Ok((vs, None)),
+        QueryResult::None => Err(Flow::Exhausted),
+        QueryResult::Error(e) => Err(Flow::Escaped(Control::Error(e))),
+        QueryResult::Break(label) => Err(Flow::Escaped(Control::Break(label))),
+        QueryResult::Halt(code) => Err(Flow::Escaped(Control::Halt(code))),
+        QueryResult::Partial(vs, control) => Ok((vs, Some(control))),
+    }
+}
+
 /// Lazy twin of [`eval_as`] (#1462): the bind expression (`expr`) is
 /// evaluated eagerly, exactly as `eval_as` already does -- mirroring
 /// `each_if`'s decision to leave `cond` eager, this fix is scoped to what
@@ -2230,19 +2259,10 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
-    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
-        match bound_result.materialize_cursor() {
-            QueryResult::One(v) => (vec![to_owned(&v)], None),
-            QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => return Flow::Exhausted,
-            QueryResult::Error(e) => return Flow::Escaped(Control::Error(e)),
-            QueryResult::Break(label) => return Flow::Escaped(Control::Break(label)),
-            QueryResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
+    let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
 
     for bound_val in bound_values {
         let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
@@ -2274,19 +2294,10 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
-    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
-        match bound_result.materialize_cursor() {
-            QueryResult::One(v) => (vec![to_owned(&v)], None),
-            QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => return Flow::Exhausted,
-            QueryResult::Error(e) => return Flow::Escaped(Control::Error(e)),
-            QueryResult::Break(label) => return Flow::Escaped(Control::Break(label)),
-            QueryResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
+    let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
 
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
