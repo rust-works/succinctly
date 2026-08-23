@@ -20894,3 +20894,20 @@ fn test_yq_auto_output_mixed_format_separator_order_independent_1493() -> Result
     );
     Ok(())
 }
+
+/// #1409's `Comma` path-threading fix in yq mode too, since
+/// `eval_pipe_with_path_context_internal` is shared verbatim between jq
+/// and yq (`key`/`parent` reachable in yq mode via its own `--eval-all`
+/// support) -- pins yq-mode parity so a future mode-specific edit has real
+/// CI signal here, not just in `jq_cli_tests.rs`.
+#[test]
+fn test_yq_comma_path_context_threads_per_output_path_1409() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".a | (.[], empty) | key",
+        "a:\n  - 10\n  - 20\n  - 30\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "0\n1\n2\n");
+    Ok(())
+}

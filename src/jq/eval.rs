@@ -21814,8 +21814,11 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// comparison, an `if`/`then`/`else`, or a `try`/`catch` result is still
 /// "at" the position it was computed from) and fanning a multi-valued
 /// result back out over `rest` the same way `Iterate` does above. Shared by
-/// `If`/`Comma`/`Try`/`Label` below to avoid re-deriving this fan-out loop
-/// at each call site.
+/// `If`/`Try`/`Label` below to avoid re-deriving this fan-out loop at each
+/// call site (`Comma` used to as well, until #1409 moved it onto the
+/// combine-with-`rest` idiom `Optional`/`Pipe` already use, since threading
+/// one ambient `current_path` through every comma branch lost each
+/// branch's own per-output path).
 fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     intermediate: QueryResult<'a, W>,
     rest: &[Expr],
@@ -22558,9 +22561,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // output's real one (`.a | (.[])? | key` would wrongly report every
         // element's key as `"a"` instead of its index). This is a
         // pre-existing limitation of the isolate-then-continue shape shared
-        // by the `Comma`/`Try`/`Label` arms elsewhere in this function, not
-        // something new here -- filed as #1409 (needs a real
-        // path-preserving redesign of that shared shape) -- but this arm
+        // by the `Try`/`Label` arms elsewhere in this function (`Comma` had
+        // it too, until #1409 fixed it there by combining each branch with
+        // `rest` instead -- a trick that doesn't carry over to `Try`/`Label`,
+        // since it would let `rest`'s own errors be caught by `try`'s
+        // handler or `label`'s break scope), not something new here -- but
+        // this arm
         // must not regress it for `Optional` specifically, so it only takes
         // the fast, isolated path when `rest` doesn't consult path context
         // in the first place, and otherwise falls back to evaluating
@@ -22659,8 +22665,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // arithmetic is typically a mid-pipe computation, not the pipe's
             // final value, so later `key`/`file_index` calls must still
             // resolve against the pre-arithmetic position. Uses the same
-            // accumulate-or-stop continuation `Comma`/`If`/`Select` already
-            // share, since the fanout above can now legitimately produce
+            // accumulate-or-stop continuation `If`/`Select` already share,
+            // since the fanout above can now legitimately produce
             // `ManyOwned`/`Partial`/`Break`, not just `Owned`/`None`/`Error`.
             continue_rest_with_context::<W, S>(
                 arith_result,
@@ -23290,7 +23296,6 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // jq never does -- tracked separately, #1409 remains open for
             // those two.
             let mut branch_outputs = Vec::new();
-            let mut stopped = None;
             for sub_expr in exprs {
                 let mut combined = vec![sub_expr.clone()];
                 combined.extend(rest.iter().cloned());
@@ -23303,11 +23308,10 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     optional,
                 );
                 if let Some(stop) = accumulate_path_context_step(&mut branch_outputs, step) {
-                    stopped = Some(stop);
-                    break;
+                    return stop;
                 }
             }
-            stopped.unwrap_or_else(|| owned_vec_to_result(branch_outputs))
+            owned_vec_to_result(branch_outputs)
         }
         Expr::Try {
             expr: try_expr,
