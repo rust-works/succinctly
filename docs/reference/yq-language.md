@@ -112,7 +112,9 @@ succinctly yq '.items[] | split_doc' file.yaml
 # item3
 ```
 
-### Cross-File Operations (Succinctly Extension)
+### Cross-File Operations
+
+**Real yq surface, not a succinctly invention** — cross-file evaluation is real yq (`eval-all`), filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, and the deviation noted below is tracked accordingly, not exempted under rule 5.
 
 `--eval-all`/`--ea` combines every document from every input file into one evaluation context (default `eval` mode evaluates each document independently, low memory). `file_index`/`fileIndex`/`fi` returns the 0-indexed origin file position, resolvable only within that combined context.
 
@@ -377,7 +379,9 @@ succinctly yq 'at_position(5; 3)' config.yaml
 | `--tab`               | Use tabs for indentation                      |
 | `--split-exp EXPR`    | Split output into one file per result (below) |
 
-### `--front-matter` (Succinctly Extension)
+### `--front-matter`
+
+**Real yq surface, not a succinctly invention** — `yq --help` lists `-f, --front-matter`, filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, not an exemption under rule 5.
 
 Real yq can operate on YAML embedded as front matter inside another file (e.g. Markdown with a `---`-delimited YAML header). `--front-matter extract` evaluates the expression against just the front matter and discards the trailing content; `--front-matter process` re-emits the transformed front matter (re-fenced) followed by the original trailing content, unchanged.
 
@@ -391,7 +395,9 @@ succinctly yq --front-matter process --inplace '.tags += ["new"]' post.md
 
 A file without a leading `---` line errors. `--front-matter` is incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, and an explicit `--input-format json` (front matter is YAML by definition); `--front-matter=process` additionally requires YAML output and is incompatible with `--slurp` (a slurped array can't reattach a body per input file); `--front-matter=extract` is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`/`at_position`/`line`/`column`) resolve against the extracted YAML block's own coordinates, not the original file (see [Known Limitations](#known-limitations)).
 
-### `--split-exp` (Succinctly Extension)
+### `--split-exp`
+
+**Real yq surface, not a succinctly invention** — `yq --help` lists `-s, --split-exp`, filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, not an exemption under rule 5 (the long-only spelling below is a separate, deliberate divergence, not the extension question).
 
 Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter).
 
