@@ -17202,6 +17202,57 @@ fn test_jq_slurp_zero_value_input_with_inputs_builtin_1309() -> Result<()> {
     Ok(())
 }
 
+/// #1520: `--slurp`'s single combined value's `(at ...)` marker names the
+/// *last source on the command line*, at that source's own newline count --
+/// not the last *value*'s location, which `test_jq_slurp_exhaustion_location_
+/// is_unknown_1309`'s companion check above happened not to distinguish
+/// (both its files were non-empty with exactly one newline each, so the two
+/// readings coincide). These cases pin them apart. Every expectation here is
+/// jq 1.7.1's own live output.
+#[test]
+fn test_jq_slurp_error_location_is_last_source_eof_1520() -> Result<()> {
+    // The last file contributes zero values (empty) -- jq still names *that*
+    // file, at line 0, not the previous file's last value.
+    let (_, stderr, code, paths) = run_jq_over_files(&["-c", "-s", r#"error("x")"#], &["1\n", ""])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[1])),
+        "{stderr}"
+    );
+
+    // The sole file is empty -- jq names it (and at line 0), not `<stdin>`.
+    let (_, stderr, code, paths) = run_jq_over_files(&["-c", "-s", r#"error("x")"#], &[""])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[0])),
+        "{stderr}"
+    );
+
+    // A file with content but no trailing newline still counts 0 newlines,
+    // matching jq's "count newlines, not lines" rule -- not the same as
+    // `content_lines`'s always-at-least-1 line count.
+    let (_, stderr, code, paths) = run_jq_over_files(&["-c", "-s", r#"error("x")"#], &["1 2"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[0])),
+        "{stderr}"
+    );
+
+    // `-R -s` (raw input + slurp) follows the same last-source-EOF rule as
+    // plain `-s`, not the whole-combined-input line count `content_lines`
+    // would give (which would wrongly count both files' newlines together
+    // and wrongly attribute them to the first file).
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-R", "-c", "-s", r#"error("x")"#], &["1\n", "2\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
