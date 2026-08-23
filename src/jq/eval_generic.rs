@@ -22,8 +22,8 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, effective_fields, effective_keys, effective_len, key_hash, DocumentCursor,
-    DocumentElements, DocumentFields, DocumentValue, IndentSpec, KeyHashes,
+    collapsed_fields, effective_fields, effective_keys, effective_len, DistinctKeyCursors,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, eval_each_owned, format_owned,
@@ -686,42 +686,12 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// An object's key cursors in document order, with a repeated key dropped
 /// after its first occurrence when the mode collapses (#1514).
 ///
-/// One walk. The [`KeyHashes`] probe rides along with the walk that was
-/// happening anyway, so a duplicate-free object -- the overwhelmingly
-/// common case -- pays one hash per key and nothing else. Before this the
-/// caller ran a whole separate `document::census` first, then walked again
-/// to build this list.
-///
-/// A repeated hash abandons the walk and settles the object exactly through
-/// `collapsed_fields`, which decides on the keys themselves. That costs one
-/// extra pass on an object that genuinely repeats a key -- and on the
-/// 1-in-2^64 collision that only looks like one, where `collapsed_fields`
-/// answers `None` and the plain walk is the right answer after all.
+/// Materializes what [`DistinctKeyCursors`] streams. `.[]` over a key array
+/// has to hand back every cursor at once, but the dedup still happens during
+/// the single walk that collects them -- where before, the caller ran a
+/// whole separate `document::census` and then walked again to build this.
 fn distinct_key_cursors<V: DocumentValue>(fields: &V::Fields, collapse: bool) -> Vec<V::Cursor> {
-    let mut cursors = Vec::new();
-    let mut seen = KeyHashes::new();
-    let mut walk = fields.clone();
-    while let Some((field, rest)) = walk.uncons() {
-        if collapse
-            && field
-                .key_str()
-                .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
-        {
-            return match collapsed_fields(fields) {
-                Some(collapsed) => collapsed.into_iter().map(|f| f.key_cursor).collect(),
-                // A hash collision, not a duplicate: no key repeats
-                // anywhere in the object, so the plain walk is correct.
-                None => fields
-                    .all_fields()
-                    .into_iter()
-                    .map(|f| f.key_cursor)
-                    .collect(),
-            };
-        }
-        cursors.push(field.key_cursor);
-        walk = rest;
-    }
-    cursors
+    DistinctKeyCursors::new(fields, collapse).collect()
 }
 
 /// Materialize a `GenericResult::LazyIndexRange` fallback: build the
@@ -788,27 +758,9 @@ enum LazySource<V: DocumentValue> {
     ///
     /// Carries the mode's duplicate-key rule into the pull itself (#1514)
     /// instead of probing the whole object before the first element is
-    /// asked for. "First occurrence wins" is an *online* rule: every key
-    /// already emitted was a first occurrence, so a repeat discovered
-    /// later means "skip this one" and never invalidates what went out.
-    Keys {
-        /// The fields still to pull from.
-        rest: V::Fields,
-        /// The object as a whole, kept only for the exact resolution in
-        /// `advance` -- `V::Fields` is a cursor position, so this is a
-        /// copy of two machine words, not of the object.
-        all: V::Fields,
-        /// Hashes of the keys emitted so far, in jq mode. `None` in yq
-        /// mode, where every occurrence is kept, and `None` again once
-        /// the object has been *proved* free of duplicates.
-        seen: Option<KeyHashes>,
-        /// How many elements have gone out, which is where `collapsed`
-        /// resumes.
-        emitted: usize,
-        /// Set once a repeat is confirmed: the exact collapsed key
-        /// cursors, which the pull reads from for the remainder.
-        collapsed: Option<Vec<V::Cursor>>,
-    },
+    /// asked for -- see [`DistinctKeyCursors`] for why that is sound on a
+    /// forward-only consumer.
+    Keys(DistinctKeyCursors<V::Fields>),
     /// Array `keys_unsorted | map(f)` (#724) — synthetic `[0, 1, ..., len-1]`,
     /// no cursor to point at.
     IndexRange { next: usize, len: usize },
@@ -833,7 +785,7 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
         match self {
             Self::Elements(_) => f.write_str("LazySource::Elements(..)"),
             Self::Values(_) => f.write_str("LazySource::Values(..)"),
-            Self::Keys { .. } => f.write_str("LazySource::Keys(..)"),
+            Self::Keys(_) => f.write_str("LazySource::Keys(..)"),
             Self::IndexRange { next, len } => f
                 .debug_struct("LazySource::IndexRange")
                 .field("next", next)
@@ -851,19 +803,9 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
 impl<V: DocumentValue> LazySource<V> {
     /// A `keys_unsorted` source that honours the mode's duplicate-key
     /// rule as it pulls (#1514).
-    ///
-    /// `collapse` false -- yq -- keeps every occurrence, so no probe state
-    /// is carried at all and the pull is the plain cons-list walk it was.
     fn keys(fields: V::Fields, collapse: bool) -> Self {
-        Self::Keys {
-            rest: fields.clone(),
-            all: fields,
-            seen: collapse.then(KeyHashes::new),
-            emitted: 0,
-            collapsed: None,
-        }
+        Self::Keys(DistinctKeyCursors::new(&fields, collapse))
     }
-
     /// Pull one element forward, storing "the rest" back into `self`. Once a
     /// variant's underlying cons-list is empty (or `next == len`), every
     /// subsequent call returns `None` forever.
@@ -879,51 +821,7 @@ impl<V: DocumentValue> LazySource<V> {
                 *fields = rest;
                 Some(LazyElem::Cursor(field.value_cursor))
             }
-            Self::Keys {
-                rest,
-                all,
-                seen,
-                emitted,
-                collapsed,
-            } => {
-                if let Some(cursors) = collapsed {
-                    let cursor = cursors.get(*emitted).copied()?;
-                    *emitted += 1;
-                    return Some(LazyElem::Cursor(cursor));
-                }
-                let (field, tail) = rest.uncons()?;
-                *rest = tail;
-                let repeat = seen.as_mut().is_some_and(|seen| {
-                    field
-                        .key_str()
-                        .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
-                });
-                if repeat {
-                    // Settle it on the keys themselves. `collapsed_fields`
-                    // answers `None` when nothing actually repeats -- a
-                    // 64-bit hash collision -- and that answer covers the
-                    // whole object, so the probe is dropped for good
-                    // rather than re-run at the next collision.
-                    match collapsed_fields(all) {
-                        Some(fields) => {
-                            let cursors: Vec<V::Cursor> =
-                                fields.into_iter().map(|f| f.key_cursor).collect();
-                            // The collapsed list opens with the same
-                            // first occurrences already emitted, so the
-                            // remainder resumes at `emitted`.
-                            let cursor = cursors.get(*emitted).copied();
-                            *collapsed = Some(cursors);
-                            *seen = None;
-                            let cursor = cursor?;
-                            *emitted += 1;
-                            return Some(LazyElem::Cursor(cursor));
-                        }
-                        None => *seen = None,
-                    }
-                }
-                *emitted += 1;
-                Some(LazyElem::Cursor(field.key_cursor))
-            }
+            Self::Keys(keys) => Some(LazyElem::Cursor(keys.next()?)),
             Self::IndexRange { next, len } => {
                 if *next >= *len {
                     return None;
