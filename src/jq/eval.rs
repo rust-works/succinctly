@@ -21608,7 +21608,19 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let from_val = bound!(from_owned);
 
         let Some(to_expr) = to else {
-            // range(n) means range(0; n)
+            // range(n) means range(0; n).
+            //
+            // Unreachable from any query, and was before #1279 too: the parser
+            // desugars the one-argument form itself, emitting
+            // `Range { from: Literal(0), to: Some(n), step: None }`
+            // (`parse_range_expr`), and every other `Expr::Range` construction
+            // in the tree is a rebuild that threads an existing `to` through.
+            // So nothing ever sets `to: None`, and llvm-cov reports 0 hits
+            // here while the line above it has 65. Kept rather than deleted
+            // because narrowing the AST field to a non-`Option` would ripple
+            // through the parser and six rebuild sites for no behavioural
+            // gain -- noted so a reader does not go looking for the test that
+            // would cover it.
             let one = match from_val {
                 RangeNum::Int(to) => eval_range_values::<W>(0, to, 1),
                 RangeNum::Float(to) => eval_range_values_f64::<W>(0.0, to, 1.0),
