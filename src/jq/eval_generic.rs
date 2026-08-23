@@ -5,8 +5,6 @@
 //! JSON and YAML without intermediate conversion.
 
 #[cfg(not(test))]
-use alloc::borrow::Cow;
-#[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::format;
@@ -19,15 +17,13 @@ use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
 #[cfg(test)]
-use std::borrow::Cow;
-#[cfg(test)]
 use std::rc::Rc;
 
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, effective_fields, effective_keys, effective_len, DocumentCursor,
-    DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
+    collapsed_fields, effective_fields, effective_keys, effective_len, key_hash, DocumentCursor,
+    DocumentElements, DocumentFields, DocumentValue, IndentSpec, KeyHashes,
 };
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, eval_each_owned, format_owned,
@@ -687,74 +683,45 @@ fn materialize_lazy_keys<V: DocumentValue>(
     OwnedValue::Array(keys.into_iter().map(OwnedValue::String).collect())
 }
 
-/// The `LazyKeys` `Pipe` fast-path arms, over an object whose repeated keys
-/// have already been collapsed (#1385).
+/// An object's key cursors in document order, with a repeated key dropped
+/// after its first occurrence when the mode collapses (#1514).
 ///
-/// Mirrors the cons-list arms in `eval_single`'s `LazyKeys` dispatch
-/// one-for-one, reading from the collapsed field list instead of walking
-/// `V::Fields`. It is reached only when the object genuinely carries a
-/// duplicate, so allocating here costs nothing on ordinary documents.
+/// One walk. The [`KeyHashes`] probe rides along with the walk that was
+/// happening anyway, so a duplicate-free object -- the overwhelmingly
+/// common case -- pays one hash per key and nothing else. Before this the
+/// caller ran a whole separate `document::census` first, then walked again
+/// to build this list.
 ///
-/// `map` has no collapsed counterpart -- `LazySource::Keys` holds a
-/// `V::Fields`, not a slice -- so it joins the materializing fallback rather
-/// than staying lazy. That trades #724's laziness for correctness on an
-/// input that cannot use it anyway.
-///
-/// The empty-`fields` arms below are unreachable rather than dead: this
-/// function is only called once `collapsed_fields` has answered `Some`,
-/// which needs a key to have repeated, which needs at least two fields.
-/// They cannot be deleted -- `Vec::into_iter().next()` is an `Option`, and
-/// the cons-list arms they mirror do have to handle an empty object.
-fn lazy_keys_collapsed<S: EvalSemantics, V: DocumentValue>(
-    expr: &Expr,
-    fields: Vec<DocumentField<V, V::Cursor>>,
-    sorted: bool,
-    optional: bool,
-) -> GenericResult<V> {
-    match unwrap_paren(expr) {
-        Expr::Builtin(Builtin::Length) => {
-            GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
-        }
-        Expr::Iterate if !sorted => {
-            let cursors: Vec<V::Cursor> = fields.into_iter().map(|f| f.key_cursor).collect();
-            if cursors.is_empty() {
-                GenericResult::None
-            } else {
-                GenericResult::ManyCursor(cursors)
-            }
-        }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
-            let target = if *idx < 0 {
-                let normalized = fields.len() as i64 + idx;
-                usize::try_from(normalized).ok()
-            } else {
-                Some(*idx as usize)
+/// A repeated hash abandons the walk and settles the object exactly through
+/// `collapsed_fields`, which decides on the keys themselves. That costs one
+/// extra pass on an object that genuinely repeats a key -- and on the
+/// 1-in-2^64 collision that only looks like one, where `collapsed_fields`
+/// answers `None` and the plain walk is the right answer after all.
+fn distinct_key_cursors<V: DocumentValue>(fields: &V::Fields, collapse: bool) -> Vec<V::Cursor> {
+    let mut cursors = Vec::new();
+    let mut seen = KeyHashes::new();
+    let mut walk = fields.clone();
+    while let Some((field, rest)) = walk.uncons() {
+        if collapse
+            && field
+                .key_str()
+                .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
+        {
+            return match collapsed_fields(fields) {
+                Some(collapsed) => collapsed.into_iter().map(|f| f.key_cursor).collect(),
+                // A hash collision, not a duplicate: no key repeats
+                // anywhere in the object, so the plain walk is correct.
+                None => fields
+                    .all_fields()
+                    .into_iter()
+                    .map(|f| f.key_cursor)
+                    .collect(),
             };
-            match target.and_then(|t| fields.into_iter().nth(t)) {
-                Some(field) => GenericResult::OneCursor(field.key_cursor),
-                None => GenericResult::Owned(OwnedValue::Null),
-            }
         }
-        Expr::Builtin(Builtin::First) if !sorted => match fields.into_iter().next() {
-            Some(field) => GenericResult::OneCursor(field.key_cursor),
-            None => GenericResult::Owned(OwnedValue::Null),
-        },
-        Expr::Builtin(Builtin::Last) if !sorted => match fields.into_iter().next_back() {
-            Some(field) => GenericResult::OneCursor(field.key_cursor),
-            None => GenericResult::Owned(OwnedValue::Null),
-        },
-        _ => {
-            let mut keys: Vec<String> = fields
-                .iter()
-                .filter_map(|f| f.key_str().map(Cow::into_owned))
-                .collect();
-            if sorted {
-                keys.sort();
-            }
-            let owned = OwnedValue::Array(keys.into_iter().map(OwnedValue::String).collect());
-            eval_on_owned::<S, _>(expr, owned, optional)
-        }
+        cursors.push(field.key_cursor);
+        walk = rest;
     }
+    cursors
 }
 
 /// Materialize a `GenericResult::LazyIndexRange` fallback: build the
@@ -818,7 +785,30 @@ enum LazySource<V: DocumentValue> {
     /// Bare `obj | map(f)` (#725).
     Values(V::Fields),
     /// `keys_unsorted | map(f)` (#724).
-    Keys(V::Fields),
+    ///
+    /// Carries the mode's duplicate-key rule into the pull itself (#1514)
+    /// instead of probing the whole object before the first element is
+    /// asked for. "First occurrence wins" is an *online* rule: every key
+    /// already emitted was a first occurrence, so a repeat discovered
+    /// later means "skip this one" and never invalidates what went out.
+    Keys {
+        /// The fields still to pull from.
+        rest: V::Fields,
+        /// The object as a whole, kept only for the exact resolution in
+        /// `advance` -- `V::Fields` is a cursor position, so this is a
+        /// copy of two machine words, not of the object.
+        all: V::Fields,
+        /// Hashes of the keys emitted so far, in jq mode. `None` in yq
+        /// mode, where every occurrence is kept, and `None` again once
+        /// the object has been *proved* free of duplicates.
+        seen: Option<KeyHashes>,
+        /// How many elements have gone out, which is where `collapsed`
+        /// resumes.
+        emitted: usize,
+        /// Set once a repeat is confirmed: the exact collapsed key
+        /// cursors, which the pull reads from for the remainder.
+        collapsed: Option<Vec<V::Cursor>>,
+    },
     /// Array `keys_unsorted | map(f)` (#724) — synthetic `[0, 1, ..., len-1]`,
     /// no cursor to point at.
     IndexRange { next: usize, len: usize },
@@ -843,7 +833,7 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
         match self {
             Self::Elements(_) => f.write_str("LazySource::Elements(..)"),
             Self::Values(_) => f.write_str("LazySource::Values(..)"),
-            Self::Keys(_) => f.write_str("LazySource::Keys(..)"),
+            Self::Keys { .. } => f.write_str("LazySource::Keys(..)"),
             Self::IndexRange { next, len } => f
                 .debug_struct("LazySource::IndexRange")
                 .field("next", next)
@@ -859,6 +849,21 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
 }
 
 impl<V: DocumentValue> LazySource<V> {
+    /// A `keys_unsorted` source that honours the mode's duplicate-key
+    /// rule as it pulls (#1514).
+    ///
+    /// `collapse` false -- yq -- keeps every occurrence, so no probe state
+    /// is carried at all and the pull is the plain cons-list walk it was.
+    fn keys(fields: V::Fields, collapse: bool) -> Self {
+        Self::Keys {
+            rest: fields.clone(),
+            all: fields,
+            seen: collapse.then(KeyHashes::new),
+            emitted: 0,
+            collapsed: None,
+        }
+    }
+
     /// Pull one element forward, storing "the rest" back into `self`. Once a
     /// variant's underlying cons-list is empty (or `next == len`), every
     /// subsequent call returns `None` forever.
@@ -874,9 +879,49 @@ impl<V: DocumentValue> LazySource<V> {
                 *fields = rest;
                 Some(LazyElem::Cursor(field.value_cursor))
             }
-            Self::Keys(fields) => {
-                let (field, rest) = fields.uncons()?;
-                *fields = rest;
+            Self::Keys {
+                rest,
+                all,
+                seen,
+                emitted,
+                collapsed,
+            } => {
+                if let Some(cursors) = collapsed {
+                    let cursor = cursors.get(*emitted).copied()?;
+                    *emitted += 1;
+                    return Some(LazyElem::Cursor(cursor));
+                }
+                let (field, tail) = rest.uncons()?;
+                *rest = tail;
+                let repeat = seen.as_mut().is_some_and(|seen| {
+                    field
+                        .key_str()
+                        .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
+                });
+                if repeat {
+                    // Settle it on the keys themselves. `collapsed_fields`
+                    // answers `None` when nothing actually repeats -- a
+                    // 64-bit hash collision -- and that answer covers the
+                    // whole object, so the probe is dropped for good
+                    // rather than re-run at the next collision.
+                    match collapsed_fields(all) {
+                        Some(fields) => {
+                            let cursors: Vec<V::Cursor> =
+                                fields.into_iter().map(|f| f.key_cursor).collect();
+                            // The collapsed list opens with the same
+                            // first occurrences already emitted, so the
+                            // remainder resumes at `emitted`.
+                            let cursor = cursors.get(*emitted).copied();
+                            *collapsed = Some(cursors);
+                            *seen = None;
+                            let cursor = cursor?;
+                            *emitted += 1;
+                            return Some(LazyElem::Cursor(cursor));
+                        }
+                        None => *seen = None,
+                    }
+                }
+                *emitted += 1;
                 Some(LazyElem::Cursor(field.key_cursor))
             }
             Self::IndexRange { next, len } => {
@@ -2688,118 +2733,153 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     optional: bool,
 ) -> GenericResult<V> {
-    match if collapse {
-        // #1385: in jq mode a repeated key collapses, so
-        // these count- and order-sensitive arms cannot
-        // answer from the raw walk -- the collapsed object
-        // has fewer members, and `.[n]`/`last` land
-        // elsewhere. Probe once: an object with no repeat
-        // (the common case) keeps the zero-allocation
-        // cons-list arms below exactly as they were, and in
-        // yq mode `collapse` is a `false` const, so the
-        // probe itself compiles away.
-        collapsed_fields(&fields)
-    } else {
-        None
-    } {
-        Some(eff) => lazy_keys_collapsed::<S, V>(expr, eff, sorted, optional),
-        None => match unwrap_paren(expr) {
-            // Order-independent for both `keys` and
-            // `keys_unsorted` — the one fast path #683 adds for
-            // sorted `keys`.
-            Expr::Builtin(Builtin::Length) => {
-                GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
+    match unwrap_paren(expr) {
+        // #1514: the collapse probe used to run in guard
+        // position, ahead of this match, so every arm paid a
+        // full `document::census` -- including the ones that
+        // never needed the answer (`first`, and the
+        // materializing fallback, which applies the rule
+        // itself through `effective_keys`) and the ones that
+        // can settle it during a walk they were making
+        // anyway. It now runs only where the answer is read
+        // *positionally*, which is the only shape that cannot
+        // be decided as the walk goes.
+        //
+        // Order-independent for both `keys` and
+        // `keys_unsorted` — the one fast path #683 adds for
+        // sorted `keys`. `effective_len` counts distinct keys
+        // in one walk without materializing the field list,
+        // and is `fields.len()` outright when `collapse` is
+        // false.
+        Expr::Builtin(Builtin::Length) => {
+            GenericResult::Owned(OwnedValue::Int(effective_len(&fields, collapse) as i64))
+        }
+        // Document order is a valid answer only for
+        // `keys_unsorted`. `keys` needs lexicographic order
+        // for these and falls through to the shared
+        // materialize-(and-sort) fallback below. Do not drop
+        // the `if !sorted` guard on a new arm here without
+        // re-deriving why document order would still be a
+        // correct answer.
+        Expr::Iterate if !sorted => {
+            let cursors = distinct_key_cursors::<V>(&fields, collapse);
+            if cursors.is_empty() {
+                GenericResult::None
+            } else {
+                GenericResult::ManyCursor(cursors)
             }
-            // Document order is a valid answer only for
-            // `keys_unsorted`. `keys` needs lexicographic order
-            // for these and falls through to the shared
-            // materialize-(and-sort) fallback below. Do not drop
-            // the `if !sorted` guard on a new arm here without
-            // re-deriving why document order would still be a
-            // correct answer.
-            Expr::Iterate if !sorted => {
-                let mut cursors = Vec::new();
-                let mut current = fields;
-                while let Some((field, rest)) = current.uncons() {
-                    cursors.push(field.key_cursor);
-                    current = rest;
-                }
-                if cursors.is_empty() {
-                    GenericResult::None
-                } else {
-                    GenericResult::ManyCursor(cursors)
-                }
-            }
-            Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
-                // Negative indices need the length to normalize
-                // against, same as `Expr::Index`'s array arm
-                // above; positive indices skip straight to the
-                // walk. Out-of-bounds is `null`, never an error
-                // (#307), matching that same arm.
+        }
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
+            // Positional: a collapsed object has fewer
+            // members, so `.[n]` lands elsewhere. This is one
+            // of the two arms that still has to know the
+            // whole answer before it can pick an element.
+            //
+            // Negative indices need the length to normalize
+            // against, same as `Expr::Index`'s array arm
+            // above; positive indices skip straight to the
+            // walk. Out-of-bounds is `null`, never an error
+            // (#307), matching that same arm.
+            let collapsed = if collapse {
+                collapsed_fields(&fields)
+            } else {
+                None
+            };
+            if let Some(eff) = collapsed {
                 let target = if *idx < 0 {
-                    let len = fields.len();
-                    let normalized = len as i64 + idx;
-                    if normalized < 0 {
-                        None
-                    } else {
-                        Some(normalized as usize)
-                    }
+                    usize::try_from(eff.len() as i64 + idx).ok()
                 } else {
                     Some(*idx as usize)
                 };
-                match target {
-                    Some(target) => {
-                        let mut current = fields;
-                        let mut found = None;
-                        let mut i = 0usize;
-                        while let Some((field, rest)) = current.uncons() {
-                            if i == target {
-                                found = Some(field.key_cursor);
-                                break;
-                            }
-                            current = rest;
-                            i += 1;
+                return match target.and_then(|t| eff.into_iter().nth(t)) {
+                    Some(field) => GenericResult::OneCursor(field.key_cursor),
+                    None => GenericResult::Owned(OwnedValue::Null),
+                };
+            }
+            let target = if *idx < 0 {
+                let len = fields.len();
+                let normalized = len as i64 + idx;
+                if normalized < 0 {
+                    None
+                } else {
+                    Some(normalized as usize)
+                }
+            } else {
+                Some(*idx as usize)
+            };
+            match target {
+                Some(target) => {
+                    let mut current = fields;
+                    let mut found = None;
+                    let mut i = 0usize;
+                    while let Some((field, rest)) = current.uncons() {
+                        if i == target {
+                            found = Some(field.key_cursor);
+                            break;
                         }
-                        match found {
-                            Some(c) => GenericResult::OneCursor(c),
-                            None => GenericResult::Owned(OwnedValue::Null),
-                        }
+                        current = rest;
+                        i += 1;
                     }
-                    None => GenericResult::Owned(OwnedValue::Null),
+                    match found {
+                        Some(c) => GenericResult::OneCursor(c),
+                        None => GenericResult::Owned(OwnedValue::Null),
+                    }
                 }
-            }
-            Expr::Builtin(Builtin::First) if !sorted => match fields.uncons() {
-                Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
                 None => GenericResult::Owned(OwnedValue::Null),
-            },
-            Expr::Builtin(Builtin::Last) if !sorted => {
-                let mut current = fields;
-                let mut last_cursor = None;
-                while let Some((field, rest)) = current.uncons() {
-                    last_cursor = Some(field.key_cursor);
-                    current = rest;
-                }
-                match last_cursor {
-                    Some(c) => GenericResult::OneCursor(c),
-                    None => GenericResult::Owned(OwnedValue::Null),
-                }
             }
-            // Slice 1 (#724): stay lazy instead of falling
-            // through to the `_` materializing fallback below —
-            // reuses the composability arm (`GenericResult::LazySeq`
-            // below) for everything past this first `map` stage.
-            // Same `!sorted` guard as the other fast-path arms
-            // above: sorted `keys` still needs a full decode+sort
-            // first.
-            Expr::Builtin(Builtin::Map(f)) if !sorted => {
-                GenericResult::LazySeq(LazySeq::new(LazySource::Keys(fields)).push_map(f, S::TAG))
-            }
-            _ => eval_on_owned::<S, _>(
-                expr,
-                materialize_lazy_keys::<V>(&fields, sorted, collapse),
-                optional,
-            ),
+        }
+        // No probe: collapsing keeps every key at its *first*
+        // position, and the first field is nobody's repeat, so
+        // it survives whatever the rest of the object does.
+        Expr::Builtin(Builtin::First) if !sorted => match fields.uncons() {
+            Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
+            None => GenericResult::Owned(OwnedValue::Null),
         },
+        // The other positional arm: the last field *is*
+        // droppable — if its key repeats an earlier one it
+        // collapses away and some other field ends up last.
+        Expr::Builtin(Builtin::Last) if !sorted => {
+            let collapsed = if collapse {
+                collapsed_fields(&fields)
+            } else {
+                None
+            };
+            if let Some(eff) = collapsed {
+                return match eff.into_iter().next_back() {
+                    Some(field) => GenericResult::OneCursor(field.key_cursor),
+                    None => GenericResult::Owned(OwnedValue::Null),
+                };
+            }
+            let mut current = fields;
+            let mut last_cursor = None;
+            while let Some((field, rest)) = current.uncons() {
+                last_cursor = Some(field.key_cursor);
+                current = rest;
+            }
+            match last_cursor {
+                Some(c) => GenericResult::OneCursor(c),
+                None => GenericResult::Owned(OwnedValue::Null),
+            }
+        }
+        // Slice 1 (#724): stay lazy instead of falling
+        // through to the `_` materializing fallback below —
+        // reuses the composability arm (`GenericResult::LazySeq`
+        // below) for everything past this first `map` stage.
+        // Same `!sorted` guard as the other fast-path arms
+        // above: sorted `keys` still needs a full decode+sort
+        // first. `LazySource::keys` carries the collapse rule
+        // into the pull itself (#1514), so no probe runs here
+        // either.
+        Expr::Builtin(Builtin::Map(f)) if !sorted => GenericResult::LazySeq(
+            LazySeq::new(LazySource::keys(fields, collapse)).push_map(f, S::TAG),
+        ),
+        // No probe: `materialize_lazy_keys` applies the
+        // collapse rule itself, through `effective_keys`.
+        _ => eval_on_owned::<S, _>(
+            expr,
+            materialize_lazy_keys::<V>(&fields, sorted, collapse),
+            optional,
+        ),
     }
 }
 

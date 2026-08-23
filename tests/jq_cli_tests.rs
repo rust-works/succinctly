@@ -2708,6 +2708,85 @@ fn test_undecodable_keys_are_not_duplicates_1385() -> Result<()> {
     Ok(())
 }
 
+/// #1514: `keys_unsorted | map(f)` and `keys_unsorted | .[]` no longer probe
+/// the whole object before the first key comes out — they dedup as they walk
+/// and switch to the exact collapsed list only once a hash repeats. That
+/// switch has to resume at the right offset, so a duplicate in the *middle*
+/// of a wide object is the shape that matters: keys before it have already
+/// been emitted and must not repeat, keys after it must all still arrive.
+///
+/// The object is wider than the printer's `PAIRWISE_SPAN_SCAN_LIMIT` so the
+/// hash-table branch is the one under test, not the small-object pairwise
+/// scan.
+#[test]
+fn test_lazy_keys_dedup_switches_mid_walk_1514() -> Result<()> {
+    const HEAD: usize = 30;
+    const TAIL: usize = 30;
+    let mut input = String::from("{");
+    for i in 0..HEAD {
+        input.push_str(&format!("\"m{i}\":{i},"));
+    }
+    input.push_str("\"m5\":-1,");
+    for i in 0..TAIL {
+        input.push_str(&format!("\"n{i}\":{i},"));
+    }
+    input.pop();
+    input.push('}');
+
+    let expected_keys: Vec<String> = (0..HEAD)
+        .map(|i| format!("\"m{i}\""))
+        .chain((0..TAIL).map(|i| format!("\"n{i}\"")))
+        .collect();
+    let expected_array = format!("[{}]", expected_keys.join(","));
+
+    for filter in ["keys_unsorted|map(.)", "[keys_unsorted[]]"] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(
+            out.trim(),
+            expected_array,
+            "filter {filter}: the repeat of m5 collapses to its first position \
+             and every later key still arrives"
+        );
+    }
+
+    // The positional and counting arms have to agree with the streamed ones.
+    for (filter, expected) in [
+        ("keys_unsorted|length", (HEAD + TAIL).to_string()),
+        ("keys_unsorted|first", "\"m0\"".to_string()),
+        ("keys_unsorted|last", format!("\"n{}\"", TAIL - 1)),
+        ("keys_unsorted[5]", "\"m5\"".to_string()),
+        ("keys_unsorted[-1]", format!("\"n{}\"", TAIL - 1)),
+        (".m5", "-1".to_string()),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(&input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    Ok(())
+}
+
+/// #1514: an object whose keys *all* repeat drives the mid-walk switch on
+/// the very first duplicate, when exactly one key has gone out. Guards the
+/// resume offset against an off-by-one that a tail-duplicate case cannot
+/// see.
+#[test]
+fn test_lazy_keys_dedup_switches_on_the_second_field_1514() -> Result<()> {
+    let input = r#"{"a":1,"a":2,"a":3,"b":4}"#;
+    for (filter, expected) in [
+        ("keys_unsorted|map(.)", r#"["a","b"]"#),
+        ("[keys_unsorted[]]", r#"["a","b"]"#),
+        ("keys_unsorted|length", "2"),
+        (".", r#"{"a":3,"b":4}"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+    Ok(())
+}
+
 /// #1385 review: `--preserve-input` preserves duplicate keys on *output*
 /// and nowhere else. The exemption ADR-0018 rule 5 grants that extension
 /// reaches the printer, which is gated on `jq_compat`; the evaluator is
@@ -2757,10 +2836,12 @@ fn test_preserve_input_duplicate_keys_are_output_only_1385() -> Result<()> {
     Ok(())
 }
 
-/// #1385 review: the `LazyKeys` collapsed fast path (`lazy_keys_collapsed`
-/// in `eval_generic.rs`) mirrors the cons-list arms one-for-one, and every
-/// one of its arms was reached only when the object carries a duplicate --
-/// so none of them was covered. Each filter here lands on a different arm.
+/// #1385 review: every `LazyKeys` arm in `eval_generic.rs`'s `Expr::Pipe`
+/// dispatch answers differently once the object carries a duplicate, and
+/// none of those answers was covered. Each filter here lands on a different
+/// arm. (#1514 folded the separate `lazy_keys_collapsed` mirror this
+/// originally covered back into the arms themselves; the filters are
+/// unchanged because the answers are.)
 #[test]
 fn test_duplicate_keys_lazy_keys_fast_paths_1385() -> Result<()> {
     let input = r#"{"b":1,"a":2,"b":3}"#;
