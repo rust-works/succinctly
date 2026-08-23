@@ -16623,11 +16623,49 @@ fn resolve_limit<'a, S: EvalSemantics>(
     // (verified live against jq 1.7.1: `path(limit(empty; .a,.b))` on
     // `{"a":1,"b":2}` produces nothing, exit 0). `eval_owned_expr_full`
     // keeps that distinction visible.
-    let n_value = match eval_owned_expr_full::<S>(n_expr, value, false) {
-        Ok(Some((v, _trailing))) => v,
-        Ok(None) => return Ok(Vec::new()),
-        Err(control) => return Err((Vec::new(), control.into())),
-    };
+    // `n` is the OUTER loop, exactly as in value context (#1279):
+    // `{"a":1,"b":2} | [path(limit((1,2); .a,.b))]` is `[["a"],["a"],["b"]]`
+    // in jq. Path context cannot use `fanout_arg` -- it returns
+    // `PathResolveResult`, not `QueryResult` -- so the loop is written out,
+    // but it follows the same two rules: concatenate one resolution per `n`,
+    // and fire `n`'s own trailing escape only after the whole prefix.
+    //
+    // `take_path_branches`' "the prefix is never *longer* than jq's"
+    // invariant (#972/#985) still holds: it is applied per `n` inside
+    // `resolve_limit_one_n`, capping each resolution at that `n` before the
+    // results are concatenated, so no single resolution can overrun its own
+    // bound.
+    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
+    let mut branches = Vec::new();
+    for n_value in n_values {
+        match resolve_limit_one_n::<S>(n_value, expr, value, trackable) {
+            Ok(mut b) => branches.append(&mut b),
+            Err((mut b, e)) => {
+                branches.append(&mut b);
+                return Err((branches, e));
+            }
+        }
+    }
+    match escape {
+        Some(e) => Err((branches, e)),
+        None => Ok(branches),
+    }
+}
+
+/// `path(limit(n; expr))`'s resolution for one already-resolved `n` — the body
+/// of [`resolve_limit`], run once per output of its `n` generator (#1279).
+fn resolve_limit_one_n<'a, S: EvalSemantics>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+) -> PathResolveResult<'a> {
+    // Uses main's `classify_limit_n` (landed independently while this
+    // branch was in flight) rather than the inline match this commit
+    // originally duplicated here: identical case-for-case, and one
+    // definition shared with `limit_with_n` keeps the two contexts from
+    // drifting -- `path(limit(-1.5; ...))` diverging from value-mode
+    // `limit(-1.5; ...)` is exactly the bug #1313 already had to fix once.
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => return resolve_node::<S>(expr, value, trackable),
         Ok(LimitN::Take(n)) => n,
@@ -20782,7 +20820,30 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the same branch a negative count would) means "no limit at all",
     // not an error (#983; verified against jq 1.7.1: `limit(-1; 1,2,3)`
     // and `limit(null; 1,2,3)` both pass every value through unchanged).
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
+    // `n` is the OUTER loop and `expr` the inner one, re-evaluated once per
+    // `n` output -- live-verified against jq 1.7.1:
+    // `[limit((1,2); (10,20,30))]` is `[10,10,20]` (n=1 then n=2), not
+    // `[10,20,10]`. #1277's cluster 3 asked for a design pass to merge `n`'s
+    // own trailing control with the bespoke `Flow` reconciliation below; the
+    // fan-out makes that unnecessary, because the two now sit at different
+    // nesting levels and cannot double-count -- `fanout_arg` owns `n`'s
+    // trailing control, the loop body owns `expr`'s.
+    fanout_arg(
+        eval_single::<W, S>(n_expr, value.clone(), optional),
+        // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |n_value| limit_with_n::<W, S>(n_value, expr, value.clone(), optional),
+    )
+}
+
+/// `limit(n; expr)`'s work for one already-resolved `n` — the body of
+/// [`eval_limit`], run once per output of its `n` generator (#1279).
+fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // #1313: `result_to_owned` collapses a genuinely zero-output bound
     // (`limit(empty; ...)`) into `result_to_owned_ctrl`'s own `Err("no
     // value")` -- not real jq's behavior (`n as $n | ...` never binds, so
@@ -20791,18 +20852,12 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // nothing, exit 0). `result_to_owned_full`
     // (#1045) keeps that distinction visible; migrated the same way every
     // other #1045-era caller already was (e.g. `builtin_ltrimstr` above).
-    // Unwrap the `(value, trailing)` pair once up front, matching the
-    // house style `resolve_limit` (above) and `builtin_nth` both use for
-    // `result_to_owned_full`/`eval_owned_expr_full` call sites, rather than
-    // repeating `Ok(Some((pattern, _)))` in every arm below (code review,
-    // #1313) -- `trailing` is unused here either way (same drop the old,
-    // pre-#1313 `result_to_owned` already made), just surfaced once instead
-    // of four times.
-    let n_value = match result_to_owned_full(n_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((v, _trailing))) => v,
-        Err(e) => return e.into(),
-    };
+    // `n_value` arrives already unwrapped: `fanout_arg` owns the
+    // `(value, trailing)` pair now, so the zero-output bound never reaches
+    // here as a value at all -- it simply runs this body zero times.
+    //
+    // Uses main's `classify_limit_n`, shared with `resolve_limit_one_n`
+    // above, in place of the inline match this commit first duplicated.
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => return eval_single::<W, S>(expr, value, optional),
         Ok(LimitN::Take(n)) => n,
@@ -20920,34 +20975,30 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n. `result_to_owned_full`, not `result_to_owned` (#1408):
-    // `nth(n; expr)`'s one-arg sibling `builtin_nth` was already migrated
-    // for exactly this -- a zero-output `n` (e.g. `nth(empty; .a,.b)`)
-    // must make the whole call produce zero output, matching real jq's
-    // `n as $n | ...` desugaring, not this call site's own leftover
-    // `result_to_owned` hard-erroring with "no value" instead.
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match result_to_owned_full(n_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _), _)))
-            if i >= 0 =>
-        {
-            i as usize
-        }
-        Ok(Some(_)) => {
-            return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
-        }
-        Err(e) => return e.into(),
-    };
+    // `n` is the OUTER loop, `expr` the inner one -- live-verified against
+    // jq 1.7.1: `[nth((0,1); (10,20))]` is `[10,20]`.
+    fanout_arg(
+        eval_single::<W, S>(n_expr, value.clone(), optional),
+        // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |n_value| {
+            let n = match n_value {
+                OwnedValue::Int(i) if i >= 0 => i as usize,
+                _ => {
+                    return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
+                }
+            };
 
-    // Pull only as far as index `n`, then stop -- jq defines `nth` as
-    // `last(limit($n + 1; f))`, so it stops there too (#820).
-    match each_take_nth::<W, S>(expr, value, optional, n) {
-        Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
-        Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
-        Ok(None) => QueryResult::None,
-        Err(control) => control_to_result(control),
-    }
+            // Pull only as far as index `n`, then stop -- jq defines `nth` as
+            // `last(limit($n + 1; f))`, so it stops there too (#820).
+            match each_take_nth::<W, S>(expr, value.clone(), optional, n) {
+                Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
+                Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
+                Ok(None) => QueryResult::None,
+                Err(control) => control_to_result(control),
+            }
+        },
+    )
 }
 
 /// Total recursive fork budget for `while`/`until` (#534): shared across the
@@ -28437,44 +28488,52 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // unreachable today (see #981's investigation), but kept consistent
     // so a future routing change can't silently reintroduce the bug this
     // issue fixed in the live implementation.
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match n_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                num.as_i64().unwrap_or(0) as usize
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(OwnedValue::Int(i)) if i >= 0 => i as usize,
-        QueryResult::Owned(OwnedValue::Float(f)) if f >= 0.0 => f as usize,
-        QueryResult::Owned(
-            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::Null | OwnedValue::Bool(_),
-        ) => return eval_single::<W, S>(expr, value, optional),
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
+    // `n` is the OUTER loop, matching `eval_limit` (#1279).
+    fanout_arg(
+        eval_single::<W, S>(n_expr, value.clone(), optional),
+        // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |n_owned| {
+            // A document-sourced number arrives here as a `NumberLiteral` (it used to
+            // arrive as a borrowed `QueryResult::One` and take its own arm, with the
+            // same `as_i64().unwrap_or(0)` coercion).
+            let n = match n_owned {
+                OwnedValue::Int(i) if i >= 0 => i as usize,
+                OwnedValue::Float(f) if f >= 0.0 => f as usize,
+                ref lit @ OwnedValue::NumberLiteral(..) => lit.as_i64().unwrap_or(0) as usize,
+                OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::Null
+                | OwnedValue::Bool(_) => {
+                    return eval_single::<W, S>(expr, value.clone(), optional);
+                }
+                ref other => {
+                    return QueryResult::Error(EvalError::type_error("number", other.type_name()))
+                }
+            };
 
-    if n == 0 {
-        return QueryResult::None;
-    }
-
-    // `Builtin::Limit` is the internal spelling of the same `limit(n; f)`,
-    // differing from `eval_limit` only in always materializing its answer.
-    // Same sink, same trailing-control rule (#820).
-    let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
-    let satisfied = taken.len() >= n;
-    let values: Vec<OwnedValue> = taken.into_iter().map(Item::into_owned).collect();
-    match flow {
-        Flow::Stopped { .. } | Flow::Exhausted => owned_vec_to_result(values),
-        Flow::Escaped(control) => {
-            if satisfied {
-                owned_vec_to_result(values)
-            } else {
-                partial(values, control)
+            if n == 0 {
+                return QueryResult::None;
             }
-        }
-    }
+
+            // `Builtin::Limit` is the internal spelling of the same `limit(n; f)`,
+            // differing from `eval_limit` only in always materializing its answer.
+            // Same sink, same trailing-control rule (#820).
+            let (taken, flow) = each_take_n::<W, S>(expr, value.clone(), optional, n);
+            let satisfied = taken.len() >= n;
+            let values: Vec<OwnedValue> = taken.into_iter().map(Item::into_owned).collect();
+            match flow {
+                Flow::Stopped { .. } | Flow::Exhausted => owned_vec_to_result(values),
+                Flow::Escaped(control) => {
+                    if satisfied {
+                        owned_vec_to_result(values)
+                    } else {
+                        partial(values, control)
+                    }
+                }
+            }
+        },
+    )
 }
 
 /// Builtin: first(expr) - output only the first value from expr (stream version)
@@ -28545,49 +28604,45 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the same jq-required outcome); a genuinely negative number silently
     // became index 0 here instead of erroring (#983; verified against jq
     // 1.7.1's own two-arg `nth`).
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let n = match n_result {
-        QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                let f = num.as_f64().unwrap_or(0.0);
-                if f < 0.0 {
-                    return QueryResult::Error(EvalError::new(
-                        "nth doesn't support negative indices",
-                    ));
+    // `n` is the OUTER loop -- live-verified against jq 1.7.1:
+    // `[nth((0,1); (10,20))]` is `[10,20]`. The `_ =>` catch-all this
+    // replaces swallowed a multi-output `n` into a type error, so
+    // `[nth((0,1); .a,.b,.c)]` reported "expected number, got null" where jq
+    // answers `[1,2]` (#1279).
+    fanout_arg(
+        eval_single::<W, S>(n_expr, value.clone(), optional),
+        // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |n_owned| {
+            // A document-sourced number arrives here as an `OwnedValue` (it used to
+            // arrive as a borrowed `QueryResult::One` and take its own arm); the
+            // negative check and the `as_i64`-then-`as_f64` coercion are unchanged.
+            let n = match n_owned {
+                ref owned @ (OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::NumberLiteral(..)) => {
+                    let f = owned.as_f64().unwrap_or(0.0);
+                    if f < 0.0 {
+                        return QueryResult::Error(EvalError::new(
+                            "nth doesn't support negative indices",
+                        ));
+                    }
+                    f as usize
                 }
-                num.as_i64().map_or(f as usize, |i| i as usize)
-            } else {
-                return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
-            }
-        }
-        QueryResult::Owned(
-            ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
-        ) => {
-            let f = owned.as_f64().unwrap_or(0.0);
-            if f < 0.0 {
-                return QueryResult::Error(EvalError::new("nth doesn't support negative indices"));
-            }
-            f as usize
-        }
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // A halt while evaluating `n` must propagate, not be misreported as
-        // a type error (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-        // #1408: a zero-output `n` (e.g. `nth(empty; .a,.b)`) must make the
-        // whole call produce zero output, matching real jq's `n as $n | ...`
-        // desugaring -- not fall into the generic type-error catch-all below.
-        QueryResult::None => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::type_error("number", "null")),
-    };
+                ref other => {
+                    return QueryResult::Error(EvalError::type_error("number", other.type_name()))
+                }
+            };
 
-    // Same sink as `eval_nth_expr`, differing only in always materializing
-    // its answer (#820).
-    match each_take_nth::<W, S>(expr, value, optional, n) {
-        Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
-        Ok(None) => QueryResult::None,
-        Err(control) => control_to_result(control),
-    }
+            // Same sink as `eval_nth_expr`, differing only in always materializing
+            // its answer (#820).
+            match each_take_nth::<W, S>(expr, value.clone(), optional, n) {
+                Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
+                Ok(None) => QueryResult::None,
+                Err(control) => control_to_result(control),
+            }
+        },
+    )
 }
 
 /// Builtin: isempty(expr) - returns true if expr produces no outputs
