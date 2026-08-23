@@ -16873,13 +16873,30 @@ fn resolve_node<'a, S: EvalSemantics>(
             let mut branches = Vec::with_capacity(values.len());
             let mut arg_escape: Option<EvalEscape> = None;
             if !values.is_empty() {
-                for v in &values {
+                // Every failure inside this loop leaves via `arg_escape` +
+                // `break 'outputs`, never an early `return`, so the branches
+                // earlier outputs already resolved survive to `path_result`
+                // below — rule 2's "abort the loop, keep the prefix" (#1532).
+                //
+                // Three of these used to `return Err((Vec::new(), ..))`,
+                // carried over verbatim from the single-output code this
+                // fan-out replaced, where there was no accumulator yet to
+                // keep. Real jq prints the resolved prefix first:
+                //
+                //   $ echo '{"a":1,"b":2}' | jq -c 'path(getpath((["b"], ["a","x"])))'
+                //   ["b"]
+                //   jq: error (at <stdin>:1): Cannot index number with string "x"
+                //
+                // The labelled break is what lets the inner `for key` loop
+                // abandon a half-built `components` without pushing it.
+                'outputs: for v in &values {
                     let OwnedValue::Array(keys) = v else {
                         arg_escape = Some(EvalError::path_must_be_array().into());
                         break;
                     };
                     if !trackable && keys.is_empty() {
-                        return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+                        arg_escape = Some(EvalError::invalid_path_expression(value).into());
+                        break;
                     }
                     let mut components = Vec::new();
                     // Starts borrowed — an empty `keys` (a bare `getpath([])`)
@@ -16894,12 +16911,22 @@ fn resolve_node<'a, S: EvalSemantics>(
                         // no-op behavior to match here -- unlike the `.foo`/
                         // `.[key]` shapes `resolve_index_expr` handles below,
                         // which do (#1181).
-                        let component = key_to_path_component(key, &current, false)
-                            .map_err(|e| (Vec::new(), e.into()))?;
+                        let component = match key_to_path_component(key, &current, false) {
+                            Ok(component) => component,
+                            Err(e) => {
+                                arg_escape = Some(e.into());
+                                break 'outputs;
+                            }
+                        };
+                        let indexed = match index_one_owned(&current, key, false) {
+                            Ok(indexed) => indexed,
+                            Err(e) => {
+                                arg_escape = Some(e.into());
+                                break 'outputs;
+                            }
+                        };
                         current = Cow::Owned(
-                            index_one_owned(&current, key, false)
-                                .map_err(|e| (Vec::new(), e.into()))?
-                                .expect("non-optional index yields a value or errors"),
+                            indexed.expect("non-optional index yields a value or errors"),
                         );
                         components.push(component);
                     }

@@ -19716,3 +19716,70 @@ fn test_validate_multi_file_second_invalid_keeps_first_files_output_1558() -> Re
     );
     Ok(())
 }
+
+/// #1532: a fanned-out `getpath` must keep the path branches earlier
+/// argument outputs already resolved when a later output fails, rather than
+/// discarding the whole prefix.
+///
+/// Three escape points inside the fan-out loop returned
+/// `Err((Vec::new(), ..))`, carried over verbatim from the single-output
+/// code the fan-out replaced -- where `Vec::new()` was right because no
+/// accumulator existed yet. Live-captured from the pinned jq 1.7.1:
+///
+/// ```text
+/// $ echo '{"a":1,"b":2}' | jq -c 'path(getpath((["b"], ["a","x"])))'
+/// ["b"]
+/// jq: error (at <stdin>:1): Cannot index number with string "x"
+/// ```
+#[test]
+fn test_jq_getpath_fanout_keeps_resolved_prefix_on_later_failure_1532() -> Result<()> {
+    // `index_one_owned`'s failure -- indexing a number with a string.
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"path(getpath((["b"], ["a","x"])))"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(out.trim(), r#"["b"]"#, "the resolved prefix must survive");
+    assert!(err.contains("Cannot index number"), "err: {err:?}");
+    assert_eq!(code, 5, "err: {err:?}");
+    Ok(())
+}
+
+/// #1532 guard: the sibling non-array arm already kept its prefix (it broke
+/// with `arg_escape` rather than returning), and must keep doing so now
+/// that every arm in the loop leaves the same way. Real jq agrees:
+/// `["a"]` on stdout, then "Path must be specified as an array".
+#[test]
+fn test_jq_getpath_fanout_keeps_prefix_on_non_array_output_1532() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#"path(getpath((["a"], "notarray")))"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(out.trim(), r#"["a"]"#);
+    assert!(
+        err.contains("Path must be specified as an array"),
+        "err: {err:?}"
+    );
+    assert_eq!(code, 5, "err: {err:?}");
+    Ok(())
+}
+
+/// #1532 guard: the all-succeed path is unchanged by the restructure --
+/// every output still produces its own branch, in argument order, and a
+/// write through a fanned-out `getpath` still reaches every branch.
+#[test]
+fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
+    let (out, _, code) = run_jq_full(
+        &["-c", r#"[path(getpath((["a"],["b"])))]"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"[["a"],["b"]]"#);
+
+    let (out, _, code) = run_jq_full(
+        &["-c", r#"(getpath((["a"],["b"]))) |= 99"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
