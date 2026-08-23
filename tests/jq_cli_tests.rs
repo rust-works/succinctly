@@ -5449,6 +5449,57 @@ fn test_path_context_fanout_preserves_output_before_break_or_error_715() -> Resu
     Ok(())
 }
 
+/// `Comma`'s own arm used to isolate each branch (evaluated with an empty
+/// `rest`) and continue the *accumulated* result through `rest` afterward,
+/// reusing the pre-comma `current_path` for every output regardless of
+/// which branch (or which fan-out iteration within a branch) actually
+/// produced it -- `Field`/`Index`/`Iterate` only compute and thread an
+/// updated path when *they* have a non-empty `rest` to recurse into, so
+/// isolating them first meant `rest` always saw the stale path (#1409).
+/// Fixed by combining each branch with `rest` into one recursive call
+/// instead (`,` distributes over `|` in jq, live-verified against jq
+/// 1.7.1), so `Field`/`Iterate` inside `rest` build `new_path` in the same
+/// call chain as the branch that produced their input.
+#[test]
+fn test_comma_path_context_threads_per_output_path_1409() -> Result<()> {
+    // The issue's own repro: `.[]` isolated inside a comma used to report
+    // every element's key as the pre-comma path (`"a"`) instead of its own
+    // index.
+    let (stdout, _stderr, code) =
+        run_jq_full(&[".a | (.[], empty) | key"], Some(r#"{"a":[10,20,30]}"#))?;
+    assert_eq!(stdout, "0\n1\n2\n");
+    assert_eq!(code, 0);
+
+    // Two independent branches, each its own field of the root -- `key`
+    // after the comma must resolve per-branch (`"a"`, then `"b"`), not
+    // fall back to `null` (no path at all) or the pre-comma path.
+    let (stdout, _stderr, code) =
+        run_jq_full(&["(.a, .b) | key"], Some(r#"{"a":{"x":1},"b":{"y":2}}"#))?;
+    assert_eq!(stdout, "\"a\"\n\"b\"\n");
+    assert_eq!(code, 0);
+
+    // Two independently-iterated arrays: each `.[]` branch's own elements
+    // must report their own array's index, not leak into the other's.
+    let (stdout, _stderr, code) =
+        run_jq_full(&["(.a[], .b[]) | key"], Some(r#"{"a":[1,2],"b":[3,4]}"#))?;
+    assert_eq!(stdout, "0\n1\n0\n1\n");
+    assert_eq!(code, 0);
+
+    // An error/break/halt from a later branch (or from `rest` itself) must
+    // still abort the whole comma, preserving whatever earlier branches'
+    // *correctly-pathed* output already produced -- not just the fix's
+    // main case in isolation.
+    let (stdout, stderr, code) = run_jq_full(
+        &[".a | (.[], error(\"boom\")) | key"],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(stdout, "0\n1\n2\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::Array` arm (#1302), so `[key]` --
 /// semantically equivalent to `(key,key)`'s single-branch case, just
 /// array-wrapped instead of comma-joined -- silently lost path context and
