@@ -41654,6 +41654,117 @@ mod tests {
                 assert!(vs.is_empty(), "jq finds a match at offset 1 — known gap, #922");
             }
         );
+
+        // #1502: the gap is not specific to test/match/scan — sub/gsub/
+        // split/splits all route through the same first_captures/
+        // global_captures choke point, so they miss the same lazy-
+        // quantifier match and silently no-op instead of replacing/
+        // splitting. Verified live against jq 1.7.1, which returns
+        // "xXXb"/"xXab"/["x","","b"]/[["x","","b"]] for the four cases
+        // below.
+        query!(br#""xaab""#, r#"gsub("a*?"; "X"; "gn")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "xaab", "jq returns \"xXXb\" — known gap, #922");
+            }
+        );
+        query!(br#""xaab""#, r#"sub("a*?"; "X"; "n")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "xaab", "jq returns \"xXab\" — known gap, #922");
+            }
+        );
+        query!(br#""xaab""#, r#"[splits("a*?"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::String("xaab".to_string())],
+                    "jq returns [\"x\",\"\",\"b\"] — known gap, #922"
+                );
+            }
+        );
+        query!(br#""xaab""#, r#"[split("a*?"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Array(vec![OwnedValue::String("xaab".to_string())])],
+                    "jq returns [[\"x\",\"\",\"b\"]] — known gap, #922"
+                );
+            }
+        );
+
+        // Boundary, greedy half: a greedy quantifier (no backtracking
+        // needed to find the non-empty match) and a `[0-9]*` character
+        // class are both unaffected and agree with jq — the gap is in
+        // *reaching* a non-empty match via backtracking, not in `n`
+        // itself. Complements the reordered-alternation boundary pinned
+        // above.
+        query!(br#""xaab""#, r#"[scan("a*"; "gn")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("aa".to_string())]);
+            }
+        );
+        query!(br#""a12b""#, r#"[match("[0-9]*"; "gn").string]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("12".to_string())]);
+            }
+        );
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_regex_l_flag_known_gap_920() {
+        // #920: jq's `l` flag switches from Perl-style leftmost-first to
+        // POSIX leftmost-longest matching (real oniguruma), applied
+        // recursively to every subexpression. Rust's `regex`/
+        // `regex-automata` stack has no `MatchKind::LeftmostLongest`
+        // implementation to switch to (the crate's own maintainers left
+        // the door open but never built it), so succinctly accepts `l` as
+        // valid flag syntax — see test_regex_unknown_flags_rejected_730 —
+        // but it has no effect on match semantics. Accepted as a
+        // permanent, documented limitation — see ADR-0019.
+        //
+        // This pins the *current, known-divergent* behavior rather than
+        // jq's — verified live against jq 1.7.1, which returns "aaa"/"X"/
+        // ["aaa"]/["aaa","a"] for the four cases below (`l` reorders a
+        // top-level alternation to prefer the longest branch at each
+        // position; succinctly keeps its own leftmost-first order and
+        // stops at the first alternative that matches, "a").
+        query!(br#""aaa""#, r#"match("a|aa|aaa"; "l").string"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "a", "jq returns \"aaa\" — known gap, #920");
+            }
+        );
+        query!(br#""aaa""#, r#"sub("a|aa|aaa"; "X"; "l")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Xaa", "jq returns \"X\" — known gap, #920");
+            }
+        );
+        query!(br#""aaa""#, r#"[scan("a|aa|aaa"; "gl")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string()),
+                    ],
+                    "jq returns [\"aaa\"] — known gap, #920"
+                );
+            }
+        );
+        query!(br#""aaaa""#, r#"[match("a|aa|aaa"; "gl").string]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string()),
+                    ],
+                    "jq returns [\"aaa\",\"a\"] — known gap, #920"
+                );
+            }
+        );
     }
 
     #[cfg(feature = "regex")]
