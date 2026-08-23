@@ -293,21 +293,31 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 /// reasoning: this recurses, so a generic parameter would monomorphise the
 /// whole traversal per call site. Borrowing, not consuming, `builtin` --
 /// matching `builtin_kids`'s own convention -- costs one clone per
-/// sub-expression at `rewrite_namespaced_calls`'s only call site today
-/// (bounded by the parser's own `MAX_EXPR_DEPTH`, since this runs once per
-/// parsed program, not per document); a consuming signature would avoid
-/// that at the cost of breaking symmetry with `builtin_kids`, considered and
-/// not taken (#1526 review of a similar tradeoff elsewhere reached the same
-/// call for a comparable one-time, depth-bounded traversal).
+/// sub-expression at `rewrite_namespaced_calls`'s call site specifically,
+/// because that caller's own transform (`Expr -> Expr`, not `&Expr ->
+/// Expr`) needs an owned value to hand back into itself (bounded by the
+/// parser's own `MAX_EXPR_DEPTH`, since it runs once per parsed program,
+/// not per document); a consuming signature would avoid that at the cost of
+/// breaking symmetry with `builtin_kids`, considered and not taken (#1526
+/// review of a similar tradeoff elsewhere reached the same call for a
+/// comparable one-time, depth-bounded traversal). The three `eval.rs`
+/// callers added by #1506 (below) pay no such clone: their transforms are
+/// already `&Expr -> Expr`, the same shape this function hands them.
 ///
-/// This is the 4th/5th independently hand-maintained exhaustive `Builtin`
-/// match in this codebase, alongside `builtin_kids` (this file) and three
-/// more in `eval.rs` (`substitute_var_in_builtin`,
-/// `expand_func_calls_in_builtin`, `substitute_func_param_in_builtin`) --
-/// nothing forces all five to agree when a new sub-expression-carrying
-/// variant is added, which is exactly the class of bug this function fixes
-/// for one of the five. Consolidating them is filed separately, **#1506**,
-/// not attempted here.
+/// #1506 consolidated this function's three former siblings in `eval.rs`
+/// (`substitute_var_in_builtin`, `expand_func_calls_in_builtin`,
+/// `substitute_func_param_in_builtin`) onto this one, after confirming each
+/// was pure structural recursion -- every arm forwarding its sub-expression
+/// unchanged to one fixed transform, with no per-variant special-casing --
+/// so no behavior moved in the process, only the traversal itself. Unlike
+/// `rewrite_namespaced_calls` (parse-time, once per program),
+/// `substitute_var_in_builtin` and `expand_func_calls_in_builtin` sit on the
+/// AST-substitution path this codebase uses in place of a runtime variable
+/// environment (see #1371), so they can re-run per binding evaluation --
+/// potentially many times per document, not just once at parse time.
+/// `builtin_kids` remains the sole surviving hand-maintained accessor
+/// alongside this one; nothing else duplicates the variant-to-sub-expression
+/// mapping now.
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
         // --- No sub-expression (125) ---------------------------------------
