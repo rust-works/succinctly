@@ -18211,6 +18211,69 @@ fn test_first_over_pipe_prefix_dispatches_every_generic_result_shape_1451() -> R
     Ok(())
 }
 
+/// #1519, found while implementing #1462's own oracle sweep: real jq's
+/// short-circuiting builtins are macro-expanded `label $out | ... break
+/// $out` definitions, and its `?//`-alternatives operator retries the next
+/// alternative on *any* escaping `break` -- including one addressed to a
+/// `label` entirely outside the `?//` expression, established by whatever
+/// builtin is consuming it. So wrapping a `?//` bind in `isempty` makes the
+/// whole thing run once per alternative, not once total: confirmed live
+/// against jq 1.7.1, `isempty(1 as $x ?// $y | 5)` is `false` **twice**, a
+/// three-alternative chain is `false` **three** times, and the *unwrapped*
+/// expression (`1 as $x ?// $y | 5`, no consumer at all) is an ordinary
+/// single `5`.
+///
+/// succinctly's `?//` resolution (`each_pattern_alternatives`/
+/// `try_pattern_alternatives`) has no concept of an enclosing `label`/
+/// `break` at all -- its short-circuiting builtins are native Rust
+/// functions, not user-space macro expansions -- so it always produces
+/// exactly one answer regardless of alternative count. Orthogonal to
+/// #1462's own scope (whether a wrapping consumer's demand reaches a nested
+/// generator; here demand reaches it correctly, and stops it after exactly
+/// the number of outputs succinctly itself produces) and confirmed
+/// pre-existing on `main` before that work landed, so pinned here rather
+/// than attempted there.
+///
+/// The table below records succinctly's own current (single-answer,
+/// jq-diverging) output directly, in the same style as
+/// `test_short_circuit_side_effect_leaks_820_932_987` above -- jq's answer
+/// for each row is given in a comment rather than asserted, since matching
+/// it is #1519's own future fix, not this test's job.
+#[test]
+fn test_as_pattern_alternatives_do_not_retry_under_a_wrapping_label_1519() -> Result<()> {
+    let cases: &[SideEffectCase] = &[
+        // No wrapping consumer: jq and succinctly already agree (`5`, once).
+        (&["-cn", "1 as $x ?// $y | 5"], None, "5\n", "", 0),
+        // Wrapped in `isempty`: jq is `false` twice; succinctly, once.
+        (
+            &["-cn", "isempty(1 as $x ?// $y | 5)"],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // Three alternatives: jq is `false` three times; succinctly, once.
+        (
+            &["-cn", "isempty(1 as $x ?// $y ?// $z | 5)"],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+    ];
+
+    for (args, stdin, want_out, want_err, want_code) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, *stdin)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end_matches('\n'), code),
+            (*want_out, *want_err, *want_code),
+            "`{}` changed -- if #1519 is fixed, update this test's expectations",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// #987 (Stage 3, `each_paths_filter`): `path(paths(f))` used to run `f`
 /// against a node real jq never visits, because `resolve_leaf`'s catch-all
 /// evaluated `paths(f)`'s whole generator eagerly before ever checking
