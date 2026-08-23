@@ -21135,3 +21135,76 @@ fn test_yq_has_gate_is_per_mode_not_per_format_1279() -> Result<()> {
     assert_eq!(out.trim(), "[true]");
     Ok(())
 }
+
+/// `setpath`/`delpaths` are the two builtins real yq **refuses** a multi-output
+/// argument for, rather than quietly taking its first the way its
+/// `has`/`test`/`sub` do. Live-verified against the pinned yq v4.53.3:
+///
+/// ```text
+/// [setpath(["a"]; (1,2))]        Error: SETPATH: expected single value on RHS but found 2
+/// [setpath((["a"],["b"]); 1)]    Error: SETPATH: expected single path but found 2 results instead
+/// [delpaths(([["a"]],[["b"]]))]  Error: DELPATHS: expected single value but found 2
+/// ```
+///
+/// So they take `ArgFanout::RejectMany` rather than `FirstOnly` — jq mode fans
+/// all three out (#1279), and letting yq mode do so would turn an error into a
+/// silent success. succinctly's own wording differs from yq's per-slot text;
+/// what ADR-0018 requires preserving here is the *outcome*, which is why these
+/// assert on the exit code and the "single result" substring rather than
+/// byte-for-byte parity.
+///
+/// The three cases are deliberately distinct code paths: the value slot is
+/// `fanout_two_args`' outer loop, the path slot its inner loop, and `delpaths`
+/// goes through `fanout_arg`. Nothing else in the suite reaches any of them.
+#[test]
+fn test_yq_setpath_delpaths_reject_a_multi_output_argument_1279() -> Result<()> {
+    // `fanout_two_args`' OUTER slot: setpath's value.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        "[setpath([\"a\"]; (1,2))]",
+        "a: 1\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(err.contains("single result"), "err: {err:?}");
+
+    // `fanout_two_args`' INNER slot: setpath's path.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        "[setpath(([\"a\"],[\"b\"]); 1)]",
+        "a: 1\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(err.contains("single result"), "err: {err:?}");
+
+    // `fanout_arg`'s own RejectMany arm: delpaths' single argument.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        "[delpaths(([[\"a\"]],[[\"b\"]]))]",
+        "a: 1\nb: 2\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(err.contains("single result"), "err: {err:?}");
+    Ok(())
+}
+
+/// The gate must not fire on a *single*-output argument, which is the shape
+/// real yq accepts — otherwise `RejectMany` would break ordinary yq writes.
+#[test]
+fn test_yq_setpath_delpaths_accept_a_single_output_argument_1279() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "[setpath([\"a\"]; 9)]",
+        "a: 1\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[{\"a\":9}]");
+
+    let (out, code) = run_yq_stdin(
+        "[delpaths([[\"a\"]])]",
+        "a: 1\nb: 2\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[{\"b\":2}]");
+    Ok(())
+}
