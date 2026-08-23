@@ -181,5 +181,4 @@
 
 
 
-delpaths_own_error_outranks_trailing_halt  eager-argument   exit code and stdout now match jq; the residual is stderr — succinctly evaluates the whole argument generator up front, so halt_error's own output leaks even though jq never reaches it — #820
 

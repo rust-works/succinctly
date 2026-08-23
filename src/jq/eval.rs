@@ -281,6 +281,24 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
         )
     }
 
+    /// Returns true if evaluating this ended in *any* control — an error, a
+    /// `break`, or a `halt` — rather than only an error like
+    /// [`Self::is_error`].
+    ///
+    /// Answers "must the caller stop pulling?" without consuming the result,
+    /// which is what lets [`fanout_arg`] decide whether a `body` result can
+    /// be buffered for its single-output fast path before it has been
+    /// flattened (#1531).
+    fn is_escape(&self) -> bool {
+        matches!(
+            self,
+            QueryResult::Error(_)
+                | QueryResult::Break(_)
+                | QueryResult::Halt(_)
+                | QueryResult::Partial(_, _)
+        )
+    }
+
     /// Collect all output values into a `Vec<OwnedValue>`.
     ///
     /// Mirrors [`crate::jq::eval_generic::GenericResult::collect_owned`]:
@@ -1579,10 +1597,16 @@ fn apply_arg_fanout(
 ///
 /// 1. The loop runs to completion over *every* argument value first, and only
 ///    then does the argument's deferred control fire: `"abcabc" | label $out |
-///    [ltrimstr(("a","b", break $out))]` is `["bcabc","abcabc"]`. This is the
-///    same rule [`build_string_parts`] (#1403) and [`build_object_entries`]
-///    (#354) already document; the difference is one loop here instead of a
-///    recursion.
+///    ltrimstr(("a","b", break $out))` emits `"bcabc"` and `"abcabc"`, then
+///    breaks. This is the same rule [`build_string_parts`] (#1403) and
+///    [`build_object_entries`] (#354) already document; the difference is one
+///    loop here instead of a recursion.
+///
+///    (Wrapping that in `[...]` gives *empty* output, not
+///    `["bcabc","abcabc"]` — a `break` escaping an array construction
+///    discards the partly-built array. An earlier revision of this comment
+///    cited the wrapped form with the unwrapped form's result; both spellings
+///    were re-checked against jq 1.7.1 when the lazy pull landed.)
 /// 2. A failure raised by `body` itself aborts the loop but *keeps* the prefix
 ///    already produced: `"abc" | contains(("a", 1))` writes `true` to stdout
 ///    and then raises the containment error, exiting 5.
@@ -1591,34 +1615,125 @@ fn apply_arg_fanout(
 ///    "Path must be specified as an array", because the value `1` fails before
 ///    the halt is ever reached. "Emit the prefix, then halt" is not a separate
 ///    rule; it is what rule 2 produces when the loop gets that far.
-fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
-    arg: QueryResult<'a, W>,
+/// 4. `body` runs against argument value N *before* value N+1 is evaluated,
+///    so a `body` failure means the rest of the argument is never evaluated
+///    at all — side effects included. This is what `x as $b | body` gives
+///    for free and what an eager `Vec` of every output cannot (#1531):
+///
+///    ```text
+///    $ jq -c 'setpath((1, input); 1), input' three-docs.jsonl
+///    jq: error (at three-docs.jsonl:1): Path must be specified as an array
+///    jq: error (at three-docs.jsonl:2): Path must be specified as an array
+///    jq: error (at three-docs.jsonl:3): Path must be specified as an array
+///    ```
+///
+///    The `1` fails rule 2 before `input` is reached, so `input` never runs
+///    and no document is consumed. Materializing the argument first ran it,
+///    stealing document 2 while document 1 was still being processed and
+///    losing document 1's own error entirely.
+///
+/// Only [`ArgFanout::All`] is driven lazily. Both yq gates stay eager on
+/// purpose: real yq evaluates the whole argument and *reports* an escape
+/// found anywhere in it (see [`apply_arg_fanout`]'s shared escape arm,
+/// #1533/#1534), so pulling lazily there would hide the very control those
+/// gates have to propagate.
+fn fanout_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+    arg_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
     fanout: ArgFanout,
-    mut body: impl FnMut(OwnedValue) -> QueryResult<'a, W>,
-) -> QueryResult<'a, W> {
-    let (mut args, trailing) = stream_outputs(arg);
-    if let Err(e) = apply_arg_fanout(fanout, &mut args, &trailing) {
-        return QueryResult::Error(e);
-    }
-
-    // Allocation-identical fast path for the single-output case, which is
-    // every query that predates #1279. `body`'s result is returned *verbatim*,
-    // so a borrowed `One`/`OneCursor` (`nth` -> `index_one`, `flatten` ->
-    // `builtin_flatten`) keeps the zero-copy path `finish_result`'s own `None`
-    // arm used to preserve. Without this, `[1,2,3] | nth(0)` would materialize.
-    if trailing.is_none() && args.len() == 1 {
-        return body(args.pop().expect("len() == 1 guarantees an element"));
+    mut body: B,
+) -> QueryResult<'a, W>
+where
+    B: FnMut(OwnedValue) -> QueryResult<'a, W>,
+{
+    if !matches!(fanout, ArgFanout::All) {
+        let (mut args, trailing) =
+            stream_outputs(eval_single::<W, S>(arg_expr, value.clone(), optional));
+        if let Err(e) = apply_arg_fanout(fanout, &mut args, &trailing) {
+            return QueryResult::Error(e);
+        }
+        if trailing.is_none() && args.len() == 1 {
+            return body(args.pop().expect("len() == 1 guarantees an element"));
+        }
+        let mut out: Vec<OwnedValue> = Vec::new();
+        for arg in args {
+            if let Some(control) = push_owned_values(body(arg), &mut out) {
+                return partial(out, control);
+            }
+        }
+        return match trailing {
+            Some(control) => partial(out, control),
+            None => owned_vec_to_result(out),
+        };
     }
 
     let mut out: Vec<OwnedValue> = Vec::new();
-    for arg in args {
-        if let Some(control) = push_owned_values(body(arg), &mut out) {
-            return partial(out, control);
+    let mut body_control: Option<Control> = None;
+    // Holds `body`'s result for a *first* argument value whose successor has
+    // not arrived yet, so the single-output case can still return it
+    // verbatim. That fast path is every query predating #1279, and returning
+    // the result unflattened is what keeps a borrowed `One`/`OneCursor`
+    // (`nth` -> `index_one`, `flatten` -> `builtin_flatten`) zero-copy;
+    // without it `[1,2,3] | nth(0)` would materialize. A second value flushes
+    // it into `out` before that value's own body result is appended, so
+    // ordering is unaffected.
+    let mut pending_first: Option<QueryResult<'a, W>> = None;
+
+    let flow = eval_each::<W, S>(arg_expr, value.clone(), optional, &mut |item| {
+        let owned = item_to_owned(item);
+        if let Some(previous) = pending_first.take() {
+            if let Some(control) = push_owned_values(previous, &mut out) {
+                body_control = Some(control);
+                return Demand::Stop;
+            }
         }
-    }
-    match trailing {
-        Some(control) => partial(out, control),
-        None => owned_vec_to_result(out),
+        let result = body(owned);
+        // Rule 2/4: a `body` failure stops the pull *here*, so the argument's
+        // remaining outputs are never evaluated. Checked before buffering,
+        // or an escaping first result would be parked and the sink would ask
+        // for another value anyway -- which is the bug this arm exists to fix.
+        if result.is_escape() {
+            if let Some(control) = push_owned_values(result, &mut out) {
+                body_control = Some(control);
+            }
+            return Demand::Stop;
+        }
+        if out.is_empty() && pending_first.is_none() {
+            pending_first = Some(result);
+        } else if let Some(control) = push_owned_values(result, &mut out) {
+            body_control = Some(control);
+            return Demand::Stop;
+        }
+        Demand::Continue
+    });
+
+    match flow {
+        // `pending_first` is `Some` here exactly when one value was delivered
+        // and `body` did not escape -- the old fast path's condition.
+        Flow::Exhausted => match pending_first {
+            Some(result) => result,
+            None => owned_vec_to_result(out),
+        },
+        // Our sink is the only thing that stops this pull, and it does so
+        // only after recording `body_control`. `pending` is dropped for the
+        // reason every other lazy consumer drops it (see `Flow::Stopped`):
+        // it belongs to an eager fallback that jq would never have reached.
+        Flow::Stopped { .. } => match body_control {
+            Some(control) => partial(out, control),
+            None => owned_vec_to_result(out),
+        },
+        // Rule 1: the argument's own control fires only after every body
+        // result already produced, so a buffered first must be flushed ahead
+        // of it.
+        Flow::Escaped(control) => {
+            if let Some(previous) = pending_first.take() {
+                if let Some(body_control) = push_owned_values(previous, &mut out) {
+                    return partial(out, body_control);
+                }
+            }
+            partial(out, control)
+        }
     }
 }
 
@@ -1649,6 +1764,10 @@ fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
 /// pattern or path per combination, so two one-element `Vec`s are noise next
 /// to that -- unlike [`fanout_arg`], whose fast path exists to preserve a
 /// borrowed cursor result.
+/// Like [`fanout_arg`], only [`ArgFanout::All`] is driven lazily, and for the
+/// same two reasons: jq never evaluates argument value N+1 once `body` has
+/// failed on N (#1531), and real yq — the only source of the other two gates
+/// — is eager and must stay so to keep seeing the escapes those gates report.
 fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     outer: &Expr,
     inner: &Expr,
@@ -1657,6 +1776,10 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     fanout: ArgFanout,
     mut body: impl FnMut(OwnedValue, OwnedValue) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
+    if matches!(fanout, ArgFanout::All) {
+        return fanout_two_args_lazy::<W, S, _>(outer, inner, value, optional, body);
+    }
+
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers, &outer_trailing) {
@@ -1683,6 +1806,73 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match outer_trailing {
         Some(control) => partial(out, control),
         None => owned_vec_to_result(out),
+    }
+}
+
+/// Convert one [`Item`] delivered by [`eval_each`] into the owned value a
+/// fan-out `body` takes. The borrowed arm is what `stream_outputs`'
+/// `collect_owned` did in the eager path, hoisted so both lazy drivers
+/// share one definition.
+fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
+    match item {
+        Item::Owned(v) => v,
+        Item::Borrowed(v) => to_owned(&v),
+    }
+}
+
+/// [`fanout_two_args`]'s [`ArgFanout::All`] path, pulling both generators on
+/// demand so neither is evaluated past the point jq would stop (#1531).
+///
+/// The nesting and escape ordering are the eager path's, unchanged: `inner`
+/// is re-evaluated once per `outer` value, an escape from `inner` (or from
+/// `body`) unwinds the outer loop rather than resuming it, and `outer`'s own
+/// trailing control fires only after every inner loop has completed.
+fn fanout_two_args_lazy<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+    outer: &Expr,
+    inner: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    mut body: B,
+) -> QueryResult<'a, W>
+where
+    B: FnMut(OwnedValue, OwnedValue) -> QueryResult<'a, W>,
+{
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let mut escape: Option<Control> = None;
+
+    let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
+        let o = item_to_owned(outer_item);
+        let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
+            let i = item_to_owned(inner_item);
+            match push_owned_values(body(o.clone(), i), &mut out) {
+                Some(control) => {
+                    escape = Some(control);
+                    Demand::Stop
+                }
+                None => Demand::Continue,
+            }
+        });
+        match inner_flow {
+            Flow::Exhausted => Demand::Continue,
+            // `body` already recorded its own control above.
+            Flow::Stopped { .. } => Demand::Stop,
+            // The inner generator's own control unwinds the outer loop too.
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    // A recorded `escape` always came with a `Demand::Stop`, so the outer
+    // flow is `Stopped` whenever one exists; `Escaped` therefore carries the
+    // outer generator's own control, which fires last.
+    match escape {
+        Some(control) => partial(out, control),
+        None => match outer_flow {
+            Flow::Escaped(control) => partial(out, control),
+            Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(out),
+        },
     }
 }
 
@@ -5031,8 +5221,10 @@ fn builtin_has<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(key_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        key_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `has()` and does not fan it out: live-verified against
         // the pinned v4.53.3, `[has(("a","b"))]` on `a: 1` is `[true]`, where
         // jq gives `[true,false]`. Bug-for-bug per ADR-0018, so yq mode keeps
@@ -6044,8 +6236,10 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(prefix_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        prefix_expr,
+        value.clone(),
+        optional,
         // Real yq has no `ltrimstr` at all -- live-verified against the pinned
         // v4.53.3, which answers `lexer: invalid input text "ltrimstr(\"a\")"`.
         // With no reference behaviour to be bug-compatible with, jq's fan-out
@@ -6088,8 +6282,10 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(suffix_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        suffix_expr,
+        value.clone(),
+        optional,
         // Real yq has no `rtrimstr` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |suffix_owned| {
@@ -6125,8 +6321,10 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(prefix_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        prefix_expr,
+        value.clone(),
+        optional,
         // Real yq has no `startswith` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |prefix_owned| {
@@ -6151,8 +6349,10 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(suffix_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        suffix_expr,
+        value.clone(),
+        optional,
         // Real yq has no `endswith` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |suffix_owned| {
@@ -6177,8 +6377,10 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(sep_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        sep_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `split` and does not fan it out: live-verified against
         // the pinned v4.53.3, `[.x | split((",","b"))]` on `a,b` is
         // `[["a","b"]]`, where jq gives two results. Bug-for-bug (ADR-0018).
@@ -6437,8 +6639,10 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(sep_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        sep_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `join` and does not fan it out: live-verified against
         // the pinned v4.53.3, `[.x | join((",","-"))]` on `[a, b]` is
         // `["a,b"]`, where jq gives both separators. Bug-for-bug (ADR-0018).
@@ -6527,8 +6731,10 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `to_owned` deep-copies the whole document — inside the loop, an N-output
     // argument would pay for it N times.
     let input = to_owned(&value);
-    fanout_arg(
-        eval_single::<W, S>(b_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        b_expr,
+        value.clone(),
+        optional,
         // Not gated to yq's first-output-only behaviour, unlike its neighbours:
         // real yq fans `contains` out too (live-verified against the pinned
         // v4.53.3 — `[.x | contains(("a","zz"))]` on `abc` is `[true,false]`,
@@ -6597,8 +6803,10 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `to_owned` deep-copies the whole document. Same reasoning as
     // `builtin_contains`, of which this is the inverse.
     let input = to_owned(&value);
-    fanout_arg(
-        eval_single::<W, S>(b_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        b_expr,
+        value.clone(),
+        optional,
         // Real yq has no `inside` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |b| {
@@ -6681,8 +6889,10 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // key type valid on null. `index_one` is the generic `.[$k]` operator
     // itself, so delegating to it gets all of this -- including its own
     // lazy array fast path -- for free instead of re-deriving it here.
-    fanout_arg(
-        eval_single::<W, S>(n_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        n_expr,
+        value.clone(),
+        optional,
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         // `index_one` yields a borrowed `QueryResult::One` for the common
@@ -6788,8 +6998,10 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(depth_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        depth_expr,
+        value.clone(),
+        optional,
         // Real yq's `flatten` takes a literal depth only -- a generator
         // argument is `bad expression, please check expression syntax`
         // (live-verified against the pinned v4.53.3), so there is no
@@ -9517,8 +9729,10 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(re_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `test` and does not fan it out (live-verified against
         // the pinned v4.53.3: `[.x | test(("a","z"))]` on `abc` is `[true]`,
         // where jq gives `[true,false]`), so yq mode keeps the first pattern
@@ -9644,8 +9858,10 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(s_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        s_expr,
+        value.clone(),
+        optional,
         // Real yq has no `indices` at all -- live-verified against the
         // pinned v4.53.3, whose lexer rejects the call outright. See
         // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
@@ -9724,8 +9940,10 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(s_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        s_expr,
+        value.clone(),
+        optional,
         // Real yq has no `index` at all -- live-verified against the
         // pinned v4.53.3, whose lexer rejects the call outright. See
         // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
@@ -9852,8 +10070,10 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(s_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        s_expr,
+        value.clone(),
+        optional,
         // Real yq has no `rindex` at all -- live-verified against the
         // pinned v4.53.3, whose lexer rejects the call outright. See
         // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
@@ -9996,8 +10216,10 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(path_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        path_expr,
+        value.clone(),
+        optional,
         // Real yq has no `getpath` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |path_owned| getpath_one_path::<W, S>(&value, path_owned, optional),
@@ -10602,11 +10824,9 @@ fn fanout_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
 
     match (family, flags_expr) {
         // Bare form: one generator argument, so no nesting question arises.
-        (_, None) => fanout_arg(
-            eval_single::<W, S>(re_expr, value, optional),
-            fanout,
-            |raw_pattern| run(raw_pattern, None),
-        ),
+        (_, None) => fanout_arg::<W, S, _>(re_expr, value, optional, fanout, |raw_pattern| {
+            run(raw_pattern, None)
+        }),
         // #942 forces flags first for this family, and jq nests it outermost.
         (RegexArgFamily::TestMatchCapture, Some(fe)) => fanout_two_args::<W, S>(
             fe,
@@ -11855,8 +12075,10 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
     optional: bool,
     body: &mut dyn FnMut(&str, &[String]) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(re_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
         // Real yq has `split/2` but not `splits`; neither fans its pattern
         // out, so both are gated together.
         ArgFanout::yq_native::<S>(),
@@ -11989,8 +12211,10 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // No `Ok(_) if optional` guard: same reasoning as `resolve_regex_args`'
     // own doc comment (#693) — `optional` is never forced `true` reaching a
     // nested `Call` like this.
-    fanout_arg(
-        eval_single::<W, S>(re_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `sub` and does not fan it out (live-verified against
         // the pinned v4.53.3); `gsub` it rejects at the lexer entirely, so
         // this arm is unopposed either way. Gated with `sub` for consistency.
@@ -12043,8 +12267,10 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(re_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
         // Real yq has no `scan` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |raw_pattern| {
@@ -12237,8 +12463,10 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(re_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
         // Real yq has no `splits` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |raw_pattern| {
@@ -21183,8 +21411,10 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // fan-out makes that unnecessary, because the two now sit at different
     // nesting levels and cannot double-count -- `fanout_arg` owns `n`'s
     // trailing control, the loop body owns `expr`'s.
-    fanout_arg(
-        eval_single::<W, S>(n_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        n_expr,
+        value.clone(),
+        optional,
         // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_value| limit_with_n::<W, S>(n_value, expr, value.clone(), optional),
@@ -21337,8 +21567,10 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // call this replaces existed to satisfy: a zero-output `n` (`nth(empty;
     // .a,.b)`) yields no outputs to loop over, so the whole call produces
     // nothing rather than hard-erroring "no value".
-    fanout_arg(
-        eval_single::<W, S>(n_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        n_expr,
+        value.clone(),
+        optional,
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_value| {
@@ -27055,8 +27287,10 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(fmt_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        fmt_expr,
+        value.clone(),
+        optional,
         // Real yq has no `strftime` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |fmt_owned| {
@@ -27389,8 +27623,10 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    fanout_arg(
-        eval_single::<W, S>(fmt_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        fmt_expr,
+        value.clone(),
+        optional,
         // Real yq has no `strptime` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |fmt_owned| {
@@ -28265,8 +28501,10 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(r) => return r,
     };
 
-    fanout_arg(
-        eval_single::<W, S>(zone_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        zone_expr,
+        value.clone(),
+        optional,
         // Real yq *has* `tz` and does not fan it out (live-verified against
         // the pinned v4.53.3), so yq mode keeps using the first zone only.
         ArgFanout::yq_native::<S>(),
@@ -28311,8 +28549,10 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     use std::path::Path;
 
-    fanout_arg(
-        eval_single::<W, S>(file_expr, value, optional),
+    fanout_arg::<W, S, _>(
+        file_expr,
+        value,
+        optional,
         // Real yq has no `load` in the jq-language sense reachable here; this
         // is a succinctly extension either way, so jq's fan-out is unopposed.
         ArgFanout::All,
@@ -28916,8 +29156,10 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // so a future routing change can't silently reintroduce the bug this
     // issue fixed in the live implementation.
     // `n` is the OUTER loop, matching `eval_limit` (#1279).
-    fanout_arg(
-        eval_single::<W, S>(n_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        n_expr,
+        value.clone(),
+        optional,
         // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
@@ -29038,8 +29280,10 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // answers `[1,2]` (#1279). Its dedicated `QueryResult::None` arm (#1408's
     // zero-output fix) is subsumed the same way `eval_nth_expr`'s is: no
     // argument outputs means no loop iterations, hence no result.
-    fanout_arg(
-        eval_single::<W, S>(n_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        n_expr,
+        value.clone(),
+        optional,
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
@@ -29158,8 +29402,10 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // rather than unwinding to the label, and for the reason the old comment
     // gave: the `1` output fails first, and a body failure outranks a
     // trailing control that has not been reached yet.
-    fanout_arg(
-        eval_single::<W, S>(paths_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        paths_expr,
+        value.clone(),
+        optional,
         // Real yq refuses a multi-output `delpaths` argument outright rather
         // than taking its first -- see `ArgFanout::RejectMany`.
         ArgFanout::reject_many_in_yq::<S>(),
@@ -30268,8 +30514,10 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (#1279). The `_ => return QueryResult::None` catch-all this replaces
     // swallowed a `Many`/`ManyOwned` target into *no output at all*:
     // `[1,2,3] | [bsearch((2,3))]` answered `[]` where jq answers `[1,2]`.
-    fanout_arg(
-        eval_single::<W, S>(x_expr, value.clone(), optional),
+    fanout_arg::<W, S, _>(
+        x_expr,
+        value.clone(),
+        optional,
         // Real yq has no `bsearch` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |x| bsearch_one_target::<W>(value.clone(), x, optional),
@@ -53014,13 +53262,18 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a, .b").unwrap();
-        let arg = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
 
         let mut seen = Vec::new();
-        let result = fanout_arg(arg, ArgFanout::All, |v| {
-            seen.push(v.to_json());
-            QueryResult::Owned(v)
-        });
+        let result = fanout_arg::<Vec<u64>, JqSemantics, _>(
+            &expr,
+            cursor.value(),
+            false,
+            ArgFanout::All,
+            |v| {
+                seen.push(v.to_json());
+                QueryResult::Owned(v)
+            },
+        );
 
         assert_eq!(seen, vec![r#""x""#, r#""y""#]);
         match result {
@@ -53042,13 +53295,18 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse(".a, .b").unwrap();
-        let arg = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
 
         let mut calls = 0;
-        let result = fanout_arg(arg, ArgFanout::FirstOnly, |v| {
-            calls += 1;
-            QueryResult::Owned(v)
-        });
+        let result = fanout_arg::<Vec<u64>, JqSemantics, _>(
+            &expr,
+            cursor.value(),
+            false,
+            ArgFanout::FirstOnly,
+            |v| {
+                calls += 1;
+                QueryResult::Owned(v)
+            },
+        );
 
         assert_eq!(calls, 1);
         match result {
