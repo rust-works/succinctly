@@ -11986,12 +11986,13 @@ fn test_delpaths_own_error_outranks_trailing_halt_1279() -> Result<()> {
     // never reaching `halt_error` at all. This test used to assert exit 9,
     // pinning the pre-#1279 behaviour where the halt won.
     //
-    // stderr still carries `halt_error`'s own output, which jq's does not:
-    // succinctly evaluates the whole argument generator up front, so the
-    // second output runs even though the loop never uses it. That is #820's
-    // eager-generator gap, not this one's -- pinned by the
-    // `delpaths_own_error_outranks_trailing_halt` golden, which stays a known
-    // failure for exactly that residue.
+    // stderr used to carry `halt_error`'s own output too, which jq's does
+    // not: the argument generator was evaluated up front, so the second
+    // output ran even though the loop never used it. #1531 made the
+    // `ArgFanout::All` pull lazy, so `halt_error(9)` is now never reached
+    // and stderr matches jq byte for byte -- the
+    // `delpaths_own_error_outranks_trailing_halt` golden came off the
+    // known-failure list in the same commit.
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
@@ -12004,6 +12005,12 @@ fn test_delpaths_own_error_outranks_trailing_halt_1279() -> Result<()> {
     assert!(
         stderr.contains("Paths must be specified as an array"),
         "stderr: {stderr:?}"
+    );
+    // The halt's own diagnostic must be absent -- jq never evaluates
+    // `halt_error(9)`, and since #1531 neither do we.
+    assert!(
+        !stderr.contains('9'),
+        "halt_error output leaked: {stderr:?}"
     );
     Ok(())
 }
@@ -19781,5 +19788,131 @@ fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":99,"b":99}"#);
+    Ok(())
+}
+
+/// #1531: a generator argument must be pulled lazily, so `body` runs against
+/// argument value N *before* value N+1 is evaluated. Once `body` fails, jq
+/// never evaluates the rest of the argument -- side effects included.
+///
+/// The observable case is `input`, which consumes from the shared document
+/// queue. Materializing the whole argument first ran `input` even though the
+/// preceding value had already failed, stealing the *next* document while
+/// the current one was still being processed -- so the first document's own
+/// error was lost and every later position shifted by one.
+///
+/// Live-captured from the pinned jq 1.7.1 over three one-line documents:
+///
+/// ```text
+/// $ jq -c 'setpath((1, input); 1), input' three.jsonl
+/// jq: error (at three.jsonl:1): Path must be specified as an array
+/// jq: error (at three.jsonl:2): Path must be specified as an array
+/// jq: error (at three.jsonl:3): Path must be specified as an array
+/// ```
+///
+/// succinctly used to report only lines 2 and 3.
+#[test]
+fn test_jq_generator_argument_is_not_evaluated_past_a_body_failure_1531() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    writeln!(file, r#"{{"a":1}}"#)?;
+    writeln!(file, r#"{{"b":2}}"#)?;
+    writeln!(file, r#"{{"c":3}}"#)?;
+    let path = file.path().to_str().unwrap().to_string();
+
+    // `fanout_two_args` (setpath): one error per document, none consumed by
+    // the unreached `input`.
+    let (_, stderr, code) = run_jq_full(&["-c", "setpath((1, input); 1), input", &path], None)?;
+    assert_eq!(
+        stderr.matches("Path must be specified as an array").count(),
+        3,
+        "one error per document; stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+
+    // `fanout_arg` (delpaths): same property through the one-argument driver.
+    let (_, stderr, code) = run_jq_full(&["-c", "delpaths((1, input))", &path], None)?;
+    assert_eq!(
+        stderr
+            .matches("Paths must be specified as an array")
+            .count(),
+        3,
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+
+    // `nth`, whose own `n` check fails before the second output is pulled.
+    let (_, stderr, code) = run_jq_full(&["-c", "nth((-1, input); (10,20))", &path], None)?;
+    assert_eq!(
+        stderr.matches("negative indices").count(),
+        3,
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1531 companion: the same laziness means a `halt_error` sitting after a
+/// failing value is never reached, so its diagnostic never reaches stderr.
+/// jq prints only the body's own error here, and now so do we -- this is
+/// the residue that kept `delpaths_own_error_outranks_trailing_halt` on the
+/// golden known-failure list until this fix.
+#[test]
+fn test_jq_unreached_halt_error_in_a_generator_argument_stays_silent_1531() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"{"a":1} | delpaths((1, halt_error(9)))"#], None)?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Paths must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains('9'),
+        "halt_error was reached but jq never reaches it: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1531 guard: laziness must not disturb the fan-out rules it sits under.
+/// Every argument value is still used when `body` succeeds, in order, and
+/// the argument's own trailing control still fires *after* the whole prefix
+/// (rule 1) rather than pre-empting it.
+#[test]
+fn test_jq_lazy_fanout_preserves_prefix_and_trailing_control_1531() -> Result<()> {
+    // Rule 1: every value's result is emitted before the argument's own
+    // `break` fires. Deliberately *not* wrapped in `[...]`: a `break`
+    // escaping an array construction discards the whole array, so the
+    // wrapped form is empty output in real jq -- verified against 1.7.1,
+    // and the reason `fanout_arg`'s own rule-1 example was corrected in
+    // the same commit as this test.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#"label $out | ltrimstr(("a","b", break $out))"#],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"bcabc\"\n\"abcabc\"\n");
+
+    // ...and the array-wrapped form really is empty, in both tools.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#"label $out | [ltrimstr(("a","b", break $out))]"#],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Every value used, in argument order.
+    let (stdout, _, code) = run_jq_full(&["-c", "[contains((1,2))]"], Some("1"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[true,false]");
+
+    // Rule 2: body failure keeps the prefix already produced.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"contains(("a", 1))"#], Some(r#""abc""#))?;
+    assert_eq!(stdout.trim(), "true", "the prefix must survive");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+
+    // The single-output fast path still returns its result verbatim.
+    let (stdout, _, code) = run_jq_full(&["-c", "nth(0)"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
     Ok(())
 }
