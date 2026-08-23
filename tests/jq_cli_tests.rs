@@ -17529,6 +17529,70 @@ fn test_jq_slurp_error_location_is_last_source_eof_1520() -> Result<()> {
     Ok(())
 }
 
+/// #1542: `--seq --slurp`'s EOF marker is `<unknown>`, not a resolved
+/// position, when the stream's *own last* record leaves real jq's
+/// incremental parser with nothing to point at -- either genuinely
+/// truncated/malformed content, or a bare number butting right up against
+/// EOF with no terminating byte after it (ambiguous: jq's streaming number
+/// scanner can't rule out more digits still arriving). A malformed record
+/// *earlier* in the stream, with a valid record after it, still resolves
+/// normally -- only the trailing position is ever lost. Every expectation
+/// here is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
+    // Genuinely truncated trailing record (unterminated object).
+    let (_, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
+
+    // Bare number with nothing at all after it before EOF -- ambiguous to
+    // jq's streaming parser even though "2" alone is valid JSON.
+    let (_, stderr, code, _paths) =
+        run_jq_over_files(&["--seq", "-c", "-s", r#"error("x")"#], &["\x1e1\n\x1e2"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
+
+    // Control: the same bare number followed by even one trailing space
+    // resolves the ambiguity -- reports normally, not <unknown>.
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["--seq", "-c", "-s", r#"error("x")"#], &["\x1e1\n\x1e2 "])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[0])),
+        "{stderr}"
+    );
+
+    // Control: a malformed record *not* last -- the trailing valid record's
+    // own position still resolves normally, not <unknown>.
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1\n\x1e3\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:3): x", paths[0])),
+        "{stderr}"
+    );
+
+    // Data-safety control: a truncated trailing record must not lose the
+    // rest of the slurped document to `input`/`inputs` -- the `<unknown>`
+    // marker is carried by a placeholder table entry precisely so this
+    // still returns the wrapped array intact, not an empty/truncated one.
+    // `--seq` RS-prefixes output too (RFC 7464), not just input.
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "-c", "-s", "., inputs"],
+        Some("\x1e1\n\x1e{\"a\":1"),
+    )
+    .expect("seq slurp with truncated trailing record still runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "\x1e[1]\n", "{stderr}");
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
