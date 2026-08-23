@@ -14,6 +14,7 @@ use succinctly::jq::document::{collapsed_fields, effective_keys};
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
+use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
     self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
     OwnedValue, Program,
@@ -404,6 +405,20 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             start: start.map(|e| Box::new(rewrite_namespaced_calls(*e))),
             end: end.map(|e| Box::new(rewrite_namespaced_calls(*e))),
         },
+        // A namespaced call can appear inside any of the 82
+        // sub-expression-carrying builtins (`map(ns::f)`, `limit(1; ns::f)`,
+        // `sub("a"; "b"; ns::f)`, ...) -- #1505. Without this arm, the
+        // catch-all below returned `expr` unchanged, so a call nested this
+        // way never got rewritten from `Expr::NamespacedCall` to
+        // `Expr::FuncCall`, and evaluation failed with "module not loaded".
+        // `map_builtin_subexprs` (`jq::walk`) is `builtin_kids`'s mapping
+        // twin: exhaustive over every `Builtin` variant with no wildcard, so
+        // a future variant that carries a sub-expression is a compile error
+        // here until it's declared there, the same discipline this file's
+        // own manual `Expr` recursion already follows above.
+        Expr::Builtin(builtin) => Expr::Builtin(map_builtin_subexprs(&builtin, &mut |sub| {
+            rewrite_namespaced_calls(sub.clone())
+        })),
         // Expressions that don't contain sub-expressions - return as-is
         Expr::Identity
         | Expr::Field(_)
@@ -419,8 +434,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         | Expr::Loc { .. }
         | Expr::Env
         | Expr::Not
-        | Expr::Format(_)
-        | Expr::Builtin(_) => expr,
+        | Expr::Format(_) => expr,
     }
 }
 
