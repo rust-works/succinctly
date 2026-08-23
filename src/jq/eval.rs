@@ -22463,6 +22463,44 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Like [`continue_rest_with_context`], but for a single value already
+/// reached by reference during DOM navigation (`Field`/`Index`/`Iterate`)
+/// rather than one already wrapped in an owned `QueryResult`.
+///
+/// `continue_rest_with_context` takes `intermediate` by value, so a caller
+/// that only has a borrow (a reference into the parent `Object`'s map or
+/// `Array`'s vec) would have to clone it just to call that function --
+/// unconditionally, before `rest.is_empty()` is even checked, since the
+/// clone-or-borrow decision has already been made by the time the value
+/// enters that function's `Owned` arm. For a chained path
+/// (`.a.b.c.d.e`) or a `.[] | ...` over a large array/object, that turns an
+/// O(1)-borrows, one-clone-at-the-leaf traversal into O(depth)/O(n) deep
+/// clones of whatever subtree hangs off each intermediate value --
+/// `OwnedValue::clone()` is a real recursive deep clone (`Array`/`Object`
+/// hold plain `Vec`/`IndexMap`, no `Rc`/`Arc` sharing) -- exactly the
+/// "real, measurable cost" #1445 fixed for the *terminal* case, reappearing
+/// on the *continuing* case if these call sites route through
+/// `continue_rest_with_context` directly (found in review of this
+/// function's own initial version).
+///
+/// Deciding first, borrowing until decided, keeps both ends cheap: `rest.
+/// is_empty()` returns `Owned(v.clone())` (one clone, unavoidable -- the
+/// caller needs an owned leaf value either way), and continuing recurses
+/// with the reference the caller already had, no clone at all.
+fn continue_rest_with_borrowed_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    v: &OwnedValue,
+    rest: &[Expr],
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    if rest.is_empty() {
+        return QueryResult::Owned(v.clone());
+    }
+    eval_pipe_with_path_context_internal::<W, S>(rest, v, root, file_origin, current_path, optional)
+}
+
 /// Continue evaluating `rest` for each output of an already-computed
 /// intermediate `QueryResult`, treating each output as a *fresh root* with
 /// an empty path -- the counterpart to `continue_rest_with_context` for a
@@ -22916,8 +22954,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Get the field value
             if let OwnedValue::Object(entries) = value {
                 if let Some(v) = entries.get(name) {
-                    return continue_rest_with_context::<W, S>(
-                        QueryResult::Owned(v.clone()),
+                    return continue_rest_with_borrowed_value::<W, S>(
+                        v,
                         rest,
                         root,
                         file_origin,
@@ -22954,8 +22992,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 let actual_idx = if *idx < 0 { len + *idx } else { *idx };
                 if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                     let v = &arr[actual_idx as usize];
-                    return continue_rest_with_context::<W, S>(
-                        QueryResult::Owned(v.clone()),
+                    return continue_rest_with_borrowed_value::<W, S>(
+                        v,
                         rest,
                         root,
                         file_origin,
@@ -22979,18 +23017,22 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         }
         Expr::Iterate => {
             // Iterate produces multiple paths. Each element gets its own
-            // distinct `new_path`, so `continue_rest_with_context` is called
-            // once per element here rather than once for the whole batch --
-            // its single-value signature has nothing to batch a per-element
-            // path over.
+            // distinct `new_path`, so `continue_rest_with_borrowed_value` is
+            // called once per element here rather than once for the whole
+            // batch -- its single-value signature has nothing to batch a
+            // per-element path over, and taking `v` by reference (rather
+            // than wrapping an eager clone in `QueryResult::Owned`) avoids
+            // deep-cloning every element that still has more pipeline
+            // ahead of it (only the terminal, `rest.is_empty()` case clones
+            // at all, same as before this arm used a shared helper).
             let mut results = Vec::new();
             match value {
                 OwnedValue::Array(arr) => {
                     for (i, v) in arr.iter().enumerate() {
                         let mut new_path = current_path.to_vec();
                         new_path.push(OwnedValue::Int(i as i64));
-                        let step = continue_rest_with_context::<W, S>(
-                            QueryResult::Owned(v.clone()),
+                        let step = continue_rest_with_borrowed_value::<W, S>(
+                            v,
                             rest,
                             root,
                             file_origin,
@@ -23006,8 +23048,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     for (key, v) in entries {
                         let mut new_path = current_path.to_vec();
                         new_path.push(OwnedValue::String(key.clone()));
-                        let step = continue_rest_with_context::<W, S>(
-                            QueryResult::Owned(v.clone()),
+                        let step = continue_rest_with_borrowed_value::<W, S>(
+                            v,
                             rest,
                             root,
                             file_origin,
