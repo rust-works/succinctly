@@ -18955,6 +18955,46 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "B",
             0,
         ),
+        // Code review of #1461, filed as #1565: when the pipe's *first*
+        // stage evaluates to `GenericResult::LazyKeys` (`keys`,
+        // `keys_unsorted`) and 2+ further stages follow, the driver hands
+        // the whole remaining pipe to `fold_pipe_stages` -- the plain eager
+        // fold, with no demand check -- rather than continuing through
+        // `eval_each_pipe_generic`'s own sink. So `.[] | stderr` after a
+        // `keys` prefix still fires for every key, unlike the bare
+        // `first(.[] | stderr)` #1461 itself fixed. Confirmed pre-existing
+        // (identical on `main` before #1461, via the old 2-stage-only
+        // `first_over_comma_generic`), so not a regression here -- pinned so
+        // a fix for #1565 has a red test to turn green. jq: writes `a` once.
+        (
+            &["-c", "first(keys | .[] | stderr)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"a\"\n",
+            "abc",
+            0,
+        ),
+        // Same #1565 gap, `LazySeq` (`map(f)`, #724/#725) flavor instead of
+        // `LazyKeys`. jq: writes `2` once.
+        (
+            &["-c", "first(map(.+1) | .[] | stderr)"],
+            Some("[1,2,3]"),
+            "2\n",
+            "234",
+            0,
+        ),
+        // Same class as the `Compare` row above (#1565): `Expr::If` has no
+        // native `eval_each_generic` arm either, so `first(if ...)` falls
+        // through to eager `eval_single` and the discarded `else` branch's
+        // sibling side effect still fires. Out of #1461's scope by design,
+        // same as `Compare`; pre-existing on `main` before #1461 too. jq: no
+        // stderr.
+        (
+            &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
         // The eager copies of jq's right-outer/left-inner fanout loop
         // (`binary_fanout_core` via `eval_binary_fanout`,
         // `eval_binary_fanout_with_path_context`, and `eval_generic`'s own
