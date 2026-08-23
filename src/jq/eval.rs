@@ -1366,41 +1366,30 @@ fn borrowed_vec_to_result<W>(vs: Vec<StandardJson<'_, W>>) -> QueryResult<'_, W>
     )
 }
 
-/// Finish a builtin whose own computation succeeded with `value`, given the
-/// optional trailing [`Control`] [`result_to_owned_ctrl`] returned alongside
-/// the argument value that computation used (#1164). `None` is the ordinary
-/// case (`QueryResult::Owned(value)`); `Some(control)` means the argument
-/// generator produced that value and *then* broke/errored, which real jq
-/// still lets this builtin finish and use before unwinding -- see
-/// `result_to_owned_ctrl`'s own doc comment for the live-verified semantics
-/// this preserves.
-fn finish_owned<'a, W>(value: OwnedValue, trailing: Option<Control>) -> QueryResult<'a, W> {
-    match trailing {
-        None => QueryResult::Owned(value),
-        Some(control) => partial(vec![value], control),
-    }
-}
-
-/// Like [`finish_owned`], but for a builtin that delegates its own
-/// post-argument computation to another function returning a full
-/// `QueryResult<'a, W>` directly (e.g. `nth(n)` delegating to `index_one`,
-/// `flatten(depth)` delegating to `builtin_flatten`) instead of a single
-/// already-`OwnedValue` (#1164). `None` passes `result` through completely
+/// Splice a trailing [`Control`] onto a builtin's own already-computed
+/// `QueryResult<'a, W>` (#1164). `None` passes `result` through completely
 /// unchanged, preserving any zero-copy/cursor fast path it took; `Some`
 /// only forces materializing it, to splice the trailing control on.
+///
+/// Only one caller remains: `builtin_envvar`, whose argument is resolved
+/// through [`eval_owned_expr_ctrl_full`] rather than a [`QueryResult`], so it
+/// cannot use [`fanout_arg`] the way #1279 migrated the rest of this family.
+/// The `finish_owned` that used to sit beside this is gone — every builtin
+/// that had one now returns `QueryResult::Owned` from inside a `fanout_arg`
+/// closure, and the driver splices the trailing control itself.
 ///
 /// If `result` itself escapes (its own `Error`/`Break`/`Halt`/`Partial`, not
 /// the argument's), that escape wins outright and `trailing` is discarded --
 /// same "the computation that actually ran and escaped supersedes an
 /// earlier, never-revisited argument escape" rule `result_to_owned_ctrl`'s
-/// own doc comment describes and `has()`/`contains()`'s error paths above
-/// already follow. No current caller can make `result` its own `Partial`
-/// (each delegates to a function with no generator-argument evaluation of
-/// its own) -- but unlike the true structural impossibility right above
-/// (`OneCursor`, ruled out by `materialize_cursor`'s own contract), this is
-/// just "not exercised by today's callers," not "cannot happen," so it gets
-/// the same defensible fallback as the plain `Error`/`Break`/`Halt` case
-/// instead of an assertion a future caller could legitimately trip.
+/// own doc comment describes and `has()`/`contains()`'s error paths already
+/// follow. Its caller cannot make `result` its own `Partial` (it delegates to
+/// `std::env::var`, which has no generator-argument evaluation of its own) --
+/// but unlike the true structural impossibility right above (`OneCursor`,
+/// ruled out by `materialize_cursor`'s own contract), this is just "not
+/// exercised by today's caller," not "cannot happen," so it gets the same
+/// defensible fallback as the plain `Error`/`Break`/`Halt` case instead of an
+/// assertion a future caller could legitimately trip.
 fn finish_result<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     trailing: Option<Control>,
@@ -5893,32 +5882,42 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the prefix string
-    let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
-    let (prefix, trailing) = match result_to_owned_full(prefix_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-        // jq's ltrimstr is total: a non-string argument leaves input unchanged.
-        Ok(Some((_, trailing))) => return finish_owned(to_owned(&value), trailing),
-        Err(e) => return e.into(),
-    };
-
-    let result = match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                if cow.starts_with(&prefix) {
-                    OwnedValue::String(cow[prefix.len()..].to_string())
-                } else {
-                    OwnedValue::String(cow.into_owned())
+    fanout_arg(
+        eval_single::<W, S>(prefix_expr, value.clone(), optional),
+        // Real yq has no `ltrimstr` at all -- live-verified against the pinned
+        // v4.53.3, which answers `lexer: invalid input text "ltrimstr(\"a\")"`.
+        // With no reference behaviour to be bug-compatible with, jq's fan-out
+        // is the unopposed choice for succinctly's yq-mode extension
+        // (ADR-0018), not a divergence. Same for every other `ArgFanout::All`
+        // in this family.
+        ArgFanout::All,
+        |prefix_owned| {
+            // jq's ltrimstr is total: a non-string argument leaves input
+            // unchanged. `to_owned` stays inside the loop rather than being
+            // hoisted -- it is only reached on these two cold paths, so
+            // hoisting would pay for a whole-document copy on the hot one.
+            let OwnedValue::String(prefix) = prefix_owned else {
+                return QueryResult::Owned(to_owned(&value));
+            };
+            let result = match &value {
+                StandardJson::String(s) => {
+                    if let Ok(cow) = s.as_str() {
+                        if cow.starts_with(&prefix) {
+                            OwnedValue::String(cow[prefix.len()..].to_string())
+                        } else {
+                            OwnedValue::String(cow.into_owned())
+                        }
+                    } else {
+                        OwnedValue::String(String::new())
+                    }
                 }
-            } else {
-                OwnedValue::String(String::new())
-            }
-        }
-        // jq's ltrimstr is total: a non-string input passes through unchanged.
-        _ => to_owned(&value),
-    };
-    finish_owned(result, trailing)
+                // jq's ltrimstr is total: a non-string input passes through
+                // unchanged.
+                _ => to_owned(&value),
+            };
+            QueryResult::Owned(result)
+        },
+    )
 }
 
 /// Builtin: rtrimstr(s) - remove suffix s
@@ -5927,32 +5926,35 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the suffix string
-    let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
-    let (suffix, trailing) = match result_to_owned_full(suffix_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-        // jq's rtrimstr is total: a non-string argument leaves input unchanged.
-        Ok(Some((_, trailing))) => return finish_owned(to_owned(&value), trailing),
-        Err(e) => return e.into(),
-    };
-
-    let result = match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                if cow.ends_with(&suffix) {
-                    OwnedValue::String(cow[..cow.len() - suffix.len()].to_string())
-                } else {
-                    OwnedValue::String(cow.into_owned())
+    fanout_arg(
+        eval_single::<W, S>(suffix_expr, value.clone(), optional),
+        // Real yq has no `rtrimstr` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |suffix_owned| {
+            // jq's rtrimstr is total: a non-string argument leaves input
+            // unchanged.
+            let OwnedValue::String(suffix) = suffix_owned else {
+                return QueryResult::Owned(to_owned(&value));
+            };
+            let result = match &value {
+                StandardJson::String(s) => {
+                    if let Ok(cow) = s.as_str() {
+                        if cow.ends_with(&suffix) {
+                            OwnedValue::String(cow[..cow.len() - suffix.len()].to_string())
+                        } else {
+                            OwnedValue::String(cow.into_owned())
+                        }
+                    } else {
+                        OwnedValue::String(String::new())
+                    }
                 }
-            } else {
-                OwnedValue::String(String::new())
-            }
-        }
-        // jq's rtrimstr is total: a non-string input passes through unchanged.
-        _ => to_owned(&value),
-    };
-    finish_owned(result, trailing)
+                // jq's rtrimstr is total: a non-string input passes through
+                // unchanged.
+                _ => to_owned(&value),
+            };
+            QueryResult::Owned(result)
+        },
+    )
 }
 
 /// Builtin: startswith(s) - check if string starts with s
@@ -5961,28 +5963,24 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the prefix string
-    let prefix_result = eval_single::<W, S>(prefix_expr, value.clone(), optional);
-    let (prefix, trailing) = match result_to_owned_full(prefix_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-        Ok(Some(_)) => {
-            return QueryResult::Error(EvalError::new("startswith() requires string inputs"));
-        }
-        Err(e) => return e.into(),
-    };
-
-    match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                finish_owned(OwnedValue::Bool(cow.starts_with(&prefix)), trailing)
-            } else {
-                finish_owned(OwnedValue::Bool(false), trailing)
+    fanout_arg(
+        eval_single::<W, S>(prefix_expr, value.clone(), optional),
+        // Real yq has no `startswith` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |prefix_owned| {
+            let OwnedValue::String(prefix) = prefix_owned else {
+                return QueryResult::Error(EvalError::new("startswith() requires string inputs"));
+            };
+            match &value {
+                StandardJson::String(s) => {
+                    let starts = s.as_str().is_ok_and(|cow| cow.starts_with(&prefix));
+                    QueryResult::Owned(OwnedValue::Bool(starts))
+                }
+                _ if optional => QueryResult::None,
+                _ => QueryResult::Error(EvalError::new("startswith() requires string inputs")),
             }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("startswith() requires string inputs")),
-    }
+        },
+    )
 }
 
 /// Builtin: endswith(s) - check if string ends with s
@@ -5991,28 +5989,24 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the suffix string
-    let suffix_result = eval_single::<W, S>(suffix_expr, value.clone(), optional);
-    let (suffix, trailing) = match result_to_owned_full(suffix_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-        Ok(Some(_)) => {
-            return QueryResult::Error(EvalError::new("endswith() requires string inputs"));
-        }
-        Err(e) => return e.into(),
-    };
-
-    match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                finish_owned(OwnedValue::Bool(cow.ends_with(&suffix)), trailing)
-            } else {
-                finish_owned(OwnedValue::Bool(false), trailing)
+    fanout_arg(
+        eval_single::<W, S>(suffix_expr, value.clone(), optional),
+        // Real yq has no `endswith` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |suffix_owned| {
+            let OwnedValue::String(suffix) = suffix_owned else {
+                return QueryResult::Error(EvalError::new("endswith() requires string inputs"));
+            };
+            match &value {
+                StandardJson::String(s) => {
+                    let ends = s.as_str().is_ok_and(|cow| cow.ends_with(&suffix));
+                    QueryResult::Owned(OwnedValue::Bool(ends))
+                }
+                _ if optional => QueryResult::None,
+                _ => QueryResult::Error(EvalError::new("endswith() requires string inputs")),
             }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("endswith() requires string inputs")),
-    }
+        },
+    )
 }
 
 /// Builtin: split(s) - split string by separator
@@ -6021,39 +6015,43 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the separator string
-    let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
-    let (sep, trailing) = match result_to_owned_full(sep_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-        Ok(Some(_)) => {
-            return QueryResult::Error(EvalError::new("split input and separator must be strings"));
-        }
-        Err(e) => return e.into(),
-    };
-
-    match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                // jq: split("") returns each character as a separate element
-                // Rust's split("") includes empty strings at boundaries, so special-case it
-                let parts: Vec<OwnedValue> = if sep.is_empty() {
-                    cow.chars()
-                        .map(|c| OwnedValue::String(c.to_string()))
-                        .collect()
-                } else {
-                    cow.split(&sep)
-                        .map(|p| OwnedValue::String(p.to_string()))
-                        .collect()
-                };
-                finish_owned(OwnedValue::Array(parts), trailing)
-            } else {
-                finish_owned(OwnedValue::Array(vec![]), trailing)
+    fanout_arg(
+        eval_single::<W, S>(sep_expr, value.clone(), optional),
+        // Real yq *has* `split` and does not fan it out: live-verified against
+        // the pinned v4.53.3, `[.x | split((",","b"))]` on `a,b` is
+        // `[["a","b"]]`, where jq gives two results. Bug-for-bug (ADR-0018).
+        ArgFanout::yq_native::<S>(),
+        |sep_owned| {
+            let OwnedValue::String(sep) = sep_owned else {
+                return QueryResult::Error(EvalError::new(
+                    "split input and separator must be strings",
+                ));
+            };
+            match &value {
+                StandardJson::String(s) => {
+                    let Ok(cow) = s.as_str() else {
+                        return QueryResult::Owned(OwnedValue::Array(vec![]));
+                    };
+                    // jq: split("") returns each character as a separate element
+                    // Rust's split("") includes empty strings at boundaries, so special-case it
+                    let parts: Vec<OwnedValue> = if sep.is_empty() {
+                        cow.chars()
+                            .map(|c| OwnedValue::String(c.to_string()))
+                            .collect()
+                    } else {
+                        cow.split(&sep)
+                            .map(|p| OwnedValue::String(p.to_string()))
+                            .collect()
+                    };
+                    QueryResult::Owned(OwnedValue::Array(parts))
+                }
+                _ if optional => QueryResult::None,
+                _ => {
+                    QueryResult::Error(EvalError::new("split input and separator must be strings"))
+                }
             }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("split input and separator must be strings")),
-    }
+        },
+    )
 }
 
 /// Stringifies one `join` element for yq mode (#1041, live-verified against
@@ -6277,13 +6275,26 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let sep_result = eval_single::<W, S>(sep_expr, value.clone(), optional);
-    let (sep, trailing) = match result_to_owned_full(sep_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
+    fanout_arg(
+        eval_single::<W, S>(sep_expr, value.clone(), optional),
+        // Real yq *has* `join` and does not fan it out: live-verified against
+        // the pinned v4.53.3, `[.x | join((",","-"))]` on `[a, b]` is
+        // `["a,b"]`, where jq gives both separators. Bug-for-bug (ADR-0018).
+        ArgFanout::yq_native::<S>(),
+        |sep| join_with_separator::<W, S>(value.clone(), sep),
+    )
+}
 
+/// `join`'s work for one already-resolved separator — the body of
+/// [`builtin_join`], run once per output of its separator generator (#1279).
+///
+/// Takes `value` by value rather than by reference because both branches below
+/// consume the element/field cursors by move; the fan-out loop clones the
+/// cursor per iteration, which is a cursor copy rather than a document one.
+fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+    sep: OwnedValue,
+) -> QueryResult<'_, W> {
     if S::TAG == EvalTag::Yq {
         let sep_str = yq_join_separator(sep);
         return match value {
@@ -6307,7 +6318,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         _ => yq_join_element_part(to_owned_key_shape(&e)),
                     })
                     .collect();
-                finish_owned(OwnedValue::String(parts.join(&sep_str)), trailing)
+                QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
             }
             other => QueryResult::Error(EvalError::new(format!(
                 "cannot join with {}, can only join arrays of scalars",
@@ -6339,7 +6350,7 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     match result {
-        Ok(acc) => finish_owned(acc.unwrap_or(OwnedValue::String(String::new())), trailing),
+        Ok(acc) => QueryResult::Owned(acc.unwrap_or(OwnedValue::String(String::new()))),
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -6420,23 +6431,26 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the container value
-    let b_result = eval_single::<W, S>(b_expr, value.clone(), optional);
-    let (b, trailing) = match result_to_owned_full(b_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
-
+    // Hoisted out of the fan-out: the input does not vary with `b`, and
+    // `to_owned` deep-copies the whole document. Same reasoning as
+    // `builtin_contains`, of which this is the inverse.
     let input = to_owned(&value);
-    // inside is the inverse of contains: b contains input
-    if jq_kind(&b) != jq_kind(&input) {
-        if optional {
-            return QueryResult::None;
-        }
-        return QueryResult::Error(EvalError::containment_check(&b, &input));
-    }
-    finish_owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)), trailing)
+    fanout_arg(
+        eval_single::<W, S>(b_expr, value.clone(), optional),
+        // Real yq has no `inside` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |b| {
+            // inside is the inverse of contains: b contains input
+            if jq_kind(&b) != jq_kind(&input) {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::containment_check(&b, &input))
+                };
+            }
+            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)))
+        },
+    )
 }
 
 // =============================================================================
@@ -6505,13 +6519,16 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // key type valid on null. `index_one` is the generic `.[$k]` operator
     // itself, so delegating to it gets all of this -- including its own
     // lazy array fast path -- for free instead of re-deriving it here.
-    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
-    let (n, trailing) = match result_to_owned_full(n_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
-    finish_result(index_one::<W>(value, &n, optional), trailing)
+    fanout_arg(
+        eval_single::<W, S>(n_expr, value.clone(), optional),
+        // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        // `index_one` yields a borrowed `QueryResult::One` for the common
+        // array case, and `fanout_arg`'s single-output fast path returns it
+        // verbatim -- so `[1,2,3] | nth(0)` keeps the zero-copy path
+        // `finish_result(result, None)` used to preserve here.
+        |n| index_one::<W>(value.clone(), &n, optional),
+    )
 }
 
 /// Builtin: reverse - reverse array
@@ -6609,24 +6626,26 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the depth
-    let depth_result = eval_single::<W, S>(depth_expr, value.clone(), optional);
-    let (depth_value, trailing) = match result_to_owned_full(depth_result) {
-        Ok(None) => return QueryResult::None,
-        Ok(Some(v)) => v,
-        Err(e) => return e.into(),
-    };
-    let depth = match depth_value {
-        OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d >= 0 => {
-            d as usize
-        }
-        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
-            return QueryResult::Error(EvalError::new("depth must be non-negative"));
-        }
-        _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
-    };
-
-    finish_result(builtin_flatten::<W>(value, optional, depth), trailing)
+    fanout_arg(
+        eval_single::<W, S>(depth_expr, value.clone(), optional),
+        // Real yq's `flatten` takes a literal depth only -- a generator
+        // argument is `bad expression, please check expression syntax`
+        // (live-verified against the pinned v4.53.3), so there is no
+        // multi-output behaviour of its own to match.
+        ArgFanout::All,
+        |depth_value| {
+            let depth = match depth_value {
+                OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d >= 0 => {
+                    d as usize
+                }
+                OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+                    return QueryResult::Error(EvalError::new("depth must be non-negative"));
+                }
+                _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
+            };
+            builtin_flatten::<W>(value.clone(), optional, depth)
+        },
+    )
 }
 
 /// Builtin: group_by(f) - group by key function
@@ -9758,23 +9777,41 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the path expression
-    let (path, trailing) =
-        match result_to_owned_full(eval_single::<W, S>(path_expr, value.clone(), optional)) {
-            Ok(None) => return QueryResult::None,
-            Ok(Some((OwnedValue::Array(arr), trailing))) => (arr, trailing),
-            Ok(Some(_)) if optional => return QueryResult::None,
-            Ok(Some(_)) => return QueryResult::Error(EvalError::path_must_be_array()),
-            Err(e) => return e.into(),
-        };
+    fanout_arg(
+        eval_single::<W, S>(path_expr, value.clone(), optional),
+        // Real yq has no `getpath` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |path_owned| getpath_one_path::<W, S>(&value, path_owned, optional),
+    )
+}
 
-    let mut current = to_owned(&value);
+/// `getpath`'s walk for one already-resolved path — the body of
+/// [`builtin_getpath`], run once per output of its path generator (#1279).
+///
+/// Split out rather than inlined into the closure because the walk `return`s
+/// from a dozen places, and each of those must end the *path*, not the fan-out
+/// loop. Same restructure #1164 applied to `has`/`load`, and what #1277's
+/// cluster 1 asked for.
+fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    path_owned: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let OwnedValue::Array(path) = path_owned else {
+        return if optional {
+            QueryResult::None
+        } else {
+            QueryResult::Error(EvalError::path_must_be_array())
+        };
+    };
+
+    let mut current = to_owned(value);
 
     for segment in path {
         match (&current, &segment) {
             // jq: null | getpath(["a"]) => null
             (OwnedValue::Null, _) => {
-                return finish_owned(OwnedValue::Null, trailing);
+                return QueryResult::Owned(OwnedValue::Null);
             }
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
                 current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
@@ -9829,7 +9866,7 @@ fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    finish_owned(current, trailing)
+    QueryResult::Owned(current)
 }
 
 // =============================================================================
@@ -20200,8 +20237,8 @@ fn eval_owned_expr_ctrl<S: EvalSemantics>(
 /// `QueryResult::Partial`'s own control, which the plain version silently
 /// drops (#1164). See [`result_to_owned_ctrl`]'s doc comment for the
 /// live-verified jq semantics this preserves for a caller that can re-wrap
-/// its own successful final result via [`partial`]/[`finish_owned`]/
-/// [`finish_result`] when this is `Some`.
+/// its own successful final result via [`partial`]/[`finish_result`] when
+/// this is `Some`.
 ///
 /// A thin wrapper over [`eval_owned_expr_full`]: this function's own
 /// contract is "callers need exactly one owned value", so a genuinely empty
@@ -26473,118 +26510,125 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // First get the format string
-    let (fmt, trailing) =
-        match result_to_owned_full(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
-            Ok(None) => return QueryResult::None,
-            Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-            Ok(Some(_)) if optional => return QueryResult::None,
-            Ok(Some(_)) => {
-                return QueryResult::Error(EvalError::type_error("string", "strftime format"));
-            }
-            Err(e) => return e.into(),
-        };
-
-    // Value should be a broken-down time array, or a raw Unix timestamp
-    // number (auto-converted the same way `gmtime` converts one).
-    let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
-        StandardJson::Number(n) => {
-            // Extracted directly rather than via `get_float_value_with`:
-            // `value` is already known to be a `Number` here, so that
-            // helper's generic `not_a_number` case would be unreachable.
-            let timestamp = if is_nan_sentinel(n.raw_bytes()) {
-                f64::NAN
-            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
-                if negative {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                }
-            } else if let Ok(f) = n.as_f64() {
-                f
-            } else if optional {
-                return QueryResult::None;
-            } else {
-                return QueryResult::Error(EvalError::new("invalid number"));
+    fanout_arg(
+        eval_single::<W, S>(fmt_expr, value.clone(), optional),
+        // Real yq has no `strftime` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |fmt_owned| {
+            let fmt = match fmt_owned {
+                OwnedValue::String(s) => s,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "strftime format")),
             };
 
-            // Auto-converted the same way `gmtime` converts a raw number.
-            let t = match ok_or_result::<W, _>(
-                broken_down_time_from_unix_secs(timestamp.trunc() as i64),
-                optional,
-            ) {
-                Ok(t) => t,
-                Err(r) => return r,
-            };
-            (
-                t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
-            )
-        }
-        _ => match to_owned(&value) {
-            OwnedValue::Array(arr) => {
-                // Real jq requires the full 8-element array — weekday and
-                // yearday included — not just the 6 fields mktime needs.
-                // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
-                // errors in real jq for every length 1-7, only succeeding at
-                // 8. Below 8, this codebase used to default weekday/yearday
-                // to 0 instead of erroring, which was harmless before this
-                // PR added specifiers that read those fields (#760) — now it
-                // would silently produce a wrong date instead of matching
-                // jq's error.
-                if arr.len() < 8 {
-                    if optional {
+            // Value should be a broken-down time array, or a raw Unix timestamp
+            // number (auto-converted the same way `gmtime` converts one).
+            let (year, month, day, hour, minute, second, weekday, yearday) = match &value {
+                StandardJson::Number(n) => {
+                    // Extracted directly rather than via `get_float_value_with`:
+                    // `value` is already known to be a `Number` here, so that
+                    // helper's generic `not_a_number` case would be unreachable.
+                    let timestamp = if is_nan_sentinel(n.raw_bytes()) {
+                        f64::NAN
+                    } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
+                        if negative {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        }
+                    } else if let Ok(f) = n.as_f64() {
+                        f
+                    } else if optional {
                         return QueryResult::None;
-                    }
-                    return QueryResult::Error(
-                        EvalError::strftime_requires_parsed_datetime_inputs(),
-                    );
+                    } else {
+                        return QueryResult::Error(EvalError::new("invalid number"));
+                    };
+
+                    // Auto-converted the same way `gmtime` converts a raw number.
+                    let t = match ok_or_result::<W, _>(
+                        broken_down_time_from_unix_secs(timestamp.trunc() as i64),
+                        optional,
+                    ) {
+                        Ok(t) => t,
+                        Err(r) => return r,
+                    };
+                    (
+                        t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
+                    )
                 }
+                _ => match to_owned(&value) {
+                    OwnedValue::Array(arr) => {
+                        // Real jq requires the full 8-element array — weekday and
+                        // yearday included — not just the 6 fields mktime needs.
+                        // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
+                        // errors in real jq for every length 1-7, only succeeding at
+                        // 8. Below 8, this codebase used to default weekday/yearday
+                        // to 0 instead of erroring, which was harmless before this
+                        // PR added specifiers that read those fields (#760) — now it
+                        // would silently produce a wrong date instead of matching
+                        // jq's error.
+                        if arr.len() < 8 {
+                            if optional {
+                                return QueryResult::None;
+                            }
+                            return QueryResult::Error(
+                                EvalError::strftime_requires_parsed_datetime_inputs(),
+                            );
+                        }
 
-                let get_int = |idx: usize| -> i64 {
-                    match arr.get(idx) {
-                        Some(OwnedValue::Int(n)) => *n,
-                        Some(OwnedValue::Float(f)) => *f as i64,
-                        Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
-                        Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => *f as i64,
-                        _ => 0,
+                        let get_int = |idx: usize| -> i64 {
+                            match arr.get(idx) {
+                                Some(OwnedValue::Int(n)) => *n,
+                                Some(OwnedValue::Float(f)) => *f as i64,
+                                Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+                                Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+                                    *f as i64
+                                }
+                                _ => 0,
+                            }
+                        };
+
+                        // `checked_month_index` (jq's 0-indexed month -> this
+                        // function's 1-indexed month) overflows for an adversarial
+                        // `i64::MAX` array element (#893's panic class, reachable
+                        // here independently of `%s`/`unix_secs_from_broken_down_time`:
+                        // every format path eagerly computes `month`, not just `%s`).
+                        let month = match checked_month_index(get_int(1)) {
+                            Ok(m) => m,
+                            Err(_) if optional => return QueryResult::None,
+                            Err(e) => return QueryResult::Error(e),
+                        };
+
+                        (
+                            get_int(0),
+                            month,
+                            get_int(2),
+                            get_int(3),
+                            get_int(4),
+                            get_int(5),
+                            get_int(6),
+                            get_int(7),
+                        )
                     }
-                };
+                    _ if optional => return QueryResult::None,
+                    _ => {
+                        return QueryResult::Error(
+                            EvalError::strftime_requires_parsed_datetime_inputs(),
+                        )
+                    }
+                },
+            };
 
-                // `checked_month_index` (jq's 0-indexed month -> this
-                // function's 1-indexed month) overflows for an adversarial
-                // `i64::MAX` array element (#893's panic class, reachable
-                // here independently of `%s`/`unix_secs_from_broken_down_time`:
-                // every format path eagerly computes `month`, not just `%s`).
-                let month = match checked_month_index(get_int(1)) {
-                    Ok(m) => m,
-                    Err(_) if optional => return QueryResult::None,
-                    Err(e) => return QueryResult::Error(e),
-                };
-
-                (
-                    get_int(0),
-                    month,
-                    get_int(2),
-                    get_int(3),
-                    get_int(4),
-                    get_int(5),
-                    get_int(6),
-                    get_int(7),
-                )
-            }
-            _ if optional => return QueryResult::None,
-            _ => return QueryResult::Error(EvalError::strftime_requires_parsed_datetime_inputs()),
+            let result = match format_strftime(
+                &fmt, year, month, day, hour, minute, second, weekday, yearday,
+            ) {
+                Ok(s) => s,
+                Err(_) if optional => return QueryResult::None,
+                Err(e) => return QueryResult::Error(e),
+            };
+            QueryResult::Owned(OwnedValue::String(result))
         },
-    };
-
-    let result = match format_strftime(
-        &fmt, year, month, day, hour, minute, second, weekday, yearday,
-    ) {
-        Ok(s) => s,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e),
-    };
-    finish_owned(OwnedValue::String(result), trailing)
+    )
 }
 
 /// Format a time according to strftime format specifiers
@@ -26800,50 +26844,53 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // First get the format string
-    let (fmt, trailing) =
-        match result_to_owned_full(eval_single::<W, S>(fmt_expr, value.clone(), optional)) {
-            Ok(None) => return QueryResult::None,
-            Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-            Ok(Some(_)) if optional => return QueryResult::None,
-            // #929: confirmed live: `"2020" | strptime(1)` raises "strptime/1
-            // requires string inputs and arguments" in jq 1.7.1 -- the same
-            // wording jq's combined input+format check uses regardless of
-            // which side is the offender (see the other arm below).
-            Ok(Some(_)) => return QueryResult::Error(EvalError::strptime_requires_string()),
-            Err(e) => return e.into(),
-        };
+    fanout_arg(
+        eval_single::<W, S>(fmt_expr, value.clone(), optional),
+        // Real yq has no `strptime` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |fmt_owned| {
+            let fmt = match fmt_owned {
+                OwnedValue::String(s) => s,
+                _ if optional => return QueryResult::None,
+                // #929: confirmed live: `"2020" | strptime(1)` raises "strptime/1
+                // requires string inputs and arguments" in jq 1.7.1 -- the same
+                // wording jq's combined input+format check uses regardless of
+                // which side is the offender (see the other arm below).
+                _ => return QueryResult::Error(EvalError::strptime_requires_string()),
+            };
 
-    // Value should be a string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            // Value should be a string
+            let input = match &value {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                },
+                _ if optional => return QueryResult::None,
+                // #929: confirmed live: `5 | strptime("%Y")` raises "strptime/1
+                // requires string inputs and arguments" in jq 1.7.1.
+                _ => return QueryResult::Error(EvalError::strptime_requires_string()),
+            };
+
+            match parse_strptime(&input, &fmt) {
+                Ok(t) => {
+                    let result = vec![
+                        OwnedValue::Int(t.year),
+                        OwnedValue::Int(t.month - 1), // 0-indexed
+                        OwnedValue::Int(t.day),
+                        OwnedValue::Int(t.hour),
+                        OwnedValue::Int(t.minute),
+                        OwnedValue::Int(t.second),
+                        OwnedValue::Int(t.weekday),
+                        OwnedValue::Int(t.yearday),
+                    ];
+                    QueryResult::Owned(OwnedValue::Array(result))
+                }
+                Err(_) if optional => QueryResult::None,
+                Err(_) => QueryResult::Error(EvalError::strptime_no_match(&input, &fmt)),
+            }
         },
-        _ if optional => return QueryResult::None,
-        // #929: confirmed live: `5 | strptime("%Y")` raises "strptime/1
-        // requires string inputs and arguments" in jq 1.7.1.
-        _ => return QueryResult::Error(EvalError::strptime_requires_string()),
-    };
-
-    match parse_strptime(&input, &fmt) {
-        Ok(t) => {
-            let result = vec![
-                OwnedValue::Int(t.year),
-                OwnedValue::Int(t.month - 1), // 0-indexed
-                OwnedValue::Int(t.day),
-                OwnedValue::Int(t.hour),
-                OwnedValue::Int(t.minute),
-                OwnedValue::Int(t.second),
-                OwnedValue::Int(t.weekday),
-                OwnedValue::Int(t.yearday),
-            ];
-            finish_owned(OwnedValue::Array(result), trailing)
-        }
-        Err(_) if optional => QueryResult::None,
-        Err(_) => QueryResult::Error(EvalError::strptime_no_match(&input, &fmt)),
-    }
+    )
 }
 
 /// Broken-down time representation (matches jq's format)
@@ -27673,32 +27720,38 @@ fn builtin_tz<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(r) => return r,
     };
 
-    // Evaluate the timezone expression to get the zone name
-    let (zone_str, trailing) =
-        match result_to_owned_full(eval_single::<W, S>(zone_expr, value.clone(), optional)) {
-            Ok(None) => return QueryResult::None,
-            Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-            Ok(Some(_)) if optional => return QueryResult::None,
-            Ok(Some(_)) => {
-                return QueryResult::Error(EvalError::type_error("string", "tz zone argument"));
-            }
-            Err(e) => return e.into(),
-        };
+    fanout_arg(
+        eval_single::<W, S>(zone_expr, value.clone(), optional),
+        // Real yq *has* `tz` and does not fan it out (live-verified against
+        // the pinned v4.53.3), so yq mode keeps using the first zone only.
+        ArgFanout::yq_native::<S>(),
+        |zone_owned| {
+            let zone_str = match zone_owned {
+                OwnedValue::String(s) => s,
+                _ if optional => return QueryResult::None,
+                _ => {
+                    return QueryResult::Error(EvalError::type_error("string", "tz zone argument"))
+                }
+            };
 
-    // Get the timezone offset
-    let offset = match get_timezone_offset(&zone_str, timestamp) {
-        Ok(o) => o,
-        Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(EvalError::new(e)),
-    };
+            // Get the timezone offset
+            let offset = match get_timezone_offset(&zone_str, timestamp) {
+                Ok(o) => o,
+                Err(_) if optional => return QueryResult::None,
+                Err(e) => return QueryResult::Error(EvalError::new(e)),
+            };
 
-    // Format the datetime with the timezone offset
-    let result =
-        match ok_or_result::<W, _>(format_datetime_with_offset(timestamp, offset), optional) {
-            Ok(s) => s,
-            Err(r) => return r,
-        };
-    finish_owned(OwnedValue::String(result), trailing)
+            // Format the datetime with the timezone offset
+            let result = match ok_or_result::<W, _>(
+                format_datetime_with_offset(timestamp, offset),
+                optional,
+            ) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            QueryResult::Owned(OwnedValue::String(result))
+        },
+    )
 }
 
 // Phase 22: File operations (yq)
@@ -27713,77 +27766,79 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     use std::path::Path;
 
-    // Evaluate the file expression to get the filename
-    let (filename, trailing) =
-        match result_to_owned_full(eval_single::<W, S>(file_expr, value, optional)) {
-            Ok(None) => return QueryResult::None,
-            Ok(Some((OwnedValue::String(s), trailing))) => (s, trailing),
-            Ok(Some(_)) if optional => return QueryResult::None,
-            Ok(Some(_)) => {
-                return QueryResult::Error(EvalError::type_error("string", "load filename"));
-            }
-            Err(e) => return e.into(),
-        };
+    fanout_arg(
+        eval_single::<W, S>(file_expr, value, optional),
+        // Real yq has no `load` in the jq-language sense reachable here; this
+        // is a succinctly extension either way, so jq's fan-out is unopposed.
+        ArgFanout::All,
+        |filename_owned| {
+            let filename = match filename_owned {
+                OwnedValue::String(s) => s,
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::type_error("string", "load filename")),
+            };
 
-    // Read the file contents
-    let file_bytes = match std::fs::read(&filename) {
-        Ok(bytes) => bytes,
-        Err(_) if optional => {
-            // In optional mode, return null for file errors
-            return QueryResult::None;
-        }
-        Err(e) => {
-            return QueryResult::Error(EvalError::new(format!(
-                "load: failed to read file '{filename}': {e}"
-            )));
-        }
-    };
+            // Read the file contents
+            let file_bytes = match std::fs::read(&filename) {
+                Ok(bytes) => bytes,
+                Err(_) if optional => {
+                    // In optional mode, return null for file errors
+                    return QueryResult::None;
+                }
+                Err(e) => {
+                    return QueryResult::Error(EvalError::new(format!(
+                        "load: failed to read file '{filename}': {e}"
+                    )));
+                }
+            };
 
-    // Detect format from file extension
-    let path = Path::new(&filename);
-    let is_json = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            // Detect format from file extension
+            let path = Path::new(&filename);
+            let is_json = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
 
-    let result = if is_json {
-        // Parse as JSON
-        let index = crate::json::JsonIndex::build(&file_bytes);
-        let cursor = index.root(&file_bytes);
-        QueryResult::Owned(to_owned(&cursor.value()))
-    } else {
-        // Parse as YAML (default)
-        match crate::yaml::YamlIndex::build(&file_bytes) {
-            Ok(index) => {
-                let root = index.root(&file_bytes);
-                // YAML documents are wrapped in a sequence at the root
-                match root.value() {
-                    crate::yaml::YamlValue::Sequence(mut docs) => {
-                        // If single document, return it directly; otherwise return array
-                        let mut doc_values = Vec::new();
-                        while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                            doc_values.push(yaml_value_to_owned(doc_cursor));
-                            docs = rest;
-                        }
-                        if doc_values.len() == 1 {
-                            QueryResult::Owned(doc_values.into_iter().next().unwrap())
-                        } else {
-                            QueryResult::Owned(OwnedValue::Array(doc_values))
+            let result = if is_json {
+                // Parse as JSON
+                let index = crate::json::JsonIndex::build(&file_bytes);
+                let cursor = index.root(&file_bytes);
+                QueryResult::Owned(to_owned(&cursor.value()))
+            } else {
+                // Parse as YAML (default)
+                match crate::yaml::YamlIndex::build(&file_bytes) {
+                    Ok(index) => {
+                        let root = index.root(&file_bytes);
+                        // YAML documents are wrapped in a sequence at the root
+                        match root.value() {
+                            crate::yaml::YamlValue::Sequence(mut docs) => {
+                                // If single document, return it directly; otherwise return array
+                                let mut doc_values = Vec::new();
+                                while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
+                                    doc_values.push(yaml_value_to_owned(doc_cursor));
+                                    docs = rest;
+                                }
+                                if doc_values.len() == 1 {
+                                    QueryResult::Owned(doc_values.into_iter().next().unwrap())
+                                } else {
+                                    QueryResult::Owned(OwnedValue::Array(doc_values))
+                                }
+                            }
+                            // Documents are always wrapped in a virtual root sequence,
+                            // so this is defensive; `root` itself is this single
+                            // document's cursor either way.
+                            _ => QueryResult::Owned(yaml_value_to_owned(root)),
                         }
                     }
-                    // Documents are always wrapped in a virtual root sequence,
-                    // so this is defensive; `root` itself is this single
-                    // document's cursor either way.
-                    _ => QueryResult::Owned(yaml_value_to_owned(root)),
+                    Err(_) if optional => QueryResult::None,
+                    Err(e) => QueryResult::Error(EvalError::new(format!(
+                        "load: failed to parse YAML file '{filename}': {e}"
+                    ))),
                 }
-            }
-            Err(_) if optional => QueryResult::None,
-            Err(e) => QueryResult::Error(EvalError::new(format!(
-                "load: failed to parse YAML file '{filename}': {e}"
-            ))),
-        }
-    };
-    finish_result(result, trailing)
+            };
+            result
+        },
+    )
 }
 
 /// Convert a YAML value to OwnedValue (helper for `load`).
@@ -52146,7 +52201,7 @@ mod tests {
     /// #1164 coverage: a non-optional lookup of an unset variable takes the
     /// `Owned(Null)` arm (pre-existing, unrelated choice this fix doesn't
     /// touch -- see the `optional` sibling test above for the `None` arm),
-    /// combined with a trailing break to confirm `finish_owned`/
+    /// combined with a trailing break to confirm `fanout_arg`/
     /// `finish_result`'s ordinary success-wrap path still applies to it.
     #[cfg(feature = "std")]
     #[test]
