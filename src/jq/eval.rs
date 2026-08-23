@@ -21212,16 +21212,36 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Whether a `Control` escaping a `?//` alternative's attempt should retry
+/// the next alternative rather than propagate: `Halt` never retries (must
+/// bypass `try`/`catch` and `label`/`break` -- see [`Control::Halt`]'s own
+/// doc comment), and neither does `Error`/`Break` on the *last* alternative,
+/// since there's nothing left to fall through to.
+///
+/// Shared by both of [`try_foreach_step_alternatives`]'s retry decisions
+/// (UPDATE's own, and EXTRACT's -- #1458) so the two can't independently
+/// drift on what counts as retryable, the way `try_pattern_alternatives`'s
+/// own copy of this same predicate already once did (#1457).
+/// [`try_reduce_step_alternatives`] hand-rolls an equivalent match rather
+/// than calling this, since its single UPDATE-only retry predates this
+/// helper; consolidating it too is tracked separately (#1571) rather than
+/// attempted here, to keep this fix scoped to the bug it's actually fixing.
+fn is_retryable_control(control: &Control, is_last: bool) -> bool {
+    !is_last && matches!(control, Control::Error(_) | Control::Break(_))
+}
+
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
 /// step, in order, against a single `input_val`.
 ///
-/// Only UPDATE participates in the `?//` retry -- the state-threading rule
-/// is identical to [`try_reduce_step_alternatives`]'s (a pattern-match
-/// failure leaves `state` untouched; a body `Error`/`Break` still updates
-/// it first, from whatever partial output that attempt produced, *then*
-/// falls through; `Halt` alone always propagates immediately) -- see that
-/// function's own doc comment for the oracle-verified rationale and repro,
-/// which applies here unchanged.
+/// Only UPDATE participated in the `?//` retry until #1458 -- the state-
+/// threading rule for UPDATE's own retry is identical to
+/// [`try_reduce_step_alternatives`]'s (a pattern-match failure leaves
+/// `state` untouched; a body `Error`/`Break` still updates it first, from
+/// whatever partial output that attempt produced, *then* falls through;
+/// `Halt` alone always propagates immediately) -- see that function's own
+/// doc comment for the oracle-verified rationale and repro, which applies
+/// here unchanged. EXTRACT now participates too, with its own, stranger
+/// state-threading rule -- see below.
 ///
 /// EXTRACT runs only once UPDATE has picked a winning alternative, fanning
 /// out over every one of UPDATE's (possibly multiple) outputs using that
@@ -21314,30 +21334,28 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 let (ext_vals, ext_control) =
                     eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
                 outputs.extend(ext_vals);
-                if let Some(control) = ext_control {
-                    match control {
-                        // #1458: real jq retries here too, but with a state-
-                        // threading rule found nowhere else in this file --
-                        // the *next* alternative's UPDATE resumes from this
-                        // failed EXTRACT call's own input (`update_val`), not
-                        // the pre-attempt state and not `update_vals.last()`
-                        // (this same attempt's own final UPDATE output,
-                        // which may not even be `update_val` -- the failure
-                        // can land on an earlier one while later ones sit
-                        // unprocessed). Any of `update_vals` after this
-                        // point, and this attempt's own trailing
-                        // `update_control` (if UPDATE itself also partially
-                        // failed), are both abandoned in favor of the next
-                        // alternative's fresh UPDATE-then-EXTRACT run --
-                        // matching the doc comment's oracle repro, where the
-                        // retry re-runs UPDATE wholesale rather than
-                        // resuming this attempt's own remaining outputs.
-                        Control::Error(_) | Control::Break(_) if !is_last => {
-                            state = update_val.clone();
-                            continue 'alternatives;
-                        }
-                        control => return (state, Some(control)),
+                match ext_control {
+                    None => {}
+                    // #1458: real jq retries here too, but with a state-
+                    // threading rule found nowhere else in this file -- the
+                    // *next* alternative's UPDATE resumes from this failed
+                    // EXTRACT call's own input (`update_val`), not the pre-
+                    // attempt state and not `update_vals.last()` (this same
+                    // attempt's own final UPDATE output, which may not even
+                    // be `update_val` -- the failure can land on an earlier
+                    // one while later ones sit unprocessed). Any of
+                    // `update_vals` after this point, and this attempt's
+                    // own trailing `update_control` (if UPDATE itself also
+                    // partially failed), are both abandoned in favor of the
+                    // next alternative's fresh UPDATE-then-EXTRACT run --
+                    // matching the doc comment's oracle repro, where the
+                    // retry re-runs UPDATE wholesale rather than resuming
+                    // this attempt's own remaining outputs.
+                    Some(control) if is_retryable_control(&control, is_last) => {
+                        state = update_val.clone();
+                        continue 'alternatives;
                     }
+                    Some(control) => return (state, Some(control)),
                 }
             } else {
                 outputs.push(update_val.clone());
@@ -21346,7 +21364,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
 
         match update_control {
             None => return (state, None),
-            Some(Control::Error(_) | Control::Break(_)) if !is_last => continue,
+            Some(control) if is_retryable_control(&control, is_last) => continue,
             Some(control) => return (state, Some(control)),
         }
     }

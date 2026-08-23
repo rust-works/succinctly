@@ -15931,6 +15931,26 @@ fn test_foreach_alt_extract_success_survives_when_alt_later_falls_through_1458()
     Ok(())
 }
 
+#[test]
+fn test_foreach_alt_extract_error_on_middle_output_abandons_later_ones_1458() -> Result<()> {
+    // A 3-output UPDATE fan-out (.+1, .+2, .+3), EXTRACT erroring on the
+    // *middle* one -- the third output (5, from alt1's own UPDATE) is never
+    // reached by alt1's EXTRACT at all: it's abandoned along with the
+    // failure, not merely skipped-and-resumed. Alt2's fresh UPDATE re-run
+    // from state 2 produces 3,4,5 -- the doc comment's own claim ("the
+    // failure can land on an earlier one while later ones sit unprocessed").
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2, .+3; if . == 2 then error(\"boom\") else [$x,$y,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[1,null,1]\n[null,1,3]\n[null,1,4]\n[null,1,5]");
+    Ok(())
+}
+
 // =============================================================================
 // #1164: a builtin argument generator that produces a value and *then*
 // breaks/errors no longer silently continues past that escape once the
