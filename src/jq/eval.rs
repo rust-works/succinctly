@@ -26143,8 +26143,8 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `yq_del_slice_outcome` instead of being cloned -- a real allocation
     // win at scale (a `k`-branch computed key ahead of an `n`-element
     // trailing `[]` resolves to `k*n` paths here, each a multi-component
-    // `Expr` tree), measured at roughly a 19-31% peak-RSS reduction for
-    // `del()` on `.items[(0,1)].foo[]` across 100k/400k/800k elements.
+    // `Expr` tree), measured at an 18-28% peak-RSS reduction for `del()`
+    // on `.items[(0,1)].foo[]` across 100k/400k/800k elements.
     let rewritten: Vec<Expr> = paths
         .into_iter()
         .filter_map(|path| {
