@@ -1728,7 +1728,7 @@ impl InputLocations {
     /// -c -s '., inputs'` prints `[]`.
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
-        locations.push(0, at.line.map_or(UNKNOWN_LINE as usize, |line| line));
+        locations.push(0, at.line.unwrap_or(UNKNOWN_LINE as usize));
         locations
     }
 
