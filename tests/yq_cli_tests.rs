@@ -21290,3 +21290,75 @@ fn test_yq_first_only_gate_still_takes_the_first_output_1534() -> Result<()> {
     assert_eq!(out.trim(), r#"["a","b"]"#);
     Ok(())
 }
+
+/// #1533: `ArgFanout::RejectMany` used to test `args.len() > 1` before ever
+/// looking at the argument's own trailing control, so a real `error(...)`
+/// inside the generator was masked by succinctly's generic count message.
+///
+/// Live-captured from the pinned yq v4.53.3 -- it propagates the embedded
+/// error, and never mentions a result count at all:
+///
+/// ```text
+/// $ printf 'null' | yq 'setpath((1,2,error("boom")); 1)'
+/// Error: boom
+/// ```
+#[test]
+fn test_yq_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
+    // Path-side generator.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath((1,2,error("boom")); 1)"#,
+        "null\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert!(
+        !err.contains("single result"),
+        "the count message must not mask the real error: {err:?}"
+    );
+    assert_eq!(code, 1);
+
+    // Value-side generator -- the other argument of the same builtin.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath(["a"]; (1,2,error("boom")))"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert!(!err.contains("single result"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // `delpaths`, the other `RejectMany` builtin.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"delpaths((["a"],["b"],error("boom")))"#,
+        "a: 1\nb: 2\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert!(!err.contains("single result"), "err: {err:?}");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// #1533 guard: with no escape in the argument, a genuinely multi-output
+/// generator must still be refused by the count check -- the fix must not
+/// turn `RejectMany` into a pass-through. Real yq refuses both of these
+/// too (with its own wording, a pre-existing gap left alone here).
+#[test]
+fn test_yq_reject_many_still_refuses_a_clean_multi_output_argument_1533() -> Result<()> {
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(r#"setpath((["a"],["b"]); 1)"#, "a: 1\n", &["-o", "json"])?;
+    assert!(err.contains("single result"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#"delpaths(([["a"]],[["b"]]))"#,
+        "a: 1\nb: 2\n",
+        &["-o", "json"],
+    )?;
+    assert!(err.contains("single result"), "err: {err:?}");
+    assert_eq!(code, 1);
+    Ok(())
+}
