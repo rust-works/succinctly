@@ -179,6 +179,16 @@
 #   zero-output    #1045's "zero outputs means zero results" contract, extended
 #                  to the ~16 builtins that still report a bare "no value".
 
-
-
-
+#
+# Reseeded by #1466, which replaced `FoldRegister`'s structural-equality
+# register check with a modelled `jv_identical` (jq compares string/array/
+# object *pointers*, and a number's representation; only null/true/false fall
+# to its "same kind is identical" arm). That closed the only divergence in
+# this area that *accepted* where jq refuses — `(reduce (1) as $i (.; {a:.a}))
+# = 9` wrote `9` to a document jq leaves untouched — at the cost of the three
+# refuse-only shapes below, which the old value comparison had been accepting
+# by accident. Refusing is the safe direction: exit 5, nothing written, and
+# #985's revert is what the other direction looks like.
+fold_register_var_from_navigated_binding   path-tracking   a variable bound from a navigated position carries no snapshot marker — #1573
+fold_register_snapshot_via_nested_init     path-tracking   an inner fold's `Expr::Identity` on an untrackable input rebuilds the branch, losing the marker — #1573
+fold_register_empty_merge_artifact         path-tracking   jq accepts `$x + {}` only because an empty merge returns its left operand's pointer; mirrored `{} + $x` refuses there too, so there is no rule to model — #1466

@@ -1,0 +1,1 @@
+del(reduce (1) as $i (.; {a:.a}))

@@ -1,0 +1,1 @@
+path(reduce (1) as $i (.a; null))
