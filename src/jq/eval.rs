@@ -10383,55 +10383,34 @@ enum RegexArgFamily {
 /// dispatch in `eval_single`, #693) — a bare `?` suppresses this error via
 /// the ancestor `eval_try`'s catch, not locally.
 #[cfg(feature = "regex")]
-fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    re_expr: &Expr,
-    flags_expr: Option<&Expr>,
+/// Validate one already-resolved `(pattern, flags)` pair — everything the old
+/// `eval_regex_pattern_and_flags` did once both raw argument values were in
+/// hand: bare-array-pattern unpacking (#943/#956), yq's narrower flag grammar
+/// (#1426), the pattern type check (#928/#937), then
+/// [`validate_regex_flags`].
+///
+/// Split out of that function so [`fanout_regex_pattern_and_flags`] can run it
+/// once per `(pattern, flags)` combination (#1279). Returns a bare
+/// [`EvalError`] rather than a `QueryResult` because every failure here was
+/// already a `QueryResult::Error`; the driver wraps it.
+#[cfg(feature = "regex")]
+fn resolve_regex_args<S: EvalSemantics>(
+    raw_pattern: OwnedValue,
+    raw_flags: Option<OwnedValue>,
+    flags_present: bool,
     family: RegexArgFamily,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> Result<(String, Option<String>), QueryResult<'a, W>> {
-    // Only clones `value` when there are two arguments actually left to
-    // evaluate — the bare (`flags_expr: None`) form does zero internal
-    // clones here (beyond whatever the caller already did to obtain this
-    // `value`), matching what a single pattern-only evaluation cost
-    // before this function existed.
-    let (raw_pattern, raw_flags) = match family {
-        RegexArgFamily::TestMatchCapture => {
-            let raw_flags = match flags_expr {
-                None => None,
-                Some(fe) => Some(result_to_owned(eval_single::<W, S>(
-                    fe,
-                    value.clone(),
-                    optional,
-                ))?),
-            };
-            let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value, optional))?;
-            (raw_pattern, raw_flags)
-        }
-        RegexArgFamily::Sub => {
-            if let Some(fe) = flags_expr {
-                let raw_pattern =
-                    result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional))?;
-                let raw_flags = Some(result_to_owned(eval_single::<W, S>(fe, value, optional))?);
-                (raw_pattern, raw_flags)
-            } else {
-                let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value, optional))?;
-                (raw_pattern, None)
-            }
-        }
-    };
-
-    // #943: `test`/`match`/`capture`'s *bare* form (no `flags_expr` at all)
+) -> Result<(String, Option<String>), EvalError> {
+    // #943: `test`/`match`/`capture`'s *bare* form (no flags argument at all)
     // additionally unpacks a non-empty array pattern via the shared
     // `unpack_bare_array_pattern` helper (also used by the non-regex
     // `builtin_test` fallback, #956) — see its own doc comment for the
     // exact boundary. Does not apply to `sub` (confirmed live:
     // `sub(["a","i"];"b")` is a plain non-string-pattern error, no
-    // unpacking) or when `flags_expr` is itself present (`test(["a","i"];
+    // unpacking) or when a flags argument is present (`test(["a","i"];
     // "x")` is likewise a plain error — the two ways of supplying flags
     // don't combine).
     let (raw_pattern, raw_flags, array_unpacked) =
-        if matches!(family, RegexArgFamily::TestMatchCapture) && flags_expr.is_none() {
+        if matches!(family, RegexArgFamily::TestMatchCapture) && !flags_present {
             unpack_bare_array_pattern(raw_pattern)
         } else {
             (raw_pattern, raw_flags, false)
@@ -10481,9 +10460,7 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::Array(_) | OwnedValue::Object(_) => None,
             };
             if let Some(s) = flags_str {
-                if let Err(e) = validate_yq_match_flags(&s) {
-                    return Err(QueryResult::Error(e));
-                }
+                validate_yq_match_flags(&s)?;
             }
         }
     }
@@ -10495,19 +10472,91 @@ fn eval_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // string or array" `test(1)` alone would give.
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
-        v if array_unpacked || flags_expr.is_some() || matches!(family, RegexArgFamily::Sub) => {
-            return Err(QueryResult::Error(EvalError::is_not_a_string(&v)));
+        v if array_unpacked || flags_present || matches!(family, RegexArgFamily::Sub) => {
+            return Err(EvalError::is_not_a_string(&v));
         }
         v => {
-            return Err(QueryResult::Error(EvalError::not_string_or_array(
-                v.type_name(),
-            )));
+            return Err(EvalError::not_string_or_array(v.type_name()));
         }
     };
 
-    let flags = validate_regex_flags(raw_flags).map_err(|e| QueryResult::Error(e))?;
+    let flags = validate_regex_flags(raw_flags)?;
 
     Ok((pattern, flags))
+}
+
+/// Run `body` once per `(pattern, flags)` combination a regex builtin's
+/// arguments produce (#1279).
+///
+/// **jq's nesting order here *is* the evaluation order `RegexArgFamily`
+/// already encodes** (#938/#942) — first-evaluated is the outer loop — so this
+/// reuses that enum rather than introducing a second source of truth.
+/// Live-verified against the pinned jq 1.7.1:
+///
+/// ```text
+/// "aAbB" | [match(("a","b"); ("","i")) | .offset]  => [0,2,0,2]
+///                                    flags OUTER, pattern inner
+/// "aA"   | [sub(("a","A"); "Z"; ("","i"))]         => ["ZA","ZA","aZ","ZA"]
+///                                    pattern OUTER, flags inner
+/// ```
+///
+/// The two disagree because `test`/`match`/`capture` bottom out in a C call
+/// (`def test(re; mode): _match_impl(re; mode; true)`), which nests
+/// rightmost-outermost, while `sub` is a jq-level `def` with `$`-bound
+/// arguments, which nests leftmost-outermost. Reading the signature would give
+/// the right output *count* and the wrong order for one of them.
+#[cfg(feature = "regex")]
+fn fanout_regex_pattern_and_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    flags_expr: Option<&Expr>,
+    family: RegexArgFamily,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    body: &mut dyn FnMut(&str, Option<&str>) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    // Real yq has `test`, `match`, `capture` and `sub`, and fans out none of
+    // them: live-verified against the pinned v4.53.3, `[.x | test(("a","z"))]`
+    // on `abc` is `[true]` where jq gives `[true,false]`. Bug-for-bug per
+    // ADR-0018.
+    let fanout = ArgFanout::yq_native::<S>();
+    let flags_present = flags_expr.is_some();
+    let mut run =
+        |raw_pattern: OwnedValue, raw_flags: Option<OwnedValue>| match resolve_regex_args::<S>(
+            raw_pattern,
+            raw_flags,
+            flags_present,
+            family,
+        ) {
+            Ok((pattern, flags)) => body(&pattern, flags.as_deref()),
+            Err(e) => QueryResult::Error(e),
+        };
+
+    match (family, flags_expr) {
+        // Bare form: one generator argument, so no nesting question arises.
+        (_, None) => fanout_arg(
+            eval_single::<W, S>(re_expr, value, optional),
+            fanout,
+            |raw_pattern| run(raw_pattern, None),
+        ),
+        // #942 forces flags first for this family, and jq nests it outermost.
+        (RegexArgFamily::TestMatchCapture, Some(fe)) => fanout_two_args::<W, S>(
+            fe,
+            re_expr,
+            value,
+            optional,
+            fanout,
+            |raw_flags, raw_pattern| run(raw_pattern, Some(raw_flags)),
+        ),
+        // #942 forces the pattern first for `sub`, and jq nests it outermost.
+        (RegexArgFamily::Sub, Some(fe)) => fanout_two_args::<W, S>(
+            re_expr,
+            fe,
+            value,
+            optional,
+            fanout,
+            |raw_pattern, raw_flags| run(raw_pattern, Some(raw_flags)),
+        ),
+    }
 }
 
 /// Builtin: test(re) - test if string matches the regex
@@ -10547,74 +10596,71 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
     // order (#942) and arity-dependent wording (#937) rationale, and why
     // there's no `Ok(_) if optional` arm.
-    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+    fanout_regex_pattern_and_flags::<W, S>(
         re_expr,
         flags_expr,
         RegexArgFamily::TestMatchCapture,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-    let flags = flags.as_deref();
+        &mut |pattern, flags| {
+            // Get the input string
+            let input = match &value {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                },
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+            };
 
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
-        },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
+            // Build regex
+            let re = match build_regex(pattern, flags) {
+                Ok(r) => r,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            };
 
-    // Build regex
-    let re = match build_regex(&pattern, flags) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
+            // Check if global flag is set
+            let global = flags.is_some_and(|f| f.contains('g'));
 
-    // Check if global flag is set
-    let global = flags.is_some_and(|f| f.contains('g'));
-
-    if global {
-        // Stream one match object per match (jq's match(re;"g") is a generator)
-        let caps_vec = global_captures::<S>(&re, &input);
-        if caps_vec.is_empty() {
-            return QueryResult::None;
-        }
-        // Computed once per input (and only once we know there's at least
-        // one match to build) rather than per match/offset (#806). The
-        // cursor is shared across every match in this call so the whole
-        // `match(re;"g")` invocation pays for one forward scan of `input`
-        // in total, not one scan per match -- see `CodepointCursor`.
-        let input_is_ascii = input.is_ascii();
-        let mut cursor = CodepointCursor::default();
-        let matches: Vec<OwnedValue> = caps_vec
-            .iter()
-            .map(|caps| build_match_object(&re, caps, &input, input_is_ascii, &mut cursor))
-            .collect();
-        QueryResult::ManyOwned(matches)
-    } else {
-        // Return first match, or no output (not `null`) when there's no match.
-        match re.captures(&input) {
-            Some(caps) => {
+            if global {
+                // Stream one match object per match (jq's match(re;"g") is a generator)
+                let caps_vec = global_captures::<S>(&re, &input);
+                if caps_vec.is_empty() {
+                    return QueryResult::None;
+                }
+                // Computed once per input (and only once we know there's at least
+                // one match to build) rather than per match/offset (#806). The
+                // cursor is shared across every match in this call so the whole
+                // `match(re;"g")` invocation pays for one forward scan of `input`
+                // in total, not one scan per match -- see `CodepointCursor`.
                 let input_is_ascii = input.is_ascii();
                 let mut cursor = CodepointCursor::default();
-                QueryResult::Owned(build_match_object(
-                    &re,
-                    &caps,
-                    &input,
-                    input_is_ascii,
-                    &mut cursor,
-                ))
+                let matches: Vec<OwnedValue> = caps_vec
+                    .iter()
+                    .map(|caps| build_match_object(&re, caps, &input, input_is_ascii, &mut cursor))
+                    .collect();
+                QueryResult::ManyOwned(matches)
+            } else {
+                // Return first match, or no output (not `null`) when there's no match.
+                match re.captures(&input) {
+                    Some(caps) => {
+                        let input_is_ascii = input.is_ascii();
+                        let mut cursor = CodepointCursor::default();
+                        QueryResult::Owned(build_match_object(
+                            &re,
+                            &caps,
+                            &input,
+                            input_is_ascii,
+                            &mut cursor,
+                        ))
+                    }
+                    None => QueryResult::None,
+                }
             }
-            None => QueryResult::None,
-        }
-    }
+        },
+    )
 }
 
 /// One step of a forward regex search: the leftmost match of `re` at or
@@ -10950,7 +10996,17 @@ fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
-        parts.push(input[last_end..m.start()].to_string());
+        // `matches` is monotonic for a single regex, but `split`/`splits`
+        // concatenate one match list per flags value (#1279), which can hand
+        // this the same span twice. jq slices with `$s[.[0]:.[1]]`, and a jq
+        // string slice whose start is past its end is `""` -- reproduced here
+        // rather than letting `input[last_end..m.start()]` panic on a reversed
+        // range.
+        parts.push(if last_end >= m.start() {
+            String::new()
+        } else {
+            input[last_end..m.start()].to_string()
+        });
         last_end = m.end();
     }
     parts.push(input[last_end..].to_string());
@@ -11249,38 +11305,35 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
     // order (#942) and arity-dependent wording (#937) rationale, and why
     // there's no `Ok(_) if optional` arm.
-    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+    fanout_regex_pattern_and_flags::<W, S>(
         re_expr,
         flags_expr,
         RegexArgFamily::TestMatchCapture,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-    let flags = flags.as_deref();
+        &mut |pattern, flags| {
+            // Get the input string
+            let input = match &value {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                },
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+            };
 
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            // Build regex with flags
+            let re = match build_regex(pattern, flags) {
+                Ok(r) => r,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            };
+
+            // Test if regex matches
+            QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
         },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex with flags
-    let re = match build_regex(&pattern, flags) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Test if regex matches
-    QueryResult::Owned(OwnedValue::Bool(re.is_match(&input)))
+    )
 }
 
 /// Builtin: match(re; flags) - match with flags expression
@@ -11320,57 +11373,54 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // See `eval_regex_pattern_and_flags`'s doc comment for the evaluation-
     // order (#942) and arity-dependent wording (#937) rationale, and why
     // there's no `Ok(_) if optional` arm.
-    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+    fanout_regex_pattern_and_flags::<W, S>(
         re_expr,
         flags_expr,
         RegexArgFamily::TestMatchCapture,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-    let flags = flags.as_deref();
+        &mut |pattern, flags| {
+            // Get the input string
+            let input = match &value {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                },
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+            };
 
-    // Get the input string
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            // Build regex
+            let re = match build_regex(pattern, flags) {
+                Ok(r) => r,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            };
+
+            // Check if global flag is set
+            let global = flags.is_some_and(|f| f.contains('g'));
+
+            if global {
+                // Stream one captures object per match (jq's capture(re;"g") is a generator)
+                let objects: Vec<OwnedValue> = global_captures::<S>(&re, &input)
+                    .iter()
+                    .map(|caps| capture_object(&re, caps))
+                    .collect();
+                if objects.is_empty() {
+                    QueryResult::None
+                } else {
+                    QueryResult::ManyOwned(objects)
+                }
+            } else if let Some(caps) = re.captures(&input) {
+                QueryResult::Owned(capture_object(&re, &caps))
+            } else {
+                // jq produces no output (not `{}`, not `null`) when there's no match,
+                // whether or not `?` was used.
+                QueryResult::None
+            }
         },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    // Build regex
-    let re = match build_regex(&pattern, flags) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    // Check if global flag is set
-    let global = flags.is_some_and(|f| f.contains('g'));
-
-    if global {
-        // Stream one captures object per match (jq's capture(re;"g") is a generator)
-        let objects: Vec<OwnedValue> = global_captures::<S>(&re, &input)
-            .iter()
-            .map(|caps| capture_object(&re, caps))
-            .collect();
-        if objects.is_empty() {
-            QueryResult::None
-        } else {
-            QueryResult::ManyOwned(objects)
-        }
-    } else if let Some(caps) = re.captures(&input) {
-        QueryResult::Owned(capture_object(&re, &caps))
-    } else {
-        // jq produces no output (not `{}`, not `null`) when there's no match,
-        // whether or not `?` was used.
-        QueryResult::None
-    }
+    )
 }
 
 /// Extract named captures from an already-obtained `Captures` into a jq object.
@@ -11421,23 +11471,21 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return yq_sub_arity3_empty_replace::<W, S>(re_expr, value, optional);
     }
 
-    let (pattern, flags) = match eval_regex_pattern_and_flags::<W, S>(
+    fanout_regex_pattern_and_flags::<W, S>(
         re_expr,
         flags_expr,
         RegexArgFamily::Sub,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-
-    sub_with_resolved_pattern::<W, S>(
-        &pattern,
-        replacement_expr,
-        flags.as_deref(),
-        value,
-        optional,
+        &mut |pattern, flags| {
+            sub_with_resolved_pattern::<W, S>(
+                pattern,
+                replacement_expr,
+                flags,
+                value.clone(),
+                optional,
+            )
+        },
     )
 }
 
@@ -11658,40 +11706,18 @@ enum FlagsConcat {
     Prepend,
 }
 
-/// Evaluate a gsub-family builtin's pattern and flags arguments in jq's
-/// real order (#938): jq binds the *pattern* expression first — enough to
-/// propagate a genuine `error()`, but without checking its type yet, and
-/// short-circuiting flags entirely if pattern itself raises — then
-/// computes `flags + "g"`/`"g" + flags` per `concat`, which *does*
-/// type-check flags (a non-string value fails the concatenation itself,
-/// raising jq's own `+`-operator error). Only once flags succeeds is
-/// pattern's own type finally checked (`is_not_a_string`, matching #926;
-/// this family has no #937-style bare-vs-flagged wording switch, since
-/// every call site here always has a flags argument).
+/// Validate and combine one already-resolved `(pattern, flags)` pair for the
+/// `"g"`-forcing family (`gsub`/`scan`/`split`/`splits`).
 ///
-/// Confirmed live via `debug()`-based side-effect probes (#942's lesson
-/// applied here too — "which error wins" alone doesn't distinguish
-/// evaluation order when only one side ever raises): `gsub(debug("x");
-/// "b"; error("F"))` always prints "x" (pattern forced first,
-/// unconditionally, regardless of what flags does), while
-/// `gsub(error("P"); "b"; debug("x"))` never prints "x" (flags never
-/// evaluated once pattern itself raises). Identical for scan/split/
-/// splits.
-///
-/// Returns the pattern string and the *already-concatenated* global-flags
-/// string (e.g. `"gi"`, not `"i"`) — ready to hand straight to
-/// `build_regex`/`sub_with_resolved_pattern` without the caller doing any
-/// further concatenation.
+/// Split out of the old `eval_regex_pattern_and_concat_flags` so
+/// [`fanout_regex_pattern_and_concat_flags`] can run it once per combination
+/// (#1279).
 #[cfg(feature = "regex")]
-fn eval_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    re_expr: &Expr,
-    flags_expr: &Expr,
+fn resolve_concat_flags<S: EvalSemantics>(
+    raw_pattern: OwnedValue,
+    raw_flags: OwnedValue,
     concat: FlagsConcat,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> Result<(String, String), QueryResult<'a, W>> {
-    let raw_pattern = result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional))?;
-
+) -> Result<(String, String), EvalError> {
     // jq's own "+" operator, `arith_add`, already implements exactly what
     // this concatenation needs: string concat, `null` as an identity
     // element (`null + "g"` / `"g" + null` both just yield `"g"`, matching
@@ -11708,14 +11734,13 @@ fn eval_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSeman
     // `raw_flags` up front rather than trusting whatever `arith_add`
     // happens to accept -- restoring the original (String, String) / (Null,
     // String) invariant regardless of `+`'s own evolving semantics.
-    let raw_flags = result_to_owned(eval_single::<W, S>(flags_expr, value, optional))?;
     if !matches!(raw_flags, OwnedValue::String(_) | OwnedValue::Null) {
         let g = OwnedValue::String("g".to_string());
         let (a, b) = match concat {
             FlagsConcat::Append => (&raw_flags, &g),
             FlagsConcat::Prepend => (&g, &raw_flags),
         };
-        return Err(EvalError::binary_op(a, b, BinOp::Add).into());
+        return Err(EvalError::binary_op(a, b, BinOp::Add));
     }
     let g = OwnedValue::String("g".to_string());
     let (a, b) = match concat {
@@ -11731,15 +11756,123 @@ fn eval_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSeman
         Ok(other) => unreachable!(
             "arith_add(_, \"g\"-or-\"g\"-paired) always yields a String, got {other:?}"
         ),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     };
 
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
-        v => return Err(QueryResult::Error(EvalError::is_not_a_string(&v))),
+        v => return Err(EvalError::is_not_a_string(&v)),
     };
 
     Ok((pattern, global_flags))
+}
+
+/// Run `body` once per pattern, handing it **every** flags value at once
+/// (#1279).
+///
+/// `split`/`splits` take `flags` as a plain, non-`$` parameter that jq uses
+/// inside an array construction -- `[match($re; "g" + flags) | ...]` -- so its
+/// outputs are *collected* into one match stream rather than fanned out.
+/// Live-verified against the pinned jq 1.7.1:
+///
+/// ```text
+/// "XaYbZ" | [split(("a","b"); ("","i"))]
+///   => [["X","","YbZ"],["XaY","","Z"]]      TWO outputs, not four
+/// ```
+///
+/// The extra `""` in each is the signature of the collection: both flag values
+/// match at the same offset, so the offset list carries that span twice and
+/// jq's pairwise slicing yields an empty piece between them.
+#[cfg(feature = "regex")]
+fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    concat: FlagsConcat,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    body: &mut dyn FnMut(&str, &[String]) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    fanout_arg(
+        eval_single::<W, S>(re_expr, value.clone(), optional),
+        // Real yq has `split/2` but not `splits`; neither fans its pattern
+        // out, so both are gated together.
+        ArgFanout::yq_native::<S>(),
+        |raw_pattern| {
+            // Re-evaluated per pattern, matching jq: the array construction
+            // holding `flags` sits inside `$re`'s own binding.
+            let (raw_flags_values, trailing) =
+                stream_outputs(eval_single::<W, S>(flags_expr, value.clone(), optional));
+            let mut resolved_pattern: Option<String> = None;
+            let mut flags = Vec::with_capacity(raw_flags_values.len());
+            for raw_flags in raw_flags_values {
+                match resolve_concat_flags::<S>(raw_pattern.clone(), raw_flags, concat) {
+                    Ok((p, f)) => {
+                        resolved_pattern = Some(p);
+                        flags.push(f);
+                    }
+                    Err(e) => return QueryResult::Error(e),
+                }
+            }
+            if let Some(control) = trailing {
+                return partial(Vec::new(), control);
+            }
+            match resolved_pattern {
+                Some(pattern) => body(&pattern, &flags),
+                // Zero flags outputs is *not* the #1045 zero-output rule
+                // here: `flags` feeds an array construction, so producing
+                // nothing means an empty match list, and an empty match list
+                // means one output -- the input, unsplit. Live-verified:
+                // `"abc" | [split("b"; empty)]` is `[["abc"]]` in jq, not `[]`.
+                //
+                // The pattern is deliberately *not* type-checked in this case,
+                // and is passed as `""` because both callers leave it unread
+                // when `flags` is empty. jq does the same by construction --
+                // with no flags value there is no `match($re; ...)` call to
+                // evaluate, so `$re` is never inspected: `"abc" |
+                // [split(1; empty)]` is `[["abc"]]` in jq, not a type error.
+                None => body("", &flags),
+            }
+        },
+    )
+}
+
+/// Run `body` once per `(pattern, flags)` combination for the `"g"`-forcing
+/// family, with the **pattern as the outer loop** (#1279).
+///
+/// `gsub`/`scan` are jq-level `def`s with `$`-bound arguments, so they nest
+/// leftmost-outermost -- the opposite of `test`/`match`/`capture`, which
+/// bottom out in a C call. Live-verified against the pinned jq 1.7.1:
+///
+/// ```text
+/// "aaa" | [scan(("a","aa"); ("","g"))]      => 8 outputs, re outer
+/// "aA"  | [gsub(("a","A"); "Z"; ("","i"))]  => ["ZA","ZZ","aZ","ZZ"]
+/// ```
+///
+/// **Not** used by `split`/`splits`, whose `flags` is a plain (non-`$`)
+/// parameter that jq *collects* into a single match stream rather than fanning
+/// out: `"XaYbZ" | [split(("a","b"); ("","i"))]` is two outputs, not four.
+#[cfg(feature = "regex")]
+fn fanout_regex_pattern_and_concat_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    re_expr: &Expr,
+    flags_expr: &Expr,
+    concat: FlagsConcat,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    body: &mut dyn FnMut(&str, &str) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    fanout_two_args::<W, S>(
+        re_expr,
+        flags_expr,
+        value,
+        optional,
+        // Real yq rejects `gsub`/`scan` at its lexer entirely, so jq's model
+        // is unopposed here; see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |raw_pattern, raw_flags| match resolve_concat_flags::<S>(raw_pattern, raw_flags, concat) {
+            Ok((pattern, flags)) => body(&pattern, &flags),
+            Err(e) => QueryResult::Error(e),
+        },
+    )
 }
 
 /// Builtin: gsub(re; replacement; flags) - replace all matches with flags
@@ -11751,23 +11884,21 @@ fn builtin_gsub_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let (pattern, global_flags) = match eval_regex_pattern_and_concat_flags::<W, S>(
+    fanout_regex_pattern_and_concat_flags::<W, S>(
         re_expr,
         flags_expr,
         FlagsConcat::Append,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-
-    sub_with_resolved_pattern::<W, S>(
-        &pattern,
-        replacement_expr,
-        Some(&global_flags),
-        value,
-        optional,
+        &mut |pattern, global_flags| {
+            sub_with_resolved_pattern::<W, S>(
+                pattern,
+                replacement_expr,
+                Some(global_flags),
+                value.clone(),
+                optional,
+            )
+        },
     )
 }
 
@@ -11792,16 +11923,28 @@ fn builtin_gsub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern. No `Ok(_) if optional` guard: same reasoning as
-    // `eval_regex_pattern_and_flags`'s doc comment (#693) — `optional` is
-    // never forced `true` reaching a nested `Call` like this.
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    sub_with_resolved_pattern::<W, S>(&pattern, replacement_expr, Some("g"), value, optional)
+    // No `Ok(_) if optional` guard: same reasoning as `resolve_regex_args`'
+    // own doc comment (#693) — `optional` is never forced `true` reaching a
+    // nested `Call` like this.
+    fanout_arg(
+        eval_single::<W, S>(re_expr, value.clone(), optional),
+        // Real yq *has* `sub` and does not fan it out (live-verified against
+        // the pinned v4.53.3); `gsub` it rejects at the lexer entirely, so
+        // this arm is unopposed either way. Gated with `sub` for consistency.
+        ArgFanout::yq_native::<S>(),
+        |raw_pattern| {
+            let OwnedValue::String(pattern) = raw_pattern else {
+                return QueryResult::Error(EvalError::is_not_a_string(&raw_pattern));
+            };
+            sub_with_resolved_pattern::<W, S>(
+                &pattern,
+                replacement_expr,
+                Some("g"),
+                value.clone(),
+                optional,
+            )
+        },
+    )
 }
 
 /// Builtin: scan(re; flags) - find all matches with flags
@@ -11812,18 +11955,16 @@ fn builtin_scan_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let (pattern, global_flags) = match eval_regex_pattern_and_concat_flags::<W, S>(
+    fanout_regex_pattern_and_concat_flags::<W, S>(
         re_expr,
         flags_expr,
         FlagsConcat::Prepend,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-
-    scan_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
+        &mut |pattern, global_flags| {
+            scan_with_resolved_pattern::<W>(pattern, global_flags, value.clone(), optional)
+        },
+    )
 }
 
 /// Builtin: scan(re) - find all matches (bare form, no flags argument)
@@ -11839,14 +11980,17 @@ fn builtin_scan_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    scan_with_resolved_pattern::<W>(&pattern, "g", value, optional)
+    fanout_arg(
+        eval_single::<W, S>(re_expr, value.clone(), optional),
+        // Real yq has no `scan` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |raw_pattern| {
+            let OwnedValue::String(pattern) = raw_pattern else {
+                return QueryResult::Error(EvalError::is_not_a_string(&raw_pattern));
+            };
+            scan_with_resolved_pattern::<W>(&pattern, "g", value.clone(), optional)
+        },
+    )
 }
 
 /// The rest of `scan`'s work once the pattern string and already-
@@ -11932,34 +12076,51 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let (pattern, global_flags) = match eval_regex_pattern_and_concat_flags::<W, S>(
+    fanout_regex_pattern_with_collected_flags::<W, S>(
         re_expr,
         flags_expr,
         FlagsConcat::Prepend,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
+        &mut |pattern, global_flags| {
+            split_regex_resolved::<W>(pattern, global_flags, &value, optional)
+        },
+    )
+}
 
+/// `split(re; flags)`'s work once the pattern and every flags value are
+/// resolved — the body of [`builtin_split_regex`], run once per output of its
+/// pattern generator (#1279).
+#[cfg(feature = "regex")]
+fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
+    pattern: &str,
+    global_flags: &[String],
+    value: &StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Get the input string
-    let input = match &value {
+    let input = match value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
             Err(_) if optional => return QueryResult::None,
             Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
     };
 
-    // Build regex
-    let re = match build_regex(&pattern, Some(&global_flags)) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
+    // One match list per flags value, concatenated in flags order -- see
+    // `fanout_regex_pattern_with_collected_flags` for why `flags` collects
+    // rather than fanning out.
+    let mut matches = Vec::new();
+    for flags in global_flags {
+        let re = match build_regex(pattern, Some(flags)) {
+            Ok(r) => r,
+            Err(_e) if optional => return QueryResult::None,
+            Err(e) => return e.into(),
+        };
+        matches.extend(global_captures::<JqSemantics>(&re, &input));
+    }
 
     // Split by regex. `split(re;flags)` *is* a real yq builtin, unlike
     // `gsub`/`scan`/`splits` above -- but it has its own separate,
@@ -11970,7 +12131,6 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // mismatch, and guessing at how the two interact risks conflicting
     // with #1439's eventual fix -- left on jq-style iteration and deferred
     // to whoever picks up #1439, per #1255's own step-5 timeboxing.
-    let matches = global_captures::<JqSemantics>(&re, &input);
     let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
         .into_iter()
         .map(OwnedValue::String)
@@ -11987,18 +12147,16 @@ fn builtin_splits_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let (pattern, global_flags) = match eval_regex_pattern_and_concat_flags::<W, S>(
+    fanout_regex_pattern_with_collected_flags::<W, S>(
         re_expr,
         flags_expr,
         FlagsConcat::Prepend,
         value.clone(),
         optional,
-    ) {
-        Ok(pf) => pf,
-        Err(qr) => return qr,
-    };
-
-    splits_with_resolved_pattern::<W>(&pattern, &global_flags, value, optional)
+        &mut |pattern, global_flags| {
+            splits_with_resolved_pattern::<W>(pattern, global_flags, value.clone(), optional)
+        },
+    )
 }
 
 /// Builtin: splits(re) - split by regex as stream (bare form, no flags
@@ -12016,14 +12174,23 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get the pattern
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(e) => return e.into(),
-    };
-
-    splits_with_resolved_pattern::<W>(&pattern, "g", value, optional)
+    fanout_arg(
+        eval_single::<W, S>(re_expr, value.clone(), optional),
+        // Real yq has no `splits` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |raw_pattern| {
+            let global = "g".to_string();
+            let OwnedValue::String(pattern) = raw_pattern else {
+                return QueryResult::Error(EvalError::is_not_a_string(&raw_pattern));
+            };
+            splits_with_resolved_pattern::<W>(
+                &pattern,
+                core::slice::from_ref(&global),
+                value.clone(),
+                optional,
+            )
+        },
+    )
 }
 
 /// The rest of `splits`'s work once the pattern string and already-
@@ -12036,7 +12203,7 @@ fn builtin_splits_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 #[cfg(feature = "regex")]
 fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     pattern: &str,
-    global_flags: &str,
+    global_flags: &[String],
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
@@ -12051,19 +12218,24 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
     };
 
-    // Build regex
-    let re = match build_regex(pattern, Some(global_flags)) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
+    // One match list per flags value, concatenated in flags order -- jq's
+    // `[match($re; "g" + flags) | ...]` collects them into a single array
+    // because `flags` is a plain (non-`$`) parameter (#1279).
+    let mut matches = Vec::new();
+    for flags in global_flags {
+        let re = match build_regex(pattern, Some(flags)) {
+            Ok(r) => r,
+            Err(_e) if optional => return QueryResult::None,
+            Err(e) => return e.into(),
+        };
+        matches.extend(global_captures::<JqSemantics>(&re, &input));
+    }
 
     // Split by regex and return as stream. `splits` isn't a real yq
     // builtin at all (confirmed live against yq v4.53.3, #1436 -- its
     // lexer rejects `splits(...)` outright), so #1255's yq-mode Go-style
     // zero-width fix doesn't apply here for the same reason it doesn't for
     // `scan`/`gsub` above -- no oracle to diverge from.
-    let matches = global_captures::<JqSemantics>(&re, &input);
     let parts: Vec<OwnedValue> = stitch_split(&input, &matches)
         .into_iter()
         .map(OwnedValue::String)
@@ -29243,86 +29415,61 @@ fn builtin_exp2<W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Error type for number extraction
-enum NumberError {
-    None,
-    Error(EvalError),
-    /// A halt reached while evaluating the argument (#791): must abort the
-    /// caller as a halt, never be downgraded to `Error`'s "expected number"
-    /// — that would make `pow(halt_error(3); 2)` a catchable type error
-    /// instead of a halt.
-    Halt(i32),
-    /// A bare unmatched `break` reached while evaluating the argument
-    /// (#833): must keep unwinding toward its label, never be downgraded
-    /// to `Error`'s "expected number" — same reasoning as `Halt` above.
-    /// Doesn't cover `Partial(_, Control::Break(_))` (an argument that
-    /// produced a value before breaking); see `result_to_owned`'s own
-    /// comment for why that shape is a separate, harder fix.
-    Break(String),
-}
-
-/// Helper to get number from eval result
-fn get_number_from_result<W: Clone + AsRef<[u64]>>(
-    result: QueryResult<'_, W>,
-    optional: bool,
-) -> Result<f64, NumberError> {
-    match result {
-        QueryResult::Owned(OwnedValue::Int(n)) => Ok(n as f64),
-        QueryResult::Owned(OwnedValue::Float(n)) => Ok(n),
-        QueryResult::Owned(v @ OwnedValue::NumberLiteral(..)) => v
+/// Builtin: pow(base; exp) - power function
+/// One already-resolved operand of a two-argument math builtin (`pow`,
+/// `atan2`) as an `f64`.
+///
+/// The per-value half of `get_number_from_result`, which used to match a whole
+/// `QueryResult` and so collapsed a generator argument to its first output --
+/// `[pow((2,3);2)]` errored "expected number" where jq answers `[4,9]`
+/// (#1279). `stream_outputs` now owns the Halt/Break/Partial arms that
+/// function carried.
+/// `Err(None)` means an `optional` context swallowed the type mismatch, so the
+/// caller yields no output; `Err(Some(e))` is a real error.
+fn math_operand(value: &OwnedValue, optional: bool) -> Result<f64, Option<EvalError>> {
+    match value {
+        OwnedValue::Int(n) => Ok(*n as f64),
+        OwnedValue::Float(n) => Ok(*n),
+        OwnedValue::NumberLiteral(..) => value
             .as_f64()
-            .ok_or_else(|| NumberError::Error(EvalError::new("invalid number"))),
-        QueryResult::One(StandardJson::Number(n)) => {
-            if is_nan_sentinel(n.raw_bytes()) {
-                Ok(f64::NAN)
-            } else if let Some(negative) = is_infinity_sentinel(n.raw_bytes()) {
-                Ok(if negative {
-                    f64::NEG_INFINITY
-                } else {
-                    f64::INFINITY
-                })
-            } else {
-                n.as_f64()
-                    .map_err(|_| NumberError::Error(EvalError::new("invalid number")))
-            }
-        }
-        QueryResult::Error(e) => Err(NumberError::Error(e)),
-        QueryResult::Halt(code) => Err(NumberError::Halt(code)),
-        QueryResult::Partial(_, Control::Halt(code)) => Err(NumberError::Halt(code)),
-        QueryResult::Break(label) => Err(NumberError::Break(label)),
-        _ if optional => Err(NumberError::None),
-        _ => Err(NumberError::Error(EvalError::new("expected number"))),
+            .ok_or_else(|| Some(EvalError::new("invalid number"))),
+        _ if optional => Err(None),
+        _ => Err(Some(EvalError::new("expected number"))),
     }
 }
 
-/// Builtin: pow(base; exp) - power function
 fn builtin_pow<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     base_expr: &Expr,
     exp_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let base = match get_number_from_result(
-        eval_single::<W, S>(base_expr, value.clone(), optional),
+    // Both operands are generator arguments, and jq nests the *second*
+    // outermost -- `pow`/`atan2` are C builtins, and jq nests those
+    // rightmost-outermost. Live-verified against the pinned jq 1.7.1:
+    //
+    //     [pow((2,3);(2,3))] => [4,9,8,27]   (exponent outer)
+    fanout_two_args::<W, S>(
+        exp_expr,
+        base_expr,
+        value.clone(),
         optional,
-    ) {
-        Ok(n) => n,
-        Err(NumberError::None) => return QueryResult::None,
-        Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
-        Err(NumberError::Error(e)) => return QueryResult::Error(e),
-        Err(NumberError::Break(label)) => return QueryResult::Break(label),
-    };
-
-    let exp = match get_number_from_result(eval_single::<W, S>(exp_expr, value, optional), optional)
-    {
-        Ok(n) => n,
-        Err(NumberError::None) => return QueryResult::None,
-        Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
-        Err(NumberError::Error(e)) => return QueryResult::Error(e),
-        Err(NumberError::Break(label)) => return QueryResult::Break(label),
-    };
-
-    QueryResult::Owned(OwnedValue::Float(libm::pow(base, exp)))
+        // Real yq has neither builtin (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |exp, base| {
+            let base = match math_operand(&base, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            let exp = match math_operand(&exp, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            QueryResult::Owned(OwnedValue::Float(libm::pow(base, exp)))
+        },
+    )
 }
 
 // Trigonometric functions
@@ -29400,26 +29547,32 @@ fn builtin_atan2<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let y = match get_number_from_result(
-        eval_single::<W, S>(y_expr, value.clone(), optional),
+    // Both operands are generator arguments, and jq nests the *second*
+    // outermost -- `pow`/`atan2` are C builtins, and jq nests those
+    // rightmost-outermost. Live-verified against the pinned jq 1.7.1:
+    //
+    //     [atan2((0,1);(1,2))] => [0, 0.785, 0, 0.464]   (x outer)
+    fanout_two_args::<W, S>(
+        x_expr,
+        y_expr,
+        value.clone(),
         optional,
-    ) {
-        Ok(n) => n,
-        Err(NumberError::None) => return QueryResult::None,
-        Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
-        Err(NumberError::Error(e)) => return QueryResult::Error(e),
-        Err(NumberError::Break(label)) => return QueryResult::Break(label),
-    };
-
-    let x = match get_number_from_result(eval_single::<W, S>(x_expr, value, optional), optional) {
-        Ok(n) => n,
-        Err(NumberError::None) => return QueryResult::None,
-        Err(NumberError::Halt(code)) => return QueryResult::Halt(code),
-        Err(NumberError::Error(e)) => return QueryResult::Error(e),
-        Err(NumberError::Break(label)) => return QueryResult::Break(label),
-    };
-
-    QueryResult::Owned(OwnedValue::Float(libm::atan2(y, x)))
+        // Real yq has neither builtin (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |x, y| {
+            let y = match math_operand(&y, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            let x = match math_operand(&x, optional) {
+                Ok(n) => n,
+                Err(None) => return QueryResult::None,
+                Err(Some(e)) => return QueryResult::Error(e),
+            };
+            QueryResult::Owned(OwnedValue::Float(libm::atan2(y, x)))
+        },
+    )
 }
 
 // Hyperbolic functions
