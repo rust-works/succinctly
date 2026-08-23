@@ -19477,9 +19477,12 @@ fn test_validate_reports_unterminated_object_1558() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(r#"{"a":1"#))?;
     assert_eq!(code, 3);
     assert_eq!(stdout, "", "no output once validation fails");
+    // Pins the specific error kind (UnexpectedEof), not just "some validation
+    // error fired" -- a future regression that misclassified this exact
+    // input as a different ValidationErrorKind would otherwise pass silently.
     assert!(
-        stderr.contains("validation error"),
-        "expected a validation error, got: {stderr}"
+        stderr.contains("unexpected end of input, expected ',' or '}'"),
+        "expected the unterminated-object error, got: {stderr}"
     );
     assert!(
         stderr.contains("<stdin>"),
@@ -19491,26 +19494,20 @@ fn test_validate_reports_unterminated_object_1558() -> Result<()> {
 /// `--validate` treats the whole input as exactly one RFC 8259 document, so
 /// a genuinely valid *jq* multi-value stream (two JSON values, one per line)
 /// still fails it -- `--validate` has no concept of jq's own multi-value
-/// parsing, only "is this one JSON text." Live-verified: the same input
-/// without `--validate` succeeds and produces two outputs.
+/// parsing, only "is this one JSON text." That the same shape of input is
+/// accepted *without* `--validate` is already its own regression guard
+/// (`test_jq_valid_multi_value_stream_unaffected_1171`), so this test only
+/// needs to pin the rejection itself, not re-prove the contrast.
 #[test]
 fn test_validate_rejects_a_valid_multi_value_stream_1558() -> Result<()> {
-    let input = "{\"a\":1}\n{\"b\":2}\n";
-
-    let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(input))?;
+    let (stdout, stderr, code) =
+        run_jq_full(&["--validate", "-c", "."], Some("{\"a\":1}\n{\"b\":2}\n"))?;
     assert_eq!(code, 3);
     assert_eq!(stdout, "");
     assert!(
         stderr.contains("trailing content after JSON value"),
         "expected a trailing-content error, got: {stderr}"
     );
-
-    // Contrast: without --validate, the same two-value stream is accepted
-    // and produces one output per value, confirming the rejection above is
-    // specific to --validate's single-document rule, not a parser bug.
-    let (stdout2, stderr2, code2) = run_jq_full(&["-c", "."], Some(input))?;
-    assert_eq!(code2, 0, "stderr={stderr2}");
-    assert_eq!(stdout2, "{\"a\":1}\n{\"b\":2}\n");
     Ok(())
 }
 
@@ -19545,29 +19542,19 @@ fn test_validate_with_slurp_rejects_multi_value_per_line_1558() -> Result<()> {
 }
 
 /// Multi-file: an earlier file's validation failure stops before any later
-/// file is even read, and is labeled with that file's own name (not
-/// `<stdin>`) in the error location.
+/// file is *processed* (validated and evaluated) -- not before it's read off
+/// disk, which happens eagerly for every file up front regardless
+/// (`jq_runner.rs`'s lazy path collects all `raw_inputs` before the
+/// per-file validate-then-process loop even starts) -- and is labeled with
+/// that file's own name (not `<stdin>`) in the error location.
 #[test]
 fn test_validate_multi_file_first_invalid_stops_before_second_1558() -> Result<()> {
-    let mut file1 = NamedTempFile::new()?;
-    writeln!(file1, r#"{{"bad""#)?;
-    let mut file2 = NamedTempFile::new()?;
-    writeln!(file2, r#"{{"ok":1}}"#)?;
-
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "--validate",
-            "-c",
-            ".",
-            file1.path().to_str().unwrap(),
-            file2.path().to_str().unwrap(),
-        ],
-        None,
-    )?;
+    let (stdout, stderr, code, paths) =
+        run_jq_over_files(&["--validate", "-c", "."], &["{\"bad\"\n", "{\"ok\":1}\n"])?;
     assert_eq!(code, 3);
     assert_eq!(stdout, "", "no output from the second, never-reached file");
     assert!(
-        stderr.contains(file1.path().to_str().unwrap()),
+        stderr.contains(&paths[0]),
         "error location should name the failing file, got: {stderr}"
     );
     Ok(())
@@ -19575,31 +19562,22 @@ fn test_validate_multi_file_first_invalid_stops_before_second_1558() -> Result<(
 
 /// Multi-file: a *later* file's validation failure does not discard output
 /// already produced for an earlier, valid file -- confirming per-file
-/// validation is interleaved with processing, not a whole-run pre-pass.
+/// validation is interleaved with processing on *this* (the non-`--slurp`
+/// lazy) path, not a whole-run pre-pass. This doesn't generalize to every
+/// `--validate` invocation: under `--slurp`, `get_inputs` must fully
+/// validate and parse every file before any output is written at all, so
+/// the same two files would produce no output whatsoever there.
 #[test]
 fn test_validate_multi_file_second_invalid_keeps_first_files_output_1558() -> Result<()> {
-    let mut file1 = NamedTempFile::new()?;
-    writeln!(file1, r#"{{"ok":1}}"#)?;
-    let mut file2 = NamedTempFile::new()?;
-    writeln!(file2, r#"{{"bad""#)?;
-
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "--validate",
-            "-c",
-            ".",
-            file1.path().to_str().unwrap(),
-            file2.path().to_str().unwrap(),
-        ],
-        None,
-    )?;
+    let (stdout, stderr, code, paths) =
+        run_jq_over_files(&["--validate", "-c", "."], &["{\"ok\":1}\n", "{\"bad\"\n"])?;
     assert_eq!(code, 3);
     assert_eq!(
         stdout, "{\"ok\":1}\n",
         "the first file's valid output survives"
     );
     assert!(
-        stderr.contains(file2.path().to_str().unwrap()),
+        stderr.contains(&paths[1]),
         "error location should name the failing (second) file, got: {stderr}"
     );
     Ok(())
