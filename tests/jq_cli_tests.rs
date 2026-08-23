@@ -19880,11 +19880,9 @@ fn test_jq_unreached_halt_error_in_a_generator_argument_stays_silent_1531() -> R
 #[test]
 fn test_jq_lazy_fanout_preserves_prefix_and_trailing_control_1531() -> Result<()> {
     // Rule 1: every value's result is emitted before the argument's own
-    // `break` fires. Deliberately *not* wrapped in `[...]`: a `break`
-    // escaping an array construction discards the whole array, so the
-    // wrapped form is empty output in real jq -- verified against 1.7.1,
-    // and the reason `fanout_arg`'s own rule-1 example was corrected in
-    // the same commit as this test.
+    // `break` fires. Where the `[...]` goes decides the answer, so both
+    // spellings are pinned here -- verified against jq 1.7.1, and the
+    // reason `fanout_arg`'s own rule-1 example was corrected alongside.
     let (stdout, _, code) = run_jq_full(
         &["-c", r#"label $out | ltrimstr(("a","b", break $out))"#],
         Some(r#""abcabc""#),
@@ -19892,13 +19890,23 @@ fn test_jq_lazy_fanout_preserves_prefix_and_trailing_control_1531() -> Result<()
     assert_eq!(code, 0);
     assert_eq!(stdout, "\"bcabc\"\n\"abcabc\"\n");
 
-    // ...and the array-wrapped form really is empty, in both tools.
+    // `label` *outside* the array: the break escapes through the array
+    // construction, discarding the partly-built array, so this is empty.
     let (stdout, _, code) = run_jq_full(
         &["-c", r#"label $out | [ltrimstr(("a","b", break $out))]"#],
         Some(r#""abcabc""#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "");
+
+    // `label` *inside* the array: the array is built outside the label, so
+    // it survives the break and collects the whole prefix.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#"[label $out | ltrimstr(("a","b", break $out))]"#],
+        Some(r#""abcabc""#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["bcabc","abcabc"]"#);
 
     // Every value used, in argument order.
     let (stdout, _, code) = run_jq_full(&["-c", "[contains((1,2))]"], Some("1"))?;
