@@ -26663,6 +26663,18 @@ mod remaining_inputs {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    /// Marks a queued document as having no real line to report -- jq's own
+    /// parser lost its EOF position entirely for it (e.g. `--seq -s`'s
+    /// trailing-record drop, #1542). The CLI driver (`jq_runner.rs`) owns
+    /// the *only* other place this same "no real position" concept exists
+    /// (its own `UNKNOWN_LINE`, used to resolve the `(at ...)` error marker)
+    /// -- shared here so both sides agree on one value instead of each
+    /// independently picking `u32::MAX` and hoping they never drift (#1549:
+    /// `input_line_number` used to read the raw sentinel straight off this
+    /// queue with no idea it meant "unknown," reporting `4294967295` instead
+    /// of real jq's own `0`).
+    pub const UNKNOWN_LINE: u32 = u32::MAX;
+
     thread_local! {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
         // here: the CLI assigns it and resolves it back to a file name itself,
@@ -26759,6 +26771,19 @@ mod remaining_inputs {
         LAST_LINE.with(Cell::get)
     }
 }
+
+/// The line value a queued document carries when it has no real EOF
+/// position to report at all (#1549).
+///
+/// The CLI driver ([`seed_remaining_inputs`]'s caller) tags a document this
+/// way rather than with a resolvable line number, and `input_line_number`
+/// maps it back to `0` at read time instead of exposing the raw sentinel.
+/// Shared here so the CLI's own line-resolution logic (which independently
+/// needs the same "no position" concept for its `(at ...)` error marker)
+/// can reference one value instead of each side picking `u32::MAX` on its
+/// own and hoping they never drift apart.
+#[cfg(feature = "std")]
+pub const UNKNOWN_INPUT_LINE: u32 = remaining_inputs::UNKNOWN_LINE;
 
 /// Seeds the `input`/`inputs`/`input_line_number` queue (#723).
 ///
@@ -26950,7 +26975,19 @@ fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() ->
     }
     #[cfg(feature = "std")]
     {
-        QueryResult::Owned(OwnedValue::Int(remaining_inputs::last_line() as i64))
+        // #1549: the most recently popped document can carry
+        // `remaining_inputs::UNKNOWN_LINE` (no real EOF position at all,
+        // e.g. `--seq -s`'s trailing-record drop) rather than a real line --
+        // report real jq's own answer for "no line known yet" (`0`, the
+        // same value this builtin already reports before anything has been
+        // read) instead of the raw sentinel.
+        let line = remaining_inputs::last_line();
+        let reported = if line == remaining_inputs::UNKNOWN_LINE {
+            0
+        } else {
+            line
+        };
+        QueryResult::Owned(OwnedValue::Int(reported as i64))
     }
     #[cfg(not(feature = "std"))]
     {

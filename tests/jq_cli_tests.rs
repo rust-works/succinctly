@@ -18008,6 +18008,26 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
     Ok(())
 }
 
+/// #1549: `input_line_number`'s own *value* (not just the `(at ...)` error
+/// marker #1542 already covers) must report real jq's own answer for "no
+/// line known yet" (`0`) for a dropped `--seq -s` trailing record, not the
+/// raw internal sentinel line the CLI driver tags it with. Verified live
+/// against jq 1.7.1 (`0`, confirmed against a fresh probe -- not carried over
+/// from #1542's own suite, which only ever checked the error marker).
+#[test]
+fn test_jq_input_line_number_after_seq_slurp_dropped_trailing_record_1549() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "-c", "-s", "input_line_number"],
+        Some("\x1e1\n\x1e{\"a\":1"),
+    )
+    .expect("input_line_number after a dropped --seq -s trailing record still runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // `--seq` RS-prefixes output too (RFC 7464), not just input.
+    assert_eq!(stdout, "\x1e0\n", "{stderr}");
+
+    Ok(())
+}
+
 /// #1550: #1542's drop check only ever inspected `raw_inputs.last()` -- the
 /// *physically* last file on the command line. Real jq's `-s` reader treats
 /// every file as one continuous byte stream, so a truncated record's own

@@ -1742,7 +1742,15 @@ fn json_seq_ends(raw: &[u8]) -> Vec<usize> {
 /// straight from [`per_value`](InputLocations::per_value) -- answers
 /// `<unknown>` the same way, rather than only the direct-lookup path
 /// checking a side flag `resolve` itself didn't know about.
-const UNKNOWN_LINE: u32 = u32::MAX;
+///
+/// Value comes from the library crate's own `jq::UNKNOWN_INPUT_LINE` (#1549)
+/// rather than an independently-picked `u32::MAX` here: this same raw value
+/// also crosses into the shared `input`/`inputs`/`input_line_number` queue
+/// (`seed_remaining_inputs`, below), so `builtin_input_line_number` needs to
+/// recognize the exact sentinel this side emits -- previously it didn't,
+/// and reported the raw `u32::MAX` (`4294967295`) instead of real jq's own
+/// `0` for a dropped trailing `--seq -s` record.
+const UNKNOWN_LINE: u32 = jq::UNKNOWN_INPUT_LINE;
 
 /// Source locations for the values returned by [`get_inputs`].
 ///
