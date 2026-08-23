@@ -3436,6 +3436,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// its `map`/`select`/`first`/`.[n]` composability fast paths (#724/#725) --
 /// rather than being decomposed or materialized here, which is exactly what
 /// regressed #1503's own broader attempt.
+///
+/// **Known gap (#1565):** `fold_pipe_stages` itself is a plain eager fold
+/// with no demand check, so a `LazyKeys`/`LazyIndexRange`/`LazySeq` item
+/// folded through it this way does not get `first`'s early-stop benefit --
+/// `first(keys | .[] | stderr)` still visits every key, unlike the sibling
+/// `first(.[] | stderr)` shape #1461 fixed. Pre-existing (unchanged from the
+/// old eager fallback this function replaced), not a regression from #1461.
 fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     value: V,
