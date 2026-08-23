@@ -1979,6 +1979,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
         ))
     }
 
+    /// The inherent `JsonFields::uncons` builds a `JsonField` of two
+    /// cursors and materializes nothing, so a key-only walk pays for one
+    /// `key()` and no `value()` -- which is the difference between this
+    /// and the trait default (#1514).
+    fn uncons_key(&self) -> Option<(Self::Value, Self::Cursor, Self)> {
+        let (field, rest) = JsonFields::uncons(self)?;
+        Some((field.key(), field.key_cursor(), rest))
+    }
+
     fn find(&self, name: &str) -> Option<Self::Value> {
         JsonFields::find(self, name)
     }

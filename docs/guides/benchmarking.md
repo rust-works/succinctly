@@ -877,6 +877,34 @@ Before trusting a neutral result, confirm the suite contains the shape the chang
 does not, add a pattern to `src/bin/succinctly/yaml_generators.rs` (or the JSON/DSV equivalent)
 and regenerate.
 
+### 8. A share of runtime is not a comparison, and one signal finds one regression
+
+`b6c0c3ca` was titled *"cut the duplicate-key probe from 10.4% to 3.9%"* and shipped inside the
+very series that #1514 later bisected as a 2-3x regression. Both figures are shares of the
+*post-change* runtime. They say the probe got cheaper relative to a binary that was already
+much slower than the baseline; they cannot say whether it got closer to it. Measured against
+the pre-change commit, that same commit recovered part of one regression and left the other
+slightly worse.
+
+A perf claim needs a **named baseline commit that predates the change being judged** — not a
+sibling from the same series, and not the current tip. "A benchmark claim is only as fresh as
+its baseline" is already on record for the broadword UTF-8 reversal, where a clean rebase
+silently improved the control side; this is the same failure with the staleness chosen rather
+than inherited.
+
+**Corollary for a detector** — anything that decides whether a fast path applies. Measure it on
+the workload where the guarded code was *already fastest*, not the one where it was slowest: a
+precheck is charged to every input including the ones it cannot help, so the input with the
+least work to save is where its cost shows most. #1514's duplicate-key detector cost ~3% of
+`sjq '.'` over a document of small objects and doubled `sjq keys_unsorted` over one holding a
+single wide object.
+
+**And pick more than one signal.** #1385 shipped two regressions on two paths. A `git bisect`
+on `keys_unsorted` found the evaluator commit and stepped straight over the print-path one,
+because `.` had barely moved at that commit; a second bisect on `.` was needed to find it. One
+signal proves one thing. Before believing a bisect result, ask which paths the suspected change
+touches and whether the signal is sensitive to each of them.
+
 ### Building both halves on a remote box
 
 A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:

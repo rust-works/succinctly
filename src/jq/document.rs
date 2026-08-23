@@ -500,6 +500,23 @@ pub trait DocumentFields: Sized + Clone {
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 
+    /// Walk one field, materializing only its key.
+    ///
+    /// [`uncons`](Self::uncons) builds a whole [`DocumentField`], which
+    /// means constructing the field's *value* as well -- wasted for a
+    /// caller that only ever looks at keys, and not cheap. Routing the
+    /// `keys_unsorted` writer through `uncons` rather than a key-only walk
+    /// measured **+89% at 10 MB and +100% at 100 MB** on a wide object
+    /// with duplicate detection switched off entirely (#1514) -- it was the
+    /// whole of that path's cost, dwarfing the detector it was carrying.
+    ///
+    /// The default delegates to `uncons`, so a format pays nothing to
+    /// ignore it; JSON overrides it.
+    fn uncons_key(&self) -> Option<(Self::Value, Self::Cursor, Self)> {
+        let (field, rest) = self.uncons()?;
+        Some((field.key, field.key_cursor, rest))
+    }
+
     /// Walk every field, keeping every occurrence of a repeated key in
     /// document order.
     ///
@@ -619,13 +636,18 @@ fn ascii_key_hash(key: &[u8]) -> Option<u64> {
 ///
 /// Prefers the raw span (see [`ascii_key_hash`]) and falls back to the
 /// decoded key, which is what every exact resolution downstream uses.
-fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, C>) -> Option<u64> {
-    if let Some(raw) = field.key.key_raw_unescaped() {
+fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
+    if let Some(raw) = key.key_raw_unescaped() {
         if let Some(hash) = ascii_key_hash(raw) {
             return Some(hash);
         }
     }
-    field.key_str().map(|key| key_hash(key.as_bytes()))
+    key.key_string().map(|key| key_hash(key.as_bytes()))
+}
+
+/// [`key_hash_of`] for a caller holding a whole field.
+fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, C>) -> Option<u64> {
+    key_hash_of(&field.key)
 }
 
 /// An open-addressed set of key hashes: "has any key repeated?" in one
@@ -976,8 +998,8 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     seen: Option<KeyHashes>,
     /// How many cursors have gone out, which is where `collapsed` resumes.
     yielded: usize,
-    /// The exact collapsed key cursors, once a repeat is confirmed.
-    collapsed: Option<Vec<F::Cursor>>,
+    /// The exact collapsed fields, once a repeat is confirmed.
+    collapsed: Option<Vec<DocumentField<F::Value, F::Cursor>>>,
 }
 
 impl<F: DocumentFields> DistinctKeyCursors<F> {
@@ -995,37 +1017,38 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
 }
 
 impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
-    type Item = F::Cursor;
+    /// The key *and* a cursor to it. Both, because every consumer wants
+    /// the key itself, and re-deriving it from the cursor materializes a
+    /// second time what the walk has already built (#1514).
+    type Item = (F::Value, F::Cursor);
 
-    fn next(&mut self) -> Option<F::Cursor> {
-        if let Some(cursors) = &self.collapsed {
-            let cursor = cursors.get(self.yielded).copied()?;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(collapsed) = &self.collapsed {
+            let field = collapsed.get(self.yielded)?;
             self.yielded += 1;
-            return Some(cursor);
+            return Some((field.key.clone(), field.key_cursor));
         }
-        let (field, tail) = self.rest.uncons()?;
+        let (key, key_cursor, tail) = self.rest.uncons_key()?;
         self.rest = tail;
         let repeat = self
             .seen
             .as_mut()
-            .is_some_and(|seen| field_key_hash(&field).is_some_and(|hash| seen.insert(hash)));
+            .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)));
         if repeat {
             match collapsed_fields(&self.all) {
                 Some(fields) => {
-                    let cursors: Vec<F::Cursor> =
-                        fields.into_iter().map(|f| f.key_cursor).collect();
-                    let cursor = cursors.get(self.yielded).copied();
-                    self.collapsed = Some(cursors);
+                    self.collapsed = Some(fields);
                     self.seen = None;
-                    let cursor = cursor?;
-                    self.yielded += 1;
-                    return Some(cursor);
+                    // Resumes at `yielded`, which the collapsed list's own
+                    // prefix matches: every key emitted so far was a first
+                    // occurrence, and collapsing keeps those in place.
+                    return self.next();
                 }
                 None => self.seen = None,
             }
         }
         self.yielded += 1;
-        Some(field.key_cursor)
+        Some((key, key_cursor))
     }
 }
 
@@ -1102,6 +1125,7 @@ pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<Stri
 }
 
 /// A single field from an object.
+#[derive(Clone)]
 pub struct DocumentField<V, C> {
     /// The field key.
     pub key: V,

@@ -3631,11 +3631,11 @@ where
                 out.write_all(b"[]")?;
             } else if compact {
                 out.write_all(b"[")?;
-                for (i, key_cursor) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
+                for (i, (key, _)) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    if let SJ::String(k) = key_cursor.value() {
+                    if let SJ::String(k) = key {
                         let raw = k.raw_bytes();
                         let content = &raw[1..raw.len().saturating_sub(1)];
                         if !config.ascii_output && !content.contains(&b'\\') {
@@ -3658,13 +3658,13 @@ where
             } else {
                 out.write_all(b"[")?;
                 out.write_all(separator.as_bytes())?;
-                for (i, key_cursor) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
+                for (i, (key, _)) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    if let SJ::String(k) = key_cursor.value() {
+                    if let SJ::String(k) = key {
                         let raw = k.raw_bytes();
                         let content = &raw[1..raw.len().saturating_sub(1)];
                         if !config.ascii_output && !content.contains(&b'\\') {
