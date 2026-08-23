@@ -407,3 +407,11 @@ so it doesn't touch the single-value-then-escape shapes the reverted rule broke.
 now flipped) alongside the still-passing regression guards
 (`test_yq_two_argument_body_validation_outranks_a_slot_escape_1533`,
 `test_yq_fanout_two_args_argument_escape_reports_bare_not_prefix_then_raise`).
+
+Review of that fix found one more gap before it landed: when *both* slots independently trip
+`RejectMany` at once, it reported whichever slot (outer) it happened to check first, rather than
+real yq's own consistent rule — inner (for `setpath`, the path) always wins, whether either
+slot's violation escapes or is a plain count mismatch. `fanout_two_args` now always evaluates
+inner before reporting outer's own violation of either kind, matching real yq's evaluation order
+rather than just guessing at its final answer. Live-verified across all four
+escaping/clean combinations; see `test_yq_setpath_reject_many_prefers_inner_violation_over_outer_1533`.

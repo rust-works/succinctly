@@ -1848,18 +1848,41 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
-        // #1533's other half: a `RejectMany` count violation is only ever a
-        // symptom of an argument that also escaped -- `(1, 2, error("x"))`
-        // has two values *because* the generator didn't get to collapse
-        // them into one before raising. When that's what happened, report
-        // the real escape instead of the synthetic count message. Narrower
-        // than the reverted fix this doc comment's neighbor describes: this
-        // only fires when the count check itself is about to trip (`args.len()
-        // > 1`), so a slot with exactly one value before escaping -- the
-        // shape that fix broke -- is untouched, and `body` still gets to run
-        // for it exactly as before.
+        // #1533's other half. Two things had to be established live against
+        // the pinned yq v4.53.3 oracle, not assumed:
+        //
+        // 1. A `RejectMany` count violation is only ever a symptom of an
+        //    argument that also escaped -- `(1, 2, error("x"))` has two
+        //    values *because* the generator didn't get to collapse them
+        //    into one before raising -- so when a slot's own violation
+        //    carries a trailing escape, report that escape instead of the
+        //    synthetic count message.
+        // 2. Whenever *inner* independently has a `RejectMany` violation of
+        //    its own -- escaping or not -- real yq reports inner's, never
+        //    outer's, even when outer's own violation also escaped. Checked
+        //    across all four combinations: inner escapes + outer escapes ->
+        //    inner's escape; inner escapes + outer clean -> inner's escape;
+        //    inner clean-violation (no escape) + outer escapes -> inner's
+        //    plain count message, still outranking outer's real escape;
+        //    inner fine + outer clean -> outer's own plain message, since
+        //    there is nothing on inner's side to prefer.
+        //
+        // So inner always gets checked here before outer's own violation
+        // (of either kind) is reported. Inner hasn't been evaluated at all
+        // yet on this path -- the loop below is what would normally do
+        // that, on its first iteration -- so this is its first evaluation,
+        // not an extra one, with the same side-effect profile the loop's
+        // first iteration would have had.
+        let (mut probe_inners, probe_inner_trailing) =
+            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+        if let Err(inner_e) = apply_arg_fanout(fanout, &mut probe_inners) {
+            return match probe_inner_trailing {
+                Some(inner_control) => partial(Vec::new(), inner_control),
+                None => QueryResult::Error(inner_e),
+            };
+        }
         return match outer_trailing {
-            Some(control) => partial(Vec::new(), control),
+            Some(outer_control) => partial(Vec::new(), outer_control),
             None => QueryResult::Error(e),
         };
     }
