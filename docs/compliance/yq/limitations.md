@@ -355,24 +355,48 @@ per-mode-wholesale — all rows live-verified against yq v4.53.3:
 |---|---|---|
 | `contains` (scalars, arrays, objects) | **yes** — `[.x \| contains(("a","zz"))]` on `abc` is `[true,false]` | fans out; this *closed* a pre-existing divergence |
 | `has`, `test/1`, `test/2`, `match`, `capture`, `sub/2`, `sub/3`, `split`, `tz` | no — first output only | gated off (`ArgFanout::yq_native`) |
-| `setpath`, `delpaths` | **error** — `SETPATH: expected single path but found 2 results instead` | still errors (`ArgFanout::RejectMany`); wording differs, see below |
+| `setpath`, `delpaths` | **error** — `SETPATH: expected single path but found 2 results instead` | still errors (`ArgFanout::reject_many_in_yq`); wording differs, see below |
 | `flatten(n)` | literal depth only — `bad expression, please check expression syntax` | gated off |
 | `getpath`, `range`, `nth`, `limit`, `combinations`, `paths`, `ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `index`, `rindex`, `indices`, `inside`, `splits`, `scan`, `gsub`, `strftime`, `strptime`, `bsearch`, `pow` | **lexer-rejected — the builtin does not exist** | fans out; unopposed extension |
 
-`grep 'ArgFanout::yq_native' src/jq/eval.rs` is the audit for the gated set — the predicate is
-named rather than inlined precisely so that stays a grep (CLAUDE.md's #106 lesson).
+There are **two** gate predicates, so the audit is both greps —
+`grep -E 'ArgFanout::(yq_native|reject_many_in_yq)' src/jq/eval.rs`. Each is named rather than
+inlined precisely so that stays a grep (CLAUDE.md's #106 lesson).
 
-Two residues:
+### The prefix rule is where the two modes deliberately part
 
-- **`setpath`/`delpaths` error wording.** Real yq says `SETPATH: expected single path but found
-  2 results instead` (and `...single value on RHS but found 2`, and `DELPATHS: expected single
-  value but found 2`); succinctly says `expected a single result but found 2`. The *outcome* —
-  an error rather than a fan-out or a silent truncation — is what #1279 preserved; matching the
-  per-slot wording is unstarted.
-- **The halt-prefix rule has no yq oracle at all.** Real yq has no `halt_error` (lexer-rejected)
-  and never emits a prefix before an error, so #1277's "emit the outputs the prefix earned, then
-  fire the trailing control" is unobservable through yq's own CLI. Applying it uniformly in both
-  modes is therefore unopposed rather than a divergence.
+jq emits the outputs a prefix earned and *then* fires the argument's trailing control (#1277's
+rule 2). Real yq does not: an escape anywhere in a gated argument produces the escape alone,
+with nothing printed first — live-verified against v4.53.3 for `has`, `split` and `join`
+(#1534), and for `delpaths` (#1533):
+
+```bash
+$ printf 'a: 1\n' | yq            'has(("a","b", error("boom")))'   # Error: boom, stdout empty
+$ printf 'a: 1\n' | succinctly yq 'has(("a","b", error("boom")))'   # Error: boom, stdout empty
+```
+
+`clear_values_when_yq_argument_escaped` implements that, called only from `fanout_arg`. So the
+jq-mode prefix rule and the yq-mode no-prefix rule are both live, per mode, exactly as ADR-0018
+requires — an earlier draft of this section claimed the rule applied "uniformly in both modes",
+which was true only before #1534.
+
+### Residues
+
+- **`setpath`/`delpaths` count-message wording.** Real yq says `SETPATH: expected single path but
+  found 2 results instead` (and `...single value on RHS but found 2`, and `DELPATHS: expected
+  single value but found 2`); succinctly says `expected a single result but found 2`. The
+  *outcome* — an error rather than a fan-out or a silent truncation — is what #1279 preserved;
+  matching the per-slot wording is unstarted.
+- **Two-argument escape ordering** ([#1533](https://github.com/rust-works/succinctly/issues/1533),
+  half-closed). The escape-clearing above is deliberately *not* applied to `fanout_two_args`:
+  emptying one slot's values skips the body, which is where the other slot gets validated, and
+  which slot real yq reports is per-builtin and does not follow succinctly's outer/inner order
+  (`test` wants the flags, `setpath` wants the path). That needs a per-builtin ordering probe.
+  Pinned as a known divergence by `test_yq_setpath_two_argument_escape_order_is_unfixed_1533`.
+- **`contains` on an escaping argument**
+  ([#1553](https://github.com/rust-works/succinctly/issues/1553)). `contains` is ungated because
+  real yq fans it out, but real yq still emits nothing when its argument escapes, where
+  succinctly emits the prefix first.
 
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 

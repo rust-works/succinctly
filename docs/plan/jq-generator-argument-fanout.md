@@ -358,17 +358,45 @@ run `./scripts/sync-jq-golden.sh` with the pinned jq on `PATH`.
 - [#1045](https://github.com/rust-works/succinctly/issues/1045), [#1164](https://github.com/rust-works/succinctly/issues/1164) — the zero-output and trailing-escape fixes this work completes.
 - [ADR-0018](../adrs/adr-0018.md) — the reference-fidelity rule the yq gates answer to.
 
-## Follow-up issues to file
+## Follow-ups
 
-Explicit non-goals, so they do not read as oversights:
+Explicit non-goals of the fan-out work, so they do not read as oversights. Filed where a
+dedicated issue was warranted; otherwise the existing issue that already covers them.
 
-- **#1277 cluster 4** — `eval_owned_expr_opt` inside `eval_pipe_with_path_context_internal`,
-  which *array-collapses* 2+ outputs rather than truncating.
-- **`pick`/`omit`** — they collapse to the first output too, but they implement yq's
-  value-array `pick`, a different builtin from jq's path-expression `pick`.
+- **#1277 cluster 4** — `eval_owned_expr_opt` inside `eval_pipe_with_path_context_internal`
+  drops its trailing control *and* array-collapses 2+ outputs.
+  Filed as [#1559](https://github.com/rust-works/succinctly/issues/1559); no user-visible
+  divergence found for it yet, and the issue records the probes that came back clean.
+- **`pick`/`omit`** — they collapse to the first output too, but implement yq's value-array
+  `pick`, a different builtin from jq's path-expression one. Not filed: it needs the oracle
+  question settled first (which `pick` is succinctly's?), not a fan-out change.
 - **`eval_index_expr`/`eval_slice_expr`** — the conservative `Partial(_, Error) => Error`
   prefix drop, documented in place as outside #400/#494's verified semantics.
-- **yq `setpath`/`delpaths` error wording** — succinctly's messages differ from real yq's
-  `SETPATH:`/`DELPATHS:` text.
-- **`combinations` error wording** on a non-array input (`expected array, got number` vs
-  jq's `Cannot iterate over number (1)`) — pre-existing, unrelated to fan-out.
+- **yq `setpath`/`delpaths` count-message wording** — succinctly's `expected a single result
+  but found 2` versus real yq's per-slot `SETPATH:`/`DELPATHS:` text. Recorded in
+  [docs/compliance/yq/limitations.md](../compliance/yq/limitations.md).
+- **`combinations` error wording** on a non-array input (`expected array, got number` vs jq's
+  `Cannot iterate over number (1)`) — pre-existing and unrelated to fan-out; already covered by
+  [#991](https://github.com/rust-works/succinctly/issues/991)'s `type_error` wording audit.
+
+## Review findings on this work
+
+A high-effort review of the implementation branch found six further defects. Five were
+branch-local and fixed there: [#1531](https://github.com/rust-works/succinctly/issues/1531)
+(arguments pulled eagerly, reaching `input`/side effects jq's laziness skips),
+[#1532](https://github.com/rust-works/succinctly/issues/1532) (fanned-out `getpath` discarding
+its resolved prefix), [#1534](https://github.com/rust-works/succinctly/issues/1534) (yq's
+`FirstOnly` gate emitting a value it then raises over),
+[#1537](https://github.com/rust-works/succinctly/issues/1537) (the `ArgFanout` dispatch
+duplicated five times), and the single-argument half of
+[#1533](https://github.com/rust-works/succinctly/issues/1533).
+
+#1531's lazy pull is the one that changed a documented conclusion: it closed the last golden
+known-failure, the #820 eager-argument residue this design had recorded as out of scope.
+
+#1533's two-argument half stays open. Applying "an escape in the argument clears its values" to
+`fanout_two_args` regressed two shapes, because emptying one slot's values skips the body — and
+the body is where the *other* slot gets validated. Which slot real yq reports is per-builtin and
+does not follow succinctly's outer/inner order (`test` wants the flags, `setpath` wants the
+path), so it needs a per-builtin ordering probe of its own. Pinned meanwhile by
+`test_yq_setpath_two_argument_escape_order_is_unfixed_1533`.
