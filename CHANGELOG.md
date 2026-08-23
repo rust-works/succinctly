@@ -293,7 +293,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   position — the file its parser has open and the line it last finished a
   value on — rather than each value's provenance:
   `jq '[inputs] | .[0] | error("boom")' a b c` names **c**, not `.[0]`'s own
-  **a**. succinctly now matches, without any filename crossing the library
+  **b**. succinctly now matches, without any filename crossing the library
   seam (the queue carries an opaque source tag the CLI resolves itself).
 
   **An exhausted stream names where it ran out.** `printf '' | jq -n 'input'`
