@@ -602,6 +602,8 @@ For detailed documentation on optimization techniques used in this project, see 
 - Duplicated predicates diverge silently — one definition, plus a test that the call sites agree (#106: three copies of one predicate, one of them quadratic)
 - Check where data physically lives before proposing to tag it (#106: the proposal assumed a `Vec<u32>`; no real file has one)
 - Re-derive a break-even before trusting it (#106: the issue's stated 12.5% dropped a bits-to-bytes conversion; the real gate was 3.125%)
+- A hash table is not automatically cheaper than a sort — above L3 a sort streams and a table does not, and which wins is architecture-dependent (#1514: the same table beat the sort on an M4 Pro and lost 24% to it on a 7950X at 7.1M keys)
+- To attribute a cost, build the binary again with the feature *disabled* and measure that — timings alone cannot separate what a check costs from what the code around it costs (#1514: it proved #1385's cost was 100% its probe, and caught a larger regression introduced by the fix)
 
 ### Benchmarking Discipline
 
@@ -614,6 +616,8 @@ For detailed documentation on optimization techniques used in this project, see 
 - **Memory-bound effects do not port across architectures** — measure ARM *and* x86_64, and name the chip in every table. #106 was 6.1x on M4 Pro, 16.4x on Zen 4.
 - **Verify the box is idle; macOS load average lies** (read 1.4 on a machine using 2.4% CPU — it counts uninterruptible-wait threads). Never benchmark a laptop on battery.
 - **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.
+- **A share of runtime is not a comparison.** Name a baseline commit that predates the change being judged — not a sibling from the same series (#1514: "cut the probe from 10.4% to 3.9%" shipped inside a 2-3x regression).
+- **Measure a precheck where the guarded code is already fastest.** It is charged to every input including the ones it cannot help, so the workload with least work to save is where its cost shows (#1514: the same detector read +8% on record-shaped input and +134% on one wide object).
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth

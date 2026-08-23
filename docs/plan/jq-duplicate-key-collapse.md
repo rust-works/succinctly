@@ -389,13 +389,165 @@ why patch coverage on `src/json/light.rs` read 15%. `raw_and_escaped`, from the 
 genuinely used and stays. Deleting them also left exactly one pairwise-scan threshold in the
 tree rather than three.
 
+## What the detector cost, and how it was made cheap (#1514)
+
+Open risk 1 above asked for the 4-6% to be confirmed on the pinned hosts. It was not 4-6%.
+Measured against `40c5ff93` on both boxes — interleaved, identity-gated, `codegen-units=1` (see
+"The measurement had a hole in it" below) — the detector cost up to **+141%** on a document
+holding one wide object, and *no object in that document carries a repeated key*.
+
+Two corrections to what this document says above, both of which it had the information to avoid:
+
+- **"The residue is the printer's alone."** It was not. The printer's share (`.`) was the smaller
+  half; `keys_unsorted` — the path that had no probe at all before this series and gained a whole
+  `census` walk — more than doubled, and `keys_unsorted | length` with it.
+- **The numbers came from `succinctly json generate`'s default shape.** A detector's cost shows
+  most on the workload where the guarded code is *already fastest*, which here is a single wide
+  object (82K keys at 1 MB, 7.1M at 100 MB). On the record-shaped `users` pattern the same
+  detector reads +14%, which is why it shipped.
+
+### Finding the cost: disable the detector, then measure
+
+Timings alone cannot separate "what the detector costs" from "what the code around it costs".
+Building each binary a second time with the detector *forcibly disabled* can, and the whole
+investigation turned on it:
+
+| `wide` `keys_unsorted`, Apple M4 Pro | 10 MB | 100 MB |
+|---|---|---|
+| `main`, probe disabled | **−1.1%** | **−0.7%** |
+| an intermediate fix, dedup disabled | +89.4% | +100.0% |
+| the same intermediate, dedup on | +112.3% | +154.2% |
+
+Row 1 proves #1514's premise: with the probe gone, `main` sits exactly on the pre-#1385
+baseline, so on that path the detector was the entire cost. Row 2 caught a regression introduced
+*by the fix* — see "The mistake the fix made".
+
+### Where the cost sat
+
+Three separate passes, which is why one bisect signal only ever revealed one of them:
+
+1. **The printer** (`spans_repeat`) sorted the key *spans*, so every comparison chased a pointer
+   into a random offset of the document text.
+2. **The evaluator** ran a second full cons-list walk (`census`), `key_str()`-decoding every field
+   — `as_str` scans for the closing quote, scans again for a backslash, then validates UTF-8 —
+   before sorting anything.
+3. **The probe ran in guard position**, ahead of the arm match, so `select(true)` and `map(.)`
+   paid a full census and discarded the answer.
+
+### The fix
+
+- Hash with eight bytes per multiply and a splitmix64 finalizer, not byte-at-a-time FNV-1a.
+- Hash the key's **raw span** when it is escape-free and ASCII, instead of decoding it. ASCII is
+  what makes the substitution sound, not just fast: it is valid UTF-8, so `key_string` would have
+  answered `Some` with those exact bytes, which keeps the keyed/unkeyed split `census` counts on.
+- Run the probe **only where the answer is read positionally** (`.[n]`, `last`). `length` asks
+  `effective_len`; `.[]` and `map` dedup during the walk they were already making; `first` needs
+  nothing, because collapsing keeps a key at its first position and the first field is nobody's
+  repeat; the materializing fallback applies the rule itself.
+- **Walk keys without materializing values.** `DocumentFields::uncons_key` exists because `uncons`
+  builds a whole `DocumentField`, constructing the value a key walk never looks at.
+- Sort hashes; do not probe a table — except in `DistinctKeyCursors`, which answers per key as it
+  streams and has nothing to sort yet.
+
+### The mistake the fix made
+
+Removing the probe walk from `keys_unsorted` did not make it faster, and the dedup-disabled build
+said why: the replacement walk cost **+89% at 10 MB and +100% at 100 MB on its own**. Routing the
+writer through the generic `DocumentFields::uncons` materialized each field's value as well as its
+key, and the consumer then called `cursor.value()` to rebuild the key the walk had just dropped —
+two wasted materializations per key, worth about what the probe had cost.
+
+Local sanity checks did not catch it: the same binary measured 21% apart between two runs on a
+laptop. Only a pinned box, with the detector disabled, separated the two effects.
+
+### The table was the wrong structure, and only one architecture said so
+
+An open-addressed hash set replaced every sort first. On an M4 Pro that was right. On a 7950X it
+cost **24% on the identity path**, where at 7.1M keys the table is 134 MB against 32 MB of L3 per
+CCD: a sort streams, a table does not. Sorting `u64` hashes instead is better than both on both
+boxes — it keeps the printer's real win (registers, not pointer-chasing memcmp) without the
+random access.
+
+Two further findings, recorded so they are not re-derived:
+
+- **Size the table; never let it grow into a wide object.** Shipped growing first and measured:
+  `keys_unsorted` on `wide/10mb` went from +110% to +146% — the sort it replaced was *faster*.
+  Seventeen doublings each rehash everything held.
+- **Rejected: quadrupling instead of doubling.** Cuts rehashed entries to about a third and moved
+  `wide/100mb` from +108.5% to +108.2%, with 10 MB flat. Growth was not where the money was: a
+  rehash reads the old table sequentially and writes into one it is filling, so those inserts
+  pipeline; live inserts do not.
+
+### The measurement had a hole in it
+
+`succinctly jq type` — which reports the root's type and touches no keys — measured **+12% on an
+M4 Pro and +27% on a 7950X** between binaries in this series, scaling with input size (~0.19
+ms/MB, so it is index build). It did not bisect to the same commit on the two machines. At
+`codegen-units=1` it is **+0.2%**.
+
+The crate has no `[profile.release]`, so it builds at `codegen-units = 16` with no LTO, and adding
+code to one module changes how unrelated modules are optimized. Every CLI A/B this project has
+recorded carries that component, this document's own figures included. All numbers below were
+re-measured with `codegen-units=1` on both sides.
+
+### What it costs now
+
+`codegen-units=1`, median of 7, against `40c5ff93`. Control bands: M4 Pro −0.7%..+0.4%, 7950X
+−2.8%..+0.8%. Identity: 25 configurations, 0 differences on each box.
+
+| `wide` | M4 Pro `main` | M4 Pro tip | 7950X `main` | 7950X tip |
+|---|---|---|---|---|
+| `.` 1/10/100 MB | +24 / +30 / +34% | **+16 / +19 / +24%** | +39 / +46 / +49% | **+24 / +28 / +30%** |
+| `keys_unsorted` | +88 / +123 / +136% | **+50 / +57 / +96%** | +129 / +137 / +141% | **+78 / +97 / +142%** |
+| `\| select(true)` | +27 / +32 / +37% | **+4 / +4 / +5%** | +32 / +39 / +52% | **+2 / +4 / +3%** |
+| `\| map(.)` | +20 / +25 / +30% | **+4 / +6 / +12%** | +38 / +39 / +38% | **+16 / +23 / +36%** |
+| `\| length` | +77 / +105 / +119% | **+22 / +29 / +25%** | +98 / +106 / +107% | **+23 / +22 / +21%** |
+
+Median across all 25 configurations: M4 Pro **+25.1% → +4.8%**, 7950X **+38.1% → +12.2%**. Head to
+head against `main` on the 7950X: **median −12.0%, 24 of 25 rows faster**; the exception is
+`keys_unsorted` at 100 MB (+3.8%). yq is flat on both (median −0.3%, every row inside ±1.6%).
+
+### The floor
+
+At 7.1M keys in one object the streaming table is 134 MB and every live insert is a DRAM round
+trip — ~87 ns per key against a 670 ms baseline query. That is why `keys_unsorted` at 100 MB is
+the one row that does not improve on a 7950X. Identity `.` pays the same absolute cost and reads
+as +30% only because it has an order of magnitude more work to hide it behind: the
+"measure a precheck where the guarded code is already fastest" rule, demonstrated rather than
+argued.
+
+### Memory
+
+Peak RSS, Apple M4 Pro, MiB:
+
+| workload | `40c5ff93` | `main` | tip |
+|---|---|---|---|
+| `wide/10mb` `.` | 20.8 | 63.0 | **57.1** |
+| `wide/10mb` `keys_unsorted` | 20.8 | 29.7 | 52.9 |
+| `wide/10mb` `\| length` | 20.8 | 29.8 | 29.8 |
+| `wide/100mb` `.` | 132.5 | 514.0 | **459.7** |
+| `wide/100mb` `keys_unsorted` | 132.5 | 188.9 | 388.7 |
+| `wide/100mb` `\| length` | 132.5 | 189.0 | 189.0 |
+| `users/10mb`, every filter | 16.4 | 16.5 | 16.5 |
+
+`.` improves on `main` (the printer's `Vec<u64>` is half the width of the `Vec<&[u8]>` it
+replaced) and `length` is identical. Only the streaming `keys_unsorted` path doubles: an
+open-addressed table keeps 16 bytes per key at its half-load point where a sorted `Vec<u64>` keeps
+8. That is the trade for the time above, and defect 4 in this document is the precedent for
+reporting both rather than one.
+
 ## Open risks for an implementer to sanity-check
 
-1. **The 4-6% wants confirming on the pinned hosts.** Everything above was measured on a
-   laptop under someone else's load. Re-run `succinctly bench run jq_bench` interleaved on the
-   M4 Pro and the 7950X before treating the figure as settled — and note the cost is
-   memory-traffic-shaped (a per-field buffer), which is exactly the kind that does not port
-   between architectures.
+1. ~~**The 4-6% wants confirming on the pinned hosts.**~~ **Closed by
+   [#1514](https://github.com/rust-works/succinctly/issues/1514), and the answer was not 4-6%.**
+   On both pinned hosts the detector cost up to **+134%** on a document holding one wide
+   object — none of whose objects carries a repeated key. The laptop figure was low for two
+   reasons this risk named only half of: the machine, and the *workload*. See "What the
+   detector cost, and how it was made cheap" below.
+
+   The prediction that the cost is memory-traffic-shaped and would not port between
+   architectures was right, and mattered more than expected: the fix's first structure won on
+   an M4 Pro and lost 24% on a 7950X.
 2. **Shared-evaluator hazard.** ADR-0018 rule 2's standing warning, and a repeated failure in this
    repo: a builtin generic over `S` serves *both* modes, so a jq-motivated rewrite can silently
    regress yq. Every touched arm needs a yq-mode check.
@@ -434,3 +586,5 @@ tree rather than three.
 - Symptom issues: #443, #442, #478, #1251, #1170 (jq), #1342/#1343/#1344 (yq)
 - [#1377](https://github.com/rust-works/succinctly/issues/1377) — #820's design doc, where this
   was first surfaced as Open Risk 7
+- [#1514](https://github.com/rust-works/succinctly/issues/1514) — what the detector cost once it
+  was measured on the pinned hosts, and the work that made it cheap
