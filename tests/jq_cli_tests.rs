@@ -17590,6 +17590,34 @@ fn test_jq_slurp_error_location_is_last_source_eof_1520() -> Result<()> {
     Ok(())
 }
 
+/// #1541: `--input-dsv` under `--slurp` skips `get_inputs`'s per-row
+/// `locations.push` loop entirely (it's pure overhead once `--slurp`
+/// replaces the whole table with a single `slurp_eof` location below) --
+/// confirm that skip doesn't touch the actual values, and that the error
+/// location still follows the same last-source-EOF rule #1520 established
+/// for the other three input modes.
+#[test]
+fn test_jq_dsv_slurp_skips_location_tracking_1541() -> Result<()> {
+    let (stdout, _, code, _paths) = run_jq_over_files(
+        &["--input-dsv", ",", "-c", "-s", "."],
+        &["a,b\n1,2\n", "c,d\n"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\",\"b\"],[\"1\",\"2\"],[\"c\",\"d\"]]\n");
+
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--input-dsv", ",", "-c", "-s", r#"error("x")"#],
+        &["a,b\n1,2\n", "c,d\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1542: `--seq --slurp`'s EOF marker is `<unknown>`, not a resolved
 /// position, when the stream's *own last* record leaves real jq's
 /// incremental parser with nothing to point at -- either genuinely
