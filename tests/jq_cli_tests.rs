@@ -9691,23 +9691,25 @@ fn test_range_bound_error_is_caught_by_try_catch() -> Result<()> {
 }
 
 #[test]
-fn test_range_from_bound_partial_halt_aborts_immediately() -> Result<()> {
-    // `range_arg`'s `QueryResult::Partial(_, Control::Halt(code))` arm,
-    // reached via `eval_range`'s `from_val` computation (`Err(e) => return
-    // e.into()`): the `from` bound produces one output and then halts. This
-    // is a succinctly-only shape to pin: real jq's `range/2` fans out over
-    // every output of a multi-valued bound (confirmed live --
-    // `jq -n 'range((1, halt_error(4)); 10)'` prints `1` through `9` from
-    // the first `from` value's whole `range(1;10)` before halting on the
-    // second), whereas this evaluator's `from`/`to`/`step` each take exactly
-    // one resolved value and never fork. So here the halt is caught before
-    // `eval_range` ever calls `eval_range_values`: no range values are
-    // generated at all, unlike jq's partial run. Succinctly's own contract
-    // (halt is never downgraded, never partially computed around) still
-    // holds: no output, exit 4.
+fn test_range_from_bound_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
+    // The `from` bound produces one output and then halts. jq's `range/2` is a
+    // jq-level `def` with `$`-bound arguments, so it runs the first value's
+    // whole `range(1;10)` before the second value halts:
+    //
+    //   $ jq -n 'range((1, halt_error(4)); 10)'
+    //   1 2 3 4 5 6 7 8 9        <- stdout
+    //   exit 4
+    //
+    // This test used to assert an empty stdout, because `range_arg` matched
+    // the whole `QueryResult` and its `Partial(_, Control::Halt(code))` arm
+    // aborted before `eval_range_values` ever ran. `eval_range` now loops over
+    // every bound value and lets `stream_outputs` carry the halt, so the
+    // prefix survives (#1279/#1277) -- while the halt itself is still never
+    // downgraded to a catchable error, which
+    // `test_range_halt_not_caught_by_try_catch` pins separately.
     let (stdout, stderr, code) = run_jq_full(&["-n", "range((1, halt_error(4)); 10)"], None)?;
     assert_eq!(code, 4, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
     Ok(())
 }
 
