@@ -21224,7 +21224,7 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// own copy of this same predicate already once did (#1457).
 /// [`try_reduce_step_alternatives`] hand-rolls an equivalent match rather
 /// than calling this, since its single UPDATE-only retry predates this
-/// helper; consolidating it too is tracked separately (#1571) rather than
+/// helper; consolidating it too is tracked separately (#1570) rather than
 /// attempted here, to keep this fix scoped to the bug it's actually fixing.
 fn is_retryable_control(control: &Control, is_last: bool) -> bool {
     !is_last && matches!(control, Control::Error(_) | Control::Break(_))
@@ -21252,10 +21252,11 @@ fn is_retryable_control(control: &Control, is_last: bool) -> bool {
 /// whole UPDATE-then-EXTRACT sequence from scratch, seeded with the failed
 /// EXTRACT call's own input as UPDATE's new state (#1458; live-verified
 /// against real jq 1.7.1): `foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2;
-/// if . == 2 then error("boom") else [$x,$y,.] end)` on `[{"a":1}]` is
-/// `[[1,null,1],[null,1,3],[null,1,4]]` -- the `3`/`4` only make sense as
-/// `.+1, .+2` re-run against state `2`, the failed EXTRACT call's own
-/// input, not `4`, this attempt's own final UPDATE output. That state-
+/// if . == 2 then error("boom") else [$x,$y,.] end)` on `[{"a":1}]` prints
+/// three separate top-level outputs -- `[1,null,1]`, then `[null,1,3]`,
+/// then `[null,1,4]` -- and the `3`/`4` only make sense as `.+1, .+2`
+/// re-run against state `2`, the failed EXTRACT call's own input, not `4`,
+/// this attempt's own final UPDATE output. That state-
 /// threading rule is substantially stranger than anything else `?//` does
 /// elsewhere in this codebase and reads as an accidental byproduct of jq's
 /// bytecode compilation rather than a designed behavior -- reproduced here

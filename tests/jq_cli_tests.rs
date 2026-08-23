@@ -15913,8 +15913,10 @@ fn test_foreach_alt_extract_retry_cascades_through_three_alternatives_1458() -> 
 fn test_foreach_alt_extract_success_survives_when_alt_later_falls_through_1458() -> Result<()> {
     // The already-successfully-extracted output from the failed alternative
     // (`[1,null,1]`) is NOT discarded when that alternative later fails and
-    // falls through -- confirmed via `try`/`catch` capturing only the error,
-    // with the earlier output already collected into the array.
+    // falls through -- collecting into `[...]` succeeds with all three
+    // outputs present (no error escapes to the top level at all, since the
+    // retry handles EXTRACT's failure internally), confirming the earlier
+    // output was already collected rather than discarded on retry.
     let (out, err, code) = run_jq_full(
         &[
             "-c",
