@@ -3588,8 +3588,15 @@ fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Resul
 
 #[test]
 fn test_seq_output_format() -> Result<()> {
-    // --seq should prepend RS (0x1E) before each output value
-    let (output, code) = run_jq_binary_stdin(".", br#"{"a":1}"#, &["--seq", "-c"])?;
+    // --seq should prepend RS (0x1E) before each output value. Input must
+    // itself be RS-framed for --seq to read it at all -- RFC 7464 requires
+    // every record to start with one, and real jq's own reader treats
+    // unprefixed input as "abandoned text" and reads nothing, even when
+    // it's otherwise well-formed JSON and --slurp isn't in play (#1542
+    // found and fixed the same rule for --seq --slurp's own trailing-record
+    // case; oracle-verified live against jq 1.7.1 that it holds here too:
+    // `printf '{"a":1}' | jq --seq -c '.'` prints nothing at all).
+    let (output, code) = run_jq_binary_stdin(".", b"\x1e{\"a\":1}\n", &["--seq", "-c"])?;
     assert_eq!(code, 0);
 
     // Output should start with RS (0x1E)
@@ -3684,8 +3691,10 @@ fn test_seq_error_location_correct_with_many_preceding_records_1213() -> Result<
 
 #[test]
 fn test_seq_multiple_outputs() -> Result<()> {
-    // Each output from iterator should get RS prefix
-    let (output, code) = run_jq_binary_stdin(".[]", br"[1,2,3]", &["--seq"])?;
+    // Each output from iterator should get RS prefix. Input must be
+    // RS-framed for --seq to read it at all -- see test_seq_output_format's
+    // comment for why.
+    let (output, code) = run_jq_binary_stdin(".[]", b"\x1e[1,2,3]\n", &["--seq"])?;
     assert_eq!(code, 0);
 
     // Count RS characters - should be 3 (one per output)
@@ -17628,6 +17637,42 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
     .expect("seq slurp with truncated trailing record still runs");
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout, "\x1e[1]\n", "{stderr}");
+
+    // The trailing record real jq itself never resolves must also be
+    // dropped from the slurped *value*, not just the error location --
+    // `printf '\x1e1\n\x1e2' | jq --seq -s '.'` gives `[1]` on real jq, not
+    // `[1,2]`, even though "2" alone is perfectly valid JSON on its own.
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "-s", "."], Some("\x1e1\n\x1e2"))
+        .expect("seq slurp with ambiguous trailing number still runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "\x1e[1]\n", "{stderr}");
+
+    // A last file with real, non-empty content but no RS byte anywhere is
+    // "abandoned text" to real jq's --seq reader (RFC 7464 requires every
+    // record to start with one) -- unknown, not a resolved position, even
+    // though a truly *empty* last file still keeps #1520's own plain
+    // "empty source, line 0" rule (the companion control just above).
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n", "{\"a\":1"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}; {paths:?}");
+
+    // The `input`/`inputs`/`input_line_number`-consuming path
+    // (`ErrorAt::Live`, reached whenever the filter references any of
+    // them) must answer `<unknown>` for a dropped trailing record too, not
+    // just the plain `error(...)`-only path (`ErrorAt::Fixed`) the checks
+    // above exercise -- the two paths read the same placeholder through
+    // different accessors (`InputLocations::get` vs `::resolve`), and only
+    // fixing one previously left the other still resolving it to a
+    // spurious concrete location.
+    let (_, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"input_line_number, error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
 
     Ok(())
 }
