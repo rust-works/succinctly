@@ -3475,28 +3475,18 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                 GenericItem::Owned(o) => eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
                     sink(GenericItem::Owned(o))
                 }),
-                GenericItem::LazyKeys {
-                    fields,
-                    sorted,
-                    collapse,
-                } => drain_result_generic(
-                    fold_pipe_stages::<S, V>(
-                        GenericResult::LazyKeys {
-                            fields,
-                            sorted,
-                            collapse,
-                        },
-                        rest,
-                        optional,
-                    ),
-                    &mut *sink,
-                ),
-                GenericItem::LazyIndexRange(len) => drain_result_generic(
-                    fold_pipe_stages::<S, V>(GenericResult::LazyIndexRange(len), rest, optional),
-                    &mut *sink,
-                ),
-                GenericItem::LazySeq(seq) => drain_result_generic(
-                    fold_pipe_stages::<S, V>(GenericResult::LazySeq(seq), rest, optional),
+                // These three carry a deferred computation `fold_pipe_stages`
+                // already knows how to thread through the rest of the pipe
+                // (its `map`/`select`/`first`/`.[n]` composability fast
+                // paths, #724/#725) without decomposing it -- so convert
+                // back to the `GenericResult` shape it came from via
+                // `generic_item_to_result` (the exact inverse of
+                // `drain_result_generic`'s own construction of these items)
+                // rather than re-deriving that conversion by hand here.
+                item @ (GenericItem::LazyKeys { .. }
+                | GenericItem::LazyIndexRange(_)
+                | GenericItem::LazySeq(_)) => drain_result_generic(
+                    fold_pipe_stages::<S, V>(generic_item_to_result(item), rest, optional),
                     &mut *sink,
                 ),
             };
