@@ -21357,6 +21357,59 @@ fn test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533() 
     Ok(())
 }
 
+/// #1533 review finding: when *both* slots independently violate
+/// `RejectMany` at once, real yq always prefers reporting inner's (the
+/// path's) own violation over outer's (the value's) -- whether either
+/// side's violation carries its own escape or is a plain count mismatch.
+/// A first version of this fix only checked the escaping slot it was
+/// evaluating and missed this ordering, reporting whichever slot it
+/// happened to check first (outer) instead -- caught by review before
+/// landing.
+///
+/// All four combinations live-verified against the pinned yq v4.53.3:
+#[test]
+fn test_yq_setpath_reject_many_prefers_inner_violation_over_outer_1533() -> Result<()> {
+    // Both slots escape -- inner's escape wins.
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath((1,2,error("PATH_ERR")); (1,2,error("VAL_ERR")))"#,
+        "null\n",
+        &["-o", "json"],
+    )?;
+    assert!(
+        err.contains("PATH_ERR") && !err.contains("VAL_ERR"),
+        "err: {err:?}"
+    );
+    assert_eq!(code, 1);
+
+    // Inner escapes, outer has a plain (non-escaping) count violation --
+    // inner's escape still wins.
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath((1,2,error("PATH_ERR")); (1,2))"#,
+        "null\n",
+        &["-o", "json"],
+    )?;
+    assert!(err.contains("PATH_ERR"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // Inner has a plain count violation (no escape at all), outer escapes
+    // -- inner's plain violation *still* outranks outer's real escape.
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath((["a"],["b"]); (1,2,error("VAL_ERR")))"#,
+        "a: 1\nb: 2\n",
+        &["-o", "json"],
+    )?;
+    assert!(!err.contains("VAL_ERR"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // Outer has a plain count violation, inner is fine (single value) --
+    // nothing on inner's side to prefer, so outer's own violation reports.
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(r#"setpath(["a"]; (1,2))"#, "a: 1\n", &["-o", "json"])?;
+    assert!(err.contains("single result"), "err: {err:?}");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
 /// #1533/#1534 regression guard: applying the single-argument escape rule to
 /// `fanout_two_args` as well broke two shapes that already matched real yq,
 /// because emptying a slot's values skips the body.

@@ -398,6 +398,13 @@ which was true only before #1534.
   escape, not competing evidence against it, so `fanout_two_args` now defers to that slot's
   trailing control whenever its own count check is what's about to fire. Confirmed by
   `test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533`.
+
+  Review found this alone still misattributed the error when *both* slots violate `RejectMany`
+  at once — reporting whichever slot (outer) it happened to check first, rather than real yq's
+  own consistent "inner always wins" rule (for `setpath`, path over value — live-verified across
+  every escaping/clean combination). `fanout_two_args` now always evaluates inner before
+  reporting outer's own violation, matching real yq's own evaluation order rather than just its
+  final answer. See `test_yq_setpath_reject_many_prefers_inner_violation_over_outer_1533`.
 - **`contains` on an escaping argument**
   ([#1553](https://github.com/rust-works/succinctly/issues/1553)). `contains` is ungated because
   real yq fans it out, but real yq still emits nothing when its argument escapes, where
