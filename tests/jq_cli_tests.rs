@@ -27,20 +27,44 @@ const MAX_CARGO_RETRIES: u32 = 3;
 /// mid-replacement and fail with `ENOENT` (#550).
 const MAX_SPAWN_RETRIES: u32 = 3;
 
+/// Builds the "child was killed by signal N" error for a signal-terminated
+/// process (`ExitStatus::code()` returns `None` only in that case, on
+/// Unix), naming the signal and the captured stderr -- shared by
+/// `classify_cargo_run_exit` below and by `run_jq_full`, which spawns the
+/// pre-built binary directly rather than through `cargo run` and so has no
+/// retry loop to hook a classifier into, but is just as exposed to a
+/// signal-killed child under heavy concurrent load. Historically both
+/// silently coerced this to `-1` via `.code().unwrap_or(-1)`, which renders
+/// as an inscrutable `left: -1, right: 0` with no indication a child was
+/// ever killed -- exactly what cost a wrong root-cause call in the #1459
+/// review (#1516).
+fn signal_death_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
+    // `ExitStatus::code()` returns `None` only when the child was
+    // terminated by a signal (Unix) -- there is no other cause.
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    anyhow::anyhow!(
+        "child was killed by signal {}; stderr:\n{stderr}",
+        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
+    )
+}
+
 /// Classifies a `cargo run` child's exit for the retry loops below, so each
-/// of the four call sites doesn't hand-roll the same "retry on 101" check
-/// (and, historically, the same bug: silently coercing a signal death to
-/// `-1` via `.code().unwrap_or(-1)`).
+/// of the four call sites doesn't hand-roll the same "retry on 101" check.
 ///
 /// Returns `Ok(Some(code))` once a real exit code is available to the
 /// caller, or `Ok(None)` when the caller should sleep (per `attempt`) and
 /// retry -- covering both the existing `101` lock-contention case and a
-/// signal death within `MAX_CARGO_RETRIES` attempts. Once retries are
-/// exhausted on a signal death, returns `Err` naming the signal and the
-/// captured stderr, instead of letting the caller's exit-code assertion
-/// render as an inscrutable `left: -1, right: 0` with no indication a child
-/// was ever killed -- which is exactly what cost a wrong root-cause call in
-/// the #1459 review (#1516).
+/// signal death within `MAX_CARGO_RETRIES` attempts (a signal death under
+/// the same heavy concurrent load -- an OOM kill, another session's
+/// `pkill`, or fallout from that same lock contention -- is just as
+/// plausible as `101` is). Once retries are exhausted on a signal death,
+/// returns the `signal_death_error` above instead of `Ok(Some(-1))`.
 fn classify_cargo_run_exit(
     status: std::process::ExitStatus,
     stderr: &str,
@@ -52,24 +76,10 @@ fn classify_cargo_run_exit(
         }
         return Ok(Some(code));
     }
-
-    // `ExitStatus::code()` returns `None` only when the child was
-    // terminated by a signal (Unix) -- there is no other cause.
     if attempt + 1 < MAX_CARGO_RETRIES {
         return Ok(None);
     }
-    #[cfg(unix)]
-    let signal = {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    };
-    #[cfg(not(unix))]
-    let signal: Option<i32> = None;
-    anyhow::bail!(
-        "cargo run child was killed by signal {} after {} attempt(s); stderr:\n{stderr}",
-        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
-        attempt + 1,
-    );
+    Err(signal_death_error(status, stderr))
 }
 
 /// #1516: a signal-killed child used to render as an inscrutable
@@ -108,11 +118,18 @@ fn test_classify_cargo_run_exit_reports_signal_death_1516() {
     );
 
     // Within the retry budget, the same signal death asks the caller to
-    // retry instead of erroring immediately.
+    // retry instead of erroring immediately -- at both the first attempt
+    // and an interior one (`MAX_CARGO_RETRIES` is 3, so attempt 1 is the
+    // only non-boundary value).
     assert_eq!(
         classify_cargo_run_exit(killed, "", 0).unwrap(),
         None,
         "a signal death within retry budget should ask for a retry"
+    );
+    assert_eq!(
+        classify_cargo_run_exit(killed, "", 1).unwrap(),
+        None,
+        "a signal death on an interior attempt should still ask for a retry"
     );
 
     // Exit code 101 (lock contention) keeps its pre-existing retry
@@ -127,6 +144,11 @@ fn test_classify_cargo_run_exit_reports_signal_death_1516() {
         classify_cargo_run_exit(contention, "", 0).unwrap(),
         None,
         "101 within retry budget should still retry"
+    );
+    assert_eq!(
+        classify_cargo_run_exit(contention, "", 1).unwrap(),
+        None,
+        "101 on an interior attempt should still retry"
     );
     assert_eq!(
         classify_cargo_run_exit(contention, "", MAX_CARGO_RETRIES - 1).unwrap(),
@@ -187,13 +209,15 @@ fn run_jq_stdin_streams(
         }
 
         let output = cmd.wait_with_output()?;
-        let stderr = String::from_utf8(output.stderr)?;
-        let Some(exit_code) = classify_cargo_run_exit(output.status, &stderr, attempt)? else {
+        let lossy_stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) = classify_cargo_run_exit(output.status, &lossy_stderr, attempt)?
+        else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
         };
 
         let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
         return Ok((stdout, stderr, exit_code));
     }
     unreachable!()
@@ -221,11 +245,12 @@ fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i3
     }
 
     let output = cmd.wait_with_output()?;
-    Ok((
-        String::from_utf8(output.stdout)?,
-        String::from_utf8(output.stderr)?,
-        output.status.code().unwrap_or(-1),
-    ))
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    Ok((stdout, stderr, exit_code))
 }
 
 /// Spawns the pre-built `succinctly` binary, retrying on `ENOENT`.
@@ -260,6 +285,7 @@ fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(St
         let output = Command::new("cargo")
             .args([
                 "run",
+                "--quiet",
                 "--features",
                 "cli",
                 "--bin",
@@ -290,6 +316,7 @@ fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
         let output = Command::new("cargo")
             .args([
                 "run",
+                "--quiet",
                 "--features",
                 "cli",
                 "--bin",
@@ -3528,6 +3555,7 @@ fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Resul
         let mut cmd = Command::new("cargo")
             .args([
                 "run",
+                "--quiet",
                 "--features",
                 "cli",
                 "--bin",
