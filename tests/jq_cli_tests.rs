@@ -19510,32 +19510,29 @@ fn test_nth_stream_ordinary_n_unaffected_by_1408() -> Result<()> {
     Ok(())
 }
 
-/// Control: `builtin_nth_stream`'s `n`-argument match only special-cases
-/// `QueryResult::Partial(_, Control::Halt(code))`, not `Control::Error`/
-/// `Control::Break` -- a genuinely multi-output `n` that produces one
-/// value and then errors falls into the generic `_ => Error("expected
-/// number, got null")` catch-all instead of using the first value and
-/// then propagating the trailing error, unlike real jq (`n as $n | ...`
-/// forks once per output of `n`). Pre-existing, not introduced by #1408's
-/// zero-output fix (which only added the separate bare-`QueryResult::None`
-/// arm above); same class of gap as #1277's cluster 3 (which named
-/// `eval_nth_expr`, unaware at the time that it's unreachable and
-/// `builtin_nth_stream` is the function real queries actually hit -- noted
-/// there). Pinning the current (wrong but stable) behavior, matching this
-/// file's existing precedent for `combinations`'s analogous gap
-/// (`test_combinations_n_break_semantics_documented_not_fixed_by_1164`).
+/// A genuinely multi-output `n` that produces one value and then errors uses
+/// that value, emits its result, and only then propagates the error --
+/// jq's `n as $n | ...` forks once per output of `n`:
+///
+///   $ echo '{"a":1,"b":2,"c":3}' | jq -c 'nth((1,error("boom")); .a,.b,.c)'
+///   2
+///   jq: error (at <stdin>:1): boom
+///
+/// This test used to pin the opposite. `builtin_nth_stream`'s `n`-argument
+/// match special-cased only `Partial(_, Control::Halt)`, so a trailing
+/// `Error`/`Break` fell into the generic `_ => Error("expected number, got
+/// null")` catch-all -- #1277's cluster 3, which named `eval_nth_expr` before
+/// anyone noticed `builtin_nth_stream` is the function real queries hit.
+/// #1279 replaced that match with `fanout_arg`, so both are covered.
 #[test]
-fn test_nth_stream_trailing_error_in_multi_output_n_documented_not_fixed_by_1408() -> Result<()> {
+fn test_nth_stream_multi_output_n_emits_prefix_then_error_1279() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &["-c", r#"nth((1,error("boom")); .a,.b,.c)"#],
         Some(r#"{"a":1,"b":2,"c":3}"#),
     )?;
     assert_ne!(code, 0);
-    // Pre-existing divergence from real jq (which prints `2` to stdout
-    // before erroring "boom", verified live) -- see this test's own doc
-    // comment.
-    assert_eq!(out, "");
-    assert!(err.contains("expected number, got null"), "err={err}");
+    assert_eq!(out, "2\n");
+    assert!(err.contains("boom"), "err={err}");
     Ok(())
 }
 
