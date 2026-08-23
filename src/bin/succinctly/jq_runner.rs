@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
-use succinctly::jq::document::{collapsed_fields, effective_keys};
+use succinctly::jq::document::{collapsed_fields, effective_keys, key_hash, KeyHashes};
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
@@ -630,7 +630,21 @@ fn span_fingerprint(raw: &[u8]) -> u64 {
     ((n as u64) << 16) | ((first as u64) << 8) | last as u64
 }
 
-/// Whether any two key spans are byte-identical.
+/// Whether any two key spans *may* be byte-identical.
+///
+/// Small objects -- nearly every object in a real document -- take the
+/// pairwise branch, which allocates nothing. Above the threshold the
+/// pairwise loop is quadratic, so the wide case probes a [`KeyHashes`]
+/// table instead: one hash and about 1.5 slot reads per key, against the
+/// `Vec<&[u8]>`-plus-`sort_unstable` this replaced, whose every comparison
+/// chased a pointer into a random offset of the document text. That sort
+/// was the whole of #1514's identity-path regression -- 59 ns per key on a
+/// 10 MB document with a wide root object.
+///
+/// Above the threshold the answer is conservative: two distinct keys
+/// sharing a 64-bit hash report `true`. [`collapse_duplicate_fields`]
+/// resolves it on the spans themselves and returns `None` when nothing
+/// actually collapsed, so a collision costs one exact rebuild.
 fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
     if prepared.len() <= PAIRWISE_SPAN_SCAN_LIMIT {
         let mut marks = [0u64; PAIRWISE_SPAN_SCAN_LIMIT];
@@ -642,12 +656,10 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
                 .any(|j| marks[i] == marks[j] && prepared[i].raw == prepared[j].raw)
         });
     }
-    // Sorting keeps the wide case out of the quadratic loop: on a 10 MB
-    // document whose root object is wide, an unbounded pairwise scan
-    // measured 1240% slower than not collapsing at all.
-    let mut spans: Vec<&[u8]> = prepared.iter().map(|field| field.raw).collect();
-    spans.sort_unstable();
-    spans.windows(2).any(|w| w[0] == w[1])
+    let mut seen = KeyHashes::with_capacity(prepared.len());
+    prepared
+        .iter()
+        .any(|field| seen.insert(key_hash(field.raw)))
 }
 
 /// jq's duplicate-key rule over an object's already-walked fields (#1385):

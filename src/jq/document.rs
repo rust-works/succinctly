@@ -5,6 +5,8 @@
 //! intermediate conversion.
 
 #[cfg(not(test))]
+use alloc::vec;
+#[cfg(not(test))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use indexmap::{IndexMap, IndexSet};
@@ -526,42 +528,153 @@ pub trait DocumentFields: Sized + Clone {
     }
 }
 
-/// A 64-bit fingerprint of a key, for grouping candidates cheaply.
+/// A 64-bit hash of a key, for grouping candidates cheaply.
 ///
-/// FNV-1a: no dependency, no `HashMap` (this module is `no_std` + `alloc`),
-/// and deterministic across runs. Fingerprint quality only affects *speed*
-/// -- every routine below resolves a shared fingerprint by comparing the
-/// keys themselves, so a collision costs work, never a wrong answer.
-fn key_fingerprint(key: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in key.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// Mixes eight bytes per multiply rather than one, then runs a
+/// splitmix64 finalizer so the low bits [`KeyHashes`] indexes on are as
+/// well distributed as the high ones. No dependency and no `HashMap`
+/// (this module is `no_std` + `alloc`), and deterministic across runs.
+///
+/// Hash quality only affects *speed* -- every routine below resolves a
+/// shared hash by comparing the keys themselves, so a collision costs
+/// work, never a wrong answer.
+pub fn key_hash(key: &[u8]) -> u64 {
+    const PRIME: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut acc = 0xcbf2_9ce4_8422_2325 ^ (key.len() as u64);
+    let mut chunks = key.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        acc = (acc ^ u64::from_le_bytes(word))
+            .wrapping_mul(PRIME)
+            .rotate_left(31);
     }
-    hash
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut word = [0u8; 8];
+        word[..tail.len()].copy_from_slice(tail);
+        acc = (acc ^ u64::from_le_bytes(word))
+            .wrapping_mul(PRIME)
+            .rotate_left(31);
+    }
+    // splitmix64 finalizer: without it the low bits carry too little of
+    // the input, and `& mask` would cluster short keys into one run.
+    acc ^= acc >> 33;
+    acc = acc.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    acc ^= acc >> 33;
+    acc = acc.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    acc ^ (acc >> 33)
 }
 
-/// The sorted, deduplicated fingerprints that occur more than once in
-/// `sorted`, plus how many distinct fingerprint values it holds in total.
+/// An open-addressed set of key hashes: "has any key repeated?" in one
+/// pass, no sort, no key text kept.
 ///
-/// `sorted` must already be sorted ascending; the returned list is too, so
-/// callers can `binary_search` it.
-fn shared_fingerprints(sorted: &[u64]) -> (Vec<u64>, usize) {
-    let mut shared = Vec::new();
-    let mut distinct = 0usize;
-    let mut i = 0usize;
-    while i < sorted.len() {
-        let mut j = i + 1;
-        while j < sorted.len() && sorted[j] == sorted[i] {
-            j += 1;
+/// This replaces the sort-then-scan shape #1385 shipped (#1514). Sorting
+/// is O(n log n) with a comparison per step; on a wide object it dominated
+/// the walk it was guarding -- and the printer's variant sorted *byte
+/// slices*, chasing a pointer into a random offset of the document on
+/// every comparison. Probing costs one hash and about 1.5 slot reads per
+/// key, and the slots are one contiguous array.
+///
+/// The table holds hashes only -- 8 bytes per slot, never a key -- so it
+/// stays a fraction of what materializing the fields would cost, and it
+/// can grow by rehashing what it already has.
+///
+/// [`insert`](Self::insert) is deliberately **conservative**: it reports a
+/// repeat when two keys merely share a 64-bit hash, which for distinct
+/// keys happens about `n^2 / 2^64` of the time. Every caller resolves a
+/// reported repeat against the keys themselves, so a false report costs
+/// one exact pass and still answers correctly.
+pub struct KeyHashes {
+    /// Open-addressed slots. `0` marks an empty slot, so a key hashing to
+    /// zero is stored as `1` -- folding two hash values together, which
+    /// the exact resolution above already tolerates.
+    slots: Vec<u64>,
+    mask: usize,
+    len: usize,
+}
+
+impl KeyHashes {
+    /// Smallest table built, in slots. Below this the pairwise scans the
+    /// callers keep for small objects are cheaper anyway.
+    const MIN_SLOTS: usize = 16;
+
+    /// A table sized for `keys` insertions without a rehash: capacity is
+    /// the next power of two at or above `2 * keys`, keeping the load
+    /// factor at or below one half.
+    pub fn with_capacity(keys: usize) -> Self {
+        let slots = keys
+            .saturating_mul(2)
+            .next_power_of_two()
+            .max(Self::MIN_SLOTS);
+        Self {
+            slots: vec![0; slots],
+            mask: slots - 1,
+            len: 0,
         }
-        distinct += 1;
-        if j - i > 1 {
-            shared.push(sorted[i]);
-        }
-        i = j;
     }
-    (shared, distinct)
+
+    /// Record `hash`, answering whether an equal hash was already present.
+    ///
+    /// `true` means "these keys may be the same" -- see the type's note on
+    /// conservatism.
+    pub fn insert(&mut self, hash: u64) -> bool {
+        // Grow before inserting so the load factor never exceeds one half;
+        // past that, linear probing's run lengths climb sharply.
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let hash = if hash == 0 { 1 } else { hash };
+        let mut at = (hash as usize) & self.mask;
+        loop {
+            match self.slots[at] {
+                0 => {
+                    self.slots[at] = hash;
+                    self.len += 1;
+                    return false;
+                }
+                seen if seen == hash => return true,
+                _ => at = (at + 1) & self.mask,
+            }
+        }
+    }
+
+    /// Distinct hashes recorded so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Double the table and re-place what it holds.
+    ///
+    /// Rehashing needs no keys: the slots *are* the hashes, which is the
+    /// whole reason a caller that cannot count its keys up front (the
+    /// streaming `keys_unsorted` writer) can still use this.
+    fn grow(&mut self) {
+        let slots = (self.slots.len() * 2).max(Self::MIN_SLOTS);
+        let old = core::mem::replace(&mut self.slots, vec![0; slots]);
+        self.mask = slots - 1;
+        for hash in old {
+            if hash == 0 {
+                continue;
+            }
+            let mut at = (hash as usize) & self.mask;
+            while self.slots[at] != 0 {
+                at = (at + 1) & self.mask;
+            }
+            self.slots[at] = hash;
+        }
+    }
+}
+
+impl Default for KeyHashes {
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
 }
 
 /// Number of distinct values in an already-sorted slice, and whether any
@@ -609,37 +722,53 @@ impl KeyCensus {
 }
 
 /// Take the census of `fields` (see [`KeyCensus`]).
+///
+/// The walk collects hashes into a `Vec` and the table is built afterwards,
+/// rather than probing as the walk goes, purely so the table can be sized
+/// exactly. A [`KeyHashes`] left to grow into a wide object rehashes
+/// everything it holds at every doubling -- roughly as many extra
+/// random-access inserts as there are keys, plus zeroing each intermediate
+/// table -- and measured *slower* than the sort it replaces: `keys_unsorted`
+/// on `wide/10mb` went +110% to +146% against the pre-#1385 baseline instead
+/// of improving. The `Vec` was already here before this change, so sizing
+/// the table off it costs nothing new.
 fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
-    let mut prints: Vec<u64> = Vec::new();
+    let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
     let mut walk = fields.clone();
     while let Some((field, rest)) = walk.uncons() {
         match field.key_str() {
-            Some(key) => prints.push(key_fingerprint(&key)),
+            Some(key) => hashes.push(key_hash(key.as_bytes())),
             None => unkeyed += 1,
         }
         walk = rest;
     }
-    let keyed = prints.len();
-    prints.sort_unstable();
-    let (shared, distinct_prints) = shared_fingerprints(&prints);
+    let mut seen = KeyHashes::with_capacity(hashes.len());
+    let mut shared: Vec<u64> = Vec::new();
+    for hash in hashes {
+        if seen.insert(hash) {
+            shared.push(hash);
+        }
+    }
     if shared.is_empty() {
         return KeyCensus {
-            distinct: keyed,
+            distinct: seen.len(),
             unkeyed,
             repeated: false,
         };
     }
+    shared.sort_unstable();
+    shared.dedup();
 
-    // A shared fingerprint is nearly always a genuine repeat, but two
-    // different keys can collide, and counting those as one would be
-    // wrong. Re-walk owning *only* the colliding keys -- on an ordinary
-    // duplicate that is a handful of strings, not one per field.
+    // A shared hash is nearly always a genuine repeat, but two different
+    // keys can collide, and counting those as one would be wrong. Re-walk
+    // owning *only* the colliding keys -- on an ordinary duplicate that is
+    // a handful of strings, not one per field.
     let mut colliding: Vec<String> = Vec::new();
     let mut walk = fields.clone();
     while let Some((field, rest)) = walk.uncons() {
         if let Some(key) = field.key_str() {
-            if shared.binary_search(&key_fingerprint(&key)).is_ok() {
+            if shared.binary_search(&key_hash(key.as_bytes())).is_ok() {
                 colliding.push(key.into_owned());
             }
         }
@@ -648,18 +777,26 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     colliding.sort_unstable();
     let (distinct_colliding, repeated) = distinct_sorted(&colliding);
     KeyCensus {
-        distinct: distinct_prints - shared.len() + distinct_colliding,
+        // `seen.len()` counts distinct *hashes*; every colliding group
+        // contributed exactly one of them, so swap each group's single
+        // hash for however many distinct keys it actually held.
+        distinct: seen.len() - shared.len() + distinct_colliding,
         unkeyed,
         repeated,
     }
 }
 
-/// Whether any key occurs more than once among already-walked fields.
+/// Whether any key *may* occur more than once among already-walked fields.
 ///
 /// The slice counterpart of [`census`], for callers that have had to
-/// materialize the fields anyway. Same fingerprint-then-verify shape, so it
-/// is linear in the field count and keeps 8 bytes per field rather than a
-/// borrowed-key `Cow` (32).
+/// materialize the fields anyway. One [`KeyHashes`] probe per key, no sort.
+///
+/// Deliberately conservative, as [`KeyHashes::insert`] is: two distinct
+/// keys sharing a 64-bit hash answer `true` here. The only caller,
+/// [`effective_fields`], responds by running [`collapse_repeated`], which
+/// decides on the keys themselves and returns the same field list when
+/// nothing actually repeated -- so a collision costs one rebuild, never a
+/// wrong answer.
 ///
 /// A field whose key does not stringify (`key_str` answers `None`) never
 /// compares equal to anything, including another such field.
@@ -667,22 +804,11 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
     if fields.len() < 2 {
         return false;
     }
-    let mut prints: Vec<(u64, usize)> = Vec::with_capacity(fields.len());
-    for (i, field) in fields.iter().enumerate() {
-        if let Some(key) = field.key_str() {
-            prints.push((key_fingerprint(&key), i));
-        }
-    }
-    prints.sort_unstable();
-    prints.windows(2).any(|w| {
-        w[0].0 == w[1].0 && {
-            // Same fingerprint: decide it on the keys themselves.
-            let (a, b) = (fields[w[0].1].key_str(), fields[w[1].1].key_str());
-            match (a, b) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            }
-        }
+    let mut seen = KeyHashes::with_capacity(fields.len());
+    fields.iter().any(|field| {
+        field
+            .key_str()
+            .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
     })
 }
 
@@ -778,12 +904,22 @@ pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
 /// An object's field names under the mode's duplicate-key rule, in
 /// document order (first position of each key).
 ///
-/// `IndexSet::insert` keeps the first occurrence's position and discards
-/// later equal ones -- which is the whole rule, since a key array carries
+/// Probes with [`KeyHashes`] first and returns the walked keys untouched
+/// when nothing repeats, which is the overwhelmingly common case (#1514).
+/// Only a document that actually carries a repeat pays for the
+/// `IndexSet`, whose `insert` keeps the first occurrence's position and
+/// discards later equal ones -- the whole rule, since a key array carries
 /// no values for "last value wins" to choose between.
 pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<String> {
     let keys = fields.keys();
     if !collapse {
+        return keys;
+    }
+    let mut probe = KeyHashes::with_capacity(keys.len());
+    if !keys
+        .iter()
+        .any(|key| probe.insert(key_hash(key.as_bytes())))
+    {
         return keys;
     }
     let mut seen: IndexSet<String> = IndexSet::with_capacity(keys.len());
@@ -880,5 +1016,87 @@ pub trait DocumentElements: Sized + Copy + Clone {
             elems = rest;
         }
         cursors
+    }
+}
+
+#[cfg(test)]
+mod key_hash_tests {
+    use super::{key_hash, KeyHashes};
+
+    /// The set answers "already seen" exactly for repeated hashes, and
+    /// `len` counts distinct ones — the two properties `census` derives
+    /// its whole answer from.
+    #[test]
+    fn key_hashes_reports_repeats_and_counts_distinct_1514() {
+        let mut seen = KeyHashes::with_capacity(4);
+        assert!(!seen.insert(key_hash(b"a")));
+        assert!(!seen.insert(key_hash(b"b")));
+        assert!(seen.insert(key_hash(b"a")), "second `a` is a repeat");
+        assert!(!seen.insert(key_hash(b"c")));
+        assert_eq!(seen.len(), 3);
+    }
+
+    /// A table built with no capacity hint must grow correctly, because
+    /// the streaming callers cannot count their keys up front. Growing
+    /// rehashes from the stored hashes, so nothing may be lost or
+    /// duplicated across the resize.
+    #[test]
+    fn key_hashes_grows_without_losing_entries_1514() {
+        const N: usize = 5_000;
+        let mut seen = KeyHashes::default();
+        assert!(seen.is_empty());
+        for i in 0..N {
+            let key = alloc::format!("k{i}");
+            assert!(
+                !seen.insert(key_hash(key.as_bytes())),
+                "{key} is the first of its kind"
+            );
+        }
+        assert_eq!(seen.len(), N, "every distinct key survived the growth");
+        for i in 0..N {
+            let key = alloc::format!("k{i}");
+            assert!(seen.insert(key_hash(key.as_bytes())), "{key} repeats");
+        }
+        assert_eq!(seen.len(), N, "a repeat adds nothing");
+    }
+
+    /// Zero is the empty-slot marker, so a key hashing to zero has to be
+    /// folded onto another value rather than read back as "empty" — which
+    /// would let it repeat forever undetected.
+    #[test]
+    fn key_hashes_handles_a_zero_hash_1514() {
+        let mut seen = KeyHashes::with_capacity(2);
+        assert!(!seen.insert(0));
+        assert!(seen.insert(0), "a zero hash must still register as seen");
+        assert_eq!(seen.len(), 1);
+    }
+
+    /// The hash must depend on length as well as content, or `"ab"` and
+    /// `"ab\0"` would collide constantly through the tail path and turn
+    /// every wide object into an exact-resolution pass.
+    #[test]
+    fn key_hash_separates_length_from_content_1514() {
+        assert_ne!(key_hash(b"ab"), key_hash(b"ab\0"));
+        assert_ne!(key_hash(b""), key_hash(b"\0"));
+        assert_eq!(key_hash(b"abcdefghij"), key_hash(b"abcdefghij"));
+    }
+
+    /// Low bits carry the index, so a run of keys differing only in their
+    /// last byte must not pile into one probe chain. Without the
+    /// splitmix64 finalizer this distribution collapses.
+    #[test]
+    fn key_hash_spreads_the_low_bits_1514() {
+        let mut buckets = [0usize; 16];
+        for i in 0..4096u32 {
+            let key = alloc::format!("field_{i:06}");
+            buckets[(key_hash(key.as_bytes()) & 15) as usize] += 1;
+        }
+        let (lo, hi) = (
+            *buckets.iter().min().expect("16 buckets"),
+            *buckets.iter().max().expect("16 buckets"),
+        );
+        // Perfectly uniform is 256 per bucket; allow a wide margin so this
+        // pins "not degenerate", not the exact hash function.
+        assert!(lo > 150 && hi < 400, "buckets {buckets:?}");
     }
 }
