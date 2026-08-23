@@ -2941,8 +2941,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     }
 
     // Parse the jq program (use Yq mode for extended identifier syntax like kebab-case)
-    let mut program = jq::parse_program_with_mode(&filter_str, jq::ParserMode::Yq)
-        .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
+    let mut program = jq::parse_program_with_mode_and_extensions(
+        &filter_str,
+        jq::ParserMode::Yq,
+        args.jq_extensions,
+    )
+    .map_err(|e| anyhow::anyhow!("parse error: {e}"))?;
 
     // Parse variables
     let context = parse_variables(&args)?;
@@ -2967,7 +2971,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         .split_exp
         .as_deref()
         .map(|s| {
-            jq::parse_program_with_mode(s, jq::ParserMode::Yq)
+            jq::parse_program_with_mode_and_extensions(s, jq::ParserMode::Yq, args.jq_extensions)
                 .map(|p| jq::substitute_vars(&p.expr, all_vars.iter().copied()))
                 .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))
         })
