@@ -50058,6 +50058,36 @@ mod tests {
         );
     }
 
+    /// Object-input mirror of the two tests above (#1477 review) --
+    /// `Expr::Iterate`'s array and object loop bodies share
+    /// `iterate_element_step` since #1477's unification, but the early-stop
+    /// path had coverage only from the array side. `file_index` isn't used
+    /// here (it's array-position-keyed, not meaningful for an object's own
+    /// entries); `key` plays both roles instead.
+    #[test]
+    fn test_label_catches_its_own_bare_break_with_path_context_object() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"{"a":10,"b":20}"#,
+                &[],
+                r#"label $out | .[] | if key == "a" then break $out else key end"#
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_label_catches_partial_break_with_path_context_object() {
+        assert_eq!(
+            eval_all_outputs(
+                br#"{"a":10,"b":20}"#,
+                &[],
+                r#"label $out | .[] | if key == "b" then break $out else key end"#
+            ),
+            vec![r#""a""#]
+        );
+    }
+
     #[test]
     fn test_label_continues_pipe_with_path_context() {
         assert_eq!(
