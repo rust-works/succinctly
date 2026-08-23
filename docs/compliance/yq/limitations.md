@@ -279,22 +279,6 @@ jq's queue is `Vec<(OwnedValue, u32, u32)>`. Reusing jq's queue would push YAML 
 through `OwnedValue` and silently lose all three, so real support needs a second,
 cursor-native queue. See #1507.
 
-### `gsub`, `scan`, `splits` are not real yq builtins at all
-
-Confirmed via the pinned binary's lexer rejecting all three outright, at any arity
-([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg `gsub`
-diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:
-
-```bash
-$ echo '"aaa"' | yq 'gsub("a";"X")'      # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\")"
-$ echo '"aaa"' | yq 'gsub("a";"X";"g")'  # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\";\"g\"..."
-$ echo '"aaa"' | yq 'scan("a")'          # Error: 1:1: lexer: invalid input text "scan(\"a\")"
-```
-
-| Filter on `"aaa"` | real yq | succinctly |
-|---|---|---|
-| `gsub("a";"X";"g")` | `Error: 1:1: lexer: invalid input text` | `"XXX"` |
-
 ### 3-argument `sub(re; s; flags)` — resolved, real yq ignores everything past the pattern
 
 [#1122](https://github.com/rust-works/succinctly/issues/1122) resolved what had looked like an
@@ -338,7 +322,8 @@ $ echo '"bab"' | succinctly yq 'sub("a*"; "X")'   # "XbXbX"  (matches)
 
 Deliberately **not** extended to `gsub`/`scan`/`splits` (not real yq builtins at all, per
 #1436 — there's no oracle for succinctly's own yq-mode extensions to diverge from, so they
-stay on the jq-style iteration) or to `split(re;flags)` (a real yq builtin, but with its own
+stay on the jq-style iteration; see [Extensions](#extensions) below — all three are gated
+behind `--jq-extensions` since #1512) or to `split(re;flags)` (a real yq builtin, but with its own
 separate, still-unresolved mystery, #1439 above — #1255's fix alone wouldn't make it
 oracle-correct given that deeper algorithm mismatch, so the two are deliberately decoupled
 rather than guessed at together).
@@ -579,12 +564,41 @@ must be verified in the other (ADR-0018 rule 2).
 
 ## Extensions
 
-succinctly adds capabilities neither reference has — `at_offset`/`at_position`,
-`leaf_paths`, `@dsv`. Under ADR-0018 rule 5 these are a third category: permitted where
-marked as extensions and where they change the behaviour of no filter the reference also
-accepts. They are documented in
-[yq Query Language Reference](../../reference/yq-language.md) and in
-[CLAUDE.md](../../../CLAUDE.md), not here — an extension is not a divergence.
+succinctly's extension surface falls into two groups. Under ADR-0018 rule 5 both are a
+third category: permitted where marked as extensions and where they change the behaviour of
+no filter the reference also accepts — an extension is not a divergence.
+
+**Wholly new syntax, unconditional** — `at_offset`/`at_position`, `@dsv`. Neither jq nor yq
+has anything resembling these; there is no reference token to gate them against.
+
+**jq-styled syntax real yq's lexer rejects, gated behind `--jq-extensions`, off by default
+([#1512](https://github.com/rust-works/succinctly/issues/1512))** — `paths`, `getpath`,
+`leaf_paths`, `tostream`/`fromstream`/`truncate_stream`, `IN`, `ltrimstr`, `limit`,
+`isempty`, `debug`, `infinite`, `isnan`, and `gsub`/`scan`/`splits`. `succinctly yq` matches
+real yq's rejection of all of these by default; the flag opts back into the jq-compatible
+surface. `leaf_paths` is grouped here even though it isn't real jq syntax either — real jq
+itself rejects it too (`leaf_paths/0 is not defined`; it's a succinctly-only invention
+modeled on a jq community recipe, see CLAUDE.md) — because, from `succinctly yq`'s
+syntax-surface point of view, it's the same kind of thing as the rest of this list: extra,
+off by default.
+
+`gsub`/`scan`/`splits` specifically: real yq's lexer rejects all three outright, at any
+arity ([#1436](https://github.com/rust-works/succinctly/issues/1436)) — this isn't "3-arg
+`gsub` diverges," it's that yq's grammar has no `gsub`/`scan`/`splits` token at all:
+
+```bash
+$ echo '"aaa"' | yq 'gsub("a";"X")'      # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\")"
+$ echo '"aaa"' | yq 'gsub("a";"X";"g")'  # Error: 1:1: lexer: invalid input text "gsub(\"a\";\"X\";\"g\"..."
+$ echo '"aaa"' | yq 'scan("a")'          # Error: 1:1: lexer: invalid input text "scan(\"a\")"
+```
+
+| Filter on `"aaa"` | real yq | succinctly (default) | succinctly `--jq-extensions` |
+|---|---|---|---|
+| `gsub("a";"X";"g")` | `Error: 1:1: lexer: invalid input text` | parse error, names the flag | `"XXX"` |
+
+The full builtin list is documented, with examples, in
+[yq Query Language Reference](../../reference/yq-language.md#gated-jq-builtins---jq-extensions)
+and in [CLAUDE.md](../../../CLAUDE.md) — not enumerated a second time here.
 
 **Not extensions, though a draft of this page listed them as such:** `--front-matter`,
 `--split-exp`, and cross-file evaluation. All three are real yq surface —

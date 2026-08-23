@@ -102,6 +102,7 @@ syq '.users[].name' config.yaml
 syq -o json '.' config.yaml         # Output as JSON
 syq '.spec.containers[]' k8s.yaml
 syq --doc 0 '.' multi-doc.yaml      # First document only
+syq --jq-extensions '[paths]' config.yaml  # opt into jq-only builtins yq's lexer rejects (#1512)
 syq-locate config.yaml --offset 42
 syq-locate config.yaml --line 5 --column 10
 
@@ -301,7 +302,7 @@ printf 'a:\n  x: 1\nb:\n  x: 2\n  y: 3\n' | succinctly yq '.a *=n .b'  # a: {x: 
 
 ### `sub` divergence (yq mode only) — `gsub`/`scan`/`splits` aren't real yq builtins at all
 
-Real yq's bare, 2-arg `sub(re; s)` replaces *every* match, not just the first — jq's `sub` = first match only, `gsub` = all matches; yq's bare `sub` behaves like jq's `gsub` unconditionally (`"aaa" | sub("a";"X")` => `"XXX"` in yq, `"Xaa"` in jq, confirmed against yq v4.53.3). `gsub` is not a real yq builtin at any arity — its lexer rejects `gsub(...)` outright, same as `scan`/`splits` (confirmed live against yq v4.53.3, #1436) — so there's no jq-model "match" to speak of for succinctly's own `gsub` in yq mode; it's an unopposed succinctly behavior, not a verified divergence.
+Real yq's bare, 2-arg `sub(re; s)` replaces *every* match, not just the first — jq's `sub` = first match only, `gsub` = all matches; yq's bare `sub` behaves like jq's `gsub` unconditionally (`"aaa" | sub("a";"X")` => `"XXX"` in yq, `"Xaa"` in jq, confirmed against yq v4.53.3). `gsub` is not a real yq builtin at any arity — its lexer rejects `gsub(...)` outright, same as `scan`/`splits` (confirmed live against yq v4.53.3, #1436) — so there's no jq-model "match" to speak of for succinctly's own `gsub` in yq mode; it's a succinctly extension (ADR-0018 rule 5), gated behind `--jq-extensions` and off by default since #1512, not a verified divergence.
 
 Real yq's 3-arg `sub(re; replacement; flags)` never evaluates `replacement` or `flags` at all — it always performs a global replace-with-empty-string using only the pattern (near-certainly an upstream Go bug reading its replacement from a fixed AST slot that's empty once arity exceeds 2, not a designed feature; confirmed live that an `error(...)` in either position never fires). Per ADR-0018 rule 3, succinctly reproduces this bug-for-bug rather than "fixing" it into jq's model (`"aaa" | sub("a";"X";"g")` => `""` in both yq and succinctly yq mode; flags like `"i"` are silently ignored, and a 4th+ argument is accepted and discarded, matching real yq's own parser leniency — #1122).
 
@@ -420,6 +421,13 @@ This divergence is intentional: `leaf_paths` uses a tree-structural
 definition of "leaf" (no children), which the community recipe's
 type-based `scalars` filter doesn't fully capture. See
 [collect_leaf_paths](src/jq/eval.rs) and issue #771 for the full rationale.
+
+**In `succinctly yq`**, `leaf_paths` (along with `paths`, `getpath`, `limit`,
+`gsub`/`scan`/`splits`, and the rest of the jq-only surface real yq's lexer
+rejects) is gated behind `--jq-extensions` and off by default since #1512 —
+`succinctly jq` above is unaffected either way. See
+[docs/reference/yq-language.md](docs/reference/yq-language.md#gated-jq-builtins---jq-extensions)
+for the full list.
 
 ## Feature Flags
 
