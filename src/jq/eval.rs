@@ -20930,32 +20930,33 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`; that is a
 /// different construct and already correct.)
 ///
-/// The operand is evaluated with `optional: false` even when this call is
-/// `last(f)?`, and the error is suppressed here instead: `last` has to tell
-/// "the stream was empty" (answer `null`) from "the operand raised and `?`
-/// swallowed it" (answer nothing), and once `eval_single` has flattened a
-/// swallowed error into `None` those two are indistinguishable. Oracle:
-/// `last(empty)?` is `null` but `last(error("x"))?` is empty.
+/// No local `optional` handling is needed for `last(f)?`: post-#693,
+/// `Expr::Optional(inner)` evaluates `inner` with the *ambient* `optional`
+/// (never forced `true`) and catches the resulting `Error`/`Partial(_,
+/// Error)` itself, one layer out, so this function's own `optional`
+/// parameter is always `false` on every dispatch path that can reach it
+/// today. `last(empty)?` still answers `null` and `last(error("x"))?` is
+/// still empty — that split is entirely the outer `Expr::Optional`/
+/// `eval_try` boundary's job, not this function's.
 fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let result = eval_single::<W, S>(expr, value, false);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::One(v),
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => match vs.into_iter().last() {
+        QueryResult::Many(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::One(last),
             None => QueryResult::Owned(OwnedValue::Null),
         },
         QueryResult::Owned(v) => QueryResult::Owned(v),
-        QueryResult::ManyOwned(vs) => match vs.into_iter().last() {
+        QueryResult::ManyOwned(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
             None => QueryResult::Owned(OwnedValue::Null),
         },
         QueryResult::None => QueryResult::Owned(OwnedValue::Null),
-        QueryResult::Error(_) if optional => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -20964,7 +20965,6 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `last(1,2,error("x"))` raises, it does not answer `2`) — so a
         // `Partial` just surfaces its control, dropping the prefix, the
         // same as `reduce`'s input-stream handling.
-        QueryResult::Partial(_, Control::Error(_)) if optional => QueryResult::None,
         QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
         QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
@@ -28508,34 +28508,38 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: last(expr) - output only the last value from expr (stream version)
+///
+/// Mirrors [`eval_last_expr`]'s `null`-for-an-empty-stream rule (#1521); see
+/// its doc comment for the rule and for why no local `optional` handling is
+/// needed here either. Unlike `eval_last_expr`, this function is never
+/// actually reached from parsed `succinctly jq`/`succinctly yq` filter text
+/// -- `last(expr)` always parses to `Expr::LastExpr`, not
+/// `Builtin::LastStream` (see `builtin_last_stream_propagates_bare_halt`) --
+/// so this update exists purely to keep the two implementations in sync.
 fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Same `null`-for-an-empty-stream rule and same `optional` handling as
-    // [`eval_last_expr`]; see its doc comment for why (#1521).
-    let result = eval_single::<W, S>(expr, value, false);
+    let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
         QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
         QueryResult::Owned(v) => QueryResult::Owned(v),
-        QueryResult::Many(results) => match results.into_iter().last() {
+        QueryResult::Many(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(to_owned(&last)),
             None => QueryResult::Owned(OwnedValue::Null),
         },
-        QueryResult::ManyOwned(results) => match results.into_iter().last() {
+        QueryResult::ManyOwned(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
             None => QueryResult::Owned(OwnedValue::Null),
         },
         QueryResult::None => QueryResult::Owned(OwnedValue::Null),
-        QueryResult::Error(_) if optional => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
         // Same semantics as `eval_last_expr`: `last` cannot short-circuit,
         // so a `Partial` just surfaces its control, dropping the prefix.
-        QueryResult::Partial(_, Control::Error(_)) if optional => QueryResult::None,
         QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
         QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),

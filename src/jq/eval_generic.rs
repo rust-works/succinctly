@@ -3327,12 +3327,14 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    // `last` evaluates its operand with `optional: false` even for `last(f)?`
-    // and suppresses the error itself below: it must tell "the stream was
-    // empty" (jq answers `null`) from "the operand raised and `?` swallowed
-    // it" (jq answers nothing), and those are indistinguishable once flattened
-    // to `None` (#1521). `first` keeps the existing propagation.
-    let result = eval_single::<S, V>(inner, value, !want_last && optional, cursor);
+    // No local `optional` handling is needed for `last(f)?` here: post-#693,
+    // `Expr::Optional(inner)`'s own dispatch evaluates `inner` with the
+    // *ambient* `optional` (never forced `true`) and catches the resulting
+    // `Error`/`Partial(_, Error)` itself, one layer out. So `optional` is
+    // always `false` on every dispatch path that reaches this function
+    // today, and `last(empty)?` (`null`) vs. `last(error("x"))?` (empty)
+    // stays correct entirely via that outer boundary, not anything here.
+    let result = eval_single::<S, V>(inner, value, optional, cursor);
     if want_last {
         match result {
             GenericResult::One(v) => GenericResult::One(v),
@@ -3373,7 +3375,6 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
             // produces exactly one output -- an empty operand answers the
             // seed. `first` is deliberately not symmetric (#1521).
             GenericResult::None => GenericResult::Owned(OwnedValue::Null),
-            GenericResult::Error(_) if optional => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
             GenericResult::Halt(code) => GenericResult::Halt(code),
@@ -3381,7 +3382,6 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
             // last one until the stream is exhausted -- so a `Partial` just
             // surfaces its trailing control, dropping the prefix (matches
             // `eval::eval_last_expr`).
-            GenericResult::Partial(_, Control::Error(_)) if optional => GenericResult::None,
             GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
             GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
             GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),

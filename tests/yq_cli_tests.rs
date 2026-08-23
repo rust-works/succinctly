@@ -8781,6 +8781,32 @@ fn test_first_last_wrapping_computation_gets_scientific_notation_997() -> Result
     Ok(())
 }
 
+/// `last(f)`/`first(f)` are succinctly-only extensions in yq mode -- real yq
+/// (Homebrew v4.53.3) rejects both outright with "lexer: invalid input
+/// text", live-confirmed -- so #1521's "empty operand answers `null`" rule
+/// has no yq oracle to check against. succinctly mirrors jq's own semantics
+/// here by design; this pins that choice on both dispatch routes so a future
+/// change to only one of `eval_generic.rs`'s `eval_first_or_last_generic` or
+/// `eval.rs`'s `eval_last_expr` can't silently regress the other for yq mode.
+#[test]
+fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
+    // M2/streaming route.
+    let (out, code) = run_yq_stdin("last(.a[])", "a: []\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    // DOM fallback route (`--sort-keys` forces it past `can_use_m2_streaming`).
+    let (out, code) = run_yq_stdin("last(.a[])", "a: []\n", &["-o=json", "-I=0", "--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    // `first` stays asymmetric here too, same as jq mode (#1521).
+    let (out, code) = run_yq_stdin("first(.a[])", "a: []\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "");
+    Ok(())
+}
+
 /// `succinctly jq` (JSON mode) must be completely unaffected: the fix is
 /// gated on `ControlEscape::Yq`, and jq mode's own analogous formatter gap
 /// (different threshold, out of scope for #997) keeps its pre-existing
