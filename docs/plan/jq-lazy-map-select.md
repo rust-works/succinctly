@@ -266,6 +266,17 @@ variants — `JqValue::Array` already stores per-element cursors (its own "Phase
 Optimization"), so a `LazySeq` converts into it by pulling forward and wrapping each element,
 reusing the existing `write_json` code path entirely.
 
+> **Corrected by Slice 3's implementation (#757).** The `JqValue` half held; the
+> `stream_lazy_keys_*` half did not. Those two generalize trivially *because keys are plain
+> strings* — they write at a fixed top-level indent and never recurse. A `LazySeq` element is
+> an arbitrary value that must render at a **nested** indent, and neither
+> `DocumentCursor::stream_json` nor `stream_yaml` carries a current-indent parameter to render
+> at. So Slice 3 did need new surface after all, though not a new *type family*:
+> `DocumentCursor` gained `stream_sequence_json`/`stream_sequence_yaml` plus a
+> `supports_sequence_streaming` probe, defaulting to "unsupported" exactly as `stream_json`
+> already did. `YamlCursor`'s YAML impl is a straight delegation to the `stream_yaml_sequence`
+> that `--slurp` had used since #478, which is why the change stayed small.
+
 ## Open risks for an implementer to sanity-check
 
 1. `Rc::make_mut` in `push_map` clones `instructions` if a `LazySeq` was previously cloned
@@ -474,7 +485,22 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
 - Slice 2 (plain container `map`/`select` — `Builtin::Map`'s first native arm):
   [#725](https://github.com/rust-works/succinctly/issues/725), depends on #724 landing first
   for the shared `LazySeq` machinery.
-- Slice 3 (CLI streaming-output integration): deferred, not yet filed.
+- Slice 3 (CLI streaming-output integration):
+  [#757](https://github.com/rust-works/succinctly/issues/757) — **landed**. Two things the
+  scoping did not anticipate:
+  - The issue's own "Tier 2" reading (whitelist `LazySeq`, add a `stream_lazy_seq_json` that
+    calls `materialize_atomic` then reuses `OwnedValue::stream_*`) turned out to be a no-op:
+    `GenericResult::stream_json`/`stream_yaml`'s `LazySeq` arms already did precisely that.
+  - The tension with `map`'s atomicity that pushed this out of #724/#725 dissolves once the
+    drain is separated from the conversion. `LazySeq::drain_atomic` settles the whole chain
+    up front while keeping cursors (`Copy`, pointer-sized), so a failing element can never
+    leave a truncated prefix — no element-of-lookahead buffering needed, and the deep
+    `OwnedValue` copy is what goes away.
+  - The payoff was mostly *correctness*, not throughput: routing `map` through the DOM path
+    had been collapsing duplicate mapping keys and dropping comments, anchors, flow style
+    and quoted-scalar style, and under `-I0` emitted nested containers at their parent's
+    indent (silent data loss). All were verified against the pinned yq v4.53.3 and are now
+    covered by `tests/data/yq-golden/cases/map_*`.
 
 ## Critical files
 
@@ -486,15 +512,20 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
   `test_generic_array_keys_unsorted_fallback_map_select`)
 - `src/jq/document.rs` — `DocumentCursor`/`DocumentFields`/`DocumentElements` cons-list
   traits this design builds on
-- `src/jq/stream.rs` — `stream_lazy_keys_json`/`_yaml`, the template for
-  `stream_lazy_seq_json`/`_yaml`
+- `src/jq/stream.rs` — `stream_lazy_keys_json`/`_yaml`, the intended template for
+  `stream_lazy_seq_json`/`_yaml` (see the correction above: Slice 3 used
+  `DocumentCursor::stream_sequence_*` and `src/yaml/light.rs`'s
+  `stream_yaml_sequence`/`stream_json_sequence` instead, because these two cannot render at a
+  nested indent)
 - `src/jq/eval.rs` — `EvalSemantics` trait (needs `EvalTag`), `map_over`/`builtin_map`, the
   atomicity precedent
 - `src/jq/lazy.rs` — `JqValue::LazyKeysArray`/`LazyIndexRange`, confirmed to need zero new
   variants
 - `src/bin/succinctly/jq_bench.rs` — existing `QueryType` variants to reuse for before/after
   measurement
-- `src/bin/succinctly/yq_runner.rs` — `can_use_m2_streaming` whitelist, Slice 3 (deferred)
+- `src/bin/succinctly/yq_runner.rs` — `can_use_m2_streaming` whitelist, Slice 3 (landed:
+  `Builtin::Map(f) => can_use_m2_streaming(f)`, recursing into the body for the same reason
+  `FirstExpr`/`LastExpr` do)
 
 ## Related
 
