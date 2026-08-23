@@ -1933,11 +1933,27 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
-/// (#987, Stage 3) and `Compare` (#1459, Stage 4). Everything else falls
-/// back to `eval_single` + [`drain_result`]. `Paren` is not optional
-/// cosmetics: `isempty(...)` consumes only its own parentheses, so
-/// `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and without this arm
-/// the fix would be a coin flip on spelling.
+/// (#987, Stage 3), `Compare` (#1459, Stage 4), and -- #1462, Stage 5 --
+/// `If`, `Try`/`Optional`, `Label`, `AsPattern`, `FuncDef` and `Limit`.
+/// Everything else falls back to `eval_single` + [`drain_result`]. `Paren`
+/// is not optional cosmetics: `isempty(...)` consumes only its own
+/// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
+/// without this arm the fix would be a coin flip on spelling.
+///
+/// **Why `FirstExpr`/`NthExpr` get no arm here, unlike `Limit`** (#1462):
+/// `first(f)`/`nth(n;f)` already emit *at most one* output no matter how
+/// large `f` is, and `each_take_first`/`each_take_nth` (Stage 2) already
+/// drive that single output through their own `eval_each` call on `f` --
+/// so a *wrapping* consumer's demand has nothing left to shrink; the one
+/// item either satisfies it or doesn't. `limit(n; f)` is different in kind:
+/// it forwards up to `n` outputs downstream, and Stage 2's `each_take_n`
+/// only bounded evaluation against its *own* `n`, not against whatever a
+/// wrapping consumer might want fewer of -- confirmed live,
+/// `isempty(nth(0; limit(3; 1, ("B"|stderr))))` leaked before this arm
+/// existed even though neither `FirstExpr` nor `NthExpr` needed one:
+/// `each_take_nth` already called `eval_each` on `Limit{3, G}`, and it was
+/// *that* callee falling back to eager `drain_result` that leaked --
+/// wiring `Limit` alone fixes every nesting of it.
 fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -2000,7 +2016,471 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // optimization -- see `each_inputs` for why the fallback below is
         // not a safe default for this particular producer (#1309).
         Expr::Builtin(Builtin::Inputs) => each_inputs::<W, S>(sink),
+
+        // #1462 (Stage 5): branch *selection* was already lazy (`eval_fanout`
+        // evaluates only the taken branch) -- what wasn't is a generator
+        // *inside* that branch. `cond` itself stays eager, mirroring
+        // `eval_if`/`eval_fanout` exactly: this fix is scoped to the taken
+        // branch's body, the same way `Expr::Compare` above leaves `cond`-less
+        // operand evaluation alone.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => each_if::<W, S>(cond, then_branch, else_branch, value, optional, sink),
+
+        // `.[EXPR]?`/`.[S:E]?`: same carve-out as `eval_single`'s matching
+        // arm above -- `?` here guards only the final index/slice step, not
+        // the key/bounds sub-expression, and `IndexExpr`/`SliceExpr` are
+        // never multi-output generators, so there is nothing for a sink to
+        // shrink here; forward `optional: true` directly rather than
+        // wrapping in `each_try`, exactly as `eval_single` forwards to
+        // `eval_index_expr`/`eval_slice_expr` directly.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            eval_each::<W, S>(inner, value, true, sink)
+        }
+        // `E?` is sugar for `try E` (no catch handler) -- same ambient-
+        // `optional` forwarding rationale as `eval_single`'s own arm (#693).
+        Expr::Optional(inner) => each_try::<W, S>(inner, None, value, optional, sink),
+        Expr::Try { expr, catch } => {
+            each_try::<W, S>(expr, catch.as_deref(), value, optional, sink)
+        }
+
+        Expr::Label { name, body } => each_label::<W, S>(name, body, value, optional, sink),
+
+        // The parser builds `Expr::As` for the bare-`$var` spelling
+        // (`EXPR as $x | body`) and reserves `Expr::AsPattern` for anything
+        // destructured (`[$a,$b]`, `{a:$x}`, `?//`) — confirmed live: the
+        // divergence table's own `first(1 as $x | (1,("B"|stderr)))` repro
+        // parses to `Expr::As`, not `Expr::AsPattern`, so both need an arm.
+        Expr::As { expr, var, body } => each_as::<W, S>(expr, var, body, value, optional, sink),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => each_as_pattern::<W, S>(expr, patterns, body, value, optional, sink),
+
+        // `def name(params): body; then` is pure, evaluation-free AST
+        // substitution (`eval_func_def`'s whole body is `expand_func_calls`
+        // then evaluate) -- so unlike every other arm here, there is no
+        // producer logic of its own to make demand-aware. Routing the
+        // expanded tree through `eval_each` instead of `eval_single` is the
+        // entire fix: it lets a wrapping consumer's sink reach whatever
+        // native lazy arm (`Comma`, `Pipe`, ...) the expansion exposes,
+        // rather than stopping at this node and materializing the whole
+        // thing via `drain_result`'s fallback. Confirmed live that the
+        // *top-level* `def f: (1,("B"|stderr)); first(f)` already matched jq
+        // before this arm existed (`first`'s own `eval_first_expr` already
+        // reaches the expansion via `eval_single`, and is itself lazy) --
+        // the gap this arm closes is a `FuncDef` *nested inside* another
+        // consumer's argument, e.g. `isempty(def f: (1,("B"|stderr)); f)`.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => {
+            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
+            eval_each::<W, S>(&expanded_then, value, optional, sink)
+        }
+
+        // #1462 (Stage 5): demand-forwarding through a nested consumer.
+        // `each_take_n` (Stage 2) already stops asking `expr` for more once
+        // `n` outputs exist, but it materializes all `n` into a `QueryResult`
+        // before this arm's fallback `drain_result` would get a chance to
+        // forward a wrapping consumer's own, possibly *smaller*, demand --
+        // so `isempty(limit(3; 1, ("B"|stderr)))` evaluated all 3 candidates
+        // to build `limit`'s answer before `isempty` ever saw the first one.
+        // `each_limit` below forwards every output straight to `sink` and
+        // stops on whichever comes first, `n` or `sink` itself.
+        Expr::Limit { n, expr } => each_limit::<W, S>(n, expr, value, optional, sink),
+
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
+    }
+}
+
+/// Lazy twin of [`eval_if`]: `cond` is evaluated eagerly (branch selection
+/// was already lazy -- `eval_fanout` only ever evaluates the taken branch),
+/// but the taken branch's own body is pushed through `eval_each` rather than
+/// materialized via `eval_single`, so a generator inside it honours the
+/// wrapping consumer's demand (#1462: `first(if true then (1,("B"|stderr))
+/// else 9 end)` no longer evaluates the `stderr` branch).
+///
+/// Mirrors `eval_fanout`'s own bit-by-bit walk (multi-output `cond`, e.g.
+/// `if (true,false) then "a" else "b" end`, #378) minus the borrowed/owned
+/// accumulator -- the sink *is* the accumulator here, same as `eval_each`'s
+/// `Comma` arm.
+fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
+    let mut bits: Vec<bool> = Vec::new();
+    let cond_control = push_truthiness(cond_result, &mut bits);
+
+    for bit in bits {
+        let branch = if bit { then_branch } else { else_branch };
+        match eval_each::<W, S>(branch, value.clone(), optional, sink) {
+            Flow::Exhausted => {}
+            stopped_or_escaped => return stopped_or_escaped,
+        }
+    }
+
+    match cond_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Lazy twin of [`eval_try`]: pushes `expr`'s own outputs straight to `sink`,
+/// then -- only on a *bare* escape, i.e. `Flow::Escaped`, whose own contract
+/// guarantees every output produced before it was already delivered -- runs
+/// the catch handler (if any) and forwards its outputs too. `catch` runs
+/// bound to the raised payload for `Error`, or `null` for `Break` (#562,
+/// real jq binds its own internal break marker there, not worth
+/// replicating); `Halt` is never caught, matching `Control`'s own
+/// pass-through guarantee.
+///
+/// `Flow` makes the eager `eval_try`'s `Partial(prefix, control)` split
+/// unnecessary: there, the prefix and the control share one return slot, so
+/// "some outputs, then an error" needs its own arm distinct from "a bare
+/// error". Here the prefix is already gone -- pushed to `sink` as it was
+/// produced -- so both collapse into the same `Escaped` arm (plan doc,
+/// "Partial disappears from the lazy path").
+///
+/// If `sink` itself is satisfied before `expr` would have errored,
+/// `eval_each` returns `Flow::Stopped` rather than `Escaped`, and this
+/// function propagates it verbatim without ever running `catch` --
+/// matching jq exactly: `first(try (1, error("x")) catch "c")` is `1`, and
+/// jq never even reaches `error`, let alone `catch`.
+fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match eval_each::<W, S>(expr, value, optional, sink) {
+        Flow::Escaped(Control::Error(e)) => match catch {
+            Some(catch_expr) => {
+                eval_each_owned::<S>(catch_expr, &e.payload(), optional, &mut |o| {
+                    sink(Item::Owned(o))
+                })
+            }
+            None => Flow::Exhausted,
+        },
+        Flow::Escaped(Control::Break(_)) => match catch {
+            Some(catch_expr) => {
+                eval_each_owned::<S>(catch_expr, &OwnedValue::Null, optional, &mut |o| {
+                    sink(Item::Owned(o))
+                })
+            }
+            None => Flow::Exhausted,
+        },
+        // Halt is never caught (`Control`'s own guarantee); other terminal
+        // shapes (`Exhausted`, `Stopped`) pass straight through.
+        other => other,
+    }
+}
+
+/// Lazy twin of [`eval_label`]: pushes `body`'s outputs straight to `sink`,
+/// then -- only on a bare `Flow::Escaped(Control::Break(name))` matching this
+/// label, whose contract guarantees every prior output was already delivered
+/// -- swallows it, mirroring `eval_label`'s `QueryResult::Break(label) if
+/// label == name => QueryResult::None` (and its `Partial` sibling, which
+/// collapses into the same arm here for the same reason `each_try` above
+/// does). Every other outcome -- a non-matching break, a bare or trailing
+/// `Error`/`Halt`, `Exhausted`, or a satisfied `Stopped` -- propagates
+/// unchanged; a `Stopped`'s own `pending` is left for whichever consumer
+/// ultimately reads it to decide, not intercepted here.
+fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    name: &str,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match eval_each::<W, S>(body, value, optional, sink) {
+        Flow::Escaped(Control::Break(label)) if label == name => Flow::Exhausted,
+        other => other,
+    }
+}
+
+/// Lazy twin of [`eval_as`] (#1462): the bind expression (`expr`) is
+/// evaluated eagerly, exactly as `eval_as` already does -- mirroring
+/// `each_if`'s decision to leave `cond` eager, this fix is scoped to what
+/// runs *per bound value*, not to the binding itself. Each bound value's
+/// `body` is then pushed through `eval_each` rather than materialized via
+/// `eval_single`, so `isempty(1 as $x | (1,("B"|stderr)))` no longer
+/// evaluates the `stderr` branch. The parser reserves this bare-`$var` node
+/// for `Expr::As`; [`each_as_pattern`] below is its destructuring sibling
+/// (`Expr::AsPattern`, `?//`-chains included).
+fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    var: &str,
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
+    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
+        match bound_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => return Flow::Exhausted,
+            QueryResult::Error(e) => return Flow::Escaped(Control::Error(e)),
+            QueryResult::Break(label) => return Flow::Escaped(Control::Break(label)),
+            QueryResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
+
+    for bound_val in bound_values {
+        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+        match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+
+    match bound_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Lazy twin of [`eval_as_pattern`]: the bind expression (`expr`) is
+/// evaluated eagerly, exactly as `eval_as_pattern` already does -- same
+/// reasoning as [`each_as`] above, its non-destructuring sibling. Each bound
+/// value's `body` (after `?//`-alternative substitution) is then pushed
+/// through `eval_each` rather than materialized, so
+/// `isempty([$x] as [$a] | (1,("B"|stderr)))`-shaped destructuring binds no
+/// longer evaluate a trailing `stderr` branch either.
+fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    patterns: &[Pattern],
+    body: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
+    let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
+        match bound_result.materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => return Flow::Exhausted,
+            QueryResult::Error(e) => return Flow::Escaped(Control::Error(e)),
+            QueryResult::Break(label) => return Flow::Escaped(Control::Break(label)),
+            QueryResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
+
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
+
+    for bound_val in bound_values {
+        match each_pattern_alternatives::<W, S>(
+            patterns,
+            &all_var_names,
+            body,
+            &bound_val,
+            &value,
+            optional,
+            sink,
+        ) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+
+    match bound_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Sink-based twin of [`try_pattern_alternatives`]: same `?//`-alternative
+/// fallthrough rule (a pattern-match failure, a body error, or a body break
+/// tries the next alternative unless this is the last one; halt never falls
+/// through), but each alternative's own successful outputs are pushed to
+/// `sink` as they're produced instead of collected -- so, exactly as that
+/// function's own doc comment requires, "each tried alternative's own
+/// partial output before its error/break is kept, not just the winning
+/// alternative's": those pushes already happened by the time an alternative
+/// fails, `sink` having seen them is what "kept" means here.
+///
+/// If `sink` itself is satisfied partway through an alternative,
+/// `eval_each` returns `Flow::Stopped` rather than `Escaped`, which this
+/// function propagates immediately rather than falling through to the next
+/// alternative -- once the consumer has what it wants, no further
+/// alternative is ever tried, matching `each_try`'s identical reasoning.
+fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    body: &Expr,
+    bound_val: &OwnedValue,
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let last_idx = patterns.len() - 1;
+    // #1366: a genuine `?//`-chain (2+ patterns) inverts real jq's
+    // duplicate-binding dedup rule relative to a bare pattern -- see
+    // `extract_pattern_bindings`'s own doc comment.
+    let invert_dedup = patterns.len() > 1;
+
+    for (i, pattern) in patterns.iter().enumerate() {
+        let is_last = i == last_idx;
+
+        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
+            Ok(b) => b,
+            Err(e) => {
+                if is_last {
+                    return Flow::Escaped(Control::Error(e));
+                }
+                continue;
+            }
+        };
+
+        let null_value = OwnedValue::Null;
+        let substituted_body = substitute_vars(
+            body,
+            as_var_refs(&bindings).chain(
+                all_var_names
+                    .iter()
+                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                    .map(|name| (name.as_str(), &null_value)),
+            ),
+        );
+
+        match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
+            Flow::Exhausted => return Flow::Exhausted,
+            Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1457: `Break` falls through like `Error`, not immediately
+            // like `Halt` -- same live-verified correction
+            // `try_pattern_alternatives` itself documents.
+            Flow::Escaped(Control::Error(e)) => {
+                if is_last {
+                    return Flow::Escaped(Control::Error(e));
+                }
+                continue;
+            }
+            Flow::Escaped(Control::Break(label)) => {
+                if is_last {
+                    return Flow::Escaped(Control::Break(label));
+                }
+                continue;
+            }
+            Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+        }
+    }
+
+    unreachable!(
+        "patterns is always non-empty by construction (the parser never \
+         builds an empty AsPattern), and every loop iteration above \
+         returns on its `is_last` pass"
+    )
+}
+
+/// Demand-forwarding twin of [`eval_limit`] (#1462, Stage 5): forwards every
+/// output of `expr` straight to `sink`, stopping the generator as soon as
+/// *either* `n` outputs have been forwarded or `sink` itself says to stop --
+/// whichever comes first. `eval_limit`'s own `each_take_n` (Stage 2) already
+/// stops `expr` at `n`, but only `n`; a wrapping consumer that is satisfied
+/// sooner (`isempty(limit(3; 1, ("B"|stderr)))`) had no way to say so until
+/// this arm existed, because `eval_limit` fully materializes its `n`-bounded
+/// answer before returning to any wrapping `drain_result`.
+///
+/// `n`'s own resolution duplicates `eval_limit`'s (jq's `def limit($n; exp):
+/// if $n > 0 then ... elif $n == 0 then empty else exp end`, #983) rather
+/// than sharing it -- the blast radius this design commits to for Stage 5 is
+/// `eval_each` alone, not touching `eval_limit`'s already-shipped body (same
+/// precedent as `resolve_limit`, a third independent copy for `path()`'s own
+/// context). `eval_each_with_a_never_stopping_sink_matches_eval_single_820`
+/// guards the two from drifting apart.
+fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
+    let n_value = match result_to_owned_full(n_result) {
+        Ok(None) => return Flow::Exhausted,
+        Ok(Some((v, _trailing))) => v,
+        Err(e) => return Flow::Escaped(e.into()),
+    };
+    let n = match n_value {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            i as usize
+        }
+        OwnedValue::Int(_)
+        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        | OwnedValue::Null
+        | OwnedValue::Bool(_) => return eval_each::<W, S>(expr, value, optional, sink),
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
+            return eval_each::<W, S>(expr, value, optional, sink);
+        }
+        _ => {
+            return Flow::Escaped(Control::Error(EvalError::new(
+                "limit requires non-negative integer",
+            )));
+        }
+    };
+
+    if n == 0 {
+        return Flow::Exhausted;
+    }
+
+    let mut count = 0usize;
+    let mut outer_stopped = false;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        count += 1;
+        if sink(item) == Demand::Stop {
+            outer_stopped = true;
+            Demand::Stop
+        } else if count >= n {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+
+    // The wrapping consumer, not our own `n` cap, is why the generator
+    // stopped -- propagate its verdict (and whatever `pending` came with it)
+    // verbatim, exactly as every other lazy arm does.
+    if outer_stopped {
+        return flow;
+    }
+    match flow {
+        // `n` outputs arrived (or the generator simply ran dry on its own):
+        // jq's own `foreach ... break $out` fires here, so a trailing
+        // control from an eager fallback past this point is dropped, exactly
+        // as `eval_limit`'s identical `Flow::Stopped { .. } => result` arm
+        // already drops it.
+        Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
+        // Fewer than `n` were produced, so the generator's own terminator is
+        // what `limit` reaches -- same policy as `eval_limit`'s `Escaped`
+        // arm (`[limit(3; 1,2,error("x"),4)]` raises).
+        Flow::Escaped(control) => Flow::Escaped(control),
     }
 }
 
@@ -33740,6 +34220,56 @@ mod tests {
             (b"null", "((1,2) == (10,20)), ((3,4) == (3,4))"),
             (b"null", "(1,2) | . == (1,2)"),
             (b"null", "[limit(2; (1,2,3) == (10,20))]"),
+            // #1462, Stage 5: `If`, `Try`/`Optional`, `Label`, `As`,
+            // `AsPattern` and `Limit` all gained native lazy arms. This
+            // differential is what guards each against drifting from the
+            // eager sibling it now shadows (`eval_if`/`eval_fanout`,
+            // `eval_try`, `eval_label`, `eval_as`, `eval_as_pattern`,
+            // `eval_limit`) -- every case below is deliberately still
+            // side-effect free (`stderr`/`input` ordering differences are
+            // the CLI-level tests' job, not this one's), so an always-
+            // `Continue` sink must deliver the identical values in the
+            // identical order.
+            (b"null", "if true then 1, 2 else 3 end"),
+            (b"null", "if false then 1 else 2, 3 end"),
+            (b"null", "(true, false) | if . then 1 else 2 end"),
+            (b"null", "if true then (1, error(\"x\"), 3) else 9 end"),
+            (b"null", "if true then (1, break $o) else 9 end"),
+            (b"null", "try (1, 2) catch 9"),
+            (b"null", "try (1, error(\"x\"), 3) catch 9"),
+            (b"null", "try (error(\"x\"), 1) catch (9, 10)"),
+            (b"null", "try (1, break $o) catch 9"),
+            (b"null", "(1, error(\"x\"))?"),
+            (b"null", "(1, 2)?"),
+            (b"null", "label $o | (1, 2, 3)"),
+            (b"null", "label $o | (1, break $o, 3)"),
+            (b"null", "label $o | (1, break $p, 3)"),
+            (b"null", "1 as $x | ($x, $x + 1)"),
+            (b"null", "(1, 2) as $x | ($x, $x + 10)"),
+            (b"null", "(1, error(\"x\"), 3) as $x | $x"),
+            (b"null", "1 as $x | (1, break $o)"),
+            (b"null", "[1, 2] as [$a, $b] | ($a, $b)"),
+            (b"null", "1 as $x ?// $y | ($x, $x)"),
+            (b"null", "(1, [2]) as $x ?// [$y] | ($x, $y)"),
+            (b"null", "def f: 1, 2, 3; f"),
+            (b"null", "def f: 1, 2; def g: f, f; g"),
+            (b"null", "def f(x): x, x + 1; f(5)"),
+            (b"null", "[limit(2; 1, 2, 3)]"),
+            (b"null", "[limit(0; 1, 2, 3)]"),
+            (b"null", "[limit(-1; 1, 2, 3)]"),
+            (b"null", "[limit(null; 1, 2, 3)]"),
+            (b"null", "[limit(3; 1, 2, error(\"x\"), 4)]"),
+            (b"null", "[limit(5; 1, 2)]"),
+            (b"null", "limit(\"x\"; 1, 2)"),
+            // Nested inside each other, and inside the previously-lazified
+            // arms, so every arm is also reached indirectly.
+            (
+                b"null",
+                "(1, 2) | if . == 1 then (10, 11) else (20, 21) end",
+            ),
+            (b"null", "[limit(2; if true then (1,2,3) else 9 end)]"),
+            (b"null", "def f: (1, 2); [limit(1; f)]"),
+            (b"null", "label $o | (1 as $x | ($x, $x)), 99"),
         ];
 
         for (json, src) in cases {

@@ -17995,6 +17995,139 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "BACA",
             0,
         ),
+        // ---- closed by #820 Stage 5 (#1462); these were leaking above -----
+        // `eval_each` gained native `If`/`Try`/`Optional`/`Label`/`As`/
+        // `AsPattern`/`FuncDef` arms and a demand-forwarding `Limit` arm, so
+        // a generator inside any of these -- reached through a consumer that
+        // has no native `eval_generic` routing of its own (`isempty`,
+        // `limit`, `nth`, `path`, ... -- NOT a bare `first(...)`/`last(...)`,
+        // which `eval_generic`'s own native arm intercepts before this
+        // subtree ever reaches `eval.rs`; that gap is #1461) -- now stops on
+        // the output that satisfies the consumer instead of running to
+        // completion first.
+        //
+        // `path(paths(if...))`: node `[0]`'s own `if`-filter now stops after
+        // its `true` branch's first output, so `path()`'s stop-after-first
+        // sink is satisfied before the `stderr` half of the comma is ever
+        // reached.
+        (
+            &[
+                "-c",
+                "path(paths(if .==1 then (true,(stderr|true)) else false end))",
+            ],
+            Some("[1,2,3]"),
+            "",
+            "jq: error (at <stdin>:0): Invalid path expression with result [0]",
+            5,
+        ),
+        // The `binary_fanout_each` left/right `halt_error` pair Stage 4 added
+        // (see the leaks table's own historical note): with `Expr::If` now
+        // lazy, neither operand ever evaluates `halt_error` at all, so both
+        // rows lose their stray `x` and agree with jq's own path error --
+        // including the second row, whose already-triggered halt no longer
+        // has anything to preempt it with.
+        (
+            &[
+                "-cn",
+                r#"path(1 == (if true then (1, ("x"|halt_error(3))) else empty end))"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
+        (
+            &[
+                "-cn",
+                r#"path((if true then (1, ("x"|halt_error(3))) else empty end) == 1)"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
+        // `Expr::Limit`'s own demand-forwarding gap: `each_take_n` (Stage 2)
+        // already stops asking its generator for more once `n` outputs
+        // exist, but materialized all of them before a *wrapping* consumer's
+        // own, possibly smaller, demand had any way to shrink that -- so
+        // `isempty` used to see `limit(3; ...)`'s full 3-item answer only
+        // after all 3 had already run.
+        (
+            &["-cn", r#"isempty(limit(3; 1, ("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `Expr::If`: branch *selection* was already lazy; the generator
+        // *inside* the taken branch was not.
+        (
+            &[
+                "-cn",
+                r#"isempty(if true then (1,("B"|stderr)) else 9 end)"#,
+            ],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `Expr::Try` and its `?` sugar (`Expr::Optional`).
+        (
+            &["-cn", r#"isempty(try (1,("B"|stderr)) catch 9)"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"isempty((1,("B"|stderr))?)"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `Expr::Label`: already correct when it wraps a satisfied consumer
+        // (`label $o | first(...)`, in the leaks-table history above) --
+        // this is the other direction, a label *inside* the consumer's own
+        // argument.
+        (
+            &["-cn", r#"isempty(label $o | (1,("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `Expr::As` (bare `$var`) and `Expr::AsPattern` (destructuring) --
+        // two distinct parser nodes for `EXPR as PATTERN | body`, so both
+        // need their own arm.
+        (
+            &["-cn", r#"isempty(1 as $x | (1,("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"isempty([1] as [$a] | (1,("B"|stderr)))"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `Expr::FuncDef`: pure AST substitution, so the fix is routing the
+        // *expanded* tree through `eval_each` instead of `eval_single` --
+        // the top-level `def f: (1,("B"|stderr)); first(f)` spelling already
+        // matched jq before this arm existed (`first`'s own
+        // `eval_first_expr` reaches the expansion through `eval_single`,
+        // which is itself already lazy); the gap was a `FuncDef` *nested*
+        // inside another consumer's argument, as here.
+        (
+            &["-cn", r#"isempty(def f: (1,("B"|stderr)); f)"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -18096,69 +18229,6 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "[false,false]\n",
             "BCAA",
             0,
-        ),
-        // #987 Stage 3 closed the bare-comma spelling of this shape
-        // (`path(paths((true,(stderr|true))))`, now in the "already match"
-        // table above) but not this `If`-wrapped one: `eval_each` has no
-        // native `Expr::If` arm, so node `[0]`'s own filter still falls
-        // back to eager `drain_result(eval_single(...))` for that one
-        // sub-expression, and the whole `If` runs to completion (both
-        // comma branches of its `then`) before `path()`'s stop-after-first
-        // sink ever sees `[0]`'s first truthy output. jq: no stderr, since
-        // its own generator never even reaches the `stderr` half of the
-        // comma before `path()` is satisfied by the `true` half.
-        (
-            &[
-                "-c",
-                "path(paths(if .==1 then (true,(stderr|true)) else false end))",
-            ],
-            Some("[1,2,3]"),
-            "",
-            "1jq: error (at <stdin>:0): Invalid path expression with result [0]",
-            5,
-        ),
-        // ---- `binary_fanout_each` drops the OUTER operand's `pending` -----
-        // `resolve_leaf` is the one consumer that reads `Flow::Stopped`'s
-        // `pending`, and this pair pins the left/right asymmetry that falls
-        // out of `binary_fanout_each`'s `abort.unwrap_or(outer)`: a `Halt`
-        // an eager-fallback operand had already triggered survives from the
-        // INNER (left) operand and is dropped from the OUTER (right) one.
-        // The drop is deliberate -- see `binary_fanout_each`'s own doc
-        // comment -- and it is the half that lands on jq's verdict, since
-        // jq's fully lazy `path()` never evaluates the `halt_error` at all
-        // and raises the path error instead.
-        //
-        // Both rows still diverge, and by the same Stage 5 residual rather
-        // than anything Stage 4 introduced: `Expr::If` has no lazy arm, so
-        // the `halt_error` is evaluated and writes `x` where jq writes
-        // nothing. Once Stage 5 lands neither operand evaluates it at all,
-        // so both rows lose the `x`, the second row's halt stops preempting
-        // the path error, and both move into the table above.
-        //
-        // Right operand (outer): pending dropped, so the path error wins --
-        // jq's own exit code and message, plus the stray `x`.
-        (
-            &[
-                "-cn",
-                r#"path(1 == (if true then (1, ("x"|halt_error(3))) else empty end))"#,
-            ],
-            None,
-            "",
-            "xjq: error (at <unknown>): Invalid path expression with result true",
-            5,
-        ),
-        // Left operand (inner): pending kept, so the already-triggered halt
-        // wins and the path error is never raised. jq: exit 5, same message
-        // as the row above.
-        (
-            &[
-                "-cn",
-                r#"path((if true then (1, ("x"|halt_error(3))) else empty end) == 1)"#,
-            ],
-            None,
-            "",
-            "x",
-            3,
         ),
     ];
 
