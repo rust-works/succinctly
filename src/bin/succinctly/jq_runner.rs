@@ -1670,6 +1670,19 @@ fn json_seq_ends(raw: &[u8]) -> Vec<usize> {
         .collect()
 }
 
+/// Sentinel `per_value` line meaning "no real position" (#1542 -- a
+/// `--seq` trailing record real jq itself never resolves). Never a real
+/// line number: every genuine line comes from an actual newline count or
+/// 1-based line index, bounded by the input's own byte length, and no real
+/// input has close to `u32::MAX` lines. [`InputLocations::resolve`] checks
+/// for it once, centrally, so every consumer of a `(source, line)` pair --
+/// [`get`](InputLocations::get)'s direct lookup *and* the shared
+/// `input`/`inputs` queue's `#1309` `ErrorAt::Live` path, which reads
+/// straight from [`per_value`](InputLocations::per_value) -- answers
+/// `<unknown>` the same way, rather than only the direct-lookup path
+/// checking a side flag `resolve` itself didn't know about.
+const UNKNOWN_LINE: u32 = u32::MAX;
+
 /// Source locations for the values returned by [`get_inputs`].
 ///
 /// Kept apart from the values and stored as `(source, line)` pairs: an owned
@@ -1680,17 +1693,10 @@ pub struct InputLocations {
     /// File name per source, `None` for stdin.
     files: Vec<Option<String>>,
     /// `(source index, 1-based line)` per value. Empty means there is no input
-    /// to point at (`-n`), which jq renders as `<unknown>`.
+    /// to point at (`-n`), which jq renders as `<unknown>`. A line of
+    /// [`UNKNOWN_LINE`] means the same thing for one specific value within
+    /// an otherwise-populated table (#1542).
     per_value: Vec<(u32, u32)>,
-    /// Set only by [`single`](Self::single) when its one value has no real
-    /// position to report (#1542 -- a `--seq` trailing record real jq itself
-    /// can't resolve). `per_value` still carries a placeholder `(0, 0)`
-    /// entry regardless, so [`per_value`](Self::per_value)'s queue-seeding
-    /// consumer (`#1309`'s `input`/`inputs` path) keeps its "one location
-    /// per value" invariant and never loses the document -- only
-    /// [`get`](Self::get)'s direct lookup (the common, non-`input`-builtin
-    /// path) answers `<unknown>` instead of resolving that placeholder.
-    unknown_single: bool,
 }
 
 impl InputLocations {
@@ -1698,7 +1704,6 @@ impl InputLocations {
         Self {
             files,
             per_value: Vec::new(),
-            unknown_single: false,
         }
     }
 
@@ -1708,7 +1713,8 @@ impl InputLocations {
     }
 
     /// Locations for a single value at an already-resolved location, or at
-    /// no location at all (`at.line.is_none()`, #1542).
+    /// no location at all (`at.line.is_none()`, #1542 -- stored as
+    /// [`UNKNOWN_LINE`]).
     ///
     /// Always pushes exactly one `per_value` entry regardless of `at`:
     /// slurp mode always produces exactly one value, so `get_inputs`'s
@@ -1722,8 +1728,7 @@ impl InputLocations {
     /// -c -s '., inputs'` prints `[]`.
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
-        locations.unknown_single = at.line.is_none();
-        locations.push(0, at.line.unwrap_or(0));
+        locations.push(0, at.line.map_or(UNKNOWN_LINE as usize, |line| line));
         locations
     }
 
@@ -1761,9 +1766,6 @@ impl InputLocations {
 
     /// Location of the value at `idx`.
     pub fn get(&self, idx: usize) -> InputLocation {
-        if self.unknown_single {
-            return InputLocation::unknown();
-        }
         match self.per_value.get(idx) {
             Some(&(src, line)) => self.resolve(src, line),
             None => InputLocation::unknown(),
@@ -1772,7 +1774,10 @@ impl InputLocations {
 
     /// The `(source, line)` pairs, in input order, for seeding the shared
     /// input queue (#1309). The queue carries the tag rather than the file
-    /// name; [`resolve`](Self::resolve) turns it back.
+    /// name; [`resolve`](Self::resolve) turns it back -- including a
+    /// [`UNKNOWN_LINE`] tag, so a value with no real position (#1542) still
+    /// answers `<unknown>` once it's popped back off the queue and resolved
+    /// via `ErrorAt::Live`, the same as it would through [`get`](Self::get).
     fn per_value(&self) -> &[(u32, u32)] {
         &self.per_value
     }
@@ -1780,6 +1785,9 @@ impl InputLocations {
     /// Turn a raw `(source, line)` -- as handed back by
     /// `jq::current_input_location` -- into a printable location.
     fn resolve(&self, src: u32, line: u32) -> InputLocation {
+        if line == UNKNOWN_LINE {
+            return InputLocation::unknown();
+        }
         InputLocation::at(
             self.files.get(src as usize).and_then(Option::as_deref),
             line as usize,
@@ -2516,10 +2524,28 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
+    // The stream's own trailing record, when real jq's incremental reader
+    // never resolves it (malformed, or an ambiguous bare number at true
+    // EOF -- see `seq_trailing_record_is_dropped`), is silently dropped
+    // from the *output* too, not just from the error-location computation
+    // (#1542): `printf '\x1e1\n\x1e2' | jq --seq -s '.'` gives `[1]` on
+    // real jq, not `[1,2]`, even though "2" alone is perfectly valid JSON.
+    // Computed once, up front, and checked only against the split's last
+    // element below -- the already-malformed case is caught either way
+    // (this check, or `seq_record_parses` failing on its own a few lines
+    // down), but the ambiguous-number case parses just fine on its own and
+    // needs this explicit exclusion to be dropped at all.
+    let drop_trailing = seq_trailing_record_is_dropped(s);
+    let segments: Vec<&str> = s.split('\x1E').collect();
+    let last_idx = segments.len().saturating_sub(1);
+
     // Split on RS character (0x1E)
-    for segment in s.split('\x1E') {
+    for (i, segment) in segments.into_iter().enumerate() {
         let segment = segment.trim();
         if segment.is_empty() {
+            continue;
+        }
+        if i == last_idx && drop_trailing {
             continue;
         }
 
@@ -2570,9 +2596,20 @@ fn seq_record_parses(segment: &str) -> bool {
 ///   trailing byte at all) reports `<unknown>`, but the same shape with
 ///   `true`/`"s"`/`{}`/`[]`/`null` in place of `2`, or `2` followed by even
 ///   one trailing space, all report their own line normally.
+///
+/// A third shape needs no record-level check at all: content with **no RS
+/// byte anywhere**. RFC 7464 requires every record to start with one, so
+/// real jq's `--seq` reader never even attempts to read unprefixed text --
+/// it's "abandoned" the instant EOF arrives with nothing synced onto,
+/// oracle-verified as `<unknown>` regardless of what the unprefixed text
+/// actually contains (even fully well-formed JSON). *Empty* content is the
+/// one exception: an empty last file has no text to abandon, so it keeps
+/// #1520's own plain "empty source, EOF at line 0" rule instead (oracle-
+/// verified: an empty last file after a valid one still reports
+/// `emptyfile:0`, not `<unknown>`).
 fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     let Some((_, tail)) = raw.rsplit_once('\u{1e}') else {
-        return false;
+        return !raw.trim().is_empty();
     };
     let segment = tail.trim();
     if segment.is_empty() {
