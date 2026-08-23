@@ -9355,50 +9355,56 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern
-    let raw_pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
-    // #956 (#943 follow-up): the bare form additionally unpacks a non-empty
-    // array pattern via the shared `unpack_bare_array_pattern` helper -- see
-    // its own doc comment for the exact boundary. Confirmed against jq
-    // 1.7.1: `"abc" | test(["a","i"])` is `true` in both this fallback and
-    // the regex-enabled path (the `i` flag happens not to change the
-    // outcome for this particular pattern/input pair).
-    let (raw_pattern, raw_flags, array_unpacked) = unpack_bare_array_pattern(raw_pattern);
-    let pattern = match raw_pattern {
-        OwnedValue::String(s) => s,
-        _ if optional => return QueryResult::None,
-        v if array_unpacked => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        v => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
-    };
-    // The unpacked flags slot (if any) is still *validated* the same way
-    // `eval_regex_pattern_and_flags` does -- confirmed against jq 1.7.1:
-    // `"abc" | test(["a", 5])` raises "number (5) is not a string" in both
-    // that path and real jq, not a silent `true`/`false` that ignores the
-    // bad element -- but its *content* is then discarded regardless: this
-    // fallback has no flag support at all (already a documented
-    // approximation of full regex semantics), so a validly-typed flags
-    // string still can't change the substring match's outcome.
-    if let Err(e) = validate_regex_flags(raw_flags) {
-        return QueryResult::Error(e);
-    }
-
-    // Check if the input string contains the pattern (simple substring match)
-    match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::Bool(cow.contains(&pattern)))
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
+    fanout_arg(
+        eval_single::<W, S>(re_expr, value.clone(), optional),
+        // Real yq *has* `test` and does not fan it out (live-verified against
+        // the pinned v4.53.3: `[.x | test(("a","z"))]` on `abc` is `[true]`,
+        // where jq gives `[true,false]`), so yq mode keeps the first pattern
+        // only. Kept in step with the `regex`-enabled twin, which gates the
+        // same way through `eval_regex_pattern_and_flags`.
+        ArgFanout::yq_native::<S>(),
+        |raw_pattern| {
+            // #956 (#943 follow-up): the bare form additionally unpacks a non-empty
+            // array pattern via the shared `unpack_bare_array_pattern` helper -- see
+            // its own doc comment for the exact boundary. Confirmed against jq
+            // 1.7.1: `"abc" | test(["a","i"])` is `true` in both this fallback and
+            // the regex-enabled path (the `i` flag happens not to change the
+            // outcome for this particular pattern/input pair).
+            let (raw_pattern, raw_flags, array_unpacked) = unpack_bare_array_pattern(raw_pattern);
+            let pattern = match raw_pattern {
+                OwnedValue::String(s) => s,
+                _ if optional => return QueryResult::None,
+                v if array_unpacked => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+                v => return QueryResult::Error(EvalError::not_string_or_array(v.type_name())),
+            };
+            // The unpacked flags slot (if any) is still *validated* the same way
+            // `eval_regex_pattern_and_flags` does -- confirmed against jq 1.7.1:
+            // `"abc" | test(["a", 5])` raises "number (5) is not a string" in both
+            // that path and real jq, not a silent `true`/`false` that ignores the
+            // bad element -- but its *content* is then discarded regardless: this
+            // fallback has no flag support at all (already a documented
+            // approximation of full regex semantics), so a validly-typed flags
+            // string still can't change the substring match's outcome.
+            if let Err(e) = validate_regex_flags(raw_flags) {
+                return QueryResult::Error(e);
             }
-        }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    }
+
+            // Check if the input string contains the pattern (simple substring match)
+            match &value {
+                StandardJson::String(s) => {
+                    if let Ok(cow) = s.as_str() {
+                        QueryResult::Owned(OwnedValue::Bool(cow.contains(&pattern)))
+                    } else if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(EvalError::new("invalid string"))
+                    }
+                }
+                _ if optional => QueryResult::None,
+                _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+            }
+        },
+    )
 }
 
 /// The refusal for a non-string pattern handed to `indices`, `index` or
@@ -9476,17 +9482,34 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
+    fanout_arg(
+        eval_single::<W, S>(s_expr, value.clone(), optional),
+        // Real yq has no `indices` at all -- live-verified against the
+        // pinned v4.53.3, whose lexer rejects the call outright. See
+        // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
+        ArgFanout::All,
+        |pattern| indices_with_pattern::<W, S>(&value, &pattern, optional),
+    )
+}
 
-    match &value {
+/// `indices`'s search for one already-resolved pattern -- the body of
+/// [`builtin_indices`], run once per output of its pattern generator (#1279).
+///
+/// Split out rather than inlined into the closure because the search returns
+/// from several places inside a nested `match`, and each of those must end the
+/// *search*, not the fan-out loop. That scattered-return shape is exactly what
+/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
+/// the body solves it and the fan-out together.
+fn indices_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    pattern: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
         StandardJson::String(s) => {
             // An object pattern is jq's slice, which answers a *substring*
             // rather than a list of positions — see `string_slice_pattern`.
-            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+            if let Some(sliced) = string_slice_pattern(value, pattern) {
                 return match sliced {
                     Ok(v) => QueryResult::Owned(v),
                     Err(_) if optional => QueryResult::None,
@@ -9494,10 +9517,10 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
             }
             // For strings, pattern must be a string
-            let pattern_str = match &pattern {
+            let pattern_str = match pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
+                _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 let mut indices = Vec::new();
@@ -9523,13 +9546,13 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // (#950 review).
             let mut indices = Vec::new();
             for (i, elem) in (*elements).enumerate() {
-                if owned_value_eq::<S>(&to_owned(&elem), &pattern) {
+                if owned_value_eq::<S>(&to_owned(&elem), pattern) {
                     indices.push(OwnedValue::Int(i as i64));
                 }
             }
             QueryResult::Owned(OwnedValue::Array(indices))
         }
-        _ => unsearchable_input(&value, &pattern, optional),
+        _ => unsearchable_input(value, pattern, optional),
     }
 }
 
@@ -9539,18 +9562,35 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
+    fanout_arg(
+        eval_single::<W, S>(s_expr, value.clone(), optional),
+        // Real yq has no `index` at all -- live-verified against the
+        // pinned v4.53.3, whose lexer rejects the call outright. See
+        // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
+        ArgFanout::All,
+        |pattern| index_with_pattern::<W, S>(&value, &pattern, optional),
+    )
+}
 
-    match &value {
+/// `index`'s search for one already-resolved pattern -- the body of
+/// [`builtin_index`], run once per output of its pattern generator (#1279).
+///
+/// Split out rather than inlined into the closure because the search returns
+/// from several places inside a nested `match`, and each of those must end the
+/// *search*, not the fan-out loop. That scattered-return shape is exactly what
+/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
+/// the body solves it and the fan-out together.
+fn index_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    pattern: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
         StandardJson::String(s) => {
             // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
             // `indices` answers, so an object pattern — jq's slice — leaves a
             // *substring* to be indexed with a number, and reports that.
-            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+            if let Some(sliced) = string_slice_pattern(value, pattern) {
                 return match sliced {
                     _ if optional => QueryResult::None,
                     Err(e) => e.into(),
@@ -9560,10 +9600,10 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
             }
             // For strings, pattern must be a string
-            let pattern_str = match &pattern {
+            let pattern_str = match pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
+                _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 if let Some(pos) = cow.find(pattern_str.as_str()) {
@@ -9582,13 +9622,13 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // not plain `==` (#950 review, same reasoning as `indices`
             // above).
             for (i, elem) in (*elements).enumerate() {
-                if owned_value_eq::<S>(&to_owned(&elem), &pattern) {
+                if owned_value_eq::<S>(&to_owned(&elem), pattern) {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
             QueryResult::Owned(OwnedValue::Null)
         }
-        _ => unsearchable_input(&value, &pattern, optional),
+        _ => unsearchable_input(value, pattern, optional),
     }
 }
 
@@ -9650,18 +9690,35 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the pattern (can be any type for arrays, must be string for strings)
-    let pattern = match result_to_owned(eval_single::<W, S>(s_expr, value.clone(), optional)) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
+    fanout_arg(
+        eval_single::<W, S>(s_expr, value.clone(), optional),
+        // Real yq has no `rindex` at all -- live-verified against the
+        // pinned v4.53.3, whose lexer rejects the call outright. See
+        // `builtin_ltrimstr` for why that makes jq's fan-out unopposed.
+        ArgFanout::All,
+        |pattern| rindex_with_pattern::<W, S>(&value, &pattern, optional),
+    )
+}
 
-    match &value {
+/// `rindex`'s search for one already-resolved pattern -- the body of
+/// [`builtin_rindex`], run once per output of its pattern generator (#1279).
+///
+/// Split out rather than inlined into the closure because the search returns
+/// from several places inside a nested `match`, and each of those must end the
+/// *search*, not the fan-out loop. That scattered-return shape is exactly what
+/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
+/// the body solves it and the fan-out together.
+fn rindex_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    pattern: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match value {
         StandardJson::String(s) => {
             // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
             // `indices` answers, so an object pattern — jq's slice — leaves a
             // *substring* to be indexed with a number, and reports that.
-            if let Some(sliced) = string_slice_pattern(&value, &pattern) {
+            if let Some(sliced) = string_slice_pattern(value, pattern) {
                 return match sliced {
                     _ if optional => QueryResult::None,
                     Err(e) => e.into(),
@@ -9671,10 +9728,10 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
             }
             // For strings, pattern must be a string
-            let pattern_str = match &pattern {
+            let pattern_str = match pattern {
                 OwnedValue::String(p) => p,
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(non_string_pattern(&value, &pattern)),
+                _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             if let Ok(cow) = s.as_str() {
                 if let Some(pos) = cow.rfind(pattern_str.as_str()) {
@@ -9694,13 +9751,13 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // above).
             let items: Vec<_> = (*elements).collect();
             for (i, elem) in items.iter().enumerate().rev() {
-                if owned_value_eq::<S>(&to_owned(elem), &pattern) {
+                if owned_value_eq::<S>(&to_owned(elem), pattern) {
                     return QueryResult::Owned(OwnedValue::Int(i as i64));
                 }
             }
             QueryResult::Owned(OwnedValue::Null)
         }
-        _ => unsearchable_input(&value, &pattern, optional),
+        _ => unsearchable_input(value, pattern, optional),
     }
 }
 
@@ -29703,18 +29760,29 @@ fn builtin_bsearch<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // jq's `bsearch($target)` desugars to `target as $target | if length == 0
     // then -1 ...`, which evaluates `target` before ever looking at the input's
-    // shape — a `target`-side error (or `empty`) wins over the checks below.
-    let x = match eval_single::<W, S>(x_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::Owned(v) => v,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // A halt in the target expression must propagate, not be treated as
-        // an absent target (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-        _ => return QueryResult::None,
-    };
+    // shape — a `target`-side error (or `empty`) wins over the checks below —
+    // and, being an `as` binding, runs the body once per output of `target`
+    // (#1279). The `_ => return QueryResult::None` catch-all this replaces
+    // swallowed a `Many`/`ManyOwned` target into *no output at all*:
+    // `[1,2,3] | [bsearch((2,3))]` answered `[]` where jq answers `[1,2]`.
+    fanout_arg(
+        eval_single::<W, S>(x_expr, value.clone(), optional),
+        // Real yq has no `bsearch` (lexer-rejected); see `builtin_ltrimstr`.
+        ArgFanout::All,
+        |x| bsearch_one_target::<W>(value.clone(), x, optional),
+    )
+}
 
+/// `bsearch`'s search for one already-resolved target — the body of
+/// [`builtin_bsearch`], run once per output of its target generator (#1279).
+///
+/// Takes `value` by value because the array arm consumes the element cursor by
+/// move; the fan-out loop clones the cursor per iteration.
+fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
+    value: StandardJson<'_, W>,
+    x: OwnedValue,
+    optional: bool,
+) -> QueryResult<'_, W> {
     let elements_iter = match value {
         StandardJson::Array(a) => a,
         // `null | length` is `0` in jq, so `null` takes the same `length == 0`

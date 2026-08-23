@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Generator-argument fan-out
 
-**Status: Stages 0-2 merged; Stages 3-9 open.** This document is the
+**Status: Stages 0-3 merged; Stages 4-9 open.** This document is the
 deliverable for [#1279](https://github.com/rust-works/succinctly/issues/1279), whose tier
 review (2026-08-20) classified it Tier 3 — "changes evaluation *shape* rather than fixing
 a local mistake … wants a design doc first". It also scopes
@@ -16,8 +16,8 @@ generator-argument model resolves more than one of them". It does: see
 | 0     | Oracle capture: 48 pinned goldens + 4 must-not-regress guards      | ✅ merged |
 | 1     | `stream_outputs` + `ArgFanout` + `fanout_arg`; `contains` + `has` | ✅ merged |
 | 2     | Group A, `finish_owned` family (13 remaining); `finish_owned` deleted | ✅ merged |
-| 3     | Group A, bespoke-body family (`indices`/`index`/`rindex`/`test`/`bsearch`) | open |
-| 3b    | `pow`/`atan2` (`get_number_from_result`)                          | open   |
+| 3     | Group A, bespoke-body family (`indices`/`index`/`rindex`/`test`/`bsearch`) | ✅ merged |
+| 3b    | ~~`pow`/`atan2`~~ — moved into Stage 8; both arguments are generators (exponent outer) so they need `fanout_two_args` | moved |
 | 4     | `resolve_node`'s `GetPath` arm (path context)                     | open   |
 | 5     | `limit`/`nth`, value **and** path contexts                        | open   |
 | 6     | `range` (1-, 2- and 3-arg)                                        | open   |
