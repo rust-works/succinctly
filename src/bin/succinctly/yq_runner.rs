@@ -2791,6 +2791,27 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // cheaply, so this only changes routing for the mapping case.
         Expr::Builtin(Builtin::KeysUnsorted) => true,
 
+        // `map(f)` on a container produces `GenericResult::LazySeq` (#724,
+        // #725), which `GenericResult::stream_json`/`stream_yaml` now render
+        // one element at a time from each element's own live cursor (#757)
+        // rather than through an `OwnedValue::Array`. That is both the
+        // performance point and a fidelity fix: routing `map` through the DOM
+        // path collapsed duplicate mapping keys and dropped comments,
+        // anchors/aliases and flow style, all of which real yq keeps
+        // (verified live against v4.53.3 — `map(.)` on `- a: 1`/`  a: 2`
+        // prints both keys there, and on `- {a: 1, b: 2}` keeps flow style).
+        // `.[]` on the same inputs already matched, because it already
+        // streamed.
+        //
+        // Recursing into `f` rather than answering a flat `true` follows
+        // `FirstExpr`/`LastExpr` above, for the same reason: a *computing*
+        // body materializes an `OwnedValue::Float` that needs the DOM path's
+        // yq-mode scientific-notation/decimal-point formatting (#997, #949,
+        // #1090), which the M2 streamers don't have. So `map(.)`,
+        // `map(.name)`, `map(.a.b)` and `map(select(...))` stream; `map(.+1)`
+        // and `map(length)` keep the DOM path exactly as before.
+        Expr::Builtin(Builtin::Map(f)) => can_use_m2_streaming(f),
+
         // Everything else requires OwnedValue
         _ => false,
     }
@@ -4353,6 +4374,37 @@ mod tests {
             right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
         })));
         assert!(!can_use_m2_streaming(&arithmetic));
+    }
+
+    /// #757: `map(f)` recurses into `f` for the same reason
+    /// `FirstExpr`/`LastExpr` do above -- a navigational body streams every
+    /// element from its own cursor, while a computing one materializes an
+    /// `OwnedValue::Float` that only the DOM path formats correctly (#997,
+    /// #949, #1090). Pinned here so a later "just return `true`" simplification
+    /// has to argue with a test rather than silently route arithmetic at the
+    /// M2 streamers.
+    #[test]
+    fn test_can_use_m2_streaming_recurses_into_map_body_757() {
+        for navigational in [
+            Expr::Identity,
+            Expr::Field("name".to_string()),
+            Expr::Builtin(Builtin::Select(Box::new(Expr::Identity))),
+        ] {
+            let map = Expr::Builtin(Builtin::Map(Box::new(navigational)));
+            assert!(can_use_m2_streaming(&map), "{map:?} should stream");
+        }
+
+        let computing = Expr::Builtin(Builtin::Map(Box::new(Expr::Arithmetic {
+            op: succinctly::jq::ArithOp::Add,
+            left: Box::new(Expr::Identity),
+            right: Box::new(Expr::Literal(succinctly::jq::Literal::Float(1e100))),
+        })));
+        assert!(!can_use_m2_streaming(&computing));
+
+        // The `Pipe` arm already requires every stage to qualify, so a
+        // rejected `map` body disqualifies the whole chain it sits in.
+        let piped = Expr::Pipe(vec![Expr::Field("r".to_string()), computing]);
+        assert!(!can_use_m2_streaming(&piped));
     }
 
     #[test]

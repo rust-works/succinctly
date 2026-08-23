@@ -1000,21 +1000,85 @@ impl<V: DocumentValue> LazySeq<V> {
         Ok(items)
     }
 
+    /// Pull every remaining element to completion *without* converting the
+    /// still-live cursors among them, discarding everything collected so far
+    /// on the first error/break.
+    ///
+    /// The atomicity primitive both public consumers share (#757).
+    /// `materialize_atomic` below is this plus a `to_owned_cursor` per item;
+    /// `GenericResult::stream_json`/`stream_yaml`'s `LazySeq` arms skip that
+    /// conversion entirely and render each `LazyElem::Cursor` straight from
+    /// the source document, which is what lets CLI output keep duplicate
+    /// mapping keys, comments, anchors and flow style through `map` the way
+    /// `.[]` already does.
+    ///
+    /// Draining *before* writing a byte is also what preserves `map`'s
+    /// all-or-nothing output contract for a streaming consumer: the whole
+    /// chain's success is known up front, so a failing element can never
+    /// leave a truncated prefix in the writer. A `Vec<LazyElem<V>>` is a
+    /// cheap thing to hold for that — `V::Cursor` is `Copy` and pointer-sized
+    /// — unlike the `OwnedValue` tree `materialize_atomic` builds, which for
+    /// `map(.)` is a full deep copy of every element it touches.
+    pub fn drain_atomic(self) -> Result<Vec<LazyElem<V>>, Control> {
+        let mut out = Vec::new();
+        for item in self {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
     /// Pull every remaining element to completion, discarding the whole
     /// in-progress array on the first error/break (mirrors `map_over`'s
     /// atomicity — real jq's array construction is all-or-nothing:
     /// `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
     /// diagnostic).
     pub fn materialize_atomic(self) -> Result<OwnedValue, Control> {
-        let mut out = Vec::new();
-        for item in self {
-            match item {
-                Ok(LazyElem::Cursor(c)) => out.push(to_owned_cursor(&c)),
-                Ok(LazyElem::Owned(o)) => out.push(o),
-                Err(control) => return Err(control),
-            }
-        }
-        Ok(OwnedValue::Array(out))
+        Ok(OwnedValue::Array(
+            self.drain_atomic()?
+                .iter()
+                .map(lazy_elem_to_owned)
+                .collect(),
+        ))
+    }
+}
+
+/// The drained elements of a `LazySeq` as a cursor slice, or `None` when this
+/// sequence cannot render straight from the source document (#757).
+///
+/// `None` on two counts, both real rather than defensive:
+///
+/// - The cursor type has no sequence writer (`JsonCursor` takes
+///   `DocumentCursor`'s defaults — `jq`'s CLI has no M2 streaming path to
+///   reach this from anyway).
+/// - Some element is a computed value rather than a live cursor. The
+///   clearest case is `keys_unsorted | map(f)` over an *array*, which sources
+///   from `LazySource::IndexRange`: every element is a synthetic
+///   `LazyElem::Owned(Int)` with no node in the document to point at.
+///
+/// Both fall back to materializing an `OwnedValue::Array`, which is what this
+/// arm did unconditionally before #757.
+fn sequence_streamable_cursors<V: DocumentValue>(items: &[LazyElem<V>]) -> Option<Vec<V::Cursor>> {
+    if !V::Cursor::supports_sequence_streaming() {
+        return None;
+    }
+    items
+        .iter()
+        .map(|elem| match elem {
+            LazyElem::Cursor(c) => Some(*c),
+            LazyElem::Owned(_) => None,
+        })
+        .collect()
+}
+
+/// Convert one drained `LazyElem` to an `OwnedValue`.
+///
+/// The single conversion point shared by `materialize_atomic` and the
+/// `LazySeq` streaming arms' non-cursor fallback (#757), so the two can never
+/// disagree about how a drained item becomes a value.
+fn lazy_elem_to_owned<V: DocumentValue>(elem: &LazyElem<V>) -> OwnedValue {
+    match elem {
+        LazyElem::Cursor(c) => to_owned_cursor(c),
+        LazyElem::Owned(o) => o.clone(),
     }
 }
 
@@ -1901,24 +1965,43 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.last_was_falsy = false;
                 stats.any_truthy = true;
             }
-            // Deliberately NOT a zero-buffer writer like `LazyKeys`'s
-            // unsorted arm above: `map`'s array construction is atomic in
-            // real jq (`[1,2,"x"]|map(.+1)` prints nothing to stdout, only
-            // the stderr diagnostic), but a byte-at-a-time writer would
-            // already have flushed `[1,2,` to `out` before discovering
-            // element 3 fails — wrong, unfixable-after-the-fact output. One
-            // atomic forward pass via `materialize_atomic`, then reuse the
-            // already-tested `OwnedValue::stream_json` — this still avoids
-            // the reserialize+reindex+separate-evaluator round trip that was
-            // the actual expensive part; a single `Vec<OwnedValue>` for the
-            // final array was never it.
-            Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
-                Ok(owned) => {
-                    owned.stream_json(out, indent, sort_keys)?;
+            // Still not a byte-at-a-time writer like `LazyKeys`'s unsorted
+            // arm above, and it can't be: `map`'s array construction is
+            // atomic in real jq (`[1,2,"x"]|map(.+1)` prints nothing to
+            // stdout, only the stderr diagnostic), so a writer that emitted
+            // as it pulled would already have flushed `[1,2,` before
+            // discovering element 3 fails — wrong, and unfixable after the
+            // fact.
+            //
+            // `drain_atomic` (#757) is what buys the rest of the win anyway:
+            // it settles the whole chain's success up front, holding only
+            // `LazyElem`s (a `V::Cursor` is `Copy` and pointer-sized) rather
+            // than the deep `OwnedValue` copy `materialize_atomic` builds.
+            // Elements that are still live cursors then render straight from
+            // the source document, which is what keeps duplicate mapping
+            // keys, comments, anchors and flow style through `map` the way
+            // `.[]` already does — see `can_use_m2_streaming`'s `Builtin::Map`
+            // arm (yq_runner.rs) for what actually routes a query here.
+            Self::LazySeq(seq) => match seq.clone().drain_atomic() {
+                Ok(items) => {
+                    match sequence_streamable_cursors(&items) {
+                        Some(cursors) => {
+                            V::Cursor::stream_sequence_json(&cursors, out, indent, sort_keys)?;
+                        }
+                        None => {
+                            OwnedValue::Array(items.iter().map(lazy_elem_to_owned).collect())
+                                .stream_json(out, indent, sort_keys)?;
+                        }
+                    }
                     on_value(out)?;
                     stats.count = 1;
-                    stats.last_was_falsy = owned.is_falsy();
-                    stats.any_truthy = !stats.last_was_falsy;
+                    // A `map` result is always an array, and every array is
+                    // truthy in jq — only `null`/`false` are falsy — so this
+                    // needs no per-value check (same reasoning as the
+                    // `LazyIndexRange` arm above, which is also always an
+                    // array).
+                    stats.last_was_falsy = false;
+                    stats.any_truthy = true;
                 }
                 Err(control) => {
                     let (error, halt) = control_to_stream_outcome(&control);
@@ -2083,16 +2166,24 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.last_was_falsy = false;
                 stats.any_truthy = true;
             }
-            // Same atomicity reasoning as `stream_json`'s `LazySeq` arm
-            // above — no zero-buffer writer, one atomic forward pass then
-            // reuse `OwnedValue::stream_yaml`.
-            Self::LazySeq(seq) => match seq.clone().materialize_atomic() {
-                Ok(owned) => {
-                    owned.stream_yaml(out, indent, sort_keys)?;
+            // Same atomicity and cursor-streaming reasoning as
+            // `stream_json`'s `LazySeq` arm above — read it there; this is
+            // the identical shape with the YAML writers substituted.
+            Self::LazySeq(seq) => match seq.clone().drain_atomic() {
+                Ok(items) => {
+                    match sequence_streamable_cursors(&items) {
+                        Some(cursors) => {
+                            V::Cursor::stream_sequence_yaml(&cursors, out, indent, sort_keys)?;
+                        }
+                        None => {
+                            OwnedValue::Array(items.iter().map(lazy_elem_to_owned).collect())
+                                .stream_yaml(out, indent, sort_keys)?;
+                        }
+                    }
                     on_value(out)?;
                     stats.count = 1;
-                    stats.last_was_falsy = owned.is_falsy();
-                    stats.any_truthy = !stats.last_was_falsy;
+                    stats.last_was_falsy = false;
+                    stats.any_truthy = true;
                 }
                 Err(control) => {
                     let (error, halt) = control_to_stream_outcome(&control);

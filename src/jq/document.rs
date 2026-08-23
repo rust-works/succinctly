@@ -275,6 +275,54 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         self.stream_yaml(out, indent, sort_keys)
     }
 
+    /// Whether this cursor type implements the two `stream_sequence_*`
+    /// methods below (#757).
+    ///
+    /// An *advance* capability probe rather than letting the callers discover
+    /// it from an `Err(fmt::Error)` return: the fallback for an unsupported
+    /// cursor is to materialize an `OwnedValue::Array` and stream that
+    /// instead, and a caller can only switch to it safely while `out` is
+    /// still untouched. `stream_json`/`stream_yaml` above get away with
+    /// signalling "unsupported" through their return value because every
+    /// caller of theirs gates on the output flags in advance
+    /// (`can_use_m2_streaming` and friends); a `LazySeq`'s element shapes
+    /// aren't knowable from the flags, so this one needs a real probe.
+    fn supports_sequence_streaming() -> bool {
+        false
+    }
+
+    /// Stream `cursors` as a single JSON array, one element per cursor,
+    /// without materializing an `OwnedValue` for any of them (#757).
+    ///
+    /// Unlike [`stream_json`](Self::stream_json), the cursors need not be
+    /// siblings — or even share one index — so this is what renders a `map`
+    /// chain's drained output (`LazySeq::drain_atomic`), where each element is
+    /// wherever in the source document its own sub-expression navigated to.
+    ///
+    /// Only called when [`supports_sequence_streaming`](Self::supports_sequence_streaming)
+    /// answers `true`; the default is the same "not supported" signal
+    /// `stream_json` uses.
+    fn stream_sequence_json<W: core::fmt::Write>(
+        _cursors: &[Self],
+        _out: &mut W,
+        _indent: IndentSpec,
+        _sort_keys: bool,
+    ) -> core::fmt::Result {
+        Err(core::fmt::Error)
+    }
+
+    /// The YAML counterpart of
+    /// [`stream_sequence_json`](Self::stream_sequence_json) (#757), rendering
+    /// `cursors` as one block- or flow-style sequence.
+    fn stream_sequence_yaml<W: core::fmt::Write>(
+        _cursors: &[Self],
+        _out: &mut W,
+        _indent: IndentSpec,
+        _sort_keys: bool,
+    ) -> core::fmt::Result {
+        Err(core::fmt::Error)
+    }
+
     /// Check if the value at this cursor is falsy (null or false).
     ///
     /// Used for `--exit-status` flag handling without requiring full materialization.
