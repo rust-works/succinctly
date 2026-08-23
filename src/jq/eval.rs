@@ -1516,8 +1516,60 @@ impl ArgFanout {
     }
 }
 
-/// Apply `fanout`'s gate to one argument's materialized output list and its
-/// own trailing control.
+/// Drop every value of a yq-gated argument that ended in an escape, so the
+/// caller emits the escape alone rather than a value it then raises over.
+/// Returns whether it fired.
+///
+/// Real yq evaluates the whole argument and reports an escape found anywhere
+/// in it, with no output at all — live-captured from the pinned v4.53.3:
+///
+/// ```text
+/// $ printf 'a: 1\n' | yq 'has(("a","b", error("boom")))'
+/// Error: boom      <- stderr only; stdout empty, exit 1
+/// $ printf 'a: 1\nb: 2\n' | yq 'delpaths((["a"],["b"],error("boom")))'
+/// Error: boom
+/// ```
+///
+/// succinctly got each gate wrong in its own way — `FirstOnly` truncated to
+/// the first value while the control the later ones escaped through still
+/// fired (#1534), and `RejectMany` tested the value count before ever looking
+/// at the control, masking a real `error(...)` behind "expected a single
+/// result but found 2" (#1533). Clearing the values rather than the control
+/// is what leaves a bare `Error`/`Break`/`Halt` (`partial` normalizes an
+/// empty prefix down to one); dropping the control instead would swallow an
+/// escape raised *before* any output, which both gates must still propagate.
+///
+/// **Single-argument fan-out only.** [`fanout_two_args`] deliberately does
+/// not do this, because emptying one slot's values skips the body — and the
+/// body is where the *other* slot gets validated. Which slot real yq reports
+/// is per-builtin and does not follow succinctly's outer/inner order:
+///
+/// ```text
+/// # yq validates the flags, which only the body checks -- not the pattern's escape
+/// $ printf 'x: "abcabc"\n' | yq '.x | test(("a", error("p")); "z")'
+/// Error: unrecognised match params 'z', ...
+///
+/// # yq reports the *path* slot, which is succinctly's inner, not the outer value
+/// $ printf 'a: 1\n' | yq '[setpath((["a"],error("p")); (1,error("v")))]'
+/// Error: p
+/// ```
+///
+/// Both were regressions when an earlier revision applied this rule to
+/// `fanout_two_args` as well. Getting the two-argument cases right needs a
+/// per-builtin ordering probe rather than one shared rule — tracked on
+/// #1533, which this therefore only half closes.
+fn clear_values_when_yq_argument_escaped(
+    args: &mut Vec<OwnedValue>,
+    trailing: &Option<Control>,
+) -> bool {
+    if trailing.is_none() {
+        return false;
+    }
+    args.clear();
+    true
+}
+
+/// Apply `fanout`'s gate to one argument's materialized output list.
 ///
 /// One definition for the three places that need it — [`fanout_arg`], and
 /// both the outer and the inner argument of [`fanout_two_args`]. The gate
@@ -1526,53 +1578,19 @@ impl ArgFanout {
 /// CLAUDE.md's #106 lesson ("duplicated predicates diverge silently — one
 /// definition, plus a test that the call sites agree") warns about (#1537).
 ///
-/// `trailing` is passed in — read, never written — because both yq gates
-/// have to reconcile the values against it rather than gate the values
-/// alone; see the shared escape arm below (#1534, #1533).
-fn apply_arg_fanout(
-    fanout: ArgFanout,
-    args: &mut Vec<OwnedValue>,
-    trailing: &Option<Control>,
-) -> Result<(), EvalError> {
+/// Purely a gate on the values: reconciling them against the argument's own
+/// trailing control is [`fanout_arg`]'s job, and *only* its job — see
+/// `clear_values_when_yq_argument_escaped` for why two-argument builtins
+/// cannot share that rule.
+fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(), EvalError> {
     match fanout {
         // jq's rule 1: every value is used, and the argument's own control
-        // fires *after* them (#1279). Only the yq gates below reconcile.
+        // fires *after* them (#1279).
         ArgFanout::All => Ok(()),
 
-        // Both yq gates share one rule: an escape anywhere in the argument
-        // takes the whole call down, with no output and no substituted
-        // message of our own. Live-captured from the pinned yq v4.53.3:
-        //
-        //   $ printf 'a: 1\n' | yq 'has(("a","b", error("boom")))'
-        //   Error: boom      <- stderr only; stdout empty, exit 1
-        //   $ printf 'null'  | yq 'setpath((1,2,error("boom")); 1)'
-        //   Error: boom
-        //
-        // succinctly used to get each of these wrong in its own way, which
-        // is why they were filed separately but fix together here:
-        //
-        //   * `FirstOnly` truncated to the first *value* while the control
-        //     the later ones escaped through still fired, so it printed
-        //     `true` to stdout and *then* raised (#1534).
-        //   * `RejectMany` tested `args.len() > 1` before ever looking at
-        //     `trailing`, so a real `error(...)` was masked by the generic
-        //     "expected a single result but found 2" (#1533).
-        //
-        // Clearing the values rather than the control is what makes the
-        // caller's own `match trailing` arm emit a bare `Error`/`Break`/
-        // `Halt`: `partial` normalizes an empty prefix down to one. Doing it
-        // the other way round -- dropping the control -- would swallow an
-        // escape that happened *before* any output (`has(error("boom"))`),
-        // which both gates must still propagate.
-        ArgFanout::FirstOnly | ArgFanout::RejectMany if trailing.is_some() => {
-            args.clear();
-            Ok(())
-        }
-
-        // No escape: each gate does its ordinary job. `has(("a","b"))` is
-        // `true` in real yq, and `setpath((["a"],["b"]); 1)` is a count
-        // error. (succinctly's wording for that count error differs from
-        // yq's own `SETPATH: expected single path but found 2 results
+        // `has(("a","b"))` is `true` in real yq, and `setpath((["a"],["b"]); 1)`
+        // is a count error. (succinctly's wording for that count error differs
+        // from yq's own `SETPATH: expected single path but found 2 results
         // instead`; that gap predates #1279 and is out of scope here.)
         ArgFanout::FirstOnly => {
             args.truncate(1);
@@ -1602,11 +1620,18 @@ fn apply_arg_fanout(
 ///    [`build_object_entries`] (#354) already document; the difference is one
 ///    loop here instead of a recursion.
 ///
-///    (Wrapping that in `[...]` gives *empty* output, not
-///    `["bcabc","abcabc"]` — a `break` escaping an array construction
-///    discards the partly-built array. An earlier revision of this comment
-///    cited the wrapped form with the unwrapped form's result; both spellings
-///    were re-checked against jq 1.7.1 when the lazy pull landed.)
+///    Where the `[...]` goes matters, and an earlier revision of this comment
+///    got it wrong by citing one spelling with the other's result. Both
+///    re-checked against jq 1.7.1:
+///
+///    ```text
+///    [label $out | ltrimstr(("a","b", break $out))]   =>  ["bcabc","abcabc"]
+///    label $out | [ltrimstr(("a","b", break $out))]   =>  (no output)
+///    ```
+///
+///    The second is empty because the `break` escapes *through* the array
+///    construction, discarding the partly-built array; in the first the
+///    array is built outside the label, so it survives.
 /// 2. A failure raised by `body` itself aborts the loop but *keeps* the prefix
 ///    already produced: `"abc" | contains(("a", 1))` writes `true` to stdout
 ///    and then raises the containment error, exiting 5.
@@ -1650,7 +1675,10 @@ where
     if !matches!(fanout, ArgFanout::All) {
         let (mut args, trailing) =
             stream_outputs(eval_single::<W, S>(arg_expr, value.clone(), optional));
-        if let Err(e) = apply_arg_fanout(fanout, &mut args, &trailing) {
+        if clear_values_when_yq_argument_escaped(&mut args, &trailing) {
+            // Fall through with no values: the `match trailing` below turns
+            // the escape into a bare `Error`/`Break`/`Halt`.
+        } else if let Err(e) = apply_arg_fanout(fanout, &mut args) {
             return QueryResult::Error(e);
         }
         if trailing.is_none() && args.len() == 1 {
@@ -1782,7 +1810,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
-    if let Err(e) = apply_arg_fanout(fanout, &mut outers, &outer_trailing) {
+    if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
         return QueryResult::Error(e);
     }
 
@@ -1790,7 +1818,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for o in outers {
         let (mut inners, inner_trailing) =
             stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
-        if let Err(e) = apply_arg_fanout(fanout, &mut inners, &inner_trailing) {
+        if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
             return QueryResult::Error(e);
         }
 
@@ -53324,28 +53352,27 @@ mod tests {
     #[test]
     fn apply_arg_fanout_gates_agree_across_every_variant_1537() {
         let three = || vec![OwnedValue::int(1), OwnedValue::int(2), OwnedValue::int(3)];
-        let clean = || None;
 
         // `All` keeps every output.
         let mut args = three();
-        assert!(apply_arg_fanout(ArgFanout::All, &mut args, &clean()).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::All, &mut args).is_ok());
         assert_eq!(args.len(), 3);
 
         // `FirstOnly` keeps exactly the first.
         let mut args = three();
-        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &clean()).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args).is_ok());
         assert_eq!(args.len(), 1);
         assert_eq!(args[0].to_json(), "1");
 
         // `RejectMany` refuses two or more, and reports the real count.
         let mut args = three();
-        let err = apply_arg_fanout(ArgFanout::RejectMany, &mut args, &clean())
+        let err = apply_arg_fanout(ArgFanout::RejectMany, &mut args)
             .expect_err("three outputs must be refused");
         assert!(err.to_string().contains('3'), "err={err}");
 
         // ...but passes a lone output through untouched.
         let mut args = vec![OwnedValue::int(1)];
-        assert!(apply_arg_fanout(ArgFanout::RejectMany, &mut args, &clean()).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::RejectMany, &mut args).is_ok());
         assert_eq!(args.len(), 1);
 
         // An empty argument list is never refused, under any gate: zero
@@ -53353,7 +53380,7 @@ mod tests {
         // not the "found N results" condition `RejectMany` exists to catch.
         for gate in [ArgFanout::All, ArgFanout::FirstOnly, ArgFanout::RejectMany] {
             let mut args: Vec<OwnedValue> = Vec::new();
-            assert!(apply_arg_fanout(gate, &mut args, &clean()).is_ok());
+            assert!(apply_arg_fanout(gate, &mut args).is_ok());
             assert!(args.is_empty());
         }
     }
@@ -53375,21 +53402,24 @@ mod tests {
         // Values present *and* an escape: the escape wins outright.
         let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
         let trailing = escaped();
-        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &trailing).is_ok());
+        assert!(clear_values_when_yq_argument_escaped(&mut args, &trailing));
         assert!(args.is_empty(), "args={args:?}");
         assert!(trailing.is_some(), "the control must still fire");
 
         // No escape: the ordinary truncation still happens.
         let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
         let trailing = None;
-        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &trailing).is_ok());
+        assert!(!clear_values_when_yq_argument_escaped(&mut args, &trailing));
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args).is_ok());
         assert_eq!(args.len(), 1);
 
         // `All` must not adopt the clearing behaviour -- jq mode keeps every
         // value *and* fires the trailing control after them (#1279 rule 1).
+        // The gate is consulted on its own here precisely because
+        // `clear_values_when_yq_argument_escaped` is never reached for `All`:
+        // `fanout_arg` routes that variant down the lazy pull instead.
         let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
-        let trailing = escaped();
-        assert!(apply_arg_fanout(ArgFanout::All, &mut args, &trailing).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::All, &mut args).is_ok());
         assert_eq!(args.len(), 2);
     }
 

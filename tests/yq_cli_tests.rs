@@ -21291,23 +21291,28 @@ fn test_yq_first_only_gate_still_takes_the_first_output_1534() -> Result<()> {
     Ok(())
 }
 
-/// #1533: `ArgFanout::RejectMany` used to test `args.len() > 1` before ever
-/// looking at the argument's own trailing control, so a real `error(...)`
-/// inside the generator was masked by succinctly's generic count message.
+/// #1533 (single-argument half): `ArgFanout::RejectMany` used to test
+/// `args.len() > 1` before ever looking at the argument's own trailing
+/// control, so a real `error(...)` inside the generator was masked by
+/// succinctly's generic count message.
 ///
 /// Live-captured from the pinned yq v4.53.3 -- it propagates the embedded
 /// error, and never mentions a result count at all:
 ///
 /// ```text
-/// $ printf 'null' | yq 'setpath((1,2,error("boom")); 1)'
+/// $ printf 'a: 1\nb: 2\n' | yq 'delpaths((["a"],["b"],error("boom")))'
 /// Error: boom
 /// ```
+///
+/// Only `delpaths` is asserted here because only it is a *single*-argument
+/// builtin. `setpath`'s two-argument form is covered by
+/// `test_yq_setpath_two_argument_escape_order_is_unfixed_1533` below, which
+/// pins the divergence that remains.
 #[test]
 fn test_yq_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
-    // Path-side generator.
     let (out, err, code) = run_yq_stdin_with_stderr(
-        r#"setpath((1,2,error("boom")); 1)"#,
-        "null\n",
+        r#"delpaths((["a"],["b"],error("boom")))"#,
+        "a: 1\nb: 2\n",
         &["-o", "json"],
     )?;
     assert_eq!(out, "", "stdout must be empty, got {out:?}");
@@ -21317,27 +21322,72 @@ fn test_yq_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
         "the count message must not mask the real error: {err:?}"
     );
     assert_eq!(code, 1);
+    Ok(())
+}
 
-    // Value-side generator -- the other argument of the same builtin.
+/// #1533's remaining half, pinned as a known divergence rather than left
+/// silent. For a *two*-argument builtin the same rule cannot be applied by
+/// emptying the escaping slot's values: doing so skips the body, and the
+/// body is where the other slot is validated. Which slot real yq reports is
+/// per-builtin and does not follow succinctly's outer/inner order, so this
+/// needs a per-builtin ordering probe (see
+/// `clear_values_when_yq_argument_escaped`'s doc comment).
+///
+/// Real yq answers `Error: boom`; succinctly still answers with its count
+/// message. Asserting the *current* behaviour keeps the gap visible and
+/// makes the eventual fix flip a pin rather than pass silently.
+#[test]
+fn test_yq_setpath_two_argument_escape_order_is_unfixed_1533() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr(
-        r#"setpath(["a"]; (1,2,error("boom")))"#,
-        "a: 1\n",
+        r#"setpath((1,2,error("boom")); 1)"#,
+        "null\n",
         &["-o", "json"],
     )?;
     assert_eq!(out, "", "stdout must be empty, got {out:?}");
-    assert!(err.contains("boom"), "err: {err:?}");
-    assert!(!err.contains("single result"), "err: {err:?}");
+    assert!(
+        err.contains("single result"),
+        "expected the (still-diverging) count message, got {err:?}"
+    );
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// #1533/#1534 regression guard: applying the single-argument escape rule to
+/// `fanout_two_args` as well broke two shapes that already matched real yq,
+/// because emptying a slot's values skips the body.
+///
+/// Both live-captured from the pinned yq v4.53.3:
+///
+/// ```text
+/// $ printf 'x: "abcabc"\n' | yq '.x | test(("a", error("p")); "z")'
+/// Error: unrecognised match params 'z', ...      <- the *flags*, which only the body checks
+/// $ printf 'a: 1\n' | yq '[setpath((["a"],error("p")); (1,error("v")))]'
+/// Error: p                                       <- the *path* slot, succinctly's inner
+/// ```
+#[test]
+fn test_yq_two_argument_body_validation_outranks_a_slot_escape_1533() -> Result<()> {
+    // The flags argument's own error, reached only by running the body.
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#".x | test(("a", error("p")); "z")"#,
+        "x: \"abcabc\"\n",
+        &["-o", "json"],
+    )?;
+    assert!(
+        err.contains("unrecognised match params"),
+        "the flags error must survive the pattern's escape: {err:?}"
+    );
     assert_eq!(code, 1);
 
-    // `delpaths`, the other `RejectMany` builtin.
-    let (out, err, code) = run_yq_stdin_with_stderr(
-        r#"delpaths((["a"],["b"],error("boom")))"#,
+    // The path slot's escape, not the value slot's.
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        r#"[setpath((["a"],error("p")); (1,error("v")))]"#,
         "a: 1\nb: 2\n",
         &["-o", "json"],
     )?;
-    assert_eq!(out, "", "stdout must be empty, got {out:?}");
-    assert!(err.contains("boom"), "err: {err:?}");
-    assert!(!err.contains("single result"), "err: {err:?}");
+    assert!(
+        err.contains('p') && !err.contains('v'),
+        "yq reports the path slot's escape, not the value's: {err:?}"
+    );
     assert_eq!(code, 1);
     Ok(())
 }
