@@ -22916,12 +22916,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Get the field value
             if let OwnedValue::Object(entries) = value {
                 if let Some(v) = entries.get(name) {
-                    if rest.is_empty() {
-                        return QueryResult::Owned(v.clone());
-                    }
-                    return eval_pipe_with_path_context_internal::<W, S>(
+                    return continue_rest_with_context::<W, S>(
+                        QueryResult::Owned(v.clone()),
                         rest,
-                        v,
                         root,
                         file_origin,
                         &new_path,
@@ -22957,12 +22954,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 let actual_idx = if *idx < 0 { len + *idx } else { *idx };
                 if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
                     let v = &arr[actual_idx as usize];
-                    if rest.is_empty() {
-                        return QueryResult::Owned(v.clone());
-                    }
-                    return eval_pipe_with_path_context_internal::<W, S>(
+                    return continue_rest_with_context::<W, S>(
+                        QueryResult::Owned(v.clone()),
                         rest,
-                        v,
                         root,
                         file_origin,
                         &new_path,
@@ -22984,27 +22978,27 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
         }
         Expr::Iterate => {
-            // Iterate produces multiple paths
+            // Iterate produces multiple paths. Each element gets its own
+            // distinct `new_path`, so `continue_rest_with_context` is called
+            // once per element here rather than once for the whole batch --
+            // its single-value signature has nothing to batch a per-element
+            // path over.
             let mut results = Vec::new();
             match value {
                 OwnedValue::Array(arr) => {
                     for (i, v) in arr.iter().enumerate() {
                         let mut new_path = current_path.to_vec();
                         new_path.push(OwnedValue::Int(i as i64));
-                        if rest.is_empty() {
-                            results.push(v.clone());
-                        } else {
-                            let step = eval_pipe_with_path_context_internal::<W, S>(
-                                rest,
-                                v,
-                                root,
-                                file_origin,
-                                &new_path,
-                                optional,
-                            );
-                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
-                                return stop;
-                            }
+                        let step = continue_rest_with_context::<W, S>(
+                            QueryResult::Owned(v.clone()),
+                            rest,
+                            root,
+                            file_origin,
+                            &new_path,
+                            optional,
+                        );
+                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            return stop;
                         }
                     }
                 }
@@ -23012,20 +23006,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     for (key, v) in entries {
                         let mut new_path = current_path.to_vec();
                         new_path.push(OwnedValue::String(key.clone()));
-                        if rest.is_empty() {
-                            results.push(v.clone());
-                        } else {
-                            let step = eval_pipe_with_path_context_internal::<W, S>(
-                                rest,
-                                v,
-                                root,
-                                file_origin,
-                                &new_path,
-                                optional,
-                            );
-                            if let Some(stop) = accumulate_path_context_step(&mut results, step) {
-                                return stop;
-                            }
+                        let step = continue_rest_with_context::<W, S>(
+                            QueryResult::Owned(v.clone()),
+                            rest,
+                            root,
+                            file_origin,
+                            &new_path,
+                            optional,
+                        );
+                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            return stop;
                         }
                     }
                 }
@@ -23591,19 +23581,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     };
                     rendered.push_str(&s);
                 }
-                let result = OwnedValue::String(rendered);
-                return if rest.is_empty() {
-                    QueryResult::Owned(result)
-                } else {
-                    eval_pipe_with_path_context_internal::<W, S>(
-                        rest,
-                        &result,
-                        &result,
-                        file_origin,
-                        &[],
-                        optional,
-                    )
-                };
+                let intermediate = QueryResult::Owned(OwnedValue::String(rendered));
+                return continue_rest_with_fresh_root::<W, S>(
+                    intermediate,
+                    rest,
+                    file_origin,
+                    optional,
+                );
             }
 
             let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
