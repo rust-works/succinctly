@@ -381,7 +381,7 @@ succinctly yq 'at_position(5; 3)' config.yaml
 
 ### `--front-matter`
 
-**Real yq surface, not a succinctly invention** — `yq --help` lists `-f, --front-matter`, filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, not an exemption under rule 5.
+**Real yq surface, not a succinctly invention** — same correction as [Cross-File Operations](#cross-file-operations) above; `yq --help` lists `-f, --front-matter`.
 
 Real yq can operate on YAML embedded as front matter inside another file (e.g. Markdown with a `---`-delimited YAML header). `--front-matter extract` evaluates the expression against just the front matter and discards the trailing content; `--front-matter process` re-emits the transformed front matter (re-fenced) followed by the original trailing content, unchanged.
 
@@ -397,7 +397,7 @@ A file without a leading `---` line errors. `--front-matter` is incompatible wit
 
 ### `--split-exp`
 
-**Real yq surface, not a succinctly invention** — `yq --help` lists `-s, --split-exp`, filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, not an exemption under rule 5 (the long-only spelling below is a separate, deliberate divergence, not the extension question).
+**Real yq surface, not a succinctly invention** — same correction as [Cross-File Operations](#cross-file-operations) above; `yq --help` lists `-s, --split-exp` (the long-only spelling below is a separate, deliberate divergence, not the extension question).
 
 Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter).
 
