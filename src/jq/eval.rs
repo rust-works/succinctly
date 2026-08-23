@@ -2276,7 +2276,7 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
 /// has what it came for, and jq's generator would never have been asked for
 /// another value".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Demand {
+pub(crate) enum Demand {
     Continue,
     Stop,
 }
@@ -2313,7 +2313,7 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
 /// gives for splitting `Error`/`Break`/`Halt` — it makes "escaped" and
 /// "stopped, with a control the consumer must still rule on" structurally
 /// distinct, so the wrong one cannot be written by accident.
-enum Flow {
+pub(crate) enum Flow {
     /// Ran to exhaustion; every output was delivered.
     Exhausted,
     /// A sink returned [`Demand::Stop`].
@@ -2346,6 +2346,12 @@ enum Flow {
     /// delivered to the sink.
     Escaped(Control),
 }
+
+// `Demand`/`Flow` above have no generic parameters and nothing not already
+// crate-visible (`Control` is `pub`), so `eval_generic.rs`'s own mirror of
+// this sink (#1461) reuses them directly via `pub(crate)` rather than
+// duplicating two parameter-free enums. `Item<'a, W>` is JSON/cursor-specific
+// by design and stays private -- `eval_generic.rs` has its own `GenericItem`.
 
 /// Drain an already-materialized [`QueryResult`] into a sink, checking demand
 /// between values. The fallback for every `Expr` variant with no lazy arm.
@@ -3213,7 +3219,7 @@ fn each_take_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_owned_input` normalizes `One`/`Many` to `Owned`/`ManyOwned`. This is
 /// what lets one primitive serve the owned-surface consumers (`any`/`all`,
 /// `IN`) as well as the cursor ones.
-fn eval_each_owned<S: EvalSemantics>(
+pub(crate) fn eval_each_owned<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
