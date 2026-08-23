@@ -15818,6 +15818,120 @@ fn test_reduce_foreach_accept_pattern_alternatives_1365() -> Result<()> {
 }
 
 // =============================================================================
+// #1458: `foreach ?//`'s EXTRACT retry. Real jq's own oracle-verified
+// behavior when EXTRACT (not UPDATE) errors mid-stream on a non-last
+// alternative: it abandons the rest of that attempt's own UPDATE outputs
+// and retries the *next* alternative's whole UPDATE-then-EXTRACT sequence,
+// seeded with the failed EXTRACT call's own input as UPDATE's new state --
+// not the pre-attempt state, and not this attempt's own final UPDATE
+// output. All cases below live-verified against pinned jq 1.7.1.
+// =============================================================================
+
+#[test]
+fn test_foreach_alt_extract_error_retries_next_alt_from_failed_input_1458() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2; if . == 2 then error(\"boom\") else [$x,$y,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "[1,null,1]\n[null,1,3]\n[null,1,4]",
+        "the 3/4 only make sense as .+1,.+2 re-run against state 2 (the failed EXTRACT's own input), not 4 (this attempt's own final UPDATE output)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_foreach_alt_extract_break_also_retries_like_error_1458() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2; if . == 2 then break $out else [$x,$y,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[1,null,1]\n[null,1,3]\n[null,1,4]");
+    Ok(())
+}
+
+#[test]
+fn test_foreach_alt_extract_error_on_last_alt_still_propagates_1458() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach .[] as {a:$x} (0; .+1, .+2; if . == 2 then error(\"boom\") else [$x,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    // Single alternative -- no next one to retry -- so the error propagates
+    // after the already-produced prefix (#494), same as pre-#1458.
+    assert_eq!(code, 5, "should error; out={out}");
+    assert!(err.contains("boom"), "err={err}");
+    assert_eq!(out.trim(), "[1,1]");
+    Ok(())
+}
+
+#[test]
+fn test_foreach_alt_extract_halt_never_retries_1458() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2; if . == 2 then halt else [$x,$y,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    // `halt` bypasses try/catch, label/break, AND this retry mechanism --
+    // stops the whole process at the first successful output.
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "[1,null,1]");
+    Ok(())
+}
+
+#[test]
+fn test_foreach_alt_extract_retry_cascades_through_three_alternatives_1458() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "foreach .[] as {a:$x} ?// {a:$y} ?// {a:$z} (0; .+1, .+2; if . == 2 or . == 4 then error(\"boom \\(.)\") else [$x,$y,$z,.] end)",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "[1,null,null,1]\n[null,1,null,3]\n[null,null,1,5]\n[null,null,1,6]"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_foreach_alt_extract_success_survives_when_alt_later_falls_through_1458() -> Result<()> {
+    // The already-successfully-extracted output from the failed alternative
+    // (`[1,null,1]`) is NOT discarded when that alternative later fails and
+    // falls through -- confirmed via `try`/`catch` capturing only the error,
+    // with the earlier output already collected into the array.
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "[foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2; if . == 2 then error(\"boom\") else [$x,$y,.] end)]",
+        ],
+        Some(r#"[{"a":1}]"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "[[1,null,1],[null,1,3],[null,1,4]]",
+        "the first alternative's own successful [1,null,1] output must survive"
+    );
+    Ok(())
+}
+
+// =============================================================================
 // #1164: a builtin argument generator that produces a value and *then*
 // breaks/errors no longer silently continues past that escape once the
 // builtin has finished using the value -- `result_to_owned`/

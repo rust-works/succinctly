@@ -21225,20 +21225,24 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// EXTRACT runs only once UPDATE has picked a winning alternative, fanning
 /// out over every one of UPDATE's (possibly multiple) outputs using that
-/// same alternative's bindings; an EXTRACT error/break/halt propagates
-/// directly, without retrying a different alternative. This is a
-/// deliberately narrower scope than real jq's own behavior: live-probing
-/// found that when EXTRACT itself errors, real jq retries by re-running
-/// UPDATE *again* with the next alternative, feeding it the failed EXTRACT
-/// call's own input as UPDATE's new state (`foreach .[] as {a:$x} ?//
-/// {a:$y} (0; .+1, .+2; if . == 2 then error("boom") else [$x,$y,.] end)`
-/// on `[{"a":1}]` is `[[1,null,1],[null,1,3],[null,1,4]]` -- the `3`/`4`
-/// only make sense as `.+1, .+2` re-run against state `2`, the failed
-/// EXTRACT call's own input). That interaction is substantially stranger
-/// than anything else `?//` does elsewhere in this codebase and reads as
-/// an accidental byproduct of jq's bytecode compilation rather than a
-/// designed behavior; reproducing it is left as a follow-up (#1458) rather
-/// than blocking this one on fully reverse-engineering it.
+/// same alternative's bindings. Unlike UPDATE's own retry above, an EXTRACT
+/// error/break (on a non-last alternative) doesn't resume the *same*
+/// attempt or reuse the pre-attempt state -- it abandons this attempt's
+/// remaining UPDATE outputs entirely and retries the *next* alternative's
+/// whole UPDATE-then-EXTRACT sequence from scratch, seeded with the failed
+/// EXTRACT call's own input as UPDATE's new state (#1458; live-verified
+/// against real jq 1.7.1): `foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2;
+/// if . == 2 then error("boom") else [$x,$y,.] end)` on `[{"a":1}]` is
+/// `[[1,null,1],[null,1,3],[null,1,4]]` -- the `3`/`4` only make sense as
+/// `.+1, .+2` re-run against state `2`, the failed EXTRACT call's own
+/// input, not `4`, this attempt's own final UPDATE output. That state-
+/// threading rule is substantially stranger than anything else `?//` does
+/// elsewhere in this codebase and reads as an accidental byproduct of jq's
+/// bytecode compilation rather than a designed behavior -- reproduced here
+/// bug-for-bug anyway, per ADR-0018, rather than "fixed" into a cleaner
+/// model that doesn't match. `Halt`, and any EXTRACT failure on the *last*
+/// alternative, still propagate immediately -- unretryable, same as
+/// UPDATE's own rule.
 ///
 /// Appends every EXTRACT (or bare UPDATE, when EXTRACT is absent) output
 /// straight into `outputs` (mirroring `eval_foreach`'s own "the steps
@@ -21265,7 +21269,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
     let last_idx = substituted_steps.len() - 1;
     let mut state = state_input;
 
-    for (i, step) in substituted_steps.iter().enumerate() {
+    'alternatives: for (i, step) in substituted_steps.iter().enumerate() {
         let is_last = i == last_idx;
 
         let (substituted_update, substituted_extract) = match step {
@@ -21311,7 +21315,29 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
                 outputs.extend(ext_vals);
                 if let Some(control) = ext_control {
-                    return (state, Some(control));
+                    match control {
+                        // #1458: real jq retries here too, but with a state-
+                        // threading rule found nowhere else in this file --
+                        // the *next* alternative's UPDATE resumes from this
+                        // failed EXTRACT call's own input (`update_val`), not
+                        // the pre-attempt state and not `update_vals.last()`
+                        // (this same attempt's own final UPDATE output,
+                        // which may not even be `update_val` -- the failure
+                        // can land on an earlier one while later ones sit
+                        // unprocessed). Any of `update_vals` after this
+                        // point, and this attempt's own trailing
+                        // `update_control` (if UPDATE itself also partially
+                        // failed), are both abandoned in favor of the next
+                        // alternative's fresh UPDATE-then-EXTRACT run --
+                        // matching the doc comment's oracle repro, where the
+                        // retry re-runs UPDATE wholesale rather than
+                        // resuming this attempt's own remaining outputs.
+                        Control::Error(_) | Control::Break(_) if !is_last => {
+                            state = update_val.clone();
+                            continue 'alternatives;
+                        }
+                        control => return (state, Some(control)),
+                    }
                 }
             } else {
                 outputs.push(update_val.clone());
