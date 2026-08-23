@@ -26203,11 +26203,21 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         })
         .collect();
+    // `rewritten.into_iter()`: `rewritten` is never read again after this
+    // loop either, so each `Expr` tree can be dropped as soon as its own
+    // `flatten_delete_path` call finishes instead of staying resident until
+    // `builtin_del`'s scope ends (locals drop in reverse declaration order,
+    // not at last use -- `.iter()` alone doesn't change that). Not a clone
+    // elimination like `paths.into_iter()` above (`flatten_delete_path`
+    // still takes `&Expr` and pays the same per-leaf `component.clone()`
+    // either way); this only shrinks the window where the full `rewritten`
+    // buffer overlaps with `flatten_delete_path`'s own clone-heavy pass and
+    // the subsequent `delete_expr_paths_at` call (#1569).
     let flattened: Vec<Vec<DeleteStep>> = rewritten
-        .iter()
+        .into_iter()
         .map(|path| {
             let mut steps = Vec::new();
-            flatten_delete_path(path, false, &mut steps);
+            flatten_delete_path(&path, false, &mut steps);
             steps
         })
         .collect();
