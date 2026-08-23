@@ -49812,6 +49812,35 @@ mod tests {
         );
     }
 
+    /// Object-input mirror of [`test_map_element_partial_error_propagates_with_path_context`]
+    /// -- the array branch already covers the mid-element error path, but
+    /// the object branch (sharing `map_element_step` since #1477) had no
+    /// equivalent.
+    #[test]
+    fn test_map_element_partial_error_propagates_with_path_context_object() {
+        match eval_all_result(
+            br#"[{"a":1}]"#,
+            &[0],
+            r#".[] | map((1, error("boom"))) | file_index"#,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// Object-input mirror of [`test_map_element_partial_break_propagates_with_path_context`].
+    #[test]
+    fn test_map_element_partial_break_propagates_with_path_context_object() {
+        match eval_all_result(
+            br#"[{"a":1}]"#,
+            &[0],
+            ".[] | map((1, break $out)) | file_index",
+        ) {
+            QueryResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected Break, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_if_cond_empty_produces_none_with_path_context() {
         // `.arr[]` on an empty array produces bare `QueryResult::None`
