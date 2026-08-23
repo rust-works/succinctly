@@ -1506,13 +1506,21 @@ fn get_inputs(
     // always out of bounds at `end == bytes.len()`, so it degenerates to a
     // plain newline count -- the same one-off, single-lookup use its own
     // doc comment describes, not `LineCounter`'s repeated-increasing-offset
-    // case.
-    let slurp_eof_line = if args.slurp {
-        raw_inputs
-            .last()
-            .map_or(0, |(_, raw)| line_at(raw.as_bytes(), raw.len()))
+    // case. `None` when `--seq`'s trailing record was truncated/malformed
+    // and silently dropped (#1542): real jq's own incremental parser loses
+    // its EOF position entirely for a record it never finished reading,
+    // where a malformed record earlier in the stream (one a later valid
+    // record resyncs after) still reports normally.
+    let slurp_eof_line: Option<usize> = if args.slurp {
+        raw_inputs.last().and_then(|(_, raw)| {
+            if args.seq && seq_trailing_record_is_dropped(raw) {
+                None
+            } else {
+                Some(line_at(raw.as_bytes(), raw.len()))
+            }
+        })
     } else {
-        0
+        None
     };
 
     // jq -R -s: the entire input (all files concatenated) becomes a single
@@ -1522,10 +1530,13 @@ fn get_inputs(
         for (_, raw) in &raw_inputs {
             combined.push_str(raw);
         }
-        let (src, line) = locations.slurp_eof(slurp_eof_line);
+        let at = match locations.slurp_eof(slurp_eof_line) {
+            Some((src, line)) => locations.resolve(src, line),
+            None => InputLocation::unknown(),
+        };
         return Ok(Ok((
             vec![OwnedValue::String(combined)],
-            InputLocations::single(locations.resolve(src, line)),
+            InputLocations::single(at),
         )));
     }
 
@@ -1597,10 +1608,13 @@ fn get_inputs(
 
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
-        let (src, line) = locations.slurp_eof(slurp_eof_line);
+        let at = match locations.slurp_eof(slurp_eof_line) {
+            Some((src, line)) => locations.resolve(src, line),
+            None => InputLocation::unknown(),
+        };
         Ok(Ok((
             vec![OwnedValue::Array(values)],
-            InputLocations::single(locations.resolve(src, line)),
+            InputLocations::single(at),
         )))
     } else {
         Ok(Ok((values, locations)))
@@ -1656,6 +1670,15 @@ pub struct InputLocations {
     /// `(source index, 1-based line)` per value. Empty means there is no input
     /// to point at (`-n`), which jq renders as `<unknown>`.
     per_value: Vec<(u32, u32)>,
+    /// Set only by [`single`](Self::single) when its one value has no real
+    /// position to report (#1542 -- a `--seq` trailing record real jq itself
+    /// can't resolve). `per_value` still carries a placeholder `(0, 0)`
+    /// entry regardless, so [`per_value`](Self::per_value)'s queue-seeding
+    /// consumer (`#1309`'s `input`/`inputs` path) keeps its "one location
+    /// per value" invariant and never loses the document -- only
+    /// [`get`](Self::get)'s direct lookup (the common, non-`input`-builtin
+    /// path) answers `<unknown>` instead of resolving that placeholder.
+    unknown_single: bool,
 }
 
 impl InputLocations {
@@ -1663,6 +1686,7 @@ impl InputLocations {
         Self {
             files,
             per_value: Vec::new(),
+            unknown_single: false,
         }
     }
 
@@ -1671,24 +1695,22 @@ impl InputLocations {
         Self::default()
     }
 
-    /// Locations for a single value at an already-resolved location.
+    /// Locations for a single value at an already-resolved location, or at
+    /// no location at all (`at.line.is_none()`, #1542).
     ///
-    /// Always pushes exactly one `per_value` entry -- `at.line` is always
-    /// `Some(_)` from every current caller (both go through
-    /// [`slurp_eof`](Self::slurp_eof), which always resolves to a concrete
-    /// EOF line, never `None`), but the `unwrap_or(0)` below is not merely
-    /// decorative: slurp mode always produces exactly one value, so
-    /// `get_inputs`'s `values`/`locations` invariant ("one location per
-    /// value") must hold here unconditionally regardless of what `at`
-    /// contains -- the seeding `.zip()` in `run_jq` silently truncates to the
-    /// shorter side on a mismatch instead of erroring, so a skipped push
-    /// here previously lost the whole slurped document to `input`/`inputs`
-    /// (debug-build panic on the `debug_assert_eq!` guarding that zip,
-    /// release-build silent empty output instead of jq's own `[]`) --
-    /// confirmed live against jq 1.7.1: `printf '' | jq -c -s '., inputs'`
-    /// prints `[]`.
+    /// Always pushes exactly one `per_value` entry regardless of `at`:
+    /// slurp mode always produces exactly one value, so `get_inputs`'s
+    /// `values`/`locations` invariant ("one location per value") must hold
+    /// here unconditionally -- the seeding `.zip()` in `run_jq` silently
+    /// truncates to the shorter side on a mismatch instead of erroring, so
+    /// a skipped push here previously lost the whole slurped document to
+    /// `input`/`inputs` (debug-build panic on the `debug_assert_eq!`
+    /// guarding that zip, release-build silent empty output instead of
+    /// jq's own `[]`) -- confirmed live against jq 1.7.1: `printf '' | jq
+    /// -c -s '., inputs'` prints `[]`.
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
+        locations.unknown_single = at.line.is_none();
         locations.push(0, at.line.unwrap_or(0));
         locations
     }
@@ -1727,6 +1749,9 @@ impl InputLocations {
 
     /// Location of the value at `idx`.
     pub fn get(&self, idx: usize) -> InputLocation {
+        if self.unknown_single {
+            return InputLocation::unknown();
+        }
         match self.per_value.get(idx) {
             Some(&(src, line)) => self.resolve(src, line),
             None => InputLocation::unknown(),
@@ -1800,20 +1825,23 @@ impl InputLocations {
     }
 
     /// Where `--slurp`'s single combined value's `(at ...)` marker points
-    /// (#1520), as a raw `(source, line)` tag -- the same shape
-    /// [`exhausted`](Self::exhausted) returns, for the same reason (the
-    /// caller resolves it to a printable name only once it's actually
-    /// needed): the last source on the command line, at `eof_line` -- that
-    /// source's own newline count (`line_at(bytes, bytes.len())` at the call
-    /// site above).
+    /// (#1520), as a raw `(source, line)` tag -- the same `Option` shape
+    /// [`exhausted`](Self::exhausted) returns, for the same reason (`None`
+    /// means "no position to point at", i.e. `<unknown>`; the caller
+    /// resolves `Some` to a printable name only once it's actually needed):
+    /// the last source on the command line, at `eof_line` -- that source's
+    /// own newline count (`line_at(bytes, bytes.len())` at the call site
+    /// above), or `None` when the caller found `--seq`'s trailing record
+    /// truncated/malformed (#1542).
     ///
     /// The same "last source" rule as `exhausted`, but slurp collapses every
     /// input into one value up front, so there is no per-value table
     /// afterward to fall back on the way `exhausted` does -- the caller must
     /// compute `eof_line` directly from the last source's raw text before
     /// it's consumed, and pass it in.
-    fn slurp_eof(&self, eof_line: usize) -> (u32, u32) {
-        (self.last_src(), eof_line as u32)
+    fn slurp_eof(&self, eof_line: Option<usize>) -> Option<(u32, u32)> {
+        let line = eof_line?;
+        Some((self.last_src(), line as u32))
     }
 }
 
@@ -2484,18 +2512,65 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
         }
 
         // Try to parse as JSON, silently ignore failures
-        if validate::validate(segment.as_bytes()).is_ok() {
+        if seq_record_parses(segment) {
             values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
-        } else {
-            let normalized = normalize_leading_zero_numbers(segment);
-            if normalized != segment && validate_json_str(&normalized).is_ok() {
-                values.push(crate::output::json_bytes_to_owned_value(segment.as_bytes()));
-            }
-            // Genuine parse failures are silently ignored per RFC 7464
         }
+        // Genuine parse failures are silently ignored per RFC 7464
     }
 
     values
+}
+
+/// Whether a trimmed, non-empty `--seq` record segment parses as JSON --
+/// [`parse_json_seq`]'s own per-segment success check, factored out so
+/// [`seq_trailing_record_is_dropped`] can ask the identical question about
+/// one specific segment without duplicating the leading-zero retry logic.
+fn seq_record_parses(segment: &str) -> bool {
+    if validate::validate(segment.as_bytes()).is_ok() {
+        return true;
+    }
+    let normalized = normalize_leading_zero_numbers(segment);
+    normalized != segment && validate_json_str(&normalized).is_ok()
+}
+
+/// Whether `raw`'s trailing `--seq` record (RFC 7464, everything after the
+/// last RS byte) leaves real jq's own incremental parser with no EOF
+/// position to report -- distinct from a malformed record *elsewhere* in
+/// the stream, which a later valid record still resyncs after (#1542,
+/// oracle-verified: `\x1e1\n\x1e{"a":1\n\x1e3\n` still reports the trailing
+/// `3`'s own line; only the stream's actual *last* record can trigger this).
+///
+/// Two shapes, both silently swallowed by real jq's own `--seq` reader:
+///
+/// - **Genuinely malformed/truncated** -- [`seq_record_parses`] fails on it
+///   (an unterminated string/object, e.g.), matching
+///   [`parse_json_seq`]'s own silent-drop rule (RFC 7464's recommended
+///   failure mode, #1243).
+/// - **A bare number with nothing at all after it before EOF** -- valid
+///   JSON on its own, but jq's streaming number scanner can't rule out more
+///   digits still arriving without seeing a terminating byte (whitespace,
+///   or the start of the next token) after the last one it read, so a
+///   number that happens to butt right up against real EOF is
+///   indistinguishable from one truncated mid-digit. Every other JSON type
+///   has its own unambiguous closing delimiter (`"`, `}`, `]`, the last
+///   letter of `true`/`false`/`null`) and reports normally even with
+///   nothing trailing it -- oracle-verified: `\x1e1\n\x1e2` (bare `2`, no
+///   trailing byte at all) reports `<unknown>`, but the same shape with
+///   `true`/`"s"`/`{}`/`[]`/`null` in place of `2`, or `2` followed by even
+///   one trailing space, all report their own line normally.
+fn seq_trailing_record_is_dropped(raw: &str) -> bool {
+    let Some((_, tail)) = raw.rsplit_once('\u{1e}') else {
+        return false;
+    };
+    let segment = tail.trim();
+    if segment.is_empty() {
+        return false;
+    }
+    if !seq_record_parses(segment) {
+        return true;
+    }
+    let is_bare_number = matches!(segment.as_bytes().first(), Some(b'-' | b'0'..=b'9'));
+    is_bare_number && tail.trim_end() == tail
 }
 
 /// Validate that the DSV delimiter is acceptable.
