@@ -691,7 +691,9 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// the single walk that collects them -- where before, the caller ran a
 /// whole separate `document::census` and then walked again to build this.
 fn distinct_key_cursors<V: DocumentValue>(fields: &V::Fields, collapse: bool) -> Vec<V::Cursor> {
-    DistinctKeyCursors::new(fields, collapse).collect()
+    DistinctKeyCursors::new(fields, collapse)
+        .map(|(_, cursor)| cursor)
+        .collect()
 }
 
 /// Materialize a `GenericResult::LazyIndexRange` fallback: build the
@@ -821,7 +823,7 @@ impl<V: DocumentValue> LazySource<V> {
                 *fields = rest;
                 Some(LazyElem::Cursor(field.value_cursor))
             }
-            Self::Keys(keys) => Some(LazyElem::Cursor(keys.next()?)),
+            Self::Keys(keys) => Some(LazyElem::Cursor(keys.next()?.1)),
             Self::IndexRange { next, len } => {
                 if *next >= *len {
                     return None;

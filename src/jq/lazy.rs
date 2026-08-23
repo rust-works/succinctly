@@ -609,7 +609,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::LazyKeysArray { fields, collapse } => {
                 out.write_char('[')?;
                 let mut first = true;
-                for key_cursor in DistinctKeyCursors::new(fields, *collapse) {
+                for (key, key_cursor) in DistinctKeyCursors::new(fields, *collapse) {
                     if !first {
                         out.write_char(',')?;
                     }
@@ -623,7 +623,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                         // string tokens with a text range, so this is not
                         // expected to be reached.
                         None => {
-                            if let StandardJson::String(k) = key_cursor.value() {
+                            if let StandardJson::String(k) = key {
                                 out.write_char('"')?;
                                 if let Ok(s) = k.as_str() {
                                     write_json_body_jq(out, &s)?;
@@ -673,8 +673,8 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     collapse: bool,
 ) -> OwnedValue {
     let mut keys = Vec::new();
-    for key_cursor in DistinctKeyCursors::new(fields, collapse) {
-        if let StandardJson::String(k) = key_cursor.value() {
+    for (key, _) in DistinctKeyCursors::new(fields, collapse) {
+        if let StandardJson::String(k) = key {
             if let Ok(s) = k.as_str() {
                 keys.push(OwnedValue::String(s.into_owned()));
             }
