@@ -291,7 +291,23 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 ///
 /// `&mut dyn FnMut`, not a generic `F`, matching [`any_subexpr`]'s own
 /// reasoning: this recurses, so a generic parameter would monomorphise the
-/// whole traversal per call site.
+/// whole traversal per call site. Borrowing, not consuming, `builtin` --
+/// matching `builtin_kids`'s own convention -- costs one clone per
+/// sub-expression at `rewrite_namespaced_calls`'s only call site today
+/// (bounded by the parser's own `MAX_EXPR_DEPTH`, since this runs once per
+/// parsed program, not per document); a consuming signature would avoid
+/// that at the cost of breaking symmetry with `builtin_kids`, considered and
+/// not taken (#1526 review of a similar tradeoff elsewhere reached the same
+/// call for a comparable one-time, depth-bounded traversal).
+///
+/// This is the 4th/5th independently hand-maintained exhaustive `Builtin`
+/// match in this codebase, alongside `builtin_kids` (this file) and three
+/// more in `eval.rs` (`substitute_var_in_builtin`,
+/// `expand_func_calls_in_builtin`, `substitute_func_param_in_builtin`) --
+/// nothing forces all five to agree when a new sub-expression-carrying
+/// variant is added, which is exactly the class of bug this function fixes
+/// for one of the five. Consolidating them is filed separately, **#1506**,
+/// not attempted here.
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
         // --- No sub-expression (125) ---------------------------------------
