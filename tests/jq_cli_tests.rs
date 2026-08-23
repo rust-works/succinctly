@@ -10,8 +10,13 @@ use std::time::Duration;
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-/// Maximum retries for cargo run commands that fail with exit code 101.
-/// This handles flaky failures from cargo lock contention when tests run in parallel.
+/// Maximum retries for cargo run commands that fail with exit code 101, or
+/// whose child is killed by a signal (`ExitStatus::code()` returns `None`
+/// only in that case, on Unix). Both are treated as transient: `101` often
+/// means cargo lock contention between concurrently running tests, and a
+/// signal death under the same heavy concurrent load (an OOM kill, another
+/// session's `pkill`, or fallout from that same lock contention) is just as
+/// likely to be environmental as a real bug in the code under test (#1516).
 const MAX_CARGO_RETRIES: u32 = 3;
 
 /// Maximum retries for spawning the pre-built binary directly.
@@ -21,6 +26,125 @@ const MAX_CARGO_RETRIES: u32 = 3;
 /// `run_jq_stdin_streams`). `spawn()` can transiently observe that path
 /// mid-replacement and fail with `ENOENT` (#550).
 const MAX_SPAWN_RETRIES: u32 = 3;
+
+/// Classifies a `cargo run` child's exit for the retry loops below, so each
+/// of the four call sites doesn't hand-roll the same "retry on 101" check
+/// (and, historically, the same bug: silently coercing a signal death to
+/// `-1` via `.code().unwrap_or(-1)`).
+///
+/// Returns `Ok(Some(code))` once a real exit code is available to the
+/// caller, or `Ok(None)` when the caller should sleep (per `attempt`) and
+/// retry -- covering both the existing `101` lock-contention case and a
+/// signal death within `MAX_CARGO_RETRIES` attempts. Once retries are
+/// exhausted on a signal death, returns `Err` naming the signal and the
+/// captured stderr, instead of letting the caller's exit-code assertion
+/// render as an inscrutable `left: -1, right: 0` with no indication a child
+/// was ever killed -- which is exactly what cost a wrong root-cause call in
+/// the #1459 review (#1516).
+fn classify_cargo_run_exit(
+    status: std::process::ExitStatus,
+    stderr: &str,
+    attempt: u32,
+) -> Result<Option<i32>> {
+    if let Some(code) = status.code() {
+        if code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+            return Ok(None);
+        }
+        return Ok(Some(code));
+    }
+
+    // `ExitStatus::code()` returns `None` only when the child was
+    // terminated by a signal (Unix) -- there is no other cause.
+    if attempt + 1 < MAX_CARGO_RETRIES {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    anyhow::bail!(
+        "cargo run child was killed by signal {} after {} attempt(s); stderr:\n{stderr}",
+        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
+        attempt + 1,
+    );
+}
+
+/// #1516: a signal-killed child used to render as an inscrutable
+/// `left: -1, right: 0` panic -- exercises `classify_cargo_run_exit`
+/// directly against constructed `ExitStatus` values (via
+/// `ExitStatusExt::from_raw`) rather than by actually killing a `cargo run`
+/// child, which would make the test itself exactly as flaky as the bug it
+/// pins.
+#[cfg(unix)]
+#[test]
+fn test_classify_cargo_run_exit_reports_signal_death_1516() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    // Raw wait-status encoding (see `man 2 wait`): a signal death stores the
+    // signal number in the low 7 bits with no exit-code shift; SIGKILL is 9.
+    let killed = ExitStatus::from_raw(9);
+    assert_eq!(
+        killed.code(),
+        None,
+        "sanity: from_raw(9) must look signal-killed"
+    );
+
+    // On the last allowed attempt, a signal death must be a real error --
+    // naming the signal and the captured stderr -- not `Ok(Some(-1))`.
+    let err = classify_cargo_run_exit(killed, "some stderr output", MAX_CARGO_RETRIES - 1)
+        .expect_err("a signal death on the last attempt must error, not return a fake exit code");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("signal 9"),
+        "expected the signal number in the message: {msg}"
+    );
+    assert!(
+        msg.contains("some stderr output"),
+        "expected captured stderr in the message: {msg}"
+    );
+
+    // Within the retry budget, the same signal death asks the caller to
+    // retry instead of erroring immediately.
+    assert_eq!(
+        classify_cargo_run_exit(killed, "", 0).unwrap(),
+        None,
+        "a signal death within retry budget should ask for a retry"
+    );
+
+    // Exit code 101 (lock contention) keeps its pre-existing retry
+    // behavior unchanged.
+    let contention = ExitStatus::from_raw(101 << 8);
+    assert_eq!(
+        contention.code(),
+        Some(101),
+        "sanity: from_raw encodes exit code 101"
+    );
+    assert_eq!(
+        classify_cargo_run_exit(contention, "", 0).unwrap(),
+        None,
+        "101 within retry budget should still retry"
+    );
+    assert_eq!(
+        classify_cargo_run_exit(contention, "", MAX_CARGO_RETRIES - 1).unwrap(),
+        Some(101),
+        "101 with no retries left surfaces as-is, same as before this change"
+    );
+
+    // A genuine, non-101 exit code passes through unchanged regardless of
+    // attempt number.
+    assert_eq!(
+        classify_cargo_run_exit(ExitStatus::from_raw(0), "", 0).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        classify_cargo_run_exit(ExitStatus::from_raw(1 << 8), "", 0).unwrap(),
+        Some(1)
+    );
+}
 
 /// Helper to run jq command with input from stdin
 fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
@@ -63,16 +187,13 @@ fn run_jq_stdin_streams(
         }
 
         let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8(output.stderr)?;
+        let Some(exit_code) = classify_cargo_run_exit(output.status, &stderr, attempt)? else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
         let stdout = String::from_utf8(output.stdout)?;
-        let stderr = String::from_utf8(output.stderr)?;
         return Ok((stdout, stderr, exit_code));
     }
     unreachable!()
@@ -151,13 +272,11 @@ fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(St
             .arg(file_path)
             .output()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) = classify_cargo_run_exit(output.status, &stderr, attempt)? else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
         let stdout = String::from_utf8(output.stdout)?;
         return Ok((stdout, exit_code));
@@ -183,13 +302,11 @@ fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
             .arg(filter)
             .output()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) = classify_cargo_run_exit(output.status, &stderr, attempt)? else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
         let stdout = String::from_utf8(output.stdout)?;
         return Ok((stdout, exit_code));
@@ -3430,13 +3547,11 @@ fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Resul
         }
 
         let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) = classify_cargo_run_exit(output.status, &stderr, attempt)? else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
         return Ok((output.stdout, exit_code));
     }
