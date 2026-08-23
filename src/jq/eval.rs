@@ -21236,13 +21236,26 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // `n` is the OUTER loop, `expr` the inner one -- live-verified against
     // jq 1.7.1: `[nth((0,1); (10,20))]` is `[10,20]`.
+    //
+    // Subsumes #1408's zero-output requirement, which the `result_to_owned_full`
+    // call this replaces existed to satisfy: a zero-output `n` (`nth(empty;
+    // .a,.b)`) yields no outputs to loop over, so the whole call produces
+    // nothing rather than hard-erroring "no value".
     fanout_arg(
         eval_single::<W, S>(n_expr, value.clone(), optional),
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_value| {
+            // `NumberLiteral(Int)` alongside `Int` (#1408 review, 769b80583):
+            // a document-sourced integer materializes as the former, and
+            // `stream_outputs` hands this closure exactly that shape, so
+            // matching only `Int` would reject `nth` on any `n` read from the
+            // input. `builtin_nth_stream` -- the arity-2 form real queries
+            // actually reach -- accepts both for the same reason.
             let n = match n_value {
-                OwnedValue::Int(i) if i >= 0 => i as usize,
+                OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+                    i as usize
+                }
                 _ => {
                     return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
                 }
@@ -28436,7 +28449,10 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //            [range((1,2))]                    => [0,0,1]  <- length 3
     //
     // and a zero-output `n` gives arity 0, which is one empty combination:
-    // `[1,2] | [combinations(empty)]` is `[[]]`, not no output at all.
+    // `[1,2] | [combinations(empty)]` is `[[]]`, not no output at all -- which
+    // is #1408's own requirement for this builtin, subsumed here rather than
+    // dropped: it is the array constructor's answer, not the `x as $x |`
+    // zero-fanout "produce nothing" every other builtin in this family gets.
     let (n_values, trailing) = stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
 
     // Array construction drops its prefix when its generator escapes, so a
@@ -28915,15 +28931,21 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `[nth((0,1); (10,20))]` is `[10,20]`. The `_ =>` catch-all this
     // replaces swallowed a multi-output `n` into a type error, so
     // `[nth((0,1); .a,.b,.c)]` reported "expected number, got null" where jq
-    // answers `[1,2]` (#1279).
+    // answers `[1,2]` (#1279). Its dedicated `QueryResult::None` arm (#1408's
+    // zero-output fix) is subsumed the same way `eval_nth_expr`'s is: no
+    // argument outputs means no loop iterations, hence no result.
     fanout_arg(
         eval_single::<W, S>(n_expr, value.clone(), optional),
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            // A document-sourced number arrives here as an `OwnedValue` (it used to
-            // arrive as a borrowed `QueryResult::One` and take its own arm); the
-            // negative check and the `as_i64`-then-`as_f64` coercion are unchanged.
+            // A document-sourced number arrives here as an `OwnedValue`; it used
+            // to arrive as a borrowed `QueryResult::One` and take an arm of its
+            // own, which preferred `as_i64()` and only fell back to `as_f64()`.
+            // That preference is kept: an integer past f64's 53-bit mantissa
+            // would otherwise be rounded on its way to `usize`. The sibling
+            // owned arm this replaces used `as_f64()` alone, so consolidating on
+            // the *borrowed* arm's rule is the lossless direction.
             let n = match n_owned {
                 ref owned @ (OwnedValue::Int(_)
                 | OwnedValue::Float(_)
@@ -28934,7 +28956,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             "nth doesn't support negative indices",
                         ));
                     }
-                    f as usize
+                    owned.as_i64().map_or(f as usize, |i| i as usize)
                 }
                 ref other => {
                     return QueryResult::Error(EvalError::type_error("number", other.type_name()))
@@ -52397,6 +52419,27 @@ mod tests {
         match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
             QueryResult::Halt(code) => assert_eq!(code, 11),
             other => panic!("expected Halt(11), got {other:?}"),
+        }
+    }
+
+    /// #1408 review (769b80583) taught `eval_nth_expr` to accept a
+    /// `NumberLiteral(Int)` `n`, not just an `Int` -- a document-sourced
+    /// integer materializes as the former. #1279 rewrote this function around
+    /// `fanout_arg`, whose closure receives exactly that shape, and the rebase
+    /// conflict over the rewrite briefly dropped the arm again. Pinned here so
+    /// it cannot be lost a third time; the sibling zero-output test below
+    /// would not have caught it.
+    #[test]
+    fn eval_nth_expr_accepts_a_document_sourced_integer_n_1408() {
+        let json_bytes: &[u8] = br#"{"n": 1, "xs": [10, 20, 30]}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = parse(".n").unwrap();
+        let expr = parse(".xs[]").unwrap();
+        match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
+            QueryResult::One(v) => assert_eq!(to_owned(&v).to_json(), "20"),
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), "20"),
+            other => panic!("expected the element at index 1, got {other:?}"),
         }
     }
 
