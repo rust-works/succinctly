@@ -1535,7 +1535,15 @@ fn get_inputs(
     // not `<unknown>`.
     let slurp_eof_line: Option<usize> = if args.slurp {
         raw_inputs.last().and_then(|(_, raw)| {
-            if args.seq && !args.raw_input && seq_trailing_record_is_dropped(raw) {
+            // #1550: the drop check itself has to walk back past any empty
+            // trailing files to the source that actually carries the
+            // stream's last record -- `raw_inputs.last()` alone can't see a
+            // truncated record left behind in an earlier file.
+            let dropped = args.seq
+                && !args.raw_input
+                && last_non_empty_seq_source(&raw_inputs)
+                    .is_some_and(seq_trailing_record_is_dropped);
+            if dropped {
                 None
             } else {
                 Some(line_at(raw.as_bytes(), raw.len()))
@@ -2675,6 +2683,24 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     }
     let is_bare_number = matches!(segment.as_bytes().first(), Some(b'-' | b'0'..=b'9'));
     is_bare_number && tail.trim_end() == tail
+}
+
+/// The actual last non-empty raw source in `raw_inputs`, walking backward
+/// from the end (#1550). `--seq -s`'s trailing-record drop check needs this
+/// instead of always trusting `raw_inputs.last()`: real jq's `-s` reader
+/// treats every file on the command line as one continuous byte stream, so a
+/// truncated trailing record physically located in a non-last file (with the
+/// actual last file(s) empty) still loses jq's EOF position -- but a check
+/// that only ever looks at the physically-last file can't see across the
+/// file boundary to find it. Returns `None` when every source is empty
+/// (including the no-files case), in which case the drop check is skipped
+/// and #1520's own "empty last file, EOF at line 0" rule applies unchanged.
+fn last_non_empty_seq_source(raw_inputs: &[(Option<usize>, String)]) -> Option<&str> {
+    raw_inputs
+        .iter()
+        .rev()
+        .map(|(_, raw)| raw.as_str())
+        .find(|raw| !raw.trim().is_empty())
 }
 
 /// Validate that the DSV delimiter is acceptable.
