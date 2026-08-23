@@ -231,10 +231,30 @@ Four narrower gaps this fix deliberately left alone remain open, each already fi
   missed wiring like the three above.
 
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
-[#478](https://github.com/rust-works/succinctly/issues/478) and
-[#868](https://github.com/rust-works/succinctly/issues/868) are closed decisions that
+[#478](https://github.com/rust-works/succinctly/issues/478),
+[#868](https://github.com/rust-works/succinctly/issues/868) and
+[#757](https://github.com/rust-works/succinctly/issues/757) are closed decisions that
 deliberately made output *preserve* duplicate keys. They stand for yq mode; ADR-0018 rules 2
 and 3 revise them for jq mode only.
+
+#757 is the same shape as #442/#478 one route further out, and worth reading as the general
+lesson rather than a fourth incident: `map(...)` was absent from `can_use_m2_streaming`, so
+every `map` query fell to the `OwnedValue` DOM path — and an `IndexMap` cannot represent a
+repeated key. Because the loss was a *side effect of routing* rather than of any rule about
+duplicates, it arrived bundled with four more losses that have nothing to do with duplicate
+keys (comments, anchors/aliases, flow style, quoted-scalar style) plus, under `-I0`, nested
+containers emitted at their parent's indent — output that reads back with the whole nested
+value gone. `.[]` and `select()` on the identical input were already correct, because they
+already streamed. Every one of those was fixed by the same one-line gate change plus a
+cursor-level sequence writer, and is now pinned by
+[tests/data/yq-golden/cases/map_*](../../../tests/data/yq-golden/cases). **When auditing
+what a construct loses, the question to ask is which output route it takes, not which rule it
+implements** — a construct on the DOM route loses everything the DOM cannot carry, all at
+once.
+
+The `-I0` nesting bug that surfaced along the way is *wider* than `map` and is not fixed:
+`to_entries -I=0` still emits a nested container at its parent's indent, while `-P -I=0` is
+correct for both. #757 only closed the route `map` took into it.
 
 ### `input`, `inputs`, `input_line_number` are rejected, but at runtime rather than parse time
 
@@ -455,6 +475,15 @@ and any filter yielding multiple results — anything containing a comma — los
 before one can be captured
 ([#1361](https://github.com/rust-works/succinctly/issues/1361)). Both predate
 [ADR-0017](../../adrs/adr-0017.md)'s mechanism and neither is anchor-specific.
+
+There used to be a third: `map(...)`, which lost all three the same way for the same reason —
+it took the DOM route, which carries none of them.
+[#757](https://github.com/rust-works/succinctly/issues/757) closed it by streaming `map`'s
+elements from their own cursors (see the duplicate-key section above for the full list of
+what that one route was dropping). `--inplace` is *not* an exception here despite #1349:
+its M2 fast path shares `stream_cursor!` with stdout, so an M2-eligible `map` keeps comments
+and style through `-i` too — #1349 is about the `--inplace` **DOM fallback**, which a
+non-M2-eligible filter still reaches.
 
 ### Comma-grouped scalar-target assignment no-op
 
