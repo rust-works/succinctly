@@ -1539,25 +1539,24 @@ impl ArgFanout {
 /// empty prefix down to one); dropping the control instead would swallow an
 /// escape raised *before* any output, which both gates must still propagate.
 ///
-/// **Single-argument fan-out only.** [`fanout_two_args`] deliberately does
-/// not do this, because emptying one slot's values skips the body — and the
-/// body is where the *other* slot gets validated. Which slot real yq reports
-/// is per-builtin and does not follow succinctly's outer/inner order:
+/// **Not shared verbatim with [`fanout_two_args`].** An earlier revision
+/// tried calling this same function on each of that function's two slots
+/// *before* running `body`, and that regressed: emptying a slot's values
+/// pre-emptively skips `body` entirely, and `body` is where a builtin's own,
+/// slot-independent validation lives —
 ///
 /// ```text
-/// # yq validates the flags, which only the body checks -- not the pattern's escape
+/// # yq validates the flags inside `body`, which only runs if `body` is reached --
+/// # not the pattern's escape, even though pattern is the slot that actually escaped
 /// $ printf 'x: "abcabc"\n' | yq '.x | test(("a", error("p")); "z")'
 /// Error: unrecognised match params 'z', ...
-///
-/// # yq reports the *path* slot, which is succinctly's inner, not the outer value
-/// $ printf 'a: 1\n' | yq '[setpath((["a"],error("p")); (1,error("v")))]'
-/// Error: p
 /// ```
 ///
-/// Both were regressions when an earlier revision applied this rule to
-/// `fanout_two_args` as well. Getting the two-argument cases right needs a
-/// per-builtin ordering probe rather than one shared rule — tracked on
-/// #1533, which this therefore only half closes.
+/// `fanout_two_args` instead runs `body` exactly as it always did, and only
+/// discards `body`'s *result* — not its own values ahead of time — once it is
+/// about to report a slot's own trailing control rather than `body`'s. See
+/// that function's doc comment for the four-shape proof this still resolves
+/// correctly per-builtin without a shared pre-`body` clear (#1533/#1534).
 fn clear_values_when_yq_argument_escaped(
     args: &mut Vec<OwnedValue>,
     trailing: &Option<Control>,
@@ -1788,6 +1787,40 @@ where
 /// only after every inner loop has completed. [`build_object_entries`] (#354)
 /// documents the same two rules for key/value nesting.
 ///
+/// **Under a yq gate ([`ArgFanout::FirstOnly`]/[`ArgFanout::RejectMany`]),
+/// an argument's own escape always reports bare, discarding whatever `body`
+/// already computed** -- unlike [`ArgFanout::All`]'s rule above, and unlike
+/// `body`'s *own* error (the arm just above this one in the loop), which does
+/// keep its prefix. Both gates truncate/reject each slot to at most one
+/// value, so `body` runs at most once here regardless -- there is no
+/// multi-iteration prefix to preserve, only a single already-computed value
+/// real yq never surfaces once either slot's generator has escaped. Four
+/// live-verified shapes pin this (`setpath`'s own regression test cites the
+/// first two, `capture`'s the second two):
+///
+/// ```text
+/// # value fixed, path escapes -- Error alone, no {"a":1} printed first
+/// $ printf 'a: 1\n' | yq 'setpath((["a"],error("p")); 1)'      => Error: p
+/// # path fixed, value escapes -- same, from the other slot
+/// $ printf 'a: 1\n' | yq 'setpath(["a"]; (1,error("v")))'      => Error: v
+/// # flags fixed+valid, pattern escapes after a value body would have used
+/// $ printf 'x: "aa"\n' | yq '.x | capture(("(?<x>a)",error("boom")); "")'
+///                                                               => Error: boom
+/// # pattern fixed, flags escapes -- outer's own escape, no {"x":"a"} first
+/// $ printf 'x: "aa"\n' | yq '.x | capture("(?<x>a)"; ("","x",error("boom")))'
+///                                                               => Error: boom
+/// ```
+///
+/// This does not reopen #1533/#1534's reverted attempt to share
+/// `clear_values_when_yq_argument_escaped` between the two functions: that
+/// attempt cleared a slot's *values* before `body` ever ran, which skips
+/// `body` outright and can suppress a validation error only `body` itself
+/// raises (`test(("a", error("p")); "z")` needs `body` to still run once on
+/// `"z"`/`"a"` so its own "unrecognised match params" fires *before* either
+/// slot's trailing control is even consulted). This fix runs `body` exactly
+/// as before and only changes what happens to its *result* once an
+/// argument's own trailing control is the thing being reported.
+///
 /// No 1x1 fast path, deliberately: every caller already allocates an owned
 /// pattern or path per combination, so two one-element `Vec`s are noise next
 /// to that -- unlike [`fanout_arg`], whose fast path exists to preserve a
@@ -1827,12 +1860,16 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return partial(out, control);
             }
         }
+        // The argument's *own* escape (as opposed to `body`'s, handled
+        // above) always reports bare -- discard whatever `body` computed.
+        // See this function's doc comment for why that differs from the
+        // `body`-escape arm just above, which keeps its prefix.
         if let Some(control) = inner_trailing {
-            return partial(out, control);
+            return partial(Vec::new(), control);
         }
     }
     match outer_trailing {
-        Some(control) => partial(out, control),
+        Some(control) => partial(Vec::new(), control),
         None => owned_vec_to_result(out),
     }
 }
@@ -11861,59 +11898,78 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// none of those arguments are ever read. Flags are not honoured either
 /// -- `"AAA" | sub("a";"X";"i")` stays `"AAA"`, matching `re_expr`
 /// case-sensitively regardless of what a flags argument requested.
+///
+/// `re_expr` itself still goes through the same [`ArgFanout::FirstOnly`]
+/// gate as every other yq-native regex builtin -- confirmed live, a
+/// multi-output pattern quietly takes its first (`[sub(("a","b");"Z";"")]`
+/// is `[""]`, not `["",""]`), and an escape anywhere in it raises with no
+/// output at all rather than the first output and then an error
+/// (`"aa" | sub(("a",error("boom"));"Z";"")` is just `Error: boom`,
+/// confirmed live). This used to go through `result_to_owned`, which
+/// silently drops exactly that trailing escape (#1277) -- routing through
+/// [`fanout_arg`] instead reuses the escape-clearing already proven correct
+/// for `has`/`split`/`join` (#1534) rather than a fourth hand-rolled copy.
 #[cfg(feature = "regex")]
 fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     re_expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let pattern = match result_to_owned(eval_single::<W, S>(re_expr, value.clone(), optional)) {
-        Ok(OwnedValue::String(s)) => s,
-        Ok(v) => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-        Err(escape) => return escape.into(),
-    };
+    fanout_arg::<W, S, _>(
+        re_expr,
+        value.clone(),
+        optional,
+        ArgFanout::yq_native::<S>(),
+        move |raw_pattern| {
+            let pattern = match raw_pattern {
+                OwnedValue::String(s) => s,
+                v => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            };
 
-    // The three `if optional` guards below mirror every sibling builtin's own
-    // `_ if optional => QueryResult::None` arm (see `format_base64` above)
-    // for consistency, but are very likely unreachable dead code post-#693:
-    // `Expr::Optional` forces the inner evaluation's ambient `optional` to
-    // `false` and catches the resulting `Error` itself, rather than letting
-    // a builtin's own internal `optional` flag see `true`. Confirmed via
-    // `cargo llvm-cov`: `sub(...; ...; ...)?` on a non-string input or an
-    // invalid pattern still returns empty output (proving `?` itself works),
-    // but does so via the outer wrapper catching the arms below that ignore
-    // `optional`, not via these guards.
-    let input = match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            // The three `if optional` guards below mirror every sibling
+            // builtin's own `_ if optional => QueryResult::None` arm (see
+            // `format_base64` above) for consistency, but are very likely
+            // unreachable dead code post-#693: `Expr::Optional` forces the
+            // inner evaluation's ambient `optional` to `false` and catches
+            // the resulting `Error` itself, rather than letting a builtin's
+            // own internal `optional` flag see `true`. Confirmed via
+            // `cargo llvm-cov`: `sub(...; ...; ...)?` on a non-string input
+            // or an invalid pattern still returns empty output (proving `?`
+            // itself works), but does so via the outer wrapper catching the
+            // arms below that ignore `optional`, not via these guards.
+            let input = match &value {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => cow.into_owned(),
+                    Err(_) if optional => return QueryResult::None,
+                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                },
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+            };
+
+            let re = match build_regex(&pattern, None) {
+                Ok(r) => r,
+                Err(_e) if optional => return QueryResult::None,
+                Err(e) => return e.into(),
+            };
+
+            let matches = global_captures::<S>(&re, &input);
+            if matches.is_empty() {
+                return QueryResult::Owned(OwnedValue::String(input));
+            }
+            let mut out = String::with_capacity(input.len());
+            let mut last_end = 0;
+            for caps in &matches {
+                let m = caps
+                    .get(0)
+                    .expect("capture group 0 is always present on a match");
+                out.push_str(&input[last_end..m.start()]);
+                last_end = m.end();
+            }
+            out.push_str(&input[last_end..]);
+            QueryResult::Owned(OwnedValue::String(out))
         },
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
-    };
-
-    let re = match build_regex(&pattern, None) {
-        Ok(r) => r,
-        Err(_e) if optional => return QueryResult::None,
-        Err(e) => return e.into(),
-    };
-
-    let matches = global_captures::<S>(&re, &input);
-    if matches.is_empty() {
-        return QueryResult::Owned(OwnedValue::String(input));
-    }
-    let mut out = String::with_capacity(input.len());
-    let mut last_end = 0;
-    for caps in &matches {
-        let m = caps
-            .get(0)
-            .expect("capture group 0 is always present on a match");
-        out.push_str(&input[last_end..m.start()]);
-        last_end = m.end();
-    }
-    out.push_str(&input[last_end..]);
-    QueryResult::Owned(OwnedValue::String(out))
+    )
 }
 
 /// The rest of `sub`/`gsub`'s work once the pattern string and flags string
