@@ -94,7 +94,7 @@ does now, see the tests named above. Each was run against the pinned oracle
 `/usr/bin/jq` (jq-1.7.1-apple) and a `--release --features cli` build of this worktree,
 with stdout and stderr captured *separately*.** `2>&1` interleaves the two misleadingly,
 since stdout is buffered when piped and stderr is not — the convention stated at
-`tests/jq_cli_tests.rs:3469`.
+`tests/jq_cli_tests.rs`.
 
 ## Problem
 
@@ -102,7 +102,7 @@ Every consumer that only needs a *prefix* of a generator's outputs evaluates the
 generator first, then truncates the already-materialized `QueryResult`. For `error(...)`
 and `debug` that is externally indistinguishable from real laziness — their "output" is
 data carried in the result, with no I/O at evaluation time. For `stderr` and `halt_error`
-it is not: both call `write_stderr` (`src/jq/eval.rs:24928`) *during* evaluation, so the
+it is not: both call `write_stderr` (`src/jq/eval.rs`) *during* evaluation, so the
 bytes are gone by the time the consumer decides it never needed that output.
 
 ```
@@ -110,7 +110,7 @@ $ jq -n 'isempty(1, stderr)'              false         (nothing on stderr)
 $ succinctly jq -n 'isempty(1, stderr)'   false         (leaks `null` to stderr)
 ```
 
-`builtin_debug`/`builtin_debug_msg` (`:24882`/`:24892`) are deliberate library-context
+`builtin_debug`/`builtin_debug_msg` are deliberate library-context
 no-ops, which is why #820's original `first(1, debug)` repro was a false negative that
 made `first`/`limit` look already-lazy. Re-tested with `stderr`, they leak identically to
 `isempty`.
@@ -120,9 +120,9 @@ made `first`/`limit` look already-lazy. Re-tested with `stderr`, they leak ident
 **#820's own severity rationale is out of date**, because a dependency changed after it
 was filed. When #820 was written, `input`/`inputs` were `undefined function` — that was
 #723's whole point. #723 is now closed and they are implemented, parsed at
-`src/jq/parser.rs:3444-3454` and backed by a process-global `thread_local!` queue
-(`mod remaining_inputs`, `src/jq/eval.rs:21428`) that the CLI's own per-document driver
-loop also drains (`src/bin/succinctly/jq_runner.rs:1023`).
+`src/jq/parser.rs` and backed by a process-global `thread_local!` queue
+(`mod remaining_inputs`, `src/jq/eval.rs`) that the CLI's own per-document driver
+loop also drains (`src/bin/succinctly/jq_runner.rs`).
 
 `input` is therefore a **consuming** side effect, not merely a visible one. An eagerly
 evaluated, never-needed comma branch containing it eats a document the driver loop then
@@ -157,31 +157,31 @@ $ succinctly jq -n '"outer" | halt_error(1, ("inner"|halt_error(2)))'  stderr: i
 ```
 
 `eval_comma` runs the second branch, which halts; `result_to_owned_full`'s
-`Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code))` arm (`:1511`, correct in
+`Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code))` arm (correct in
 isolation per #791) then lets the inner halt win over the outer. #820's body reports
 `innerouter` / exit 1, which is stale — anyone re-running it may wrongly conclude the
 issue is partly fixed.
 
 ## Root cause (verified by reading, not guessed)
 
-`eval_comma` (`src/jq/eval.rs:853`) is a plain `for expr in exprs` loop calling
+`eval_comma` (`src/jq/eval.rs`) is a plain `for expr in exprs` loop calling
 `eval_single` per branch into a `borrowed: Vec<StandardJson>` / `owned:
 Option<Vec<OwnedValue>>` pair — one ordered accumulator, promoted on the first owned
 operand (#353). It returns on the first `Error`/`Break`/`Halt`/`Partial` as a `Partial`.
 **There is no channel by which a consumer can tell it to stop.**
 
-`eval_pipe` (`:9953`) materializes stage 1 fully via `eval_single`, then loops
+`eval_pipe` materializes stage 1 fully via `eval_single`, then loops
 `for v in values { eval_pipe(rest, v) }`. Downstream *already* streams per value; the two
 gaps are that stage 1 is fully materialized first, and that nothing downstream can stop
 the loop.
 
 Every short-circuiting consumer sits on top of that: `eval_single` (or
 `eval_owned_expr_fork` / `eval_owned_multi_keep_partial`) on the whole sub-expression,
-then `.take(n)` / `.next()` / a membership scan on the *result*. They correctly drop the
+then `.take(n)` / `.next` / a membership scan on the *result*. They correctly drop the
 trailing `Control` once satisfied — that half is right and oracle-verified — but the side
 effect has already fired.
 
-`resolve_leaf`'s catch-all (`:13813`) says so in its own comment: *"unlike jq,
+`resolve_leaf`'s catch-all says so in its own comment: *"unlike jq,
 `eval_owned_multi_keep_partial` already ran the candidate that halted, side effects
 included, by the time control reaches here."*
 
@@ -190,7 +190,7 @@ included, by the time control reaches here."*
 `Expr::Alternative`'s resolver comment (`:13420-13427`) records a live-verified
 double-fire: checking an operand's truthiness by evaluating it a *second* time made
 `path(stderr // .b)` "write its input to stderr twice", and was rejected in review. The
-same comment (`:13435`) names #820 as the general case. This rules out the cheaper
+same comment names #820 as the general case. This rules out the cheaper
 "demand budget, re-evaluate with a bigger `n`" alternative: a fix must **not evaluate**,
 rather than evaluate-and-discard or evaluate-again.
 
@@ -198,8 +198,8 @@ rather than evaluate-and-discard or evaluate-again.
 
 Load-bearing, and mis-scoped in #820's thread, so it is stated before the design.
 
-`src/bin/succinctly/jq_runner.rs:2199` and `:2296` both call
-`eval_generic::eval_with_cursor` (`eval_generic.rs:2138`). **Every `succinctly jq`
+`src/bin/succinctly/jq_runner.rs` and  both call
+`eval_generic::eval_with_cursor` (`eval_generic.rs`). **Every `succinctly jq`
 invocation enters `eval_generic.rs` first**, recurses through its native arms, and only
 hands a subtree to `eval.rs`'s `full_eval` at a node with no native generic arm — at which
 point the *whole* subtree crosses over.
@@ -211,11 +211,11 @@ point the *whole* subtree crosses over.
 | `any(g;c)` / `all(g;c)` / `IN` / `IN(src;s)` | no                                   | `eval.rs`              |
 | `halt_error(n)`                              | no                                   | `eval.rs`              |
 | `path(...)` / `paths(f)`                     | no                                   | `eval.rs`              |
-| **`first(f)` / `last(f)`**                   | **yes** (`:2878`, `:4274` → `:3121`) | **`eval_generic.rs`**  |
+| **`first(f)` / `last(f)`**                   | **yes**                              | **`eval_generic.rs`**  |
 
 **Consequence: an `eval.rs`-only fix does not fix `succinctly jq -n 'first(1, stderr)'`.**
 The generic `FirstExpr` arm calls `eval_generic::eval_single` on the inner `Comma`, hits
-the native eager Comma arm at `eval_generic.rs:3018`, and never reaches `eval.rs`'s
+the native eager Comma arm at `eval_generic.rs`, and never reaches `eval.rs`'s
 `eval_first_expr`. Meanwhile `limit` — which has no generic arm — *would* be fixed. Two
 adjacent short-circuiting consumers, opposite outcomes, for reasons that have nothing to
 do with the fix. Stage 2b addresses this.
@@ -276,7 +276,7 @@ enum Demand { Continue, Stop }
 /// `QueryResult::One`/`Many` when their input was borrowed, and collapsing that
 /// to `OwnedValue` would lose the zero-copy path #295/#353 exist to protect and
 /// change observable duplicate-key and number-spelling behaviour. No `Cursor`
-/// variant: every producer calls `.materialize_cursor()` first, exactly as
+/// variant: every producer calls `.materialize_cursor` first, exactly as
 /// `eval_comma`/`eval_pipe` already do.
 enum Item<'a, W = Vec<u64>> {
     Borrowed(StandardJson<'a, W>),
@@ -302,7 +302,7 @@ enum Flow {
 ```
 
 `Flow` is isomorphic to `struct { stopped: bool, control: Option<Control> }`. It is an
-enum for the reason `EvalEscape`'s own doc comment (`src/jq/error.rs:66-113`) gives for
+enum for the reason `EvalEscape`'s own doc comment (`src/jq/error.rs`) gives for
 splitting `Error`/`Break`/`Halt`: it makes "escaped without a control" and "stopped with a
 control the consumer must decide about" structurally distinct, so the mistake cannot be
 made by writing the natural-looking arm.
@@ -311,19 +311,17 @@ made by writing the natural-looking arm.
 
 ```rust
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
-fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    expr: &Expr, value: StandardJson<'a, W>, optional: bool,
+fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(expr: &Expr, value: StandardJson<'a, W>, optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow;
 
 /// Slice twin, so the `Pipe` arm recurses on `&rest` without rebuilding an
 /// `Expr::Pipe` per value (mirrors `eval_pipe`'s own slice recursion).
-fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    exprs: &[Expr], value: StandardJson<'a, W>, optional: bool,
+fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(exprs: &[Expr], value: StandardJson<'a, W>, optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow;
 
-/// Owned-input twin, mirroring `eval_owned_input` (`:16650`) exactly:
+/// Owned-input twin, mirroring `eval_owned_input` exactly:
 /// `eval_owned_fast_path` first, otherwise serialize via `to_json_for_reindex`,
 /// rebuild a `JsonIndex`, run `eval_each` against the fresh cursor.
 ///
@@ -332,23 +330,20 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// normalizes `One`/`Many` to `Owned`/`ManyOwned` today. **This is what lets the
 /// borrowed-surface primitive serve the owned-surface consumers** (`any`/`all`,
 /// `resolve_leaf`), which is otherwise the design's hardest constraint.
-fn eval_each_owned<S: EvalSemantics>(
-    expr: &Expr, input: &OwnedValue, optional: bool,
+fn eval_each_owned<S: EvalSemantics>(expr: &Expr, input: &OwnedValue, optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Flow;
 
 /// Drain an already-materialized `QueryResult` into a sink, checking demand
 /// between values. The fallback for every un-lazified arm.
-fn drain_result<'a, W: Clone + AsRef<[u64]>>(
-    result: QueryResult<'a, W>, sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+fn drain_result<'a, W: Clone + AsRef<[u64]>>(result: QueryResult<'a, W>, sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow;
 
 /// Test-only inverse: collect a sink stream back into a `QueryResult`,
 /// reproducing `eval_comma`'s borrowed/owned promotion. Makes the fallback
 /// invariant differentially testable.
 #[cfg(test)]
-fn collect_each<'a, W: Clone + AsRef<[u64]>>(
-    run: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+fn collect_each<'a, W: Clone + AsRef<[u64]>>(run: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
 ) -> QueryResult<'a, W>;
 ```
 
@@ -390,10 +385,9 @@ un-`Clone`able borrow into a long-lived result type.
 ### The fallback drain, in full
 
 ```rust
-fn drain_result<'a, W: Clone + AsRef<[u64]>>(
-    result: QueryResult<'a, W>, sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+fn drain_result<'a, W: Clone + AsRef<[u64]>>(result: QueryResult<'a, W>, sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    match result.materialize_cursor() {
+    match result.materialize_cursor {
         QueryResult::None => Flow::Exhausted,
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
 
@@ -426,9 +420,9 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Break(label) => Flow::Escaped(Control::Break(label)),
         QueryResult::Halt(code)   => Flow::Escaped(Control::Halt(code)),
 
-        // The prefix was produced *before* the control (`partial` (`:1328`)
+        // The prefix was produced *before* the control (`partial`
         // guarantees it is non-empty), so it is delivered first, exactly as
-        // `push_owned_values` (`:1630`) already delivers it. If a sink stops
+        // `push_owned_values` already delivers it. If a sink stops
         // mid-prefix, the control it never reached rides out as `pending` — not
         // dropped here, because consumers already have different, individually
         // oracle-verified policies for it.
@@ -470,7 +464,7 @@ match expr {
     // Mirrors eval_comma (:853) exactly, minus the accumulator.
     Expr::Comma(exprs) => {
         for e in exprs {
-            match eval_each::<W, S>(e, value.clone(), optional, sink) {
+            match eval_each::<W, S>(e, value.clone, optional, sink) {
                 Flow::Exhausted => {}
                 other => return other,     // Stopped or Escaped
             }
@@ -497,12 +491,12 @@ match expr {
 // Pipe/Paren/Comma/Array/If/Try/Label, so this is a WHOLE-PIPE property and
 // cannot be decided per stage. Delegate to the eager fallback, which performs
 // the same check itself, rather than re-deriving it.
-if exprs.iter().any(needs_path_context) {
+if exprs.iter.any(needs_path_context) {
     return drain_result(eval_pipe::<W, S>(exprs, value, optional), sink);
 }
-if exprs.is_empty() { return match sink(Item::Borrowed(value)) { … }; }
-let (first, rest) = exprs.split_first().unwrap();
-if rest.is_empty()  { return eval_each::<W, S>(first, value, optional, sink); }
+if exprs.is_empty { return match sink(Item::Borrowed(value)) { … }; }
+let (first, rest) = exprs.split_first.unwrap;
+if rest.is_empty  { return eval_each::<W, S>(first, value, optional, sink); }
 
 let mut inner_escape: Option<Control> = None;
 let mut driver = |item: Item<'a, W>| -> Demand {
@@ -510,8 +504,7 @@ let mut driver = |item: Item<'a, W>| -> Demand {
         Item::Borrowed(v) => eval_each_pipe::<W, S>(rest, v, optional, sink),
         // Mirrors eval_pipe's Owned/ManyOwned arms, which route through
         // eval_owned_pipe (:10111) -> eval_owned_input. Same bridge, same cost.
-        Item::Owned(v) => eval_each_owned::<S>(
-            &pipe_of(rest), &v, optional, &mut |o| sink(Item::Owned(o)),
+        Item::Owned(v) => eval_each_owned::<S>(&pipe_of(rest), &v, optional, &mut |o| sink(Item::Owned(o)),
         ),
     };
     match flow {
@@ -521,7 +514,7 @@ let mut driver = |item: Item<'a, W>| -> Demand {
     }
 };
 match eval_each::<W, S>(first, value, optional, &mut driver) {
-    _ if inner_escape.is_some() => Flow::Escaped(inner_escape.unwrap()),
+    _ if inner_escape.is_some => Flow::Escaped(inner_escape.unwrap),
     flow => flow,
 }
 ```
@@ -548,7 +541,7 @@ Each checked against the oracle. "already correct" means succinctly matches jq t
 | `Iterate`, `Range`, literals, field/index  | no, ever                   | side-effect-free producers; the drain already stops per value                                           |
 | `Break`                                    | no, ever                   | a leaf returning `QueryResult::Break`; drain maps it to `Escaped`                                       |
 | `And`/`Or`/`Alternative`                   | no — already correct       | `false and ("B"\|stderr)` etc. agree today                                                              |
-| `If` (branch selection)                    | no — already correct       | `eval_fanout` (`:1662`) evaluates only the taken branch                                                 |
+| `If` (branch selection)                    | no — already correct       | `eval_fanout` evaluates only the taken branch                                                 |
 | `If` (generator inside a branch)           | no                         | but `first(if true then (1,("B"\|stderr)) else 9 end)` leaks. Stage 5                                   |
 | `Try`/`Optional`                           | no                         | but `first(try (1,("B"\|stderr)) catch 9)` leaks. Stage 5                                               |
 | `Label`                                    | no                         | but `first(label $o \| (1,("B"\|stderr)))` leaks. Stage 5                                               |
@@ -585,9 +578,9 @@ time there, or `first`/`last` no longer shadowing `eval.rs` for these shapes spe
 worth folding into **#1462**'s own scope rather than rediscovering as a surprise gap once
 that issue's `eval.rs` half ships.
 
-**Honest scoping of #932.** `builtin_upper_in` (`:3759`) synthesizes
+**Honest scoping of #932.** `builtin_upper_in` synthesizes
 `gen = Expr::Compare { Eq, src, s }` for the `IN(src; s)` form and hands it to
-`any_all_gen_cond`. `binary_fanout_core` (`:1772`) evaluates the **right** operand to
+`any_all_gen_cond`. `binary_fanout_core` evaluates the **right** operand to
 completion first, then re-evaluates the left per right value — jq's real nested-loop
 order, established and oracle-verified by #910. So `IN(src; s)` needs `Expr::Compare`
 demand-aware in its outer loop, or it keeps leaking. **Stage 2 closed `any`/`all`/`IN(s)`;
@@ -665,7 +658,7 @@ break under a too-eager `Stop`.
 **`all` is the one most likely to be got wrong.** #932's text guesses that `all(gen;cond)`
 "presumably shares the identical code path" and leaks too. It does not: real jq writes `5`
 here as well, because `all` must inspect every output before it can answer. Only the `any`
-direction (`target_truthy: true` in `any_all_gen_cond`, `:4162`) may stop early. Wiring
+direction (`target_truthy: true` in `any_all_gen_cond`) may stop early. Wiring
 early exit into both directions would be a new divergence in the opposite direction. This
 correction has been posted to #932.
 
@@ -699,24 +692,24 @@ issue this design must not make worse.)
 
 ## How each consumer is rewritten
 
-| Consumer                           | Line                   | Currently                                                                      | Sink it installs                                      | Stage |
+| Consumer                           | File                   | Currently                                                                      | Sink it installs                                      | Stage |
 |------------------------------------|------------------------|--------------------------------------------------------------------------------|-------------------------------------------------------|-------|
-| `builtin_isempty`                  | `:24109`               | `eval_single` + 8-arm match                                                    | first item ⇒ `Stop`                                   | 2     |
-| `eval_first_expr`                  | `:16984`               | `eval_single` + `.next()`                                                      | first item ⇒ record + `Stop`                          | 2     |
-| `builtin_first_stream`             | `:23952`               | same                                                                           | same                                                  | 2     |
-| `eval_limit`                       | `:16890`               | `eval_single` + `.take(n)`                                                     | count ⇒ `Stop` at `n` (after the `n==0` return)       | 2     |
-| `builtin_limit`                    | `:23884`               | same                                                                           | same                                                  | 2     |
-| `eval_nth_expr`                    | `:17062`               | `eval_single` + `.nth(n)`                                                      | keep index `n`, `Stop` there                          | 2     |
-| `builtin_nth_stream`               | `:24024`               | same                                                                           | same                                                  | 2     |
-| `any_all_gen_cond`                 | `:4162`                | `eval_owned_expr_fork` + probe loop                                            | probe per element ⇒ `Stop` on match / escape          | 2     |
-| `builtin_upper_in`                 | `:3759`                | `eval_owned_expr_fork` + `.any(eq)`                                            | equality per candidate ⇒ `Stop` on match              | 2     |
-| `builtin_halt_error`               | `:24983`               | `eval_single` + `result_to_owned`                                              | first item ⇒ `Stop` (justification 1)                 | 2     |
-| `eval_first_or_last_generic`       | `eval_generic.rs:3121` | `eval_single` + `.next()`                                                      | see Stage 2b                                          | 2b    |
-| `resolve_leaf` catch-all           | `:13813`               | `eval_owned_multi_keep_partial`                                                | first item ⇒ shape check, record, `Stop`              | 3     |
-| `builtin_paths_filter`             | `:19590`               | `for path in all_paths { … push }`                                             | *producer*: push each surviving path, honour `Demand` | 3     |
-| `binary_fanout_core` right operand | `:1772`                | `push_owned_values` + nested loop                                              | outer loop becomes the sink; #910's order preserved   | 4     |
-| **`eval_last_expr`**               | `:17022`               | **unchanged** — cannot short-circuit; its `Partial` drop-the-prefix rule stays | —                                                     | —     |
-| **`builtin_last_stream`**          | `:23987`               | **unchanged**, same reason                                                     | —                                                     | —     |
+| `builtin_isempty`                  | `eval.rs`              | `eval_single` + 8-arm match                                                    | first item ⇒ `Stop`                                   | 2     |
+| `eval_first_expr`                  | `eval.rs`              | `eval_single` + `.next`                                                      | first item ⇒ record + `Stop`                          | 2     |
+| `builtin_first_stream`             | `eval.rs`              | same                                                                           | same                                                  | 2     |
+| `eval_limit`                       | `eval.rs`              | `eval_single` + `.take(n)`                                                     | count ⇒ `Stop` at `n` (after the `n==0` return)       | 2     |
+| `builtin_limit`                    | `eval.rs`              | same                                                                           | same                                                  | 2     |
+| `eval_nth_expr`                    | `eval.rs`              | `eval_single` + `.nth(n)`                                                      | keep index `n`, `Stop` there                          | 2     |
+| `builtin_nth_stream`               | `eval.rs`              | same                                                                           | same                                                  | 2     |
+| `any_all_gen_cond`                 | `eval.rs`              | `eval_owned_expr_fork` + probe loop                                            | probe per element ⇒ `Stop` on match / escape          | 2     |
+| `builtin_upper_in`                 | `eval.rs`              | `eval_owned_expr_fork` + `.any(eq)`                                            | equality per candidate ⇒ `Stop` on match              | 2     |
+| `builtin_halt_error`               | `eval.rs`              | `eval_single` + `result_to_owned`                                              | first item ⇒ `Stop` (justification 1)                 | 2     |
+| `eval_first_or_last_generic`       | `eval_generic.rs`      | `eval_single` + `.next`                                                      | see Stage 2b                                          | 2b    |
+| `resolve_leaf` catch-all           | `eval.rs`              | `eval_owned_multi_keep_partial`                                                | first item ⇒ shape check, record, `Stop`              | 3     |
+| `builtin_paths_filter`             | `eval.rs`              | `for path in all_paths { … push }`                                             | *producer*: push each surviving path, honour `Demand` | 3     |
+| `binary_fanout_core` right operand | `eval.rs`              | `push_owned_values` + nested loop                                              | outer loop becomes the sink; #910's order preserved   | 4     |
+| **`eval_last_expr`**               | `eval.rs`              | **unchanged** — cannot short-circuit; its `Partial` drop-the-prefix rule stays | —                                                     | —     |
+| **`builtin_last_stream`**          | `eval.rs`              | **unchanged**, same reason                                                     | —                                                     | —     |
 
 ### Worked example — `builtin_isempty`
 
@@ -728,8 +721,7 @@ issue this design must not make worse.)
 /// replaces the eight-arm case analysis this function grew (#882, #791, #867)
 /// with three structural arms: every oracle fact those comments record now falls
 /// out of `Flow`'s shape instead of being re-derived per variant.
-fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    expr: &Expr, value: StandardJson<'a, W>, optional: bool,
+fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(expr: &Expr, value: StandardJson<'a, W>, optional: bool,
 ) -> QueryResult<'a, W> {
     match eval_each::<W, S>(expr, value, optional, &mut |_item| Demand::Stop) {
         // `g` produced an output and we stopped it there. `pending` (only ever
@@ -745,7 +737,7 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A *bare* escape — `g`'s very first "output" was itself an
         // error/break/halt, so there is nothing to answer with. All three must
         // propagate rather than be answered `true` (#882/#791/#867).
-        // `control_to_result` (`:4106`) preserves Halt/Break by construction.
+        // `control_to_result` preserves Halt/Break by construction.
         Flow::Escaped(control) => control_to_result(control),
     }
 }
@@ -758,8 +750,8 @@ lines justifying becomes the difference between `Escaped` and `Stopped`.
 
 `any_all_gen_cond`'s rewrite follows the same shape, using `eval_each_owned` (so its
 `to_owned` + owned bridge is preserved byte-for-byte) and carrying `cond`'s own escape
-out-of-band per [How a sink raises](#how-a-sink-raises). `any_all_probe_element` (`:4091`)
-and `any_all_f` (`:4118`, the container form) are **unchanged** — the latter iterates
+out-of-band per [How a sink raises](#how-a-sink-raises). `any_all_probe_element`
+and `any_all_f` (the container form) are **unchanged** — the latter iterates
 already-materialized container elements, which is pure navigation and leaks nothing.
 
 ## Where `Stop` meets `Partial`, `Halt`, `Break` and `optional`
@@ -768,7 +760,7 @@ already-materialized container elements, which is pure navigation and leaks noth
 
 `Partial(prefix, control)` exists (#400, #494) because the eager API has one return slot
 and must carry "these outputs, then this terminator". A sink has two channels: the pushes
-*are* the prefix, `Flow` *is* the terminator. `partial()` (`:1328`) is untouched and only
+*are* the prefix, `Flow` *is* the terminator. `partial` is untouched and only
 reached at the eager boundary — inside `eval_single`, and inside `collect_each`.
 
 ### `Halt` before the stop is structurally impossible on the lazy path
@@ -785,7 +777,7 @@ own existing, individually verified policy**:
 
 - `first`/`limit`/`nth`/`isempty`/`any`/`all` **drop** it once satisfied. Verified:
   `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0 in jq.
-- `resolve_leaf` **keeps** it. Its own comment (`:13836`) argues this at length: a script
+- `resolve_leaf` **keeps** it. Its own comment argues this at length: a script
   relying on `halt_error` as a hard, uncatchable abort must not have it downgraded into a
   catchable "Invalid path expression".
 
@@ -798,16 +790,16 @@ evaporates.
 ### A `Break` addressed to an outer label
 
 - **Bare** (`isempty(break $out)`): nothing pushed, `Flow::Escaped(Break("out"))`, the
-  consumer's existing arm propagates, `eval_label` (`:2926`) catches it. Verified exit 0,
+  consumer's existing arm propagates, `eval_label` catches it. Verified exit 0,
   no output.
 - **After an output** (`label $o | [isempty(1, break $o)]`): the sink stops on `1`, so
   under the lazy `Comma` arm **`break $o` is never evaluated at all** — exactly jq's
   semantics, and strictly *more* faithful than today's evaluate-then-discard. Verified
   `[false]`, exit 0, both.
 
-`Control::Halt`'s guarantee (`error.rs:56-63`) — that `try`/`catch` and `label`/`break`
+`Control::Halt`'s guarantee (`error.rs`) — that `try`/`catch` and `label`/`break`
 pass it through via their existing `other => other` fallthrough — is unaffected, because
-`eval_try` (`:2870`) and `eval_label` are **not** lazified in any stage here.
+`eval_try` and `eval_label` are **not** lazified in any stage here.
 
 ### `optional` (`?`)
 
@@ -818,7 +810,7 @@ pass it through via their existing `other => other` fallthrough — is unaffecte
    `Expr::Try` have no lazy arm. Every `?` boundary goes through
    `drain_result(eval_single(…))`, i.e. through `eval_try` verbatim, preserving #693's
    "don't force `optional` down the subtree" fix and #1069's `.[EXPR]?` carve-out.
-2. `finish_fork` (`:1383`) is **outside the blast radius** — its callers are
+2. `finish_fork` is **outside the blast radius** — its callers are
    `reduce`/`foreach`/`while`/`until`/`binary_fanout_core`, none a prefix consumer. Its
    doc comment is still the governing precedent: `optional` never silences a `Break` or
    `Halt`, only a trailing `Error`, and only after the `?`/`try` boundary has had its
@@ -840,8 +832,8 @@ pass it through via their existing `other => other` fallthrough — is unaffecte
 ### What does **not** change
 
 - **`QueryResult`, `Control`, `EvalEscape`** — no new variants, no changed contract.
-- **`eval_single` (`:546`), `eval_comma` (`:853`), `eval_pipe` (`:9953`),
-  `eval_owned_input` (`:16650`), `eval_owned_pipe` (`:10111`)** — bodies untouched.
+- **`eval_single`, `eval_comma`, `eval_pipe`,
+  `eval_owned_input`, `eval_owned_pipe`** — bodies untouched.
 - **113 `eval_single` call sites** — 0 change in Stage 2; consumers' own calls are
   *replaced*, not modified in place.
 - **13 of 15 `eval_owned_expr_fork` sites**; **8 of 9 `eval_owned_multi_keep_partial`
@@ -851,11 +843,11 @@ pass it through via their existing `other => other` fallthrough — is unaffecte
   *sibling* of `push_owned_values`, not a replacement.
 - **`eval_try`, `eval_label`, `eval_if`, `eval_alternative`, `eval_array_construction`,
   `eval_reduce`, `eval_foreach`, `map_over`** — unchanged.
-- **`eval_generic.rs`'s `Expr::Comma` (`:3018`), `Expr::Pipe` fold, `LazySeq`/`LazyKeys`** —
+- **`eval_generic.rs`'s `Expr::Comma`, `Expr::Pipe` fold, `LazySeq`/`LazyKeys`** —
   unchanged.
 - **`src/jq/lazy.rs`, `jq_runner.rs`, `yq_runner.rs`, `src/jq/stream.rs`** — unchanged.
 - **`no_std`** — `dyn FnMut` needs no allocator; `Item`/`Flow` are plain data. (Note
-  `write_stderr` is `#[cfg(feature = "std")]` with a no-op twin at `:24934`, so none of
+  `write_stderr` is `#[cfg(feature = "std")]` with a no-op `no_std` twin, so none of
   these bugs is observable under `no_std` — this is a std-only fix.)
 
 ### The one real cost this creates
@@ -876,18 +868,18 @@ lazy `eval_each`). That is the price of additive-not-rewrite. Mitigations, in or
 Each stage is one issue, one PR, independently shippable and independently verifiable.
 
 **Stage 1 — characterization, no behaviour change.** Pin both tables above in
-`tests/jq_cli_tests.rs` via `run_jq_full` (`:93`, which spawns `CARGO_BIN_EXE_succinctly`
+`tests/jq_cli_tests.rs` via `run_jq_full` (which spawns `CARGO_BIN_EXE_succinctly`
 directly, so stderr is the binary's alone — `run_jq_stdin_streams` goes through
 `cargo run` and is unusable here). Two test functions, mirroring #1284's split:
 `test_short_circuit_side_effect_shapes_already_match_jq_820` (the trap set — **the
 high-value one**, and what a too-eager `Stop` would break) and
 `test_short_circuit_side_effect_leaks_820_932_987` (the divergence set, asserting today's
 *leaked* stderr so the fix's diff shows exactly which leaks closed). Template:
-`test_non_pipe_path_expressions_still_raise_986` (`:13822`).
+`test_non_pipe_path_expressions_still_raise_986`.
 
 There are currently **zero** tests anywhere mentioning #820, #932 or #987, and the jq
 golden corpus cannot pin these: `Case::expected_status` is `Option<i32>` with "`None`
-means jq exits 0 and **stderr is not asserted**" (`tests/jq_golden_tests.rs:66`), and the
+means jq exits 0 and **stderr is not asserted**" (`tests/jq_golden_tests.rs`), and the
 loader requires a non-zero status wherever `expected.err` is present. These cases exit 0
 with empty stderr, so `jq_cli_tests.rs` is the only home unless that invariant is relaxed.
 
@@ -911,14 +903,14 @@ options:
   `first(.[] | stderr)`.
 
   **Recommendation: (b) now, (c) filed by (b)'s own PR.** #607's regression tests
-  (`eval_generic.rs:8034`, `:8053`) pin the shapes any option must keep native.
+  (`eval_generic.rs`) pin the shapes any option must keep native.
 
 **Stage 3 — `paths(f)` as a lazy producer + `resolve_leaf` as a sink consumer.** Closes
 #987. `builtin_paths_filter`'s per-path loop becomes a sink push (mechanical);
 `collect_paths` stays eager (pure structural walk, no user filter, leaks nothing).
 `resolve_leaf`'s catch-all switches to `eval_each_owned` with a take-first-and-`Stop` sink.
 **Its `trackable`-primitive branch must keep an always-`Continue` sink**, because that
-branch's `match values.len()` genuinely needs `0`/`1`/`many`; the branch condition is
+branch's `match values.len` genuinely needs `0`/`1`/`many`; the branch condition is
 purely syntactic, so the sink can be chosen before evaluation. Sequenced after Stage 2
 because it touches the path resolver, which #1283 Part 2 C says must not be worked
 concurrently with cluster A's family.
@@ -952,7 +944,7 @@ by delegating the whole node to `eval.rs` rather than by making this module lazy
    borrow and reborrows per call while also capturing `inner_escape`. Expect to
    restructure; do not "solve" it by cloning the sink or boxing per value.
 4. **`needs_path_context` must gate `eval_each_pipe` before anything else.** It is a
-   *whole-pipe* property (`:466`), so a per-stage check is wrong. Getting it wrong silently
+   *whole-pipe* property, so a per-stage check is wrong. Getting it wrong silently
    stubs `file_index`/`key`/`parent` to zero defaults — the #715/#1302 failure class, which
    produces wrong *output*, not an error.
 5. **`eval_generic.rs` is the real CLI entry point.** Any Stage-2 test written against
@@ -960,9 +952,9 @@ by delegating the whole node to `eval.rs` rather than by making this module lazy
    *root* node. Write both a library-level unit test on `full_eval` and a CLI test via
    `run_jq_full`, and expect them to disagree for `first`/`last` until Stage 2b.
 6. **Stack depth — the parser deliberately leaves pipe/comma chains uncapped.**
-   `src/jq/parser.rs:154-156` records that chained pipes and commas are *not* charged
+   `src/jq/parser.rs` records that chained pipes and commas are *not* charged
    against `MAX_EXPR_DEPTH` because they parse iteratively, and
-   `test_flat_chains_are_not_charged_against_expr_depth_1156` (`parser.rs:6675`) asserts
+   `test_flat_chains_are_not_charged_against_expr_depth_1156` (`parser.rs`) asserts
    `MAX_EXPR_DEPTH * 4` = 1024-stage pipes must parse, calling a cap "a real regression".
    Today's `eval_pipe` already recurses per stage, so the lazy version is not a new class
    of risk — but it adds a closure frame per stage on top, and every stage's frame stays
@@ -982,7 +974,7 @@ by delegating the whole node to `eval.rs` rather than by making this module lazy
    the #1251/#1170/#443 symptom family. **Unverified** which yq behaviours depend on the
    arm staying native.
 8. **`eval_each_owned`'s `pipe_of(rest)` allocation.** `eval_owned_pipe` already clones
-   `exprs.to_vec()` per owned intermediate value; the lazy twin inherits that. A
+   `exprs.to_vec` per owned intermediate value; the lazy twin inherits that. A
    borrowed-slice variant would avoid it but is out of scope — do not "improve" it in the
    same PR.
 
@@ -1016,30 +1008,30 @@ differential gate at least as rigorous as #1282's.
 
 ## Critical files
 
-- **`src/jq/eval.rs`** — `eval_single` (`:546`), `eval_comma` (`:853`), `eval_pipe`
-  (`:9953`), `needs_path_context` (`:466`), `eval_pipe_with_path_context` (`:17869`);
-  `partial` (`:1328`), `finish_fork` (`:1383`), `push_owned_values` (`:1630`),
-  `control_to_result` (`:4106`); `result_to_owned` (`:1442`) / `_ctrl` (`:1465`) / `_full`
-  (`:1490`, Halt arm `:1511`); the ten consumers (`:24109`, `:16984`, `:23952`, `:16890`,
-  `:23884`, `:17062`, `:24024`, `:4162`, `:3759`, `:24983`); the two deliberately
-  unchanged (`:17022`, `:23987`); `resolve_leaf` (`:13813`) and `builtin_paths_filter`
-  (`:19590`) for Stage 3; `binary_fanout_core`/`binary_fanout_each` for Stage 4; `write_stderr`
-  (`:24928`), `builtin_stderr` (`:24961`), `builtin_halt_error` (`:24983`) — the only
-  sites with evaluation-time I/O; `mod remaining_inputs` (`:21428`) for the `input` queue.
-- **`src/jq/error.rs`** — `Control` (`:54`), `EvalEscape` (`:120`) and their doc comments;
+- **`src/jq/eval.rs`** — `eval_single`, `eval_comma`, `eval_pipe`, `needs_path_context`,
+  `eval_pipe_with_path_context`; `partial`, `finish_fork`, `push_owned_values`,
+  `control_to_result`; `result_to_owned` / `_ctrl` / `_full` and its `Halt` arm; the ten
+  consumers (`builtin_isempty`, `eval_first_expr`, `builtin_first_stream`, `eval_limit`,
+  `builtin_limit`, `eval_nth_expr`, `builtin_nth_stream`, `any_all_gen_cond`,
+  `builtin_upper_in`, `builtin_halt_error`); the two deliberately unchanged
+  (`eval_last_expr`, `builtin_last_stream`); `resolve_leaf` and `builtin_paths_filter` for
+  Stage 3; `binary_fanout_core`/`binary_fanout_each` for Stage 4; `write_stderr`,
+  `builtin_stderr`, `builtin_halt_error` — the only sites with evaluation-time I/O;
+  `mod remaining_inputs` for the `input` queue.
+- **`src/jq/error.rs`** — `Control`, `EvalEscape` and their doc comments;
   `Flow` is designed to obey both. No change required.
-- **`src/jq/eval_generic.rs`** — `eval_with_cursor` (`:2138`) / `eval_single` (`:2154`), the
-  real CLI entry point; `Expr::FirstExpr`/`LastExpr` (`:2878`) and
-  `Builtin::FirstStream`/`LastStream` (`:4274`) routing to `eval_first_or_last_generic`
-  (`:3121`) — Stage 2b's target; native `Expr::Comma` (`:3018`).
-- **`src/bin/succinctly/jq_runner.rs`** — `eval_with_cursor` call sites (`:2199`, `:2296`),
-  which make `eval_generic` the CLI's front door; the input driver loop (`:1023`). No
+- **`src/jq/eval_generic.rs`** — `eval_with_cursor` / `eval_single`, the
+  real CLI entry point; `Expr::FirstExpr`/`LastExpr` and
+  `Builtin::FirstStream`/`LastStream` routing to `eval_first_or_last_generic`
+  — Stage 2b's target; native `Expr::Comma`.
+- **`src/bin/succinctly/jq_runner.rs`** — `eval_with_cursor` call sites,
+  which make `eval_generic` the CLI's front door; the input driver loop. No
   change required, but read them before believing any "the fix reaches the CLI" claim.
-- **`src/jq/parser.rs`** — `MAX_EXPR_DEPTH` and its flat-chain carve-out (`:154`), and
-  `test_flat_chains_are_not_charged_against_expr_depth_1156` (`:6675`), for Open Risk 6.
-- **`tests/jq_cli_tests.rs`** — `run_jq_full` (`:93`) / `spawn_jq_full` (`:113`), the only
-  helper with clean stderr; the `halt`/`stderr` convention header (`:3469`);
-  `test_non_pipe_path_expressions_still_raise_986` (`:13822`) as the template.
+- **`src/jq/parser.rs`** — `MAX_EXPR_DEPTH` and its flat-chain carve-out, and
+  `test_flat_chains_are_not_charged_against_expr_depth_1156`, for Open Risk 6.
+- **`tests/jq_cli_tests.rs`** — `run_jq_full` / `spawn_jq_full`, the only
+  helper with clean stderr; the `halt`/`stderr` convention header;
+  `test_non_pipe_path_expressions_still_raise_986` as the template.
 
 ## Related
 
@@ -1048,7 +1040,7 @@ differential gate at least as rigorous as #1282's.
   re-assessment above.
 - [#932](https://github.com/rust-works/succinctly/issues/932) — `any`/`all`/`IN`; closes in
   Stage 2 except `IN(src; s)` (Stage 4). Its `all` claim is retracted; see the trap set.
-- [#987](https://github.com/rust-works/succinctly/issues/987) — `path()`'s non-primitive
+- [#987](https://github.com/rust-works/succinctly/issues/987) — `path`'s non-primitive
   resolver; closes in Stage 3.
 - [#980](https://github.com/rust-works/succinctly/issues/980) — closed incidentally by
   #1283 cluster A (#1288); no longer a dependant.
@@ -1133,7 +1125,7 @@ the reasoning behind each placement:
    `pending`s; `abort.unwrap_or(outer)` keeps the *inner* one and drops the *outer* one.
    `resolve_leaf` is the only consumer that reads `pending`, so the effect is confined to
    a `Halt` under `path(...)`, and the drop is the half that lands on jq's verdict (jq's
-   `path()` is lazy end to end and never evaluates the trailing `halt_error` at all).
+   `path` is lazy end to end and never evaluates the trailing `halt_error` at all).
    Left and right therefore answer differently, deliberately: both rows are pinned in
    `test_short_circuit_side_effect_leaks_820_932_987`, and `Flow::Stopped`'s own doc
    comment now records this as its one stated exception.

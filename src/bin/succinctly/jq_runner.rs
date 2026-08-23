@@ -1116,7 +1116,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             }
         }
     } else {
-        // Original path: parse through serde_json (loses number formatting)
+        // The materializing path: reads every document up front into a
+        // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
+        // to seed from and what `--slurp`/`-R`/`--seq` need in order to
+        // combine or reshape the whole stream.
+        //
+        // This comment used to say "parse through serde_json (loses number
+        // formatting)". Both halves went stale: `parse_json_stream` routes
+        // through the crate's own fidelity-preserving semi-indexer since
+        // #1058/#1093, so this path preserves number literals exactly as the
+        // lazy path does. Verified rather than assumed while removing #1309's
+        // false-positive detection, which newly routes filters like `.input`
+        // here: `1.10`, `4E+4` and `2.50` all round-trip identically on both
+        // paths, and `test_jq_field_named_input_is_not_an_input_builtin_1309`
+        // pins that they agree.
         //
         // `force_read_under_null_input` narrows `uses_input_builtins` by one
         // safety check: never force a real read under `-n` when stdin is an
