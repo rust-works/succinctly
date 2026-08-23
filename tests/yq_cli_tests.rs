@@ -21407,6 +21407,20 @@ fn test_yq_setpath_reject_many_prefers_inner_violation_over_outer_1533() -> Resu
         run_yq_stdin_with_stderr(r#"setpath(["a"]; (1,2))"#, "a: 1\n", &["-o", "json"])?;
     assert!(err.contains("single result"), "err: {err:?}");
     assert_eq!(code, 1);
+
+    // Outer escapes with multiple values, inner is fine (a plain literal,
+    // not even a generator) -- inner's probe finds nothing to prefer, so
+    // outer's own escape reports, the same as before this fix touched
+    // anything (inner was never evaluated at all on this path before
+    // either, since it's a plain literal with nothing to fan out).
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"setpath(["a"]; (1,2,error("boom")))"#,
+        "{}\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1);
     Ok(())
 }
 
