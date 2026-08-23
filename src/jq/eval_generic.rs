@@ -3327,23 +3327,28 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    let result = eval_single::<S, V>(inner, value, optional, cursor);
+    // `last` evaluates its operand with `optional: false` even for `last(f)?`
+    // and suppresses the error itself below: it must tell "the stream was
+    // empty" (jq answers `null`) from "the operand raised and `?` swallowed
+    // it" (jq answers nothing), and those are indistinguishable once flattened
+    // to `None` (#1521). `first` keeps the existing propagation.
+    let result = eval_single::<S, V>(inner, value, !want_last && optional, cursor);
     if want_last {
         match result {
             GenericResult::One(v) => GenericResult::One(v),
             GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
             GenericResult::Many(vs) => match vs.into_iter().next_back() {
                 Some(v) => GenericResult::One(v),
-                None => GenericResult::None,
+                None => GenericResult::Owned(OwnedValue::Null),
             },
             GenericResult::ManyCursor(cs) => match cs.into_iter().next_back() {
                 Some(c) => GenericResult::OneCursor(c),
-                None => GenericResult::None,
+                None => GenericResult::Owned(OwnedValue::Null),
             },
             GenericResult::Owned(v) => GenericResult::Owned(v),
             GenericResult::ManyOwned(vs) => match vs.into_iter().next_back() {
                 Some(v) => GenericResult::Owned(v),
-                None => GenericResult::None,
+                None => GenericResult::Owned(OwnedValue::Null),
             },
             // `inner`'s stream has exactly one output (the whole `keys`/
             // `keys_unsorted` result) — forward it unchanged, same as
@@ -3364,7 +3369,11 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
             // anything -- whoever consumes the returned `LazySeq` next
             // materializes it, and any error surfaces there.
             GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
-            GenericResult::None => GenericResult::None,
+            // jq's `last(f)` is `reduce f as $x (null; $x)`, which always
+            // produces exactly one output -- an empty operand answers the
+            // seed. `first` is deliberately not symmetric (#1521).
+            GenericResult::None => GenericResult::Owned(OwnedValue::Null),
+            GenericResult::Error(_) if optional => GenericResult::None,
             GenericResult::Error(e) => GenericResult::Error(e),
             GenericResult::Break(label) => GenericResult::Break(label),
             GenericResult::Halt(code) => GenericResult::Halt(code),
@@ -3372,6 +3381,7 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
             // last one until the stream is exhausted -- so a `Partial` just
             // surfaces its trailing control, dropping the prefix (matches
             // `eval::eval_last_expr`).
+            GenericResult::Partial(_, Control::Error(_)) if optional => GenericResult::None,
             GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
             GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
             GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),

@@ -17217,6 +17217,58 @@ fn test_jq_field_named_input_is_not_an_input_builtin_1309() -> Result<()> {
     Ok(())
 }
 
+/// #1521: `last(f)` over an empty stream answers `null`, not nothing.
+///
+/// jq defines it as `reduce f as $x (null; $x)` and `reduce` always produces
+/// exactly one output, so an empty operand yields the seed. succinctly mapped
+/// the empty case to "no output" in all three of its `last` paths
+/// (`eval_last_expr`, `builtin_last_stream`, `eval_first_or_last_generic`).
+///
+/// Every expectation is pinned jq 1.7.1's own output. The `first` rows are the
+/// guard against over-fixing: jq's `first(f)` is `label $out | (f, break $out)`,
+/// which genuinely yields nothing, and the asymmetry is jq's own — ADR-0018
+/// rule 3 says reproduce it rather than normalise it. The 0-arity `first`/`last`
+/// are `.[0]`/`.[-1]`, a different construct that was already correct.
+#[test]
+fn test_jq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
+    for (filter, input, expected) in [
+        // The fix.
+        ("last(empty)", "null", "null\n"),
+        ("last(.[])", "[]", "null\n"),
+        ("last(limit(0; 1,2))", "null", "null\n"),
+        ("[last(empty)]", "null", "[null]\n"),
+        (r#"last(empty)//"alt""#, "null", "\"alt\"\n"),
+        // `?` must not turn the (non-erroring) empty case into no output...
+        ("last(empty)?", "null", "null\n"),
+        // ...but a genuinely raising operand under `?` still yields nothing,
+        // which is why `last` evaluates its operand unswallowed and suppresses
+        // the error itself.
+        (r#"[last(error("x"))?]"#, "null", "[]\n"),
+        (r#"[last(1,2,error("x"))?]"#, "null", "[]\n"),
+        // `first` is deliberately NOT symmetric.
+        ("[first(empty)]", "null", "[]\n"),
+        ("[first(empty)?]", "null", "[]\n"),
+        // 0-arity forms, unchanged.
+        ("first", "[]", "null\n"),
+        ("last", "[]", "null\n"),
+        // Non-empty `last` unchanged, including nested under iteration.
+        ("last(.[])", "[1,2]", "2\n"),
+        ("[.[] | last(.[])]", "[[1,2],[3]]", "[2,3]\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(input)).expect("last-empty repro runs");
+        assert_eq!(code, 0, "{filter} on {input}: stderr: {stderr}");
+        assert_eq!(stdout, expected, "{filter} on {input}");
+    }
+
+    // An uncaught error still raises rather than answering `null`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"last(error("x"))"#], Some("null")).expect("last-error repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}");
+    assert!(stderr.contains("): x"), "{stderr}");
+    Ok(())
+}
+
 // #1309 item 2: a truncating combinator over `inputs` must consume only the
 // documents it actually uses. The queue is shared with the CLI's own
 // per-document loop and is non-replayable, so an over-eager drain does not
