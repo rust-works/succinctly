@@ -17387,13 +17387,22 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     optional: bool,
     trackable: bool,
 ) -> PathResolveResult<'a> {
-    let starts = resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
+    let (starts, starts_escape) =
+        resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
     if starts.is_empty() {
-        return Ok(Vec::new());
+        return path_result(Vec::new(), starts_escape);
     }
-    let ends = resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
+    let (ends, ends_escape) =
+        resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
     if ends.is_empty() {
-        return Ok(Vec::new());
+        // `end` (`T`) is nested inside `start` (`S`)'s own iteration --
+        // jq's `S as $s | T as $t | ...` re-runs `T` fresh for `$s`'s very
+        // first value, so a `T` escape (if any) fires before `S` ever gets
+        // a chance to expose its own. `ends_escape` therefore wins over
+        // `starts_escape` here, same "innermost escape wins" rule as the
+        // `target_escape`/`ends_escape`/`starts_escape` priority chain
+        // below.
+        return path_result(Vec::new(), ends_escape.or(starts_escape));
     }
     // #843: same rule as `resolve_index_expr` above, for a slice's bounds
     // instead of an index's key.
@@ -17459,22 +17468,52 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         ));
     }
 
-    // jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]` — target
-    // inner, bounds outer — so when `target` escapes, that fires inside the
-    // very first `(s, e)` pair; neither bound generator is resumed for a
-    // second pair. `target_branches` was computed once, outside this loop,
-    // so restricting `starts`/`ends` to their first element when `target`
-    // escaped keeps this function's `Err` prefix equal to jq's own
-    // pre-escape stream, mirroring `resolve_index_expr`'s identical fix
-    // (#972). Confirmed against jq 1.7.1:
-    // `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
-    // prints only `[{"start":0,"end":2}]` before raising `t`.
+    // jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]` — `S`
+    // outer, `T` middle (re-run fresh for every `$s`), `E` innermost. Three
+    // generators can each independently escape after producing some
+    // values, and whichever is *innermost* is the one that actually fires
+    // first in jq's real depth-first walk — the others never get a chance
+    // to advance far enough to reach their own escape at all (#1517;
+    // `starts`/`ends` here are each already truncated to their own
+    // pre-escape partial prefix by `resolve_slice_bound`, so only the
+    // *cross-product* needs restricting, not the lists themselves):
+    //
+    // - `target` (`E`) escapes inside the very first `(s, t)` pair --
+    //   neither bound generator is ever resumed for a second pair, so both
+    //   restrict to their first element. `target_branches` was computed
+    //   once, outside this loop, so this keeps this function's `Err`
+    //   prefix equal to jq's own pre-escape stream, mirroring
+    //   `resolve_index_expr`'s identical fix (#972, pre-existing).
+    //   Confirmed against jq 1.7.1:
+    //   `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
+    //   prints only `[{"start":0,"end":2}]` before raising `t`.
+    // - `end` (`T`) escapes during `start`'s (`S`'s) very first value's own
+    //   iteration -- `S` never gets to try a second value, so `starts`
+    //   restricts to its first element; `ends` keeps its own full
+    //   pre-escape prefix (nothing "outside" it was ever short-circuited).
+    //   Confirmed against jq 1.7.1: `path(.[(0,1):(2,error("b"))])` on
+    //   `[10,20,30]` prints only `[{"start":0,"end":2}]` before raising
+    //   `b` -- `$s=1` is never tried.
+    // - `start` (`S`) escapes on its own later value -- every prior `$s`
+    //   value already had `T`/`E` run to completion for it (unaffected by
+    //   `S`'s later escape), so neither `ends` nor `target_branches` needs
+    //   any restriction; `starts`'s own pre-escape prefix is already the
+    //   right length. Confirmed against jq 1.7.1:
+    //   `path(.[(0,error("b")):(2,3)])` on `[10,20,30]` prints *both*
+    //   `[{"start":0,"end":2}]` and `[{"start":0,"end":3}]` before raising
+    //   `b` (`T` fully iterated for `$s=0` before `S` ever tries to
+    //   advance).
     let (starts, ends): (&[ResolvedSliceBound], &[ResolvedSliceBound]) = if target_escape.is_some()
     {
         (&starts[..1], &ends[..1])
+    } else if ends_escape.is_some() {
+        (&starts[..1], &ends[..])
     } else {
         (&starts[..], &ends[..])
     };
+    // Innermost escape wins, same reasoning as the restriction above and
+    // the `ends.is_empty()` early return: `target` > `end` > `start`.
+    let escape = target_escape.or(ends_escape).or(starts_escape);
     let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
     for (s, s_key) in starts {
         for (e, e_key) in ends {
@@ -17542,7 +17581,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             }
         }
     }
-    path_result(out, target_escape)
+    path_result(out, escape)
 }
 
 /// One resolved slice bound, paired with the [`NumberKey`] it should
@@ -17561,22 +17600,35 @@ type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
 /// `.[(1+1):]`) needs exactly the same key-preservation `fold_slice_bound`'s
 /// static sibling already gives a literal one, and this is where that value
 /// is still on hand to check.
+///
+/// Keeps the bound generator's own partial prefix rather than discarding it
+/// on escape (#1517) -- `eval_owned_multi_keep_partial`, not the
+/// discard-prefix `eval_owned_multi`, mirroring `resolve_index_expr`'s
+/// `key`/`key_escape` split for its own (single) generator argument. A
+/// resolved-but-non-numeric bound is a genuinely different failure (a type
+/// error on a value the generator already committed to, not an escape mid-
+/// stream) and still fails the whole call immediately via the outer
+/// `Result`, unchanged from before this fix -- only the generator's own
+/// error/break/halt is now threaded through as a *partial* result instead
+/// of silently reset to an empty `Vec`.
 fn resolve_slice_bound<S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
     round: fn(f64) -> f64,
-) -> Result<Vec<ResolvedSliceBound>, EvalEscape> {
+) -> Result<(Vec<ResolvedSliceBound>, Option<EvalEscape>), EvalEscape> {
     let Some(expr) = bound else {
-        return Ok(vec![(None, None)]);
+        return Ok((vec![(None, None)], None));
     };
-    eval_owned_multi::<S>(expr, value)?
+    let (values, escape) = eval_owned_multi_keep_partial::<S>(expr, value);
+    let resolved = values
         .iter()
         .map(|v| {
             owned_bound_to_i64(v, round)
                 .map(|i| (i, numeric_slice_bound_key(v)))
                 .map_err(EvalEscape::from)
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((resolved, escape))
 }
 
 /// Thread a value through a run of static path components, without expanding

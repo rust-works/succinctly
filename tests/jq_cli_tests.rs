@@ -10485,6 +10485,130 @@ fn test_resolve_slice_expr_keeps_target_partial_fanout_before_its_own_error_973(
     Ok(())
 }
 
+/// #1517: `resolve_slice_expr` resolved `start`/`end`'s own bound generator
+/// via the discard-prefix `eval_owned_multi`, so a bound generator that
+/// produced some values before escaping (`(0,error("b"))`) reset the whole
+/// prefix to empty instead of keeping what it had already produced --
+/// unlike `target`'s own escape (#973 above), which was already correctly
+/// kept. A short `Err` prefix under-satisfies `take_path_branches`' `>= n`
+/// test, so `first`/`limit` in path position wrongly refused a filter real
+/// jq answers. Both bound axes covered, both verified live against jq
+/// 1.7.1: `start`'s own escape lets `end` (nested inside `start`'s first
+/// value, per jq's `S as $s | T as $t | ...` compilation) run to full
+/// completion before `start` ever tries to advance, so *both*
+/// `{"start":0,"end":2}` and `{"start":0,"end":3}` appear; `end`'s own
+/// escape fires during `start`'s very first value, so `start` never tries
+/// a second one and only `{"start":0,"end":2}` appears.
+#[test]
+fn test_resolve_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1517() -> Result<()> {
+    // `start` escapes: `end` (nested inside) is fully iterated for the one
+    // `start` value that did resolve.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.[(0,error("b")):(2,3)])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":2}]\n[{\"start\":0,\"end\":3}]\n"
+    );
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    // `end` escapes: `start` never gets to try a second value.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.[(0,1):(2,error("b"))])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    // The issue's own `first`/`limit` repros: previously raised `b` where
+    // jq answers cleanly, since the (wrongly empty) prefix under-satisfied
+    // `take_path_branches`' `>= 1` test.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(limit(1; .[(0,error("b")):(2,3)]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(first(.[(0,error("b")):(2,3)]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(limit(1; .[(0,1):(2,error("b"))]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(limit(1; .[(0,error("b")):2]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert_eq!(stderr, "");
+
+    Ok(())
+}
+
+/// #1517 Guard A (the write-side twin of #972's own Guard A, this time on
+/// the bound axis instead of the key axis): the exact boundary that would
+/// silently over-satisfy `take_path_branches` if the fix above overshot
+/// jq's real pre-escape count instead of matching it exactly. `limit(2; ...)`
+/// on the `start`-escape shape (real prefix length 2, per the test above) is
+/// fully satisfied and must write both; `limit(3; ...)` is still
+/// under-satisfied and must refuse untouched. Same pairing for the
+/// `end`-escape shape (real prefix length 1): `limit(1; ...)` writes,
+/// `limit(2; ...)` refuses. All four verified against jq 1.7.1.
+#[test]
+fn test_first_limit_path_truncation_does_not_overreach_slice_bound_fanout_1517() -> Result<()> {
+    // `start`-escape axis: real prefix length is 2.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"del(limit(2; .[(0,error("b")):(2,3)]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"del(limit(3; .[(0,error("b")):(2,3)]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    // `end`-escape axis: real prefix length is 1.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"del(limit(1; .[(0,1):(2,error("b"))]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[30]\n");
+    assert_eq!(stderr, "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"del(limit(2; .[(0,1):(2,error("b"))]))"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `walk_impl` applies `f` via `eval_owned_expr_fork` at every level
