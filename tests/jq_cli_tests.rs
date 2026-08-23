@@ -17050,6 +17050,132 @@ fn test_jq_input_inside_included_module_seeds_the_queue_1309() -> Result<()> {
     Ok(())
 }
 
+// #1505: `rewrite_namespaced_calls` (`src/bin/succinctly/jq_runner.rs`) ended
+// its `Expr` traversal in `Expr::Builtin(_) => expr`, so a namespaced call
+// nested inside any of the 82 sub-expression-carrying builtins never got
+// rewritten from `Expr::NamespacedCall` to `Expr::FuncCall`, and evaluation
+// failed with "module not loaded" even though the same call worked fine bare
+// (`m::f` alone). `map_builtin_subexprs` (`jq::walk`) closes this for every
+// arity. Every expectation below is pinned jq 1.7.1's own output.
+
+/// Writes `def f: . * 2; def two: 2; def flags: "g";` into a fresh module
+/// directory and returns it. The `tempfile::TempDir` must outlive the run,
+/// so it is returned, not the path alone.
+fn namespaced_builtin_arg_module_dir() -> Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    std::fs::write(
+        dir.path().join("mymath.jq"),
+        "def f: . * 2; def two: 2; def flags: \"g\";",
+    )?;
+    Ok(dir)
+}
+
+#[test]
+fn test_jq_namespaced_call_inside_one_arg_builtin_1505() -> Result<()> {
+    let dir = namespaced_builtin_arg_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    // `map(f)`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, r#"import "mymath" as m; map(m::f)"#],
+        Some("[1,2]"),
+    )
+    .expect("map(namespaced call) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[2,4]\n");
+
+    // `select(f)`, the issue's own third repro shape (a comprehension).
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "-L",
+            &lib,
+            r#"import "mymath" as m; [.[] | select(m::f > 2)]"#,
+        ],
+        Some("[1,2]"),
+    )
+    .expect("select(namespaced call) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[2]\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_jq_namespaced_call_inside_two_arg_builtin_1505() -> Result<()> {
+    let dir = namespaced_builtin_arg_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    // `limit(n; f)` parses into its own dedicated `Expr::Limit` AST node
+    // (`parser.rs`'s `parse_limit_expr`), not `Expr::Builtin(Builtin::
+    // Limit(..))` -- `rewrite_namespaced_calls` already had a (pre-existing,
+    // unrelated to this fix) `Expr::Limit` arm, so this shape alone would
+    // not exercise the new code. `pow(x; y)` has no such dedicated AST node
+    // and genuinely reaches `Expr::Builtin(Builtin::Pow(..))`, so it is the
+    // shape that actually pins the new two-argument arm.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "-L", &lib, r#"import "mymath" as m; pow(2; m::two)"#],
+        None,
+    )
+    .expect("pow(x; namespaced call) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "4\n");
+
+    // `limit(n; f)` itself, kept as a regression pin for the common idiom
+    // even though it does not exercise the new `Expr::Builtin` arm.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, r#"import "mymath" as m; limit(1; m::f)"#],
+        Some("5"),
+    )
+    .expect("limit(n; namespaced call) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "10\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_jq_namespaced_call_inside_three_arg_builtin_1505() -> Result<()> {
+    let dir = namespaced_builtin_arg_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "-L",
+            &lib,
+            r#"import "mymath" as m; "aAaA" | sub("a"; "X"; m::flags)"#,
+        ],
+        None,
+    )
+    .expect("sub(re; s; namespaced flags) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "\"XAXA\"\n");
+
+    Ok(())
+}
+
+#[test]
+fn test_jq_namespaced_call_inside_builtin_arg_via_include_1505() -> Result<()> {
+    let dir = namespaced_builtin_arg_module_dir()?;
+    let lib = dir.path().to_string_lossy().into_owned();
+
+    // `include` binds names directly (no namespace prefix), so the call
+    // inside `map(...)` is a bare `Expr::FuncCall`, not
+    // `Expr::NamespacedCall` -- included here anyway, per the issue's own
+    // suggested test plan, since `include`'s own module-body inlining shares
+    // the same `rewrite_namespaced_calls` pass this fix touches.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, r#"include "mymath"; map(f)"#],
+        Some("[1,2]"),
+    )
+    .expect("map(include-bound call) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[2,4]\n");
+
+    Ok(())
+}
+
 /// The other direction #1309 fixed: the substring scan also *over*-reported,
 /// forcing a filter that merely spells "input" in a field name or a string
 /// literal off the fast path. Output must be identical either way -- these

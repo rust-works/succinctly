@@ -19,6 +19,8 @@
 //! wildcard arm, so adding a `Builtin` variant is a compile error here until
 //! its sub-expressions are declared, and every caller picks the fix up at once.
 
+use alloc::boxed::Box;
+
 use super::{Builtin, Expr, ObjectKey, StringPart};
 
 /// The sub-expressions a [`Builtin`] owns, in source order.
@@ -268,6 +270,250 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 
         // --- Three sub-expressions (2) -------------------------------------
         Builtin::SubFlags(a, b, c) | Builtin::GsubFlags(a, b, c) => BuiltinKids::Three(a, b, c),
+    }
+}
+
+/// The mapping twin of [`builtin_kids`]: reconstructs `builtin` with each of
+/// its sub-expressions replaced by `f`'s answer for it, in the same source
+/// order `builtin_kids` reports them in.
+///
+/// **Deliberately has no wildcard arm, for the same reason `builtin_kids`
+/// doesn't** — a new `Builtin` variant is a compile error here until its
+/// sub-expressions (if any) are declared, keeping this function honest
+/// alongside `builtin_kids` as the set grows, rather than silently treating
+/// a new variant as a leaf. `rewrite_namespaced_calls`
+/// (`src/bin/succinctly/jq_runner.rs`) is exactly this shape's motivating
+/// caller (#1505): before it existed, that function's own `Builtin`
+/// traversal ended in `Expr::Builtin(_) => expr`, so a namespaced call
+/// inside any of the 82 sub-expression-carrying builtins (`map`, `select`,
+/// `limit`, `sub`, ...) was never rewritten from `Expr::NamespacedCall` to
+/// `Expr::FuncCall`, and evaluation failed with "module not loaded".
+///
+/// `&mut dyn FnMut`, not a generic `F`, matching [`any_subexpr`]'s own
+/// reasoning: this recurses, so a generic parameter would monomorphise the
+/// whole traversal per call site.
+pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
+    match builtin {
+        // --- No sub-expression (125) ---------------------------------------
+        Builtin::Type
+        | Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Values
+        | Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects
+        | Builtin::Iterables
+        | Builtin::Scalars
+        | Builtin::Length
+        | Builtin::Utf8ByteLength
+        | Builtin::Keys
+        | Builtin::KeysUnsorted
+        | Builtin::Empty
+        | Builtin::Add
+        | Builtin::Any
+        | Builtin::All
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::AsciiDowncase
+        | Builtin::AsciiUpcase
+        | Builtin::First
+        | Builtin::Last
+        | Builtin::Reverse
+        | Builtin::Flatten
+        | Builtin::Unique
+        | Builtin::Sort
+        | Builtin::ToEntries
+        | Builtin::FromEntries
+        | Builtin::ToString
+        | Builtin::ToNumber
+        | Builtin::ToJson
+        | Builtin::FromJson
+        | Builtin::Explode
+        | Builtin::Implode
+        | Builtin::ToJsonStream
+        | Builtin::FromJsonStream
+        | Builtin::ToStream
+        | Builtin::Recurse
+        | Builtin::PathNoArg
+        | Builtin::Parent
+        | Builtin::Paths
+        | Builtin::LeafPaths
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Round
+        | Builtin::Sqrt
+        | Builtin::Fabs
+        | Builtin::Log
+        | Builtin::Log10
+        | Builtin::Log2
+        | Builtin::Exp
+        | Builtin::Exp10
+        | Builtin::Exp2
+        | Builtin::Sin
+        | Builtin::Cos
+        | Builtin::Tan
+        | Builtin::Asin
+        | Builtin::Acos
+        | Builtin::Atan
+        | Builtin::Sinh
+        | Builtin::Cosh
+        | Builtin::Tanh
+        | Builtin::Asinh
+        | Builtin::Acosh
+        | Builtin::Atanh
+        | Builtin::Infinite
+        | Builtin::Nan
+        | Builtin::IsInfinite
+        | Builtin::IsNan
+        | Builtin::IsNormal
+        | Builtin::IsFinite
+        | Builtin::Debug
+        | Builtin::Halt
+        | Builtin::Stderr
+        | Builtin::HaltError
+        | Builtin::Env
+        | Builtin::EnvObject(_)
+        | Builtin::StrEnv(_)
+        | Builtin::NullLit
+        | Builtin::Trim
+        | Builtin::Ltrim
+        | Builtin::Rtrim
+        | Builtin::Transpose
+        | Builtin::Tag
+        | Builtin::Anchor
+        | Builtin::Style
+        | Builtin::Kind
+        | Builtin::Key
+        | Builtin::Line
+        | Builtin::Column
+        | Builtin::DocumentIndex
+        | Builtin::LineComment
+        | Builtin::FileIndex
+        | Builtin::Shuffle
+        | Builtin::Pivot
+        | Builtin::SplitDoc
+        | Builtin::Now
+        | Builtin::Input
+        | Builtin::Inputs
+        | Builtin::InputLineNumber
+        | Builtin::Abs
+        | Builtin::Builtins
+        | Builtin::Normals
+        | Builtin::Finites
+        | Builtin::RecurseDown
+        | Builtin::Gmtime
+        | Builtin::Localtime
+        | Builtin::Mktime
+        | Builtin::Todate
+        | Builtin::Fromdate
+        | Builtin::Todateiso8601
+        | Builtin::Fromdateiso8601
+        | Builtin::Combinations
+        | Builtin::Trunc
+        | Builtin::ToBoolean
+        | Builtin::FromUnix
+        | Builtin::ToUnix => builtin.clone(),
+
+        // --- One sub-expression (60) ---------------------------------------
+        Builtin::Has(e) => Builtin::Has(Box::new(f(e))),
+        Builtin::In(e) => Builtin::In(Box::new(f(e))),
+        Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(f(e))),
+        Builtin::Select(e) => Builtin::Select(Box::new(f(e))),
+        Builtin::Map(e) => Builtin::Map(Box::new(f(e))),
+        Builtin::MapValues(e) => Builtin::MapValues(Box::new(f(e))),
+        Builtin::AnyF(e) => Builtin::AnyF(Box::new(f(e))),
+        Builtin::AllF(e) => Builtin::AllF(Box::new(f(e))),
+        Builtin::MinBy(e) => Builtin::MinBy(Box::new(f(e))),
+        Builtin::MaxBy(e) => Builtin::MaxBy(Box::new(f(e))),
+        Builtin::Ltrimstr(e) => Builtin::Ltrimstr(Box::new(f(e))),
+        Builtin::Rtrimstr(e) => Builtin::Rtrimstr(Box::new(f(e))),
+        Builtin::Startswith(e) => Builtin::Startswith(Box::new(f(e))),
+        Builtin::Endswith(e) => Builtin::Endswith(Box::new(f(e))),
+        Builtin::Split(e) => Builtin::Split(Box::new(f(e))),
+        Builtin::Join(e) => Builtin::Join(Box::new(f(e))),
+        Builtin::Contains(e) => Builtin::Contains(Box::new(f(e))),
+        Builtin::Inside(e) => Builtin::Inside(Box::new(f(e))),
+        Builtin::Nth(e) => Builtin::Nth(Box::new(f(e))),
+        Builtin::FlattenDepth(e) => Builtin::FlattenDepth(Box::new(f(e))),
+        Builtin::GroupBy(e) => Builtin::GroupBy(Box::new(f(e))),
+        Builtin::UniqueBy(e) => Builtin::UniqueBy(Box::new(f(e))),
+        Builtin::SortBy(e) => Builtin::SortBy(Box::new(f(e))),
+        Builtin::WithEntries(e) => Builtin::WithEntries(Box::new(f(e))),
+        Builtin::Test(e) => Builtin::Test(Box::new(f(e))),
+        Builtin::Indices(e) => Builtin::Indices(Box::new(f(e))),
+        Builtin::Index(e) => Builtin::Index(Box::new(f(e))),
+        Builtin::Rindex(e) => Builtin::Rindex(Box::new(f(e))),
+        Builtin::UpperIndex(e) => Builtin::UpperIndex(Box::new(f(e))),
+        Builtin::FromStream(e) => Builtin::FromStream(Box::new(f(e))),
+        Builtin::TruncateStream(e) => Builtin::TruncateStream(Box::new(f(e))),
+        Builtin::GetPath(e) => Builtin::GetPath(Box::new(f(e))),
+        Builtin::RecurseF(e) => Builtin::RecurseF(Box::new(f(e))),
+        Builtin::Walk(e) => Builtin::Walk(Box::new(f(e))),
+        Builtin::IsValid(e) => Builtin::IsValid(Box::new(f(e))),
+        Builtin::Path(e) => Builtin::Path(Box::new(f(e))),
+        Builtin::ParentN(e) => Builtin::ParentN(Box::new(f(e))),
+        Builtin::PathsFilter(e) => Builtin::PathsFilter(Box::new(f(e))),
+        Builtin::DelPaths(e) => Builtin::DelPaths(Box::new(f(e))),
+        Builtin::DebugMsg(e) => Builtin::DebugMsg(Box::new(f(e))),
+        Builtin::HaltErrorCode(e) => Builtin::HaltErrorCode(Box::new(f(e))),
+        Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(f(e))),
+        Builtin::BSearch(e) => Builtin::BSearch(Box::new(f(e))),
+        Builtin::ModuleMeta(e) => Builtin::ModuleMeta(Box::new(f(e))),
+        Builtin::Pick(e) => Builtin::Pick(Box::new(f(e))),
+        Builtin::Omit(e) => Builtin::Omit(Box::new(f(e))),
+        Builtin::Del(e) => Builtin::Del(Box::new(f(e))),
+        Builtin::FirstStream(e) => Builtin::FirstStream(Box::new(f(e))),
+        Builtin::LastStream(e) => Builtin::LastStream(Box::new(f(e))),
+        Builtin::IsEmpty(e) => Builtin::IsEmpty(Box::new(f(e))),
+        Builtin::Strftime(e) => Builtin::Strftime(Box::new(f(e))),
+        Builtin::Strptime(e) => Builtin::Strptime(Box::new(f(e))),
+        Builtin::Match(e) => Builtin::Match(Box::new(f(e))),
+        Builtin::Capture(e) => Builtin::Capture(Box::new(f(e))),
+        Builtin::Scan(e) => Builtin::Scan(Box::new(f(e))),
+        Builtin::Splits(e) => Builtin::Splits(Box::new(f(e))),
+        Builtin::CombinationsN(e) => Builtin::CombinationsN(Box::new(f(e))),
+        Builtin::Tz(e) => Builtin::Tz(Box::new(f(e))),
+        Builtin::Load(e) => Builtin::Load(Box::new(f(e))),
+        Builtin::AtOffset(e) => Builtin::AtOffset(Box::new(f(e))),
+
+        // --- Two sub-expressions (20) --------------------------------------
+        Builtin::UpperInSrc(a, b) => Builtin::UpperInSrc(Box::new(f(a)), Box::new(f(b))),
+        Builtin::AnyCond(a, b) => Builtin::AnyCond(Box::new(f(a)), Box::new(f(b))),
+        Builtin::AllCond(a, b) => Builtin::AllCond(Box::new(f(a)), Box::new(f(b))),
+        Builtin::UpperIndexStream(a, b) => {
+            Builtin::UpperIndexStream(Box::new(f(a)), Box::new(f(b)))
+        }
+        Builtin::RecurseCond(a, b) => Builtin::RecurseCond(Box::new(f(a)), Box::new(f(b))),
+        Builtin::SetPath(a, b) => Builtin::SetPath(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Pow(a, b) => Builtin::Pow(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Atan2(a, b) => Builtin::Atan2(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Limit(a, b) => Builtin::Limit(Box::new(f(a)), Box::new(f(b))),
+        Builtin::NthStream(a, b) => Builtin::NthStream(Box::new(f(a)), Box::new(f(b))),
+        Builtin::TestFlags(a, b) => Builtin::TestFlags(Box::new(f(a)), Box::new(f(b))),
+        Builtin::MatchFlags(a, b) => Builtin::MatchFlags(Box::new(f(a)), Box::new(f(b))),
+        Builtin::CaptureFlags(a, b) => Builtin::CaptureFlags(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Sub(a, b) => Builtin::Sub(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Gsub(a, b) => Builtin::Gsub(Box::new(f(a)), Box::new(f(b))),
+        Builtin::ScanFlags(a, b) => Builtin::ScanFlags(Box::new(f(a)), Box::new(f(b))),
+        Builtin::SplitRegex(a, b) => Builtin::SplitRegex(Box::new(f(a)), Box::new(f(b))),
+        Builtin::SplitsFlags(a, b) => Builtin::SplitsFlags(Box::new(f(a)), Box::new(f(b))),
+        Builtin::Skip(a, b) => Builtin::Skip(Box::new(f(a)), Box::new(f(b))),
+        Builtin::AtPosition(a, b) => Builtin::AtPosition(Box::new(f(a)), Box::new(f(b))),
+
+        // --- Three sub-expressions (2) -------------------------------------
+        Builtin::SubFlags(a, b, c) => {
+            Builtin::SubFlags(Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
+        }
+        Builtin::GsubFlags(a, b, c) => {
+            Builtin::GsubFlags(Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
+        }
     }
 }
 
