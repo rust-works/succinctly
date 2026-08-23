@@ -40211,9 +40211,17 @@ mod tests {
         }
 
         // null is still treated as no flags (untouched by this fix).
+        //
+        // `Owned`, not `ManyOwned([_])`: since #1279 routed `scan(re; flags)`
+        // through `fanout_regex_pattern_and_concat_flags`, its result passes
+        // through `owned_vec_to_result`, which normalizes a one-element run to
+        // the canonical single-value shape (`collapse_vec`). Not user-visible
+        // -- `scan("a"; null)` on `"abc"` prints `"a"` either way, matching
+        // jq -- so this asserts the match itself rather than the variant it
+        // arrives in.
         query!(br#""abc""#, r#"scan("a"; null)"#,
-            QueryResult::ManyOwned(matches) => {
-                assert_eq!(matches.len(), 1);
+            QueryResult::Owned(OwnedValue::String(matched)) => {
+                assert_eq!(matched, "a");
             }
         );
     }
