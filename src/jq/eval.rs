@@ -22758,6 +22758,41 @@ fn continue_rest_with_borrowed_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     eval_pipe_with_path_context_internal::<W, S>(rest, v, root, file_origin, current_path, optional)
 }
 
+/// One `Expr::Iterate` element's full step: append `key` to `current_path`,
+/// continue `rest` from `v` at that new path, and fold the result into
+/// `results` -- the one piece the array and object loop bodies in the
+/// `Iterate` arm share verbatim, differing only in what `key` is and how
+/// they walk their own container (#1477 follow-up to #1548's `Iterate`
+/// conversion, which left this duplication in place). Kept as a shared
+/// per-element step rather than a shared iterator over both container
+/// kinds -- unifying the *iteration* itself would need either a
+/// heap-allocated `Box<dyn Iterator>` or a hand-rolled either-style
+/// wrapper, neither of which is warranted just to remove five duplicated
+/// lines, and this exact function has a documented history of perf
+/// regressions from exactly this kind of well-intentioned consolidation
+/// (#1548's own review caught an unconditional clone this shape can
+/// introduce if done carelessly).
+///
+/// Returns `Some(result)` when the caller must stop and propagate
+/// immediately, mirroring [`accumulate_path_context_step`]'s own contract.
+#[allow(clippy::too_many_arguments)]
+fn iterate_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    key: OwnedValue,
+    v: &OwnedValue,
+    rest: &[Expr],
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+    results: &mut Vec<OwnedValue>,
+) -> Option<QueryResult<'a, W>> {
+    let mut new_path = current_path.to_vec();
+    new_path.push(key);
+    let step =
+        continue_rest_with_borrowed_value::<W, S>(v, rest, root, file_origin, &new_path, optional);
+    accumulate_path_context_step(results, step)
+}
+
 /// Continue evaluating `rest` for each output of an already-computed
 /// intermediate `QueryResult`, treating each output as a *fresh root* with
 /// an empty path -- the counterpart to `continue_rest_with_context` for a
@@ -23282,38 +23317,43 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // deep-cloning every element that still has more pipeline
             // ahead of it (only the terminal, `rest.is_empty()` case clones
             // at all, same as before this arm used a shared helper).
+            //
+            // The array/object loop bodies below share `iterate_element_step`
+            // for everything past "what's the next key" (#1477) -- the
+            // iteration itself (`enumerate()` vs a map's own `iter()`) stays
+            // native and un-boxed rather than unified into one iterator, to
+            // avoid trading this duplication for a `Box<dyn Iterator>`'s
+            // allocation and dynamic dispatch on every `.[]`.
             let mut results = Vec::new();
             match value {
                 OwnedValue::Array(arr) => {
                     for (i, v) in arr.iter().enumerate() {
-                        let mut new_path = current_path.to_vec();
-                        new_path.push(OwnedValue::Int(i as i64));
-                        let step = continue_rest_with_borrowed_value::<W, S>(
+                        if let Some(stop) = iterate_element_step::<W, S>(
+                            OwnedValue::Int(i as i64),
                             v,
                             rest,
                             root,
                             file_origin,
-                            &new_path,
+                            current_path,
                             optional,
-                        );
-                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            &mut results,
+                        ) {
                             return stop;
                         }
                     }
                 }
                 OwnedValue::Object(entries) => {
                     for (key, v) in entries {
-                        let mut new_path = current_path.to_vec();
-                        new_path.push(OwnedValue::String(key.clone()));
-                        let step = continue_rest_with_borrowed_value::<W, S>(
+                        if let Some(stop) = iterate_element_step::<W, S>(
+                            OwnedValue::String(key.clone()),
                             v,
                             rest,
                             root,
                             file_origin,
-                            &new_path,
+                            current_path,
                             optional,
-                        );
-                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            &mut results,
+                        ) {
                             return stop;
                         }
                     }
