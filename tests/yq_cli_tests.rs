@@ -19371,6 +19371,32 @@ fn test_yq_input_line_number_not_supported_723() -> Result<()> {
     Ok(())
 }
 
+/// #1507: the gate above fires at *dispatch*, so a call site that is never
+/// reached is silently accepted. Real yq rejects at *lex* time and so is
+/// unconditional -- `yq 'if false then input else . end'` is
+/// `Error: 1:1: lexer: invalid input text`, exit 1, captured live from
+/// v4.53.3.
+///
+/// This is the one row of the three where the *outcome* differs rather than
+/// just the wording, and it is a divergence with no ADR-0018 rule 4 condition
+/// behind it. Closing it needs per-mode keyword gating in the parser, which
+/// this codebase has for no keyword anywhere. Pinned here so it cannot drift
+/// unnoticed while it stays open; see
+/// `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_yq_unreached_input_builtin_is_not_rejected_1507() -> Result<()> {
+    for filter in [
+        "if false then input else . end",
+        "if false then inputs else . end",
+        "if false then input_line_number else . end",
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr}");
+        assert_eq!(out, "a: 1\n", "{filter}");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Issue #763 - `&anchor`/`*alias` syntax must survive the DOM write path, not
 // just the M2 cursor-streaming identity path. ADR-0017's mechanism 2.

@@ -236,6 +236,49 @@ Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/44
 deliberately made output *preserve* duplicate keys. They stand for yq mode; ADR-0018 rules 2
 and 3 revise them for jq mode only.
 
+### `input`, `inputs`, `input_line_number` are rejected, but at runtime rather than parse time
+
+Real yq has no such builtins at any arity — its lexer rejects the identifiers exactly as it
+rejects a name that does not exist
+([#1507](https://github.com/rust-works/succinctly/issues/1507)):
+
+```bash
+$ printf 'a: 1\n' | yq 'input'       # Error: 1:1: lexer: invalid input text "input"
+$ printf 'a: 1\n' | yq 'inputs'      # Error: 1:1: lexer: invalid input text "inputs"
+$ printf 'a: 1\n' | yq 'no_such_fn'  # Error: 1:1: lexer: invalid input text "no_such_fn"
+```
+
+succinctly also rejects all three in yq mode, but from
+`input_builtins_unsupported_in_yq_mode` ([src/jq/eval.rs](../../../src/jq/eval.rs)), which
+runs at *dispatch*. yq fails at *lex*, so its rejection is unconditional where succinctly's
+is reachability-dependent:
+
+| Filter on `a: 1` | real yq | succinctly |
+|---|---|---|
+| `input` | `Error: 1:1: lexer: invalid input text "input"`, exit 1 | `Error: input is not supported in yq mode`, exit 1 |
+| `., input` | lexer error at 1:4, exit 1 | runtime error, exit 1 |
+| `if false then input else . end` | lexer error, exit 1 | **exit 0, prints `a: 1`** |
+
+Only the third row differs in outcome rather than wording. It is the same shape as jq mode's
+[undefined-function gap](../jq/limitations.md) (#1473): this codebase has no per-mode keyword
+gating in the parser anywhere, so a "not supported" verdict cannot be reached before
+evaluation. Pinned by `test_yq_unreached_input_builtin_is_not_rejected_1507`
+([tests/yq_cli_tests.rs](../../../tests/yq_cli_tests.rs)) so it cannot drift unnoticed.
+
+No ADR-0018 rule 4 condition applies — the output is readable, nothing is corrupted, no
+process dies — so like the `*+d` merge-flag case above, this is recorded as a divergence to
+be fixed or re-justified, not a settled decision.
+
+**Implementing the three in yq mode is a separate question, and is not blocked on an
+oracle**, because there is none to match: it would be a rule-5 extension, which rule 5
+permits without a carve-out. The cost is the reason it has not been done, not the category.
+yq mode's document loop is cursor-native (`YamlValue::Sequence(docs)` walked by
+`uncons_cursor`, [src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs))
+precisely so duplicate mapping keys (#1398) and ADR-0017's comment/anchor side-trees survive;
+jq's queue is `Vec<(OwnedValue, u32, u32)>`. Reusing jq's queue would push YAML documents
+through `OwnedValue` and silently lose all three, so real support needs a second,
+cursor-native queue. See #1507.
+
 ### `gsub`, `scan`, `splits` are not real yq builtins at all
 
 Confirmed via the pinned binary's lexer rejecting all three outright, at any arity
