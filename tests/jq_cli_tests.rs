@@ -11908,25 +11908,22 @@ fn test_last_stream_propagates_halt_bare_and_after_partial_output() -> Result<()
 }
 
 /// `builtin_nth_stream` has two halt sites this batch targets: `n`'s own
-/// evaluation ending in a `QueryResult::Partial(_, Control::Halt(code))`
-/// (some `n` candidate produced before halting), and a bare
+/// evaluation producing a candidate before halting, and a bare
 /// `QueryResult::Halt` from `expr`'s body stream once `n` itself resolved
-/// cleanly. `nth(n; expr)` is a real jq builtin, but real jq's own `n` is
-/// bound via `as $n` and fans out -- confirmed live: `jq -n
-/// 'nth((1, halt_error(3)); 1,2,3)'` actually *prints* `2` (it fully
-/// evaluates the body for the first `n` candidate before the second one
-/// halts) -- while `builtin_nth_stream` reads `n_expr` with a single
-/// `eval_single` call, the same pre-existing, unrelated-to-#791
-/// simplification already documented for `combinations`/`setpath`
-/// elsewhere in this file; this checks succinctly's own single-shot
-/// contract for that first case. The second case (`expr` itself halting,
-/// `n` already resolved) has no such divergence: `jq -n 'nth(0;
-/// halt_error(3))'` exits 3 with no output, matching succinctly here too.
+/// cleanly. The two behave differently, and both now match jq:
+///
+/// - `n` halts after a candidate: jq binds `n` via `as $n`, so it fully
+///   evaluates the body for the first candidate before the second one halts.
+///   `jq -n 'nth((1, halt_error(3)); 1,2,3)'` prints `2`, then exits 3. This
+///   test used to assert an empty stdout, pinning the single-shot `eval_single`
+///   contract `builtin_nth_stream` had before #1279 gave it `fanout_arg`.
+/// - `expr` itself halts, `n` already resolved: no prefix exists to emit, so
+///   `jq -n 'nth(0; halt_error(3))'` exits 3 with no output. Unchanged.
 #[test]
-fn test_nth_stream_propagates_halt_from_n_partial_and_body_bare() -> Result<()> {
+fn test_nth_stream_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "nth((1, halt_error(3)); 1,2,3)"], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "2\n");
 
     let (stdout, stderr, code) = run_jq_full(&["-n", "nth(0; halt_error(3))"], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");

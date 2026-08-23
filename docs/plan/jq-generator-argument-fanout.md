@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Generator-argument fan-out
 
-**Status: Stages 0-4 merged; Stages 5-9 open.** This document is the
+**Status: Stages 0-5 merged; Stages 6-9 open.** This document is the
 deliverable for [#1279](https://github.com/rust-works/succinctly/issues/1279), whose tier
 review (2026-08-20) classified it Tier 3 — "changes evaluation *shape* rather than fixing
 a local mistake … wants a design doc first". It also scopes
@@ -19,7 +19,7 @@ generator-argument model resolves more than one of them". It does: see
 | 3     | Group A, bespoke-body family (`indices`/`index`/`rindex`/`test`/`bsearch`) | ✅ merged |
 | 3b    | ~~`pow`/`atan2`~~ — moved into Stage 8; both arguments are generators (exponent outer) so they need `fanout_two_args` | moved |
 | 4     | `resolve_node`'s `GetPath` arm (path context)                     | ✅ merged |
-| 5     | `limit`/`nth`, value **and** path contexts                        | open   |
+| 5     | `limit`/`nth`, value **and** path contexts                        | ✅ merged |
 | 6     | `range` (1-, 2- and 3-arg)                                        | open   |
 | 7     | `setpath`, `delpaths`, `combinations`                             | open   |
 | 8     | Regex pattern × flags                                             | open   |

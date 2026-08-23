@@ -188,8 +188,6 @@ regex_match_capture_re_arg_fanout          fan-out          match/capture use on
 regex_scan_re_arg_fanout                   fan-out          scan(re) uses only re's first output — #1279
 regex_splits_re_arg_fanout                 fan-out          splits(re) uses only re's first output — #1279
 regex_sub_gsub_re_arg_fanout               fan-out          sub/gsub use only the first pattern output — #1279
-limit_nth_stream_n_arg_fanout              fan-out          limit(n; f)/nth(n; f) use only n's first output — #1279
-path_limit_n_arg_fanout                    fan-out          path(limit(n; f)) rejects a generator n — #1279
 
 sub_re_replacement_fanout_order            fanout-order     sub(re; str): re outer, replacement inner — #1279
 sub_re_flags_replacement_fanout_order      fanout-order     sub(re; str; flags): re outer, flags middle, replacement innermost — #1279
@@ -202,12 +200,10 @@ range_three_arg_fanout_order               fanout-order     range(from; to; by):
 gsub_replacement_transpose_absence_padded  fanout-order     gsub's multi-output replacement transposes, padded by absence not null — #840/#1279
 
 range_from_fanout_halt_after_output        trailing-escape  range emits 1..9 before the from-bound's halt — #1277
-nth_stream_n_fanout_halt_after_output      trailing-escape  nth emits 2 before n's halt — #1277
 setpath_own_error_outranks_trailing_halt   trailing-escape  setpath's own "not an array" error outranks the trailing halt (exit 5, not 6) — #1277
 delpaths_own_error_outranks_trailing_halt  trailing-escape  delpaths' own "not an array" error outranks the trailing halt (exit 5, not 9) — #1277
 
 combinations_empty_n_yields_empty_array    zero-output      combinations(empty) is [[]], not zero output and not "no value" — #1045/#1279
 range_empty_bound_zero_output              zero-output      range with an empty bound reports "no value" — #1045
 regex_and_search_empty_arg_zero_output     zero-output      test/index/sub/gsub/scan/splits/match/capture(empty) report "no value" — #1045
-limit_nth_empty_n_zero_output              zero-output      limit/nth with an empty n report "no value" — #1045
 bsearch_delpaths_empty_arg_zero_output     zero-output      bsearch/delpaths with an empty argument report "no value" — #1045
