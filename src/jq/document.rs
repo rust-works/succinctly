@@ -585,10 +585,15 @@ pub fn key_hash(key: &[u8]) -> u64 {
 /// keys happens about `n^2 / 2^64` of the time. Every caller resolves a
 /// reported repeat against the keys themselves, so a false report costs
 /// one exact pass and still answers correctly.
+#[derive(Clone)]
 pub struct KeyHashes {
     /// Open-addressed slots. `0` marks an empty slot, so a key hashing to
     /// zero is stored as `1` -- folding two hash values together, which
     /// the exact resolution above already tolerates.
+    ///
+    /// Empty until the first insertion, so a caller that constructs one
+    /// per object and never uses it -- yq, where `collapse` is false --
+    /// allocates nothing.
     slots: Vec<u64>,
     mask: usize,
     len: usize,
@@ -599,10 +604,25 @@ impl KeyHashes {
     /// callers keep for small objects are cheaper anyway.
     const MIN_SLOTS: usize = 16;
 
+    /// An empty table that allocates on its first insertion.
+    ///
+    /// For callers that cannot count their keys up front, and for the ones
+    /// that may never insert at all.
+    pub fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            mask: 0,
+            len: 0,
+        }
+    }
+
     /// A table sized for `keys` insertions without a rehash: capacity is
     /// the next power of two at or above `2 * keys`, keeping the load
     /// factor at or below one half.
     pub fn with_capacity(keys: usize) -> Self {
+        if keys == 0 {
+            return Self::new();
+        }
         let slots = keys
             .saturating_mul(2)
             .next_power_of_two()
@@ -673,7 +693,7 @@ impl KeyHashes {
 
 impl Default for KeyHashes {
     fn default() -> Self {
-        Self::with_capacity(0)
+        Self::new()
     }
 }
 
