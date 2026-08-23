@@ -23268,11 +23268,34 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // before a later branch errors/breaks, matching the plain
             // evaluator's `eval_comma` (line ~690) instead of re-deriving a
             // different (collapse-to-array, discard-on-error) policy here.
+            //
+            // Combines each branch with `rest` into one recursive call
+            // (#1409) rather than isolating the branch (empty `rest`) and
+            // continuing the accumulated result through
+            // `continue_rest_with_context` afterward: `,` distributes over
+            // `|` in jq (`(a, b) | rest` is `(a | rest), (b | rest)`,
+            // live-verified against jq 1.7.1 including under error/break
+            // interaction), and combining lets `Field`/`Index`/`Iterate`
+            // inside `rest` see each branch's own true per-output
+            // `current_path` -- isolating first only ever built `new_path`
+            // for a non-empty `rest` *within that same recursive call*, so
+            // the old code's separate continuation always saw the stale,
+            // pre-comma path instead (`.a | (.[], empty) | key` wrongly
+            // reported every element's key as `"a"` instead of its index).
+            // `Try`/`Label` share this function's identical isolate-then-
+            // continue shape but can't take the same fix: naively
+            // rewriting `try f catch c | rest` as
+            // `try (f | rest) catch (c | rest)` would let an error from
+            // `rest` itself be caught by `try`'s own handler, which real
+            // jq never does -- tracked separately, #1409 remains open for
+            // those two.
             let mut branch_outputs = Vec::new();
             let mut stopped = None;
             for sub_expr in exprs {
+                let mut combined = vec![sub_expr.clone()];
+                combined.extend(rest.iter().cloned());
                 let step = eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(sub_expr),
+                    &combined,
                     value,
                     root,
                     file_origin,
@@ -23284,18 +23307,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     break;
                 }
             }
-            let comma_result = stopped.unwrap_or_else(|| owned_vec_to_result(branch_outputs));
-            if rest.is_empty() {
-                return comma_result;
-            }
-            continue_rest_with_context::<W, S>(
-                comma_result,
-                rest,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            )
+            stopped.unwrap_or_else(|| owned_vec_to_result(branch_outputs))
         }
         Expr::Try {
             expr: try_expr,
