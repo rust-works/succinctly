@@ -699,18 +699,6 @@ This does not extend to `=`/`|=`/`del()`: jq's write-side path resolution is ato
 (`(.a, 1) = 5` produces no output at all in jq), so those three still discard any partial
 prefix exactly as before.
 
-## Errors reach the CLI with the right text but the wrong exit code
-
-`succinctly jq` prints an uncaught evaluation error to stderr with jq's wording, but exits
-0 where jq exits 5. That is tracked separately as
-[#355](https://github.com/rust-works/succinctly/issues/355) and is why the error cases in
-the golden corpus are written as `try … catch .`: the caught form puts the message on
-stdout and exits 0, so it verifies the text through the real binary without depending on
-the exit-code fix.
-
-succinctly also omits jq's `(at <stdin>:N)` input-location prefix, which is emitted by
-jq's CLI rather than its evaluator and is therefore outside the message the two share.
-
 ## Undefined functions and arity mismatches are runtime errors, not compile errors
 
 Real jq resolves every function call at compile time, before any input is read: a call to
