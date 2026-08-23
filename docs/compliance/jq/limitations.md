@@ -535,6 +535,48 @@ refuses with `Cannot grow array to <n> elements` — succinctly's own wording, s
 no jq sentence to copy. Only the impossible is refused; every length that fits in memory
 still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
+## Regex flags `l` and `n`
+
+[ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
+of [ADR-0018](../../adrs/adr-0018.md): no dependency in the `regex`/`regex-automata` stack
+expresses oniguruma's search policies, and every alternative that does (`onig`, `pcre2`,
+`fancy-regex`) costs more than closing #920/#922 is worth. `l` (POSIX leftmost-longest) is
+accepted as valid flag syntax but has no effect; `n` (suppress empty matches) still misses a
+non-empty match reachable only by backtracking to a different alternative — lazy
+quantifiers (`a*?`) and alternations with an empty-matching branch listed first (`(?:|a)`).
+
+Both gaps route through `first_captures`/`global_captures`/`next_match_step`
+(`src/jq/eval.rs`), the one choke point every regex builtin shares, so the divergence is
+not confined to `match`/`test` — it reaches the string-transformation builtins too, and
+there it is not a wrong-answer-with-a-clear-error case, but a silent no-op or wrong-span
+replacement:
+
+```console
+$ echo '"aaa"'  | jq            -c 'match("a|aa|aaa";"l").string'   =>  "aaa"
+$ echo '"aaa"'  | succinctly jq -c 'match("a|aa|aaa";"l").string'   =>  "a"
+$ echo '"aaa"'  | jq            -c 'sub("a|aa|aaa";"X";"l")'        =>  "X"
+$ echo '"aaa"'  | succinctly jq -c 'sub("a|aa|aaa";"X";"l")'        =>  "Xaa"   # wrong span
+$ echo '"xaab"' | jq            -c 'gsub("a*?";"X";"gn")'           =>  "xXXb"
+$ echo '"xaab"' | succinctly jq -c 'gsub("a*?";"X";"gn")'           =>  "xaab"  # no-op
+$ echo '"xaab"' | jq            -c 'sub("a*?";"X";"n")'             =>  "xXab"
+$ echo '"xaab"' | succinctly jq -c 'sub("a*?";"X";"n")'             =>  "xaab"  # no-op
+```
+
+`split`/`splits` inherit the same two gaps, since both are built on the same match
+discovery as `sub`/`gsub`. Every probe above exits 0 with empty stderr — silently wrong
+output, not a wrong-error-wording case. The flag combinations that trigger it are narrow:
+greedy quantifiers and non-empty-first alternation are unaffected and agree with jq —
+`[scan("a*";"gn")]` on `"xaab"` is `["aa"]` in both, and `[match("(?:a|)";"gn").string]` on
+`"xa"` is `["a"]` in both.
+
+Unlike every other section on this page, this divergence is **not** tracked by
+[`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt) —
+that corpus pins probes where jq *errors* and succinctly does not; here jq returns a value
+and succinctly returns a different one, so there is no error message for the two-sided
+check to pin. This section is hand-maintained instead, the same caveat
+[ADR-0018](../../adrs/adr-0018.md)'s Consequences already record for
+[yq Limitations](../yq/limitations.md).
+
 ## A slice is a path component
 
 jq models `.[1:2]` as indexing with `{"start":1,"end":2}`, and treats that object as a
@@ -772,6 +814,7 @@ diff.
 ## Depends On
 
 - [ADR-0018](../../adrs/adr-0018.md) - the fidelity rule this page enumerates exceptions to
+- [ADR-0019](../../adrs/adr-0019.md) - the decision that made the regex `l`/`n` gaps permanent
 - [jq Evaluator](../../reference/jq-evaluator.md) - the evaluator raising these errors
 - [jq Language Support](../../reference/jq-language.md) - feature coverage matrix
 - [yq Limitations](../yq/limitations.md) - the yq-mode counterpart to this page
