@@ -16970,6 +16970,38 @@ fn test_jq_unknown_location_survives_when_nothing_was_read_1309() -> Result<()> 
     Ok(())
 }
 
+/// Regression (code review, #1309): `--slurp` always produces exactly one
+/// value (the wrapped array), even from zero-value input -- but
+/// `InputLocations::single` only pushed a `per_value` entry when the source
+/// span had a line to name, which a zero-value slurp never has. The
+/// resulting `values.len() != locations.per_value().len()` mismatch panicked
+/// the `debug_assert_eq!` guarding the queue-seeding `.zip()` in debug
+/// builds, and silently dropped the slurped document in release builds
+/// (the `.zip()` truncates to the shorter side instead of erroring) --
+/// reachable only once a filter references `input`/`inputs`, which is what
+/// routes evaluation through the shared queue at all. Confirmed live against
+/// jq 1.7.1: each case below prints `[]`, exit 0.
+#[test]
+fn test_jq_slurp_zero_value_input_with_inputs_builtin_1309() -> Result<()> {
+    // Empty stdin.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "-s", "., inputs"], Some("")).expect("empty slurp runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[]\n", "{stderr}");
+
+    // Whitespace-only stdin -- also zero JSON values, same code path.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-s", "., inputs"], Some("   \n  \n"))
+        .expect("whitespace-only slurp runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[]\n", "{stderr}");
+
+    // Empty file argument, not stdin.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(&["-c", "-s", "., inputs"], &[""])?;
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[]\n", "{stderr}");
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
