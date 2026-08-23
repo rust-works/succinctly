@@ -1535,14 +1535,12 @@ fn get_inputs(
     // not `<unknown>`.
     let slurp_eof_line: Option<usize> = if args.slurp {
         raw_inputs.last().and_then(|(_, raw)| {
-            // #1550: the drop check itself has to walk back past any empty
-            // trailing files to the source that actually carries the
-            // stream's last record -- `raw_inputs.last()` alone can't see a
-            // truncated record left behind in an earlier file.
-            let dropped = args.seq
-                && !args.raw_input
-                && last_non_empty_seq_source(&raw_inputs)
-                    .is_some_and(seq_trailing_record_is_dropped);
+            // #1550: the drop check has to read across every file as one
+            // stream, not just `raw_inputs.last()` alone -- a truncated
+            // record's own opening RS byte and its closing/disambiguating
+            // bytes can live in different files.
+            let dropped =
+                args.seq && !args.raw_input && seq_stream_trailing_record_is_dropped(&raw_inputs);
             if dropped {
                 None
             } else {
@@ -2685,22 +2683,35 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     is_bare_number && tail.trim_end() == tail
 }
 
-/// The actual last non-empty raw source in `raw_inputs`, walking backward
-/// from the end (#1550). `--seq -s`'s trailing-record drop check needs this
-/// instead of always trusting `raw_inputs.last()`: real jq's `-s` reader
-/// treats every file on the command line as one continuous byte stream, so a
-/// truncated trailing record physically located in a non-last file (with the
-/// actual last file(s) empty) still loses jq's EOF position -- but a check
-/// that only ever looks at the physically-last file can't see across the
-/// file boundary to find it. Returns `None` when every source is empty
-/// (including the no-files case), in which case the drop check is skipped
-/// and #1520's own "empty last file, EOF at line 0" rule applies unchanged.
-fn last_non_empty_seq_source(raw_inputs: &[(Option<usize>, String)]) -> Option<&str> {
-    raw_inputs
-        .iter()
-        .rev()
-        .map(|(_, raw)| raw.as_str())
-        .find(|raw| !raw.trim().is_empty())
+/// Whether `--seq -s`'s trailing record, read across every file on the
+/// command line as one continuous byte stream (matching real jq's own `-s`
+/// reader), leaves real jq's incremental parser with no EOF position to
+/// report -- extending [`seq_trailing_record_is_dropped`]'s single-source
+/// check across a file boundary (#1550).
+///
+/// A record's own opening RS byte and its closing bytes can live in
+/// different files, so this walks backward one file at a time: any file
+/// with no RS byte of its own is exactly that record's own continuation (or
+/// a disambiguating trailing byte after an otherwise-bare number, oracle-
+/// verified: `\x1e5` in one file plus a lone trailing space in the next
+/// still resolves normally, not `<unknown>`) and is folded, byte for byte,
+/// onto whatever followed it -- never trimmed or skipped by emptiness --
+/// until a file containing an RS byte is reached, at which point the
+/// single-source check runs against the reassembled tail. `false` (never
+/// dropped) if no file in the whole stream contains an RS byte at all:
+/// per [`seq_trailing_record_is_dropped`]'s own third case, that's
+/// "abandoned" only when there's non-whitespace content to abandon, so an
+/// all-empty stream keeps #1520's own plain "empty source, EOF at line 0"
+/// rule instead.
+fn seq_stream_trailing_record_is_dropped(raw_inputs: &[(Option<usize>, String)]) -> bool {
+    let mut suffix = String::new();
+    for (_, raw) in raw_inputs.iter().rev() {
+        if raw.contains('\u{1e}') {
+            return seq_trailing_record_is_dropped(&format!("{raw}{suffix}"));
+        }
+        suffix = format!("{raw}{suffix}");
+    }
+    !suffix.trim().is_empty()
 }
 
 /// Validate that the DSV delimiter is acceptable.
