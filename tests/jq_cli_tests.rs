@@ -7012,27 +7012,39 @@ fn test_result_to_owned_manyowned_empty_arm_via_ltrimstr_argument() -> Result<()
 }
 
 #[test]
-fn test_result_to_owned_partial_halt_outranks_its_prefix() -> Result<()> {
-    // `result_to_owned`'s `Partial(_, Control::Halt(code))` arm (#791): a
-    // single-value builtin argument that produced an output and *then*
-    // halted must still halt, not quietly compute with the value already
-    // produced. This dedicated arm is checked *before* the generic
-    // `Partial(vs, _control) => Ok(vs.into_iter().next().unwrap())`
-    // fallback right below it, which would otherwise silently take `1` and
-    // let `ltrimstr` continue. Note `ltrimstr`'s argument is a single-value
-    // site here, not a backtracking generator: real jq's own `ltrimstr((1,
-    // halt_error(6)))` actually calls `ltrimstr` once per argument output,
-    // so `jq -n '"abc" | ltrimstr((1, halt_error(6)))'` prints `abc` (from
-    // the `1` branch, where `ltrimstr` is a no-op on a non-string argument)
-    // *before* the second branch halts -- succinctly's `ltrimstr` instead
-    // resolves its argument to one value via `result_to_owned`, so it never
-    // gets that first output at all; this test pins succinctly's own
-    // contract, which #791 documents explicitly at this arm.
+fn test_ltrimstr_fanout_emits_its_prefix_then_halts_1277() -> Result<()> {
+    // A builtin argument that produced an output and *then* halted emits the
+    // outputs the prefix earned, and only then halts. Real jq calls
+    // `ltrimstr` once per argument output, so the `1` branch runs first
+    // (`ltrimstr` is a no-op on a non-string argument, so `"abc"` passes
+    // through) and only the second branch halts:
+    //
+    //   $ jq -n '"abc" | ltrimstr((1, halt_error(6)))'
+    //   abc        <- stderr, from halt_error printing its input
+    //   "abc"      <- stdout, the prefix
+    //   exit 6
+    //
+    // This test used to pin the opposite -- an empty stdout -- because
+    // `result_to_owned_full`'s dedicated `Partial(_, Control::Halt(code))`
+    // arm (#791) discarded the prefix. That arm exists only because *that*
+    // function keeps a single value and so has no honest prefix to emit
+    // alongside it; `fanout_arg` goes through `stream_outputs`, which has no
+    // such arm, so the prefix survives (#1277). The halt still outranks
+    // everything after it: `"after"` never runs, and the exit code is the
+    // halt's, not 0.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#""abc" | ltrimstr((1, halt_error(6)))"#], None)?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "\"abc\"\n");
     assert_eq!(stderr, "abc");
+
+    // The inverted case -- where the builtin's *own* error fires on the first
+    // argument output and outranks the halt entirely, so jq exits 5 with no
+    // prefix at all -- is pinned by the `setpath_own_error_outranks_trailing_halt`
+    // golden rather than here. `setpath` still collapses its argument (Stage 7
+    // of docs/plan/jq-generator-argument-fanout.md), so that golden is
+    // currently a known failure; when it flips, it is what stops a future
+    // "always emit the prefix, then halt" simplification from passing.
     Ok(())
 }
 
@@ -18597,15 +18609,15 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
 ///
 /// `result_to_owned_ctrl`'s own doc comment (`src/jq/eval.rs`) records the
 /// desugaring -- `f(x)` is roughly `x as $b | body` -- and #833's
-/// `ltrimstr(("a", break $out))` repro. This test pins the *side-effect*
-/// half: real jq evaluates the second argument output, so `B` reaches stderr.
-/// Exactly one of `result_to_owned`'s 20 call sites (`builtin_halt_error`)
-/// may ever stop, and only because its body terminates the process.
+/// `ltrimstr(("a", break $out))` repro. This test pins both halves:
 ///
-/// The stdout halves deliberately differ: jq emits one result per argument
-/// output (`"bcabc"` then `"abcabc"`), succinctly only the first. That gap is
-/// #1279 -- the OPPOSITE bug to #820, and pinned here so laziness work does
-/// not silently deepen it.
+/// - the *side-effect* half: real jq evaluates the second argument output, so
+///   `B` reaches stderr. `builtin_halt_error` remains the only site allowed to
+///   stop early, and only because its body terminates the process (#820's
+///   design doc calls this "the `ltrimstr` trap").
+/// - the *output* half: jq emits one result per argument output. This used to
+///   assert only `"bcabc"`, pinning #1279's truncation; `fanout_arg` now emits
+///   both, so the two columns agree.
 #[test]
 fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -18615,8 +18627,9 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     // The property that matters: jq DID evaluate the second argument output.
     assert_eq!(stderr, "B", "the argument's tail must still be evaluated");
-    // Today's (wrong, #1279) stdout. jq gives "bcabc"\n"abcabc"\n.
-    assert_eq!(stdout, "\"bcabc\"\n");
+    // And it used that output: `"B"` is not a prefix of `"abcabc"`, so
+    // `ltrimstr` returns the input unchanged for it.
+    assert_eq!(stdout, "\"bcabc\"\n\"abcabc\"\n");
     Ok(())
 }
 
