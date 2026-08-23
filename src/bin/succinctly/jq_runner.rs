@@ -1510,10 +1510,15 @@ fn get_inputs(
     // and silently dropped (#1542): real jq's own incremental parser loses
     // its EOF position entirely for a record it never finished reading,
     // where a malformed record earlier in the stream (one a later valid
-    // record resyncs after) still reports normally.
+    // record resyncs after) still reports normally. `-R` takes over
+    // entirely from `--seq` for raw-text mode (matching the `-R -s` branch
+    // below, which never RS-splits either) -- `!args.raw_input` here keeps
+    // that same priority for the location, oracle-verified: `-R --seq -s`
+    // on a truncated trailing record still reports its plain newline count,
+    // not `<unknown>`.
     let slurp_eof_line: Option<usize> = if args.slurp {
         raw_inputs.last().and_then(|(_, raw)| {
-            if args.seq && seq_trailing_record_is_dropped(raw) {
+            if args.seq && !args.raw_input && seq_trailing_record_is_dropped(raw) {
                 None
             } else {
                 Some(line_at(raw.as_bytes(), raw.len()))
@@ -1530,6 +1535,13 @@ fn get_inputs(
         for (_, raw) in &raw_inputs {
             combined.push_str(raw);
         }
+        // `slurp_eof_line`'s only `None` case is gated on `!args.raw_input`
+        // above, which this branch's own `args.raw_input` guard rules out
+        // here -- so `slurp_eof` always returns `Some` in this branch, but
+        // the `match` still handles `None` explicitly (rather than
+        // `.unwrap()`) to stay correct if that gate's condition ever
+        // changes, matching this codebase's convention for exhaustive-but-
+        // currently-dead defensive arms (#1064).
         let at = match locations.slurp_eof(slurp_eof_line) {
             Some((src, line)) => locations.resolve(src, line),
             None => InputLocation::unknown(),

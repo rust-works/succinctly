@@ -17577,6 +17577,34 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
         "{stderr}"
     );
 
+    // Control: an empty trailing record (a bare trailing RS with nothing,
+    // or only whitespace, after it) is not "dropped" in the #1542 sense --
+    // it never held content to begin with, so it reports normally off the
+    // preceding valid record's own position, not <unknown>.
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e2\n\x1e"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:2): x", paths[0])),
+        "{stderr}"
+    );
+
+    // Control: `-R` takes over entirely from `--seq` for the location too
+    // (matching --seq's own irrelevance to -R's raw-text value construction)
+    // -- a "truncated" record by --seq's rules still reports its plain
+    // newline count under `-R --seq -s`, not <unknown>.
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["-R", "--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[0])),
+        "{stderr}"
+    );
+
     // Data-safety control: a truncated trailing record must not lose the
     // rest of the slurped document to `input`/`inputs` -- the `<unknown>`
     // marker is carried by a placeholder table entry precisely so this
