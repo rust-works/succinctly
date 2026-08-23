@@ -394,9 +394,16 @@ duplicated five times), and the single-argument half of
 #1531's lazy pull is the one that changed a documented conclusion: it closed the last golden
 known-failure, the #820 eager-argument residue this design had recorded as out of scope.
 
-#1533's two-argument half stays open. Applying "an escape in the argument clears its values" to
-`fanout_two_args` regressed two shapes, because emptying one slot's values skips the body — and
-the body is where the *other* slot gets validated. Which slot real yq reports is per-builtin and
-does not follow succinctly's outer/inner order (`test` wants the flags, `setpath` wants the
-path), so it needs a per-builtin ordering probe of its own. Pinned meanwhile by
-`test_yq_setpath_two_argument_escape_order_is_unfixed_1533`.
+#1533's two-argument half is now closed too, but not by the general "an escape in the argument
+clears its values" rule — applying that to `fanout_two_args` regressed two shapes, because
+emptying one slot's values skips the body, and the body is where the *other* slot gets
+validated (`test` wants the flags, `setpath` wants the path — no shared outer/inner order).
+That general rule stays reverted. The fix instead is narrower: `fanout_two_args` only defers to
+a slot's own trailing escape when that slot's `RejectMany` *count* check (`args.len() > 1`) is
+what's about to fire — a count violation there is itself a symptom of the escape (`(1, 2,
+error("x"))` has two values only because the generator didn't collapse to one before raising),
+so it doesn't touch the single-value-then-escape shapes the reverted rule broke. Confirmed by
+`test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533` (the former pin,
+now flipped) alongside the still-passing regression guards
+(`test_yq_two_argument_body_validation_outranks_a_slot_escape_1533`,
+`test_yq_fanout_two_args_argument_escape_reports_bare_not_prefix_then_raise`).

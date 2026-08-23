@@ -1577,10 +1577,14 @@ fn clear_values_when_yq_argument_escaped(
 /// CLAUDE.md's #106 lesson ("duplicated predicates diverge silently — one
 /// definition, plus a test that the call sites agree") warns about (#1537).
 ///
-/// Purely a gate on the values: reconciling them against the argument's own
-/// trailing control is [`fanout_arg`]'s job, and *only* its job — see
-/// `clear_values_when_yq_argument_escaped` for why two-argument builtins
-/// cannot share that rule.
+/// Purely a gate on the values -- reconciling a `RejectMany` count failure
+/// against the argument's own trailing control is each caller's own job.
+/// [`fanout_arg`] does it unconditionally via
+/// `clear_values_when_yq_argument_escaped`, since a single-argument builtin
+/// has no other slot for that to skip validating; [`fanout_two_args`] does
+/// it narrower, only when this function's own count check is what's about
+/// to fail (#1533's other half) -- see that function's doc comment for why
+/// the wider rule doesn't apply there.
 fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(), EvalError> {
     match fanout {
         // jq's rule 1: every value is used, and the argument's own control
@@ -1844,7 +1848,20 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
-        return QueryResult::Error(e);
+        // #1533's other half: a `RejectMany` count violation is only ever a
+        // symptom of an argument that also escaped -- `(1, 2, error("x"))`
+        // has two values *because* the generator didn't get to collapse
+        // them into one before raising. When that's what happened, report
+        // the real escape instead of the synthetic count message. Narrower
+        // than the reverted fix this doc comment's neighbor describes: this
+        // only fires when the count check itself is about to trip (`args.len()
+        // > 1`), so a slot with exactly one value before escaping -- the
+        // shape that fix broke -- is untouched, and `body` still gets to run
+        // for it exactly as before.
+        return match outer_trailing {
+            Some(control) => partial(Vec::new(), control),
+            None => QueryResult::Error(e),
+        };
     }
 
     let mut out: Vec<OwnedValue> = Vec::new();
@@ -1852,7 +1869,11 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let (mut inners, inner_trailing) =
             stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
-            return QueryResult::Error(e);
+            // Same reasoning as the outer slot above.
+            return match inner_trailing {
+                Some(control) => partial(Vec::new(), control),
+                None => QueryResult::Error(e),
+            };
         }
 
         for i in inners {
