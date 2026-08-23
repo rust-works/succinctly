@@ -1479,6 +1479,45 @@ impl ArgFanout {
             Self::All
         }
     }
+
+    /// The gate for a builtin real yq *has* and refuses a multi-output
+    /// argument for outright, rather than quietly taking its first.
+    ///
+    /// Named rather than inlined for the same reason [`Self::yq_native`] is:
+    /// `grep 'ArgFanout::reject_many_in_yq'` is then the audit for which
+    /// builtins carry this gate. Two verbatim copies of the underlying
+    /// `S::TAG == EvalTag::Yq` test previously sat at `builtin_setpath` and
+    /// `builtin_delpaths` — one definition, so they cannot diverge (#1537,
+    /// and CLAUDE.md's #106 lesson).
+    fn reject_many_in_yq<S: EvalSemantics>() -> Self {
+        if S::TAG == EvalTag::Yq {
+            Self::RejectMany
+        } else {
+            Self::All
+        }
+    }
+}
+
+/// Apply `fanout`'s gate to one argument's materialized output list.
+///
+/// One definition for the three places that need it — [`fanout_arg`], and
+/// both the outer and the inner argument of [`fanout_two_args`]. The gate
+/// encodes a per-builtin *reference-fidelity rule*, so a divergence between
+/// copies would be silent rather than a compile error: exactly the shape
+/// CLAUDE.md's #106 lesson ("duplicated predicates diverge silently — one
+/// definition, plus a test that the call sites agree") warns about (#1537).
+fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(), EvalError> {
+    match fanout {
+        ArgFanout::All => Ok(()),
+        ArgFanout::FirstOnly => {
+            args.truncate(1);
+            Ok(())
+        }
+        ArgFanout::RejectMany if args.len() > 1 => {
+            Err(EvalError::single_argument_result_required(args.len()))
+        }
+        ArgFanout::RejectMany => Ok(()),
+    }
 }
 
 /// Run `body` once per output of an already-evaluated generator argument,
@@ -1511,13 +1550,8 @@ fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
     mut body: impl FnMut(OwnedValue) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
     let (mut args, trailing) = stream_outputs(arg);
-    match fanout {
-        ArgFanout::All => {}
-        ArgFanout::FirstOnly => args.truncate(1),
-        ArgFanout::RejectMany if args.len() > 1 => {
-            return QueryResult::Error(EvalError::single_argument_result_required(args.len()));
-        }
-        ArgFanout::RejectMany => {}
+    if let Err(e) = apply_arg_fanout(fanout, &mut args) {
+        return QueryResult::Error(e);
     }
 
     // Allocation-identical fast path for the single-output case, which is
@@ -1578,28 +1612,16 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
-    match fanout {
-        ArgFanout::All => {}
-        ArgFanout::FirstOnly => outers.truncate(1),
-        ArgFanout::RejectMany if outers.len() > 1 => {
-            return QueryResult::Error(EvalError::single_argument_result_required(outers.len()));
-        }
-        ArgFanout::RejectMany => {}
+    if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
+        return QueryResult::Error(e);
     }
 
     let mut out: Vec<OwnedValue> = Vec::new();
     for o in outers {
         let (mut inners, inner_trailing) =
             stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
-        match fanout {
-            ArgFanout::All => {}
-            ArgFanout::FirstOnly => inners.truncate(1),
-            ArgFanout::RejectMany if inners.len() > 1 => {
-                return QueryResult::Error(EvalError::single_argument_result_required(
-                    inners.len(),
-                ));
-            }
-            ArgFanout::RejectMany => {}
+        if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
+            return QueryResult::Error(e);
         }
 
         for i in inners {
@@ -24813,11 +24835,7 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq refuses a multi-output path or value outright rather than
         // taking its first, unlike its `has`/`test`/`sub` -- see
         // `ArgFanout::RejectMany`.
-        if S::TAG == EvalTag::Yq {
-            ArgFanout::RejectMany
-        } else {
-            ArgFanout::All
-        },
+        ArgFanout::reject_many_in_yq::<S>(),
         |new_val, path_owned| {
             let OwnedValue::Array(path) = path_owned else {
                 return if optional {
@@ -29070,11 +29088,7 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         eval_single::<W, S>(paths_expr, value.clone(), optional),
         // Real yq refuses a multi-output `delpaths` argument outright rather
         // than taking its first -- see `ArgFanout::RejectMany`.
-        if S::TAG == EvalTag::Yq {
-            ArgFanout::RejectMany
-        } else {
-            ArgFanout::All
-        },
+        ArgFanout::reject_many_in_yq::<S>(),
         |paths_owned| delpaths_one::<W, S>(&value, paths_owned, optional),
     )
 }
@@ -52967,6 +52981,72 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "x"),
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    /// #1537: the gate is one definition ([`apply_arg_fanout`]) shared by
+    /// `fanout_arg` and both arguments of `fanout_two_args`, replacing three
+    /// verbatim copies. CLAUDE.md's #106 lesson asks for "one definition,
+    /// plus a test that the call sites agree" — this is that test, driving
+    /// the helper directly across all three variants so a future edit that
+    /// changes one arm cannot leave the others behind.
+    #[test]
+    fn apply_arg_fanout_gates_agree_across_every_variant_1537() {
+        let three = || vec![OwnedValue::int(1), OwnedValue::int(2), OwnedValue::int(3)];
+
+        // `All` keeps every output.
+        let mut args = three();
+        assert!(apply_arg_fanout(ArgFanout::All, &mut args).is_ok());
+        assert_eq!(args.len(), 3);
+
+        // `FirstOnly` keeps exactly the first.
+        let mut args = three();
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args).is_ok());
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].to_json(), "1");
+
+        // `RejectMany` refuses two or more, and reports the real count.
+        let mut args = three();
+        let err = apply_arg_fanout(ArgFanout::RejectMany, &mut args)
+            .expect_err("three outputs must be refused");
+        assert!(err.to_string().contains('3'), "err={err}");
+
+        // ...but passes a lone output through untouched.
+        let mut args = vec![OwnedValue::int(1)];
+        assert!(apply_arg_fanout(ArgFanout::RejectMany, &mut args).is_ok());
+        assert_eq!(args.len(), 1);
+
+        // An empty argument list is never refused, under any gate: zero
+        // outputs means the builtin produces zero outputs (#1045), which is
+        // not the "found N results" condition `RejectMany` exists to catch.
+        for gate in [ArgFanout::All, ArgFanout::FirstOnly, ArgFanout::RejectMany] {
+            let mut args: Vec<OwnedValue> = Vec::new();
+            assert!(apply_arg_fanout(gate, &mut args).is_ok());
+            assert!(args.is_empty());
+        }
+    }
+
+    /// #1537 companion: the yq-mode gates are named constructors, so mode
+    /// selection lives in one place per gate rather than inline at each
+    /// builtin. Pins that both resolve to `All` in jq mode and to their
+    /// respective yq behaviour in yq mode.
+    #[test]
+    fn yq_gate_constructors_select_by_mode_1537() {
+        assert!(matches!(
+            ArgFanout::yq_native::<JqSemantics>(),
+            ArgFanout::All
+        ));
+        assert!(matches!(
+            ArgFanout::yq_native::<YqSemantics>(),
+            ArgFanout::FirstOnly
+        ));
+        assert!(matches!(
+            ArgFanout::reject_many_in_yq::<JqSemantics>(),
+            ArgFanout::All
+        ));
+        assert!(matches!(
+            ArgFanout::reject_many_in_yq::<YqSemantics>(),
+            ArgFanout::RejectMany
+        ));
     }
 
     #[cfg(feature = "regex")]
