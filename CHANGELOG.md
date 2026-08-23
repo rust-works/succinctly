@@ -117,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     previously fell back to their 0/null stub instead of resolving via
     path context, because `needs_path_context` never recursed into
     `Expr::Select`/`Expr::Compare`/`Expr::Arithmetic`.
-  - See [yq Language Reference](docs/reference/yq-language.md#cross-file-operations-succinctly-extension)
+  - See [yq Language Reference](docs/reference/yq-language.md#cross-file-operations)
     for the full `--eval-all` deviation and supported idioms.
 
 - **jq `@csv`/`@tsv`/`@dsv`/`@sh` allocation overhead investigated: no
