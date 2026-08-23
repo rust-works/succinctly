@@ -2399,6 +2399,52 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// How many outputs `limit`'s already-evaluated `n` calls for. Mirrors jq's
+/// own `def limit($n; exp): if $n > 0 then ... elif $n == 0 then empty else
+/// exp end` (#983): a negative int/float, `null`, or a bool -- jq's total
+/// ordering places all three below every positive number -- means unlimited
+/// passthrough, not an error.
+///
+/// Shared by [`eval_limit`], [`resolve_limit`], and [`each_limit`] (code
+/// review, #1462) -- previously three independent copies of this exact
+/// ~20-line match, one per evaluator context (plain, path-tracking,
+/// demand-forwarding). That drifted once already: `resolve_limit`'s copy
+/// was missing the negative-float arm relative to `eval_limit`'s until a
+/// code-review pass caught it (#1313). Factoring out only the
+/// classification switch -- not `n_expr`'s own evaluation, which
+/// legitimately differs across borrowed/owned/path-tracking contexts, or
+/// what each caller does with the answer -- removes that drift risk
+/// categorically instead of relying on a differential test to catch the
+/// next divergence.
+enum LimitN {
+    /// Unlimited passthrough: run the caller's own `expr`/`resolve_node`
+    /// unbounded.
+    Unlimited,
+    /// Take at most this many outputs (`0` means the empty result).
+    Take(usize),
+}
+
+fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError> {
+    match n_value {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            Ok(LimitN::Take(i as usize))
+        }
+        OwnedValue::Int(_)
+        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
+        | OwnedValue::Null
+        | OwnedValue::Bool(_) => Ok(LimitN::Unlimited),
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
+            Ok(LimitN::Unlimited)
+        }
+        // A *positive* non-integer float (e.g. `1.9`) is a separate,
+        // pre-existing gap (jq's own fractional foreach-decrement loop
+        // bounds it to 2 outputs; succinctly errors instead) left untouched
+        // here -- out of #983's scope, which is specifically the
+        // negative/null/bool "no limit" branch.
+        _ => Err(EvalError::new("limit requires non-negative integer")),
+    }
+}
+
 /// Demand-forwarding twin of [`eval_limit`] (#1462, Stage 5): forwards every
 /// output of `expr` straight to `sink`, stopping the generator as soon as
 /// *either* `n` outputs have been forwarded or `sink` itself says to stop --
@@ -2407,14 +2453,6 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// sooner (`isempty(limit(3; 1, ("B"|stderr)))`) had no way to say so until
 /// this arm existed, because `eval_limit` fully materializes its `n`-bounded
 /// answer before returning to any wrapping `drain_result`.
-///
-/// `n`'s own resolution duplicates `eval_limit`'s (jq's `def limit($n; exp):
-/// if $n > 0 then ... elif $n == 0 then empty else exp end`, #983) rather
-/// than sharing it -- the blast radius this design commits to for Stage 5 is
-/// `eval_each` alone, not touching `eval_limit`'s already-shipped body (same
-/// precedent as `resolve_limit`, a third independent copy for `path()`'s own
-/// context). `eval_each_with_a_never_stopping_sink_matches_eval_single_820`
-/// guards the two from drifting apart.
 fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
@@ -2428,22 +2466,10 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(Some((v, _trailing))) => v,
         Err(e) => return Flow::Escaped(e.into()),
     };
-    let n = match n_value {
-        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
-            i as usize
-        }
-        OwnedValue::Int(_)
-        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        | OwnedValue::Null
-        | OwnedValue::Bool(_) => return eval_each::<W, S>(expr, value, optional, sink),
-        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
-            return eval_each::<W, S>(expr, value, optional, sink);
-        }
-        _ => {
-            return Flow::Escaped(Control::Error(EvalError::new(
-                "limit requires non-negative integer",
-            )));
-        }
+    let n = match classify_limit_n(n_value) {
+        Ok(LimitN::Unlimited) => return eval_each::<W, S>(expr, value, optional, sink),
+        Ok(LimitN::Take(n)) => n,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
     };
 
     if n == 0 {
@@ -16344,36 +16370,10 @@ fn resolve_limit<'a, S: EvalSemantics>(
         Ok(None) => return Ok(Vec::new()),
         Err(control) => return Err((Vec::new(), control.into())),
     };
-    let n = match n_value {
-        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
-            i as usize
-        }
-        // Same jq-matched "no limit at all" branch as `eval_limit` (#983):
-        // a negative count, `null`, or a bool (jq's total ordering places
-        // all three below every positive number) means unlimited
-        // passthrough, not an error.
-        OwnedValue::Int(_)
-        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        | OwnedValue::Null
-        | OwnedValue::Bool(_) => {
-            return resolve_node::<S>(expr, value, trackable);
-        }
-        // Same for a negative float, matching `eval_limit`'s own identical
-        // arm -- missing here before this fix (code review, #1313), so
-        // `path(limit(-1.5; ...))` raised "limit requires non-negative
-        // integer" while plain-value-mode `limit(-1.5; ...)` correctly gave
-        // unlimited passthrough. Verified live against jq 1.7.1: both
-        // modes now agree (`path(limit(-1.5; .a,.b))` on `{"a":1,"b":2}` is
-        // `["a"]` then `["b"]` in both real jq and here).
-        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
-            return resolve_node::<S>(expr, value, trackable);
-        }
-        _ => {
-            return Err((
-                Vec::new(),
-                EvalError::new("limit requires non-negative integer").into(),
-            ));
-        }
+    let n = match classify_limit_n(n_value) {
+        Ok(LimitN::Unlimited) => return resolve_node::<S>(expr, value, trackable),
+        Ok(LimitN::Take(n)) => n,
+        Err(e) => return Err((Vec::new(), e.into())),
     };
     if n == 0 {
         return Ok(Vec::new());
@@ -21370,31 +21370,10 @@ fn eval_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(Some((v, _trailing))) => v,
         Err(e) => return e.into(),
     };
-    let n = match n_value {
-        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
-            i as usize
-        }
-        // A negative int, `null`, or a bool -- jq's total ordering places
-        // all three below every positive number, so each takes the same
-        // "no limit at all" branch of jq's own `def limit`, not an error
-        // -- verified against jq 1.7.1 (#983).
-        OwnedValue::Int(_)
-        | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        | OwnedValue::Null
-        | OwnedValue::Bool(_) => {
-            return eval_single::<W, S>(expr, value, optional);
-        }
-        // Same for a negative float. A *positive* non-integer float (e.g.
-        // `1.9`) is a separate, pre-existing gap (jq's own fractional
-        // foreach-decrement loop bounds it to 2 outputs; succinctly errors
-        // instead) left untouched here -- out of #983's scope, which is
-        // specifically the negative/null/bool "no limit" branch.
-        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
-            return eval_single::<W, S>(expr, value, optional);
-        }
-        _ => {
-            return QueryResult::Error(EvalError::new("limit requires non-negative integer"));
-        }
+    let n = match classify_limit_n(n_value) {
+        Ok(LimitN::Unlimited) => return eval_single::<W, S>(expr, value, optional),
+        Ok(LimitN::Take(n)) => n,
+        Err(e) => return QueryResult::Error(e),
     };
 
     if n == 0 {
