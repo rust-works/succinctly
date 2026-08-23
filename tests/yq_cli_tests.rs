@@ -12849,7 +12849,7 @@ fn test_split_doc_hides_in_the_builtins_the_wildcard_skipped_1309() -> Result<()
         ".[], IN(split_doc)",
         ".[], IN(split_doc; .)",
     ] {
-        let (output, code) = run_yq_stdin(filter, yaml, &[])?;
+        let (output, code) = run_yq_stdin(filter, yaml, &["--jq-extensions"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(
             output, "1\n---\n2\n---\ntrue\n",
