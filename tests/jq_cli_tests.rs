@@ -17618,6 +17618,81 @@ fn test_jq_dsv_slurp_skips_location_tracking_1541() -> Result<()> {
     Ok(())
 }
 
+/// #1541: the DSV branch's skipped `locations.push` loop feeds two
+/// independently-buggable accessors (per #1542's own precedent for `--seq`)
+/// -- `error(...)`'s direct `InputLocations::get` (covered above) and
+/// `input`/`inputs`/`input_line_number`'s live queue, seeded from
+/// `InputLocations::per_value()`/`ErrorAt::Live`. Confirm the Live path
+/// resolves the same last-source-EOF location under DSV slurp.
+#[test]
+fn test_jq_dsv_slurp_live_input_builtins_1541() -> Result<()> {
+    let (stdout, _, code, _paths) = run_jq_over_files(
+        &["--input-dsv", ",", "-c", "-s", "inputs"],
+        &["a,b\n1,2\n", "c,d\n"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["--input-dsv", ",", "-c", "-s", "., input_line_number"],
+        &["a,b\n1,2\n", "c,d\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "[[\"a\",\"b\"],[\"1\",\"2\"],[\"c\",\"d\"]]\n1\n");
+
+    Ok(())
+}
+
+/// #1541: DSV slurp's row-count loop (`for line in 1..=parsed.len()`,
+/// skipped entirely under `--slurp`) still needs its *values* to come out
+/// right at `parsed.len()`'s boundary cases -- a single file, zero rows,
+/// and exactly one (header-only) row.
+#[test]
+fn test_jq_dsv_slurp_row_count_edge_cases_1541() -> Result<()> {
+    // Single file, multiple rows.
+    let (stdout, _, code, _paths) =
+        run_jq_over_files(&["--input-dsv", ",", "-c", "-s", "."], &["a,b\n1,2\n3,4\n"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\",\"b\"],[\"1\",\"2\"],[\"3\",\"4\"]]\n");
+
+    // Empty file: zero rows.
+    let (stdout, _, code, _paths) =
+        run_jq_over_files(&["--input-dsv", ",", "-c", "-s", "."], &[""])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    // Header-only file: exactly one row.
+    let (stdout, _, code, _paths) =
+        run_jq_over_files(&["--input-dsv", ",", "-c", "-s", "."], &["a,b\n"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\",\"b\"]]\n");
+
+    Ok(())
+}
+
+/// #1541: the plain-JSON branch is the one whose `find_json_values` scan
+/// this issue actually removes under `--slurp` -- existing coverage tests
+/// either a single multi-value source or two single-value files, never
+/// multiple files *each* holding multiple values together. Confirm both the
+/// combined values and the last-source-EOF error location are still right
+/// for that combination.
+#[test]
+fn test_jq_slurp_multi_file_multi_value_json_1541() -> Result<()> {
+    let (stdout, _, code, _paths) = run_jq_over_files(&["-c", "-s", "."], &["1\n2\n", "3\n4\n"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1,2,3,4]\n");
+
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-c", "-s", r#"error("x")"#], &["1\n2\n", "3\n4\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:2): x", paths[1])),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1542: `--seq --slurp`'s EOF marker is `<unknown>`, not a resolved
 /// position, when the stream's *own last* record leaves real jq's
 /// incremental parser with nothing to point at -- either genuinely

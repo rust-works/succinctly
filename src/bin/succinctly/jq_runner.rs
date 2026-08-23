@@ -1591,7 +1591,13 @@ fn get_inputs(
             }
             values.extend(parsed);
         } else if args.raw_input {
-            // Raw input: each line becomes a string
+            // Raw input: each line becomes a string. Deliberately ungated by
+            // `!args.slurp` (#1541), unlike its three siblings above/below --
+            // `args.raw_input && args.slurp` can only reach this arm when
+            // `args.input_dsv` is also set (otherwise the dedicated `-R -s`
+            // early return above already handled it), and the DSV check is
+            // tried first in this `if`/`else if` chain, so it always wins:
+            // this arm is unreachable whenever `args.slurp` is true.
             for (line_idx, line) in raw.lines().enumerate() {
                 values.push(OwnedValue::String(line.to_string()));
                 locations.push(src, line_idx + 1);
@@ -1619,6 +1625,15 @@ fn get_inputs(
             // `find_json_values` exists here only to feed
             // `locations.extend_from_ends`, so slurp mode skips that scan
             // entirely rather than running it and discarding the result.
+            // Side effect: the divergence check below (`find_json_values`
+            // disagreeing with `parse_json_stream`/`serde_json`) no longer
+            // runs under `--slurp` either -- if the two validators were ever
+            // to disagree on some input, non-slurp mode would still raise
+            // the internal error below, but slurp mode would now silently
+            // proceed. Accepted: the comment above already treats that
+            // divergence as unreachable through this crate's public CLI
+            // surface, so this only narrows *where* an already-believed-dead
+            // safety net runs, not what output a real input can produce.
             if !args.slurp {
                 // `parse_json_stream` (above) already validated this exact
                 // input successfully via `serde_json`, which is strictly
@@ -1647,6 +1662,12 @@ fn get_inputs(
             values.extend(parsed);
         }
 
+        // Scoped to `!args.slurp` (#1541): under slurp, `locations` is left
+        // empty by design (the branches above skip their pushes), so this
+        // invariant no longer holds there and isn't meaningful to check --
+        // the real slurp-mode invariant is `InputLocations::single`'s own
+        // unconditional single push, asserted independently by `run_jq`'s
+        // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
