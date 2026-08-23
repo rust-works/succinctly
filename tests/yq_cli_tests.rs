@@ -21412,3 +21412,75 @@ fn test_yq_reject_many_still_refuses_a_clean_multi_output_argument_1533() -> Res
     assert_eq!(code, 1);
     Ok(())
 }
+
+/// `fanout_two_args`'s non-`All` (yq-gated) path used to keep whatever
+/// `body` had already computed and print it before raising a slot's own
+/// trailing control -- correct for `body`'s *own* error (see
+/// `test_yq_two_argument_body_validation_outranks_a_slot_escape_1533`
+/// above), but wrong once `body` succeeds and it is an argument's own
+/// escape being reported instead: real yq gives the escape alone, with no
+/// prior value printed, in every shape below (each live-verified against
+/// yq v4.53.3). Unlike the still-open #1533 gap above, none of these
+/// involve a competing validation in the other slot -- exactly one slot
+/// escapes and the other is a plain, non-generator literal, so there is no
+/// per-builtin ordering question to resolve.
+#[test]
+fn test_yq_fanout_two_args_argument_escape_reports_bare_not_prefix_then_raise() -> Result<()> {
+    // setpath: path fixed, value (outer) escapes.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(r#"setpath(["a"]; (1,error("v")))"#, "{}\n", &["-o", "json"])?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains('v'), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // setpath: value fixed, path (inner) escapes.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(r#"setpath((["a"],error("p")); 1)"#, "{}\n", &["-o", "json"])?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains('p'), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // capture: pattern fixed, flags (outer) escapes.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"capture("(?<x>a)"; ("","x",error("boom")))"#,
+        "\"aa\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    // capture: flags fixed and valid, pattern (inner) escapes -- the
+    // sneakiest shape, since `body` succeeds (using the pattern's first,
+    // pre-escape output) and it is only the discarded prefix that changes.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"capture(("(?<x>a)",error("boom")); "")"#,
+        "\"aa\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1);
+
+    Ok(())
+}
+
+/// `yq_sub_arity3_empty_replace` (real yq's 3-arg `sub` always ignores its
+/// replacement/flags and globally replaces with `""`, #1122) used to resolve
+/// its pattern argument via `result_to_owned`, which silently drops a
+/// `Partial`'s trailing control (#1277) -- so a pattern generator that
+/// produced an output and then escaped printed that output's (bogus, since
+/// arity-3 sub never uses the replacement anyway) result and only then
+/// raised. Real yq raises alone, with nothing printed first.
+#[test]
+fn test_yq_sub_arity3_pattern_escape_reports_bare_not_prefix_then_raise() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"sub(("a",error("boom")); "Z"; "")"#,
+        "\"aa\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1);
+    Ok(())
+}
