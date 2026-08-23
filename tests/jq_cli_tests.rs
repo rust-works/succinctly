@@ -11998,26 +11998,22 @@ fn test_delpaths_own_error_outranks_trailing_halt_1279() -> Result<()> {
 }
 
 #[test]
-fn test_pow_propagates_halt_via_partial_prefix_in_exponent_argument() -> Result<()> {
-    // `get_number_from_result`'s `QueryResult::Partial(_, Control::Halt(code))`
-    // arm -- reached when an argument expression produces at least one
-    // output (e.g. a comma expression) before halting, rather than halting
-    // immediately -- feeding `builtin_pow`'s own `exp`-branch
-    // `Err(NumberError::Halt(code)) => return QueryResult::Halt(code)` arm
-    // (a distinct site from the `base`-branch arm
-    // `test_pow_propagates_halt_in_argument` above already covers, one
-    // match block over).
+fn test_pow_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
+    // The exponent produces one usable output and then halts, so `pow` runs
+    // for it, emits `2`, and only then halts:
     //
-    // Note: `builtin_pow` evaluates each argument with a single
-    // `eval_single` call, the same pre-existing generator-vs-single-eval gap
-    // noted on `delpaths` above: `jq -n 'pow(2; (1, halt_error(3)))'` prints
-    // `2` (from the first exponent output) before halting with exit 3.
-    // Checked here against succinctly's own contract instead: the halt
-    // discards the whole call, including the already-computed
-    // `1`-exponent partial output, producing no stdout at all.
+    //   $ jq -n 'pow(2; (1, halt_error(3)))'
+    //   2
+    //   exit 3
+    //
+    // This test used to assert an empty stdout. `pow`/`atan2` reached the
+    // collapse through `get_number_from_result` rather than `result_to_owned`,
+    // which is why a grep for the latter never surfaced them; that function is
+    // gone, replaced by the per-value `math_operand` plus `fanout_two_args`
+    // (#1279).
     let (stdout, stderr, code) = run_jq_full(&["-n", "pow(2; (1, halt_error(3)))"], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "2\n");
     assert_eq!(stderr, "");
     Ok(())
 }
