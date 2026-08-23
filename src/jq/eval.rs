@@ -41707,6 +41707,19 @@ mod tests {
                 assert_eq!(vs, vec![OwnedValue::String("12".to_string())]);
             }
         );
+
+        // #1502 review: `capture` is one of ADR-0019's eight regex builtin
+        // families sharing this choke point, and was otherwise untested
+        // under `n` anywhere in this file. It shares the exact no-match
+        // outcome as match/test above: no non-empty match is reachable
+        // without backtracking, so the generator produces no output at
+        // all (not `null`, not an empty object) rather than jq's
+        // `{"x":"a"}`.
+        query!(br#""xaab""#, r#"[capture("(?<x>a*?)"; "n")]"#,
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert!(vs.is_empty(), "jq returns [{{\"x\":\"a\"}}] — known gap, #922");
+            }
+        );
     }
 
     #[cfg(feature = "regex")]
@@ -41765,6 +41778,34 @@ mod tests {
                 );
             }
         );
+
+        // #1502 review: `capture` shares the same no-op `l` arm as
+        // match/sub above and was otherwise untested under `l` anywhere
+        // in this file.
+        query!(br#""aaa""#, r#"capture("(?<x>a|aa|aaa)"; "l")"#,
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(
+                    o.get("x"),
+                    Some(&OwnedValue::String("a".to_string())),
+                    "jq binds .x to \"aaa\" — known gap, #920"
+                );
+            }
+        );
+
+        // #1502 review: `l` and `n` are independent no-ops/approximations
+        // (`build_regex`'s `'l' => {}` arm and `global_captures`'s
+        // suppress-empty search are unrelated code paths), so combining
+        // them composes into a third, still-silent divergence rather than
+        // either flag masking the other. Verified live against jq 1.7.1,
+        // which returns "aaa" for both flag orderings (order is
+        // insignificant to jq's flag parsing).
+        for flags in ["ln", "nl"] {
+            query!(br#""aaa""#, &format!(r#"match("a|aa|aaa"; "{flags}").string"#),
+                QueryResult::Owned(OwnedValue::String(s)) => {
+                    assert_eq!(s, "a", "jq returns \"aaa\" — known gap, #920, flags: {flags:?}");
+                }
+            );
+        }
     }
 
     #[cfg(feature = "regex")]
