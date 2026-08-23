@@ -1158,7 +1158,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // `input`/`inputs` then correctly see an empty queue, matching
             // this function's own stated safety goal.
             if args.null_input && !force_read_under_null_input {
-                jq::seed_remaining_inputs(Vec::new(), locations.exhausted());
+                jq::seed_remaining_inputs(Vec::new(), locations.exhausted(args.slurp));
             } else {
                 // Moves rather than clones: `inputs` isn't read again on
                 // this branch (the null-input arm below uses `OwnedValue::
@@ -1180,7 +1180,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     .zip(locations.per_value().iter().copied())
                     .map(|(v, (src, line))| (v, src, line))
                     .collect();
-                jq::seed_remaining_inputs(queue, locations.exhausted());
+                jq::seed_remaining_inputs(queue, locations.exhausted(args.slurp));
             }
 
             if args.null_input {
@@ -1716,12 +1716,29 @@ impl InputLocations {
     ///
     /// No files at all means stdin, whose tag is 0 and whose name is `None`,
     /// so the same arithmetic yields `<stdin>`.
-    fn exhausted(&self) -> (u32, u32) {
+    ///
+    /// **`--slurp` is the exception, and it is total:** slurping consumes the
+    /// entire input to build one value, so jq has no file position left to
+    /// name and reports `<unknown>` regardless of how many files were given or
+    /// what they held. `slurping` therefore short-circuits to `None`. Note
+    /// this reaches only *exhaustion* — a non-input error under `-s` still
+    /// reports the slurped value's own location, which is the ordinary
+    /// `Fixed`/`resolve` path and needs nothing special here. Oracle-verified:
+    ///
+    /// ```text
+    /// jq -s '., input'    a.json b.json  => <unknown>   (not b.json:1)
+    /// jq -R -s '., input' < two-lines    => <unknown>
+    /// jq -s 'error("x")'  a.json b.json  => b.json:1    (unchanged)
+    /// ```
+    fn exhausted(&self, slurping: bool) -> Option<(u32, u32)> {
+        if slurping {
+            return None;
+        }
         let last_src = self.files.len().saturating_sub(1) as u32;
-        match self.per_value.last() {
+        Some(match self.per_value.last() {
             Some(&(src, line)) if src == last_src => (last_src, line),
             _ => (last_src, 0),
-        }
+        })
     }
 }
 

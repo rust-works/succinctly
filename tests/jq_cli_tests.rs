@@ -16953,6 +16953,48 @@ fn test_jq_exhausted_input_location_1309() -> Result<()> {
     Ok(())
 }
 
+/// `--slurp` is the exception to the exhaustion rule, and it is total:
+/// slurping consumes the whole input to build one value, so jq has no file
+/// position left and reports `<unknown>` however many files were given. An
+/// earlier cut of #1309 named the last file here, which is worse than the
+/// `<stdin>` it replaced — a confidently wrong filename.
+///
+/// The companion row matters as much: a *non*-input error under `-s` still
+/// reports the slurped value's own location, so the exception must reach
+/// exhaustion only.
+#[test]
+fn test_jq_slurp_exhaustion_location_is_unknown_1309() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_over_files(&["-c", "-s", "., input"], &["1\n", "2\n"])
+        .map(|(o, e, c, _)| (o, e, c))?;
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[1,2]\n");
+    assert!(stderr.contains("(at <unknown>): break"), "{stderr}");
+
+    // Empty and raw-mode slurps take the same branch.
+    for args in [
+        vec!["-c", "-s", "., input"],
+        vec!["-c", "-R", "-s", "., input"],
+    ] {
+        let (_, stderr, code) = run_jq_full(&args, Some("")).expect("slurp exhaustion repro runs");
+        assert_eq!(code, 5, "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("(at <unknown>): break"),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    // Not a blanket "-s means unknown": an ordinary error still names the
+    // slurped value's own location.
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-c", "-s", r#"error("x")"#], &["1\n", "2\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 /// The other half of item 5: `<unknown>` must survive where jq keeps it. A
 /// filter that mentions `input` but never reaches it has attempted no read,
 /// and `-n` without any input builtin is unaffected entirely.

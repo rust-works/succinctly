@@ -25861,9 +25861,11 @@ mod remaining_inputs {
         // Where jq's `(at <file>:<line>)` marker points right now, or `None`
         // before any read has been *attempted* -- jq's `<unknown>` (#1309).
         static CURRENT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
-        // Where the marker settles once the queue runs dry. Supplied by the
-        // CLI because only it knows the file list; see `seed`.
-        static EXHAUSTED: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+        // Where the marker settles once the queue runs dry, or `None` for
+        // jq's `<unknown>`. Supplied by the CLI because only it knows the file
+        // list and whether the whole input was slurped into one value; see
+        // `seed`.
+        static EXHAUSTED: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
     }
 
     /// Replaces the queue's contents wholesale. Called once by the CLI driver
@@ -25871,8 +25873,10 @@ mod remaining_inputs {
     /// so this doesn't need to merge with whatever a prior call left behind.
     ///
     /// `exhausted` is the `(source, line)` [`current_location`] settles on
-    /// once every document has been consumed: jq's parser position after EOF.
-    pub fn seed(documents: Vec<(OwnedValue, u32, u32)>, exhausted: (u32, u32)) {
+    /// once every document has been consumed -- jq's parser position after EOF
+    /// -- or `None` for jq's `<unknown>`, which is what slurping leaves behind
+    /// (the whole input became one value, so no file position survives).
+    pub fn seed(documents: Vec<(OwnedValue, u32, u32)>, exhausted: Option<(u32, u32)>) {
         QUEUE.with(|q| *q.borrow_mut() = documents.into());
         LAST_LINE.with(|l| l.set(0));
         SEEDED.with(|s| s.set(true));
@@ -25920,7 +25924,7 @@ mod remaining_inputs {
                 Some(doc)
             }
             None => {
-                CURRENT.with(|c| c.set(Some(EXHAUSTED.with(Cell::get))));
+                CURRENT.with(|c| c.set(EXHAUSTED.with(Cell::get)));
                 None
             }
         }
@@ -25944,11 +25948,14 @@ mod remaining_inputs {
 ///
 /// `documents` is `(value, source tag, 1-based end line)` in input order, and
 /// `exhausted` is the `(source, line)` [`current_input_location`] settles on
-/// once they run out. The source tag is opaque to this crate: the CLI assigns
-/// it and resolves it back to a file name itself, so no file name crosses
-/// this seam in either direction (#1309).
+/// once they run out, or `None` for jq's `<unknown>`. The source tag is opaque
+/// to this crate: the CLI assigns it and resolves it back to a file name
+/// itself, so no file name crosses this seam in either direction (#1309).
 #[cfg(feature = "std")]
-pub fn seed_remaining_inputs(documents: Vec<(OwnedValue, u32, u32)>, exhausted: (u32, u32)) {
+pub fn seed_remaining_inputs(
+    documents: Vec<(OwnedValue, u32, u32)>,
+    exhausted: Option<(u32, u32)>,
+) {
     remaining_inputs::seed(documents, exhausted);
 }
 
