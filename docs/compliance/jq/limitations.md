@@ -725,8 +725,7 @@ $ succinctly jq -n 'def f(x): x; try f(1;2) catch "caught"'
 ```
 
 Exit code for the surfaced case is succinctly's general runtime-error code, 5, not jq's
-compile-error code, 3 — a different pairing from the "wrong exit code" gap just above
-(that one is 0-vs-5; this is 5-vs-3). A related, narrower symptom of the same root cause
+compile-error code, 3. A related, narrower symptom of the same root cause
 also lets a `def` forward-reference a not-yet-defined arity of itself and silently
 compute a value instead of failing — see
 [`test_func_def_forward_arity_reference_in_own_body_known_gap_1376`](../../../tests/jq_cli_tests.rs)
