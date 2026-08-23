@@ -16522,38 +16522,70 @@ fn resolve_node<'a, S: EvalSemantics>(
         // `result_to_owned` gap predates and is independent of #896.
         Expr::Builtin(Builtin::GetPath(arg)) => {
             let (values, escape) = eval_owned_multi_keep_partial::<S>(arg, value);
-            if let [OwnedValue::Array(keys)] = values.as_slice() {
-                if !trackable && keys.is_empty() {
-                    return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+            // One branch per argument output (#1279): real jq's `getpath`
+            // fans out like any other generator-argument builtin, so
+            // `{"a":1,"b":2} | [path(getpath((["a"],["b"])))]` is
+            // `[["a"],["b"]]`, and `(getpath((["a"],["b"]))) |= 99` writes
+            // both. Before this, only the exact single-array shape got a
+            // branch and everything else fell through to `resolve_leaf`,
+            // which re-evaluated the whole node through `builtin_getpath` and
+            // reported a fabricated "Invalid path expression" instead.
+            //
+            // A non-array output ends the fan-out with `getpath`'s own error,
+            // keeping the branches already built -- the same "abort the loop,
+            // keep the prefix" rule `fanout_arg` applies in value context. It
+            // also fixes the fabricated message the arm's fall-through used to
+            // produce for this shape: `path(getpath((["a"], "notarray")))`
+            // reported "Invalid path expression with result 1" where jq
+            // reports "Path must be specified as an array".
+            //
+            // An entirely empty `values` still falls through to
+            // `resolve_leaf`, which already agrees with jq there
+            // (`path(getpath(empty))` is no output in both).
+            let mut branches = Vec::with_capacity(values.len());
+            let mut arg_escape: Option<EvalEscape> = None;
+            if !values.is_empty() {
+                for v in &values {
+                    let OwnedValue::Array(keys) = v else {
+                        arg_escape = Some(EvalError::path_must_be_array().into());
+                        break;
+                    };
+                    if !trackable && keys.is_empty() {
+                        return Err((Vec::new(), EvalError::invalid_path_expression(value).into()));
+                    }
+                    let mut components = Vec::new();
+                    // Starts borrowed — an empty `keys` (a bare `getpath([])`)
+                    // then costs nothing at all; each step after the first
+                    // necessarily produces a fresh owned value from
+                    // `index_one_owned`, so it becomes `Cow::Owned` from there.
+                    let mut current: Cow<'a, OwnedValue> = Cow::Borrowed(value);
+                    for key in keys {
+                        // `false`: real yq doesn't accept `getpath(...)` as an
+                        // assignment target at all (confirmed live: a lexer
+                        // error, not even valid syntax), so there's no yq-mode
+                        // no-op behavior to match here -- unlike the `.foo`/
+                        // `.[key]` shapes `resolve_index_expr` handles below,
+                        // which do (#1181).
+                        let component = key_to_path_component(key, &current, false)
+                            .map_err(|e| (Vec::new(), e.into()))?;
+                        current = Cow::Owned(
+                            index_one_owned(&current, key, false)
+                                .map_err(|e| (Vec::new(), e.into()))?
+                                .expect("non-optional index yields a value or errors"),
+                        );
+                        components.push(component);
+                    }
+                    // #843: `getpath` may navigate an untracked value, but
+                    // that exemption is for its own indexing only — it does
+                    // not launder the result into a trackable one, or
+                    // `catch (getpath(["other"]) | .qqq)` would stop raising.
+                    branches.push(PathBranch::new(components, current, trackable));
                 }
-                let mut components = Vec::new();
-                // Starts borrowed — an empty `keys` (a bare `getpath([])`)
-                // then costs nothing at all; each step after the first
-                // necessarily produces a fresh owned value from
-                // `index_one_owned`, so it becomes `Cow::Owned` from there.
-                let mut current: Cow<'a, OwnedValue> = Cow::Borrowed(value);
-                for key in keys {
-                    // `false`: real yq doesn't accept `getpath(...)` as an
-                    // assignment target at all (confirmed live: a lexer
-                    // error, not even valid syntax), so there's no yq-mode
-                    // no-op behavior to match here -- unlike the `.foo`/
-                    // `.[key]` shapes `resolve_index_expr` handles below,
-                    // which do (#1181).
-                    let component = key_to_path_component(key, &current, false)
-                        .map_err(|e| (Vec::new(), e.into()))?;
-                    current = Cow::Owned(
-                        index_one_owned(&current, key, false)
-                            .map_err(|e| (Vec::new(), e.into()))?
-                            .expect("non-optional index yields a value or errors"),
-                    );
-                    components.push(component);
-                }
-                // #843: `getpath` may navigate an untracked value, but that
-                // exemption is for its own indexing only — it does not
-                // launder the result into a trackable one, or
-                // `catch (getpath(["other"]) | .qqq)` would stop raising.
-                let branch = PathBranch::new(components, current, trackable);
-                return path_result(vec![branch], escape);
+                // The argument's own trailing escape only fires once the
+                // whole prefix has been built (rule 2), so a non-array output
+                // encountered first supersedes it -- same precedence
+                // `fanout_arg` gives a body error over `trailing`.
+                return path_result(branches, arg_escape.or(escape));
             }
             if let Some(e) = escape {
                 return Err((Vec::new(), e));
