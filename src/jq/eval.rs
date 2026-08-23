@@ -22843,6 +22843,42 @@ fn iterate_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     accumulate_path_context_step(results, step)
 }
 
+/// One `map(f)` element's full step: append `key` to `current_path`,
+/// evaluate `f` against `v` at that new path, and fold the result into
+/// `results` -- [`iterate_element_step`]'s sibling for `Builtin::Map`
+/// (#1477). Not the same helper: a map function has no "rest is empty"
+/// fast path to skip the way `Expr::Iterate`'s continuation does, so this
+/// calls `eval_pipe_with_path_context_internal` directly on `f` rather than
+/// going through `continue_rest_with_borrowed_value`. Taking `v: &OwnedValue`
+/// (borrowed straight from the source container) instead of an owned value
+/// lets both the array and object arms below iterate their container
+/// natively, the way `Expr::Iterate`'s own two arms do, rather than the
+/// eager `.clone()` per element the un-unified version paid to first
+/// homogenize both containers into one `Vec<(OwnedValue, OwnedValue)>`.
+#[allow(clippy::too_many_arguments)]
+fn map_element_step<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    key: OwnedValue,
+    v: &OwnedValue,
+    f: &Expr,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+    results: &mut Vec<OwnedValue>,
+) -> Option<QueryResult<'a, W>> {
+    let mut new_path = current_path.to_vec();
+    new_path.push(key);
+    let step = eval_pipe_with_path_context_internal::<W, S>(
+        core::slice::from_ref(f),
+        v,
+        root,
+        file_origin,
+        &new_path,
+        optional,
+    );
+    accumulate_path_context_step(results, step)
+}
+
 /// Continue evaluating `rest` for each output of an already-computed
 /// intermediate `QueryResult`, treating each output as a *fresh root* with
 /// an empty path -- the counterpart to `continue_rest_with_context` for a
@@ -23731,36 +23767,52 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // error/break discards the in-progress array rather than
             // surfacing a partial one, verified: `[1,error("x"),3]`
             // produces no output at all).
-            let elements: Vec<(OwnedValue, OwnedValue)> = match value {
-                OwnedValue::Array(arr) => arr
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| (OwnedValue::Int(i as i64), v.clone()))
-                    .collect(),
-                OwnedValue::Object(entries) => entries
-                    .iter()
-                    .map(|(k, v)| (OwnedValue::String(k.clone()), v.clone()))
-                    .collect(),
-                _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
-            };
+            //
+            // Iterates each container natively via `map_element_step`,
+            // mirroring `Expr::Iterate`'s own two arms (#1477), rather than
+            // eagerly homogenizing into one `Vec<(OwnedValue, OwnedValue)>`
+            // first the way this arm used to -- that cloned every element
+            // up front even though the loop only ever needs a borrow,
+            // doubling peak memory for a large array/object being mapped.
             let mut results = Vec::new();
             let mut stopped = None;
-            for (key, elem) in elements {
-                let mut new_path = current_path.to_vec();
-                new_path.push(key);
-                let step = eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(f),
-                    &elem,
-                    root,
-                    file_origin,
-                    &new_path,
-                    optional,
-                );
-                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
-                    stopped = Some(stop);
-                    break;
+            match value {
+                OwnedValue::Array(arr) => {
+                    for (i, v) in arr.iter().enumerate() {
+                        if let Some(stop) = map_element_step::<W, S>(
+                            OwnedValue::Int(i as i64),
+                            v,
+                            f,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                            &mut results,
+                        ) {
+                            stopped = Some(stop);
+                            break;
+                        }
+                    }
                 }
+                OwnedValue::Object(entries) => {
+                    for (key, v) in entries {
+                        if let Some(stop) = map_element_step::<W, S>(
+                            OwnedValue::String(key.clone()),
+                            v,
+                            f,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                            &mut results,
+                        ) {
+                            stopped = Some(stop);
+                            break;
+                        }
+                    }
+                }
+                _ if optional => return QueryResult::None,
+                _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
             let map_result = match stopped {
                 Some(QueryResult::Partial(_, Control::Error(e))) => QueryResult::Error(e),
