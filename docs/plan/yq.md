@@ -568,6 +568,58 @@ Sanity-checked (not a formal interleaved A/B benchmark) on a 500K-key flat mappi
 for the same query forced onto the DOM path via `--arg` — output byte-identical in both, ~40%
 less peak memory and ~30% faster, consistent with no longer building a 500K-entry `Vec<String>`.
 
+### Lazy `map` output (#757) — and what #685's shape does *not* generalize to
+
+#757 is #685's direct sequel: `map(...)` had no `can_use_m2_streaming` arm either, so every
+`map` query took the DOM path. The obvious move — copy `stream_lazy_keys_json`/`_yaml` for
+`GenericResult::LazySeq` — does not work, and the reason is worth stating because
+`docs/plan/jq-lazy-map-select.md` predicted it would ("output streaming needs no new type
+family"):
+
+**`stream_lazy_keys_*` generalizes trivially only because keys are plain strings.** They are
+written at a fixed top-level indent and never recursed into, so `IndentSpec` alone is enough
+to render them. A `LazySeq` element is an arbitrary value that must render at a *nested*
+indent, and neither `DocumentCursor::stream_json` nor `stream_yaml` carries a current-indent
+parameter to render at. So #757 added `stream_sequence_json`/`stream_sequence_yaml` to
+`DocumentCursor` (plus a `supports_sequence_streaming` capability probe), keeping the same
+"default = not supported" idiom `stream_json` already used, with `JsonCursor` taking the
+defaults. `YamlCursor`'s YAML implementation is a straight delegation to `stream_yaml_sequence`
+— the writer `--slurp` has used since #478/#1115 — which is why the change stayed small; its
+absent JSON twin, `stream_json_sequence`, was added alongside.
+
+Two further things #757 established that are worth carrying forward:
+
+- **Atomicity does not require output buffering.** `map`'s array construction is
+  all-or-nothing in real jq, which #757 was expected to reconcile by buffering at least one
+  element ahead of the writer. Separating the *drain* from the *conversion* removes the
+  problem instead: `LazySeq::drain_atomic` pulls the whole chain while keeping cursors
+  (`Copy`, pointer-sized), so a failing element is known before the first byte is written.
+- **The payoff was mostly correctness, not throughput.** Because the loss was a side effect of
+  *routing* rather than of any rule about a specific feature, one missing whitelist entry was
+  costing duplicate mapping keys, comments, anchors/aliases, flow style, quoted-scalar style,
+  and — under `-I0` — whole nested containers, all at once, while `.[]` on the identical input
+  was already correct. See
+  [docs/compliance/yq/limitations.md](../compliance/yq/limitations.md) for the full table.
+
+Formal interleaved A/B (`scripts/ab-cli.py`, 7 reps, identity gate on, plain corpora so before
+and after are byte-identical), median deltas:
+
+| corpus | workload (1 / 10 / 100 MB) | Apple M4 Pro | AMD Ryzen 9 7950X |
+|--------|----------------------------|--------------|-------------------|
+| flat   | `map(.)` — whole elements  | −24.7% / −26.2% / −25.5% | −24.6% / −27.2% / −25.0% |
+| flat   | `map(.name)` — scalar elements | −9.2% / −9.8% / −10.1% | −6.6% / −7.9% / −9.1% |
+| deep   | `map(.meta)` — container elements | −13.9% / −14.3% / −15.5% | −13.3% / −13.3% / −13.0% |
+| deep   | `map(.name)` — scalar elements | −4.1% / −4.5% / −5.7% | −5.0% / −5.3% / −6.2% |
+
+Noise floor from `ab-cli.py --control` on the same machines: M4 Pro −0.4%..+0.3%,
+7950X −0.6%..−0.5%. `.` (identity, which never reaches the changed code) stays inside that
+band on x86 and reads −0.9%..−2.1% on ARM — code layout, the #595/#649 effect, not a claim
+that identity got faster.
+
+Flat across sizes on both chips rather than growing — a constant-factor win, exactly what the
+mechanism predicts (the `OwnedValue` deep copy and the streaming writer are both O(n); one is
+simply removed), not an algorithmic one.
+
 One casualty: `keys_unsorted` has no yq golden-fixture coverage (`tests/data/yq-golden/`)
 because the pinned oracle, `mikefarah/yq v4.53.3`, rejects the identifier at the lexer level
 (`Error: 1:5: lexer: invalid input text "_unsorted"`) — it doesn't implement this builtin at
