@@ -262,11 +262,12 @@ reached *only* from consumers that genuinely need a prefix.
 - **`last(f)`, `reduce`, `foreach`, array construction, `collect_paths`' walk.** None can
   short-circuit by definition (`last` cannot know a value is last until exhaustion; `[…]`
   is atomic in jq). They stay eager.
-- **jq's multi-output generator-argument fan-out for ordinary builtins** — `"abcabc" |
-  ltrimstr(("a","b"))` yields two outputs in jq and one here. That is **#1279**, an
-  independent and opposite-direction bug (succinctly too *lazy* there, not too eager),
-  designed in [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md). The
-  design below is careful not to make it worse; see [The `ltrimstr` trap](#the-ltrimstr-trap).
+- **jq's multi-output generator-argument fan-out for ordinary builtins** — was a non-goal
+  *here* and is now **fixed separately**: #1279, closed by PR #1522 and designed in
+  [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md). It was the
+  opposite-direction bug (succinctly too *lazy* there, not too eager), which is why this
+  design had to be careful not to deepen it; see
+  [The `ltrimstr` trap](#the-ltrimstr-trap), whose rule still stands.
 - **`eval_generic.rs`'s `Expr::Comma`/`Expr::Pipe` arms.** Only its `first`/`last` arm is
   in scope (Stage 2b).
 
@@ -687,8 +688,13 @@ backtracking into `x`**. Verified:
 $ jq -cn '["abcabc" | ltrimstr(("a", ("B"|stderr)))]'
 ["bcabc","abcabc"]                                   stderr: B    <- jq DID evaluate the tail
 $ succinctly jq -cn '["abcabc" | ltrimstr(("a", ("B"|stderr)))]'
-["bcabc"]                                            stderr: B
+["bcabc","abcabc"]                                   stderr: B    <- since #1279, so does this
 ```
+
+The two columns agreed on the stderr from the start — that is the property this section is
+about, and the reason an ordinary builtin's argument may never be given a `Stop` sink. They
+now agree on stdout too, because #1279 gave those builtins the fan-out they were missing;
+this section originally showed `["bcabc"]` there.
 
 **Therefore `result_to_owned` must not be blanket-converted to a stopping sink.** A
 consumer may install a `Stop` sink only when it can show that, in jq's `as`-desugaring,
@@ -702,8 +708,8 @@ control never returns to the generator. Exactly two justifications qualify:
    `isempty(first(…))`, `IN` via `any`.
 
 `builtin_halt_error` is the **only** one of `result_to_owned`'s 20 production call sites
-that may change. (The missing-second-output half of that example is #1279, a separate
-issue this design must not make worse, designed in
+that may change. (The missing-second-output half of that example was #1279, a separate
+issue this design had to avoid deepening; it is fixed — see
 [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md).)
 
 ## How each consumer is rewritten
@@ -1066,10 +1072,11 @@ differential gate at least as rigorous as #1282's.
   resolver; closes in Stage 3.
 - [#980](https://github.com/rust-works/succinctly/issues/980) — closed incidentally by
   #1283 cluster A (#1288); no longer a dependant.
-- [#1279](https://github.com/rust-works/succinctly/issues/1279) — generator-argument
-  builtins not fanning out over a multi-output argument. The *opposite* bug, and the reason
-  the `ltrimstr` trap must be respected rather than "fixed" here. Designed in
-  [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md).
+- [#1279](https://github.com/rust-works/succinctly/issues/1279) — **closed** (PR #1522).
+  Generator-argument builtins not fanning out over a multi-output argument: the *opposite*
+  bug, and the reason the `ltrimstr` trap must be respected rather than "fixed" here. That
+  rule outlives the fix — it is why those builtins got a fan-out rather than a `Stop` sink.
+  Designed in [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md).
 - [#723](https://github.com/rust-works/succinctly/issues/723) — implemented `input`/
   `inputs`, which is what turned this issue from a cosmetic leak into data loss.
 - [jq-path-trackability-deferral.md](jq-path-trackability-deferral.md) (#1282) — the
