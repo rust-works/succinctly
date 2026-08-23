@@ -11598,20 +11598,25 @@ fn test_paths_filter_keeps_truthy_prefix_before_break() -> Result<()> {
 /// argument halts with zero prior output): this hits the
 /// `QueryResult::Partial(_, Control::Halt(code))` arm just below it, where
 /// the path argument's stream produces an output *before* halting.
-/// `builtin_setpath` reads a single (not fanned-out) path result via
-/// `eval_single`, so this diverges from real jq's own generator-based
-/// `setpath`, which evaluates the path argument lazily and errors on the
-/// first (non-array) output before ever reaching the halt: `jq -n
-/// 'setpath((1, halt_error(6)); 1)'` raises "Path must be specified as an
-/// array" instead of halting. This checks succinctly's own contract
-/// instead -- the halt still wins over any partially-produced path output,
-/// matching the pre-#791 bug this arm fixes (silently writing `null`/an
-/// unrelated error) rather than propagating the halt.
+/// The path argument's *first* output, `1`, is not an array, so `setpath`'s
+/// own error fires there and outranks the halt the second output would have
+/// raised. jq agrees: `jq -n 'setpath((1, halt_error(6)); 1)'` raises "Path
+/// must be specified as an array" and exits 5, never reaching the halt.
+///
+/// This test used to assert exit 6, pinning the pre-#1279 behaviour where
+/// `setpath` resolved a single path value and the halt won. It is the
+/// inverted case that stops "always emit the prefix, then halt" from being
+/// mistaken for a rule of its own -- see
+/// `test_ltrimstr_fanout_emits_its_prefix_then_halts_1277` for the other half.
 #[test]
-fn test_setpath_propagates_halt_from_partial_path_argument() -> Result<()> {
+fn test_setpath_own_error_outranks_trailing_halt_1279() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "setpath((1, halt_error(6)); 1)"], None)?;
-    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Path must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -11619,18 +11624,22 @@ fn test_setpath_propagates_halt_from_partial_path_argument() -> Result<()> {
 /// which hits the bare `QueryResult::Halt` arm (value argument halts with
 /// zero prior output): this hits the `QueryResult::Partial(_,
 /// Control::Halt(code))` arm just below it, where the value argument's
-/// stream produces an output *before* halting. Diverges from real jq here
-/// too -- `jq -n 'setpath(["a"]; (1, halt_error(6)))'` fans out and prints
-/// `{"a":1}` before exiting 6 -- because `builtin_setpath` takes a single
-/// (not fanned-out) value result, the same architectural simplification as
-/// the path-argument test above; this checks succinctly's own contract
-/// that the halt still wins and no output escapes.
+/// stream produces an output *before* halting. Here the first output is
+/// usable, so `setpath` runs for it and emits `{"a":1}`, and only then does
+/// the halt fire -- `jq -n 'setpath(["a"]; (1, halt_error(6)))'` does the
+/// same, exiting 6 after printing it. This test used to assert an empty
+/// stdout, pinning the pre-#1279 single-value resolution.
+///
+/// Contrast `test_setpath_own_error_outranks_trailing_halt_1279` above,
+/// where the first output is *not* usable and the error wins instead. Which
+/// of the two happens is decided entirely by whether the loop reaches the
+/// halt, not by a rule about halts.
 #[test]
-fn test_setpath_propagates_halt_from_partial_value_argument() -> Result<()> {
+fn test_setpath_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#"setpath(["a"]; (1, halt_error(6)))"#], None)?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "{\n  \"a\": 1\n}\n");
     Ok(())
 }
 
@@ -11952,22 +11961,26 @@ fn test_nth_stream_partial_halt_in_stream_argument() -> Result<()> {
 }
 
 #[test]
-fn test_delpaths_propagates_halt_via_partial_prefix_in_paths_argument() -> Result<()> {
+fn test_delpaths_own_error_outranks_trailing_halt_1279() -> Result<()> {
     // `builtin_delpaths`'s `QueryResult::Partial(_, Control::Halt(code))`
     // arm -- a second, distinct arm from the bare `Halt` case
     // `test_delpaths_propagates_halt_in_paths_argument` above covers --
     // fires when the `paths` argument produces at least one successful
     // output (via a comma expression) before halting.
     //
-    // Note: `builtin_delpaths` evaluates `paths_expr` with a single
-    // `eval_single` call, unlike real jq's per-output "run once per value
-    // the argument filter generates" semantics for builtin filter arguments
-    // (a pre-existing, separate implementation gap unrelated to this halt
-    // fix): `jq -n '{"a":1,"b":2,"c":3} | delpaths((1, halt_error(9)))'`
-    // errors out immediately on the first output `1` not being an array
-    // (exit 5), never reaching `halt_error` at all. Checked here against
-    // succinctly's own contract instead: the halt must still win, discarding
-    // the `1` prefix entirely rather than emitting a result for it first.
+    // The argument's *first* output, `1`, is not an array, so `delpaths`'
+    // own error fires there and outranks the halt the second output would
+    // have raised -- a body failure beats a trailing control that was never
+    // reached. jq agrees: exit 5, "Paths must be specified as an array",
+    // never reaching `halt_error` at all. This test used to assert exit 9,
+    // pinning the pre-#1279 behaviour where the halt won.
+    //
+    // stderr still carries `halt_error`'s own output, which jq's does not:
+    // succinctly evaluates the whole argument generator up front, so the
+    // second output runs even though the loop never uses it. That is #820's
+    // eager-generator gap, not this one's -- pinned by the
+    // `delpaths_own_error_outranks_trailing_halt` golden, which stays a known
+    // failure for exactly that residue.
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
@@ -11975,9 +11988,12 @@ fn test_delpaths_propagates_halt_via_partial_prefix_in_paths_argument() -> Resul
         ],
         None,
     )?;
-    assert_eq!(code, 9, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
-    assert_eq!(stderr, "{\"a\":1,\"b\":2,\"c\":3}\n");
+    assert!(
+        stderr.contains("Paths must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -16082,17 +16098,20 @@ fn test_flatten_negative_depth_errors_even_with_trailing_break_1164() -> Result<
     Ok(())
 }
 
-/// Control: `combinations(n)` uses `n` inside a nested `range(n)`
-/// generator (not as a simple scalar), so real jq's own escape semantics
-/// there are different from every other case above -- a trailing break in
-/// `n`'s own generator aborts the whole array-construction context real
-/// jq's `def combinations(n): ...` body uses internally, producing *no*
-/// output at all, not "the first n's worth of combinations, then stop".
-/// Deliberately left unfixed by #1164; this pins the current (pre-existing,
-/// still-divergent-from-jq) behavior so a future attempt doesn't assume
-/// the same simple wrap other builtins got would be correct here too.
+/// `combinations(n)` uses `n` inside a nested `range(n)` that an array
+/// construction then collects, so its escape semantics differ from every
+/// other builtin in this block: a trailing break in `n`'s own generator
+/// aborts that whole array construction, producing *no* output at all --
+/// not "the first n's worth of combinations, then stop".
+///
+/// This test used to pin the opposite, because `combinations` resolved `n`
+/// to a single value and never saw the break. #1279 gave it jq's real model
+/// (`def combinations(n): . as $dot | [range(n)] | map($dot) | combinations;`),
+/// which fires the escape before the arity is ever used -- deliberately
+/// unlike `fanout_arg`'s "run the loop, then escape", and the reason
+/// `combinations` is the one builtin in this family that must NOT fan out.
 #[test]
-fn test_combinations_n_break_semantics_documented_not_fixed_by_1164() -> Result<()> {
+fn test_combinations_n_break_aborts_the_whole_construction_1279() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &[
             "-c",
@@ -16101,11 +16120,7 @@ fn test_combinations_n_break_semantics_documented_not_fixed_by_1164() -> Result<
         Some("[1,2]"),
     )?;
     assert_eq!(code, 0, "err={err}");
-    // Pre-existing divergence from real jq (which produces no output at all
-    // here, verified live: `jq -c 'label $out | (combinations((2, break
-    // $out)), "after")'` on `[1,2]` prints nothing) -- not attempted by
-    // #1164, see this test's own doc comment.
-    assert_eq!(out.trim(), "[1,1]\n[1,2]\n[2,1]\n[2,2]\n\"after\"");
+    assert_eq!(out, "");
     Ok(())
 }
 
