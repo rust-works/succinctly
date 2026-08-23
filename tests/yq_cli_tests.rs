@@ -21304,10 +21304,10 @@ fn test_yq_first_only_gate_still_takes_the_first_output_1534() -> Result<()> {
 /// Error: boom
 /// ```
 ///
-/// Only `delpaths` is asserted here because only it is a *single*-argument
-/// builtin. `setpath`'s two-argument form is covered by
-/// `test_yq_setpath_two_argument_escape_order_is_unfixed_1533` below, which
-/// pins the divergence that remains.
+/// `setpath`'s two-argument form is covered by
+/// `test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533`
+/// below, fixed the same way once `fanout_two_args` also learned to defer
+/// to a slot's own trailing escape ahead of its `RejectMany` count check.
 #[test]
 fn test_yq_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr(
@@ -21325,28 +21325,33 @@ fn test_yq_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
     Ok(())
 }
 
-/// #1533's remaining half, pinned as a known divergence rather than left
-/// silent. For a *two*-argument builtin the same rule cannot be applied by
-/// emptying the escaping slot's values: doing so skips the body, and the
-/// body is where the other slot is validated. Which slot real yq reports is
-/// per-builtin and does not follow succinctly's outer/inner order, so this
-/// needs a per-builtin ordering probe (see
-/// `clear_values_when_yq_argument_escaped`'s doc comment).
+/// #1533's other half, formerly pinned as a known divergence
+/// (`test_yq_setpath_two_argument_escape_order_is_unfixed_1533`) until now.
 ///
-/// Real yq answers `Error: boom`; succinctly still answers with its count
-/// message. Asserting the *current* behaviour keeps the gap visible and
-/// makes the eventual fix flip a pin rather than pass silently.
+/// The general "clear a slot's values whenever it escaped" rule stays
+/// reverted (it broke `test`/`setpath`'s own per-builtin escape-ordering,
+/// see `test_yq_two_argument_body_validation_outranks_a_slot_escape_1533`
+/// and `test_yq_fanout_two_args_argument_escape_reports_bare_not_prefix_then_raise`
+/// below) -- but a narrower rule is safe: only when a slot's value count is
+/// *already* about to trip `RejectMany`'s own `> 1` check does that slot's
+/// trailing escape get to outrank the resulting count message instead.
+/// `(1, 2, error("boom"))` has two values only because the generator didn't
+/// get to collapse them into one before raising, so the count itself is a
+/// symptom of the escape, not competing evidence against it -- unlike the
+/// single-value-then-escape shapes the reverted rule broke, where `body`
+/// still needs to run to decide whose validation wins.
 #[test]
-fn test_yq_setpath_two_argument_escape_order_is_unfixed_1533() -> Result<()> {
+fn test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr(
         r#"setpath((1,2,error("boom")); 1)"#,
         "null\n",
         &["-o", "json"],
     )?;
     assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
     assert!(
-        err.contains("single result"),
-        "expected the (still-diverging) count message, got {err:?}"
+        !err.contains("single result"),
+        "the count message must not mask the real error: {err:?}"
     );
     assert_eq!(code, 1);
     Ok(())

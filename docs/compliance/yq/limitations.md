@@ -388,11 +388,16 @@ which was true only before #1534.
   *outcome* — an error rather than a fan-out or a silent truncation — is what #1279 preserved;
   matching the per-slot wording is unstarted.
 - **Two-argument escape ordering** ([#1533](https://github.com/rust-works/succinctly/issues/1533),
-  half-closed). The escape-clearing above is deliberately *not* applied to `fanout_two_args`:
-  emptying one slot's values skips the body, which is where the other slot gets validated, and
-  which slot real yq reports is per-builtin and does not follow succinctly's outer/inner order
-  (`test` wants the flags, `setpath` wants the path). That needs a per-builtin ordering probe.
-  Pinned as a known divergence by `test_yq_setpath_two_argument_escape_order_is_unfixed_1533`.
+  now fully closed). The escape-clearing above is deliberately *not* applied to
+  `fanout_two_args`: emptying one slot's values skips the body, which is where the other slot
+  gets validated, and which slot real yq reports there is per-builtin and does not follow
+  succinctly's outer/inner order (`test` wants the flags, `setpath` wants the path) — that part
+  stays a known limitation with no shared rule. But the *specific* case #1533 was filed for —
+  `RejectMany`'s own `args.len() > 1` count check masking a real `error(...)` in the same
+  slot — needed no per-builtin probe: a count violation there is itself a symptom of the
+  escape, not competing evidence against it, so `fanout_two_args` now defers to that slot's
+  trailing control whenever its own count check is what's about to fire. Confirmed by
+  `test_yq_setpath_two_argument_reject_many_propagates_an_embedded_error_1533`.
 - **`contains` on an escaping argument**
   ([#1553](https://github.com/rust-works/succinctly/issues/1553)). `contains` is ungated because
   real yq fans it out, but real yq still emits nothing when its argument escapes, where
