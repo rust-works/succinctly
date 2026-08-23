@@ -21572,3 +21572,151 @@ fn test_yq_first_over_pipe_stops_at_first_element_1461() -> Result<()> {
     assert_eq!(stderr, "1", "must not visit the second element");
     Ok(())
 }
+
+// ============================================================================
+// #757: `map` streams its elements from their own cursors
+// ============================================================================
+//
+// Byte-for-byte agreement with real yq for the shapes this changed lives in
+// `tests/data/yq-golden/cases/map_*` (captured from the pinned v4.53.3, see
+// `tests/yq_golden_tests.rs`). The tests below cover what a golden fixture
+// can't: succinctly-only surface with no yq oracle, the non-cursor fallback,
+// and error/exit-code behavior.
+
+/// #757: `map(f)` used to fall to the `OwnedValue` DOM path, whose
+/// `IndexMap` cannot represent a repeated mapping key. Streaming each element
+/// from its own cursor keeps both entries, matching what `.[]` and `select()`
+/// (#442, #631, #796) already did on the same input -- and what real yq does.
+#[test]
+fn test_map_preserves_duplicate_mapping_keys_757() -> Result<()> {
+    let (output, code) = run_yq_stdin("map(.)", "- a: 1\n  a: 2\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "- a: 1\n  a: 2\n");
+
+    // The same through `-o=json`, where the DOM path collapsed it too.
+    let (json, code) = run_yq_stdin("map(.)", "- a: 1\n  a: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "output: {json:?}");
+    assert_eq!(json, "[{\"a\":1,\"a\":2}]\n");
+    Ok(())
+}
+
+/// #757: `--inplace` shares `stream_cursor!` with the stdout path, so it
+/// inherits the same fidelity -- pinned separately because it has its own
+/// copy of the M2 gate (`can_inplace_*_fast_path`, #478) that a future edit
+/// could desynchronize from the stdout one.
+#[test]
+fn test_map_preserves_presentation_inplace_757() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "- a: 1 # keep me\n- {{b: 2}}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("map(.)")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "- a: 1 # keep me\n- {b: 2}\n");
+    Ok(())
+}
+
+/// #757: `map`'s all-or-nothing array construction (#724/#725) survives the
+/// move to a streaming writer. `drain_atomic` settles the whole chain before
+/// the first byte reaches stdout, so a failing element can't leave the
+/// already-converted prefix behind -- the exact hazard the issue said a
+/// byte-at-a-time writer could not avoid.
+#[test]
+fn test_map_error_writes_no_truncated_prefix_757() -> Result<()> {
+    // Element 1 converts fine; element 2 cannot be indexed.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n- a: 5\n", &[])?;
+    assert_eq!(stdout, "", "no partial array may reach stdout");
+    assert!(stderr.contains("Cannot index number"), "stderr: {stderr:?}");
+    assert_eq!(code, 1);
+
+    // Same for a body that fails on the very first element.
+    let (stdout, _, code) = run_yq_stdin_with_stderr("map(.a.b)", "- a: 5\n- a: 6\n", &[])?;
+    assert_eq!(stdout, "");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// #757: not every `LazySeq` element is a live cursor. `keys_unsorted` over
+/// an *array* sources from `LazySource::IndexRange`, whose elements are
+/// synthetic `LazyElem::Owned(Int)`s with no node in the document to point
+/// at, so `sequence_streamable_cursors` declines and the arm falls back to
+/// the `OwnedValue::Array` path it always used. (`keys_unsorted` is
+/// succinctly-only surface in yq mode -- real yq's lexer rejects the name --
+/// so this can't be a golden fixture.)
+#[test]
+fn test_map_over_array_index_range_falls_back_to_owned_757() -> Result<()> {
+    let (output, code) = run_yq_stdin("keys_unsorted | map(.)", "- {x: 1}\n- {x: 2}\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "- 0\n- 1\n");
+
+    // A mapping's keys *are* cursors, so that side keeps streaming.
+    let (output, code) = run_yq_stdin("keys_unsorted | map(.)", "a: 1\nb: 2\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "- a\n- b\n");
+    Ok(())
+}
+
+/// #757: a computing `map` body keeps the DOM path, so its yq-mode float
+/// formatting (#997, #949, #1090) is unaffected -- the reason
+/// `can_use_m2_streaming` recurses into the body rather than answering a flat
+/// `true` (see `test_can_use_m2_streaming_recurses_into_map_body_757`, which
+/// pins the gate itself; this pins the output it protects).
+#[test]
+fn test_map_with_computing_body_keeps_dom_float_formatting_757() -> Result<()> {
+    let (output, code) = run_yq_stdin("map(.a * 1e100)", "- a: 1\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "- 1e+100\n");
+    Ok(())
+}
+
+/// #757: `map(f)` over an empty container yields no elements at all, taking
+/// `stream_json_sequence`/`stream_yaml_sequence`'s `[]` shortcut rather than
+/// writing an empty block sequence (which would be no output at all in YAML).
+#[test]
+fn test_map_over_empty_container_757() -> Result<()> {
+    let (output, code) = run_yq_stdin("map(.)", "[]\n", &[])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output, "[]\n");
+
+    let (json, code) = run_yq_stdin("map(.)", "[]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "output: {json:?}");
+    assert_eq!(json, "[]\n");
+    Ok(())
+}
+
+/// #757: routing `map` through the M2 path also moves it onto that path's
+/// existing multi-document separator convention. `produces_output()` answers
+/// `true` for a not-yet-drained `LazySeq` (as it already does for `Error`),
+/// so a `---` is written ahead of a document whose `map` then fails and emits
+/// nothing. That is a pre-existing M2 quirk, not one this change introduced --
+/// the already-streaming `.a.b` behaves identically on the same shape, while
+/// the DOM path (`-P`) suppresses the separator for both. Pinned here so the
+/// two paths' divergence is visible and a later fix has to update a test
+/// rather than silently change output.
+#[test]
+fn test_map_multidoc_separator_matches_other_m2_expressions_757() -> Result<()> {
+    let (map_out, _, code) =
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: 5\n", &[])?;
+    assert_eq!(map_out, "- 1\n---\n");
+    assert_eq!(code, 1);
+
+    // The pre-existing M2 expression, same shape, same trailing separator.
+    let (nav_out, _, code) = run_yq_stdin_with_stderr(".a.b", "a: {b: 1}\n---\na: 5\n", &[])?;
+    assert_eq!(nav_out, "1\n---\n");
+    assert_eq!(code, 1);
+
+    // The DOM path suppresses it, for `map` and navigation alike.
+    let (dom_out, _, code) =
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: 5\n", &["-P"])?;
+    assert_eq!(dom_out, "- 1\n");
+    assert_eq!(code, 1);
+    Ok(())
+}

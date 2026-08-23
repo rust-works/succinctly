@@ -6066,6 +6066,48 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::stream_yaml_as_document(self, out, indent, sort_keys)
     }
 
+    /// YAML cursors implement both `stream_sequence_*` methods below, so a
+    /// `LazySeq` whose elements are all still cursors renders straight from
+    /// the source document rather than through an `OwnedValue::Array` (#757).
+    #[inline]
+    fn supports_sequence_streaming() -> bool {
+        true
+    }
+
+    #[inline]
+    fn stream_sequence_json<Out: core::fmt::Write>(
+        cursors: &[Self],
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        stream_json_sequence(
+            resolved_sequence_cursors(cursors),
+            out,
+            0,
+            indent.width,
+            indent.unit,
+            sort_keys,
+        )
+    }
+
+    #[inline]
+    fn stream_sequence_yaml<Out: core::fmt::Write>(
+        cursors: &[Self],
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+    ) -> core::fmt::Result {
+        stream_yaml_sequence(
+            resolved_sequence_cursors(cursors),
+            out,
+            0,
+            indent.width,
+            indent.unit,
+            sort_keys,
+        )
+    }
+
     #[inline]
     fn is_falsy(&self) -> bool {
         // A value is falsy if it's null or false
@@ -6781,6 +6823,74 @@ fn write_flow_last_item_comment<Out: core::fmt::Write>(
         out.write_str(indent)?;
     }
     Ok(())
+}
+
+/// Resolve each of a `LazySeq`'s drained element cursors once, before either
+/// sequence writer reads it (#757).
+///
+/// A `map` element is a *navigated* result, so - exactly like
+/// `YamlCursor::stream_yaml`'s own note (#835) - it can still be an
+/// unresolved bare-`-` sequence-item wrapper. `stream_yaml_sequence`'s other
+/// caller (`--slurp`) never sees one, since its cursors are whole document
+/// roots, so the resolution lives here rather than inside either writer.
+fn resolved_sequence_cursors<'a, 'c, W: AsRef<[u64]>>(
+    cursors: &'c [YamlCursor<'a, W>],
+) -> impl Iterator<Item = YamlCursor<'a, W>> + 'c {
+    cursors.iter().map(YamlCursor::resolve_bare_seq_item)
+}
+
+/// Stream independent document cursors as a single JSON array, without
+/// materializing an `OwnedValue` DOM (#757).
+///
+/// The JSON counterpart of [`stream_yaml_sequence`] below, mirroring
+/// `YamlCursor::stream_json_value`'s own `Sequence` arm (same empty-sequence
+/// `"[]"` shortcut, same `indent_spaces == 0` compact handling, same
+/// `next_indent` step). Like its YAML sibling, the cursors need not be
+/// siblings or even share one `YamlIndex` — which is what lets a `map` chain's
+/// drained elements (`LazySeq::drain_atomic`) render straight from wherever
+/// each one landed in the source, keeping duplicate mapping keys that an
+/// `OwnedValue`-based `IndexMap` cannot represent.
+///
+/// Unlike that `Sequence` arm this does not `uncons_resolved_cursor` its own
+/// input: it has no cons-list to walk, and its caller
+/// (`YamlCursor::stream_sequence_json`) resolves each cursor once up front for
+/// both output targets.
+pub fn stream_json_sequence<'a, W, I, Out>(
+    cursors: I,
+    out: &mut Out,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+) -> core::fmt::Result
+where
+    W: AsRef<[u64]> + 'a,
+    I: IntoIterator<Item = YamlCursor<'a, W>>,
+    Out: core::fmt::Write,
+{
+    let mut iter = cursors.into_iter().peekable();
+    if iter.peek().is_none() {
+        return out.write_str("[]");
+    }
+    out.write_char('[')?;
+    let next_indent = current_indent + indent_spaces;
+    let mut first = true;
+    for cursor in iter {
+        if !first {
+            out.write_char(',')?;
+        }
+        first = false;
+        if indent_spaces > 0 {
+            out.write_char('\n')?;
+            write_yaml_indent(out, next_indent, unit)?;
+        }
+        cursor.stream_json_value(out, next_indent, indent_spaces, unit, sort_keys)?;
+    }
+    if indent_spaces > 0 {
+        out.write_char('\n')?;
+        write_yaml_indent(out, current_indent, unit)?;
+    }
+    out.write_char(']')
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or
@@ -8244,6 +8354,51 @@ mod tests {
         let mut out = String::new();
         stream_yaml_sequence([cursor_a, cursor_b], &mut out, 0, 0, ' ', false).unwrap();
         assert_eq!(out, "[{a: 1}, {b: 2}]");
+    }
+
+    #[test]
+    fn test_stream_json_sequence_compact_and_pretty_757() {
+        // #757: the JSON counterpart of `stream_yaml_sequence` above, added
+        // for `map`'s CLI output streaming. Cursors from two independent
+        // sources again — the point of a free function over
+        // `stream_json_value`'s own Sequence arm, which walks one index's
+        // cons-list. Duplicate mapping keys survive, which is what the
+        // `OwnedValue`/`IndexMap` path this replaces could not represent.
+        let bytes_a = b"a: 1\na: 2\n".to_vec();
+        let index_a = YamlIndex::build(&bytes_a).unwrap();
+        let bytes_b = b"b: {c: 3}\n".to_vec();
+        let index_b = YamlIndex::build(&bytes_b).unwrap();
+
+        let cursor_a = index_a.root(&bytes_a).first_child().unwrap();
+        let cursor_b = index_b.root(&bytes_b).first_child().unwrap();
+
+        let mut compact = String::new();
+        stream_json_sequence([cursor_a, cursor_b], &mut compact, 0, 0, ' ', false).unwrap();
+        assert_eq!(compact, r#"[{"a":1,"a":2},{"b":{"c":3}}]"#);
+
+        let mut pretty = String::new();
+        stream_json_sequence([cursor_a, cursor_b], &mut pretty, 0, 2, ' ', false).unwrap();
+        assert_eq!(
+            pretty,
+            "[\n  {\n    \"a\": 1,\n    \"a\": 2\n  },\n  {\n    \"b\": {\n      \"c\": 3\n    }\n  }\n]"
+        );
+    }
+
+    #[test]
+    fn test_stream_json_sequence_empty_757() {
+        // The `[]` shortcut, mirroring `stream_yaml_sequence`'s own. Reached
+        // by `map(f)` over an empty container, where `drain_atomic` yields no
+        // elements at all.
+        let bytes = b"a: 1\n".to_vec();
+        let index = YamlIndex::build(&bytes).unwrap();
+        let empty: [YamlCursor<'_, Vec<u64>>; 0] = [];
+
+        let mut out = String::new();
+        stream_json_sequence(empty, &mut out, 0, 2, ' ', false).unwrap();
+        assert_eq!(out, "[]");
+        // Silence the unused-binding warning while keeping the index alive
+        // for the cursor lifetime the signature requires.
+        let _ = index.root(&bytes);
     }
 
     #[test]
