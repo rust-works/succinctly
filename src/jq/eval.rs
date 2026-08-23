@@ -34293,6 +34293,39 @@ mod tests {
             (b"null", "[limit(2; if true then (1,2,3) else 9 end)]"),
             (b"null", "def f: (1, 2); [limit(1; f)]"),
             (b"null", "label $o | (1 as $x | ($x, $x)), 99"),
+            // #1462 code review: coverage sweep for branches only reachable
+            // when the *root* expression itself is a native lazy arm (this
+            // harness calls `eval_each` on the parsed root directly, so a
+            // `[...]`-wrapped `limit(...)` -- the earlier rows above -- never
+            // exercises `each_limit` at all: `Array` isn't itself a lazy arm,
+            // so `eval_each` falls back to `eval_single` for the whole
+            // expression instead of reaching the `Expr::Limit` arm).
+            (b"[1,2,3]", ".[0]?"),
+            (b"null", "if (true, error(\"x\")) then 1 else 2 end"),
+            (b"null", "label $o | (1, break $o)?"),
+            (b"{\"a\":1}", ".a as $x | ($x, $x)"),
+            (b"[1,2,3]", ".[] as $x | $x"),
+            (b"null", "empty as $x | 1"),
+            (b"null", "error(\"x\") as $x | 1"),
+            (b"null", "label $o | break $o as $x | 1"),
+            (b"null", "halt_error(3) as $x | 1"),
+            (b"null", "empty as [$x] | 1"),
+            (b"null", "error(\"x\") as [$x] | 1"),
+            (b"null", "label $o | break $o as [$x] | 1"),
+            (b"null", "halt_error(3) as [$x] | 1"),
+            (b"null", "([1], error(\"x\")) as [$x] | $x"),
+            (b"null", "[1] as {b:$c} ?// [$a] | $a"),
+            (b"null", "[1] as [$a] | ($a, error(\"x\"))"),
+            (b"null", "label $o | [1] as [$a] ?// [$b] | ($a, break $o)"),
+            (b"null", "[1] as [$a] | ($a, halt_error(3))"),
+            (b"null", "limit(empty; 1, 2, 3)"),
+            (b"null", "limit(error(\"x\"); 1, 2, 3)"),
+            (b"null", "limit(-1; 1, 2, 3)"),
+            (b"null", "limit(null; 1, 2, 3)"),
+            (b"null", "limit(0; 1, 2, 3)"),
+            (b"null", "limit(2; 1, 2, 3)"),
+            (b"null", "limit(5; 1, 2)"),
+            (b"null", "limit(3; 1, 2, error(\"x\"), 4)"),
         ];
 
         for (json, src) in cases {
