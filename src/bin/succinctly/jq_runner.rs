@@ -1620,11 +1620,21 @@ impl InputLocations {
     }
 
     /// Locations for a single value at an already-resolved location.
+    ///
+    /// Always pushes exactly one `per_value` entry, even when `at.line` is
+    /// `None` (an empty/whitespace-only `--slurp`, whose single wrapped-array
+    /// value still has no content line to name). Slurp mode always produces
+    /// exactly one value, so `get_inputs`'s `values`/`locations` invariant
+    /// ("one location per value") must hold here unconditionally -- the
+    /// seeding `.zip()` in `run_jq` silently truncates to the shorter side on
+    /// a mismatch instead of erroring, so a skipped push here previously lost
+    /// the whole slurped document to `input`/`inputs` (debug-build panic on
+    /// the `debug_assert_eq!` guarding that zip, release-build silent empty
+    /// output instead of jq's own `[]`) -- confirmed live against jq 1.7.1:
+    /// `printf '' | jq -c -s '., inputs'` prints `[]`.
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
-        if let Some(line) = at.line {
-            locations.push(0, line);
-        }
+        locations.push(0, at.line.unwrap_or(0));
         locations
     }
 
