@@ -416,6 +416,21 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         // a future variant that carries a sub-expression is a compile error
         // here until it's declared there, the same discipline this file's
         // own manual `Expr` recursion already follows above.
+        //
+        // A call to a namespace that was never actually `import`ed now
+        // fails the same way in this position as it already did bare
+        // (`nonexistent_ns::foo` outside any builtin) or piped -- rewritten
+        // to `Expr::FuncCall` unconditionally, regardless of import status,
+        // reporting "undefined function" from the general `FuncCall`
+        // resolution path rather than `eval.rs`'s own `Expr::NamespacedCall`
+        // arm's "module not loaded". Not a regression this fix introduces:
+        // confirmed live that the bare/piped case already answered
+        // "undefined function" before this change (`rewrite_namespaced_calls`
+        // never checked import status anywhere), and that real jq's own
+        // message for this shape is closer to "X/0 is not defined" (a
+        // compile error) than to either succinctly wording -- this arm
+        // brings the builtin-argument position in line with what every
+        // other position already did, rather than diverging from it.
         Expr::Builtin(builtin) => Expr::Builtin(map_builtin_subexprs(&builtin, &mut |sub| {
             rewrite_namespaced_calls(sub.clone())
         })),

@@ -17113,13 +17113,20 @@ fn test_jq_namespaced_call_inside_two_arg_builtin_1505() -> Result<()> {
     // not exercise the new code. `pow(x; y)` has no such dedicated AST node
     // and genuinely reaches `Expr::Builtin(Builtin::Pow(..))`, so it is the
     // shape that actually pins the new two-argument arm.
+    //
+    // The namespaced call sits in the *first* argument (`m::two`, not a
+    // literal `2`), and the two operands are chosen so a transposed
+    // reconstruction (`Pow(f(b), f(a))` instead of `Pow(f(a), f(b))`) gives
+    // a *different* answer (9, not 8) rather than accidentally matching --
+    // review found an earlier version of this test used `pow(2; m::two)`,
+    // which can't distinguish the two since both operands evaluate to 2.
     let (stdout, stderr, code) = run_jq_full(
-        &["-cn", "-L", &lib, r#"import "mymath" as m; pow(2; m::two)"#],
+        &["-cn", "-L", &lib, r#"import "mymath" as m; pow(m::two; 3)"#],
         None,
     )
-    .expect("pow(x; namespaced call) repro runs");
+    .expect("pow(namespaced call; x) repro runs");
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert_eq!(stdout, "4\n");
+    assert_eq!(stdout, "8\n");
 
     // `limit(n; f)` itself, kept as a regression pin for the common idiom
     // even though it does not exercise the new `Expr::Builtin` arm.
