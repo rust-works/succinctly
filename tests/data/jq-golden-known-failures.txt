@@ -180,7 +180,6 @@
 #                  to the ~16 builtins that still report a bare "no value".
 
 delpaths_arg_fanout                        fan-out          delpaths(ps) errors on a multi-output argument instead of fanning out — #1279
-range_one_arg_fanout                       fan-out          range(n) reports "Range bounds must be numeric" for a generator bound — #1279
 pow_atan2_arg_fanout                       fan-out          pow/atan2 error on a generator argument (get_number_from_result, not result_to_owned) — #1279
 combinations_n_collected_into_range        fan-out          combinations(n) must COLLECT n's outputs into one arity, not fan out — #1279
 regex_test_re_arg_fanout                   fan-out          test(re) uses only re's first output — #1279
@@ -196,14 +195,11 @@ test_flags_outermost_order                 fanout-order     test(re; flags): fla
 scan_re_outermost_order                    fanout-order     scan($re; $flags): re OUTER (both $-bound, leftmost-outermost) — #1279
 split_flags_collected_not_fanned           fanout-order     split(re; flags): flags are COLLECTED, not fanned — 2 outputs, not 4 — #1279
 setpath_value_outer_path_inner_order       fanout-order     setpath(p; v): VALUE outer, path inner — opposite of sub at the same arity — #1279
-range_three_arg_fanout_order               fanout-order     range(from; to; by): from outer, to middle, by inner — #1279
 gsub_replacement_transpose_absence_padded  fanout-order     gsub's multi-output replacement transposes, padded by absence not null — #840/#1279
 
-range_from_fanout_halt_after_output        trailing-escape  range emits 1..9 before the from-bound's halt — #1277
 setpath_own_error_outranks_trailing_halt   trailing-escape  setpath's own "not an array" error outranks the trailing halt (exit 5, not 6) — #1277
 delpaths_own_error_outranks_trailing_halt  trailing-escape  delpaths' own "not an array" error outranks the trailing halt (exit 5, not 9) — #1277
 
 combinations_empty_n_yields_empty_array    zero-output      combinations(empty) is [[]], not zero output and not "no value" — #1045/#1279
-range_empty_bound_zero_output              zero-output      range with an empty bound reports "no value" — #1045
 regex_and_search_empty_arg_zero_output     zero-output      test/index/sub/gsub/scan/splits/match/capture(empty) report "no value" — #1045
 bsearch_delpaths_empty_arg_zero_output     zero-output      bsearch/delpaths with an empty argument report "no value" — #1045

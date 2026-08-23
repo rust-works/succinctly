@@ -21279,40 +21279,20 @@ impl RangeNum {
     }
 }
 
-/// Extract a numeric `range()` argument from an evaluated expression result.
-fn range_arg<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> Result<RangeNum, EvalEscape> {
-    match result {
-        QueryResult::Owned(OwnedValue::Int(i)) => Ok(RangeNum::Int(i)),
-        QueryResult::Owned(OwnedValue::Float(f)) => Ok(RangeNum::Float(f)),
-        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
-            Ok(RangeNum::Int(i))
+/// Classify one already-resolved bound value as a [`RangeNum`].
+///
+/// Was a `QueryResult` matcher with its own `Halt`/`Break`/`Partial` arms;
+/// since #1279 gave `range` a real fan-out, [`stream_outputs`] owns those and
+/// this is left as a pure per-value classifier.
+fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
+    match value {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => {
+            Ok(RangeNum::Int(*i))
         }
-        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
-            Ok(RangeNum::Float(f))
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+            Ok(RangeNum::Float(*f))
         }
-        QueryResult::One(v) => match to_owned(&v) {
-            OwnedValue::Int(i) => Ok(RangeNum::Int(i)),
-            OwnedValue::Float(f) => Ok(RangeNum::Float(f)),
-            OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Ok(RangeNum::Int(i)),
-            OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => Ok(RangeNum::Float(f)),
-            _ => Err(EvalError::new("Range bounds must be numeric").into()),
-        },
-        QueryResult::Error(e) => Err(e.into()),
-        // A halt in a bound expression must abort `range()` as a halt, not
-        // be downgraded to "Range bounds must be numeric" — that would make
-        // it a catchable error, letting `try (range(halt_error(3))) catch
-        // "caught"` swallow the halt entirely (#791).
-        QueryResult::Halt(code) => Err(EvalEscape::Halt(code)),
-        QueryResult::Partial(_, Control::Halt(code)) => Err(EvalEscape::Halt(code)),
-        // Same reasoning as `result_to_owned`'s identical arm (#833): a bare
-        // unmatched `break` in a range bound must keep unwinding toward its
-        // label, not be misreported as "Range bounds must be numeric".
-        // Doesn't extend to `Partial(_, Control::Break(_))` (a bound
-        // expression that produced a value before breaking) -- see
-        // `result_to_owned`'s own comment for why that shape needs its own,
-        // separate fix (#1164).
-        QueryResult::Break(label) => Err(EvalEscape::Break(label)),
-        _ => Err(EvalError::new("Range bounds must be numeric").into()),
+        _ => Err(EvalError::new("Range bounds must be numeric")),
     }
 }
 
@@ -21324,38 +21304,85 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let from_val = match range_arg(eval_single::<W, S>(from, value.clone(), optional)) {
-        Ok(n) => n,
-        Err(e) => return e.into(),
-    };
+    // Every bound is a generator argument, and jq nests them leftmost-outermost
+    // -- `range` is a jq-level `def range($from; $upto; $by)` with all three
+    // `$`-bound, unlike the C builtins that nest rightmost-outermost.
+    // Live-verified against jq 1.7.1:
+    //
+    //   [range((1,2))]             => [0,0,1]
+    //   [range((0,1);(2,3))]       => [0,1,0,1,2,1,1,2]
+    //   [range(0;6;(2,3))]         => [0,2,4,0,3]
+    //   [range((0,1);(2,3);(1,2))] => [0,1,0,0,1,2,0,2,1,1,1,2,1]
+    //
+    // Before this every one of those reported "Range bounds must be numeric",
+    // because `range_arg` matched the whole `QueryResult` and sent
+    // `Many`/`ManyOwned` to its catch-all (#1279).
+    let mut out: Vec<OwnedValue> = Vec::new();
 
-    let to_val = if let Some(to_expr) = to {
-        match range_arg(eval_single::<W, S>(to_expr, value.clone(), optional)) {
-            Ok(n) => n,
-            Err(e) => return e.into(),
-        }
-    } else {
-        // range(n) means range(0; n)
-        return match from_val {
-            RangeNum::Int(to) => eval_range_values::<W>(0, to, 1),
-            RangeNum::Float(to) => eval_range_values_f64::<W>(0.0, to, 1.0),
+    // A bound that is not numeric aborts the remaining loops but keeps the
+    // outputs already produced -- `jq -cn 'range((1,"x"))'` prints `0` and
+    // then raises. Same "abort, keep the prefix" rule `fanout_arg` applies.
+    macro_rules! bound {
+        ($v:expr) => {
+            match range_num($v) {
+                Ok(n) => n,
+                Err(e) => return partial(out, Control::Error(e)),
+            }
         };
-    };
+    }
 
-    let step_val = if let Some(step_expr) = step {
-        match range_arg(eval_single::<W, S>(step_expr, value, optional)) {
-            Ok(n) => n,
-            Err(e) => return e.into(),
-        }
-    } else {
-        RangeNum::Int(1)
-    };
+    let (from_vals, from_ctrl) = stream_outputs(eval_single::<W, S>(from, value.clone(), optional));
+    for from_owned in &from_vals {
+        let from_val = bound!(from_owned);
 
-    match (from_val, to_val, step_val) {
-        (RangeNum::Int(from), RangeNum::Int(to), RangeNum::Int(step)) => {
-            eval_range_values::<W>(from, to, step)
+        let Some(to_expr) = to else {
+            // range(n) means range(0; n)
+            let one = match from_val {
+                RangeNum::Int(to) => eval_range_values::<W>(0, to, 1),
+                RangeNum::Float(to) => eval_range_values_f64::<W>(0.0, to, 1.0),
+            };
+            if let Some(control) = push_owned_values(one, &mut out) {
+                return partial(out, control);
+            }
+            continue;
+        };
+
+        let (to_vals, to_ctrl) =
+            stream_outputs(eval_single::<W, S>(to_expr, value.clone(), optional));
+        for to_owned in &to_vals {
+            let to_val = bound!(to_owned);
+
+            // The absent-`step` case is one implicit `1`, so it runs the same
+            // innermost loop once rather than needing a branch of its own.
+            let (step_vals, step_ctrl) = match step {
+                Some(step_expr) => {
+                    stream_outputs(eval_single::<W, S>(step_expr, value.clone(), optional))
+                }
+                None => (vec![OwnedValue::Int(1)], None),
+            };
+            for step_owned in &step_vals {
+                let step_val = bound!(step_owned);
+                let one = match (from_val, to_val, step_val) {
+                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                        eval_range_values::<W>(f, t, st)
+                    }
+                    (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
+                };
+                if let Some(control) = push_owned_values(one, &mut out) {
+                    return partial(out, control);
+                }
+            }
+            if let Some(control) = step_ctrl {
+                return partial(out, control);
+            }
         }
-        (from, to, step) => eval_range_values_f64::<W>(from.as_f64(), to.as_f64(), step.as_f64()),
+        if let Some(control) = to_ctrl {
+            return partial(out, control);
+        }
+    }
+    match from_ctrl {
+        Some(control) => partial(out, control),
+        None => owned_vec_to_result(out),
     }
 }
 
