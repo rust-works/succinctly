@@ -17874,11 +17874,11 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
 
 /// #1550: #1542's drop check only ever inspected `raw_inputs.last()` -- the
 /// *physically* last file on the command line. Real jq's `-s` reader treats
-/// every file as one continuous byte stream, so a truncated trailing record
-/// left behind in an earlier file, followed by one or more empty files,
-/// still loses jq's EOF position; the check has to walk back past those
-/// empty files to find it. Every expectation here is jq 1.7.1's own live
-/// output.
+/// every file as one continuous byte stream, so a truncated record's own
+/// opening RS byte and its closing (or disambiguating) bytes can live in
+/// different files; the check has to reassemble the tail across the file
+/// boundary, not just trust the last file's own isolated content. Every
+/// expectation here is jq 1.7.1's own live output.
 #[test]
 fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> {
     // Truncated record in the first file, one empty trailing file -- the
@@ -17912,6 +17912,64 @@ fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> 
         stderr.contains(&format!("(at {}:0): x", paths[2])),
         "{stderr}"
     );
+
+    // A record's opening RS byte and its closing bytes split across two
+    // files, with no empty file involved at all: the second file has no RS
+    // byte of its own, but it's the record's own closing continuation, not
+    // abandoned text -- resolves normally at the *second* file's own EOF,
+    // not `<unknown>`. (`/code-review` on the first version of this fix
+    // caught this: checking the non-empty last file in isolation, ignoring
+    // what came before it, misclassified this as abandoned.)
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e{\"a\":1", "}\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "{stderr}"
+    );
+
+    // Same spanning-and-closing record, but with a further empty file after
+    // the closing continuation -- resolves at the truly-last (empty) file's
+    // EOF, per #1520's rule, since the record itself is complete once
+    // reassembled across the first two files.
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e{\"a\":1", "}\n", ""],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[2])),
+        "{stderr}"
+    );
+
+    // A bare number with nothing after it in its own file is ambiguous on
+    // its own (#1542) -- but a disambiguating trailing byte in the *next*
+    // file resolves it, same as if that byte had been in the same file.
+    // (Also caught by review: skipping the next file because it's
+    // "non-empty but whitespace-only" throws away exactly the byte that
+    // disambiguates the number.)
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["--seq", "-c", "-s", r#"error("x")"#], &["\x1e5", " "])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[1])),
+        "{stderr}"
+    );
+
+    // The `input_line_number`/`inputs`-consuming path (`ErrorAt::Live`) must
+    // agree with the plain `error(...)`-only path (`ErrorAt::Fixed`) above
+    // for this same cross-file spanning shape, not just for #1542's simpler
+    // single-source case (both paths read the same placeholder through
+    // different accessors -- #1542 already found one fixed without the
+    // other).
+    let (_, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"input_line_number, error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1", ""],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
 
     Ok(())
 }
