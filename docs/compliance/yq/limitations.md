@@ -344,6 +344,36 @@ $ printf 'a: 1\n' | succinctly yq -o=json '"\(.a,2)"'   # "1" — matches
 `succinctly yq` keeps its pre-#1403 single-value-taking behavior (`eval_string_interpolation`'s
 own doc comment has the exact byte-for-byte reasoning); only jq mode became a genuine generator.
 
+### Generator-argument fan-out — per-builtin, because real yq is not uniform
+
+[#1279](https://github.com/rust-works/succinctly/issues/1279) made jq mode emit one result per
+output of a builtin's generator argument, matching jq's own `f(x)` == `x as $b | body`
+desugaring. Real yq does **not** do this uniformly, so the gate is per-builtin rather than
+per-mode-wholesale — all rows live-verified against yq v4.53.3:
+
+| real yq | fans out? | `succinctly yq` |
+|---|---|---|
+| `contains` (scalars, arrays, objects) | **yes** — `[.x \| contains(("a","zz"))]` on `abc` is `[true,false]` | fans out; this *closed* a pre-existing divergence |
+| `has`, `test/1`, `test/2`, `match`, `capture`, `sub/2`, `sub/3`, `split`, `tz` | no — first output only | gated off (`ArgFanout::yq_native`) |
+| `setpath`, `delpaths` | **error** — `SETPATH: expected single path but found 2 results instead` | still errors (`ArgFanout::RejectMany`); wording differs, see below |
+| `flatten(n)` | literal depth only — `bad expression, please check expression syntax` | gated off |
+| `getpath`, `range`, `nth`, `limit`, `combinations`, `paths`, `ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `index`, `rindex`, `indices`, `inside`, `splits`, `scan`, `gsub`, `strftime`, `strptime`, `bsearch`, `pow` | **lexer-rejected — the builtin does not exist** | fans out; unopposed extension |
+
+`grep 'ArgFanout::yq_native' src/jq/eval.rs` is the audit for the gated set — the predicate is
+named rather than inlined precisely so that stays a grep (CLAUDE.md's #106 lesson).
+
+Two residues:
+
+- **`setpath`/`delpaths` error wording.** Real yq says `SETPATH: expected single path but found
+  2 results instead` (and `...single value on RHS but found 2`, and `DELPATHS: expected single
+  value but found 2`); succinctly says `expected a single result but found 2`. The *outcome* —
+  an error rather than a fan-out or a silent truncation — is what #1279 preserved; matching the
+  per-slot wording is unstarted.
+- **The halt-prefix rule has no yq oracle at all.** Real yq has no `halt_error` (lexer-rejected)
+  and never emits a prefix before an error, so #1277's "emit the outputs the prefix earned, then
+  fire the trailing control" is unobservable through yq's own CLI. Applying it uniformly in both
+  modes is therefore unopposed rather than a divergence.
+
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't

@@ -369,33 +369,31 @@ the one sentence left in `eval_object_construction`, because reaching jq's answe
 means generating a stream, not renaming an error. The sentence stays succinctly's until
 #354 is built.
 
-`sub`/`gsub`'s replacement filter emitting 2+ outputs for one match remains a genuine,
-narrower divergence — [#840](https://github.com/rust-works/succinctly/issues/840). jq
-forks the whole `sub`/`gsub` call across every combination the multi-valued matches
-produce:
+`sub`/`gsub`'s replacement filter emitting 2+ outputs for one match is **no longer a
+divergence** — [#840](https://github.com/rust-works/succinctly/issues/840) was closed by
+#1279's generator-argument fan-out. jq forks the whole `sub`/`gsub` call, one whole-string
+output per replacement value, and succinctly now does the same:
 
-| Filter                               | Input           | jq                                    | succinctly                     |
-|--------------------------------------|-----------------|---------------------------------------|--------------------------------|
-| `sub("(?<x>[aeiou])"; (.x, .x+"!"))` | `"hello world"` | `"hello world"` then `"he!llo world"` | `"hello world"` (first output) |
+| Filter                               | Input           | jq and succinctly                     |
+|--------------------------------------|-----------------|---------------------------------------|
+| `sub("(?<x>[aeiou])"; (.x, .x+"!"))` | `"hello world"` | `"hello world"` then `"he!llo world"` |
 
-This is a real, if partial, jq feature (confirmed empirically:
-`gsub("(?<x>[aeiou])"; (.x, .x+"!"))` — three vowel matches, not just one — still only
-forks into 2 outputs total, applying the *n*-th replacement candidate uniformly to every
-match rather than a 2³ cartesian product). Succinctly's current stopgap
-(`eval_owned_input` + "take the first output", added same-day as #826 itself, in
-`src/jq/eval.rs`'s `eval_sub_replacement`) reaches jq's *first* output but not the rest.
-Real-world replacement filters are overwhelmingly single-output (the shape #826 fixed),
-so this is left as a deliberate, documented divergence rather than chased for a
-rarely-hit shape whose full fix means re-deriving jq's `builtin.jq` `reduce` structure
-verbatim.
+The fork is a **transpose**, not a cartesian product: `gsub("(?<x>[aeiou])"; (.x, .x+"!"))`
+on a three-vowel input still gives 2 outputs, not 2³, because row *k* takes each match's
+*k*-th replacement value. Uneven lists are padded by *absence* rather than `null` — a match
+with no *k*-th value contributes nothing to row *k*, dropping its own preceding gap along
+with its text, so `"a-b" | [gsub("(?<c>[ab])"; if .c=="a" then ("1","2") else "9" end)]` is
+`["1-9","2"]` and row 1 is `"2"`, not `"2-"`. `stitch_replacement_rows` in
+`src/jq/eval.rs` implements this, and non-global `sub` reaches it as the one-match case of
+the same transpose.
 
 #840 also covers a *zero*-output replacement filter (`sub("a"; empty)`), which turned out
 **not** to need this treatment: re-deriving jq's own `reduce`-based definition (and
 verifying empirically, jq 1.7.1) showed a simple, fully portable rule — if *every* match
 in the call has an empty replacement, the whole input is returned unchanged; otherwise
 each empty match drops its own text *and* its own immediately-preceding gap, while every
-non-empty match is processed normally. `eval_sub_replacement`,
-`stitch_replacements_evaluated`, and `builtin_sub_with_flags` implement this rule
+non-empty match is processed normally. `eval_sub_replacement` and
+`stitch_replacement_rows` implement this rule
 directly rather than erroring — see those functions' doc comments in `src/jq/eval.rs` for
 the mechanism.
 
