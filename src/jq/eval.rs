@@ -34300,7 +34300,11 @@ mod tests {
             // exercises `each_limit` at all: `Array` isn't itself a lazy arm,
             // so `eval_each` falls back to `eval_single` for the whole
             // expression instead of reaching the `Expr::Limit` arm).
-            (b"[1,2,3]", ".[0]?"),
+            // A *constant* key/bound (`.[0]?`) never reaches `IndexExpr`/
+            // `SliceExpr` at all -- the parser folds it to a static
+            // `Expr::Index`/`Expr::Slice` (#1326); only a genuinely computed
+            // key (`.[1+0]?`) builds the `IndexExpr` this arm targets.
+            (b"[1,2,3]", ".[1+0]?"),
             (b"null", "if (true, error(\"x\")) then 1 else 2 end"),
             (b"null", "label $o | (1, break $o)?"),
             (b"{\"a\":1}", ".a as $x | ($x, $x)"),
