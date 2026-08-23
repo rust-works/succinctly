@@ -17872,6 +17872,50 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
     Ok(())
 }
 
+/// #1550: #1542's drop check only ever inspected `raw_inputs.last()` -- the
+/// *physically* last file on the command line. Real jq's `-s` reader treats
+/// every file as one continuous byte stream, so a truncated trailing record
+/// left behind in an earlier file, followed by one or more empty files,
+/// still loses jq's EOF position; the check has to walk back past those
+/// empty files to find it. Every expectation here is jq 1.7.1's own live
+/// output.
+#[test]
+fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> {
+    // Truncated record in the first file, one empty trailing file -- the
+    // exact shape #1550 reported.
+    let (_, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1", ""],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
+
+    // Same, but with two empty trailing files -- the walk-back has to skip
+    // past more than one empty source, not just tolerate a single one.
+    let (_, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n\x1e{\"a\":1", "", ""],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("(at <unknown>): x"), "{stderr}");
+
+    // Control: a genuinely complete trailing record, followed by two empty
+    // files -- must still resolve to the *physically* last file's own EOF
+    // (#1520's rule), not `<unknown>`. The walk-back must not fire when
+    // there is nothing truncated to find.
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", r#"error("x")"#],
+        &["\x1e1\n", "", ""],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[2])),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
