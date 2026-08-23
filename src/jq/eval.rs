@@ -1450,6 +1450,18 @@ enum ArgFanout {
     All,
     /// Only the argument's first output is used; later ones are discarded.
     FirstOnly,
+    /// A multi-output argument is refused outright rather than fanned out or
+    /// truncated.
+    ///
+    /// Real yq's `setpath`/`delpaths` behave this way, unlike its
+    /// `has`/`test`/`sub`, which quietly take the first output -- live-verified
+    /// against the pinned v4.53.3, which answers `SETPATH: expected single
+    /// path but found 2 results instead` (and `...single value on RHS but
+    /// found 2`, and `DELPATHS: expected single value but found 2`).
+    /// succinctly's message wording differs from yq's; that gap predates
+    /// #1279, which only has to keep the *outcome* an error rather than let
+    /// yq mode start fanning out.
+    RejectMany,
 }
 
 impl ArgFanout {
@@ -1499,8 +1511,13 @@ fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
     mut body: impl FnMut(OwnedValue) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
     let (mut args, trailing) = stream_outputs(arg);
-    if fanout == ArgFanout::FirstOnly {
-        args.truncate(1);
+    match fanout {
+        ArgFanout::All => {}
+        ArgFanout::FirstOnly => args.truncate(1),
+        ArgFanout::RejectMany if args.len() > 1 => {
+            return QueryResult::Error(EvalError::single_argument_result_required(args.len()));
+        }
+        ArgFanout::RejectMany => {}
     }
 
     // Allocation-identical fast path for the single-output case, which is
@@ -1519,6 +1536,82 @@ fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
         }
     }
     match trailing {
+        Some(control) => partial(out, control),
+        None => owned_vec_to_result(out),
+    }
+}
+
+/// Two-argument fan-out: `outer`'s loop varies slowest, and `inner` is
+/// **re-evaluated once per `outer` value**, varying fastest.
+///
+/// The re-evaluation is jq's semantics, not an optimization gap: `f(a; b)`
+/// desugars to `b as $b | a as $a | body` (or the mirror image -- see below),
+/// and the inner generator runs inside the outer binding's body. Confirmed
+/// live with `debug`: `"aAbB" | [match((debug("a"),debug("b")); ("","i"))]`
+/// prints a,b,a,b -- twice, not once.
+///
+/// **Which argument is outer is per-builtin and must be probed.** jq has two
+/// rules and they disagree: a C builtin nests *rightmost*-outermost
+/// (`setpath`, `test`/`match`/`capture`, `pow`), while a jq-level
+/// `def f($a; $b)` nests *leftmost*-outermost (`range`, `scan`). Passing the
+/// arguments in the wrong order produces the right number of outputs in the
+/// wrong sequence, which no count-based test catches -- so every caller cites
+/// its own oracle probe.
+///
+/// Escape ordering mirrors [`fanout_arg`], one level deeper: the inner
+/// generator's own deferred control fires once its loop is exhausted and then
+/// unwinds the *outer* loop too rather than resuming it, and the outer's fires
+/// only after every inner loop has completed. [`build_object_entries`] (#354)
+/// documents the same two rules for key/value nesting.
+///
+/// No 1x1 fast path, deliberately: every caller already allocates an owned
+/// pattern or path per combination, so two one-element `Vec`s are noise next
+/// to that -- unlike [`fanout_arg`], whose fast path exists to preserve a
+/// borrowed cursor result.
+fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    outer: &Expr,
+    inner: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    fanout: ArgFanout,
+    mut body: impl FnMut(OwnedValue, OwnedValue) -> QueryResult<'a, W>,
+) -> QueryResult<'a, W> {
+    let (mut outers, outer_trailing) =
+        stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
+    match fanout {
+        ArgFanout::All => {}
+        ArgFanout::FirstOnly => outers.truncate(1),
+        ArgFanout::RejectMany if outers.len() > 1 => {
+            return QueryResult::Error(EvalError::single_argument_result_required(outers.len()));
+        }
+        ArgFanout::RejectMany => {}
+    }
+
+    let mut out: Vec<OwnedValue> = Vec::new();
+    for o in outers {
+        let (mut inners, inner_trailing) =
+            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+        match fanout {
+            ArgFanout::All => {}
+            ArgFanout::FirstOnly => inners.truncate(1),
+            ArgFanout::RejectMany if inners.len() > 1 => {
+                return QueryResult::Error(EvalError::single_argument_result_required(
+                    inners.len(),
+                ));
+            }
+            ArgFanout::RejectMany => {}
+        }
+
+        for i in inners {
+            if let Some(control) = push_owned_values(body(o.clone(), i), &mut out) {
+                return partial(out, control);
+            }
+        }
+        if let Some(control) = inner_trailing {
+            return partial(out, control);
+        }
+    }
+    match outer_trailing {
         Some(control) => partial(out, control),
         None => owned_vec_to_result(out),
     }
@@ -24503,52 +24596,54 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate path expression
-    let path_result = eval_single::<W, S>(path_expr, value.clone(), optional);
-    let path_owned = match path_result {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::Owned(v) => v,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // A suppressed sub-result (e.g. `setpath((.a)?; 1)` on a value `.a`
-        // can't index) propagates as a suppressed whole, not `null`/an error.
-        QueryResult::None => return QueryResult::None,
-        // A halt must propagate, not be misreported as "path must be an
-        // array" (#791) — checked ahead of the generic wildcard below the
-        // same way `eval_index_expr` and friends already do.
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::path_must_be_array()),
-    };
-
-    let path = match path_owned {
-        OwnedValue::Array(p) => p,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::path_must_be_array()),
-    };
-
-    // Evaluate value expression
-    let new_val = match eval_single::<W, S>(val_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::Owned(v) => v,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // Same reasoning as the path result above: `setpath(["a"]; error)?`
-        // suppresses the whole call rather than setting `"a"` to `null` (#367).
-        QueryResult::None => return QueryResult::None,
-        // A halt must propagate, not be silently written as `null` (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-        _ => OwnedValue::Null,
-    };
-
-    let owned = to_owned(&value);
-    match set_value_at_path(owned, &path, new_val) {
-        Ok(result) => QueryResult::Owned(result),
-        // An optional context swallows the refusal, as it does for every other
-        // builtin here.
-        Err(_) if optional => QueryResult::None,
-        Err(e) => e.into(),
-    }
+    // The VALUE is the outer loop and the PATH the inner one -- the opposite
+    // of `sub(re; str)` at the same arity, and the reason #1279's audit
+    // insisted every multi-generator order be probed rather than inferred.
+    // `setpath` is a C builtin, and jq nests those rightmost-outermost.
+    // Live-verified against jq 1.7.1:
+    //
+    //   {} | [setpath((["x"],["y"]); (1,2))]
+    //     => [{"x":1},{"y":1},{"x":2},{"y":2}]
+    //
+    // and confirmed by side effect that the value is evaluated once and the
+    // path re-evaluated per value, not the reverse. That is a change of
+    // *evaluation* order from the code this replaces, which resolved the path
+    // first -- observable through `debug`/`stderr`.
+    //
+    // The `_ => OwnedValue::Null` arm this deletes was the worst bug the
+    // Stage 0 oracle capture found: a multi-output value was silently
+    // *written as null* rather than truncated
+    // (`{} | [setpath(["a"]; (1,2))]` gave `[{"a":null}]`).
+    fanout_two_args::<W, S>(
+        val_expr,
+        path_expr,
+        value.clone(),
+        optional,
+        // Real yq refuses a multi-output path or value outright rather than
+        // taking its first, unlike its `has`/`test`/`sub` -- see
+        // `ArgFanout::RejectMany`.
+        if S::TAG == EvalTag::Yq {
+            ArgFanout::RejectMany
+        } else {
+            ArgFanout::All
+        },
+        |new_val, path_owned| {
+            let OwnedValue::Array(path) = path_owned else {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(EvalError::path_must_be_array())
+                };
+            };
+            match set_value_at_path(to_owned(&value), &path, new_val) {
+                Ok(result) => QueryResult::Owned(result),
+                // An optional context swallows the refusal, as it does for
+                // every other builtin here.
+                Err(_) if optional => QueryResult::None,
+                Err(e) => e.into(),
+            }
+        },
+    )
 }
 
 /// Delete every path in `paths` from `value`, the way jq's `delpaths_sorted`
@@ -28159,32 +28254,51 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Get n. `result_to_owned_full`, not `result_to_owned` (#1408): a
-    // zero-output `n` (e.g. `combinations(empty)`) must not hard-error --
-    // but unlike a plain `x as $x | ...` zero-fanout ("propagate
-    // QueryResult::None"), `n` here feeds an internal array constructor
-    // (real jq's own model is roughly `[range(n)|$dot] | combinations`),
-    // so a zero-output `n` desugars the same way `n=0` already does below
-    // (zero fan-out arrays either way) -- `Owned([])`, not `None`.
-    let n = match result_to_owned_full(eval_single::<W, S>(n_expr, value.clone(), optional)) {
-        Ok(None) => return QueryResult::Owned(OwnedValue::Array(Vec::new())),
-        Ok(Some((OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _), _)))
-            if i >= 0 =>
-        {
-            i as usize
-        }
-        Ok(Some((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _)))
-            if optional =>
-        {
-            return QueryResult::None
-        }
-        Ok(Some((OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _), _))) => {
-            return QueryResult::Error(EvalError::new("combinations(n): n must be non-negative"))
-        }
-        Ok(Some(_)) if optional => return QueryResult::None,
-        Ok(Some(_)) => return QueryResult::Error(EvalError::type_error("number", "n")),
-        Err(e) => return e.into(),
-    };
+    // `combinations(n)` is the one builtin in this family that must NOT fan
+    // out (#1279). jq defines it as
+    //
+    //     def combinations(n): . as $dot | [range(n)] | map($dot) | combinations;
+    //
+    // and `n` is *not* `$`-bound, so `[range(n)]` -- an array construction --
+    // collects every output of `range(n)` into a single list. A multi-output
+    // `n` therefore produces one combination group whose arity is the sum of
+    // the individual ranges' lengths, not one group per output:
+    //
+    //     [1,2] | [combinations((1,2))] | length   => 8   (== combinations(3))
+    //                                         NOT   6   (== 2^1 + 2^2)
+    //     [1,2] | [combinations((0,1))] | length   => 2   (== combinations(1))
+    //            [range((1,2))]                    => [0,0,1]  <- length 3
+    //
+    // and a zero-output `n` gives arity 0, which is one empty combination:
+    // `[1,2] | [combinations(empty)]` is `[[]]`, not no output at all.
+    let (n_values, trailing) = stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
+
+    // Array construction drops its prefix when its generator escapes, so a
+    // trailing break/error aborts the whole call with no output -- verified
+    // live: `[1,2] | label $out | [combinations((1, break $out))]` prints
+    // nothing in jq. That is why this fires *before* the arity is used,
+    // unlike `fanout_arg`'s "run the loop, then escape".
+    if let Some(control) = trailing {
+        return partial(Vec::new(), control);
+    }
+
+    // The arity *is* `[range(n)] | length`, so this reuses `range_num`, the
+    // very classifier `eval_range` uses. That also inherits jq's own answers
+    // for the awkward inputs, all of which used to diverge: a non-numeric `n`
+    // reports "Range bounds must be numeric" (raised by the `range` inside
+    // jq's definition, not by `combinations` itself); `range(-1)` is empty, so
+    // `combinations(-1)` is `[[]]` rather than an error; and `range(1.5)` has
+    // two outputs, so `combinations(1.5)` is `combinations(2)`.
+    let mut n = 0usize;
+    for n_value in &n_values {
+        n += match range_num(n_value) {
+            Ok(RangeNum::Int(i)) => i.max(0) as usize,
+            Ok(RangeNum::Float(f)) if f > 0.0 => f.ceil() as usize,
+            Ok(RangeNum::Float(_)) => 0,
+            Err(_) if optional => return QueryResult::None,
+            Err(e) => return QueryResult::Error(e),
+        };
+    }
 
     // Input must be an array
     let base_array = match &value {
@@ -28742,33 +28856,39 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate paths expression
-    let paths_result = eval_single::<W, S>(paths_expr, value.clone(), optional);
-    let paths_owned = match paths_result {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::Owned(v) => v,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        // A halt must propagate, not be misreported as "paths must be an
-        // array" (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-        // Same reasoning for a bare, unresolved `break` (#867 follow-up):
-        // must keep unwinding, not be misreported as the same array-type
-        // error. Deliberately asymmetric with `Halt` above, though:
-        // `Partial(_, Control::Break(_))` (paths_expr already produced a
-        // value before breaking) stays on the wildcard arm below, since
-        // real jq only ever demands paths_expr's *first* output here and
-        // never reaches a later comma branch at all — confirmed via oracle,
-        // `delpaths(1, break $out)` in real jq 1.7.1 raises the same "Paths
-        // must be specified as an array" error this wildcard already
-        // produces, it never even reaches the break.
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        _ => return QueryResult::Error(EvalError::paths_must_be_array()),
-    };
+    // One deletion per argument output (#1279): live-verified against jq
+    // 1.7.1, `{"a":1,"b":2} | [delpaths(([["a"]],[["b"]]))]` is
+    // `[{"b":2},{"a":1}]`. The `_ =>` arm this replaces swallowed a
+    // multi-output argument into "Paths must be specified as an array" --
+    // the argument was multi-valued, not the wrong shape.
+    //
+    // `delpaths(1, break $out)` still raises that same array-shape error
+    // rather than unwinding to the label, and for the reason the old comment
+    // gave: the `1` output fails first, and a body failure outranks a
+    // trailing control that has not been reached yet.
+    fanout_arg(
+        eval_single::<W, S>(paths_expr, value.clone(), optional),
+        // Real yq refuses a multi-output `delpaths` argument outright rather
+        // than taking its first -- see `ArgFanout::RejectMany`.
+        if S::TAG == EvalTag::Yq {
+            ArgFanout::RejectMany
+        } else {
+            ArgFanout::All
+        },
+        |paths_owned| delpaths_one::<W, S>(&value, paths_owned, optional),
+    )
+}
 
-    let mut paths = match paths_owned {
-        OwnedValue::Array(p) => p,
-        _ => return QueryResult::Error(EvalError::paths_must_be_array()),
+/// `delpaths`'s deletion for one already-resolved path list — the body of
+/// [`builtin_delpaths`], run once per output of its argument generator
+/// (#1279).
+fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    paths_owned: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let OwnedValue::Array(mut paths) = paths_owned else {
+        return QueryResult::Error(EvalError::paths_must_be_array());
     };
 
     // Every entry must itself be an array before any deletion runs — jq
@@ -28885,9 +29005,9 @@ fn builtin_delpaths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // array, so only the first entry needs checking: `delpaths([[],[0]])` and
     // `delpaths([[0],[]])` are both `null`.
     let result = match paths.first() {
-        None => Ok(to_owned(&value)),
+        None => Ok(to_owned(value)),
         Some([]) => Ok(OwnedValue::Null),
-        Some(_) => delete_paths_sorted(to_owned(&value), &paths, 0),
+        Some(_) => delete_paths_sorted(to_owned(value), &paths, 0),
     };
     match result {
         Ok(v) => QueryResult::Owned(v),

@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Generator-argument fan-out
 
-**Status: Stages 0-6 merged; Stages 7-9 open.** This document is the
+**Status: Stages 0-7 merged; Stages 8-9 open.** This document is the
 deliverable for [#1279](https://github.com/rust-works/succinctly/issues/1279), whose tier
 review (2026-08-20) classified it Tier 3 — "changes evaluation *shape* rather than fixing
 a local mistake … wants a design doc first". It also scopes
@@ -21,7 +21,7 @@ generator-argument model resolves more than one of them". It does: see
 | 4     | `resolve_node`'s `GetPath` arm (path context)                     | ✅ merged |
 | 5     | `limit`/`nth`, value **and** path contexts                        | ✅ merged |
 | 6     | `range` (1-, 2- and 3-arg)                                        | ✅ merged |
-| 7     | `setpath`, `delpaths`, `combinations`                             | open   |
+| 7     | `setpath`, `delpaths`, `combinations`; `fanout_two_args`          | ✅ merged |
 | 8     | Regex pattern × flags                                             | open   |
 | 9     | `sub`/`gsub` multi-output replacement                             | open   |
 

@@ -563,6 +563,21 @@ impl EvalError {
         Self::new("Paths must be specified as an array")
     }
 
+    /// `expected a single result but found <n>`.
+    ///
+    /// yq mode's refusal of a multi-output `setpath`/`delpaths` argument
+    /// (#1279). Real yq refuses these too, unlike its `has`/`test`/`sub`,
+    /// which quietly take the argument's first output — live-verified against
+    /// the pinned v4.53.3, which answers `SETPATH: expected single path but
+    /// found 2 results instead`. succinctly's wording is its own; matching
+    /// yq's exactly needs the per-slot spelling yq uses (`single path` vs
+    /// `single value on RHS`) and is tracked separately. What matters here is
+    /// that yq mode keeps *erroring* rather than starting to fan out or
+    /// silently truncate.
+    pub fn single_argument_result_required(found: usize) -> Self {
+        Self::new(format!("expected a single result but found {found}"))
+    }
+
     /// `Path must be specified as array, not <type>`.
     ///
     /// `delpaths(paths)` raises this for one entry of `paths` that is not
