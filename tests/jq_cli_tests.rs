@@ -19474,6 +19474,76 @@ fn test_owned_pipe_stage_ahead_of_comma_stays_lazy() -> Result<()> {
     Ok(())
 }
 
+/// Code review of #1461: `eval_each_pipe_generic`'s own doc comment justifies
+/// recursing on the *whole* remaining-pipe slice (rather than one stage at a
+/// time) specifically to preserve cursor threading through an arbitrary-
+/// length tail -- the exact property a narrower attempt lost (#1503 review).
+/// The only test the PR itself added for the new mechanism
+/// (`first(.[] | stderr)`) is a 2-stage tail, so this pins the property the
+/// doc comment claims for a genuine 3-stage one: `.[]` (`ManyCursor`) into
+/// `select` into a cursor-only builtin (`line`, a succinctly extension with
+/// no jq equivalent, so this checks internal consistency against the
+/// non-`first` form rather than jq).
+#[test]
+fn test_first_over_manycursor_preserves_cursor_through_three_stage_tail_1461() -> Result<()> {
+    let input = "[\n  1,\n  2,\n  3\n]";
+
+    // Control: the same 3-stage tail without `first` reaches elements 2 and
+    // 3 (lines 3 and 4) -- confirms the input/query shape actually exercises
+    // `select` filtering before `line` runs.
+    let (stdout, _, code) = run_jq_full(&["-c", ".[] | select(.>1) | line"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "3\n4\n");
+
+    // `first` must stop at the first passing element (`2`, on line 3) and
+    // its cursor must survive the two further stages (`select`, `line`)
+    // undamaged -- a lost cursor would report `0` (no position), not `3`.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "first(.[] | select(.>1) | line)"], Some(input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "3\n");
+
+    // Same shape, but with the stage 2 (`select`) firing a side effect of
+    // its own once a cursor element reaches it -- confirms the element that
+    // fails `select` (`1`) is visited (as `eval_each_pipe_generic` must, to
+    // even test the predicate) while the element after the accepted one
+    // (`3`) never is, matching jq exactly.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "first(.[] | select(.>1) | (tostring|stderr))"],
+        Some(input),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "\"2\"\n");
+    assert_eq!(stderr, "2", "must not visit element 3 past the first match");
+
+    Ok(())
+}
+
+/// Code review of #1461: the deleted `first_over_comma_owned_generic`
+/// deliberately capped itself at exactly 2 pipe stages, with its own author's
+/// comment admitting the multi-stage case was unverified ("there's no
+/// evidence its own multi-stage threading is free of an analogous
+/// dependency"). The replacement (`eval_each_pipe_generic`'s `Owned` arm,
+/// bridging unconditionally to `eval::eval_each_owned`) lifts that cap --
+/// this pins the shape that would have been rejected before, with a *flat*
+/// (not nested-in-parens) 3- and 4-stage pipe, matching jq exactly.
+#[test]
+fn test_first_over_owned_pipe_beyond_two_stages_matches_jq_1461() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", r#"first(1 | 2 | (3, ("X"|stderr)))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "3\n");
+    assert_eq!(stderr, "", "the discarded 4th comma sibling must not fire");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", r#"first(1 | 2 | 3 | (4, ("X"|stderr)))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "4\n");
+    assert_eq!(stderr, "", "the discarded 5th comma sibling must not fire");
+
+    Ok(())
+}
+
 /// `first((1,2) | input)` -- issue #1461's third reported symptom (a
 /// spurious `jq: error (at <stdin>:0): break`, exit 5) -- already matches jq
 /// exactly by the time #1461's `eval_each_generic` mirror landed, confirmed

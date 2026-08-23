@@ -21484,3 +21484,19 @@ fn test_yq_sub_arity3_pattern_escape_reports_bare_not_prefix_then_raise() -> Res
     assert_eq!(code, 1);
     Ok(())
 }
+
+/// #1461's `eval_each_generic`/`eval_each_pipe_generic` sink lives in
+/// `eval_generic.rs`, shared verbatim between jq and yq -- `tests/jq_cli_tests.rs`
+/// pins the fix there, but nothing pinned yq mode's own path through the same
+/// code. `first`, `.[]`, and `stderr` are all real yq builtins (no
+/// `--jq-extensions` needed), so this exercises the identical shape
+/// (`first(.[] | stderr)`) the jq-side fix closed.
+#[test]
+fn test_yq_first_over_pipe_stops_at_first_element_1461() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("first(.[] | stderr)", "- 1\n- 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert_eq!(stderr, "1", "must not visit the second element");
+    Ok(())
+}
