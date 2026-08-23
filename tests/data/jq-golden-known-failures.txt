@@ -179,10 +179,8 @@
 #   zero-output    #1045's "zero outputs means zero results" contract, extended
 #                  to the ~16 builtins that still report a bare "no value".
 
-indices_index_rindex_arg_fanout            fan-out          indices/index/rindex use only the first pattern output — #1279
 delpaths_arg_fanout                        fan-out          delpaths(ps) errors on a multi-output argument instead of fanning out — #1279
 range_one_arg_fanout                       fan-out          range(n) reports "Range bounds must be numeric" for a generator bound — #1279
-bsearch_arg_fanout                         fan-out          bsearch(t) silently produces NOTHING for a multi-output target — #1279
 pow_atan2_arg_fanout                       fan-out          pow/atan2 error on a generator argument (get_number_from_result, not result_to_owned) — #1279
 combinations_n_collected_into_range        fan-out          combinations(n) must COLLECT n's outputs into one arity, not fan out — #1279
 regex_test_re_arg_fanout                   fan-out          test(re) uses only re's first output — #1279

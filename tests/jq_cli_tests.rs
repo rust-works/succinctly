@@ -12072,26 +12072,26 @@ fn test_halt_error_propagates_halt_from_exit_code_argument() -> Result<()> {
 }
 
 #[test]
-fn test_bsearch_propagates_halt_via_partial_prefix_in_target_argument() -> Result<()> {
-    // `builtin_bsearch`'s `QueryResult::Partial(_, Control::Halt(code))` arm
-    // -- a second, distinct arm from the bare `Halt` case
-    // `test_bsearch_propagates_halt_in_target_argument` above covers --
-    // fires when the target expression produces an output before halting.
+fn test_bsearch_fanout_emits_its_prefix_then_halts_1279() -> Result<()> {
+    // A target expression that produces an output before halting: `bsearch`
+    // runs once for that output, emits its answer, and only then halts.
     //
-    // Note: `builtin_bsearch` evaluates `x_expr` with a single
-    // `eval_single` call, the same pre-existing generator-vs-single-eval gap
-    // noted on `delpaths`/`pow` above: `jq -n '[1,2,3] | bsearch((1,
-    // halt_error(15)))'` prints `0` (bsearch(1) succeeds on the first
-    // output) before halting with exit 15. Checked here against
-    // succinctly's own contract instead: the halt discards the whole call,
-    // producing no stdout. stderr still matches real jq byte-for-byte
-    // though, since `.` at the `halt_error` call is the same either way --
-    // the original `[1,2,3]` input to `bsearch`, untouched by which
-    // semantics evaluate the target.
+    //   $ jq -n '[1,2,3] | bsearch((1, halt_error(15)))'
+    //   [1,2,3]    <- stderr, from halt_error printing its input
+    //   0          <- stdout, bsearch(1) on the first argument output
+    //   exit 15
+    //
+    // This test used to pin an empty stdout, because `builtin_bsearch`
+    // resolved `x_expr` with a single `eval_single` and a dedicated
+    // `Partial(_, Control::Halt(code))` arm that discarded the prefix
+    // (#791). `fanout_arg` goes through `stream_outputs`, which has no such
+    // arm, so the prefix survives (#1277/#1279). stderr was already
+    // byte-identical to jq and stays so: `.` at the `halt_error` call is the
+    // original `[1,2,3]` either way.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", "[1,2,3] | bsearch((1, halt_error(15)))"], None)?;
     assert_eq!(code, 15, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "0\n");
     assert_eq!(stderr, "[1,2,3]\n");
     Ok(())
 }
