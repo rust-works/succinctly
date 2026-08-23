@@ -1579,9 +1579,15 @@ fn get_inputs(
             // DSV input: each row becomes a JSON array of strings
             let parsed = parse_dsv_input(&raw, delimiter);
             // One row per line (approximate for embedded newlines; jq has no
-            // DSV input mode, so there is no oracle to match here).
-            for line in 1..=parsed.len() {
-                locations.push(src, line);
+            // DSV input mode, so there is no oracle to match here). Skipped
+            // under `--slurp` (#1541): the combined array's own location
+            // comes from `slurp_eof_line` above, not from any of these
+            // per-value entries, which `get_inputs` discards wholesale when
+            // it replaces `locations` with `InputLocations::single` below.
+            if !args.slurp {
+                for line in 1..=parsed.len() {
+                    locations.push(src, line);
+                }
             }
             values.extend(parsed);
         } else if args.raw_input {
@@ -1593,7 +1599,10 @@ fn get_inputs(
         } else if args.seq {
             // JSON sequence input (RFC 7464): split on RS, ignore parse failures
             let parsed = parse_json_seq(&raw);
-            locations.extend_from_ends(src, &raw, &json_seq_ends(raw.as_bytes()), parsed.len());
+            // Skipped under `--slurp` (#1541) -- see the DSV branch above.
+            if !args.slurp {
+                locations.extend_from_ends(src, &raw, &json_seq_ends(raw.as_bytes()), parsed.len());
+            }
             values.extend(parsed);
         } else {
             // JSON input: validate first if --validate is set
@@ -1606,33 +1615,41 @@ fn get_inputs(
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
-            // `parse_json_stream` (above) already validated this exact
-            // input successfully via `serde_json`, which is strictly
-            // pickier than `find_json_values`'s own lenient heuristic
-            // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
-            // `find_json_values`'s RFC 8259 plus leading-zero *and*
-            // leading-dot tolerance, #1171) -- so `find_json_values`
-            // should never fail here in practice; unreachable through
-            // this crate's own public CLI surface, not exercised by a
-            // test for that reason (matching this codebase's established
-            // convention for exhaustive-but-dead defensive arms, e.g.
-            // #1064). Surfaced as an internal error rather than silently
-            // reusing a stale/wrong offset list if the two validators
-            // ever do diverge.
-            let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
-                Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
-                Err(offset) => {
-                    return Ok(Err(anyhow::anyhow!(
-                        "internal error: find_json_values failed at byte {offset} \
-                         after parse_json_stream already validated this input"
-                    )));
-                }
-            };
-            locations.extend_from_ends(src, &raw, &ends, parsed.len());
+            // Skipped under `--slurp` (#1541) -- see the DSV branch above.
+            // `find_json_values` exists here only to feed
+            // `locations.extend_from_ends`, so slurp mode skips that scan
+            // entirely rather than running it and discarding the result.
+            if !args.slurp {
+                // `parse_json_stream` (above) already validated this exact
+                // input successfully via `serde_json`, which is strictly
+                // pickier than `find_json_values`'s own lenient heuristic
+                // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
+                // `find_json_values`'s RFC 8259 plus leading-zero *and*
+                // leading-dot tolerance, #1171) -- so `find_json_values`
+                // should never fail here in practice; unreachable through
+                // this crate's own public CLI surface, not exercised by a
+                // test for that reason (matching this codebase's established
+                // convention for exhaustive-but-dead defensive arms, e.g.
+                // #1064). Surfaced as an internal error rather than silently
+                // reusing a stale/wrong offset list if the two validators
+                // ever do diverge.
+                let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
+                    Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
+                    Err(offset) => {
+                        return Ok(Err(anyhow::anyhow!(
+                            "internal error: find_json_values failed at byte {offset} \
+                             after parse_json_stream already validated this input"
+                        )));
+                    }
+                };
+                locations.extend_from_ends(src, &raw, &ends, parsed.len());
+            }
             values.extend(parsed);
         }
 
-        debug_assert_eq!(locations.len(), values.len(), "one location per value");
+        if !args.slurp {
+            debug_assert_eq!(locations.len(), values.len(), "one location per value");
+        }
     }
 
     // Slurp mode: wrap all inputs in an array
