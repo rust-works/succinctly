@@ -3557,6 +3557,49 @@ mod tests {
         }
     }
 
+    /// #757: `JsonCursor` takes `DocumentCursor`'s three `stream_sequence_*`
+    /// defaults, which is what makes `GenericResult::stream_json`/`stream_yaml`'s
+    /// `LazySeq` arms fall back to materializing an `OwnedValue::Array` for JSON
+    /// instead of streaming from cursors.
+    ///
+    /// Both halves are pinned, because they protect different things. The probe
+    /// answering `false` is what keeps the two writers below from ever being
+    /// called; the writers failing *before writing anything* is what makes the
+    /// fallback safe if a future caller ever skips the probe. Without the second
+    /// half, dropping the probe would silently emit a partial value and then
+    /// error, with no way to unwrite it.
+    #[test]
+    fn test_json_cursor_declines_sequence_streaming_757() {
+        let json = br#"[{"a": 1}, {"b": 2}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let elements = root.value().as_array().unwrap();
+        let (first, rest) = elements.uncons_cursor().unwrap();
+        let (second, _) = rest.uncons_cursor().unwrap();
+        let cursors = [first, second];
+
+        assert!(
+            !<JsonCursor<'_, Vec<u64>> as DocumentCursor>::supports_sequence_streaming(),
+            "JsonCursor has no sequence writer; the probe must say so"
+        );
+
+        for indent in [IndentSpec::COMPACT, IndentSpec::spaces(2)] {
+            let mut out = String::new();
+            assert!(
+                JsonCursor::stream_sequence_json(&cursors, &mut out, indent, false).is_err(),
+                "the default must decline, not half-write"
+            );
+            assert!(out.is_empty(), "nothing may reach `out`: {out:?}");
+
+            let mut out = String::new();
+            assert!(
+                JsonCursor::stream_sequence_yaml(&cursors, &mut out, indent, false).is_err(),
+                "the default must decline, not half-write"
+            );
+            assert!(out.is_empty(), "nothing may reach `out`: {out:?}");
+        }
+    }
+
     // === text_range tests for containers (issue #137) ===
 
     #[test]
