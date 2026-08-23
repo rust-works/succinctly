@@ -2935,6 +2935,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// what each caller does with the answer -- removes that drift risk
 /// categorically instead of relying on a differential test to catch the
 /// next divergence.
+#[derive(Debug)]
 enum LimitN {
     /// Unlimited passthrough: run the caller's own `expr`/`resolve_node`
     /// unbounded.
@@ -29234,11 +29235,14 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate n. Same "no limit at all" branch as `eval_limit` for a
-    // negative count/null/bool (#983) -- this function is parser-
-    // unreachable today (see #981's investigation), but kept consistent
-    // so a future routing change can't silently reintroduce the bug this
-    // issue fixed in the live implementation.
+    // Evaluate n via the same `classify_limit_n` every other `limit` context
+    // uses (#1462, #1313) -- this function is parser-unreachable today (see
+    // #981's investigation), but a hand-rolled copy here would be a fourth,
+    // silently-diverging classification exactly like the drift #1313 already
+    // had to fix once (an earlier version of this arm truncated a positive
+    // non-integer float instead of erroring, and wrapped a negative
+    // document-sourced `NumberLiteral` into a huge `usize` instead of
+    // treating it as unlimited).
     // `n` is the OUTER loop, matching `eval_limit` (#1279).
     fanout_arg::<W, S, _>(
         n_expr,
@@ -29247,22 +29251,12 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `limit` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            // A document-sourced number arrives here as a `NumberLiteral` (it used to
-            // arrive as a borrowed `QueryResult::One` and take its own arm, with the
-            // same `as_i64().unwrap_or(0)` coercion).
-            let n = match n_owned {
-                OwnedValue::Int(i) if i >= 0 => i as usize,
-                OwnedValue::Float(f) if f >= 0.0 => f as usize,
-                ref lit @ OwnedValue::NumberLiteral(..) => lit.as_i64().unwrap_or(0) as usize,
-                OwnedValue::Int(_)
-                | OwnedValue::Float(_)
-                | OwnedValue::Null
-                | OwnedValue::Bool(_) => {
+            let n = match classify_limit_n(n_owned) {
+                Ok(LimitN::Unlimited) => {
                     return eval_single::<W, S>(expr, value.clone(), optional);
                 }
-                ref other => {
-                    return QueryResult::Error(EvalError::type_error("number", other.type_name()))
-                }
+                Ok(LimitN::Take(n)) => n,
+                Err(e) => return QueryResult::Error(e),
             };
 
             if n == 0 {
@@ -52984,6 +52978,47 @@ mod tests {
         match builtin_limit::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
             QueryResult::Halt(code) => assert_eq!(code, 9),
             other => panic!("expected Halt(9), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_limit_n_classification_matches_classify_limit_n() {
+        // `builtin_limit` used to hand-roll its own `n` classification
+        // instead of calling `classify_limit_n` (unlike `each_limit`,
+        // `resolve_limit_one_n`, and `limit_with_n`, all migrated to it in
+        // the same change): a positive non-integer float (e.g. `2.9`) was
+        // silently truncated to `Take(2)` instead of erroring.
+        // `builtin_limit` is parser-unreachable today (see
+        // `builtin_limit_propagates_halt_from_expr_argument` above), so this
+        // is exercised directly rather than via the CLI.
+        let n_expr = parse(".n").unwrap();
+        let items_expr = parse(".items[]").unwrap();
+
+        let json_bytes: &[u8] = br#"{"n": 2.9, "items": [1, 2, 3, 4, 5]}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_limit::<Vec<u64>, JqSemantics>(&n_expr, &items_expr, cursor.value(), false) {
+            QueryResult::Error(_) => {}
+            other => panic!("expected a classify_limit_n-style error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_limit_n_treats_a_negative_number_literal_as_unlimited() {
+        // The other half of `builtin_limit`'s old drift from
+        // `classify_limit_n`: a negative document-sourced `NumberLiteral`
+        // (as opposed to a source-level `Expr::Literal` float/int) used to
+        // fall through to the inline match's unconditional `NumberLiteral`
+        // arm, `lit.as_i64().unwrap_or(0) as usize` -- wrapping `-1` into a
+        // huge `Take` count instead of `LimitN::Unlimited`. Exercised
+        // directly against `classify_limit_n` because `builtin_limit`'s own
+        // observable output happens to coincide for both interpretations on
+        // any input short of `usize::MAX` elements, so a `builtin_limit`
+        // level test would not actually distinguish the two.
+        let n = OwnedValue::NumberLiteral(NumberRepr::Int(-1), Box::from("-1"));
+        match classify_limit_n(n) {
+            Ok(LimitN::Unlimited) => {}
+            other => panic!("expected LimitN::Unlimited, got {other:?}"),
         }
     }
 
