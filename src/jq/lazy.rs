@@ -25,6 +25,8 @@ use std::borrow::Cow;
 
 use crate::json::light::{JsonCursor, StandardJson};
 
+use super::document::DistinctKeyCursors;
+
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
 use super::value::{assert_value_tree_depth, infinite_float_preview_text, OwnedValue};
@@ -91,7 +93,20 @@ pub enum JqValue<'a, W = Vec<u64>> {
     /// iterator — not yet decoded into `String`s (#140). `write_json` and
     /// `print_json` stream each key's raw bytes straight from its cursor,
     /// so a bare `keys_unsorted` output never materializes a `Vec<String>`.
-    LazyKeysArray(crate::json::light::JsonFields<'a, W>),
+    ///
+    /// `collapse` is the evaluation mode's duplicate-key rule, carried here
+    /// rather than settled before construction (#1514). #1385 built this
+    /// variant only for objects a `collapsed_fields` probe had already
+    /// declared clean, which meant a whole extra cons-list walk -- with a
+    /// `key_str()` decode per field -- ahead of the walk that writes the
+    /// output. Every consumer below now applies the rule through
+    /// `DistinctKeyCursors` during the walk it was making anyway.
+    LazyKeysArray {
+        /// The object whose keys this array presents.
+        fields: crate::json::light::JsonFields<'a, W>,
+        /// Whether a repeated key collapses onto its first occurrence.
+        collapse: bool,
+    },
 
     /// Lazy array-index range: `keys`/`keys_unsorted` on an array (#684).
     /// `[0, 1, ..., len-1]` is fully determined by `len` alone, so
@@ -274,7 +289,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::String(_) => "string",
             JqValue::Array(_) => "array",
             JqValue::Object(_) => "object",
-            JqValue::LazyKeysArray(_) => "array",
+            JqValue::LazyKeysArray { .. } => "array",
             JqValue::LazyIndexRange(_) => "array",
         }
     }
@@ -361,7 +376,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // No wildcard covers this case: without this arm,
             // `keys_unsorted | length` reaching `JqValue` directly would
             // silently answer `None` instead of the field count.
-            JqValue::LazyKeysArray(fields) => Some((*fields).count()),
+            JqValue::LazyKeysArray { fields, collapse } => {
+                Some(DistinctKeyCursors::new(fields, *collapse).count())
+            }
             // No wildcard covers this case either, for the same reason as
             // `LazyKeysArray` above: without it, `keys_unsorted | length` on
             // an array reaching `JqValue` directly would silently answer
@@ -434,7 +451,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     .map(|(k, v)| (k.clone(), v.materialize_at_depth(depth + 1)))
                     .collect(),
             ),
-            JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(fields),
+            JqValue::LazyKeysArray { fields, collapse } => {
+                lazy_keys_array_to_owned(fields, *collapse)
+            }
             JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(*len),
         }
     }
@@ -469,7 +488,9 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                     .map(|(k, v)| (k, v.into_owned_at_depth(depth + 1)))
                     .collect(),
             ),
-            JqValue::LazyKeysArray(fields) => lazy_keys_array_to_owned(&fields),
+            JqValue::LazyKeysArray { fields, collapse } => {
+                lazy_keys_array_to_owned(&fields, collapse)
+            }
             JqValue::LazyIndexRange(len) => lazy_index_range_to_owned(len),
         }
     }
@@ -585,16 +606,15 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // cursor — already a valid, already-escaped JSON string token —
             // so this never allocates a `String` per key, unlike
             // `JqValue::Object`/`Array` above.
-            JqValue::LazyKeysArray(fields) => {
+            JqValue::LazyKeysArray { fields, collapse } => {
                 out.write_char('[')?;
-                let mut current = *fields;
                 let mut first = true;
-                while let Some((field, rest)) = current.uncons() {
+                for key_cursor in DistinctKeyCursors::new(fields, *collapse) {
                     if !first {
                         out.write_char(',')?;
                     }
                     first = false;
-                    match field.key_cursor().raw_bytes() {
+                    match key_cursor.raw_bytes() {
                         Some(bytes) => {
                             let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                             out.write_str(s)?;
@@ -603,7 +623,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                         // string tokens with a text range, so this is not
                         // expected to be reached.
                         None => {
-                            if let StandardJson::String(k) = field.key() {
+                            if let StandardJson::String(k) = key_cursor.value() {
                                 out.write_char('"')?;
                                 if let Ok(s) = k.as_str() {
                                     write_json_body_jq(out, &s)?;
@@ -614,7 +634,6 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                             }
                         }
                     }
-                    current = rest;
                 }
                 out.write_char(']')
             }
@@ -651,16 +670,15 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
 /// materialized value (`sort_keys`, color output, etc.).
 fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     fields: &crate::json::light::JsonFields<'_, W>,
+    collapse: bool,
 ) -> OwnedValue {
     let mut keys = Vec::new();
-    let mut current = *fields;
-    while let Some((field, rest)) = current.uncons() {
-        if let StandardJson::String(k) = field.key() {
+    for key_cursor in DistinctKeyCursors::new(fields, collapse) {
+        if let StandardJson::String(k) = key_cursor.value() {
             if let Ok(s) = k.as_str() {
                 keys.push(OwnedValue::String(s.into_owned()));
             }
         }
-        current = rest;
     }
     OwnedValue::Array(keys)
 }

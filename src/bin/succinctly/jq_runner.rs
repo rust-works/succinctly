@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
-use succinctly::jq::document::{collapsed_fields, effective_keys, key_hash, KeyHashes};
+use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors, KeyHashes};
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
@@ -2966,28 +2966,20 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // sorted `keys` result must never be routed there (#683) — it
         // materializes and sorts here instead, same as eager `Keys` always
         // did.
-        // #1385: a duplicate key would be emitted twice by the lazy
-        // writer, which streams raw key bytes without a collapse step. Probe
-        // first and stay lazy only when the object is clean -- a repeated
-        // key materializes the collapsed list instead, keeping the fast path
-        // for every ordinary document.
+        // #1385: a duplicate key would be emitted twice by a writer that
+        // streams raw key bytes with no collapse step. #1514: the rule
+        // travels with the value instead of being settled here. Probing
+        // first cost a whole extra cons-list walk, `key_str()`-decoding
+        // every field, ahead of the walk that writes the output -- 96 ns
+        // per key on `wide/10mb`, against an 87 ns/key baseline for the
+        // entire query. `LazyKeysArray`'s consumers apply the rule as they
+        // walk, which is sound because "first occurrence wins" needs no
+        // lookahead.
         GenericResult::LazyKeys {
             fields,
             sorted: false,
             collapse,
-        } if !collapse || collapsed_fields(&fields).is_none() => {
-            vec![JqValue::LazyKeysArray(fields)]
-        }
-        GenericResult::LazyKeys {
-            fields,
-            sorted: false,
-            collapse,
-        } => vec![JqValue::from_owned(OwnedValue::Array(
-            effective_keys(&fields, collapse)
-                .into_iter()
-                .map(OwnedValue::String)
-                .collect(),
-        ))],
+        } => vec![JqValue::LazyKeysArray { fields, collapse }],
         GenericResult::LazyKeys {
             fields,
             sorted: true,
@@ -3633,17 +3625,17 @@ where
         // first. Compact/pretty duplicated as two full loops, matching the
         // `StandardJson::Array`/`StandardJson::Object` arms above rather
         // than branching mid-loop.
-        JqValue::LazyKeysArray(fields) => {
+        JqValue::LazyKeysArray { fields, collapse } => {
             use succinctly::json::light::StandardJson as SJ;
             if fields.is_empty() {
                 out.write_all(b"[]")?;
             } else if compact {
                 out.write_all(b"[")?;
-                for (i, field) in (*fields).enumerate() {
+                for (i, key_cursor) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    if let SJ::String(k) = field.key() {
+                    if let SJ::String(k) = key_cursor.value() {
                         let raw = k.raw_bytes();
                         let content = &raw[1..raw.len().saturating_sub(1)];
                         if !config.ascii_output && !content.contains(&b'\\') {
@@ -3666,13 +3658,13 @@ where
             } else {
                 out.write_all(b"[")?;
                 out.write_all(separator.as_bytes())?;
-                for (i, field) in (*fields).enumerate() {
+                for (i, key_cursor) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    if let SJ::String(k) = field.key() {
+                    if let SJ::String(k) = key_cursor.value() {
                         let raw = k.raw_bytes();
                         let content = &raw[1..raw.len().saturating_sub(1)];
                         if !config.ascii_output && !content.contains(&b'\\') {

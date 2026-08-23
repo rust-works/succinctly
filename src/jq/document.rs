@@ -877,6 +877,94 @@ pub fn collapsed_fields<F: DocumentFields>(
     Some(collapse_repeated(fields.all_fields()))
 }
 
+/// An object's key cursors under the mode's duplicate-key rule, produced
+/// one at a time (#1514).
+///
+/// "First occurrence wins" is an *online* rule -- every key already yielded
+/// was a first occurrence -- so a consumer that only moves forward (the
+/// `keys_unsorted` writers, `map`'s lazy pull, `.[]`) can stream straight
+/// through instead of running the whole-object probe those paths used to
+/// run before producing anything. On a wide object that probe was a second
+/// full cons-list walk, and `uncons` is two BP sibling hops per field.
+///
+/// The [`KeyHashes`] probe rides along with the walk. A repeated hash hands
+/// the object to [`collapsed_fields`], which decides on the keys
+/// themselves:
+///
+/// - `Some` — a real duplicate. The remainder switches to the exact
+///   collapsed list, resuming at the count already yielded, which lines up
+///   because the collapsed list opens with those same first occurrences.
+/// - `None` — a 64-bit hash collision, and the answer covers the whole
+///   object, so the probe retires rather than firing again at the next one.
+///
+/// `collapse` false (yq) carries no probe state at all and is the plain
+/// cons-list walk it always was.
+#[derive(Clone)]
+pub struct DistinctKeyCursors<F: DocumentFields> {
+    /// The fields still to walk.
+    rest: F,
+    /// The object as a whole, for the exact resolution above. A `F` is a
+    /// cursor position, so this is a copy of a couple of machine words.
+    all: F,
+    /// Hashes of the keys yielded so far, while the rule is in force and
+    /// the object is not yet proved clean.
+    seen: Option<KeyHashes>,
+    /// How many cursors have gone out, which is where `collapsed` resumes.
+    yielded: usize,
+    /// The exact collapsed key cursors, once a repeat is confirmed.
+    collapsed: Option<Vec<F::Cursor>>,
+}
+
+impl<F: DocumentFields> DistinctKeyCursors<F> {
+    /// Walk `fields`, collapsing a repeated key onto its first occurrence
+    /// when `collapse`.
+    pub fn new(fields: &F, collapse: bool) -> Self {
+        Self {
+            rest: fields.clone(),
+            all: fields.clone(),
+            seen: collapse.then(KeyHashes::new),
+            yielded: 0,
+            collapsed: None,
+        }
+    }
+}
+
+impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
+    type Item = F::Cursor;
+
+    fn next(&mut self) -> Option<F::Cursor> {
+        if let Some(cursors) = &self.collapsed {
+            let cursor = cursors.get(self.yielded).copied()?;
+            self.yielded += 1;
+            return Some(cursor);
+        }
+        let (field, tail) = self.rest.uncons()?;
+        self.rest = tail;
+        let repeat = self.seen.as_mut().is_some_and(|seen| {
+            field
+                .key_str()
+                .is_some_and(|key| seen.insert(key_hash(key.as_bytes())))
+        });
+        if repeat {
+            match collapsed_fields(&self.all) {
+                Some(fields) => {
+                    let cursors: Vec<F::Cursor> =
+                        fields.into_iter().map(|f| f.key_cursor).collect();
+                    let cursor = cursors.get(self.yielded).copied();
+                    self.collapsed = Some(cursors);
+                    self.seen = None;
+                    let cursor = cursor?;
+                    self.yielded += 1;
+                    return Some(cursor);
+                }
+                None => self.seen = None,
+            }
+        }
+        self.yielded += 1;
+        Some(field.key_cursor)
+    }
+}
+
 /// Collapse fields known to contain at least one repeated key.
 ///
 /// Linear in the field count: the surviving slot for each key is looked up
