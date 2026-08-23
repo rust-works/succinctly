@@ -17204,11 +17204,11 @@ fn test_jq_slurp_zero_value_input_with_inputs_builtin_1309() -> Result<()> {
 
 /// #1520: `--slurp`'s single combined value's `(at ...)` marker names the
 /// *last source on the command line*, at that source's own newline count --
-/// not the last *value*'s location, which `test_jq_slurp_exhaustion_location_
-/// is_unknown_1309`'s companion check above happened not to distinguish
-/// (both its files were non-empty with exactly one newline each, so the two
-/// readings coincide). These cases pin them apart. Every expectation here is
-/// jq 1.7.1's own live output.
+/// not the last *value*'s location, which
+/// `test_jq_slurp_exhaustion_location_is_unknown_1309`'s companion check
+/// above happened not to distinguish (both its files were non-empty with
+/// exactly one newline each, so the two readings coincide). These cases pin
+/// them apart. Every expectation here is jq 1.7.1's own live output.
 #[test]
 fn test_jq_slurp_error_location_is_last_source_eof_1520() -> Result<()> {
     // The last file contributes zero values (empty) -- jq still names *that*

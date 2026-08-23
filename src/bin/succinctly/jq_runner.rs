@@ -1470,8 +1470,21 @@ fn get_inputs(
     // `--slurp`'s single combined value has no content of its own to name a
     // line in -- jq instead names the *last source*'s own newline count at
     // EOF (#1520), computed here from `raw_inputs` while it's still whole,
-    // before either branch below consumes it.
-    let slurp_eof_line = raw_inputs.last().map_or(0, |(_, raw)| newline_count(raw));
+    // before either branch below consumes it, and only when slurping: every
+    // ordinary invocation would otherwise pay this O(n) scan of the last
+    // input for a value neither branch below ever reads. `line_at(bytes,
+    // bytes.len())` is exactly this count: its trailing-lookahead byte is
+    // always out of bounds at `end == bytes.len()`, so it degenerates to a
+    // plain newline count -- the same one-off, single-lookup use its own
+    // doc comment describes, not `LineCounter`'s repeated-increasing-offset
+    // case.
+    let slurp_eof_line = if args.slurp {
+        raw_inputs
+            .last()
+            .map_or(0, |(_, raw)| line_at(raw.as_bytes(), raw.len()))
+    } else {
+        0
+    };
 
     // jq -R -s: the entire input (all files concatenated) becomes a single
     // string; no line splitting and no array wrap.
@@ -1480,9 +1493,10 @@ fn get_inputs(
         for (_, raw) in &raw_inputs {
             combined.push_str(raw);
         }
+        let (src, line) = locations.slurp_eof(slurp_eof_line);
         return Ok(Ok((
             vec![OwnedValue::String(combined)],
-            InputLocations::single(locations.slurp_eof(slurp_eof_line)),
+            InputLocations::single(locations.resolve(src, line)),
         )));
     }
 
@@ -1554,9 +1568,10 @@ fn get_inputs(
 
     // Slurp mode: wrap all inputs in an array
     if args.slurp {
+        let (src, line) = locations.slurp_eof(slurp_eof_line);
         Ok(Ok((
             vec![OwnedValue::Array(values)],
-            InputLocations::single(locations.slurp_eof(slurp_eof_line)),
+            InputLocations::single(locations.resolve(src, line)),
         )))
     } else {
         Ok(Ok((values, locations)))
@@ -1567,20 +1582,12 @@ fn get_inputs(
 ///
 /// Used only as `extend_from_ends`'s ends/values-mismatch fallback -- *not*
 /// what `--slurp` reports at EOF (#1520 found that assumption wrong; see
-/// [`newline_count`] instead, which is what jq's own marker actually counts
-/// there).
+/// `line_at`'s use in the `slurp_eof_line` computation above instead, which
+/// is what jq's own marker actually counts there -- an empty input and one
+/// with content but no trailing newline both report line `0`, where
+/// `content_lines` would report `1` for the latter).
 fn content_lines(raw: &str) -> usize {
     raw.lines().count().max(1)
-}
-
-/// Number of `\n` bytes in `raw` -- what jq's own `(at ...)` marker counts
-/// for `--slurp`'s single combined value (#1520), once every input is
-/// exhausted. Unlike [`content_lines`], an empty input and one with content
-/// but no trailing newline both count as `0` here, matching jq (oracle-
-/// verified: an empty file and a `"1 2"`-with-no-newline file both report
-/// line `0`, where `content_lines` would report `1` for the latter).
-fn newline_count(raw: &str) -> usize {
-    raw.bytes().filter(|&b| b == b'\n').count()
 }
 
 /// Exclusive end offsets of the RS-delimited records in a `--seq` stream.
@@ -1637,17 +1644,20 @@ impl InputLocations {
 
     /// Locations for a single value at an already-resolved location.
     ///
-    /// Always pushes exactly one `per_value` entry, even when `at.line` is
-    /// `None` (an empty/whitespace-only `--slurp`, whose single wrapped-array
-    /// value still has no content line to name). Slurp mode always produces
-    /// exactly one value, so `get_inputs`'s `values`/`locations` invariant
-    /// ("one location per value") must hold here unconditionally -- the
-    /// seeding `.zip()` in `run_jq` silently truncates to the shorter side on
-    /// a mismatch instead of erroring, so a skipped push here previously lost
-    /// the whole slurped document to `input`/`inputs` (debug-build panic on
-    /// the `debug_assert_eq!` guarding that zip, release-build silent empty
-    /// output instead of jq's own `[]`) -- confirmed live against jq 1.7.1:
-    /// `printf '' | jq -c -s '., inputs'` prints `[]`.
+    /// Always pushes exactly one `per_value` entry -- `at.line` is always
+    /// `Some(_)` from every current caller (both go through
+    /// [`slurp_eof`](Self::slurp_eof), which always resolves to a concrete
+    /// EOF line, never `None`), but the `unwrap_or(0)` below is not merely
+    /// decorative: slurp mode always produces exactly one value, so
+    /// `get_inputs`'s `values`/`locations` invariant ("one location per
+    /// value") must hold here unconditionally regardless of what `at`
+    /// contains -- the seeding `.zip()` in `run_jq` silently truncates to the
+    /// shorter side on a mismatch instead of erroring, so a skipped push
+    /// here previously lost the whole slurped document to `input`/`inputs`
+    /// (debug-build panic on the `debug_assert_eq!` guarding that zip,
+    /// release-build silent empty output instead of jq's own `[]`) --
+    /// confirmed live against jq 1.7.1: `printf '' | jq -c -s '., inputs'`
+    /// prints `[]`.
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
         locations.push(0, at.line.unwrap_or(0));
@@ -1710,6 +1720,14 @@ impl InputLocations {
         )
     }
 
+    /// Index of the last source on the command line (0 for stdin, or when
+    /// there is exactly one source), shared by [`exhausted`](Self::exhausted)
+    /// and [`slurp_eof`](Self::slurp_eof) -- both encode the same "jq's
+    /// parser ends up at the last source" rule, just at different moments.
+    fn last_src(&self) -> u32 {
+        self.files.len().saturating_sub(1) as u32
+    }
+
     /// Where jq's `(at ...)` marker settles once every input is consumed
     /// (#1309, item 5).
     ///
@@ -1745,7 +1763,7 @@ impl InputLocations {
         if slurping {
             return None;
         }
-        let last_src = self.files.len().saturating_sub(1) as u32;
+        let last_src = self.last_src();
         Some(match self.per_value.last() {
             Some(&(src, line)) if src == last_src => (last_src, line),
             _ => (last_src, 0),
@@ -1753,17 +1771,20 @@ impl InputLocations {
     }
 
     /// Where `--slurp`'s single combined value's `(at ...)` marker points
-    /// (#1520): the last source on the command line, at `eof_line` -- that
-    /// source's own newline count ([`newline_count`]).
+    /// (#1520), as a raw `(source, line)` tag -- the same shape
+    /// [`exhausted`](Self::exhausted) returns, for the same reason (the
+    /// caller resolves it to a printable name only once it's actually
+    /// needed): the last source on the command line, at `eof_line` -- that
+    /// source's own newline count (`line_at(bytes, bytes.len())` at the call
+    /// site above).
     ///
-    /// The same "last source" rule as [`exhausted`](Self::exhausted), but
-    /// slurp collapses every input into one value up front, so there is no
-    /// per-value table afterward to fall back on the way `exhausted` does --
-    /// the caller must compute `eof_line` directly from the last source's
-    /// raw text before it's consumed, and pass it in.
-    fn slurp_eof(&self, eof_line: usize) -> InputLocation {
-        let last_src = self.files.len().saturating_sub(1) as u32;
-        self.resolve(last_src, eof_line as u32)
+    /// The same "last source" rule as `exhausted`, but slurp collapses every
+    /// input into one value up front, so there is no per-value table
+    /// afterward to fall back on the way `exhausted` does -- the caller must
+    /// compute `eof_line` directly from the last source's raw text before
+    /// it's consumed, and pass it in.
+    fn slurp_eof(&self, eof_line: usize) -> (u32, u32) {
+        (self.last_src(), eof_line as u32)
     }
 }
 
