@@ -10558,6 +10558,17 @@ fn test_resolve_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1517(
     assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
     assert_eq!(stderr, "");
 
+    // `end` escapes with *zero* prior values (a bare `error(...)`, not a
+    // comma with a leading success) -- `ends_escape` still wins over
+    // `starts_escape`, matching the `ends.is_empty()` early return's own
+    // "innermost escape wins" rule rather than falling through to
+    // `start`'s own (later, never-reached) escape.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(.[(0,1):error("b")])"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
     Ok(())
 }
 
@@ -10605,6 +10616,29 @@ fn test_first_limit_path_truncation_does_not_overreach_slice_bound_fanout_1517()
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1517 review's own known-gap residual, documented on `resolve_slice_bound`
+/// itself: a resolved-but-non-numeric bound value still discards the whole
+/// converted prefix, including values that resolved cleanly before it --
+/// the same shape of bug #1517 fixes for a genuine generator escape, just
+/// not extended to a type failure in this PR. Not a regression: confirmed
+/// present (with a *different*, wrong error message -- `b` instead of the
+/// correct type-error text) before this fix too. Pinning today's honest,
+/// still-imperfect output rather than asserting nothing here, so a future
+/// fix's diff shows exactly what changes.
+#[test]
+fn test_resolve_slice_bound_type_error_still_drops_valid_prefix_1517_known_gap() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(.[(0,1,"x"):(2,3)])"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    // jq 1.7.1 prints all four combinations of the two valid `start` values
+    // (0, 1) against both `end` values (2, 3) before raising -- this
+    // function currently drops all four instead.
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
 
     Ok(())
 }
