@@ -30,11 +30,11 @@ use super::document::{
     DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, collapse_vec, eval as full_eval, format_owned,
+    apply_compare_op, collapse_vec, eval as full_eval, eval_each_owned, format_owned,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
-    slice_owned_value_read, tonumber_from_str, Control, EvalError, EvalSemantics, EvalTag,
-    JqSemantics, QueryResult, YqSemantics,
+    slice_owned_value_read, tonumber_from_str, Control, Demand, EvalError, EvalSemantics, EvalTag,
+    Flow, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -2292,10 +2292,11 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
 
 /// Fold an already-evaluated first pipe stage through every remaining stage,
 /// eagerly. Extracted verbatim from `eval_single`'s own `Expr::Pipe` arm
-/// (`current` is `exprs[0]`'s own result, `stages` is `exprs[1..]`) so a
-/// future lazy `Pipe` mirror (#1461) can reuse this per-`GenericResult`-
-/// variant switch -- including its `map`/`select`/`first`/`.[n]`
-/// composability fast paths (#724/#725) -- instead of duplicating it.
+/// (`current` is `exprs[0]`'s own result, `stages` is `exprs[1..]`) so
+/// `eval_each_pipe_generic`'s lazy `LazyKeys`/`LazyIndexRange`/`LazySeq`
+/// items (#1461) can reuse this per-`GenericResult`-variant switch --
+/// including its `map`/`select`/`first`/`.[n]` composability fast paths
+/// (#724/#725) -- instead of duplicating it.
 fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     mut current: GenericResult<V>,
     stages: &[Expr],
@@ -3255,6 +3256,313 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// One output on its way to the sink installed by [`eval_each_generic`]
+/// (#1461, mirroring `eval::Item`).
+///
+/// Six variants, matching the six single-output shapes of [`GenericResult`]
+/// -- `None`/`Error`/`Break`/`Halt`/`Partial`/`Many`/`ManyCursor`/`ManyOwned`
+/// are multi-output or terminal and are never represented as one item;
+/// [`drain_result_generic`] handles those directly. `LazyKeys`/
+/// `LazyIndexRange`/`LazySeq` are carried opaque rather than decomposed:
+/// only [`fold_pipe_stages`]'s own per-variant switch knows how to thread
+/// one of them through a *further* pipe stage (its `map`/`select`/`first`/
+/// `.[n]` composability fast paths, #724/#725) -- collapsing one to
+/// `Owned`/`One` before that switch runs is exactly the regression #1503
+/// review found and reverted. No `Debug` derive, matching `eval::Item`'s own
+/// omission: `V::Cursor` has no guaranteed `Debug` bound (see `LazyElem`'s
+/// own comment above for why that is deliberate here too).
+enum GenericItem<V: DocumentValue> {
+    One(V),
+    OneCursor(V::Cursor),
+    Owned(OwnedValue),
+    LazyKeys {
+        fields: V::Fields,
+        sorted: bool,
+        collapse: bool,
+    },
+    LazyIndexRange(usize),
+    LazySeq(LazySeq<V>),
+}
+
+/// Push one item to `sink`, translating its `Demand` into a terminal `Flow`.
+fn push_one_generic<V: DocumentValue>(
+    item: GenericItem<V>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match sink(item) {
+        Demand::Continue => Flow::Exhausted,
+        Demand::Stop => Flow::Stopped { pending: None },
+    }
+}
+
+/// Push a sequence of already-materialized items to `sink`, stopping as soon
+/// as it says to. Shared by [`drain_result_generic`]'s `Many`/`ManyCursor`/
+/// `ManyOwned`/`Partial` arms, which only differ in how the `Vec` they
+/// already hold gets wrapped into a `GenericItem`.
+fn push_many_generic<V: DocumentValue>(
+    items: impl Iterator<Item = GenericItem<V>>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    for item in items {
+        if sink(item) == Demand::Stop {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    Flow::Exhausted
+}
+
+/// Generic-evaluator twin of `eval::drain_result` (#1461): adapt an
+/// already-computed [`GenericResult`] into one-at-a-time sink pushes,
+/// checking `Demand` between values. The fallback for every `Expr` shape
+/// [`eval_each_generic`] has no dedicated lazy arm for.
+///
+/// `Many`/`ManyCursor`/`ManyOwned` are already a `Vec` by the time
+/// `eval_single` returns them (e.g. `.[]`'s cursor enumeration is cheap
+/// navigation, not evaluation of side-effecting code), so iterating with an
+/// early `Demand::Stop` check is correct and sufficient -- only feeding an
+/// element to `sink`, which may recurse into more of the pipe, can run
+/// side-effecting code, and that is demand-checked per element.
+/// `LazyKeys`/`LazyIndexRange`/`LazySeq` are pushed as one opaque item each,
+/// never decomposed here -- see [`GenericItem`]'s own doc comment for why.
+fn drain_result_generic<V: DocumentValue>(
+    result: GenericResult<V>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match result {
+        GenericResult::None => Flow::Exhausted,
+        GenericResult::One(v) => push_one_generic(GenericItem::One(v), sink),
+        GenericResult::OneCursor(c) => push_one_generic(GenericItem::OneCursor(c), sink),
+        GenericResult::Owned(o) => push_one_generic(GenericItem::Owned(o), sink),
+        GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => push_one_generic(
+            GenericItem::LazyKeys {
+                fields,
+                sorted,
+                collapse,
+            },
+            sink,
+        ),
+        GenericResult::LazyIndexRange(len) => {
+            push_one_generic(GenericItem::LazyIndexRange(len), sink)
+        }
+        GenericResult::LazySeq(seq) => push_one_generic(GenericItem::LazySeq(seq), sink),
+        GenericResult::Many(vs) => push_many_generic(vs.into_iter().map(GenericItem::One), sink),
+        GenericResult::ManyCursor(cs) => {
+            push_many_generic(cs.into_iter().map(GenericItem::OneCursor), sink)
+        }
+        GenericResult::ManyOwned(os) => {
+            push_many_generic(os.into_iter().map(GenericItem::Owned), sink)
+        }
+        GenericResult::Error(e) => Flow::Escaped(Control::Error(e)),
+        GenericResult::Break(label) => Flow::Escaped(Control::Break(label)),
+        GenericResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
+        // `vs` is delivered first, exactly as `push_generic_owned_values`
+        // already delivers it; a sink that stops part-way carries `control`
+        // forward as `pending` rather than dropping it, same as
+        // `eval::drain_result`'s own `Partial` arm.
+        GenericResult::Partial(vs, control) => {
+            match push_many_generic(vs.into_iter().map(GenericItem::Owned), sink) {
+                Flow::Exhausted => Flow::Escaped(control),
+                Flow::Stopped { .. } => Flow::Stopped {
+                    pending: Some(control),
+                },
+                Flow::Escaped(_) => unreachable!("push_many_generic never returns Escaped"),
+            }
+        }
+    }
+}
+
+/// Generic-evaluator twin of `eval::eval_each` (#1461): a demand-driven sink
+/// over `Comma`/`Pipe`/`Paren`, so a consumer like `first` can stop pulling
+/// from the *rest* of one of these shapes as soon as it has what it needs,
+/// instead of `eval_single`'s own eager, always-materialize-everything
+/// dispatch for the same three variants.
+///
+/// Scoped to exactly these three, matching the issue's own stated scope --
+/// mirroring `eval.rs`'s wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/
+/// `Compare`/...) is out of scope here; those shapes still fall to the `_`
+/// fallback below, unchanged from before.
+fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match expr {
+        // Mirrors `eval::eval_each`'s own `Comma` arm exactly: the sink *is*
+        // the accumulator, so there is nothing to promote/collect here.
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                match eval_each_generic::<S, V>(e, value.clone(), optional, cursor, sink) {
+                    Flow::Exhausted => {}
+                    stopped_or_escaped => return stopped_or_escaped,
+                }
+            }
+            Flow::Exhausted
+        }
+        Expr::Pipe(exprs) => eval_each_pipe_generic::<S, V>(exprs, value, optional, cursor, sink),
+        Expr::Paren(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
+        _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
+    }
+}
+
+/// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
+/// pulling from stage 1 once the rest of the pipe has enough" mechanism.
+///
+/// `needs_path_context` bridges the whole remaining pipe eagerly, exactly
+/// matching `eval_single`'s own `Expr::Pipe` arm's guard (#554) -- reused
+/// directly rather than re-derived, so `path`/`parent`/`key` never silently
+/// see a stubbed-zero default. Otherwise: evaluate stage 1 lazily via
+/// [`eval_each_generic`], and for every item it produces, recursively drive
+/// the *whole remaining pipe* (not just one more stage) through a driver
+/// closure that forwards items to the outer `sink` and translates whatever
+/// `Flow` that recursive call terminates in back into a `Demand` for stage
+/// 1's own generator. Recursing on the full remaining slice, rather than one
+/// stage at a time, is what lets cursor threading (`.[] | select(...) |
+/// line`) survive an arbitrary-length remaining pipe -- the exact property a
+/// narrower, 2-stage-only attempt lost (#1503 review).
+///
+/// An `Owned` item bridges to the already-lazy `eval::eval_each_owned` so
+/// laziness (and thus `input`/`inputs` demand) continues through the rest of
+/// the pipe instead of stopping at the owned/cursor boundary, mirroring
+/// `eval_each_pipe`'s own `Item::Owned` arm (PR #1450 fixed the equivalent
+/// bug on the `eval.rs` side). A `LazyKeys`/`LazyIndexRange`/`LazySeq` item
+/// folds through the remaining stages via [`fold_pipe_stages`] -- the same
+/// per-variant switch `eval_single`'s own `Expr::Pipe` arm uses, including
+/// its `map`/`select`/`first`/`.[n]` composability fast paths (#724/#725) --
+/// rather than being decomposed or materialized here, which is exactly what
+/// regressed #1503's own broader attempt.
+fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if exprs.iter().any(needs_path_context) {
+        return drain_result_generic(
+            eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
+            sink,
+        );
+    }
+
+    let Some((first, rest)) = exprs.split_first() else {
+        // Same behaviour as `eval_single`'s own empty-pipe short-circuit:
+        // `value`'s cursor, if any, is not preserved -- an empty `Expr::Pipe`
+        // is not a shape real syntax produces, only a synthesized "rest"
+        // slice that never actually reaches zero length in practice.
+        return push_one_generic(GenericItem::One(value), sink);
+    };
+    if rest.is_empty() {
+        return eval_each_generic::<S, V>(first, value, optional, cursor, sink);
+    }
+
+    let mut downstream: Option<Flow> = None;
+    let rest_pipe = Expr::Pipe(rest.to_vec());
+    let upstream = {
+        let mut driver = |item: GenericItem<V>| -> Demand {
+            let flow = match item {
+                GenericItem::One(v) => {
+                    eval_each_pipe_generic::<S, V>(rest, v, optional, None, &mut *sink)
+                }
+                GenericItem::OneCursor(c) => {
+                    eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), &mut *sink)
+                }
+                GenericItem::Owned(o) => eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
+                    sink(GenericItem::Owned(o))
+                }),
+                GenericItem::LazyKeys {
+                    fields,
+                    sorted,
+                    collapse,
+                } => drain_result_generic(
+                    fold_pipe_stages::<S, V>(
+                        GenericResult::LazyKeys {
+                            fields,
+                            sorted,
+                            collapse,
+                        },
+                        rest,
+                        optional,
+                    ),
+                    &mut *sink,
+                ),
+                GenericItem::LazyIndexRange(len) => drain_result_generic(
+                    fold_pipe_stages::<S, V>(GenericResult::LazyIndexRange(len), rest, optional),
+                    &mut *sink,
+                ),
+                GenericItem::LazySeq(seq) => drain_result_generic(
+                    fold_pipe_stages::<S, V>(GenericResult::LazySeq(seq), rest, optional),
+                    &mut *sink,
+                ),
+            };
+            match flow {
+                Flow::Exhausted => Demand::Continue,
+                other => {
+                    downstream = Some(other);
+                    Demand::Stop
+                }
+            }
+        };
+        eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
+    };
+
+    match downstream {
+        Some(flow) => flow,
+        None => upstream,
+    }
+}
+
+/// Generic-evaluator twin of `eval::each_take_first` (#1461): pull at most
+/// one output of `inner` via [`eval_each_generic`], then stop the generator
+/// -- jq's `def first(f): label $out | (f, break $out);`.
+fn each_take_first_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Result<Option<GenericItem<V>>, Control> {
+    let mut first: Option<GenericItem<V>> = None;
+    let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
+        first = Some(item);
+        Demand::Stop
+    });
+    match flow {
+        Flow::Stopped { .. } | Flow::Exhausted => Ok(first),
+        // The sink always stops on its first item, so an escape can only
+        // mean nothing was ever produced.
+        Flow::Escaped(control) => match first {
+            Some(item) => Ok(Some(item)),
+            None => Err(control),
+        },
+    }
+}
+
+/// Convert a captured [`GenericItem`] back to the [`GenericResult`] shape it
+/// came from -- the inverse of [`drain_result_generic`]'s single-item arms.
+fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResult<V> {
+    match item {
+        GenericItem::One(v) => GenericResult::One(v),
+        GenericItem::OneCursor(c) => GenericResult::OneCursor(c),
+        GenericItem::Owned(o) => GenericResult::Owned(o),
+        GenericItem::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        },
+        GenericItem::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
+        GenericItem::LazySeq(seq) => GenericResult::LazySeq(seq),
+    }
+}
+
 /// Evaluate `first(inner)`/`last(inner)` (and the `Builtin::FirstStream`/
 /// `LastStream` spelling the parser sometimes produces for the same syntax --
 /// see the call sites in `eval_single`/`eval_builtin`), preserving a cursor
@@ -3274,15 +3582,15 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     want_last: bool,
 ) -> GenericResult<V> {
     // `first(f)` where `f` can consume input documents must not run `f` to
-    // completion. This module has no demand-driven sink, but `eval.rs` does,
-    // and `eval::eval_first_expr` has been wired to it since #820 Stage 2 --
-    // so hand the whole `first(...)` over rather than evaluating `inner`
-    // eagerly here (#1309).
-    //
-    // The whole node, not a `Builtin::Inputs` special case inside
-    // `first_over_comma_generic`: that would still drain for
-    // `first(inputs, 1)`, `first(1, inputs)` and `first(inputs | f)`, which
-    // this covers for free.
+    // completion. [`eval_each_generic`] (#1461) is only a native lazy arm for
+    // `Comma`/`Pipe`/`Paren` -- it has no `Builtin::Inputs`-aware arm of its
+    // own, so a bare `first(inputs)`/`first(inputs, 1)`/`first(inputs | f)`
+    // would still fall to its eager `_` fallback and drain the shared queue.
+    // `eval::eval_first_expr` has been wired to `eval.rs`'s own sink since
+    // #820 Stage 2, so hand the whole `first(...)` over rather than
+    // evaluating `inner` here (#1309) -- one guard covering every shape
+    // `inputs` can appear in, rather than one `eval_each_generic` arm per
+    // shape.
     //
     // Gated rather than unconditional because the bridge costs this subtree
     // its cursor, and with it #607's duplicate-key fidelity. Nothing is
@@ -3300,14 +3608,20 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
     }
 
-    // `first` over a comma stops at the first sibling that yields an output,
-    // so later siblings are never evaluated (#820 Stage 2b). `last` cannot
-    // short-circuit -- it does not know a value is the last until the stream
-    // is exhausted -- so it keeps the eager path below.
+    // `first` stops pulling from `inner` as soon as it has one output, so
+    // anything past that point -- a later comma sibling, a later pipe stage's
+    // continuation, an unpulled element of a `.[]` -- is never evaluated
+    // (#820, #1461). `last` cannot short-circuit -- it does not know a value
+    // is the last until the stream is exhausted -- so it keeps the eager
+    // path below.
     if !want_last {
-        if let Some(result) = first_over_comma_generic::<S, V>(inner, &value, optional, cursor) {
-            return result;
-        }
+        return match each_take_first_generic::<S, V>(inner, value, optional, cursor) {
+            Ok(Some(item)) => generic_item_to_result(item),
+            Ok(None) => GenericResult::None,
+            Err(Control::Error(e)) => GenericResult::Error(e),
+            Err(Control::Break(label)) => GenericResult::Break(label),
+            Err(Control::Halt(code)) => GenericResult::Halt(code),
+        };
     }
 
     // No local `optional` handling is needed for `last(f)?` here: post-#693,
@@ -3317,347 +3631,55 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     // always `false` on every dispatch path that reaches this function
     // today, and `last(empty)?` (`null`) vs. `last(error("x"))?` (empty)
     // stays correct entirely via that outer boundary, not anything here.
-    let result = eval_single::<S, V>(inner, value, optional, cursor);
-    if want_last {
-        match result {
-            GenericResult::One(v) => GenericResult::One(v),
-            GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
-            GenericResult::Many(vs) => match vs.into_iter().next_back() {
-                Some(v) => GenericResult::One(v),
-                None => GenericResult::Owned(OwnedValue::Null),
-            },
-            GenericResult::ManyCursor(cs) => match cs.into_iter().next_back() {
-                Some(c) => GenericResult::OneCursor(c),
-                None => GenericResult::Owned(OwnedValue::Null),
-            },
-            GenericResult::Owned(v) => GenericResult::Owned(v),
-            GenericResult::ManyOwned(vs) => match vs.into_iter().next_back() {
-                Some(v) => GenericResult::Owned(v),
-                None => GenericResult::Owned(OwnedValue::Null),
-            },
-            // `inner`'s stream has exactly one output (the whole `keys`/
-            // `keys_unsorted` result) — forward it unchanged, same as
-            // `Owned`/`OneCursor` above, so laziness survives `last(...)`.
-            GenericResult::LazyKeys {
-                fields,
-                sorted,
-                collapse,
-            } => GenericResult::LazyKeys {
-                fields,
-                sorted,
-                collapse,
-            },
-            GenericResult::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
-            // Same forwarding, same reasoning: `first(inner)`/`last(inner)`
-            // only need to know *which* of `inner`'s outputs this is, never
-            // inspect the value itself, so forwarding doesn't swallow
-            // anything -- whoever consumes the returned `LazySeq` next
-            // materializes it, and any error surfaces there.
-            GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
-            // jq's `last(f)` is `reduce f as $x (null; $x)`, which always
-            // produces exactly one output -- an empty operand answers the
-            // seed. `first` is deliberately not symmetric (#1521).
-            GenericResult::None => GenericResult::Owned(OwnedValue::Null),
-            GenericResult::Error(e) => GenericResult::Error(e),
-            GenericResult::Break(label) => GenericResult::Break(label),
-            GenericResult::Halt(code) => GenericResult::Halt(code),
-            // `last` cannot short-circuit -- it doesn't know a value is the
-            // last one until the stream is exhausted -- so a `Partial` just
-            // surfaces its trailing control, dropping the prefix (matches
-            // `eval::eval_last_expr`).
-            GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
-            GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
-            GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),
-        }
-    } else {
-        take_first_generic(result).unwrap_or(GenericResult::None)
-    }
-}
-
-/// The first output of `result`, or `None` if it produced none.
-///
-/// Extracted from `eval_first_or_last_generic`'s own `first` branch so that
-/// [`first_over_comma_generic`] can reuse it per comma sibling. `None` means
-/// "this stream was empty" — which for a bare `first(f)` is `GenericResult::None`,
-/// but for one sibling of `first(a, b)` means "try `b`".
-fn take_first_generic<V: DocumentValue>(result: GenericResult<V>) -> Option<GenericResult<V>> {
-    match result {
-        GenericResult::One(v) => Some(GenericResult::One(v)),
-        GenericResult::OneCursor(c) => Some(GenericResult::OneCursor(c)),
-        GenericResult::Many(vs) => vs.into_iter().next().map(GenericResult::One),
-        GenericResult::ManyCursor(cs) => cs.into_iter().next().map(GenericResult::OneCursor),
-        GenericResult::Owned(v) => Some(GenericResult::Owned(v)),
-        GenericResult::ManyOwned(vs) => vs.into_iter().next().map(GenericResult::Owned),
-        // Each of these is exactly one output of `inner`'s stream, forwarded
-        // unchanged so laziness survives `first(...)`; `first` only needs to
-        // know *which* output this is, never to inspect it.
+    match eval_single::<S, V>(inner, value, optional, cursor) {
+        GenericResult::One(v) => GenericResult::One(v),
+        GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
+        GenericResult::Many(vs) => match vs.into_iter().next_back() {
+            Some(v) => GenericResult::One(v),
+            None => GenericResult::Owned(OwnedValue::Null),
+        },
+        GenericResult::ManyCursor(cs) => match cs.into_iter().next_back() {
+            Some(c) => GenericResult::OneCursor(c),
+            None => GenericResult::Owned(OwnedValue::Null),
+        },
+        GenericResult::Owned(v) => GenericResult::Owned(v),
+        GenericResult::ManyOwned(vs) => match vs.into_iter().next_back() {
+            Some(v) => GenericResult::Owned(v),
+            None => GenericResult::Owned(OwnedValue::Null),
+        },
+        // `inner`'s stream has exactly one output (the whole `keys`/
+        // `keys_unsorted` result) — forward it unchanged, same as
+        // `Owned`/`OneCursor` above, so laziness survives `last(...)`.
         GenericResult::LazyKeys {
             fields,
             sorted,
             collapse,
-        } => Some(GenericResult::LazyKeys {
+        } => GenericResult::LazyKeys {
             fields,
             sorted,
             collapse,
-        }),
-        GenericResult::LazyIndexRange(len) => Some(GenericResult::LazyIndexRange(len)),
-        GenericResult::LazySeq(seq) => Some(GenericResult::LazySeq(seq)),
-        GenericResult::None => None,
-        GenericResult::Error(e) => Some(GenericResult::Error(e)),
-        GenericResult::Break(label) => Some(GenericResult::Break(label)),
-        GenericResult::Halt(code) => Some(GenericResult::Halt(code)),
-        // jq's generator-based `first` never asks for values past the first
-        // (verified: `first(1,2,error("x"))` is `1`, exit 0 -- the error is
-        // never reached), so a non-empty prefix always satisfies it and the
-        // trailing control is dropped. `Partial`'s prefix is never empty by
-        // construction (matches `eval::eval_first_expr`).
-        GenericResult::Partial(vs, _control) => Some(GenericResult::Owned(
-            vs.into_iter().next().expect("Partial prefix non-empty"),
-        )),
-    }
-}
-
-/// `first(a, b, ...)` evaluated one comma sibling at a time, stopping at the
-/// first that yields an output — #820 Stage 2b — and, since #1451, composing
-/// through `Pipe`/`Paren` too: a comma reached through a pipe stage (`first(1
-/// | (1, stderr))`), or nested inside one sibling of an outer comma
-/// (`first((1, stderr), 2)`), recurses back into this same function instead
-/// of falling through to the eager per-expression evaluator that started
-/// this whole gap.
-///
-/// Returns `None` when `inner` is neither a comma nor a (non-path-context)
-/// pipe, leaving the caller on its existing eager path.
-///
-/// **Why this exists at all.** Stage 2 made `eval::eval_first_expr` lazy, but
-/// the CLI never reaches it for a bare `first(...)`: `jq_runner` enters
-/// `eval_generic::eval_with_cursor`, and `Expr::FirstExpr` has a native arm
-/// here (kept cursor-preserving for #607), so the subtree never crosses into
-/// `eval.rs`. `limit`/`nth`/`isempty` have no native arm and do bounce, which
-/// is exactly why Stage 2 fixed them and left `first` leaking.
-///
-/// The original (#820 Stage 2b) fix was deliberately the *narrow* option
-/// (b) from the design doc: closing `first(1, stderr)` and — the reason it
-/// was not merely cosmetic — `first(1, input)`, where the discarded branch
-/// was **consuming a document** the CLI's driver loop then never processed.
-/// #1451 widens it to also recurse through `Pipe`'s own prefix stages: the
-/// prefix is evaluated once via the ordinary eager `eval_single` (a pipe's
-/// leading stages must run to produce the values that feed the tail either
-/// way, so this is no more eager than before), then [`first_over_pipe_prefix_result`]
-/// dispatches on every possible shape of that one evaluation's result
-/// without ever redoing it -- see its own doc comment for the full model,
-/// including why a *computed* prefix (`GenericResult::Owned`, the common
-/// case for a literal/arithmetic leading stage) needs its own
-/// `OwnedValue`-flavored twin ([`first_over_comma_owned_generic`]) rather
-/// than reusing this function directly. `needs_path_context` is checked
-/// across the *whole* pipe up front, matching the eager `Expr::Pipe` arm's
-/// own guard, so `path`/`parent`/`key` never silently see a stubbed-zero
-/// default (#715/#1302) -- a path-context pipe simply isn't attempted here
-/// and falls through to the existing bridge instead.
-fn first_over_comma_generic<S: EvalSemantics, V: DocumentValue>(
-    inner: &Expr,
-    value: &V,
-    optional: bool,
-    cursor: Option<V::Cursor>,
-) -> Option<GenericResult<V>> {
-    match unwrap_paren(inner) {
-        Expr::Comma(exprs) => {
-            for e in exprs {
-                // Each sibling is evaluated only once the previous one has
-                // been shown to produce nothing -- so a side-effecting or
-                // input-consuming sibling past the answer is never reached,
-                // matching jq's `label $out | (f, break $out)`.
-                if let Some(first) = try_lazy_first_generic::<S, V>(e, value, optional, cursor) {
-                    return Some(first);
-                }
-            }
-            // Every sibling was empty, so the comma as a whole produced
-            // nothing.
-            Some(GenericResult::None)
-        }
-        // Exactly 2 stages only, not `>= 2`: for 3+ stages, evaluating
-        // `exprs[..len-1]` as its own synthesized sub-pipe truncates the
-        // pipe one stage short of `last`, which can silently defeat
-        // `eval_single`'s own multi-stage `ManyCursor` handling -- that
-        // logic threads a cursor through the *entire* remaining pipe
-        // together, recursing into "the rest of the pipe" as one unit per
-        // cursor, not stage-by-stage; truncating the view it's given loses
-        // that (a `.[] | select(...) | line`-shaped query lost its `line`
-        // cursor this way -- #1503 review). Restricting to a single prefix
-        // stage sidesteps this: `eval_single(&exprs[0], ...)` is exactly
-        // what `eval_single`'s own `Expr::Pipe` arm evaluates as *its own*
-        // first fold step, so there is no truncation to reason about.
-        Expr::Pipe(exprs) if exprs.len() == 2 && !exprs.iter().any(needs_path_context) => {
-            let prefix_result = eval_single::<S, V>(&exprs[0], value.clone(), optional, cursor);
-            first_over_pipe_prefix_result::<S, V>(prefix_result, &exprs[1], optional)
-        }
-        _ => None,
-    }
-}
-
-/// Try to get the first lazily-recognized output of `e` against `(value,
-/// cursor)`: recurse into [`first_over_comma_generic`] first, and fall back
-/// to one eager `eval_single` call only when `e` has no further
-/// `Comma`/`Pipe`/`Paren` structure of its own to be lazy about. Returns
-/// `None` when `e` produces literally nothing, so the caller (a comma
-/// sibling loop, or a pipe's per-prefix-value tail attempt) can move on to
-/// the next candidate rather than mistaking "no output" for "stop, this is
-/// the answer" -- the same normalization `first_over_comma_generic`'s own
-/// `Comma` arm already needed, factored out so the `Pipe` arm can reuse it.
-fn try_lazy_first_generic<S: EvalSemantics, V: DocumentValue>(
-    e: &Expr,
-    value: &V,
-    optional: bool,
-    cursor: Option<V::Cursor>,
-) -> Option<GenericResult<V>> {
-    match first_over_comma_generic::<S, V>(e, value, optional, cursor) {
-        Some(GenericResult::None) => None,
-        Some(other) => Some(other),
-        None => take_first_generic(eval_single::<S, V>(e, value.clone(), optional, cursor)),
-    }
-}
-
-/// `OwnedValue`-input twin of [`first_over_comma_generic`], for a pipe
-/// prefix stage that evaluates to a *computed* value
-/// (`GenericResult::Owned`/`ManyOwned`/`Partial`) rather than one derived
-/// from the input document. A bare literal or arithmetic result has no
-/// cursor to preserve, so `eval_single` returns it this way -- and that is
-/// the *common* case for a pipe's leading stage, not a rare one: #1451's own
-/// `first(1 | (1, stderr))` repro has an `Owned` prefix (the literal `1`),
-/// not a `One`. Mirrors `first_over_comma_generic` exactly, substituting
-/// `eval_on_owned` for `eval_single` as the base-case evaluator, and mutually
-/// recurses with the `V`-flavored functions above through
-/// [`first_over_pipe_prefix_result`] so a pipe can freely mix
-/// document-derived and computed stages without losing laziness at the
-/// boundary.
-fn first_over_comma_owned_generic<S: EvalSemantics, V: DocumentValue>(
-    inner: &Expr,
-    owned: &OwnedValue,
-    optional: bool,
-) -> Option<GenericResult<V>> {
-    match unwrap_paren(inner) {
-        Expr::Comma(exprs) => {
-            for e in exprs {
-                if let Some(first) = try_lazy_first_owned_generic::<S, V>(e, owned, optional) {
-                    return Some(first);
-                }
-            }
-            Some(GenericResult::None)
-        }
-        // Exactly 2 stages only -- same reasoning as
-        // `first_over_comma_generic`'s own `Pipe` arm: kept symmetric even
-        // though `eval_on_owned` never carries a `V::Cursor` to lose, since
-        // there's no evidence its own multi-stage threading is free of an
-        // analogous "must see the whole remaining pipe" dependency, and
-        // #1451's own repros never needed more than 2 stages here either.
-        Expr::Pipe(exprs) if exprs.len() == 2 && !exprs.iter().any(needs_path_context) => {
-            let prefix_result = eval_on_owned::<S, V>(&exprs[0], owned.clone(), optional);
-            first_over_pipe_prefix_result::<S, V>(prefix_result, &exprs[1], optional)
-        }
-        _ => None,
-    }
-}
-
-/// `OwnedValue`-input twin of [`try_lazy_first_generic`] — see there for the
-/// full rationale; identical shape, `eval_on_owned` in place of
-/// `eval_single`.
-fn try_lazy_first_owned_generic<S: EvalSemantics, V: DocumentValue>(
-    e: &Expr,
-    owned: &OwnedValue,
-    optional: bool,
-) -> Option<GenericResult<V>> {
-    match first_over_comma_owned_generic::<S, V>(e, owned, optional) {
-        Some(GenericResult::None) => None,
-        Some(other) => Some(other),
-        None => take_first_generic(eval_on_owned::<S, V>(e, owned.clone(), optional)),
-    }
-}
-
-/// Shared continuation for both [`first_over_comma_generic`]'s and
-/// [`first_over_comma_owned_generic`]'s `Pipe` arm: dispatch on an
-/// already-computed prefix-stage result and try `last` (the pipe's own
-/// final stage) against it, without ever redoing the prefix evaluation
-/// itself when doing so could double-fire a side effect the prefix has.
-///
-/// A `One`/`OneCursor`/`Owned` prefix (exactly one value, safe by
-/// construction -- it's already in hand, nothing to redo) recurses lazily
-/// into whichever of the two `try_lazy_first_*_generic` twins matches that
-/// value's own kind. A `ManyOwned`/`Partial` prefix (an already-computed,
-/// already-materialized *value* set -- no document cursor, no deferred
-/// generator) tries each of its values against `last` in turn, stopping at
-/// the first that yields anything; `Partial`'s trailing control only
-/// surfaces if none of its values' own tails produced anything, matching
-/// `take_first_generic`'s own "a non-empty prefix always satisfies `first`"
-/// rule.
-///
-/// A `Many`/`ManyCursor` prefix (document-derived navigation, e.g. `.[]`)
-/// or a `LazyKeys`/`LazyIndexRange`/`LazySeq` prefix (a deferred
-/// computation that hasn't *run* yet, so reconstructing it is free) is
-/// instead handed back as `None`, deferring to the caller's own fallback of
-/// evaluating the *whole* pipe as one eager `eval_single`/`eval_on_owned`
-/// call -- redoing the prefix stage(s) that way is side-effect-free for
-/// both cases, and, critically, it is what keeps this function from
-/// regressing two properties only a *whole-pipe* evaluation preserves
-/// (#1503 review): `eval_single`'s own `ManyCursor` handling threads a
-/// cursor through the *entire* remaining pipe together, which per-value
-/// dispatch to `last` alone cannot reproduce for a multi-stage tail (a
-/// `.[] | select(...) | line`-shaped query lost its `line` cursor under the
-/// naive per-value split); and a `LazySeq` (`map(f)`'s own composability
-/// engine, #724/#725) must stay lazy until something actually indexes into
-/// it, not be forced through `materialize_lazy()` up front (`first(map(f) |
-/// .[0])` errored on a later element `f` was never supposed to reach).
-/// `GenericResult::None` is likewise handed back directly rather than via
-/// the fallback -- it's already known with certainty, so redoing the whole
-/// pipe just to re-derive the same "produces nothing" answer would be pure
-/// waste, not a correctness concern either way.
-///
-/// This means a `Many`/`ManyCursor` prefix's own per-value backtracking
-/// (which would additionally close `first(.[] | stderr)`, a harder case
-/// #820 Stage 2b explicitly could not close) is deliberately not attempted
-/// here -- doing so is what caused the cursor/`LazySeq` regressions above,
-/// so `first(.[] | stderr)` remains a known, pinned divergence rather than
-/// being closed by this function.
-fn first_over_pipe_prefix_result<S: EvalSemantics, V: DocumentValue>(
-    prefix_result: GenericResult<V>,
-    last: &Expr,
-    optional: bool,
-) -> Option<GenericResult<V>> {
-    match prefix_result {
-        GenericResult::None => Some(GenericResult::None),
-        GenericResult::Error(e) => Some(GenericResult::Error(e)),
-        GenericResult::Break(label) => Some(GenericResult::Break(label)),
-        GenericResult::Halt(code) => Some(GenericResult::Halt(code)),
-        GenericResult::One(v) => Some(
-            try_lazy_first_generic::<S, V>(last, &v, optional, None).unwrap_or(GenericResult::None),
-        ),
-        GenericResult::OneCursor(c) => {
-            let v = c.value();
-            Some(
-                try_lazy_first_generic::<S, V>(last, &v, optional, Some(c))
-                    .unwrap_or(GenericResult::None),
-            )
-        }
-        GenericResult::Owned(o) => Some(
-            try_lazy_first_owned_generic::<S, V>(last, &o, optional).unwrap_or(GenericResult::None),
-        ),
-        GenericResult::ManyOwned(os) => Some(
-            os.into_iter()
-                .find_map(|o| try_lazy_first_owned_generic::<S, V>(last, &o, optional))
-                .unwrap_or(GenericResult::None),
-        ),
-        GenericResult::Partial(vs, control) => Some(
-            vs.into_iter()
-                .find_map(|o| try_lazy_first_owned_generic::<S, V>(last, &o, optional))
-                .unwrap_or_else(|| match control {
-                    Control::Error(e) => GenericResult::Error(e),
-                    Control::Break(label) => GenericResult::Break(label),
-                    Control::Halt(code) => GenericResult::Halt(code),
-                }),
-        ),
-        GenericResult::Many(_)
-        | GenericResult::ManyCursor(_)
-        | GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_) => None,
+        },
+        GenericResult::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
+        // Same forwarding, same reasoning: `first(inner)`/`last(inner)`
+        // only need to know *which* of `inner`'s outputs this is, never
+        // inspect the value itself, so forwarding doesn't swallow
+        // anything -- whoever consumes the returned `LazySeq` next
+        // materializes it, and any error surfaces there.
+        GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
+        // jq's `last(f)` is `reduce f as $x (null; $x)`, which always
+        // produces exactly one output -- an empty operand answers the
+        // seed. `first` is deliberately not symmetric (#1521).
+        GenericResult::None => GenericResult::Owned(OwnedValue::Null),
+        GenericResult::Error(e) => GenericResult::Error(e),
+        GenericResult::Break(label) => GenericResult::Break(label),
+        GenericResult::Halt(code) => GenericResult::Halt(code),
+        // `last` cannot short-circuit -- it doesn't know a value is the
+        // last one until the stream is exhausted -- so a `Partial` just
+        // surfaces its trailing control, dropping the prefix (matches
+        // `eval::eval_last_expr`).
+        GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
+        GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
+        GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),
     }
 }
 
