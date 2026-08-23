@@ -17591,6 +17591,17 @@ fn test_jq_seq_slurp_trailing_record_unknown_location_1542() -> Result<()> {
         "{stderr}"
     );
 
+    // Control: the last file has no RS byte at all (empty) -- there is no
+    // trailing record to have dropped, so this resolves normally (line 0,
+    // #1520's own EOF rule), not <unknown>.
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["--seq", "-c", "-s", r#"error("x")"#], &["\x1e1\n", ""])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:0): x", paths[1])),
+        "{stderr}"
+    );
+
     // Control: `-R` takes over entirely from `--seq` for the location too
     // (matching --seq's own irrelevance to -R's raw-text value construction)
     // -- a "truncated" record by --seq's rules still reports its plain
