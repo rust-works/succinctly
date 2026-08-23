@@ -21208,3 +21208,85 @@ fn test_yq_setpath_delpaths_accept_a_single_output_argument_1279() -> Result<()>
     assert_eq!(out.trim(), "[{\"b\":2}]");
     Ok(())
 }
+
+/// #1534: under yq's `FirstOnly` gate, an escape anywhere in the argument
+/// takes the whole call down with **no output at all** -- it must not emit
+/// the first output and *then* raise.
+///
+/// Live-captured from the pinned yq v4.53.3, which is the only reference
+/// this gate has (the gate exists precisely because real yq does not fan
+/// these out):
+///
+/// ```text
+/// $ printf 'a: 1\n' | yq 'has(("a","b", error("boom")))'
+/// Error: boom          <- stderr only; stdout empty, exit 1
+/// ```
+///
+/// succinctly used to print `true` to stdout *and* raise, because the
+/// gate's truncation dropped the later argument values while the control
+/// they escaped through still fired.
+#[test]
+fn test_yq_first_only_gate_emits_nothing_when_the_argument_escapes_1534() -> Result<()> {
+    // `has` -- the shape from the issue.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#"has(("a","b", error("boom")))"#,
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+
+    // `split` -- same gate, different builtin.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#".x | split((",", error("boom")))"#,
+        "x: \"a,b\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+
+    // `join` -- likewise.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#".a | join((",", error("boom")))"#,
+        "a: [1, 2]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+    Ok(())
+}
+
+/// #1534 companion: an escape *before* any output was produced must still
+/// propagate -- the fix clears the values, so this case must not become a
+/// silently-swallowed error. `yq 'has(error("boom"))'` is `Error: boom`.
+#[test]
+fn test_yq_first_only_gate_still_propagates_an_immediate_escape_1534() -> Result<()> {
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(r#"has(error("boom"))"#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+    Ok(())
+}
+
+/// #1534 guard: the gate's ordinary job is untouched. A multi-output
+/// argument with *no* escape still takes the first output and succeeds --
+/// `yq 'has(("a","b"))'` on `a: 1` is `true`, not an error.
+#[test]
+fn test_yq_first_only_gate_still_takes_the_first_output_1534() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#"has(("a","b"))"#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(
+        r#".x | split((",", "-"))"#,
+        "x: \"a,b\"\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["a","b"]"#);
+    Ok(())
+}

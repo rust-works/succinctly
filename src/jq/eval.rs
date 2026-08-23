@@ -1498,7 +1498,8 @@ impl ArgFanout {
     }
 }
 
-/// Apply `fanout`'s gate to one argument's materialized output list.
+/// Apply `fanout`'s gate to one argument's materialized output list and its
+/// own trailing control.
 ///
 /// One definition for the three places that need it — [`fanout_arg`], and
 /// both the outer and the inner argument of [`fanout_two_args`]. The gate
@@ -1506,11 +1507,42 @@ impl ArgFanout {
 /// copies would be silent rather than a compile error: exactly the shape
 /// CLAUDE.md's #106 lesson ("duplicated predicates diverge silently — one
 /// definition, plus a test that the call sites agree") warns about (#1537).
-fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(), EvalError> {
+///
+/// `trailing` is passed in — read, never written — because
+/// [`ArgFanout::FirstOnly`] has to reconcile the two against each other
+/// rather than gate the values alone; see its arm below (#1534).
+fn apply_arg_fanout(
+    fanout: ArgFanout,
+    args: &mut Vec<OwnedValue>,
+    trailing: &Option<Control>,
+) -> Result<(), EvalError> {
     match fanout {
         ArgFanout::All => Ok(()),
+        // An escape anywhere in the argument takes the *whole* call down with
+        // no output at all -- it does not yield the first output and then
+        // raise. Live-verified against the pinned yq v4.53.3, which is the
+        // only mode this gate is reachable from (`ArgFanout::yq_native`):
+        //
+        //   $ printf 'a: 1\n' | yq 'has(("a","b", error("boom")))'
+        //   Error: boom            <- stderr; stdout is empty, exit 1
+        //
+        // and identically for `split`/`join`, the other two builtins gated
+        // here. succinctly used to print `true` (or the split/join result)
+        // to stdout *and* raise, because the truncation dropped the later
+        // values while the control they escaped through still fired (#1534).
+        //
+        // Clearing the values rather than the control is what makes the
+        // caller's own `match trailing` arm emit a bare `Error`/`Break`/
+        // `Halt`: `partial` normalizes an empty prefix down to one.
+        //
+        // The `trailing.is_none()` case still truncates, which is the gate's
+        // ordinary job -- `has(("a","b"))` is `true` in real yq, not an error.
         ArgFanout::FirstOnly => {
-            args.truncate(1);
+            if trailing.is_some() {
+                args.clear();
+            } else {
+                args.truncate(1);
+            }
             Ok(())
         }
         ArgFanout::RejectMany if args.len() > 1 => {
@@ -1550,7 +1582,7 @@ fn fanout_arg<'a, W: Clone + AsRef<[u64]>>(
     mut body: impl FnMut(OwnedValue) -> QueryResult<'a, W>,
 ) -> QueryResult<'a, W> {
     let (mut args, trailing) = stream_outputs(arg);
-    if let Err(e) = apply_arg_fanout(fanout, &mut args) {
+    if let Err(e) = apply_arg_fanout(fanout, &mut args, &trailing) {
         return QueryResult::Error(e);
     }
 
@@ -1612,7 +1644,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let (mut outers, outer_trailing) =
         stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
-    if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
+    if let Err(e) = apply_arg_fanout(fanout, &mut outers, &outer_trailing) {
         return QueryResult::Error(e);
     }
 
@@ -1620,7 +1652,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     for o in outers {
         let (mut inners, inner_trailing) =
             stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
-        if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
+        if let Err(e) = apply_arg_fanout(fanout, &mut inners, &inner_trailing) {
             return QueryResult::Error(e);
         }
 
@@ -52992,27 +53024,28 @@ mod tests {
     #[test]
     fn apply_arg_fanout_gates_agree_across_every_variant_1537() {
         let three = || vec![OwnedValue::int(1), OwnedValue::int(2), OwnedValue::int(3)];
+        let clean = || None;
 
         // `All` keeps every output.
         let mut args = three();
-        assert!(apply_arg_fanout(ArgFanout::All, &mut args).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::All, &mut args, &clean()).is_ok());
         assert_eq!(args.len(), 3);
 
         // `FirstOnly` keeps exactly the first.
         let mut args = three();
-        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &clean()).is_ok());
         assert_eq!(args.len(), 1);
         assert_eq!(args[0].to_json(), "1");
 
         // `RejectMany` refuses two or more, and reports the real count.
         let mut args = three();
-        let err = apply_arg_fanout(ArgFanout::RejectMany, &mut args)
+        let err = apply_arg_fanout(ArgFanout::RejectMany, &mut args, &clean())
             .expect_err("three outputs must be refused");
         assert!(err.to_string().contains('3'), "err={err}");
 
         // ...but passes a lone output through untouched.
         let mut args = vec![OwnedValue::int(1)];
-        assert!(apply_arg_fanout(ArgFanout::RejectMany, &mut args).is_ok());
+        assert!(apply_arg_fanout(ArgFanout::RejectMany, &mut args, &clean()).is_ok());
         assert_eq!(args.len(), 1);
 
         // An empty argument list is never refused, under any gate: zero
@@ -53020,9 +53053,44 @@ mod tests {
         // not the "found N results" condition `RejectMany` exists to catch.
         for gate in [ArgFanout::All, ArgFanout::FirstOnly, ArgFanout::RejectMany] {
             let mut args: Vec<OwnedValue> = Vec::new();
-            assert!(apply_arg_fanout(gate, &mut args).is_ok());
+            assert!(apply_arg_fanout(gate, &mut args, &clean()).is_ok());
             assert!(args.is_empty());
         }
+    }
+
+    /// #1534: `FirstOnly` reconciles the values against the argument's own
+    /// trailing control rather than gating the values alone. An escape
+    /// anywhere in the argument clears *every* value, so the caller emits a
+    /// bare `Error`/`Break`/`Halt` instead of "first output, then raise" --
+    /// matching the pinned yq v4.53.3 (see the arm's own comment for the
+    /// captured session).
+    ///
+    /// The other two gates leave both sides alone, which is what keeps
+    /// jq mode (always `All`) and `setpath`/`delpaths` (`RejectMany`)
+    /// unaffected by this fix.
+    #[test]
+    fn first_only_gate_clears_its_values_when_the_argument_escaped_1534() {
+        let escaped = || Some(Control::Error(EvalError::new("boom")));
+
+        // Values present *and* an escape: the escape wins outright.
+        let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
+        let trailing = escaped();
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &trailing).is_ok());
+        assert!(args.is_empty(), "args={args:?}");
+        assert!(trailing.is_some(), "the control must still fire");
+
+        // No escape: the ordinary truncation still happens.
+        let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
+        let trailing = None;
+        assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args, &trailing).is_ok());
+        assert_eq!(args.len(), 1);
+
+        // `All` must not adopt the clearing behaviour -- jq mode keeps every
+        // value *and* fires the trailing control after them (#1279 rule 1).
+        let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
+        let trailing = escaped();
+        assert!(apply_arg_fanout(ArgFanout::All, &mut args, &trailing).is_ok());
+        assert_eq!(args.len(), 2);
     }
 
     /// #1537 companion: the yq-mode gates are named constructors, so mode
