@@ -318,6 +318,31 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 /// `builtin_kids` remains the sole surviving hand-maintained accessor
 /// alongside this one; nothing else duplicates the variant-to-sub-expression
 /// mapping now.
+///
+/// **The dispatch cost this now carries, not just the clone cost above**
+/// (#1506 review): every sub-expression visit goes through `f`'s vtable
+/// call, and the no-sub-expression bucket's shared `builtin.clone()` arm
+/// compiles (confirmed via release-build disassembly, not source-level
+/// guessing) to a tail call into the derived `<Builtin as Clone>::clone` --
+/// its own ~200-arm switch re-deciding the variant a second time -- rather
+/// than the old hand-written code's zero-cost direct materialization
+/// (`Builtin::Type => Builtin::Type`) for each of the 125 fieldless
+/// variants. Neither cost is new to this function; #1506 is what newly
+/// exposes both to genuinely hot per-element callers instead of only
+/// `rewrite_namespaced_calls`'s one-shot parse-time one. Measured
+/// end-to-end rather than assumed either way, per this file's own
+/// benchmarking-discipline precedent: an interleaved A/B (pre-#1506 binary
+/// vs. post) over `.[] as $x | $x | length | ... | length` chains of 20/50/
+/// 100 fieldless-builtin substitutions across 150k-500k elements -- built to
+/// maximize exposure to exactly this path -- showed no consistent,
+/// reproducible delta (each configuration's sign flipped between runs,
+/// magnitude ~1-2%, on a heavily loaded shared machine rather than one of
+/// this project's dedicated benchmark nodes). If a real regression on this
+/// path ever does surface under properly isolated measurement, the fix is
+/// narrow: give the no-sub-expression bucket its own per-variant arms
+/// (`Builtin::Type => Builtin::Type`, ...) instead of the shared
+/// `builtin.clone()`, restoring the old zero-cost path without touching the
+/// sub-expression-carrying arms at all.
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
         // --- No sub-expression (125) ---------------------------------------
@@ -870,5 +895,84 @@ mod tests {
         }));
         // Root (`Comma`) then its first child, and no further.
         assert_eq!(seen, 2);
+    }
+
+    fn find_builtin(filter: &str) -> Builtin {
+        let expr = parse(filter).expect("filter should parse");
+        let mut found = None;
+        any_subexpr(&expr, &mut |e| {
+            if let Expr::Builtin(b) = e {
+                found = Some(b.clone());
+                true
+            } else {
+                false
+            }
+        });
+        found.unwrap_or_else(|| panic!("no Builtin found in {filter:?}"))
+    }
+
+    /// #1506 review: no test exercised `map_builtin_subexprs` directly, or
+    /// cross-checked it for field *order* rather than just field *count* --
+    /// a future two/three-field variant with its fields transcribed in the
+    /// wrong order here would still compile (exhaustiveness only checks
+    /// variant coverage, not per-arm argument order) and would misbehave
+    /// identically across every one of `map_builtin_subexprs`'s three
+    /// `eval.rs` callers at once, instead of being caught by one of three
+    /// previously-independent hand-written matches disagreeing.
+    ///
+    /// Every case below is real filter syntax whose fields already hold
+    /// distinct values (`pow(2; 3)`, not `pow(2; 2)`) -- so round-tripping
+    /// through `map_builtin_subexprs` with an identity `f` (`|e| e.clone()`)
+    /// and asserting full equality against the original genuinely catches a
+    /// swap: a buggy `Pow(f(b), f(a))` on `pow(2; 3)` would reconstruct
+    /// `Pow(3, 2)`, which fails `assert_eq!` against the original `Pow(2,
+    /// 3)`. A marker that only encodes *call order* (tried first, reverted)
+    /// does not: placement tracks call order too, so `f(b)` called first
+    /// still lands wherever `f`'s first result is written, silently passing
+    /// even when the fields themselves are transposed.
+    #[test]
+    fn map_builtin_subexprs_preserves_field_order() {
+        let two_field_cases = [
+            r#"sub("a"; "b")"#,   // Sub(re, repl)
+            "pow(2; 3)",          // Pow(a, b)
+            "atan2(2; 3)",        // Atan2(a, b)
+            "at_position(1; 2)",  // AtPosition(line, col)
+            r#"test("a"; "g")"#,  // TestFlags(re, flags)
+            "any(inputs; . > 1)", // AnyCond(source, cond)
+            "INDEX(inputs; .)",   // UpperIndexStream(source, key)
+            "IN(inputs; .)",      // UpperInSrc(source, target)
+            "setpath([0]; 1)",    // SetPath(path, value)
+        ];
+        for filter in two_field_cases {
+            let builtin = find_builtin(filter);
+            let mut calls = 0usize;
+            let result = map_builtin_subexprs(&builtin, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, 2, "expected exactly 2 sub-expressions in {filter:?}");
+            assert_eq!(
+                result, builtin,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
+
+        let three_field_cases = [
+            r#"sub("a"; "b"; "g")"#,  // SubFlags(re, repl, flags)
+            r#"gsub("a"; "b"; "g")"#, // GsubFlags(re, repl, flags)
+        ];
+        for filter in three_field_cases {
+            let builtin = find_builtin(filter);
+            let mut calls = 0usize;
+            let result = map_builtin_subexprs(&builtin, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, 3, "expected exactly 3 sub-expressions in {filter:?}");
+            assert_eq!(
+                result, builtin,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
     }
 }
