@@ -10,7 +10,7 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
-use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors, KeyHashes};
+use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors};
 use succinctly::jq::eval_generic::{
     eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
 };
@@ -634,14 +634,21 @@ fn span_fingerprint(raw: &[u8]) -> u64 {
 ///
 /// Small objects -- nearly every object in a real document -- take the
 /// pairwise branch, which allocates nothing. Above the threshold the
-/// pairwise loop is quadratic, so the wide case probes a [`KeyHashes`]
-/// table instead: one hash and about 1.5 slot reads per key, against the
-/// `Vec<&[u8]>`-plus-`sort_unstable` this replaced, whose every comparison
-/// chased a pointer into a random offset of the document text. That sort
-/// was the whole of #1514's identity-path regression -- 59 ns per key on a
-/// 10 MB document with a wide root object.
+/// pairwise loop is quadratic, so the wide case sorts one 64-bit hash per
+/// key and looks for an adjacent pair.
 ///
-/// Above the threshold the answer is conservative: two distinct keys
+/// It sorts *hashes*, not the spans it used to (#1514). Sorting `&[u8]`
+/// meant every comparison chased a pointer into a random offset of the
+/// document text, which cost 59-85 ns per key on a 10 MB document with a
+/// wide root object. Sorting `u64`s compares registers over one contiguous
+/// array, half the width of the fat pointers it replaces.
+///
+/// An open-addressed table was tried here and is *not* what shipped: it
+/// beat the sort on an M4 Pro and lost to it by 24% on a 7950X at 100 MB,
+/// where 7.1M keys make the table 134 MB against 32 MB of L3 per CCD. A
+/// sort streams; a table does not. See `docs/plan/jq-duplicate-key-collapse.md`.
+///
+/// The answer above the threshold is conservative: two distinct keys
 /// sharing a 64-bit hash report `true`. [`collapse_duplicate_fields`]
 /// resolves it on the spans themselves and returns `None` when nothing
 /// actually collapsed, so a collision costs one exact rebuild.
@@ -656,10 +663,9 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
                 .any(|j| marks[i] == marks[j] && prepared[i].raw == prepared[j].raw)
         });
     }
-    let mut seen = KeyHashes::with_capacity(prepared.len());
-    prepared
-        .iter()
-        .any(|field| seen.insert(key_hash(field.raw)))
+    let mut hashes: Vec<u64> = prepared.iter().map(|field| key_hash(field.raw)).collect();
+    hashes.sort_unstable();
+    hashes.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 /// jq's duplicate-key rule over an object's already-walked fields (#1385):

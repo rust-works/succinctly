@@ -650,19 +650,21 @@ fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, 
     key_hash_of(&field.key)
 }
 
-/// An open-addressed set of key hashes: "has any key repeated?" in one
-/// pass, no sort, no key text kept.
+/// An open-addressed set of key hashes: "have I seen this one?" answered
+/// as a walk goes, without holding the keys.
 ///
-/// This replaces the sort-then-scan shape #1385 shipped (#1514). Sorting
-/// is O(n log n) with a comparison per step; on a wide object it dominated
-/// the walk it was guarding -- and the printer's variant sorted *byte
-/// slices*, chasing a pointer into a random offset of the document on
-/// every comparison. Probing costs one hash and about 1.5 slot reads per
-/// key, and the slots are one contiguous array.
+/// **Only for a caller that cannot sort.** Every batch site here hashes
+/// into a `Vec<u64>` and sorts instead, because a sort streams and a table
+/// does not: at 7.1M keys the table is 134 MB, and on a 7950X -- 32 MB of
+/// L3 per CCD -- that cost 24% on the identity path where the sort cost
+/// nothing. An M4 Pro absorbed it and preferred the table, which is the
+/// architecture split CLAUDE.md warns memory-bound results carry. The one
+/// caller that keeps it is [`DistinctKeyCursors`], which must answer per
+/// key as it streams and has nothing to sort yet.
 ///
 /// The table holds hashes only -- 8 bytes per slot, never a key -- so it
-/// stays a fraction of what materializing the fields would cost, and it
-/// can grow by rehashing what it already has.
+/// can grow by rehashing what it already has, which is what a streaming
+/// caller with no count up front needs.
 ///
 /// [`insert`](Self::insert) is deliberately **conservative**: it reports a
 /// repeat when two keys merely share a 64-bit hash, which for distinct
@@ -781,6 +783,34 @@ impl Default for KeyHashes {
     }
 }
 
+/// The sorted, deduplicated hashes that occur more than once in `sorted`,
+/// plus how many distinct hash values it holds in total.
+///
+/// `sorted` must already be sorted ascending; the returned list is too, so
+/// callers can `binary_search` it.
+fn shared_hashes(sorted: &[u64]) -> (Vec<u64>, usize) {
+    let mut shared = Vec::new();
+    let mut distinct = 0usize;
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j] == sorted[i] {
+            j += 1;
+        }
+        distinct += 1;
+        if j - i > 1 {
+            shared.push(sorted[i]);
+        }
+        i = j;
+    }
+    (shared, distinct)
+}
+
+/// Whether an already-sorted hash list holds the same value twice.
+fn hashes_repeat(sorted: &[u64]) -> bool {
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
+}
+
 /// Number of distinct values in an already-sorted slice, and whether any
 /// value occurs more than once.
 fn distinct_sorted(sorted: &[String]) -> (usize, bool) {
@@ -847,22 +877,15 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
         }
         walk = rest;
     }
-    let mut seen = KeyHashes::with_capacity(hashes.len());
-    let mut shared: Vec<u64> = Vec::new();
-    for hash in hashes {
-        if seen.insert(hash) {
-            shared.push(hash);
-        }
-    }
+    hashes.sort_unstable();
+    let (shared, distinct_hashes) = shared_hashes(&hashes);
     if shared.is_empty() {
         return KeyCensus {
-            distinct: seen.len(),
+            distinct: distinct_hashes,
             unkeyed,
             repeated: false,
         };
     }
-    shared.sort_unstable();
-    shared.dedup();
 
     // A shared hash is nearly always a genuine repeat, but two different
     // keys can collide, and counting those as one would be wrong. Re-walk
@@ -886,10 +909,10 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     colliding.sort_unstable();
     let (distinct_colliding, repeated) = distinct_sorted(&colliding);
     KeyCensus {
-        // `seen.len()` counts distinct *hashes*; every colliding group
-        // contributed exactly one of them, so swap each group's single
-        // hash for however many distinct keys it actually held.
-        distinct: seen.len() - shared.len() + distinct_colliding,
+        // `distinct_hashes` counts distinct *hashes*; every colliding
+        // group contributed exactly one of them, so swap each group's
+        // single hash for however many distinct keys it actually held.
+        distinct: distinct_hashes - shared.len() + distinct_colliding,
         unkeyed,
         repeated,
     }
@@ -913,10 +936,9 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
     if fields.len() < 2 {
         return false;
     }
-    let mut seen = KeyHashes::with_capacity(fields.len());
-    fields
-        .iter()
-        .any(|field| field_key_hash(field).is_some_and(|hash| seen.insert(hash)))
+    let mut hashes: Vec<u64> = fields.iter().filter_map(field_key_hash).collect();
+    hashes.sort_unstable();
+    hashes_repeat(&hashes)
 }
 
 /// Apply the evaluation mode's duplicate-key rule to an object's fields.
@@ -1110,11 +1132,9 @@ pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<Stri
     if !collapse {
         return keys;
     }
-    let mut probe = KeyHashes::with_capacity(keys.len());
-    if !keys
-        .iter()
-        .any(|key| probe.insert(key_hash(key.as_bytes())))
-    {
+    let mut hashes: Vec<u64> = keys.iter().map(|key| key_hash(key.as_bytes())).collect();
+    hashes.sort_unstable();
+    if !hashes_repeat(&hashes) {
         return keys;
     }
     let mut seen: IndexSet<String> = IndexSet::with_capacity(keys.len());
