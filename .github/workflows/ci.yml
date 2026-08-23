@@ -486,6 +486,53 @@ jobs:
           name: benchmark-results-${{ matrix.arch }}
           path: bench-*.txt
 
+  # Instruction-count regression guard (#1523): `bench` above times
+  # `rank_select` and uploads artifacts nobody compares against a baseline --
+  # #1385's 2-3x jq slowdown shipped through it unnoticed. Wall-clock timing
+  # on a shared runner is the wrong mechanism (too noisy for a threshold
+  # tight enough to matter); `valgrind --tool=cachegrind` counts instructions
+  # instead, which is deterministic regardless of runner noise. Not run on
+  # macOS: valgrind has no Apple Silicon support at all. Not run in the merge
+  # queue for the same reason `bench` isn't (see its own `if`, above).
+  perf-guard:
+    name: Perf Regression Guard (${{ matrix.name }})
+    needs: gate
+    if: needs.gate.outputs.code == 'true' && github.event_name != 'merge_group'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+          - name: ARM64-Linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.name }}-perf-guard-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build release binary
+        run: cargo build --release --features cli
+
+      - name: Run perf guard
+        run: python3 scripts/perf-guard.py --binary target/release/succinctly --arch "${{ matrix.name }}" --check
+
   clippy:
     name: Clippy
     needs: gate
