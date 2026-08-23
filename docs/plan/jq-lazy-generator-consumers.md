@@ -842,14 +842,14 @@ pass it through via their existing `other => other` fallthrough — is unaffecte
 
 ### What changes
 
-| Stage | New code                                                                                                                                      | Function bodies changed |
-|-------|-----------------------------------------------------------------------------------------------------------------------------------------------|-------------------------|
-| 1     | none (tests only)                                                                                                                             | none                    |
-| 2     | `Demand`, `Item`, `Flow`, `eval_each`, `eval_each_pipe`, `eval_each_owned`, `drain_result`, `collect_each` — ~250 lines in a 46,898-line file | 10                      |
-| 2b    | one narrowing arm in `eval_generic.rs`                                                                                                        | 1                       |
-| 3     | `Builtin::PathsFilter` lazy arm                                                                                                               | 2                       |
-| 4     | demand-aware outer loop                                                                                                                       | 3                       |
-| 5     | six new arms (`each_if`, `each_try`, `each_label`, `each_as`, `each_as_pattern`, `each_pattern_alternatives`, `each_limit`) + one inline arm  | `eval_each` only        |
+| Stage | New code                                                                                                                                                                                       | Function bodies changed |
+|-------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------|
+| 1     | none (tests only)                                                                                                                                                                              | none                    |
+| 2     | `Demand`, `Item`, `Flow`, `eval_each`, `eval_each_pipe`, `eval_each_owned`, `drain_result`, `collect_each` — ~250 lines in a 46,898-line file                                                  | 10                      |
+| 2b    | one narrowing arm in `eval_generic.rs`                                                                                                                                                         | 1                       |
+| 3     | `Builtin::PathsFilter` lazy arm                                                                                                                                                                | 2                       |
+| 4     | demand-aware outer loop                                                                                                                                                                        | 3                       |
+| 5     | six new arms (`each_if`, `each_try`, `each_label`, `each_as`, `each_as_pattern`, `each_limit`; `each_pattern_alternatives` is a helper of `each_as_pattern`, not its own arm) + one inline arm | `eval_each` only        |
 
 ### What does **not** change
 

@@ -1934,7 +1934,7 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 ///
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
 /// (#987, Stage 3), `Compare` (#1459, Stage 4), and -- #1462, Stage 5 --
-/// `If`, `Try`/`Optional`, `Label`, `AsPattern`, `FuncDef` and `Limit`.
+/// `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern`, `FuncDef` and `Limit`.
 /// Everything else falls back to `eval_single` + [`drain_result`]. `Paren`
 /// is not optional cosmetics: `isempty(...)` consumes only its own
 /// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
