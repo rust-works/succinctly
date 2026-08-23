@@ -539,11 +539,13 @@ still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
 of [ADR-0018](../../adrs/adr-0018.md): no dependency in the `regex`/`regex-automata` stack
-expresses oniguruma's search policies, and every alternative that does (`onig`, `pcre2`,
-`fancy-regex`) costs more than closing #920/#922 is worth. `l` (POSIX leftmost-longest) is
-accepted as valid flag syntax but has no effect; `n` (suppress empty matches) still misses a
-non-empty match reachable only by backtracking to a different alternative — lazy
-quantifiers (`a*?`) and alternations with an empty-matching branch listed first (`(?:|a)`).
+expresses oniguruma's search policies, and of the alternatives evaluated, the ones that do
+(`onig`, `pcre2`) cost more than closing #920/#922 is worth (both are C FFI, breaking pure-
+`cargo build` portability), while the one that doesn't cost that (`fancy-regex`) closes
+neither gap at all. `l` (POSIX leftmost-longest) is accepted as valid flag syntax but has
+no effect; `n` (suppress empty matches) still misses a non-empty match reachable only by
+backtracking to a different alternative — lazy quantifiers (`a*?`) and alternations with an
+empty-matching branch listed first (`(?:|a)`).
 
 Both gaps route through `first_captures`/`global_captures`/`next_match_step`
 (`src/jq/eval.rs`), the one choke point every regex builtin shares, so the divergence is
