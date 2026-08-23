@@ -569,11 +569,15 @@ greedy quantifiers and non-empty-first alternation are unaffected and agree with
 `[scan("a*";"gn")]` on `"xaab"` is `["aa"]` in both, and `[match("(?:a|)";"gn").string]` on
 `"xa"` is `["a"]` in both.
 
-Unlike every other section on this page, this divergence is **not** tracked by
+Like [Where succinctly errors and jq does not](#where-succinctly-errors-and-jq-does-not)
+above, this divergence is **not** tracked by
 [`tests/data/jq-error-known-divergences.txt`](../../../tests/data/jq-error-known-divergences.txt) —
-that corpus pins probes where jq *errors* and succinctly does not; here jq returns a value
-and succinctly returns a different one, so there is no error message for the two-sided
-check to pin. This section is hand-maintained instead, the same caveat
+that corpus pins probes where jq *errors* and succinctly does not, so it is blind to any
+shape where jq itself doesn't error. That section's shape is succinctly erroring where jq
+returns a value; this one is a third shape neither of the two error-corpus-driven sections
+covers — both jq and succinctly return a value, exit 0, with empty stderr, and the values
+just disagree. Both sections are hand-maintained for the same reason: no error message
+exists for the two-sided check to pin, the same caveat
 [ADR-0018](../../adrs/adr-0018.md)'s Consequences already record for
 [yq Limitations](../yq/limitations.md).
 
