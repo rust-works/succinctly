@@ -26767,8 +26767,19 @@ mod remaining_inputs {
         CURRENT.with(Cell::get)
     }
 
-    pub fn last_line() -> u32 {
-        LAST_LINE.with(Cell::get)
+    /// `None` when the last-popped document carries [`UNKNOWN_LINE`] (no
+    /// real EOF position, e.g. a dropped `--seq -s` trailing record, #1542)
+    /// instead of a real line -- checked once, here, rather than leaving it
+    /// to whichever caller remembers to compare against the sentinel (#1549:
+    /// `input_line_number` didn't, and reported the raw sentinel verbatim).
+    /// This is `last_line`'s only caller crate-wide, so folding the check in
+    /// here costs nothing and makes "unknown" a type-level fact instead of a
+    /// convention.
+    pub fn last_line() -> Option<u32> {
+        match LAST_LINE.with(Cell::get) {
+            UNKNOWN_LINE => None,
+            line => Some(line),
+        }
     }
 }
 
@@ -26975,18 +26986,13 @@ fn builtin_input_line_number<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() ->
     }
     #[cfg(feature = "std")]
     {
-        // #1549: the most recently popped document can carry
-        // `remaining_inputs::UNKNOWN_LINE` (no real EOF position at all,
-        // e.g. `--seq -s`'s trailing-record drop) rather than a real line --
-        // report real jq's own answer for "no line known yet" (`0`, the
-        // same value this builtin already reports before anything has been
-        // read) instead of the raw sentinel.
-        let line = remaining_inputs::last_line();
-        let reported = if line == remaining_inputs::UNKNOWN_LINE {
-            0
-        } else {
-            line
-        };
+        // #1549: the most recently popped document can carry no real EOF
+        // position at all (e.g. `--seq -s`'s trailing-record drop) --
+        // `last_line` already maps that to `None`; report real jq's own
+        // answer for "no line known yet" (`0`, the same value this builtin
+        // already reports before anything has been read) instead of the
+        // raw sentinel it used to leak.
+        let reported = remaining_inputs::last_line().unwrap_or(0);
         QueryResult::Owned(OwnedValue::Int(reported as i64))
     }
     #[cfg(not(feature = "std"))]
