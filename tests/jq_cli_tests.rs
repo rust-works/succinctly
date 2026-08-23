@@ -7041,10 +7041,10 @@ fn test_ltrimstr_fanout_emits_its_prefix_then_halts_1277() -> Result<()> {
     // The inverted case -- where the builtin's *own* error fires on the first
     // argument output and outranks the halt entirely, so jq exits 5 with no
     // prefix at all -- is pinned by the `setpath_own_error_outranks_trailing_halt`
-    // golden rather than here. `setpath` still collapses its argument (Stage 7
-    // of docs/plan/jq-generator-argument-fanout.md), so that golden is
-    // currently a known failure; when it flips, it is what stops a future
-    // "always emit the prefix, then halt" simplification from passing.
+    // golden rather than here (also asserted directly by
+    // `test_setpath_own_error_outranks_trailing_halt_1279` below). It exists
+    // to stop a future "always emit the prefix, then halt" simplification
+    // from passing.
     Ok(())
 }
 
