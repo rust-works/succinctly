@@ -5536,6 +5536,26 @@ fn test_comma_path_context_skips_unreached_later_branch_side_effects_1409() -> R
     Ok(())
 }
 
+/// Coverage-gap regression (#1409 code review): `continue_rest_with_context`'s
+/// `ManyOwned` branch mid-loop `return stop` was previously only reached via
+/// `Comma`'s own (now-removed) call into this helper; nothing else in this
+/// test suite happened to feed it a multi-valued intermediate whose `rest`
+/// continuation stops partway through. Exercises the same line through
+/// `If`'s still-`continue_rest_with_context`-based tail instead: `(1,2)`
+/// (the taken branch) fans out to a `ManyOwned` intermediate, and `rest`
+/// (`error("stop")`) fails on the very first of those two values.
+#[test]
+fn test_if_path_context_many_owned_continuation_stops_mid_loop_1409() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(
+        &[".a | if key then (1,2) else 3 end | error(\"stop\")"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert!(stderr.contains("stop"), "stderr: {stderr}");
+    assert_eq!(code, 5);
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::Array` arm (#1302), so `[key]` --
 /// semantically equivalent to `(key,key)`'s single-branch case, just
 /// array-wrapped instead of comma-joined -- silently lost path context and
