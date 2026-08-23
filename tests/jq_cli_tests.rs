@@ -19457,9 +19457,43 @@ fn test_owned_pipe_stage_ahead_of_comma_stays_lazy() -> Result<()> {
         "every document must still be processed"
     );
 
-    let (stdout, _, code) = run_jq_full(&["-cn", r#"limit(1; 1 | (1, ("B"|stderr)))"#], None)?;
+    // #1461: `first` closed the same way -- `eval_each_generic`'s `Pipe` arm
+    // bridges the computed `1 |` prefix into `eval::eval_each_owned`, so the
+    // discarded `input` branch is never evaluated here either.
+    let (stdout, _, code) = run_jq_full(&["-c", "[first(1|(1,input)), .id]"], Some(DOCS))?;
     assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "[1,1]\n[1,2]\n[1,3]\n[1,4]\n",
+        "every document must still be processed"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-cn", r#"limit(1; 1 | (1, ("B"|stderr)))"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "1\n");
+
+    Ok(())
+}
+
+/// `first((1,2) | input)` -- issue #1461's third reported symptom (a
+/// spurious `jq: error (at <stdin>:0): break`, exit 5) -- already matches jq
+/// exactly by the time #1461's `eval_each_generic` mirror landed, confirmed
+/// live against jq 1.7.1. Not a shape #1461 needed to fix; pinned here so a
+/// future change to this machinery cannot silently reintroduce the leak.
+///
+/// `first` stops after its very first output: `(1,2) | input` yields `1 |
+/// input`'s pop first, which `first` accepts immediately, so `input` is
+/// popped exactly once per successful `first(...)` -- comma sibling `2` is
+/// never tried. That is one document consumed beyond the driving one, so two
+/// starting documents (1 and 3) each pull a neighbor (2 and 4) and produce a
+/// row; jq's own generator-based `first` behaves identically.
+#[test]
+fn test_first_over_comma_then_input_matches_jq_1461() -> Result<()> {
+    const DOCS: &str = r#"{"id":1} {"id":2} {"id":3} {"id":4}"#;
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[first((1,2) | input), .id]"], Some(DOCS))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"id\":2},1]\n[{\"id\":4},3]\n");
+    assert_eq!(stderr, "");
 
     Ok(())
 }
