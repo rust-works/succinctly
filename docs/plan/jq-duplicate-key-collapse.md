@@ -540,7 +540,7 @@ reporting both rather than one.
 
 1. ~~**The 4-6% wants confirming on the pinned hosts.**~~ **Closed by
    [#1514](https://github.com/rust-works/succinctly/issues/1514), and the answer was not 4-6%.**
-   On both pinned hosts the detector cost up to **+134%** on a document holding one wide
+   On both pinned hosts the detector cost up to **+141%** on a document holding one wide
    object — none of whose objects carries a repeated key. The laptop figure was low for two
    reasons this risk named only half of: the machine, and the *workload*. See "What the
    detector cost, and how it was made cheap" below.
