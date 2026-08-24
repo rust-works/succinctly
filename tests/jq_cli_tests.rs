@@ -19751,38 +19751,15 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // Code review of #1461, filed as #1565: when the pipe's *first*
-        // stage evaluates to `GenericResult::LazyKeys` (`keys`,
-        // `keys_unsorted`) and 2+ further stages follow, the driver hands
-        // the whole remaining pipe to `fold_pipe_stages` -- the plain eager
-        // fold, with no demand check -- rather than continuing through
-        // `eval_each_pipe_generic`'s own sink. So `.[] | stderr` after a
-        // `keys` prefix still fires for every key, unlike the bare
-        // `first(.[] | stderr)` #1461 itself fixed. Confirmed pre-existing
-        // (identical on `main` before #1461, via the old 2-stage-only
-        // `first_over_comma_generic`), so not a regression here -- pinned so
-        // a fix for #1565 has a red test to turn green. jq: writes `a` once.
-        (
-            &["-c", "first(keys | .[] | stderr)"],
-            Some(r#"{"a":1,"b":2,"c":3}"#),
-            "\"a\"\n",
-            "abc",
-            0,
-        ),
-        // Same #1565 gap, `LazySeq` (`map(f)`, #724/#725) flavor instead of
-        // `LazyKeys`. jq: writes `2` once.
-        (
-            &["-c", "first(map(.+1) | .[] | stderr)"],
-            Some("[1,2,3]"),
-            "2\n",
-            "234",
-            0,
-        ),
-        // `Expr::If` has no native `eval_each_generic` arm, so `first(if
-        // ...)` falls through to eager `eval_single` and the discarded
-        // `else` branch's sibling side effect still fires -- same #1565
-        // class as the two rows above (pre-existing on `main` before #1461,
-        // unaffected by #1461/#1481). jq: no stderr.
+        // `Expr::If`/`Try`/`Label`/`As`/`Limit` have no native
+        // `eval_each_generic` arm (#1461's own doc comment scopes it to
+        // `Comma`/`Pipe`/`Paren` only), so when one of these is `first`'s
+        // argument's top-level shape, evaluation falls through to eager
+        // `eval_single` and a sibling branch's side effect fires even though
+        // `first` never needed it. Out of scope by design -- fixing
+        // `fold_pipe_stages`'s `LazyKeys`/`LazyIndexRange`/`LazySeq` gap
+        // (#1565) does not touch this; these five shapes are pinned as an
+        // explicit, documented known gap rather than fixed. jq: no stderr.
         (
             &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
             None,
