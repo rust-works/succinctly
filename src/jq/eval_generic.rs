@@ -6690,6 +6690,73 @@ mod tests {
     }
 
     #[test]
+    fn test_generic_first_pipe_iterate_after_lazy_stops_at_one_element_1565() {
+        // Durable, non-flaky proxy for #1565's perf claim: a later element
+        // that would *error* if evaluated proves it was never pulled, the
+        // same technique `test_generic_lazy_seq_first_after_map_skips_later_error_725`
+        // uses -- a wall-clock assertion would be flaky, this instead pins
+        // the *shape* of laziness. Covers all three lazy sources
+        // `fold_pipe_stages_sink` fans out over, plus the `keys` (sorted)
+        // case, which routes through owned strings instead of cursors.
+
+        // `LazySeq` (`map(f)`, #724/#725): `"x" + 1` on the second element
+        // would error if `first`'s `.[] | ...` tail ever pulled past the
+        // first mapped element.
+        let json = br#"[1, "x", "y"]"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse("first(map(. + 1) | .[] | (. + 100))").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Int(102)
+        );
+
+        // `LazyIndexRange` (an array's own `keys`/`keys_unsorted`, #684):
+        // `error` on index `2` would fire if the iterate-after-`keys` tail
+        // ever pulled past the first index.
+        let json = br"[10, 20, 30]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr =
+            crate::jq::parse(r#"first(keys | .[] | (if . == 2 then error("touched") else . end))"#)
+                .unwrap();
+        assert_eq!(eval(&expr, value).into_owned().unwrap(), OwnedValue::Int(0));
+
+        // `LazyKeys { sorted: false }` (`keys_unsorted`): document order is
+        // `"z"`, `"a"` -- `error` on `"a"` would fire if the tail pulled
+        // past the first (document-order-first) key.
+        let json = br#"{"z": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse(
+            r#"first(keys_unsorted | .[] | (if . == "a" then error("touched") else . end))"#,
+        )
+        .unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("z".to_string())
+        );
+
+        // `LazyKeys { sorted: true }` (`keys`): lexicographic order is
+        // `"a"`, `"z"` -- `error` on `"z"` would fire if the tail pulled
+        // past the first (lexicographically-first) key. Exercises the
+        // owned-string element path (`keys` doesn't preserve a cursor for
+        // sorted keys, matching `materialize_lazy_keys`'s existing
+        // behaviour), not the cursor path the other three cases exercise.
+        let json = br#"{"z": 1, "a": 2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = crate::jq::parse(
+            r#"first(keys | .[] | (if . == "z" then error("touched") else . end))"#,
+        )
+        .unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::String("a".to_string())
+        );
+    }
+
+    #[test]
     fn test_generic_lazy_seq_composability_keys_unsorted_map_select_724() {
         // The actual point of this design: `keys_unsorted | map(f) | select(g)`
         // stays lazy through the `map` stage, materializes once at `select`.
