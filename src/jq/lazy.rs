@@ -25,7 +25,7 @@ use std::borrow::Cow;
 
 use crate::json::light::{JsonCursor, StandardJson};
 
-use super::document::DistinctKeyCursors;
+use super::document::{effective_len, DistinctKeyCursors};
 
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
@@ -376,9 +376,7 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             // No wildcard covers this case: without this arm,
             // `keys_unsorted | length` reaching `JqValue` directly would
             // silently answer `None` instead of the field count.
-            JqValue::LazyKeysArray { fields, collapse } => {
-                Some(DistinctKeyCursors::new(fields, *collapse).count())
-            }
+            JqValue::LazyKeysArray { fields, collapse } => Some(effective_len(fields, *collapse)),
             // No wildcard covers this case either, for the same reason as
             // `LazyKeysArray` above: without it, `keys_unsorted | length` on
             // an array reaching `JqValue` directly would silently answer
