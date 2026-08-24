@@ -3130,14 +3130,30 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             // already-correct, arbitrary-length-pipe-aware demand driver
             // rather than re-deriving its cursor-threading logic here
             // (#1503).
+            //
+            // These three hand off `&stages[j..]`, NOT `rest`: `current` is
+            // the value *entering* `stages[j]`, since only the lazy arms
+            // above consume `expr` (they are the arms that assign back to
+            // `current` and fall through to `j += 1`). Handing off `rest`
+            // here silently skipped `stages[j]` altogether -- `first(keys |
+            // length | tostring)` printed `3` instead of `"3"` -- so the
+            // `stages[j..]` the `other` arm below already used is the
+            // correct slice for every non-folding arm. Pinned by
+            // `test_first_over_lazy_prefix_applies_every_stage_1565`.
             GenericResult::One(v) => {
-                return eval_each_pipe_generic::<S, V>(rest, v, optional, None, sink);
+                return eval_each_pipe_generic::<S, V>(&stages[j..], v, optional, None, sink);
             }
             GenericResult::OneCursor(c) => {
-                return eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink);
+                return eval_each_pipe_generic::<S, V>(
+                    &stages[j..],
+                    c.value(),
+                    optional,
+                    Some(c),
+                    sink,
+                );
             }
             GenericResult::Owned(o) => {
-                let rest_pipe = Expr::Pipe(rest.to_vec());
+                let rest_pipe = Expr::Pipe(stages[j..].to_vec());
                 return eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
                     sink(GenericItem::Owned(o))
                 });
@@ -3150,18 +3166,23 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             | GenericResult::Halt(_)) => {
                 return drain_result_generic(terminal, sink);
             }
-            // Unreachable from this function's only entry points
-            // (`eval_each_pipe_generic`'s Lazy* driver arm and
-            // `continue_pipe_element_generic`'s own Lazy* arm, both of which
-            // always start here with a `LazyKeys`/`LazyIndexRange`/`LazySeq`
-            // `current`): nothing above ever assigns `Many`/`ManyCursor`/
-            // `ManyOwned`/`Partial` to `current` mid-loop, since the only
-            // stage shape that can fan out (`Expr::Iterate`) is intercepted
-            // above and returns immediately instead of falling through to
-            // the generic match. Kept as a safety net (degrading to the
-            // eager fold) rather than `unreachable!()`, so a future caller
-            // that *does* reach this some other way gets correct-but-less-
-            // lazy behavior instead of a panic.
+            // Genuinely reachable, not a safety net -- do not turn this
+            // into `unreachable!()`. `Expr::Iterate` is not the only stage
+            // shape that can fan out: `fold_lazy_keys_stage`'s own
+            // materializing `_` fallback hands `expr` to `eval_on_owned`,
+            // which returns `ManyOwned` for any multi-output stage that
+            // isn't one of the native fast paths. `first(keys | .[0,1] |
+            // stderr)` is the shortest witness -- `.[0,1]` is an
+            // `Expr::IndexExpr` with a `Comma` key, so it lands here with
+            // `current` already a two-element `ManyOwned`.
+            //
+            // Folding the rest eagerly from here is a deliberate
+            // correct-but-less-lazy fallback: once a stage has already
+            // fanned out into a materialized `Vec`, its side effects have
+            // all fired anyway, so there is no demand left to honor for
+            // *that* stage. Pinned by
+            // `test_first_over_lazy_prefix_applies_every_stage_1565`'s
+            // `.[0,1]` row.
             other => {
                 return drain_result_generic(
                     fold_pipe_stages::<S, V>(other, &stages[j..], optional),

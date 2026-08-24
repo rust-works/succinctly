@@ -19286,6 +19286,119 @@ fn test_first_over_pipe_prefix_dispatches_every_generic_result_shape_1451() -> R
     Ok(())
 }
 
+/// #1565 review: `fold_pipe_stages_sink`'s `One`/`OneCursor`/`Owned` arms
+/// handed the remaining pipe off as `stages[j + 1..]` while `current` was
+/// still the value *entering* `stages[j]`, so the stage that produced that
+/// single value was silently dropped -- wrong output, no error, in both
+/// modes (`first(keys | length | tostring)` printed `3`, not `"3"`).
+///
+/// Nothing in the suite caught it: #1565's own rows all end in a fan-out
+/// (`.[] | stderr`), which the `Expr::Iterate` interception handles before
+/// the buggy arms are ever reached. Each row here instead makes the *middle*
+/// stage collapse a lazy prefix to a single value, then puts a further stage
+/// behind it whose output differs observably from its input -- a stage that
+/// merely passed its input through would not distinguish "applied" from
+/// "skipped".
+///
+/// Covers all three collapsing arms (`Owned` via `length`, `OneCursor` via
+/// `first`/`last`/`.[n]`, and the `ManyOwned` fall-through to the eager
+/// `fold_pipe_stages`) across all three lazy sources (`LazyKeys` sorted and
+/// unsorted, `LazyIndexRange`, `LazySeq`). Every expectation is jq 1.7.1's.
+#[test]
+fn test_first_over_lazy_prefix_applies_every_stage_1565() -> Result<()> {
+    let cases: &[(&[&str], Option<&str>, &str)] = &[
+        // `LazyKeys{sorted}` -> `Owned` (`length`) -> a further stage.
+        (
+            &["-c", "first(keys | length | tostring)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"3\"\n",
+        ),
+        // `LazyKeys{sorted}` -> `OneCursor` (`first`) -> a further stage.
+        (
+            &["-c", "first(keys | first | ascii_upcase)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"A\"\n",
+        ),
+        // `LazyKeys{sorted}` -> `OneCursor` (`last`) -> a further stage.
+        (
+            &["-c", "first(keys | last | ascii_upcase)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"C\"\n",
+        ),
+        // `LazyKeys{sorted}` -> `OneCursor` (`.[n]`) -> a further stage.
+        (
+            &["-c", "first(keys | .[1] | ascii_upcase)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"B\"\n",
+        ),
+        // `LazyKeys{!sorted}`: the cons-list walk rather than decode+sort.
+        (
+            &["-c", "first(keys_unsorted | first | ascii_upcase)"],
+            Some(r#"{"b":1,"a":2}"#),
+            "\"B\"\n",
+        ),
+        // Four stages, so the hand-off target is itself a multi-stage pipe
+        // rather than a single trailing expression.
+        (
+            &["-c", "first(keys | first | ascii_upcase | . + \"!\")"],
+            Some(r#"{"a":1,"b":2}"#),
+            "\"A!\"\n",
+        ),
+        // `LazyIndexRange` (an array's own `keys`, #684) -> `Owned`.
+        (
+            &["-c", "first(keys | length | . + 1)"],
+            Some("[9,9,9]"),
+            "4\n",
+        ),
+        // `LazyIndexRange` -> `Owned` (`.[n]`, synthetic index, no cursor).
+        (
+            &["-c", "first(keys | .[0] | . + 1)"],
+            Some("[9,9,9]"),
+            "1\n",
+        ),
+        // `LazySeq` (#724/#725) -> `Owned` via the pull-one-and-stop
+        // `first` fast path -> a further stage.
+        (
+            &["-c", "first(map(.+1) | first | . + 100)"],
+            Some("[1,2,3]"),
+            "102\n",
+        ),
+        // `LazySeq` -> `Owned` via `length`'s count-and-discard arm.
+        (
+            &["-c", "first(map(.+1) | length | tostring)"],
+            Some("[1,2,3]"),
+            "\"3\"\n",
+        ),
+        // Two collapsing stages back to back, so the second one folds from
+        // a `current` the first already replaced.
+        (
+            &["-c", "first(keys | map(.) | length | tostring)"],
+            Some(r#"{"a":1,"b":2}"#),
+            "\"2\"\n",
+        ),
+        // The `other` arm: `.[0,1]` is an `Expr::IndexExpr` with a `Comma`
+        // key, so `fold_lazy_keys_stage`'s materializing fallback returns
+        // `ManyOwned` mid-loop -- the shape that arm's comment once called
+        // unreachable. It must still apply the trailing stage.
+        (
+            &["-c", "[first(keys | .[0,1] | ascii_upcase)]"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "[\"A\"]\n",
+        ),
+    ];
+
+    for (args, stdin, want_out) in cases {
+        let (stdout, stderr, code) = run_jq_full(args, *stdin)?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*want_out, 0),
+            "`{}` -- stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// #1519, found while implementing #1462's own oracle sweep: real jq's
 /// short-circuiting builtins are macro-expanded `label $out | ... break
 /// $out` definitions, and its `?//`-alternatives operator retries the next
