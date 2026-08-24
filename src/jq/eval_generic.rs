@@ -22,8 +22,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, effective_fields, effective_keys, effective_len, DistinctKeyCursors,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    collapsed_fields, collapsed_fields_if, effective_fields, effective_keys, effective_len,
+    DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
+    IndentSpec,
 };
 use super::eval::{
     apply_compare_op, collapse_vec, eval as full_eval, eval_each_owned, format_owned,
@@ -2680,52 +2681,49 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
             // above; positive indices skip straight to the
             // walk. Out-of-bounds is `null`, never an error
             // (#307), matching that same arm.
-            let collapsed = if collapse {
-                collapsed_fields(&fields)
-            } else {
-                None
-            };
+            let collapsed = collapsed_fields_if(&fields, collapse);
             if let Some(eff) = collapsed {
                 let target = if *idx < 0 {
                     usize::try_from(eff.len() as i64 + idx).ok()
                 } else {
                     Some(*idx as usize)
                 };
-                return match target.and_then(|t| eff.into_iter().nth(t)) {
+                match target.and_then(|t| eff.into_iter().nth(t)) {
                     Some(field) => GenericResult::OneCursor(field.key_cursor),
                     None => GenericResult::Owned(OwnedValue::Null),
-                };
-            }
-            let target = if *idx < 0 {
-                let len = fields.len();
-                let normalized = len as i64 + idx;
-                if normalized < 0 {
-                    None
-                } else {
-                    Some(normalized as usize)
                 }
             } else {
-                Some(*idx as usize)
-            };
-            match target {
-                Some(target) => {
-                    let mut current = fields;
-                    let mut found = None;
-                    let mut i = 0usize;
-                    while let Some((field, rest)) = current.uncons() {
-                        if i == target {
-                            found = Some(field.key_cursor);
-                            break;
+                let target = if *idx < 0 {
+                    let len = fields.len();
+                    let normalized = len as i64 + idx;
+                    if normalized < 0 {
+                        None
+                    } else {
+                        Some(normalized as usize)
+                    }
+                } else {
+                    Some(*idx as usize)
+                };
+                match target {
+                    Some(target) => {
+                        let mut current = fields;
+                        let mut found = None;
+                        let mut i = 0usize;
+                        while let Some((field, rest)) = current.uncons() {
+                            if i == target {
+                                found = Some(field.key_cursor);
+                                break;
+                            }
+                            current = rest;
+                            i += 1;
                         }
-                        current = rest;
-                        i += 1;
+                        match found {
+                            Some(c) => GenericResult::OneCursor(c),
+                            None => GenericResult::Owned(OwnedValue::Null),
+                        }
                     }
-                    match found {
-                        Some(c) => GenericResult::OneCursor(c),
-                        None => GenericResult::Owned(OwnedValue::Null),
-                    }
+                    None => GenericResult::Owned(OwnedValue::Null),
                 }
-                None => GenericResult::Owned(OwnedValue::Null),
             }
         }
         // No probe: collapsing keeps every key at its *first*
@@ -2739,26 +2737,23 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // droppable — if its key repeats an earlier one it
         // collapses away and some other field ends up last.
         Expr::Builtin(Builtin::Last) if !sorted => {
-            let collapsed = if collapse {
-                collapsed_fields(&fields)
-            } else {
-                None
-            };
+            let collapsed = collapsed_fields_if(&fields, collapse);
             if let Some(eff) = collapsed {
-                return match eff.into_iter().next_back() {
+                match eff.into_iter().next_back() {
                     Some(field) => GenericResult::OneCursor(field.key_cursor),
                     None => GenericResult::Owned(OwnedValue::Null),
-                };
-            }
-            let mut current = fields;
-            let mut last_cursor = None;
-            while let Some((field, rest)) = current.uncons() {
-                last_cursor = Some(field.key_cursor);
-                current = rest;
-            }
-            match last_cursor {
-                Some(c) => GenericResult::OneCursor(c),
-                None => GenericResult::Owned(OwnedValue::Null),
+                }
+            } else {
+                let mut current = fields;
+                let mut last_cursor = None;
+                while let Some((field, rest)) = current.uncons() {
+                    last_cursor = Some(field.key_cursor);
+                    current = rest;
+                }
+                match last_cursor {
+                    Some(c) => GenericResult::OneCursor(c),
+                    None => GenericResult::Owned(OwnedValue::Null),
+                }
             }
         }
         // Slice 1 (#724): stay lazy instead of falling

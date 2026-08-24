@@ -2787,6 +2787,51 @@ fn test_lazy_keys_dedup_switches_on_the_second_field_1514() -> Result<()> {
     Ok(())
 }
 
+/// #1514 review: `keys_unsorted | .[n]` and `keys_unsorted | last` must keep
+/// folding the *rest* of the pipe once they've resolved positionally against
+/// the collapsed list on a duplicate-keyed object. Both arms briefly used
+/// `return` inside `fold_pipe_stages`'s per-stage `match`, which exits the
+/// whole function instead of handing the value to the next stage — silently
+/// dropping every filter chained after the index/`last`. Only reachable when
+/// the object has a genuine duplicate key: the collapsed branch is untaken
+/// otherwise, which is why the plain no-duplicate case must be pinned here
+/// too, not just the buggy one.
+#[test]
+fn test_lazy_keys_index_and_last_continue_the_pipe_on_duplicates_1514() -> Result<()> {
+    let dup = r#"{"b":1,"a":2,"b":3}"#;
+    for (filter, expected) in [
+        ("keys_unsorted|.[0]|length", "1"),
+        ("keys_unsorted|.[-1]|length", "1"),
+        ("keys_unsorted|last|length", "1"),
+        ("keys_unsorted|.[0]|ascii_upcase", r#""B""#),
+        ("keys_unsorted|last|ascii_upcase", r#""A""#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(dup))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(
+            out.trim(),
+            expected,
+            "filter {filter}, duplicate-keyed input"
+        );
+    }
+
+    let clean = r#"{"x":1,"y":2}"#;
+    for (filter, expected) in [
+        ("keys_unsorted|.[0]|length", "1"),
+        ("keys_unsorted|last|length", "1"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(clean))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(
+            out.trim(),
+            expected,
+            "filter {filter}, no-duplicate control"
+        );
+    }
+
+    Ok(())
+}
+
 /// #1385 review: `--preserve-input` preserves duplicate keys on *output*
 /// and nowhere else. The exemption ADR-0018 rule 5 grants that extension
 /// reaches the printer, which is gated on `jq_compat`; the evaluator is
