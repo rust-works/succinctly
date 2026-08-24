@@ -23,7 +23,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::document::{DocumentFields, IndentSpec};
+use super::document::{DistinctKeyCursors, DocumentFields, DocumentValue, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
@@ -527,13 +527,19 @@ fn stream_json_string<W: core::fmt::Write>(
 /// an intermediate `Vec<String>`/`OwnedValue::Array` (#685).
 ///
 /// The lazy counterpart of `stream_owned_value_json_with`'s `Array` arm
-/// above, pulling one key at a time from `uncons()` instead of walking a
-/// materialized slice. `GenericResult::LazyKeys { sorted: false, .. }` is
-/// always the entire top-level result (never nested inside another
-/// container), so unlike the function it mirrors this has no
-/// `current_indent` parameter — it's always 0.
+/// above, pulling one key at a time from `DistinctKeyCursors` instead of
+/// walking a materialized slice. `collapse` is threaded through to it so a
+/// repeated key collapses onto its first occurrence here too, same as every
+/// other `LazyKeys` consumer (#1514) — this path is reachable from
+/// `yq_runner.rs`'s M2 fast path, where `collapse` is always `false` today,
+/// but the rule must still hold if a jq-mode caller ever reaches it.
+/// `GenericResult::LazyKeys { sorted: false, .. }` is always the entire
+/// top-level result (never nested inside another container), so unlike the
+/// function it mirrors this has no `current_indent` parameter — it's always
+/// 0.
 pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
+    collapse: bool,
     out: &mut W,
     indent: IndentSpec,
 ) -> core::fmt::Result {
@@ -541,13 +547,13 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
         return out.write_str("[]");
     }
     out.write_char('[')?;
-    let mut current = fields.clone();
     let mut i = 0usize;
-    while let Some((field, rest)) = current.uncons() {
-        // `key_str()` is expected to always return `Some` (see its doc
-        // comment on `DocumentField`); a field with no stringifiable key is
-        // silently skipped, matching `DocumentFields::keys()`'s default walk.
-        if let Some(key) = field.key_str() {
+    for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
+        // `key_string()` is expected to always return `Some` (see
+        // `DocumentField::key_str`'s doc comment); a key with no
+        // stringifiable spelling is silently skipped, matching
+        // `DocumentFields::keys()`'s default walk.
+        if let Some(key) = key.key_string() {
             if i > 0 {
                 out.write_char(',')?;
             }
@@ -558,7 +564,6 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
             stream_json_string(out, &key, write_json_body_yq)?;
             i += 1;
         }
-        current = rest;
     }
     if indent.width > 0 {
         out.write_char('\n')?;
@@ -854,35 +859,37 @@ pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fm
 /// never nested containers, so this omits that arm's "nested container gets
 /// its own indented line" branch, and — like `stream_lazy_keys_json` — has no
 /// `current_indent` parameter, since `LazyKeys { sorted: false, .. }` is
-/// always the entire top-level result.
+/// always the entire top-level result. `collapse` is threaded through for
+/// the same reason as `stream_lazy_keys_json` (#1514): yq's own
+/// `COLLAPSE_DUPLICATE_KEYS` is always `false`, so this is a no-op today,
+/// but the rule must still hold if a jq-mode caller ever reaches it.
 pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
+    collapse: bool,
     out: &mut W,
     indent: IndentSpec,
 ) -> core::fmt::Result {
     if fields.is_empty() {
         return out.write_str("[]");
     }
-    let mut current = fields.clone();
     let mut i = 0usize;
     if indent.is_compact() {
         // Flow style
         out.write_char('[')?;
-        while let Some((field, rest)) = current.uncons() {
-            if let Some(key) = field.key_str() {
+        for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
+            if let Some(key) = key.key_string() {
                 if i > 0 {
                     out.write_str(", ")?;
                 }
                 stream_yaml_string(out, &key)?;
                 i += 1;
             }
-            current = rest;
         }
         out.write_char(']')
     } else {
         // Block style
-        while let Some((field, rest)) = current.uncons() {
-            if let Some(key) = field.key_str() {
+        for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
+            if let Some(key) = key.key_string() {
                 if i > 0 {
                     out.write_char('\n')?;
                 }
@@ -890,7 +897,6 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                 stream_yaml_string(out, &key)?;
                 i += 1;
             }
-            current = rest;
         }
         Ok(())
     }
@@ -1097,6 +1103,51 @@ mod tests {
             .stream_json(&mut buf, IndentSpec::COMPACT, false)
             .unwrap();
         assert_eq!(buf, "3.125");
+    }
+
+    /// #1514 review: `stream_lazy_keys_json`/`stream_lazy_keys_yaml` are the
+    /// M2 fast path's key-array writers. They used to walk `fields.uncons()`
+    /// directly with no dedup logic at all -- every other `LazyKeys`
+    /// consumer touched by #1514 was rewired through `DistinctKeyCursors`,
+    /// but these two were missed, so a `collapse: true` caller would have
+    /// printed a repeated key twice. Reachable today only from
+    /// `yq_runner.rs`, where `collapse` is always `false`, so this is
+    /// unexercised by any CLI test; pinned directly here so the rule holds
+    /// if a jq-mode caller ever reaches this path.
+    #[test]
+    fn test_stream_lazy_keys_honors_collapse_1514() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        let json = br#"{"b":1,"a":2,"b":3}"#;
+        let index = JsonIndex::build(json);
+        let StandardJson::Object(fields) = index.root(json).value() else {
+            panic!("expected object");
+        };
+
+        let mut collapsed = String::new();
+        stream_lazy_keys_json(&fields, true, &mut collapsed, IndentSpec::COMPACT).unwrap();
+        assert_eq!(
+            collapsed, r#"["b","a"]"#,
+            "collapse: true drops the repeat of \"b\""
+        );
+
+        let mut uncollapsed = String::new();
+        stream_lazy_keys_json(&fields, false, &mut uncollapsed, IndentSpec::COMPACT).unwrap();
+        assert_eq!(
+            uncollapsed, r#"["b","a","b"]"#,
+            "collapse: false (yq) keeps every occurrence"
+        );
+
+        let mut collapsed_yaml = String::new();
+        stream_lazy_keys_yaml(&fields, true, &mut collapsed_yaml, IndentSpec::COMPACT).unwrap();
+        assert_eq!(
+            collapsed_yaml, "[b, a]",
+            "the YAML writer applies the same rule"
+        );
+
+        let mut uncollapsed_yaml = String::new();
+        stream_lazy_keys_yaml(&fields, false, &mut uncollapsed_yaml, IndentSpec::COMPACT).unwrap();
+        assert_eq!(uncollapsed_yaml, "[b, a, b]");
     }
 
     /// The `yq` JSON convention (what the M2 fast path for `.field`/`.[0]`/

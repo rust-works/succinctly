@@ -1927,7 +1927,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     // `Builtin::KeysUnsorted`. `sort_keys` (`-S`) is a no-op
                     // here: this is a flat array of key names, not a
                     // mapping, so there's nothing for `-S` to reorder.
-                    crate::jq::stream::stream_lazy_keys_json(fields, out, indent)?;
+                    crate::jq::stream::stream_lazy_keys_json(fields, *collapse, out, indent)?;
                 }
                 on_value(out)?;
                 stats.count = 1;
@@ -2131,7 +2131,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 } else {
                     // Genuinely lazy (#685): see `stream_json`'s
                     // `LazyKeys` arm above — same reasoning, YAML target.
-                    crate::jq::stream::stream_lazy_keys_yaml(fields, out, indent)?;
+                    crate::jq::stream::stream_lazy_keys_yaml(fields, *collapse, out, indent)?;
                 }
                 on_value(out)?;
                 stats.count = 1;
