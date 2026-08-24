@@ -18989,14 +18989,59 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "B",
             0,
         ),
-        // Same class as the `Compare` row above (#1565): `Expr::If` has no
-        // native `eval_each_generic` arm either, so `first(if ...)` falls
-        // through to eager `eval_single` and the discarded `else` branch's
-        // sibling side effect still fires. Out of #1461's scope by design,
-        // same as `Compare`; pre-existing on `main` before #1461 too. jq: no
-        // stderr.
+        // Same class as the `Compare` row above: `Expr::If`/`Try`/`Label`/
+        // `As`/`Limit` have no native `eval_each_generic` arm either
+        // (#1461's own doc comment scopes it to `Comma`/`Pipe`/`Paren`
+        // only), so when one of these is `first`'s argument's top-level
+        // shape, evaluation falls through to eager `eval_single` and a
+        // sibling branch's side effect fires even though `first` never
+        // needed it. Out of scope by design -- fixing `fold_pipe_stages`'s
+        // `LazyKeys`/`LazyIndexRange`/`LazySeq` gap (#1565) does not touch
+        // this; these five shapes are pinned as an explicit, documented
+        // known gap rather than fixed, matching how `Compare` was already
+        // pinned. jq: no stderr.
         (
             &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
+        // `try EXPR` with nothing erroring is just `EXPR`'s own laziness --
+        // still eager here, same root cause as the `If` row above.
+        (
+            &["-cn", r#"first(try (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
+        // `label $out | EXPR` with no `break` reached is just `EXPR`'s own
+        // laziness -- same root cause as the `If` row above.
+        (
+            &["-cn", r#"first(label $out | (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
+        // `EXPR as $x | BODY` should stop after `BODY`'s first output for
+        // the first `$x` binding, never touching the second `(1,2)`
+        // binding at all -- same root cause as the `If` row above, but
+        // doubly eager here since both bindings' `BODY` runs to completion.
+        // jq: writes `B` once (never reaches the `$x = 2` binding).
+        (
+            &["-cn", r#"first((1,2) as $x | ($x, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "BB",
+            0,
+        ),
+        // `limit(2; f)` should stop pulling from `f` after `first` takes
+        // `limit`'s own first output, never evaluating `f`'s second output
+        // -- same root cause as the `If` row above.
+        (
+            &["-cn", r#"first(limit(2; (1, ("B"|stderr))))"#],
             None,
             "1\n",
             "B",
