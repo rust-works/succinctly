@@ -33,7 +33,7 @@ use super::eval::{
     slice_owned_value_read, tonumber_from_str, Control, Demand, EvalError, EvalSemantics, EvalTag,
     Flow, JqSemantics, QueryResult, YqSemantics,
 };
-use super::expr::{Builtin, Expr, FormatType};
+use super::expr::{Builtin, CompareOp, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
@@ -1631,11 +1631,12 @@ macro_rules! push_or_control {
 
 /// Append every output of a `GenericResult` stream to `out`, returning any
 /// terminating `Control` instead of collapsing to the first output the way
-/// the old `Expr::Compare` arm did. Mirrors [`super::eval::push_owned_values`]
-/// for the generic evaluator's cursor-aware result type — used to fork
-/// `Expr::Compare`'s operands into every output instead of only the first
-/// (#768), the same way [`push_generic_truthiness`] already forks `select`'s
-/// condition.
+/// an earlier `Expr::Compare` arm did before #768. Mirrors
+/// [`super::eval::push_owned_values`] for the generic evaluator's
+/// cursor-aware result type — used to fork `Expr::Comma`'s operands into
+/// every output, the same way [`push_generic_truthiness`] already forks
+/// `select`'s condition. `Expr::Compare` moved off this helper for #1481
+/// (see `eval_compare_generic`).
 fn push_generic_owned_values<V: DocumentValue>(
     result: GenericResult<V>,
     out: &mut Vec<OwnedValue>,
@@ -3853,39 +3854,22 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Builtin(builtin) => eval_builtin::<S, _>(builtin, value, optional, cursor),
 
-        // Comparison operations - handle locally to preserve cursor context,
-        // over every pairing jq's cartesian fanout produces rather than just
-        // the first (#768): right operand outer, left operand inner, mirroring
-        // `eval::eval_binary_fanout`. `left`/`right` are evaluated at a
-        // hardcoded `optional: false` (unchanged from before this fix) --
-        // only the final comparison step below consults the ambient
-        // `optional`, same split as `Expr::IndexExpr`'s key/bounds above.
+        // Comparison operations: routed through the shared lazy fanout
+        // machinery (#1481) rather than a hand-rolled eager loop --
+        // `eval_compare_generic` drives `binary_fanout_each_generic` with
+        // `eval_each_generic` as the operand strategy and collects its
+        // demand-driven output into a `GenericResult`, mirroring `eval.rs`'s
+        // split between `eval_each`'s lazy `Expr::Compare` arm and a
+        // collecting wrapper over the same loop (`binary_fanout_core`/
+        // `eval_binary_fanout`). Right operand outer, left operand inner,
+        // forking over every pairing (#768) -- unchanged from before; what
+        // changes is *when* each operand runs: `right`'s next candidate is no
+        // longer pulled before `left` has fully run against the previous one,
+        // so `("A"|stderr) == (("B"|stderr), ("C"|stderr))` now writes
+        // `B A C A`, matching jq, instead of finishing right first (`B C A
+        // A`).
         Expr::Compare { op, left, right } => {
-            let mut right_vals = Vec::new();
-            let right_control = push_generic_owned_values(
-                eval_single::<S, _>(right, value.clone(), false, cursor),
-                &mut right_vals,
-            );
-
-            let mut out: Vec<OwnedValue> = Vec::new();
-            for right_val in &right_vals {
-                let mut left_vals = Vec::new();
-                let left_control = push_generic_owned_values(
-                    eval_single::<S, _>(left, value.clone(), false, cursor),
-                    &mut left_vals,
-                );
-
-                for left_val in left_vals {
-                    let result = apply_compare_op::<S>(*op, &left_val, right_val);
-                    out.push(OwnedValue::Bool(result));
-                }
-
-                if let Some(control) = left_control {
-                    return finish_fork_generic(out, Some(control), optional);
-                }
-            }
-
-            finish_fork_generic(out, right_control, optional)
+            eval_compare_generic::<S, V>(*op, left, right, value, optional, cursor)
         }
 
         // Array construction: collect every output of the inner expression
@@ -4195,10 +4179,16 @@ fn drain_result_generic<V: DocumentValue>(
 /// instead of `eval_single`'s own eager, always-materialize-everything
 /// dispatch for the same three variants.
 ///
-/// Scoped to exactly these three, matching the issue's own stated scope --
-/// mirroring `eval.rs`'s wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/
-/// `Compare`/...) is out of scope here; those shapes still fall to the `_`
-/// fallback below, unchanged from before.
+/// Scoped to `Comma`/`Pipe`/`Paren`/`Compare` -- mirroring `eval.rs`'s still
+/// wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/...) remains out of scope
+/// here; those shapes still fall to the `_` fallback below. `Compare` gained
+/// a native arm for #1481, mirroring `eval.rs`'s own `Expr::Compare` arm
+/// (#1459/Stage 4): this closes the interleaving gap both for a bare
+/// top-level compare (`eval_single`'s own arm now routes through this same
+/// machinery, see `eval_compare_generic`) and for a compare reached through
+/// this module's own lazy consumers (`first`/`last`), which previously fell
+/// through to the eager `_` fallback for any non-`Comma`/`Pipe`/`Paren`
+/// argument.
 fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -4220,6 +4210,34 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Pipe(exprs) => eval_each_pipe_generic::<S, V>(exprs, value, optional, cursor, sink),
         Expr::Paren(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
+        // #1481: mirrors `eval.rs`'s own `eval_each` `Expr::Compare` arm
+        // (#1459, Stage 4) -- `binary_fanout_each_generic` owns the loop
+        // order; passing `eval_each_generic` as the operand strategy is what
+        // lets the *right* operand -- jq's outer loop -- stop producing
+        // candidates a consumer (e.g. `first`) never asked for.
+        //
+        // `left`/`right` are evaluated at a hardcoded `optional: false`, not
+        // the ambient `optional` -- matching this arm's pre-#1481 eager
+        // predecessor and `eval_single`'s own `Expr::IndexExpr` key/bounds
+        // split (#693): an enclosing `?` must not mask an unrelated error
+        // deep in an operand's own subtree. The ambient `optional` is still
+        // consulted, exactly once, by whichever caller collects this arm's
+        // `Flow` (`eval_compare_generic`'s `finish_fork_generic` call, or a
+        // wrapping consumer's own demand sink).
+        Expr::Compare { op, left, right } => binary_fanout_each_generic::<V>(
+            |operand, operand_sink| {
+                eval_each_generic::<S, V>(operand, value.clone(), false, cursor, operand_sink)
+            },
+            left,
+            right,
+            optional,
+            |left_val, right_val| {
+                Ok(OwnedValue::Bool(apply_compare_op::<S>(
+                    *op, &left_val, &right_val,
+                )))
+            },
+            sink,
+        ),
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }
 }
@@ -4434,6 +4452,150 @@ fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResu
         GenericItem::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
         GenericItem::LazySeq(seq) => GenericResult::LazySeq(seq),
     }
+}
+
+/// Convert a [`GenericItem`] pulled from a fanout operand into the
+/// `OwnedValue` a `combine` step needs, forcing whatever materialization a
+/// lazy variant still owes via [`generic_item_to_result`] +
+/// `GenericResult::materialize_lazy` -- the same conversion
+/// [`push_generic_owned_values`] already applies, reused here rather than
+/// re-derived.
+///
+/// Fallible, unlike `eval::Item::into_owned`: a `LazySeq` item -- a buffered
+/// `map`/`select` chain, #724/#725 -- can itself error/break/halt on the
+/// materialization this forces (e.g. `map(1/0) == 1`), where `eval.rs`'s
+/// `QueryResult` has no lazy variant to force in the first place.
+/// [`binary_fanout_each_generic`] routes that failure through the same
+/// "abort the whole fanout" `Flow::Escaped` path a `combine` error already
+/// uses, ungated by `optional` -- matching `eval.rs`'s convention that an
+/// operand-evaluation error is caught one level up, by `Expr::Optional`/
+/// `try`, not here.
+fn generic_item_into_owned<V: DocumentValue>(item: GenericItem<V>) -> Result<OwnedValue, Control> {
+    match generic_item_to_result(item).materialize_lazy() {
+        GenericResult::One(v) => Ok(to_owned(&v)),
+        GenericResult::OneCursor(c) => Ok(to_owned_cursor(&c)),
+        GenericResult::Owned(v) => Ok(v),
+        GenericResult::Error(e) => Err(Control::Error(e)),
+        GenericResult::Break(label) => Err(Control::Break(label)),
+        GenericResult::Halt(code) => Err(Control::Halt(code)),
+        _ => {
+            unreachable!("a single GenericItem never materializes to a multi-output or lazy shape")
+        }
+    }
+}
+
+/// Generic-evaluator twin of `eval::binary_fanout_each` (#1481): the one
+/// right-outer/left-inner fanout loop for the `V: DocumentValue`-generic
+/// evaluator, parameterized over *how* an operand is enumerated -- reusing
+/// `eval.rs`'s `pub(crate)` `Demand`/`Flow` directly (they carry no generic
+/// parameters), the same way this module's whole lazy-sink family already
+/// does.
+///
+/// No `'a`/`W` parameter, unlike `eval.rs`'s version: `GenericItem<V>` owns
+/// its cursor (`V::Cursor: Copy`), so nothing here borrows from an arena.
+///
+/// `each_operand` is `Fn`, not `FnMut`, for the same re-entrancy reason
+/// `eval.rs`'s `binary_fanout_each` gives: the per-right-value call on `left`
+/// happens while the call on `right` is still on the stack.
+fn binary_fanout_each_generic<V: DocumentValue>(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    optional: bool,
+    mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut abort: Option<Flow> = None;
+
+    let outer = each_operand(right, &mut |right_item: GenericItem<V>| {
+        let right_val = match generic_item_into_owned(right_item) {
+            Ok(v) => v,
+            Err(control) => {
+                abort = Some(Flow::Escaped(control));
+                return Demand::Stop;
+            }
+        };
+
+        let inner = each_operand(left, &mut |left_item: GenericItem<V>| {
+            let left_val = match generic_item_into_owned(left_item) {
+                Ok(v) => v,
+                Err(control) => {
+                    abort = Some(Flow::Escaped(control));
+                    return Demand::Stop;
+                }
+            };
+            match combine(left_val, right_val.clone()) {
+                Ok(v) => sink(GenericItem::Owned(v)),
+                Err(e) => {
+                    abort = Some(if optional {
+                        Flow::Exhausted
+                    } else {
+                        Flow::Escaped(Control::Error(e))
+                    });
+                    Demand::Stop
+                }
+            }
+        });
+
+        if abort.is_some() {
+            return Demand::Stop;
+        }
+
+        match inner {
+            Flow::Exhausted => Demand::Continue,
+            other => {
+                abort = Some(other);
+                Demand::Stop
+            }
+        }
+    });
+
+    abort.unwrap_or(outer)
+}
+
+/// Collecting wrapper over [`binary_fanout_each_generic`] for `eval_single`'s
+/// `Expr::Compare` arm (#1481) -- mirrors `eval.rs`'s
+/// `eval_binary_fanout`/`binary_fanout_core` pairing, wired directly to the
+/// lazy `eval_each_generic` operand strategy since this file has no eager
+/// sibling (`Expr::Arithmetic` has no native arm here at all, see
+/// `eval_each_generic`'s own doc comment) that still needs an eager one kept
+/// around.
+fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
+    op: CompareOp,
+    left: &Expr,
+    right: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let flow = binary_fanout_each_generic::<V>(
+        |operand, operand_sink| {
+            eval_each_generic::<S, V>(operand, value.clone(), false, cursor, operand_sink)
+        },
+        left,
+        right,
+        optional,
+        |left_val, right_val| {
+            Ok(OwnedValue::Bool(apply_compare_op::<S>(
+                op, &left_val, &right_val,
+            )))
+        },
+        &mut |item: GenericItem<V>| {
+            match item {
+                GenericItem::Owned(v) => out.push(v),
+                // `combine` above always produces `GenericItem::Owned`.
+                _ => unreachable!("combine always produces GenericItem::Owned"),
+            }
+            Demand::Continue
+        },
+    );
+
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    };
+    finish_fork_generic(out, control, optional)
 }
 
 /// Evaluate `first(inner)`/`last(inner)` (and the `Builtin::FirstStream`/
@@ -10791,6 +10953,31 @@ mod tests {
         assert_eq!(
             summarize(b"null", "(1,break $out) == 1"),
             partial_break(&["true"])
+        );
+    }
+
+    #[test]
+    fn generic_compare_first_stops_before_unneeded_right_candidate_1481() {
+        // `first` is satisfied by the very first pairing (`1 == 10` ->
+        // `false`), so `eval_each_generic`'s new native `Expr::Compare` arm
+        // (#1481) must never let right's generator reach its second, failing
+        // candidate -- mirrors `eval.rs`'s own `IN`/`any`/`all`-wrapped
+        // equivalents, now also true for a bare `first(...)`.
+        assert_eq!(
+            summarize(b"null", r#"first((1,2) == (10, error("x")))"#),
+            Summary::Values(vec!["false".to_string()])
+        );
+    }
+
+    #[test]
+    fn generic_compare_first_still_reaches_right_when_left_is_empty_1481() {
+        // The complementary case: `left=empty` means `combine` never runs for
+        // right's first candidate (`10`), so the fanout must still continue
+        // to right's second candidate -- confirming the new lazy arm's
+        // `Demand::Continue` path is exercised, not just its stop path.
+        assert_eq!(
+            summarize(b"null", r#"first(empty == (10, error("x")))"#),
+            Summary::Error("x".to_string())
         );
     }
 
