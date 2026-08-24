@@ -2397,8 +2397,10 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// queue behaves identically either way, so the eager `eval_single` path
 /// (and its cursor/zero-copy fast paths) stays the default; only a filter
 /// that actually shares state with `jq_runner`'s input queue pays for the
-/// re-index round trip through [`eval_each_owned_collect`]. Mirrors the same
-/// two-part guard `eval_first_or_last_generic` already uses for `first`.
+/// re-index round trip through `eval_each_owned_collect`. Supersedes the
+/// narrower guard `eval_first_or_last_generic` used to run per `first(...)`
+/// call site (#1309) -- this check covers the whole expression up front, so
+/// that guard was dead code and has been removed.
 pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
     if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) {
         let owned = to_owned_with_cursor(&value, None);
@@ -4057,31 +4059,16 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     want_last: bool,
 ) -> GenericResult<V> {
     // `first(f)` where `f` can consume input documents must not run `f` to
-    // completion. [`eval_each_generic`] (#1461) is only a native lazy arm for
-    // `Comma`/`Pipe`/`Paren` -- it has no `Builtin::Inputs`-aware arm of its
-    // own, so a bare `first(inputs)`/`first(inputs, 1)`/`first(inputs | f)`
-    // would still fall to its eager `_` fallback and drain the shared queue.
-    // `eval::eval_first_expr` has been wired to `eval.rs`'s own sink since
-    // #820 Stage 2, so hand the whole `first(...)` over rather than
-    // evaluating `inner` here (#1309) -- one guard covering every shape
-    // `inputs` can appear in, rather than one `eval_each_generic` arm per
-    // shape.
-    //
-    // Gated rather than unconditional because the bridge costs this subtree
-    // its cursor, and with it #607's duplicate-key fidelity. Nothing is
-    // actually lost for the CLI: a filter that gets past
-    // `input_queue_is_active` is one `jq_runner` already routed off
-    // `can_use_lazy_path`, whose `evaluate_input` re-serialises through
-    // `OwnedValue` anyway. The one-load `input_queue_is_active` check comes
-    // first specifically so yq mode, library embedders and the common
-    // `first(.[])` never pay for the AST walk.
-    if !want_last
-        && crate::jq::input_queue_is_active()
-        && crate::jq::walk::uses_input_builtins(inner)
-    {
-        let owned = to_owned_with_cursor(&value, cursor);
-        return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
-    }
+    // completion -- previously handled by a guard here (#1309) that bridged
+    // just this subtree through `eval_on_owned`. #1504 moved that same
+    // `input_queue_is_active` + `uses_input_builtins` check to `eval_using`/
+    // `eval_with_cursor_using`, covering the *whole* expression up front
+    // rather than each `first(...)` call site individually; since `inner` is
+    // always a subterm of whatever tree that top-level check already walked,
+    // it can never satisfy the condition the top-level guard didn't. This
+    // function is only ever reached once that check has already cleared the
+    // whole expression, so the per-call guard was dead code and has been
+    // removed.
 
     // `first` stops pulling from `inner` as soon as it has one output, so
     // anything past that point -- a later comma sibling, a later pipe stage's
