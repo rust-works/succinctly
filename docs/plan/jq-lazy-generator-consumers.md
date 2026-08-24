@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Lazy generator consumers
 
-**Status: Stages 1, 2, 2b, 3, 4 and 5 implemented.** This document is the
+**Status: Stages 1, 2, 2b, 3, 4, 5 and the #1481 follow-up implemented.** This document is the
 deliverable for [#820](https://github.com/rust-works/succinctly/issues/820), which its
 own tier review (2026-08-20) classified Tier 3 — "evaluator-architecture change, design
 doc first, in the shape of #1282". It also scopes the two issues that name #820 as their
@@ -23,6 +23,7 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | 5     | Widen the lazy arm set                              | ✅ merged — closes #1462    |
 | (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ✅ merged — #1451, #1461    |
 | —     | Interleave top-level `input`/`inputs` (#1309's residue) | ✅ merged — #1504        |
+| —     | Interleave the eager binary-fanout loops            | ✅ merged — closes #1481    |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
@@ -32,18 +33,24 @@ other compare reached through a lazy consumer. Since Stage 5, `eval_each` also c
 `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern` and `Limit` arms, closing the
 demand-forwarding gap for a generator nested inside any of them (`isempty(limit(3; 1,
 ("B"|stderr)))`, `isempty(if true then (1,("B"|stderr)) else 9 end)`, and the rest of the
-family the same shape). **Three** shapes remain divergent, all pinned as such in
-`test_short_circuit_side_effect_leaks_820_932_987`. Two are the bare-`first(...)` family:
-`first(.[] | stderr)` (see "Option (c), scoped" below) and
-`first((1,2) == (10, ("B"|stderr)))`, both a `first(...)` over a
-non-`Comma`, which Stage 2b's sibling walk does not reach — option (c), #1461. This is a
-*separate* obstacle from Stage 5's own arms: a bare `first(...)`/`last(...)` never even
-reaches `eval.rs` for a non-`Comma` argument, because `eval_generic.rs`'s own native
-`first`/`last` routing intercepts it first (confirmed live while implementing Stage 5, below);
-`isempty`, `limit`, `nth`, `path`, `any`, `all` and `IN` have no such native `eval_generic` arm
-and so reach every one of Stage 5's new arms correctly. The third divergent shape is
+family the same shape). Three shapes were once flagged divergent here, all pinned as such in
+`test_short_circuit_side_effect_leaks_820_932_987`: `first(.[] | stderr)`, which turned out to
+already be closed by option (c)/#1461's `Pipe` arm by the time this was written;
+`first((1,2) == (10, ("B"|stderr)))`, a `first(...)` over a non-`Comma`/`Pipe`/`Paren`
+argument (`Expr::Compare`), which Stage 2b's sibling walk does not reach; and
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
-`eval_each` at all — #1481.
+`eval_each` at all. Both compare shapes are closed as of #1481: `eval_generic.rs` gained its
+own `binary_fanout_each_generic`/`eval_each_generic`-`Expr::Compare`-arm pair, mirroring
+`eval.rs`'s `binary_fanout_each`/`eval_each` machinery, and `eval_single`'s own top-level
+`Expr::Compare` arm now routes through it instead of a standalone eager loop. #1481 also closed
+a second, distinct gap in the same family: even where a lazy arm already existed
+(`eval.rs`'s `eval_each`), the *eager* callers reaching `Expr::Compare`/`Expr::Arithmetic`
+through ordinary (non-lazy-consumer) evaluation — `eval_binary_fanout` and its path-context
+sibling — still finished the right operand to completion before starting the left, where jq
+interleaves them; with `input`/`inputs` operands this changed delivered *values*, not just
+stderr order (`(input) + (input, input)` over `"a" "b" "c" "d"` was `["ca","db"]` instead of
+jq's `["ba","dc"]`). See [issue #1481](https://github.com/rust-works/succinctly/issues/1481)
+for the full repro set and `scripts/jq-fanout-oracle-sweep.sh` for the verification sweep.
 
 **One divergence Stage 5's own oracle sweep found and did not attempt.** `?//`-alternatives
 wrapped in a short-circuiting consumer: real jq's builtins are macro-expanded `label $out |
@@ -1157,7 +1164,13 @@ the reasoning behind each placement:
    `input`/`inputs` operands it changes *values*, not just stderr ordering:
    `(input) + (input, input)` over `"a" "b" "c" "d"` is `["ba","dc"]` in jq and
    `["ca","db"]` here, so it is silent data loss rather than a cosmetic leak. **Filed as
-   #1481.**
+   #1481, implemented.** `eval_binary_fanout` now routes through `eval_each` (which also
+   gained the `Expr::Arithmetic` arm Stage 4 deliberately left out); the path-context
+   sibling uses a per-operand hybrid (`eval_each_owned` when an operand doesn't itself need
+   path context, the pre-existing eager path when it does); and `eval_generic.rs`'s own
+   `Expr::Compare` arm — finding (a) above, `first((1,2) == (10, ("B"|stderr)))` included —
+   was rewired onto a new `binary_fanout_each_generic`/`eval_each_generic`-`Expr::Compare`
+   pair mirroring `eval.rs`'s machinery, closing both findings together.
 
    **Two things review added afterwards.** (i) #1459's own severity line — "Low (stray
    stderr write; no wrong output, no data loss)" — is true of its `IN(src; s)` repro and
