@@ -22,6 +22,7 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | 4     | `Expr::Compare`'s outer loop                        | ✅ merged — closes #1459    |
 | 5     | Widen the lazy arm set                              | ✅ merged — closes #1462    |
 | (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ✅ merged — #1451, #1461    |
+| —     | Interleave top-level `input`/`inputs` (#1309's residue) | ✅ merged — #1504        |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
@@ -84,6 +85,23 @@ existing whole-pipe fallback instead (safe to redo, since none of those shapes h
 side effect yet), leaving `first(.[] | stderr)` a known, still-pinned divergence rather than
 a second, deeper thing option (c) closes. The full generalized `Demand`/`Item`/`Flow` mirror
 this row originally called for remains the only way to close it soundly — filed as **#1461**.
+
+**#1504 — the other "two more owners" #1309 gave this row — closed, by a narrower fix than
+option (c)'s own full mirror.** `#1309`'s `inputs | f` (no interleave) and
+`(., input) | error(...)` (raises once, not twice) are about the CLI's *top-level* program —
+no `first`/`last`/`limit`/... wrapper in sight — so they were never reachable through
+`eval_each_generic`/`eval_each_pipe_generic` (which only `each_take_first_generic` drives) at
+all. Rather than building out `eval_generic.rs`'s own native lazy arm set to match `eval.rs`'s
+(the true scope of a *complete* option (c)), #1504 extended the *existing*
+`input_queue_is_active() && uses_input_builtins(...)` bridge-to-`eval.rs` pattern
+`eval_first_or_last_generic` already used for `first`/`last` to the CLI's own top-level entry
+points (`eval_using`/`eval_with_cursor_using`), via a new `eval_each_owned_collect` — a
+plain "always continue, collect everything" sink over the same `eval_each_owned` that bridge
+already called. This closes both symptoms because `eval_each_owned` reaches `eval.rs`'s full
+native `eval_each` (Stage 5's widened arm set, including `Builtin::Inputs`'s lazy production),
+not just `Comma`/`Pipe`/`Paren`. **It does not touch `first(.[] | stderr)`** — that shape uses
+no input builtin, so `#1504`'s guard never fires for it, and it remains exactly as much a
+`#1461`-only problem as before.
 
 **One correction this document earned the hard way.** Stage 2 shipped an
 `eval_each_pipe` whose `Item::Owned` arm fell back to the eager `eval_owned_pipe`,
@@ -1196,3 +1214,11 @@ the reasoning behind each placement:
    input))` consumes documents), with the narrower `first_over_comma_generic` gap it sits
    next to filed separately as **#1451**. This is the only remaining route to
    `first(.[] | stderr)`, which is a `Pipe` and so out of reach of Stage 2b's comma walk.
+
+   **#1309's other two owners of this row — filed and closed separately as #1504.**
+   `inputs | f` not interleaving and `(., input) | error(...)` raising once instead of
+   twice were both the CLI's *top-level* program (no `first`/`last` wrapper), so #1461's own
+   scope (`first(.[] | stderr)`) never covered them and they needed their own issue. Closed
+   by extending the existing `first`/`last` bridge-to-`eval.rs` pattern to the top-level
+   entry points rather than by #1461's full mirror — see "#1504 — the other 'two more
+   owners'..." above. #1461 itself remains open.

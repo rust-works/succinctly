@@ -17489,9 +17489,9 @@ fn test_jq_truncating_combinators_do_not_drain_inputs_1309() -> Result<()> {
 /// document actually read, so a truncated `inputs` must leave it pointing at
 /// the document the consumer kept rather than at the end of the stream.
 ///
-/// `inputs | input_line_number` (jq: `1 2 3`) is deliberately absent -- that
-/// needs the *pipe* to interleave, which is tracked separately. See
-/// `docs/compliance/jq/limitations.md`.
+/// The un-truncated case, `inputs | input_line_number` (jq: `1 2 3`), needs
+/// the *pipe* itself to interleave rather than a consumer stopping early --
+/// see `test_jq_inputs_pipe_interleaves_with_input_line_number_1504` below.
 #[test]
 fn test_jq_input_line_number_after_truncated_inputs_1309() -> Result<()> {
     for filter in [
@@ -17503,6 +17503,45 @@ fn test_jq_input_line_number_after_truncated_inputs_1309() -> Result<()> {
         assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
         assert_eq!(stdout, "1\n", "{filter}");
     }
+    Ok(())
+}
+
+/// #1504: the general fix for the pipe/comma interleave gap #1309 left open.
+/// `eval_generic.rs`'s top-level `Pipe` was eager -- it fully drained
+/// `inputs` before `input_line_number` ever ran on any of it -- so every
+/// output reported the *last* document's line (`3 3 3`) instead of each
+/// document's own (jq: `1 2 3`). The truncating-combinator variants above
+/// already passed because they stop pulling from `inputs` early; this is the
+/// un-truncated case that needed the pipe itself to interleave.
+#[test]
+fn test_jq_inputs_pipe_interleaves_with_input_line_number_1504() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", "inputs | input_line_number"], Some("1\n2\n3\n"))
+            .expect("interleaved inputs repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n3\n");
+    Ok(())
+}
+
+/// #1504's second symptom, same root cause: a generator branch past the
+/// point an error escapes must never be pulled. jq's lazy comma reaches
+/// `error` with `.`'s own document before `input` (comma's right branch) is
+/// ever evaluated, so its outer per-document loop runs a second time on the
+/// file `input` would have consumed; an eager comma pulled that file into the
+/// pair before `error` fired, leaving nothing for the outer loop's second
+/// pass -- one reported error instead of jq's two.
+#[test]
+fn test_jq_comma_pipe_error_raises_once_per_document_1504() -> Result<()> {
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-c", r#"(., input) | error("boom")"#], &["1\n", "2\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert_eq!(
+        stderr.matches("boom").count(),
+        2,
+        "expected one error per top-level document: {stderr}"
+    );
+    assert!(stderr.contains(&paths[0]), "{stderr}");
+    assert!(stderr.contains(&paths[1]), "{stderr}");
     Ok(())
 }
 

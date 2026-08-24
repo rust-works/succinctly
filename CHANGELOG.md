@@ -301,13 +301,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `empty.json:0`; both were `<unknown>`. `<unknown>` is now reserved for its
   real meaning — no read has been attempted at all.
 
-  Remaining divergences, all downstream of the evaluator's eager `Pipe`/`Comma`
-  rather than of these builtins, are recorded in
-  `docs/compliance/jq/limitations.md`: `inputs | input_line_number` does not
-  interleave, `(., input) | error(...)` raises once where jq raises twice, and
-  `input_line_number` keeps its line after a failed read (jq is not
-  self-consistent there, so the reset is deliberately not reproduced).
-  `input`/`inputs` remain unsupported in `yq` mode, reporting a clear error.
+  Two more divergences, both downstream of the evaluator's eager `Pipe`/`Comma`
+  rather than of these builtins, were found here and closed separately by
+  #1504 (below): `inputs | input_line_number` did not interleave, and
+  `(., input) | error(...)` raised once where jq raises twice. One remains,
+  recorded in `docs/compliance/jq/limitations.md`: `input_line_number` keeps
+  its line after a failed read (jq is not self-consistent there, so the reset
+  is deliberately not reproduced). `input`/`inputs` remain unsupported in `yq`
+  mode, reporting a clear error.
+
+- **`jq`: `inputs`/`input` now interleave with the rest of a top-level
+  `Pipe`/`Comma` instead of draining first** (#1504, the general fix #1309
+  left open). `eval_generic.rs`'s top-level entry points ran the whole
+  program through the eager `eval_single` (`fold_pipe_stages` for `Pipe`, a
+  plain accumulating loop for `Comma`), so a generator consumed the entire
+  shared input queue before the next pipe stage ever ran on any of it:
+  `inputs | input_line_number` reported the *last* document's line for every
+  output (`3 3 3` against jq's `1 2 3`), and `(., input) | error("boom")`
+  over two files raised once here against jq's twice (jq's lazy comma reaches
+  `error` with the first document before `input`, its right branch, is ever
+  evaluated, leaving the second document for its outer per-document loop to
+  process as a fresh top-level run; succinctly's eager comma consumed it
+  first). A program that actually touches `input`/`inputs`/
+  `input_line_number` (guarded the same way `first`/`last`'s existing bridge
+  already is, via `input_queue_is_active()` and `jq::walk::uses_input_builtins`)
+  now runs through a new `eval_each_owned_collect`, a plain "collect every
+  output" sink over `eval.rs`'s own demand-driven `eval_each_owned` — the
+  same `Demand`/`Item`/`Flow` machinery `first`/`limit`/... already use, just
+  driven to completion instead of stopped after N. The CLI's existing
+  per-document loop, unmodified, already reads from the same queue `input`
+  draws from, so the second symptom's fix falls out of the first: leaving a
+  document unconsumed is enough for the CLI to pick it up as the next
+  top-level run on its own.
+
+  This does not close `first(.[] | stderr)` or the top-level-compare shape
+  (#1461, #1481) — those never touch `input`/`inputs`, so this fix's guard
+  never fires for them; they remain open under their own issues.
 
 - **`yq`: `split_doc` hidden inside twelve builtins is detected** (#1309):
   `contains_split_doc` was exhaustive over `Expr` but ended its inner
