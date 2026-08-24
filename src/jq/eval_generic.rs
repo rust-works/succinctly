@@ -2618,9 +2618,13 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
 
 /// One step of folding a `GenericResult::LazyKeys` through a single further
 /// pipe stage. Extracted verbatim from `fold_pipe_stages`'s own `LazyKeys`
-/// arm so a planned demand-aware sibling (#1565) can share the exact same
+/// arm (#1565) so [`fold_pipe_stages_sink`] can share the exact same
 /// composability fast paths (`length`, `.[]`, `.[n]`, `first`, `last`,
-/// `map` when `!sorted`) instead of duplicating them.
+/// `map` when `!sorted`) instead of duplicating them -- only the eager
+/// `fold_pipe_stages` and the demand-aware `fold_pipe_stages_sink` differ in
+/// how they consume an `Expr::Iterate` result, and `fold_pipe_stages_sink`
+/// intercepts that case before ever calling this function (see its own
+/// per-lazy-variant element iteration instead).
 fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
     fields: V::Fields,
     sorted: bool,
@@ -2805,8 +2809,13 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
 
 /// One step of folding a `GenericResult::LazySeq` through a single further
 /// pipe stage. Extracted verbatim from `fold_pipe_stages`'s own `LazySeq`
-/// arm; see [`fold_lazy_keys_stage`]'s own doc comment for why this split
-/// exists.
+/// arm (#1565); see [`fold_lazy_keys_stage`]'s own doc comment for why this
+/// split exists. `fold_pipe_stages_sink` intercepts `Expr::Iterate` before
+/// ever calling this function, but every *other* stage shape here --
+/// including `Expr::Builtin(Builtin::First) | Expr::Index(0)`'s own
+/// pull-one-and-stop fast path -- is identical between the eager and
+/// demand-aware callers, since none of them fan out beyond the single `seq`
+/// they were already holding.
 fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     mut seq: LazySeq<V>,
     expr: &Expr,
@@ -2922,6 +2931,245 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
             Err(Control::Break(label)) => GenericResult::Break(label),
             Err(Control::Halt(code)) => GenericResult::Halt(code),
         },
+    }
+}
+
+/// Pull items one at a time from `elements`, threading each through `rest`
+/// via [`continue_pipe_element_generic`] and stopping the moment that isn't
+/// `Flow::Exhausted`. Shared by every `Expr::Iterate` fan-out case in
+/// [`fold_pipe_stages_sink`] (#1565) so `first` only ever pays for the
+/// elements it actually needed downstream, never the ones after it stopped.
+/// An `Err(control)` from the source itself (only `LazySeq` can produce one,
+/// mid-`map`) is an immediate stop, matching `fold_lazy_seq_stage`'s own
+/// treatment of a mid-drain error.
+fn drive_pipe_elements_generic<S: EvalSemantics, V: DocumentValue>(
+    elements: impl Iterator<Item = Result<GenericItem<V>, Control>>,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    for element in elements {
+        match element {
+            Ok(item) => match continue_pipe_element_generic::<S, V>(item, rest, optional, sink) {
+                Flow::Exhausted => continue,
+                other => return other,
+            },
+            Err(Control::Error(e)) => return drain_result_generic(GenericResult::Error(e), sink),
+            Err(Control::Break(label)) => {
+                return drain_result_generic(GenericResult::Break(label), sink);
+            }
+            Err(Control::Halt(code)) => {
+                return drain_result_generic(GenericResult::Halt(code), sink)
+            }
+        }
+    }
+    Flow::Exhausted
+}
+
+/// Demand-aware `Expr::Iterate` fan-out for a `LazyIndexRange` (#1565): no
+/// allocation at all, mirroring `fold_lazy_index_range_stage`'s own
+/// `Expr::Iterate` arm's zero-cost arithmetic -- the only difference is each
+/// index is driven through `rest` one at a time instead of all being
+/// collected into a `ManyOwned` first.
+fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
+    len: usize,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    drive_pipe_elements_generic::<S, V>(
+        (0..len).map(|i| Ok(GenericItem::Owned(OwnedValue::Int(i as i64)))),
+        rest,
+        optional,
+        sink,
+    )
+}
+
+/// Demand-aware `Expr::Iterate` fan-out for a `LazyKeys` (#1565).
+///
+/// `!sorted` (`keys_unsorted`): reuses the exact same cons-list walk
+/// `fold_lazy_keys_stage`'s own `Expr::Iterate` arm uses to build its
+/// `ManyCursor` -- building that `Vec<V::Cursor>` costs the same as a real
+/// array's own `ManyCursor` build (the baseline `first(.[] | ...)` already
+/// pays, per #1461), so `first`'s saving here is entirely in the
+/// *downstream* per-element re-evaluation this function now gates, not in
+/// this structural step.
+///
+/// `sorted` (`keys`): lexicographic order needs every key decoded and
+/// sorted first, unavoidably -- the same cost `materialize_lazy_keys` always
+/// paid. Reuses `effective_keys` (the same helper `materialize_lazy_keys`
+/// calls) rather than re-deriving key decoding, then walks the sorted `Vec`
+/// one at a time as `Owned` strings -- matching `materialize_lazy_keys`'s
+/// existing behaviour of not preserving a cursor for sorted keys (no new
+/// capability, no regression, just demand-aware instead of eager).
+fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
+    fields: V::Fields,
+    sorted: bool,
+    collapse: bool,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if !sorted {
+        let cursors: Vec<V::Cursor> = match if collapse {
+            collapsed_fields(&fields)
+        } else {
+            None
+        } {
+            Some(collapsed) => collapsed.into_iter().map(|f| f.key_cursor).collect(),
+            None => {
+                let mut cursors = Vec::new();
+                let mut current = fields;
+                while let Some((field, next)) = current.uncons() {
+                    cursors.push(field.key_cursor);
+                    current = next;
+                }
+                cursors
+            }
+        };
+        return drive_pipe_elements_generic::<S, V>(
+            cursors.into_iter().map(|c| Ok(GenericItem::OneCursor(c))),
+            rest,
+            optional,
+            sink,
+        );
+    }
+
+    let mut keys = effective_keys(&fields, collapse);
+    keys.sort();
+    drive_pipe_elements_generic::<S, V>(
+        keys.into_iter()
+            .map(|k| Ok(GenericItem::Owned(OwnedValue::String(k)))),
+        rest,
+        optional,
+        sink,
+    )
+}
+
+/// Demand-aware `Expr::Iterate` fan-out for a `LazySeq` (#1565): pulls
+/// directly from `seq`'s own `Iterator` impl one element at a time, unlike
+/// `fold_lazy_seq_stage`'s own `Expr::Iterate` arm, which drains it fully
+/// (running every buffered `map(f)` closure) before returning -- draining is
+/// exactly the O(n) cost `first(map(f) | .[] | g)` should not pay. `seq`
+/// yields `Result<LazyElem<V>, Control>`; only [`LazyElem::Cursor`]/
+/// [`LazyElem::Owned`] are real elements, an `Err` is a mid-`map` failure
+/// handled by [`drive_pipe_elements_generic`] itself.
+fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
+    seq: LazySeq<V>,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    drive_pipe_elements_generic::<S, V>(
+        seq.map(|item| {
+            item.map(|elem| match elem {
+                LazyElem::Cursor(c) => GenericItem::OneCursor(c),
+                LazyElem::Owned(o) => GenericItem::Owned(o),
+            })
+        }),
+        rest,
+        optional,
+        sink,
+    )
+}
+
+/// Demand-aware twin of `fold_pipe_stages` (#1565): folds an already-produced
+/// `LazyKeys`/`LazyIndexRange`/`LazySeq` item through the remaining pipe
+/// stages one at a time, honoring `sink`'s `Demand` the moment `Expr::Iterate`
+/// would otherwise fan out into multiple elements -- so a `first`-driven pull
+/// stops as soon as the sink says so, instead of `fold_pipe_stages`'s
+/// unconditional full materialization (`first(keys | .[] | stderr)` visiting
+/// every key). Every *other* stage shape reuses `fold_lazy_keys_stage`/
+/// `fold_lazy_index_range_stage`/`fold_lazy_seq_stage` -- the exact same
+/// composability fast paths `fold_pipe_stages` itself uses (#724/#725) --
+/// rather than duplicating them, and the moment folding resolves to a
+/// genuinely single value, control hands off to `eval_each_pipe_generic`/
+/// `eval_each_owned`, which already know how to thread an arbitrary-length
+/// remaining pipe through one value without re-deriving cursor threading here
+/// (the #1503 lesson).
+fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
+    mut current: GenericResult<V>,
+    stages: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut j = 0usize;
+    loop {
+        if j == stages.len() {
+            return drain_result_generic(current, sink);
+        }
+        let expr = &stages[j];
+        let rest = &stages[j + 1..];
+        let is_iterate = matches!(unwrap_paren(expr), Expr::Iterate);
+        current = match current {
+            GenericResult::LazyKeys {
+                fields,
+                sorted,
+                collapse,
+            } if is_iterate => {
+                return each_lazy_keys_iterate_sink::<S, V>(
+                    fields, sorted, collapse, rest, optional, sink,
+                );
+            }
+            GenericResult::LazyKeys {
+                fields,
+                sorted,
+                collapse,
+            } => fold_lazy_keys_stage::<S, V>(fields, sorted, collapse, expr, optional),
+            GenericResult::LazyIndexRange(len) if is_iterate => {
+                return each_lazy_index_range_iterate_sink::<S, V>(len, rest, optional, sink);
+            }
+            GenericResult::LazyIndexRange(len) => {
+                fold_lazy_index_range_stage::<S, V>(len, expr, optional)
+            }
+            GenericResult::LazySeq(seq) if is_iterate => {
+                return each_lazy_seq_iterate_sink::<S, V>(seq, rest, optional, sink);
+            }
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
+            // Resolved to a genuinely single value/cursor -- hand off to the
+            // already-correct, arbitrary-length-pipe-aware demand driver
+            // rather than re-deriving its cursor-threading logic here
+            // (#1503).
+            GenericResult::One(v) => {
+                return eval_each_pipe_generic::<S, V>(rest, v, optional, None, sink);
+            }
+            GenericResult::OneCursor(c) => {
+                return eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink);
+            }
+            GenericResult::Owned(o) => {
+                let rest_pipe = Expr::Pipe(rest.to_vec());
+                return eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
+                    sink(GenericItem::Owned(o))
+                });
+            }
+            // Nothing further to fold; push (or don't) and stop, same as
+            // `drain_result_generic`'s own handling of these.
+            terminal @ (GenericResult::None
+            | GenericResult::Error(_)
+            | GenericResult::Break(_)
+            | GenericResult::Halt(_)) => {
+                return drain_result_generic(terminal, sink);
+            }
+            // Unreachable from this function's only entry points
+            // (`eval_each_pipe_generic`'s Lazy* driver arm and
+            // `continue_pipe_element_generic`'s own Lazy* arm, both of which
+            // always start here with a `LazyKeys`/`LazyIndexRange`/`LazySeq`
+            // `current`): nothing above ever assigns `Many`/`ManyCursor`/
+            // `ManyOwned`/`Partial` to `current` mid-loop, since the only
+            // stage shape that can fan out (`Expr::Iterate`) is intercepted
+            // above and returns immediately instead of falling through to
+            // the generic match. Kept as a safety net (degrading to the
+            // eager fold) rather than `unreachable!()`, so a future caller
+            // that *does* reach this some other way gets correct-but-less-
+            // lazy behavior instead of a panic.
+            other => {
+                return drain_result_generic(
+                    fold_pipe_stages::<S, V>(other, &stages[j..], optional),
+                    sink,
+                );
+            }
+        };
+        j += 1;
     }
 }
 
@@ -3540,6 +3788,47 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Continue a pipe through one already-produced item: recurse the *rest* of
+/// the pipe against it, honoring `sink`'s `Demand` throughout. Shared by
+/// [`eval_each_pipe_generic`]'s own driver and [`fold_pipe_stages_sink`]'s
+/// per-element fan-out handling (#1565), so "thread one pulled value through
+/// an arbitrary-length remaining pipe" exists in exactly one place.
+///
+/// An `Owned` item bridges to the already-lazy `eval::eval_each_owned` so
+/// laziness (and thus `input`/`inputs` demand) continues through the rest of
+/// the pipe instead of stopping at the owned/cursor boundary, mirroring
+/// `eval_each_pipe`'s own `Item::Owned` arm (PR #1450 fixed the equivalent
+/// bug on the `eval.rs` side). A `LazyKeys`/`LazyIndexRange`/`LazySeq` item
+/// (never produced for a single pulled element by either caller today, but
+/// handled for robustness) folds through the remaining stages via
+/// [`fold_pipe_stages_sink`] rather than being decomposed or materialized
+/// here -- the #1503-safe move, same rationale as the top-level `Pipe`
+/// dispatch below.
+fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
+    item: GenericItem<V>,
+    rest: &[Expr],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match item {
+        GenericItem::One(v) => eval_each_pipe_generic::<S, V>(rest, v, optional, None, sink),
+        GenericItem::OneCursor(c) => {
+            eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+        }
+        GenericItem::Owned(o) => {
+            let rest_pipe = Expr::Pipe(rest.to_vec());
+            eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
+                sink(GenericItem::Owned(o))
+            })
+        }
+        item @ (GenericItem::LazyKeys { .. }
+        | GenericItem::LazyIndexRange(_)
+        | GenericItem::LazySeq(_)) => {
+            fold_pipe_stages_sink::<S, V>(generic_item_to_result(item), rest, optional, sink)
+        }
+    }
+}
+
 /// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
 /// pulling from stage 1 once the rest of the pipe has enough" mechanism.
 ///
@@ -3549,30 +3838,21 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// see a stubbed-zero default. Otherwise: evaluate stage 1 lazily via
 /// [`eval_each_generic`], and for every item it produces, recursively drive
 /// the *whole remaining pipe* (not just one more stage) through a driver
-/// closure that forwards items to the outer `sink` and translates whatever
-/// `Flow` that recursive call terminates in back into a `Demand` for stage
-/// 1's own generator. Recursing on the full remaining slice, rather than one
-/// stage at a time, is what lets cursor threading (`.[] | select(...) |
-/// line`) survive an arbitrary-length remaining pipe -- the exact property a
-/// narrower, 2-stage-only attempt lost (#1503 review).
+/// closure that forwards items to the outer `sink` (via
+/// [`continue_pipe_element_generic`]) and translates whatever `Flow` that
+/// recursive call terminates in back into a `Demand` for stage 1's own
+/// generator. Recursing on the full remaining slice, rather than one stage at
+/// a time, is what lets cursor threading (`.[] | select(...) | line`) survive
+/// an arbitrary-length remaining pipe -- the exact property a narrower,
+/// 2-stage-only attempt lost (#1503 review).
 ///
-/// An `Owned` item bridges to the already-lazy `eval::eval_each_owned` so
-/// laziness (and thus `input`/`inputs` demand) continues through the rest of
-/// the pipe instead of stopping at the owned/cursor boundary, mirroring
-/// `eval_each_pipe`'s own `Item::Owned` arm (PR #1450 fixed the equivalent
-/// bug on the `eval.rs` side). A `LazyKeys`/`LazyIndexRange`/`LazySeq` item
-/// folds through the remaining stages via [`fold_pipe_stages`] -- the same
-/// per-variant switch `eval_single`'s own `Expr::Pipe` arm uses, including
-/// its `map`/`select`/`first`/`.[n]` composability fast paths (#724/#725) --
-/// rather than being decomposed or materialized here, which is exactly what
-/// regressed #1503's own broader attempt.
-///
-/// **Known gap (#1565):** `fold_pipe_stages` itself is a plain eager fold
-/// with no demand check, so a `LazyKeys`/`LazyIndexRange`/`LazySeq` item
-/// folded through it this way does not get `first`'s early-stop benefit --
-/// `first(keys | .[] | stderr)` still visits every key, unlike the sibling
-/// `first(.[] | stderr)` shape #1461 fixed. Pre-existing (unchanged from the
-/// old eager fallback this function replaced), not a regression from #1461.
+/// A `LazyKeys`/`LazyIndexRange`/`LazySeq` item folds through the remaining
+/// stages via [`fold_pipe_stages_sink`] (#1565) -- demand-aware from the
+/// stage it was produced at, so `first(keys | .[] | stderr)` stops after one
+/// key instead of visiting every one, unlike the eager `fold_pipe_stages`
+/// this replaced for this call site. `fold_pipe_stages_sink` itself reuses
+/// `fold_pipe_stages`'s own per-variant composability fast paths (#724/#725)
+/// rather than duplicating them -- see its own doc comment.
 fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     value: V,
@@ -3599,34 +3879,9 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     let mut downstream: Option<Flow> = None;
-    let rest_pipe = Expr::Pipe(rest.to_vec());
     let upstream = {
         let mut driver = |item: GenericItem<V>| -> Demand {
-            let flow = match item {
-                GenericItem::One(v) => {
-                    eval_each_pipe_generic::<S, V>(rest, v, optional, None, &mut *sink)
-                }
-                GenericItem::OneCursor(c) => {
-                    eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), &mut *sink)
-                }
-                GenericItem::Owned(o) => eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
-                    sink(GenericItem::Owned(o))
-                }),
-                // These three carry a deferred computation `fold_pipe_stages`
-                // already knows how to thread through the rest of the pipe
-                // (its `map`/`select`/`first`/`.[n]` composability fast
-                // paths, #724/#725) without decomposing it -- so convert
-                // back to the `GenericResult` shape it came from via
-                // `generic_item_to_result` (the exact inverse of
-                // `drain_result_generic`'s own construction of these items)
-                // rather than re-deriving that conversion by hand here.
-                item @ (GenericItem::LazyKeys { .. }
-                | GenericItem::LazyIndexRange(_)
-                | GenericItem::LazySeq(_)) => drain_result_generic(
-                    fold_pipe_stages::<S, V>(generic_item_to_result(item), rest, optional),
-                    &mut *sink,
-                ),
-            };
+            let flow = continue_pipe_element_generic::<S, V>(item, rest, optional, &mut *sink);
             match flow {
                 Flow::Exhausted => Demand::Continue,
                 other => {

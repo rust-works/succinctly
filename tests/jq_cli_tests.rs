@@ -18430,6 +18430,40 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
         // `stderr` fires once per element pulled, not once per element that
         // exists -- `first` pulls exactly one.
         (&["-c", "first(.[] | stderr)"], Some("[1,2]"), "1\n", "1", 0),
+        // #1565 (moved from the leaks table below): when the pipe's *first*
+        // stage evaluates to `GenericResult::LazyKeys`/`LazyIndexRange`/
+        // `LazySeq` (`keys`, `keys_unsorted`, `map(f)`) and 2+ further
+        // stages follow, `eval_each_pipe_generic`'s driver now folds through
+        // `fold_pipe_stages_sink` instead of the eager `fold_pipe_stages` --
+        // demand-aware from the stage the lazy value was produced at, so
+        // `.[] | stderr` after a `keys` prefix fires once, same as the bare
+        // `first(.[] | stderr)` row above.
+        (
+            &["-c", "first(keys | .[] | stderr)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"a\"\n",
+            "a",
+            0,
+        ),
+        // Same #1565 fix, `keys_unsorted`/`LazyKeys{sorted:false}` flavor --
+        // the cons-list-walk fast path rather than `keys`'s decode+sort one.
+        (
+            &["-c", "first(keys_unsorted | .[] | stderr)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"a\"\n",
+            "a",
+            0,
+        ),
+        // Same #1565 fix, `LazySeq` (`map(f)`, #724/#725) flavor -- pulls
+        // `seq.next()` one at a time instead of draining the whole `map`
+        // chain before `first` gets a chance to stop.
+        (
+            &["-c", "first(map(.+1) | .[] | stderr)"],
+            Some("[1,2,3]"),
+            "2\n",
+            "2",
+            0,
+        ),
         // `n == 0` must not evaluate the operand at all.
         (&["-cn", r#"[limit(0; ("B"|stderr))]"#], None, "[]\n", "", 0),
         // Array construction is atomic in jq; laziness must not leak into it.
@@ -18953,33 +18987,6 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             None,
             "[false]\n",
             "B",
-            0,
-        ),
-        // Code review of #1461, filed as #1565: when the pipe's *first*
-        // stage evaluates to `GenericResult::LazyKeys` (`keys`,
-        // `keys_unsorted`) and 2+ further stages follow, the driver hands
-        // the whole remaining pipe to `fold_pipe_stages` -- the plain eager
-        // fold, with no demand check -- rather than continuing through
-        // `eval_each_pipe_generic`'s own sink. So `.[] | stderr` after a
-        // `keys` prefix still fires for every key, unlike the bare
-        // `first(.[] | stderr)` #1461 itself fixed. Confirmed pre-existing
-        // (identical on `main` before #1461, via the old 2-stage-only
-        // `first_over_comma_generic`), so not a regression here -- pinned so
-        // a fix for #1565 has a red test to turn green. jq: writes `a` once.
-        (
-            &["-c", "first(keys | .[] | stderr)"],
-            Some(r#"{"a":1,"b":2,"c":3}"#),
-            "\"a\"\n",
-            "abc",
-            0,
-        ),
-        // Same #1565 gap, `LazySeq` (`map(f)`, #724/#725) flavor instead of
-        // `LazyKeys`. jq: writes `2` once.
-        (
-            &["-c", "first(map(.+1) | .[] | stderr)"],
-            Some("[1,2,3]"),
-            "2\n",
-            "234",
             0,
         ),
         // Same class as the `Compare` row above (#1565): `Expr::If` has no
