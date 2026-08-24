@@ -1012,14 +1012,15 @@ pub fn collapsed_fields_if<F: DocumentFields>(
 /// full cons-list walk, and `uncons` is two BP sibling hops per field.
 ///
 /// The [`KeyHashes`] probe rides along with the walk. A repeated hash hands
-/// the object to [`collapsed_fields`], which decides on the keys
+/// the object to `collapse_confirmed_repeat`, which decides on the keys
 /// themselves:
 ///
-/// - `Some` — a real duplicate. The remainder switches to the exact
-///   collapsed list, resuming at the count already yielded, which lines up
-///   because the collapsed list opens with those same first occurrences.
-/// - `None` — a 64-bit hash collision, and the answer covers the whole
-///   object, so the probe retires rather than firing again at the next one.
+/// - A genuine collapse — the remainder switches to the exact collapsed
+///   list, resuming at the count already yielded, which lines up because
+///   the collapsed list opens with those same first occurrences.
+/// - A 64-bit hash collision, no real duplicate — the answer covers the
+///   whole object, so the probe retires rather than firing again at the
+///   next one.
 ///
 /// `collapse` false (yq) carries no probe state at all and is the plain
 /// cons-list walk it always was.
@@ -1035,8 +1036,10 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     seen: Option<KeyHashes>,
     /// How many cursors have gone out, which is where `collapsed` resumes.
     yielded: usize,
-    /// The exact collapsed fields, once a repeat is confirmed.
-    collapsed: Option<Vec<DocumentField<F::Value, F::Cursor>>>,
+    /// The exact collapsed key list, once a repeat is confirmed. Key and
+    /// cursor only -- this iterator never reads a field's value, so
+    /// `collapse_confirmed_repeat` never materializes one (#1514 review).
+    collapsed: Option<Vec<(F::Value, F::Cursor)>>,
 }
 
 impl<F: DocumentFields> DistinctKeyCursors<F> {
@@ -1061,9 +1064,9 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(collapsed) = &self.collapsed {
-            let field = collapsed.get(self.yielded)?;
+            let (key, cursor) = collapsed.get(self.yielded)?;
             self.yielded += 1;
-            return Some((field.key.clone(), field.key_cursor));
+            return Some((key.clone(), *cursor));
         }
         let (key, key_cursor, tail) = self.rest.uncons_key()?;
         self.rest = tail;
@@ -1072,21 +1075,66 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             .as_mut()
             .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)));
         if repeat {
-            match collapsed_fields(&self.all) {
-                Some(fields) => {
-                    self.collapsed = Some(fields);
-                    self.seen = None;
-                    // Resumes at `yielded`, which the collapsed list's own
-                    // prefix matches: every key emitted so far was a first
-                    // occurrence, and collapsing keeps those in place.
-                    return self.next();
-                }
-                None => self.seen = None,
+            let (collapsed, total) = collapse_confirmed_repeat(&self.all);
+            if collapsed.len() < total {
+                self.collapsed = Some(collapsed);
+                self.seen = None;
+                // Resumes at `yielded`, which the collapsed list's own
+                // prefix matches: every key emitted so far was a first
+                // occurrence, and collapsing keeps those in place.
+                return self.next();
             }
+            // A 64-bit hash collision, not a real duplicate: nothing
+            // collapsed, so the answer covers the whole object and the
+            // probe retires rather than firing again at the next one.
+            self.seen = None;
         }
         self.yielded += 1;
         Some((key, key_cursor))
     }
+}
+
+/// The exact collapsed key list for an object [`DistinctKeyCursors`] has
+/// already flagged as a probable repeat via its hash probe.
+///
+/// Unlike [`collapsed_fields`] (used by the `.[] | map` collapse path in
+/// `eval_generic.rs`, which needs `value_cursor` too), this never
+/// materializes a field's value -- `DistinctKeyCursors` only ever reads the
+/// key -- and it skips `collapsed_fields`'s own [`census`] pre-check
+/// entirely: the caller already knows a repeat is likely, so re-deriving
+/// "is this object actually repeated?" first is redundant work whose answer
+/// this caller doesn't need. A genuine hash collision (no real repeat)
+/// still resolves correctly here -- the caller sees `collapsed.len() ==
+/// total` in that case, exactly what `census`'s own exact check would have
+/// reported, just discovered post hoc instead of as a separate pass.
+///
+/// This turns the up-to-three full-object walks `collapsed_fields` +
+/// `census` would otherwise run (hash-collect, conditional exact-collision
+/// narrowing, then a value-materializing `all_fields()` walk) into one
+/// key-only walk (#1514 review).
+#[allow(clippy::type_complexity)] // STYLE-0004: (key, cursor) list plus a walked-field count; the nested tuple is intentional
+fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> (Vec<(F::Value, F::Cursor)>, usize) {
+    let mut slot_of: IndexMap<String, usize> = IndexMap::new();
+    let mut out: Vec<(F::Value, F::Cursor)> = Vec::new();
+    let mut total = 0usize;
+    let mut walk = fields.clone();
+    while let Some((key, key_cursor, rest)) = walk.uncons_key() {
+        total += 1;
+        match key.key_string().map(Cow::into_owned) {
+            Some(k) => match slot_of.get(&k) {
+                Some(&slot) => out[slot] = (key, key_cursor),
+                None => {
+                    slot_of.insert(k, out.len());
+                    out.push((key, key_cursor));
+                }
+            },
+            // Same "no name to collapse on, keep it where it stands"
+            // handling as `collapse_repeated` (#1385 review).
+            None => out.push((key, key_cursor)),
+        }
+        walk = rest;
+    }
+    (out, total)
 }
 
 /// Collapse fields known to contain at least one repeated key.
