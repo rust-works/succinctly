@@ -2577,119 +2577,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                 fields,
                 sorted,
                 collapse,
-            } => match if collapse {
-                // #1385: in jq mode a repeated key collapses, so
-                // these count- and order-sensitive arms cannot
-                // answer from the raw walk -- the collapsed object
-                // has fewer members, and `.[n]`/`last` land
-                // elsewhere. Probe once: an object with no repeat
-                // (the common case) keeps the zero-allocation
-                // cons-list arms below exactly as they were, and in
-                // yq mode `collapse` is a `false` const, so the
-                // probe itself compiles away.
-                collapsed_fields(&fields)
-            } else {
-                None
-            } {
-                Some(eff) => lazy_keys_collapsed::<S, V>(expr, eff, sorted, optional),
-                None => match unwrap_paren(expr) {
-                    // Order-independent for both `keys` and
-                    // `keys_unsorted` — the one fast path #683 adds for
-                    // sorted `keys`.
-                    Expr::Builtin(Builtin::Length) => {
-                        GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
-                    }
-                    // Document order is a valid answer only for
-                    // `keys_unsorted`. `keys` needs lexicographic order
-                    // for these and falls through to the shared
-                    // materialize-(and-sort) fallback below. Do not drop
-                    // the `if !sorted` guard on a new arm here without
-                    // re-deriving why document order would still be a
-                    // correct answer.
-                    Expr::Iterate if !sorted => {
-                        let mut cursors = Vec::new();
-                        let mut current = fields;
-                        while let Some((field, rest)) = current.uncons() {
-                            cursors.push(field.key_cursor);
-                            current = rest;
-                        }
-                        if cursors.is_empty() {
-                            GenericResult::None
-                        } else {
-                            GenericResult::ManyCursor(cursors)
-                        }
-                    }
-                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
-                        // Negative indices need the length to normalize
-                        // against, same as `Expr::Index`'s array arm
-                        // above; positive indices skip straight to the
-                        // walk. Out-of-bounds is `null`, never an error
-                        // (#307), matching that same arm.
-                        let target = if *idx < 0 {
-                            let len = fields.len();
-                            let normalized = len as i64 + idx;
-                            if normalized < 0 {
-                                None
-                            } else {
-                                Some(normalized as usize)
-                            }
-                        } else {
-                            Some(*idx as usize)
-                        };
-                        match target {
-                            Some(target) => {
-                                let mut current = fields;
-                                let mut found = None;
-                                let mut i = 0usize;
-                                while let Some((field, rest)) = current.uncons() {
-                                    if i == target {
-                                        found = Some(field.key_cursor);
-                                        break;
-                                    }
-                                    current = rest;
-                                    i += 1;
-                                }
-                                match found {
-                                    Some(c) => GenericResult::OneCursor(c),
-                                    None => GenericResult::Owned(OwnedValue::Null),
-                                }
-                            }
-                            None => GenericResult::Owned(OwnedValue::Null),
-                        }
-                    }
-                    Expr::Builtin(Builtin::First) if !sorted => match fields.uncons() {
-                        Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
-                        None => GenericResult::Owned(OwnedValue::Null),
-                    },
-                    Expr::Builtin(Builtin::Last) if !sorted => {
-                        let mut current = fields;
-                        let mut last_cursor = None;
-                        while let Some((field, rest)) = current.uncons() {
-                            last_cursor = Some(field.key_cursor);
-                            current = rest;
-                        }
-                        match last_cursor {
-                            Some(c) => GenericResult::OneCursor(c),
-                            None => GenericResult::Owned(OwnedValue::Null),
-                        }
-                    }
-                    // Slice 1 (#724): stay lazy instead of falling
-                    // through to the `_` materializing fallback below —
-                    // reuses the composability arm (`GenericResult::LazySeq`
-                    // below) for everything past this first `map` stage.
-                    // Same `!sorted` guard as the other fast-path arms
-                    // above: sorted `keys` still needs a full decode+sort
-                    // first.
-                    Expr::Builtin(Builtin::Map(f)) if !sorted => GenericResult::LazySeq(
-                        LazySeq::new(LazySource::Keys(fields)).push_map(f, S::TAG),
-                    ),
-                    _ => eval_on_owned::<S, _>(
-                        expr,
-                        materialize_lazy_keys::<V>(&fields, sorted, collapse),
-                        optional,
-                    ),
-                },
-            },
+            } => fold_lazy_keys_stage::<S, V>(fields, sorted, collapse, expr, optional),
             // The array counterpart of `LazyKeys` above
             // (#684): the index range `[0, 1, ..., len-1]` is fully
             // determined by `len` alone, so `length`, `.[]`, `.[n]`,
@@ -2697,57 +2585,9 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // allocation at all, not even a `Vec<V::Cursor>` (there's
             // no cursor to point at: array-index "keys" are
             // synthetic, not bytes in the source document).
-            GenericResult::LazyIndexRange(len) => match unwrap_paren(expr) {
-                Expr::Builtin(Builtin::Length) => GenericResult::Owned(OwnedValue::Int(len as i64)),
-                Expr::Iterate => {
-                    if len == 0 {
-                        GenericResult::None
-                    } else {
-                        GenericResult::ManyOwned(
-                            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
-                        )
-                    }
-                }
-                Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
-                    // Same normalization/OOB-is-null semantics as
-                    // `LazyKeys`'s `Expr::Index` arm above.
-                    let target = if *idx < 0 {
-                        let normalized = len as i64 + idx;
-                        if normalized < 0 {
-                            None
-                        } else {
-                            Some(normalized as usize)
-                        }
-                    } else {
-                        Some(*idx as usize)
-                    };
-                    match target {
-                        Some(i) if i < len => GenericResult::Owned(OwnedValue::Int(i as i64)),
-                        _ => GenericResult::Owned(OwnedValue::Null),
-                    }
-                }
-                Expr::Builtin(Builtin::First) => {
-                    if len == 0 {
-                        GenericResult::Owned(OwnedValue::Null)
-                    } else {
-                        GenericResult::Owned(OwnedValue::Int(0))
-                    }
-                }
-                Expr::Builtin(Builtin::Last) => {
-                    if len == 0 {
-                        GenericResult::Owned(OwnedValue::Null)
-                    } else {
-                        GenericResult::Owned(OwnedValue::Int(len as i64 - 1))
-                    }
-                }
-                // Slice 1 (#724), array counterpart of `LazyKeys`'s
-                // own `Builtin::Map` arm above. No `!sorted` guard —
-                // array "keys" are never sorted.
-                Expr::Builtin(Builtin::Map(f)) => GenericResult::LazySeq(
-                    LazySeq::new(LazySource::IndexRange { next: 0, len }).push_map(f, S::TAG),
-                ),
-                _ => eval_on_owned::<S, _>(expr, materialize_lazy_index_range(len), optional),
-            },
+            GenericResult::LazyIndexRange(len) => {
+                fold_lazy_index_range_stage::<S, V>(len, expr, optional)
+            }
             // The composability engine (#724, #725): every further
             // `| map(g)` stage just pushes onto the same chain
             // (self-recursive by construction — an arbitrary-length
@@ -2757,117 +2597,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // materializes once (`materialize_atomic`) and hands off
             // to the full evaluator — still one pass, not the
             // original four-pass round trip.
-            GenericResult::LazySeq(mut seq) => match unwrap_paren(expr) {
-                Expr::Builtin(Builtin::Map(h)) => GenericResult::LazySeq(seq.push_map(h, S::TAG)),
-
-                // Count-and-discard: every element still runs (so a
-                // `map(f)` that errors partway still errors), but no
-                // `OwnedValue` is ever built for any of them. Atomic,
-                // same as `materialize_atomic` -- `length` of an
-                // array construction that fails is itself a failure,
-                // not a partial count.
-                Expr::Builtin(Builtin::Length) => {
-                    let mut count: i64 = 0;
-                    for item in seq {
-                        match item {
-                            Ok(_) => count += 1,
-                            Err(Control::Error(e)) => return GenericResult::Error(e),
-                            Err(Control::Break(label)) => return GenericResult::Break(label),
-                            Err(Control::Halt(code)) => return GenericResult::Halt(code),
-                        }
-                    }
-                    GenericResult::Owned(OwnedValue::Int(count))
-                }
-
-                // `.[]` iterates the array `map`'s own construction
-                // already built, not the raw source -- and that
-                // construction is atomic in real jq
-                // (`[1,2,"x"]|map(.+1)` prints nothing on error, not
-                // a truncated prefix), so a failure here discards
-                // every already-yielded element too, same atomicity
-                // boundary as `Length`/the `_` fallback below. This
-                // is NOT the same case as elementwise
-                // `.[] | select(g)` (a structurally distinct,
-                // out-of-scope case per the design doc): there,
-                // `.[]` is the *source* of the pipe and each element
-                // is independent; here it's a *consumer* of an
-                // already-atomic `map` result.
-                Expr::Iterate => {
-                    let mut items = Vec::new();
-                    for item in seq {
-                        match item {
-                            Ok(elem) => items.push(elem),
-                            Err(Control::Error(e)) => return GenericResult::Error(e),
-                            Err(Control::Break(label)) => return GenericResult::Break(label),
-                            Err(Control::Halt(code)) => return GenericResult::Halt(code),
-                        }
-                    }
-                    let all_cursor = items.iter().all(|item| matches!(item, LazyElem::Cursor(_)));
-                    if items.is_empty() {
-                        GenericResult::None
-                    } else if all_cursor {
-                        GenericResult::ManyCursor(
-                            items
-                                .into_iter()
-                                .map(|item| match item {
-                                    LazyElem::Cursor(c) => c,
-                                    LazyElem::Owned(_) => {
-                                        unreachable!("checked all_cursor above")
-                                    }
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        GenericResult::ManyOwned(
-                            items
-                                .into_iter()
-                                .map(|item| match item {
-                                    LazyElem::Cursor(c) => to_owned_cursor(&c),
-                                    LazyElem::Owned(o) => o,
-                                })
-                                .collect(),
-                        )
-                    }
-                }
-
-                // Pull-one-and-stop: at most one element of `seq` is
-                // ever evaluated. Accepted, deliberate divergence
-                // from real jq's strict semantics: real jq's `map`
-                // eagerly builds the *whole* array before `first`/
-                // `.[0]` can observe it, so `map(f)|first` errors if
-                // *any* element of `f` fails, even ones past the
-                // first. This fast path only evaluates what's
-                // actually needed, so `[1,2,"x"]|map(.+1)|first`
-                // succeeds here (returns `2`) where real jq raises a
-                // type error -- the entire point of making `first`/
-                // `.[0]` lazy is to skip evaluating elements that
-                // don't affect the requested output, and an error on
-                // a skipped element is one such element. Pinned by
-                // `test_generic_lazy_seq_first_after_map_skips_later_error_725`.
-                Expr::Builtin(Builtin::First) | Expr::Index(0) => match seq.next() {
-                    None => GenericResult::Owned(OwnedValue::Null),
-                    Some(Ok(LazyElem::Cursor(c))) => GenericResult::OneCursor(c),
-                    Some(Ok(LazyElem::Owned(o))) => GenericResult::Owned(o),
-                    Some(Err(Control::Error(e))) => GenericResult::Error(e),
-                    Some(Err(Control::Break(label))) => GenericResult::Break(label),
-                    Some(Err(Control::Halt(code))) => GenericResult::Halt(code),
-                },
-
-                // `last`, nonzero `.[n]`, whole-value `select`,
-                // comparisons, everything else: one atomic forward
-                // pass, then hand off to the full evaluator -- still
-                // one pass, not the original four-pass round trip.
-                // `select` deliberately gets no dedicated arm here —
-                // it materializes once and runs through
-                // `eval_on_owned`'s already-correct `Builtin::Select`
-                // handling, same as any other computed value.
-                _ => match seq.materialize_atomic() {
-                    Ok(owned) => eval_on_owned::<S, _>(expr, owned, optional),
-                    Err(Control::Error(e)) => GenericResult::Error(e),
-                    Err(Control::Break(label)) => GenericResult::Break(label),
-                    Err(Control::Halt(code)) => GenericResult::Halt(code),
-                },
-            },
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => return GenericResult::Error(e),
             GenericResult::Owned(o) => {
@@ -2884,6 +2614,315 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
     }
 
     current
+}
+
+/// One step of folding a `GenericResult::LazyKeys` through a single further
+/// pipe stage. Extracted verbatim from `fold_pipe_stages`'s own `LazyKeys`
+/// arm so a planned demand-aware sibling (#1565) can share the exact same
+/// composability fast paths (`length`, `.[]`, `.[n]`, `first`, `last`,
+/// `map` when `!sorted`) instead of duplicating them.
+fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
+    fields: V::Fields,
+    sorted: bool,
+    collapse: bool,
+    expr: &Expr,
+    optional: bool,
+) -> GenericResult<V> {
+    match if collapse {
+        // #1385: in jq mode a repeated key collapses, so
+        // these count- and order-sensitive arms cannot
+        // answer from the raw walk -- the collapsed object
+        // has fewer members, and `.[n]`/`last` land
+        // elsewhere. Probe once: an object with no repeat
+        // (the common case) keeps the zero-allocation
+        // cons-list arms below exactly as they were, and in
+        // yq mode `collapse` is a `false` const, so the
+        // probe itself compiles away.
+        collapsed_fields(&fields)
+    } else {
+        None
+    } {
+        Some(eff) => lazy_keys_collapsed::<S, V>(expr, eff, sorted, optional),
+        None => match unwrap_paren(expr) {
+            // Order-independent for both `keys` and
+            // `keys_unsorted` — the one fast path #683 adds for
+            // sorted `keys`.
+            Expr::Builtin(Builtin::Length) => {
+                GenericResult::Owned(OwnedValue::Int(fields.len() as i64))
+            }
+            // Document order is a valid answer only for
+            // `keys_unsorted`. `keys` needs lexicographic order
+            // for these and falls through to the shared
+            // materialize-(and-sort) fallback below. Do not drop
+            // the `if !sorted` guard on a new arm here without
+            // re-deriving why document order would still be a
+            // correct answer.
+            Expr::Iterate if !sorted => {
+                let mut cursors = Vec::new();
+                let mut current = fields;
+                while let Some((field, rest)) = current.uncons() {
+                    cursors.push(field.key_cursor);
+                    current = rest;
+                }
+                if cursors.is_empty() {
+                    GenericResult::None
+                } else {
+                    GenericResult::ManyCursor(cursors)
+                }
+            }
+            Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
+                // Negative indices need the length to normalize
+                // against, same as `Expr::Index`'s array arm
+                // above; positive indices skip straight to the
+                // walk. Out-of-bounds is `null`, never an error
+                // (#307), matching that same arm.
+                let target = if *idx < 0 {
+                    let len = fields.len();
+                    let normalized = len as i64 + idx;
+                    if normalized < 0 {
+                        None
+                    } else {
+                        Some(normalized as usize)
+                    }
+                } else {
+                    Some(*idx as usize)
+                };
+                match target {
+                    Some(target) => {
+                        let mut current = fields;
+                        let mut found = None;
+                        let mut i = 0usize;
+                        while let Some((field, rest)) = current.uncons() {
+                            if i == target {
+                                found = Some(field.key_cursor);
+                                break;
+                            }
+                            current = rest;
+                            i += 1;
+                        }
+                        match found {
+                            Some(c) => GenericResult::OneCursor(c),
+                            None => GenericResult::Owned(OwnedValue::Null),
+                        }
+                    }
+                    None => GenericResult::Owned(OwnedValue::Null),
+                }
+            }
+            Expr::Builtin(Builtin::First) if !sorted => match fields.uncons() {
+                Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
+                None => GenericResult::Owned(OwnedValue::Null),
+            },
+            Expr::Builtin(Builtin::Last) if !sorted => {
+                let mut current = fields;
+                let mut last_cursor = None;
+                while let Some((field, rest)) = current.uncons() {
+                    last_cursor = Some(field.key_cursor);
+                    current = rest;
+                }
+                match last_cursor {
+                    Some(c) => GenericResult::OneCursor(c),
+                    None => GenericResult::Owned(OwnedValue::Null),
+                }
+            }
+            // Slice 1 (#724): stay lazy instead of falling
+            // through to the `_` materializing fallback below —
+            // reuses the composability arm (`GenericResult::LazySeq`
+            // below) for everything past this first `map` stage.
+            // Same `!sorted` guard as the other fast-path arms
+            // above: sorted `keys` still needs a full decode+sort
+            // first.
+            Expr::Builtin(Builtin::Map(f)) if !sorted => {
+                GenericResult::LazySeq(LazySeq::new(LazySource::Keys(fields)).push_map(f, S::TAG))
+            }
+            _ => eval_on_owned::<S, _>(
+                expr,
+                materialize_lazy_keys::<V>(&fields, sorted, collapse),
+                optional,
+            ),
+        },
+    }
+}
+
+/// One step of folding a `GenericResult::LazyIndexRange` through a single
+/// further pipe stage. Extracted verbatim from `fold_pipe_stages`'s own
+/// `LazyIndexRange` arm (#1565); see [`fold_lazy_keys_stage`]'s own doc
+/// comment for why this split exists.
+fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
+    len: usize,
+    expr: &Expr,
+    optional: bool,
+) -> GenericResult<V> {
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Length) => GenericResult::Owned(OwnedValue::Int(len as i64)),
+        Expr::Iterate => {
+            if len == 0 {
+                GenericResult::None
+            } else {
+                GenericResult::ManyOwned((0..len).map(|i| OwnedValue::Int(i as i64)).collect())
+            }
+        }
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            // Same normalization/OOB-is-null semantics as
+            // `LazyKeys`'s `Expr::Index` arm above.
+            let target = if *idx < 0 {
+                let normalized = len as i64 + idx;
+                if normalized < 0 {
+                    None
+                } else {
+                    Some(normalized as usize)
+                }
+            } else {
+                Some(*idx as usize)
+            };
+            match target {
+                Some(i) if i < len => GenericResult::Owned(OwnedValue::Int(i as i64)),
+                _ => GenericResult::Owned(OwnedValue::Null),
+            }
+        }
+        Expr::Builtin(Builtin::First) => {
+            if len == 0 {
+                GenericResult::Owned(OwnedValue::Null)
+            } else {
+                GenericResult::Owned(OwnedValue::Int(0))
+            }
+        }
+        Expr::Builtin(Builtin::Last) => {
+            if len == 0 {
+                GenericResult::Owned(OwnedValue::Null)
+            } else {
+                GenericResult::Owned(OwnedValue::Int(len as i64 - 1))
+            }
+        }
+        // Slice 1 (#724), array counterpart of `LazyKeys`'s
+        // own `Builtin::Map` arm above. No `!sorted` guard —
+        // array "keys" are never sorted.
+        Expr::Builtin(Builtin::Map(f)) => GenericResult::LazySeq(
+            LazySeq::new(LazySource::IndexRange { next: 0, len }).push_map(f, S::TAG),
+        ),
+        _ => eval_on_owned::<S, _>(expr, materialize_lazy_index_range(len), optional),
+    }
+}
+
+/// One step of folding a `GenericResult::LazySeq` through a single further
+/// pipe stage. Extracted verbatim from `fold_pipe_stages`'s own `LazySeq`
+/// arm; see [`fold_lazy_keys_stage`]'s own doc comment for why this split
+/// exists.
+fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
+    mut seq: LazySeq<V>,
+    expr: &Expr,
+    optional: bool,
+) -> GenericResult<V> {
+    match unwrap_paren(expr) {
+        Expr::Builtin(Builtin::Map(h)) => GenericResult::LazySeq(seq.push_map(h, S::TAG)),
+
+        // Count-and-discard: every element still runs (so a
+        // `map(f)` that errors partway still errors), but no
+        // `OwnedValue` is ever built for any of them. Atomic,
+        // same as `materialize_atomic` -- `length` of an
+        // array construction that fails is itself a failure,
+        // not a partial count.
+        Expr::Builtin(Builtin::Length) => {
+            let mut count: i64 = 0;
+            for item in seq {
+                match item {
+                    Ok(_) => count += 1,
+                    Err(Control::Error(e)) => return GenericResult::Error(e),
+                    Err(Control::Break(label)) => return GenericResult::Break(label),
+                    Err(Control::Halt(code)) => return GenericResult::Halt(code),
+                }
+            }
+            GenericResult::Owned(OwnedValue::Int(count))
+        }
+
+        // `.[]` iterates the array `map`'s own construction
+        // already built, not the raw source -- and that
+        // construction is atomic in real jq
+        // (`[1,2,"x"]|map(.+1)` prints nothing on error, not
+        // a truncated prefix), so a failure here discards
+        // every already-yielded element too, same atomicity
+        // boundary as `Length`/the `_` fallback below. This
+        // is NOT the same case as elementwise
+        // `.[] | select(g)` (a structurally distinct,
+        // out-of-scope case per the design doc): there,
+        // `.[]` is the *source* of the pipe and each element
+        // is independent; here it's a *consumer* of an
+        // already-atomic `map` result.
+        Expr::Iterate => {
+            let mut items = Vec::new();
+            for item in seq {
+                match item {
+                    Ok(elem) => items.push(elem),
+                    Err(Control::Error(e)) => return GenericResult::Error(e),
+                    Err(Control::Break(label)) => return GenericResult::Break(label),
+                    Err(Control::Halt(code)) => return GenericResult::Halt(code),
+                }
+            }
+            let all_cursor = items.iter().all(|item| matches!(item, LazyElem::Cursor(_)));
+            if items.is_empty() {
+                GenericResult::None
+            } else if all_cursor {
+                GenericResult::ManyCursor(
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            LazyElem::Cursor(c) => c,
+                            LazyElem::Owned(_) => {
+                                unreachable!("checked all_cursor above")
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                GenericResult::ManyOwned(
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            LazyElem::Cursor(c) => to_owned_cursor(&c),
+                            LazyElem::Owned(o) => o,
+                        })
+                        .collect(),
+                )
+            }
+        }
+
+        // Pull-one-and-stop: at most one element of `seq` is
+        // ever evaluated. Accepted, deliberate divergence
+        // from real jq's strict semantics: real jq's `map`
+        // eagerly builds the *whole* array before `first`/
+        // `.[0]` can observe it, so `map(f)|first` errors if
+        // *any* element of `f` fails, even ones past the
+        // first. This fast path only evaluates what's
+        // actually needed, so `[1,2,"x"]|map(.+1)|first`
+        // succeeds here (returns `2`) where real jq raises a
+        // type error -- the entire point of making `first`/
+        // `.[0]` lazy is to skip evaluating elements that
+        // don't affect the requested output, and an error on
+        // a skipped element is one such element. Pinned by
+        // `test_generic_lazy_seq_first_after_map_skips_later_error_725`.
+        Expr::Builtin(Builtin::First) | Expr::Index(0) => match seq.next() {
+            None => GenericResult::Owned(OwnedValue::Null),
+            Some(Ok(LazyElem::Cursor(c))) => GenericResult::OneCursor(c),
+            Some(Ok(LazyElem::Owned(o))) => GenericResult::Owned(o),
+            Some(Err(Control::Error(e))) => GenericResult::Error(e),
+            Some(Err(Control::Break(label))) => GenericResult::Break(label),
+            Some(Err(Control::Halt(code))) => GenericResult::Halt(code),
+        },
+
+        // `last`, nonzero `.[n]`, whole-value `select`,
+        // comparisons, everything else: one atomic forward
+        // pass, then hand off to the full evaluator -- still
+        // one pass, not the original four-pass round trip.
+        // `select` deliberately gets no dedicated arm here —
+        // it materializes once and runs through
+        // `eval_on_owned`'s already-correct `Builtin::Select`
+        // handling, same as any other computed value.
+        _ => match seq.materialize_atomic() {
+            Ok(owned) => eval_on_owned::<S, _>(expr, owned, optional),
+            Err(Control::Error(e)) => GenericResult::Error(e),
+            Err(Control::Break(label)) => GenericResult::Break(label),
+            Err(Control::Halt(code)) => GenericResult::Halt(code),
+        },
+    }
 }
 
 /// Evaluate a single expression against a value with optional cursor context.
