@@ -3054,6 +3054,24 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// yields `Result<LazyElem<V>, Control>`; only [`LazyElem::Cursor`]/
 /// [`LazyElem::Owned`] are real elements, an `Err` is a mid-`map` failure
 /// handled by [`drive_pipe_elements_generic`] itself.
+///
+/// **Deliberate divergence from real jq, and from the eager arm's own
+/// atomicity.** `fold_lazy_seq_stage`'s `Expr::Iterate` arm drains first, so
+/// a `map(f)` that fails on *any* element discards every element it already
+/// yielded -- matching real jq, where `map` builds the whole array before
+/// `.[]` can observe it. Pulling one at a time cannot preserve that: an
+/// element already handed to `sink` is already downstream. So
+/// `[1,"x",3] | first(map(.+1) | .[])` yields `2` here where jq errors.
+///
+/// This is the same trade #725 already made for `map(f) | first` (pinned by
+/// `test_generic_lazy_seq_first_after_map_skips_later_error_725`), widened
+/// from `first`/`.[0]` to `.[]`-under-demand: the point of a lazy `first` is
+/// to skip elements that cannot affect the requested output, and an element
+/// that errors is one such element. Restoring atomicity would mean draining
+/// the whole `seq` before emitting anything, which is exactly the O(n) cost
+/// #1565 exists to remove. Pinned by
+/// `test_first_over_lazy_seq_iterate_skips_later_error_1565`; recorded in
+/// `docs/compliance/jq/limitations.md`.
 fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     seq: LazySeq<V>,
     rest: &[Expr],

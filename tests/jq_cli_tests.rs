@@ -19028,8 +19028,11 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         // `EXPR as $x | BODY` should stop after `BODY`'s first output for
         // the first `$x` binding, never touching the second `(1,2)`
         // binding at all -- same root cause as the `If` row above, but
-        // doubly eager here since both bindings' `BODY` runs to completion.
-        // jq: writes `B` once (never reaches the `$x = 2` binding).
+        // doubly eager here since both bindings' `BODY` runs to completion,
+        // hence `BB` rather than the other rows' single `B`. jq: no stderr
+        // at all (captured from jq 1.7.1), same as every other row here --
+        // it stops at `$x`'s own first output, before `("B"|stderr)` is
+        // ever reached under either binding.
         (
             &["-cn", r#"first((1,2) as $x | ($x, ("B"|stderr)))"#],
             None,
@@ -19393,6 +19396,57 @@ fn test_first_over_lazy_prefix_applies_every_stage_1565() -> Result<()> {
             (stdout.as_str(), code),
             (*want_out, 0),
             "`{}` -- stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// #1565 made `first(map(f) | .[] | g)` pull one element at a time, which
+/// necessarily gives up the atomicity `fold_lazy_seq_stage`'s eager
+/// `Expr::Iterate` arm has: an element already handed to the sink is already
+/// downstream, so a later element that would error can no longer retract it.
+///
+/// That is the same deliberate trade #725 already made for `map(f) | first`
+/// (see `docs/compliance/jq/limitations.md`), widened from `first`/`.[0]` to
+/// `.[]`-under-demand -- pinned here so the divergence stays a decision
+/// rather than drifting, together with the draining counter-cases that must
+/// keep matching jq exactly. All expectations captured from jq 1.7.1.
+#[test]
+fn test_first_over_lazy_seq_iterate_skips_later_error_1565() -> Result<()> {
+    // Diverges from jq: jq errors (exit 5) because `map` builds the whole
+    // array first; succinctly stops after the element `first` needed.
+    for (args, want_out) in [
+        (&["-c", "first(map(.+1) | .[])"][..], "2\n"),
+        (&["-c", "first(map(.+1) | .[] | . + 10)"][..], "12\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(r#"[1,"x",3]"#))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want_out, 0),
+            "`{}` -- stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+
+    // Matches jq: every one of these has to see the whole array, so the
+    // failing element is never skipped and the error still surfaces.
+    for args in [
+        &["-c", "map(.+1)"][..],
+        &["-c", "map(.+1) | last"][..],
+        &["-c", "[map(.+1) | .[]]"][..],
+        &["-c", "[first(map(.+1) | .[] | select(. > 100))]"][..],
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(r#"[1,"x",3]"#))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 5),
+            "`{}` -- stderr: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains("cannot be added"),
+            "`{}` -- unexpected stderr: {stderr}",
             args.join(" ")
         );
     }

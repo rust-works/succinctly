@@ -799,6 +799,44 @@ Deliberately not matched. jq is not self-consistent between the two exhaustion p
 a single probe admitting two readings is not a model worth encoding; the reset is not
 reproduced until the rule behind it is known.
 
+## A truncating consumer of `map(f)` skips the elements it never needed
+
+Real jq's `map(f)` is `[.[] | f]` — an array construction, and array construction is
+atomic: every element runs before anything downstream can observe the result, so a single
+failing element fails the whole expression even when the consumer only ever wanted the
+first output.
+
+`succinctly jq` evaluates `map(f)` as a lazy sequence (#724, #725) and pulls from it on
+demand, so a consumer that stops early never runs the elements past its stopping point —
+and an element that would have errored is one such element:
+
+```
+$ echo '[1,"x",3]' | jq          -c 'map(.+1) | first'          # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1) | first'        # 2, exit 0
+$ echo '[1,"x",3]' | jq          -c 'first(map(.+1) | .[])'     # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'first(map(.+1) | .[])'   # 2, exit 0
+```
+
+Deliberate, and the whole point of the laziness: skipping elements that cannot affect the
+requested output is the optimization, and restoring jq's atomicity would mean draining the
+sequence before emitting anything — reinstating exactly the O(n) cost
+[#1565](https://github.com/rust-works/succinctly/issues/1565) removed (a 2M-element
+`first(map(.+1) | .[] | .+1)` went from ~1.8 s to ~0.04 s).
+
+The divergence is bounded to consumers that genuinely truncate. Anything that has to see
+the whole array still errors, in both tools:
+
+```
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1)'         # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1) | last'  # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c '[map(.+1) | .[]]' # error, exit 5
+```
+
+Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../../tests/jq_cli_tests.rs)
+(the `map(f) | first` / `map(f) | .[0]` spelling) and
+[`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
+(the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
