@@ -870,8 +870,8 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
     let mut walk = fields.clone();
-    while let Some((field, rest)) = walk.uncons() {
-        match field_key_hash(&field) {
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        match key_hash_of(&key) {
             Some(hash) => hashes.push(hash),
             None => unkeyed += 1,
         }
@@ -890,17 +890,18 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     // A shared hash is nearly always a genuine repeat, but two different
     // keys can collide, and counting those as one would be wrong. Re-walk
     // owning *only* the colliding keys -- on an ordinary duplicate that is
-    // a handful of strings, not one per field.
+    // a handful of strings, not one per field. `uncons_key` (#1514), same
+    // as the first walk above: a census never looks at values.
     let mut colliding: Vec<String> = Vec::new();
     let mut walk = fields.clone();
-    while let Some((field, rest)) = walk.uncons() {
-        // `field_key_hash` answers `Some` only for a key that stringifies,
-        // so the inner `key_str` is how the owned spelling is obtained
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        // `key_hash_of` answers `Some` only for a key that stringifies,
+        // so the inner `key_string` is how the owned spelling is obtained
         // here, not a second filter that could drop a counted field.
-        if let Some(hash) = field_key_hash(&field) {
+        if let Some(hash) = key_hash_of(&key) {
             if shared.binary_search(&hash).is_ok() {
-                if let Some(key) = field.key_str() {
-                    colliding.push(key.into_owned());
+                if let Some(k) = key.key_string() {
+                    colliding.push(k.into_owned());
                 }
             }
         }
