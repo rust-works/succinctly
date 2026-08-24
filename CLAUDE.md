@@ -617,7 +617,7 @@ For detailed documentation on optimization techniques used in this project, see 
 - **Verify the box is idle; macOS load average lies** (read 1.4 on a machine using 2.4% CPU — it counts uninterruptible-wait threads). Never benchmark a laptop on battery.
 - **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.
 - **A share of runtime is not a comparison.** Name a baseline commit that predates the change being judged — not a sibling from the same series (#1514: "cut the probe from 10.4% to 3.9%" shipped inside a 2-3x regression).
-- **Measure a precheck where the guarded code is already fastest.** It is charged to every input including the ones it cannot help, so the workload with least work to save is where its cost shows (#1514: the same detector read +8% on record-shaped input and +134% on one wide object).
+- **Measure a precheck where the guarded code is already fastest.** It is charged to every input including the ones it cannot help, so the workload with least work to save is where its cost shows (#1514: the same detector read +14% on record-shaped input and +141% on one wide object).
 
 **Recent YAML optimizations:**
 - ✅ P2.5 (Cached Type Checking): 1-17% improvement depending on nesting depth
