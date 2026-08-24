@@ -759,32 +759,18 @@ walker; tracked as [#1473](https://github.com/rust-works/succinctly/issues/1473)
 #723's implementation left behind: `-L`/`import`/`include` module detection, the eager
 `inputs` drain that lost documents under `first`/`limit`/`any`/`all`/`isempty`/`nth`, the
 missing filename in error locations, and `<unknown>` where jq names an exhausted file.
-Three divergences remain, all of them consequences of the evaluator's eager `Expr::Pipe`
-and `Expr::Comma` rather than of the input builtins themselves.
+[#1504](https://github.com/rust-works/succinctly/issues/1504) closed two more — `inputs | f`
+not interleaving, and a generator branch past a raised error still consuming a document —
+both consequences of the evaluator's eager `Expr::Pipe`/`Expr::Comma` rather than of the
+input builtins themselves. A top-level program that uses `input`/`inputs`/
+`input_line_number` now runs through `eval.rs`'s demand-driven `eval_each_owned` (the same
+`Demand`/`Item`/`Flow` sink `first`/`limit`/... already used) instead of `eval_single`'s
+eager fold, so `inputs | input_line_number` reports `1 2 3` and `(., input) | error(...)`
+raises once per top-level document, matching jq — see
+[`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md) for
+the mechanism.
 
-**`inputs | f` does not interleave.** `inputs` is a demand-driven producer now, but the
-pipe that consumes it is still eager, so the whole stream is produced before `f` runs on
-any of it. Visible through `input_line_number`, which reports the position of the last
-document read:
-
-```
-$ printf '1\n2\n3\n' | jq          -cn 'inputs | input_line_number'   # 1 2 3
-$ printf '1\n2\n3\n' | succinctly jq -cn 'inputs | input_line_number' # 3 3 3
-```
-
-The truncating consumers are unaffected — `first(inputs) | input_line_number` and
-`limit(1; inputs) | input_line_number` both answer `1`, matching jq — because those stop
-the producer rather than piping through it. Closing the general case needs the
-`Demand`/`Item`/`Flow` sink mirrored into `eval_generic`'s `Pipe` arm, which
-[`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md)
-already scopes as option (c).
-
-**A generator branch past the answer still consumes documents.** `(., input) | error(...)`
-over two files raises once here and twice in jq: jq's lazy comma reaches `error` with the
-first document before `input` is ever evaluated, so its outer loop runs twice. succinctly's
-eager comma consumes document 2 while building the pair, leaving nothing for a second
-iteration. The location succinctly does report is correct for the position its parser
-reached. Same root cause as above, and the same fix.
+One divergence remains, unrelated to the eager-evaluator root cause above.
 
 **`input_line_number` keeps its line after a failed read.** jq resets it to 0 after an
 `input` that finds nothing, but *not* after an `[inputs]` that exhausts the same stream:

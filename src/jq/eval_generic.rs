@@ -1481,6 +1481,40 @@ fn owned_vec_to_generic_result<V: DocumentValue>(vs: Vec<OwnedValue>) -> Generic
     )
 }
 
+/// Evaluate `expr` against `input` through `eval.rs`'s demand-driven
+/// `eval_each_owned`, collecting every output instead of stopping after the
+/// first (that's [`each_take_first_generic`]'s job). This is what lets a
+/// plain top-level `inputs | input_line_number` or `(., input) | error(...)`
+/// interleave `input`/`inputs` with the rest of the pipe/comma the way real
+/// jq does, instead of `eval_single`'s `fold_pipe_stages`/`Expr::Comma` arms
+/// draining a generator fully before the next stage ever runs (#1504).
+///
+/// `eval_each_owned` already dispatches through `eval.rs`'s full native lazy
+/// arm set (`Comma`/`Pipe`/`Paren`/`Compare`/`If`/`Try`/`Label`/
+/// `Builtin::Inputs`/...), not just the three `eval_each_generic` mirrors --
+/// so this is a thin collecting sink over already-tested machinery, not a
+/// new evaluator.
+///
+/// `Flow::Stopped` is unreachable here in practice (the sink below never
+/// returns `Demand::Stop`), but is folded into the same arm as `Exhausted`
+/// rather than asserted, since nothing here can prove a nested consumer
+/// could never surface it.
+fn eval_each_owned_collect<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    let flow = eval_each_owned::<S>(expr, input, optional, &mut |v| {
+        collected.push(v);
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(collected),
+        Flow::Escaped(control) => partial_generic(collected, control),
+    }
+}
+
 /// Normalize a `Vec<V::Cursor>` accumulator into the smallest `GenericResult`
 /// shape that represents it -- the borrowed-cursor counterpart of
 /// [`owned_vec_to_generic_result`], for the same reason (#1048): a caller
@@ -2357,7 +2391,19 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 ///
 /// Arithmetic that falls back to the full evaluator (division, modulo, overflow)
 /// follows `S`, so yq keeps yq numeric behavior instead of jq's.
+///
+/// Gated on `input`/`inputs`/`input_line_number` appearing anywhere in `expr`
+/// (#1504): a top-level `Comma`/`Pipe` that never touches the shared input
+/// queue behaves identically either way, so the eager `eval_single` path
+/// (and its cursor/zero-copy fast paths) stays the default; only a filter
+/// that actually shares state with `jq_runner`'s input queue pays for the
+/// re-index round trip through [`eval_each_owned_collect`]. Mirrors the same
+/// two-part guard `eval_first_or_last_generic` already uses for `first`.
 pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
+    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) {
+        let owned = to_owned_with_cursor(&value, None);
+        return eval_each_owned_collect::<S, V>(expr, &owned, false);
+    }
     eval_single::<S, V>(expr, value, false, None)
 }
 
@@ -2374,10 +2420,18 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 ///
 /// Like [`eval_with_cursor`] but arithmetic follows `S` (jq vs yq), so yq's
 /// modulo/division/overflow behavior is preserved on the cursor path.
+///
+/// Same `input`/`inputs`/`input_line_number` guard as [`eval_using`] (#1504);
+/// see its doc comment for why this is gated rather than unconditional.
 pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
 ) -> GenericResult<C::Value> {
+    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) {
+        let value = cursor.value();
+        let owned = to_owned_with_cursor(&value, Some(cursor));
+        return eval_each_owned_collect::<S, C::Value>(expr, &owned, false);
+    }
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
 }
 
