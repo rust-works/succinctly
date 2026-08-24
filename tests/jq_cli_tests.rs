@@ -19478,9 +19478,10 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
         // stays green. jq runs right's first output, then the whole left
         // operand, then right's second -- `B A C A`; the eager
         // `binary_fanout_core` finishes right first and writes `B C A A`.
-        // Distinct from the #1481 row in the leaks table below, which pins
-        // the *top-level* spelling of this same compare (it never reaches
-        // `eval_each`, so it keeps the eager order).
+        // The *bare top-level* spelling of this same compare used to diverge
+        // here (it reached `eval_generic.rs`'s own eager `Expr::Compare` arm,
+        // not `eval_each` at all) -- fixed for #1481, see the row in the
+        // "closed by #1481" section below.
         (
             &[
                 "-cn",
@@ -19638,6 +19639,66 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             r#"jq: error (at <unknown>): Cannot index array with string "b""#,
             5,
         ),
+        // ---- closed by #1481 ----
+        // The eager binary-fanout loops (`binary_fanout_core` via
+        // `eval_binary_fanout`, `eval_binary_fanout_with_path_context`, and
+        // `eval_generic`'s own `Expr::Compare` arm) now interleave their
+        // operands' evaluation instead of finishing the right one first:
+        // `eval_binary_fanout` routes through `eval_each`, the path-context
+        // sibling through a per-operand `needs_path_context` hybrid, and
+        // `eval_generic.rs`'s `Expr::Compare` arm through a new
+        // `binary_fanout_each_generic`/`eval_each_generic` pair mirroring
+        // `eval.rs`'s own machinery. A bare top-level compare now interleaves
+        // the same way the `all(...)`-wrapped spelling of this exact compare
+        // already did above (`isempty`/`limit`/etc. section) -- `B A C A`,
+        // not `B C A A`.
+        (
+            &["-cn", r#"[("A"|stderr) == (("B"|stderr), ("C"|stderr))]"#],
+            None,
+            "[false,false]\n",
+            "BACA",
+            0,
+        ),
+        // `eval_each_generic`'s new native `Expr::Compare` arm means a bare
+        // `first(...)` over a compare now stops the right operand's
+        // generator before it reaches an unneeded later candidate, closing
+        // the same gap #1461 closed for `Comma`/`Pipe`/`Paren` (this row used
+        // to live in the leaks table, blocked on exactly this arm not
+        // existing yet).
+        (
+            &["-cn", r#"[first((1,2) == (10, ("B"|stderr)))]"#],
+            None,
+            "[false]\n",
+            "",
+            0,
+        ),
+        // Acceptance-criteria repro: a bare top-level compare whose *left*
+        // operand errors before the *right* operand's later, side-effecting
+        // candidate is ever reached. `left`'s escape happens while evaluating
+        // it against right's *first* candidate (`1`), which aborts the whole
+        // fanout before right's generator ever produces its second,
+        // `stderr`-carrying candidate -- so only the error surfaces, no `B`.
+        (
+            &["-cn", r#"[error("x") == (1, ("B"|stderr))]"#],
+            None,
+            "",
+            "jq: error (at <unknown>): x",
+            5,
+        ),
+        // Acceptance-criteria repro: `input`/`inputs` pop from a
+        // process-global queue, so interleaving changes the *values*
+        // delivered, not just I/O order. jq takes right's 1st output (`a`),
+        // then runs left (`b`) -> `"ba"`; then right's 2nd (`c`), then left
+        // again (`d`) -> `"dc"`. The eager order used to take right fully
+        // first (`a`,`b`), then run left per right value (`c`,`d`) ->
+        // `"ca"`,`"db"`.
+        (
+            &["-cn", r"[(input) + (input, input)]"],
+            Some(r#""a" "b" "c" "d""#),
+            "[\"ba\",\"dc\"]\n",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -19690,36 +19751,38 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // Found by Stage 4's own oracle sweep (#1459): a bare `first(...)`
-        // is intercepted by `eval_generic`'s native `first`/`last` arm,
-        // whose lazy `eval_each_generic` (#1461) only gives `Comma`/`Pipe`/
-        // `Paren` native arms -- an `Expr::Compare` argument still falls
-        // through to eager `eval_single`, so `eval.rs`'s own lazy `Compare`
-        // arm is never reached. Out of #1461's scope by design (the issue
-        // named `Comma`/`Pipe`/`Paren` only); a `Compare`-native lazy arm
-        // here would be a separate follow-up, symmetrical to #1459/Stage 4's
-        // one on the `eval.rs` side. Wrapping the same compare in any
-        // consumer that does bounce into `eval.rs` (`isempty`, `limit`,
-        // `nth`, `any`, `all`, `IN`) already matches jq -- see the table
-        // above. jq: no stderr.
+        // Code review of #1461, filed as #1565: when the pipe's *first*
+        // stage evaluates to `GenericResult::LazyKeys` (`keys`,
+        // `keys_unsorted`) and 2+ further stages follow, the driver hands
+        // the whole remaining pipe to `fold_pipe_stages` -- the plain eager
+        // fold, with no demand check -- rather than continuing through
+        // `eval_each_pipe_generic`'s own sink. So `.[] | stderr` after a
+        // `keys` prefix still fires for every key, unlike the bare
+        // `first(.[] | stderr)` #1461 itself fixed. Confirmed pre-existing
+        // (identical on `main` before #1461, via the old 2-stage-only
+        // `first_over_comma_generic`), so not a regression here -- pinned so
+        // a fix for #1565 has a red test to turn green. jq: writes `a` once.
         (
-            &["-cn", r#"[first((1,2) == (10, ("B"|stderr)))]"#],
-            None,
-            "[false]\n",
-            "B",
+            &["-c", "first(keys | .[] | stderr)"],
+            Some(r#"{"a":1,"b":2,"c":3}"#),
+            "\"a\"\n",
+            "abc",
             0,
         ),
-        // Same class as the `Compare` row above: `Expr::If`/`Try`/`Label`/
-        // `As`/`Limit` have no native `eval_each_generic` arm either
-        // (#1461's own doc comment scopes it to `Comma`/`Pipe`/`Paren`
-        // only), so when one of these is `first`'s argument's top-level
-        // shape, evaluation falls through to eager `eval_single` and a
-        // sibling branch's side effect fires even though `first` never
-        // needed it. Out of scope by design -- fixing `fold_pipe_stages`'s
-        // `LazyKeys`/`LazyIndexRange`/`LazySeq` gap (#1565) does not touch
-        // this; these five shapes are pinned as an explicit, documented
-        // known gap rather than fixed, matching how `Compare` was already
-        // pinned. jq: no stderr.
+        // Same #1565 gap, `LazySeq` (`map(f)`, #724/#725) flavor instead of
+        // `LazyKeys`. jq: writes `2` once.
+        (
+            &["-c", "first(map(.+1) | .[] | stderr)"],
+            Some("[1,2,3]"),
+            "2\n",
+            "234",
+            0,
+        ),
+        // `Expr::If` has no native `eval_each_generic` arm, so `first(if
+        // ...)` falls through to eager `eval_single` and the discarded
+        // `else` branch's sibling side effect still fires -- same #1565
+        // class as the two rows above (pre-existing on `main` before #1461,
+        // unaffected by #1461/#1481). jq: no stderr.
         (
             &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
             None,
@@ -19768,24 +19831,6 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             None,
             "1\n",
             "B",
-            0,
-        ),
-        // The eager copies of jq's right-outer/left-inner fanout loop
-        // (`binary_fanout_core` via `eval_binary_fanout`,
-        // `eval_binary_fanout_with_path_context`, and `eval_generic`'s own
-        // third copy in its `Expr::Compare` arm -- which is what a top-level
-        // `==` actually reaches) still run the right operand to completion
-        // before the left, where jq interleaves them. Stage 4 made only
-        // `eval_each`'s arm demand-aware, so a top-level compare keeps the
-        // old order. jq writes `B`, `A`, `C`, `A`; succinctly writes `B`,
-        // `C`, `A`, `A`. Tracked as #1481 -- with `input` operands the same
-        // ordering changes *values*, not just stderr, and the loop it lives
-        // in is shared with `Expr::Arithmetic`.
-        (
-            &["-cn", r#"[("A"|stderr) == (("B"|stderr), ("C"|stderr))]"#],
-            None,
-            "[false,false]\n",
-            "BCAA",
             0,
         ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry -------
