@@ -986,6 +986,20 @@ pub fn collapsed_fields<F: DocumentFields>(
     Some(collapse_repeated(fields.all_fields()))
 }
 
+/// [`collapsed_fields`], but skipped outright when the mode doesn't
+/// collapse (yq) -- the single guard the two positional `LazyKeys` arms
+/// (`Index`/`IndexNumber`, `Last`) both need before they can answer.
+pub fn collapsed_fields_if<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Option<Vec<DocumentField<F::Value, F::Cursor>>> {
+    if collapse {
+        collapsed_fields(fields)
+    } else {
+        None
+    }
+}
+
 /// An object's key cursors under the mode's duplicate-key rule, produced
 /// one at a time (#1514).
 ///
