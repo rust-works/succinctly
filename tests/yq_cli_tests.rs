@@ -21720,3 +21720,42 @@ fn test_map_multidoc_separator_matches_other_m2_expressions_757() -> Result<()> 
     assert_eq!(code, 1);
     Ok(())
 }
+
+/// #1565's stage-skipping regression reached `succinctly yq` too:
+/// `eval_generic.rs` is the shared engine, so `fold_pipe_stages_sink` sits on
+/// both modes' path and its `One`/`OneCursor`/`Owned` arms dropped the stage
+/// that produced the single value they were folding from.
+///
+/// The jq-mode twin, with the full arm/source matrix and the reasoning behind
+/// each row, is `test_first_over_lazy_prefix_applies_every_stage_1565` in
+/// `tests/jq_cli_tests.rs`; this pins that the shared engine's fix reaches yq
+/// mode rather than re-deriving that matrix.
+#[test]
+fn test_first_over_lazy_prefix_applies_every_stage_1565() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        // `Owned` arm, via `length`.
+        (
+            "first(keys | length | tostring)",
+            "a: 1\nb: 2\nc: 3\n",
+            "\"3\"\n",
+        ),
+        // `OneCursor` arm, via `first` over a `LazyKeys` cons-list walk.
+        (
+            "first(keys | first | ascii_upcase)",
+            "a: 1\nb: 2\n",
+            "\"A\"\n",
+        ),
+        // `Owned` arm again, but from a `LazySeq` (`map(f)`) source.
+        (
+            "first(map(.+1) | first | . + 100)",
+            "- 1\n- 2\n- 3\n",
+            "102\n",
+        ),
+    ];
+
+    for (filter, input, want_out) in cases {
+        let (stdout, code) = run_yq_stdin(filter, input, &["--jq-extensions", "-o=json", "-I=0"])?;
+        assert_eq!((stdout.as_str(), code), (*want_out, 0), "`{filter}`");
+    }
+    Ok(())
+}
