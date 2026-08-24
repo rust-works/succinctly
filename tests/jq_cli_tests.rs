@@ -17671,6 +17671,72 @@ fn test_jq_comma_pipe_error_raises_once_per_document_1504() -> Result<()> {
     Ok(())
 }
 
+/// #1504's bridge hands the whole program to `eval.rs`, which has no cursor
+/// to answer position questions from: `line`/`column` are permanent-`0`
+/// stubs there and `at_offset`/`at_position` are unconditional "requires
+/// document cursor context" errors. So a program that mixes an input builtin
+/// with one of those must keep `eval_generic.rs`'s eager, cursor-carrying
+/// path instead. Without the carve-out every filter below either errored
+/// (exit 5) or silently answered `0` -- all four worked before #1504 and
+/// work again with it.
+///
+/// Re-indexing could not have rescued them: `eval_each_owned` rebuilds its
+/// index from re-serialised text, so any offset it reported would describe
+/// that text rather than the file the user passed.
+#[test]
+fn test_jq_cursor_metadata_builtins_survive_an_input_builtin_1504() -> Result<()> {
+    for (filter, expected) in [
+        ("at_offset(1), input_line_number", "\"a\"\n1\n"),
+        ("at_position(1; 2), input_line_number", "\"a\"\n1\n"),
+        ("line, column, input_line_number", "1\n1\n1\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some("{\"a\":1}\n")).expect("cursor-metadata repro runs");
+        assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// The carve-out above sends `first(inputs), line` back down the eager path
+/// with the shared queue still live, which is exactly the situation #1309's
+/// own `eval_first_or_last_generic` guard exists for: `each_take_first_generic`
+/// has no `Builtin::Inputs` lazy arm, so an unguarded `first(inputs)` there
+/// falls to its eager fallback and drains the queue. Dropping that guard as
+/// "dead code" is safe only while the top-level bridge is unconditional --
+/// it is not, so this pins that `[inputs]` still sees documents 2 and 3.
+#[test]
+fn test_jq_cursor_metadata_carve_out_keeps_first_inputs_lazy_1504() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "[first(inputs)], line, [inputs]"],
+        Some("1\n2\n3\n"),
+    )
+    .expect("carve-out laziness repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // `[1]` and `[2,3]` are jq 1.7.1's own answer for the same filter with
+    // `line` removed (`line` is a succinctly extension jq cannot parse).
+    assert_eq!(stdout, "[1]\n1\n[2,3]\n");
+    Ok(())
+}
+
+/// The carve-out keys off the `line`/`at_offset`/... *builtins*, so a field
+/// or key that merely spells one of their names must not trip it -- that
+/// would quietly switch a filter back to the eager path and undo #1504's own
+/// interleave fix for it. `.line` here is a plain field access: the bridge is
+/// still taken, so `input_line_number` reports each document's own line
+/// (`1`, then `2`) rather than the last one twice.
+#[test]
+fn test_jq_carve_out_does_not_fire_on_a_field_named_like_a_builtin_1504() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "inputs | [.line, input_line_number]"],
+        Some("{\"line\":9}\n{\"line\":8}\n"),
+    )
+    .expect("carve-out lookalike repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[9,1]\n[8,2]\n");
+    Ok(())
+}
+
 /// The gate on #1309's `first(...)` delegation must not fire for a filter
 /// that cannot consume inputs -- the bridge costs the subtree its cursor, and
 /// with it #607's duplicate-key fidelity. Pinned as a behavioural check on the

@@ -338,6 +338,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#1461, #1481) — those never touch `input`/`inputs`, so this fix's guard
   never fires for them; they remain open under their own issues.
 
+  Two things the bridge deliberately does *not* do. It is **carved back out
+  for cursor-metadata builtins**: `eval.rs` answers `line`/`column`/
+  `document_index`/`anchor`/`style`/`line_comment` from fixed-default stubs
+  and rejects `at_offset`/`at_position` outright, so a program mixing an
+  input builtin with one of those keeps the eager, cursor-carrying path and
+  keeps its answer, forgoing the interleave. Re-indexing could not have
+  rescued them — `eval_each_owned` rebuilds from re-serialised text, so any
+  offset it reported would describe that text, not the user's file — and a
+  confidently wrong position is worse than a divergence. That carve-out is
+  also why `eval_first_or_last_generic` keeps its own #1309 guard rather than
+  deferring to the top-level one: `first(inputs), line` reaches it down the
+  carved-out path with the queue still live, and `each_take_first_generic`
+  has no `Builtin::Inputs` lazy arm to stop the drain. And it is **not free**
+  — it re-serialises and re-indexes each document on top of the index the
+  caller already built, a per-document penalty that grows with document size
+  (an interleaved spot check put it near 1.7x, though on hardware the
+  benchmarking guide rules out for a quotable figure); a filter with no input
+  builtin is untouched. Both are written up in
+  `docs/compliance/jq/limitations.md`.
+
 - **`yq`: `split_doc` hidden inside twelve builtins is detected** (#1309):
   `contains_split_doc` was exhaustive over `Expr` but ended its inner
   `Builtin` match in `_ => false`, so `any`/`all` (both arities), `IN`/`INDEX`

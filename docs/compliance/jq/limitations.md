@@ -770,6 +770,41 @@ raises once per top-level document, matching jq — see
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md) for
 the mechanism.
 
+**The bridge is not free, and it is not universal.** It re-serialises and re-indexes each
+document on top of the index `evaluate_input` already built, so its cost scales with
+document size. An interleaved wall-clock spot check with
+`[.[] | select(.id != null) | .id], (input | [.[] | .id])` over two copies of one generated
+file, outputs byte-identical either way, put the penalty near **1.7x** and growing linearly:
+1 MB 0.06 s → 0.10 s, 2 MB 0.12 s → 0.23 s, 4 MB 0.24 s → 0.43 s. A filter with no input
+builtin is untouched (0.01 s on both), so the guard itself is free — only the programs it
+fires for pay.
+
+Treat that ratio as indicative, not as a benchmark result: it is `/usr/bin/time` over three
+interleaved repetitions on an Apple M5 Max **laptop running on battery**, which
+[the benchmarking guide](../../guides/benchmarking.md#ab-benchmarking-method) rules out for
+a number worth quoting, and x86_64 was not measured at all. What the check does establish is
+the shape — a per-document, size-proportional penalty, matching the mechanism — and that it
+is confined to filters using an input builtin. Re-measure on pinned hardware before treating
+1.7x as the figure.
+
+It is also **carved back out for cursor-metadata builtins**. `eval.rs` has no cursor to
+answer position questions from: `line`/`column`/`document_index`/`anchor`/`style`/
+`line_comment` are fixed-default stubs there and `at_offset`/`at_position` are
+unconditional `requires document cursor context` errors. So a program mixing an input
+builtin with one of those keeps the eager, cursor-carrying path and keeps its answer,
+forgoing the interleave:
+
+```
+$ echo '{"a":1}' | succinctly jq -c 'at_offset(1), input_line_number'   # "a"  1
+$ echo '{"a":1}' | succinctly jq -c 'line, column, input_line_number'   # 1  1  1
+```
+
+Re-indexing could not have rescued them: `eval_each_owned` rebuilds from re-serialised
+text, so any offset or line/column it reported would describe that text rather than the
+file the user passed. A confidently wrong position is worse than the divergence, so the
+divergence is what these filters get. `at_offset`/`at_position`/`line`/`column` are
+succinctly extensions, so no jq-compliance question arises either way.
+
 One divergence remains, unrelated to the eager-evaluator root cause above.
 
 **`input_line_number` keeps its line after a failed read.** jq resets it to 0 after an
