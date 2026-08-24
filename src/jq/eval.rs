@@ -2551,11 +2551,11 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // path-context diversion of its own, so there is nothing to preserve
         // — and each operand's own `eval_each` re-derives exactly the routing
         // `eval_single` would (a `Pipe` operand still hits `eval_each_pipe`'s
-        // gate before anything else).
-        //
-        // `Expr::Arithmetic` shares [`binary_fanout_each`] but deliberately
-        // gets no lazy arm: Stage 4 is scoped to `Expr::Compare`, and
-        // arithmetic's `combine` can fail, which is its own risk surface.
+        // gate before anything else). `Expr::Arithmetic` shares
+        // [`binary_fanout_each`] and gets the identical arm just below —
+        // `combine`'s fallibility is not new risk, `binary_fanout_each`'s
+        // `Err` handling was written generically for it from the start
+        // (#1481).
         Expr::Compare { op, left, right } => binary_fanout_each(
             |operand, operand_sink| {
                 eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
@@ -2567,6 +2567,31 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(OwnedValue::Bool(apply_compare_op::<S>(
                     *op, &left_val, &right_val,
                 )))
+            },
+            sink,
+        ),
+        // #1481: the demand-aware twin of `eval_arithmetic`'s fanout, mirroring
+        // the `Expr::Compare` arm just above exactly (including the "no
+        // `needs_path_context` gate" reasoning, which applies identically
+        // here). Closes the same class of leak for `+`/`-`/`*`/`/`/`%` that
+        // `Expr::Compare` closed for comparisons at Stage 4 — e.g. a bare
+        // `(input) + (input, input)` reached through `eval_single` is fixed by
+        // `eval_binary_fanout` alone, but this arm is what keeps that fix
+        // working when arithmetic sits inside `first(...)`/`IN(...)`/another
+        // `Compare`/etc.
+        Expr::Arithmetic { op, left, right } => binary_fanout_each(
+            |operand, operand_sink| {
+                eval_each::<W, S>(operand, value.clone(), optional, operand_sink)
+            },
+            left,
+            right,
+            optional,
+            |left_val, right_val| match op {
+                ArithOp::Add => arith_add::<S>(left_val, right_val),
+                ArithOp::Sub => arith_sub::<S>(left_val, right_val),
+                ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
+                ArithOp::Div => arith_div::<S>(left_val, right_val),
+                ArithOp::Mod => arith_mod::<S>(left_val, right_val),
             },
             sink,
         ),
@@ -3428,16 +3453,19 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 /// does not. `eval_operand` closes over whichever evaluator its caller
 /// wants; everything downstream of an operand's `QueryResult` is unchanged.
 ///
-/// **This is the eager operand strategy**, not the loop itself: the loop
-/// moved to [`binary_fanout_each`] for #1459 (Stage 4), and this is the
-/// collecting wrapper over it. `each_operand` here evaluates a whole operand
-/// up front and replays it through [`drain_result`], so both callers keep the
-/// exact "right operand evaluated to completion, *then* left re-evaluated per
-/// right value" behaviour they had when this body *was* the loop.
-/// `eval_each`'s own `Expr::Compare` arm supplies the demand-driven strategy
-/// instead — same loop, lazy operands.
+/// This is the collecting wrapper over [`binary_fanout_each`] (the loop
+/// itself, moved there for #1459/Stage 4): it just forwards whichever
+/// `each_operand` strategy its caller supplies and folds the sink's pushes
+/// back into a `QueryResult`. The strategy, not this function, decides
+/// whether operand evaluation is eager or interleaved — both
+/// [`eval_binary_fanout`] and `eval_binary_fanout_with_path_context` pass a
+/// demand-driven strategy since #1481 (respectively [`eval_each`] and a
+/// per-operand hybrid; see their own doc comments), matching `eval_each`'s
+/// own `Expr::Compare`/`Expr::Arithmetic` arms, which pass the identical
+/// [`eval_each`] strategy directly into [`binary_fanout_each`] without going
+/// through this wrapper at all.
 fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
-    eval_operand: impl Fn(&Expr) -> QueryResult<'a, W>,
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
     optional: bool,
@@ -3445,7 +3473,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
     let flow = binary_fanout_each(
-        |expr, sink| drain_result(eval_operand(expr), sink),
+        each_operand,
         left,
         right,
         optional,
@@ -3472,17 +3500,24 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// `docs/plan/jq-lazy-generator-consumers.md`) and parameterized over *how*
 /// an operand is enumerated.
 ///
-/// Two strategies exist, and only the strategy differs — never the loop:
+/// The strategy differs by caller, never the loop:
 ///
-/// * [`binary_fanout_core`] passes an eager `each_operand` (evaluate the
-///   whole operand, then replay it through [`drain_result`]), which is what
-///   `eval_arithmetic`/`eval_compare` and the path-context sibling have
-///   always done.
-/// * `eval_each`'s `Expr::Compare` arm passes [`eval_each`] itself, so the
-///   *right* operand — jq's outer loop — stops producing candidates the sink
-///   never asked for. That is what closes `IN(src; s)`'s side-effect leak
-///   (#932/#1459): a `stderr`/`halt_error` sitting past the matching
-///   candidate is no longer evaluated at all.
+/// * `eval_each`'s `Expr::Compare`/`Expr::Arithmetic` arms pass [`eval_each`]
+///   itself, so the *right* operand — jq's outer loop — stops producing
+///   candidates the sink never asked for, and its next candidate is only
+///   pulled once the sink actually asks for it, genuinely interleaving with
+///   the left operand's evaluation (#1481). That is what closes `IN(src;
+///   s)`'s side-effect leak (#932/#1459): a `stderr`/`halt_error` sitting
+///   past the matching candidate is no longer evaluated at all.
+/// * [`eval_binary_fanout`] (via [`binary_fanout_core`]) passes the identical
+///   [`eval_each`] strategy for ordinary, non-path-context evaluation, and
+///   `eval_binary_fanout_with_path_context` passes a per-operand hybrid
+///   (lazy via [`eval_each_owned`] when an operand doesn't itself need path
+///   context, eager via [`drain_result`] when it does) — see their own doc
+///   comments. Before #1481, both of these passed an eager `each_operand`
+///   (evaluate the whole operand, then replay it through [`drain_result`]),
+///   which is why a bare top-level `(input) + (input, input)` used to finish
+///   the right operand before starting the left, unlike jq.
 ///
 /// Keeping one loop is the whole point: #768 fixed a collapse-to-first-value
 /// bug here that the then-duplicated path-context copy independently
@@ -3722,6 +3757,12 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Backs `eval_arithmetic`/`eval_compare`. Operands are evaluated through
+/// [`eval_each`] (#1481), not [`eval_single`]: this is the same lazy strategy
+/// `eval_each`'s own `Expr::Compare`/`Expr::Arithmetic` arms use, so a plain
+/// top-level `left op right` interleaves its operands' evaluation exactly
+/// the way one reached through a lazy consumer (`first(...)`, `IN(...)`,
+/// etc.) already did.
 fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -3730,7 +3771,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
-        move |expr| eval_single::<W, S>(expr, value.clone(), optional),
+        move |expr, sink| eval_each::<W, S>(expr, value.clone(), optional, sink),
         left,
         right,
         optional,
@@ -23457,12 +23498,28 @@ fn resolve_ancestor_path<'a, 'p, W: Clone + AsRef<[u64]>>(
 
 /// Path-context analog of `eval_binary_fanout` (#768/#822): evaluate `left op
 /// right` over every pairing jq's cartesian fanout produces (right operand
-/// outer / left operand inner), routed through
-/// `eval_pipe_with_path_context_internal` instead of `eval_single` so
-/// `key`/`parent`/`file_index` nested in either operand still resolve
-/// against `root`/`current_path`/`file_origin`. Structure is identical to
+/// outer / left operand inner). Structure is identical to
 /// `eval_binary_fanout`; kept separate because the two recurse through
 /// different evaluators with different parameter shapes.
+///
+/// **Per-operand hybrid strategy (#1481)**: there is no lazy/demand-driven
+/// twin of `eval_pipe_with_path_context_internal` (it is a large,
+/// exhaustive-per-`Expr`-variant function; building one is out of proportion
+/// to this fix). Instead, each operand is checked individually with
+/// [`needs_path_context`] — the *specific subexpression*, not the whole
+/// enclosing pipe, exactly the granularity
+/// `eval_pipe_with_path_context_internal`'s own `Expr::Array` arm already
+/// uses. An operand that itself resolves `key`/`parent`/`file_index` stays on
+/// the eager `eval_pipe_with_path_context_internal` + [`drain_result`] path
+/// (unavoidable without new machinery, and rare — only when *that* operand
+/// directly needs path tracking, not merely some other part of the
+/// surrounding pipe). An operand that doesn't gets the same demand-driven
+/// interleaving as [`eval_binary_fanout`], bridged through [`eval_each_owned`]
+/// — the same bridge `eval_each_pipe`'s own `Item::Owned` arm already uses to
+/// hand a path-context-tracked value to the ordinary lazy evaluator.
+/// `binary_fanout_each`'s pairing/nesting guarantees (#910/#768/#822) depend
+/// only on each operand's evaluation contract, never on whether left and
+/// right share one strategy, so mixing eager and lazy per operand is safe.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors eval_pipe_with_path_context_internal's
                                      // own root/file_origin/current_path/optional threading,
                                      // used unbundled at every one of its ~15 call sites in this
@@ -23479,15 +23536,24 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
-        |expr| {
-            eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(expr),
-                value,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            )
+        |operand: &Expr, operand_sink: &mut dyn FnMut(Item<'a, W>) -> Demand| -> Flow {
+            if needs_path_context(operand) {
+                drain_result(
+                    eval_pipe_with_path_context_internal::<W, S>(
+                        core::slice::from_ref(operand),
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    operand_sink,
+                )
+            } else {
+                eval_each_owned::<S>(operand, value, optional, &mut |v| {
+                    operand_sink(Item::Owned(v))
+                })
+            }
         },
         left,
         right,
@@ -50108,6 +50174,23 @@ mod tests {
         assert_eq!(
             eval_all_outputs(b"[10]", &[0], ".[] | (((1,2) + (10,20)), file_index)"),
             vec!["11", "12", "21", "22", "0"]
+        );
+    }
+
+    #[test]
+    fn test_arithmetic_combine_error_aborts_whole_fanout_1481() {
+        // A `combine` failure (op-application itself, not operand
+        // evaluation) still aborts the whole fanout rather than skipping
+        // just that pairing, now that `eval_each`'s new `Expr::Arithmetic`
+        // arm (#1481) is what `eval_binary_fanout` routes through: right
+        // outer (2,3), left inner (1,"a") -- `1+2=3` succeeds first, then
+        // `"a"+2` fails, so the fanout carries `[3]` as its already-produced
+        // prefix and never attempts `"a"+3` at all.
+        query!(br"null", r#"(1,"a") + (2,3)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(3)]);
+                assert_eq!(e.message, "string (\"a\") and number (2) cannot be added");
+            }
         );
     }
 
