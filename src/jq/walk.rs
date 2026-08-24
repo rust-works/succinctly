@@ -775,6 +775,41 @@ pub fn uses_input_builtins(expr: &Expr) -> bool {
     })
 }
 
+/// Whether `expr` references a builtin whose answer comes from the *cursor*
+/// rather than from the value, anywhere (#1504).
+///
+/// These eight are the ones `eval_generic.rs` answers from `Option<V::Cursor>`
+/// and `eval.rs` cannot answer at all: `line`/`column`/`document_index`/
+/// `anchor`/`style`/`line_comment` are fixed-default stubs there, and
+/// `at_offset`/`at_position` are unconditional "requires document cursor
+/// context" errors. Any bridge from `eval_generic.rs` into `eval.rs` therefore
+/// silently downgrades or breaks them, which is what this predicate exists to
+/// let a caller avoid.
+///
+/// Re-indexing cannot rescue them: `eval_each_owned` rebuilds its index from
+/// `to_json_for_reindex`'s *re-serialized* text, so byte offsets and
+/// line/column on that document describe the re-serialization, not the file
+/// the user passed. A cursor-aware `eval.rs` would answer confidently and
+/// wrongly; declining the bridge is the only answer that stays true.
+///
+/// Same expanded-program requirement as [`uses_input_builtins`] — a call
+/// reachable only through an imported module body still counts.
+pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
+    contains_builtin(expr, |b| {
+        matches!(
+            b,
+            Builtin::Line
+                | Builtin::Column
+                | Builtin::DocumentIndex
+                | Builtin::Anchor
+                | Builtin::Style
+                | Builtin::LineComment
+                | Builtin::AtOffset(_)
+                | Builtin::AtPosition(_, _)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,6 +822,10 @@ mod tests {
     fn has_split_doc(filter: &str) -> bool {
         let expr = parse(filter).expect("filter should parse");
         contains_builtin(&expr, |b| matches!(b, Builtin::SplitDoc))
+    }
+
+    fn uses_cursor_meta(filter: &str) -> bool {
+        uses_cursor_metadata_builtins(&parse(filter).expect("filter should parse"))
     }
 
     #[test]
@@ -875,6 +914,50 @@ mod tests {
             then: Box::new(program.expr),
         };
         assert!(uses_input_builtins(&expanded));
+    }
+
+    #[test]
+    fn detects_every_cursor_metadata_builtin() {
+        // The six `eval.rs` answers from a fixed default...
+        assert!(uses_cursor_meta("line"));
+        assert!(uses_cursor_meta("column"));
+        assert!(uses_cursor_meta("document_index"));
+        assert!(uses_cursor_meta("anchor"));
+        assert!(uses_cursor_meta("style"));
+        assert!(uses_cursor_meta("line_comment"));
+        // ...and the two it rejects outright.
+        assert!(uses_cursor_meta("at_offset(0)"));
+        assert!(uses_cursor_meta("at_position(1; 1)"));
+    }
+
+    #[test]
+    fn cursor_metadata_check_reaches_nested_and_argument_positions() {
+        assert!(uses_cursor_meta("inputs | line"));
+        assert!(uses_cursor_meta("(., at_offset(0))"));
+        assert!(uses_cursor_meta("first(line)"));
+        assert!(uses_cursor_meta("[at_position(1; 1)]"));
+        assert!(uses_cursor_meta("def f: line; f"));
+        assert!(uses_cursor_meta("at_offset(line)")); // nested in an argument
+    }
+
+    #[test]
+    fn cursor_metadata_check_does_not_fire_on_lookalikes() {
+        assert!(!uses_cursor_meta("."));
+        assert!(!uses_cursor_meta(".line"));
+        assert!(!uses_cursor_meta(".column"));
+        assert!(!uses_cursor_meta("\"line\""));
+        assert!(!uses_cursor_meta("inputs | input_line_number"));
+        assert!(!uses_cursor_meta("{line: 1}"));
+    }
+
+    /// The two predicates are independent: #1504's carve-out is the
+    /// *conjunction* of them, so neither may imply the other.
+    #[test]
+    fn input_and_cursor_metadata_checks_are_independent() {
+        assert!(uses_inputs("inputs") && !uses_cursor_meta("inputs"));
+        assert!(uses_cursor_meta("line") && !uses_inputs("line"));
+        assert!(uses_inputs("inputs, line") && uses_cursor_meta("inputs, line"));
+        assert!(!uses_inputs(".a") && !uses_cursor_meta(".a"));
     }
 
     #[test]

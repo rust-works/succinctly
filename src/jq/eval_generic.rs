@@ -2343,16 +2343,47 @@ pub fn eval<V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
 /// queue behaves identically either way, so the eager `eval_single` path
 /// (and its cursor/zero-copy fast paths) stays the default; only a filter
 /// that actually shares state with `jq_runner`'s input queue pays for the
-/// re-index round trip through `eval_each_owned_collect`. Supersedes the
-/// narrower guard `eval_first_or_last_generic` used to run per `first(...)`
-/// call site (#1309) -- this check covers the whole expression up front, so
-/// that guard was dead code and has been removed.
+/// re-index round trip through `eval_each_owned_collect`, which re-serialises
+/// and re-indexes on top of the index the caller already built. That cost is
+/// per document and scales with document size -- an interleaved spot check
+/// put it near 1.7x wall clock; see `docs/compliance/jq/limitations.md` for
+/// the numbers and what they are and aren't worth.
+///
+/// **Carved back out for cursor-metadata builtins.** The bridge hands the
+/// program to `eval.rs`, which answers `line`/`column`/`document_index`/
+/// `anchor`/`style`/`line_comment` from fixed-default stubs and rejects
+/// `at_offset`/`at_position` outright -- all eight answers live only in this
+/// module's `Option<V::Cursor>` threading. Re-indexing cannot rescue
+/// them either: `eval_each_owned` rebuilds from re-serialised text, so any
+/// offset or line/column it could report would describe that text rather
+/// than the file the user passed. So a program that mixes an input builtin
+/// with a cursor-metadata builtin keeps the eager path and keeps its cursor,
+/// at the cost of #1504's interleave -- a divergence, where the bridge would
+/// instead give a wrong answer or an error. See
+/// [`crate::jq::walk::uses_cursor_metadata_builtins`].
 pub fn eval_using<S: EvalSemantics, V: DocumentValue>(expr: &Expr, value: V) -> GenericResult<V> {
-    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) {
+    if takes_input_queue_bridge(expr) {
         let owned = to_owned_with_cursor(&value, None);
         return eval_each_owned_collect::<S, V>(expr, &owned, false);
     }
     eval_single::<S, V>(expr, value, false, None)
+}
+
+/// Whether `expr` should be handed to `eval.rs`'s demand-driven evaluator
+/// instead of this module's eager `eval_single` (#1504).
+///
+/// One definition shared by [`eval_using`] and [`eval_with_cursor_using`], so
+/// the two top-level entry points cannot drift apart on which programs take
+/// the bridge. `input_queue_is_active` (one TLS load) comes first so yq mode,
+/// library embedders and every jq filter that never mentions an input builtin
+/// pay nothing for the two AST walks behind it.
+///
+/// See [`eval_using`]'s doc comment for why the cursor-metadata carve-out is
+/// part of the condition rather than something the bridge could handle.
+fn takes_input_queue_bridge(expr: &Expr) -> bool {
+    crate::jq::input_queue_is_active()
+        && crate::jq::walk::uses_input_builtins(expr)
+        && !crate::jq::walk::uses_cursor_metadata_builtins(expr)
 }
 
 /// Evaluate an expression against a cursor.
@@ -2369,16 +2400,18 @@ pub fn eval_with_cursor<C: DocumentCursor>(expr: &Expr, cursor: C) -> GenericRes
 /// Like [`eval_with_cursor`] but arithmetic follows `S` (jq vs yq), so yq's
 /// modulo/division/overflow behavior is preserved on the cursor path.
 ///
-/// Same `input`/`inputs`/`input_line_number` guard as [`eval_using`] (#1504);
-/// see its doc comment for why this is gated rather than unconditional.
+/// Same `takes_input_queue_bridge` condition as [`eval_using`] (#1504),
+/// cursor-metadata carve-out included; see its doc comment for why the
+/// bridge is gated rather than unconditional.
 pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     expr: &Expr,
     cursor: C,
 ) -> GenericResult<C::Value> {
-    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) {
-        let value = cursor.value();
-        let owned = to_owned_with_cursor(&value, Some(cursor));
-        return eval_each_owned_collect::<S, C::Value>(expr, &owned, false);
+    if takes_input_queue_bridge(expr) {
+        // `to_owned_cursor` directly rather than `to_owned_with_cursor`: the
+        // latter ignores its value argument whenever the cursor is `Some`, so
+        // routing through it would compute a `cursor.value()` only to drop it.
+        return eval_each_owned_collect::<S, C::Value>(expr, &to_owned_cursor(&cursor), false);
     }
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
 }
@@ -4034,16 +4067,41 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     want_last: bool,
 ) -> GenericResult<V> {
     // `first(f)` where `f` can consume input documents must not run `f` to
-    // completion -- previously handled by a guard here (#1309) that bridged
-    // just this subtree through `eval_on_owned`. #1504 moved that same
-    // `input_queue_is_active` + `uses_input_builtins` check to `eval_using`/
-    // `eval_with_cursor_using`, covering the *whole* expression up front
-    // rather than each `first(...)` call site individually; since `inner` is
-    // always a subterm of whatever tree that top-level check already walked,
-    // it can never satisfy the condition the top-level guard didn't. This
-    // function is only ever reached once that check has already cleared the
-    // whole expression, so the per-call guard was dead code and has been
-    // removed.
+    // completion. [`eval_each_generic`] (#1461) is only a native lazy arm for
+    // `Comma`/`Pipe`/`Paren` -- it has no `Builtin::Inputs`-aware arm of its
+    // own, so a bare `first(inputs)`/`first(inputs, 1)`/`first(inputs | f)`
+    // would still fall to its eager `_` fallback and drain the shared queue.
+    // `eval::eval_first_expr` has been wired to `eval.rs`'s own sink since
+    // #820 Stage 2, so hand the whole `first(...)` over rather than
+    // evaluating `inner` here (#1309) -- one guard covering every shape
+    // `inputs` can appear in, rather than one `eval_each_generic` arm per
+    // shape.
+    //
+    // **Why this is not dead code under #1504's top-level bridge.** That
+    // bridge does subsume this guard for most programs -- `inner` is always a
+    // subterm of the tree `takes_input_queue_bridge` already walked -- but
+    // only for the programs it actually takes. Its cursor-metadata carve-out
+    // deliberately declines it for a program that mixes an input builtin with
+    // `line`/`at_offset`/..., and such a program reaches `eval_single` and
+    // then this function with the shared queue still live:
+    // `first(inputs), line` is the shape. Without this guard that
+    // `first(inputs)` falls to the eager `_` fallback described above and
+    // drains the queue -- exactly #1309's silent data loss, reintroduced
+    // through the carve-out. Pinned by
+    // `test_jq_cursor_metadata_carve_out_keeps_first_inputs_lazy_1504`.
+    //
+    // Gated rather than unconditional because the bridge costs this subtree
+    // its cursor, and with it #607's duplicate-key fidelity. The one-load
+    // `input_queue_is_active` check comes first specifically so yq mode,
+    // library embedders and the common `first(.[])` never pay for the AST
+    // walk.
+    if !want_last
+        && crate::jq::input_queue_is_active()
+        && crate::jq::walk::uses_input_builtins(inner)
+    {
+        let owned = to_owned_with_cursor(&value, cursor);
+        return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
+    }
 
     // `first` stops pulling from `inner` as soon as it has one output, so
     // anything past that point -- a later comma sibling, a later pipe stage's
