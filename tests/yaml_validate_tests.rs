@@ -273,3 +273,21 @@ fn test_yaml_validate_accepts_multibyte_utf8_1242() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr}");
     Ok(())
 }
+
+/// The byte after `\` in a bad double-quoted escape can be the lead byte of
+/// a multi-byte UTF-8 sequence; the CLI must render the real decoded
+/// character, not a Latin-1-cast mojibake byte (#1422).
+#[test]
+fn test_yaml_validate_invalid_escape_multibyte_char_not_mojibake_1422() -> Result<()> {
+    let (_, stderr, code) = run_validate_stdin("a: \"\\日\"\n", &["--no-color"])?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains('日'),
+        "stderr should contain '日': {stderr}"
+    );
+    assert!(
+        !stderr.contains('æ'),
+        "stderr should not contain mojibake 'æ': {stderr}"
+    );
+    Ok(())
+}

@@ -219,9 +219,9 @@ impl<'a> Validator<'a> {
             Some(b'-' | b'0'..=b'9') => self.validate_number(),
             Some(b't' | b'f' | b'n') => self.validate_keyword(),
             Some(b'+') => Err(self.error(ValidationErrorKind::LeadingPlus)),
-            Some(c) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
+            Some(_) => Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                 expected: "JSON value",
-                found: c as char,
+                found: crate::text::utf8::decode_char_at(self.input, self.offset),
             })),
             None => Err(self.error(ValidationErrorKind::UnexpectedEof {
                 expected: "JSON value",
@@ -267,7 +267,7 @@ impl<'a> Validator<'a> {
             if self.peek() != Some(b'"') {
                 return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                     expected: "string key",
-                    found: self.peek().map_or('\0', |b| b as char),
+                    found: crate::text::utf8::decode_char_at(self.input, self.offset),
                 }));
             }
             self.validate_string()?;
@@ -277,7 +277,7 @@ impl<'a> Validator<'a> {
             if self.peek() != Some(b':') {
                 return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                     expected: "':'",
-                    found: self.peek().map_or('\0', |b| b as char),
+                    found: crate::text::utf8::decode_char_at(self.input, self.offset),
                 }));
             }
             self.advance();
@@ -304,10 +304,10 @@ impl<'a> Validator<'a> {
                     self.advance();
                     return Ok(());
                 }
-                Some(c) => {
+                Some(_) => {
                     return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                         expected: "',' or '}'",
-                        found: c as char,
+                        found: crate::text::utf8::decode_char_at(self.input, self.offset),
                     }));
                 }
                 None => {
@@ -357,10 +357,10 @@ impl<'a> Validator<'a> {
                     self.advance();
                     return Ok(());
                 }
-                Some(c) => {
+                Some(_) => {
                     return Err(self.error(ValidationErrorKind::UnexpectedCharacter {
                         expected: "',' or ']'",
-                        found: c as char,
+                        found: crate::text::utf8::decode_char_at(self.input, self.offset),
                     }));
                 }
                 None => {
@@ -512,8 +512,8 @@ impl<'a> Validator<'a> {
 
                 Ok(())
             }
-            Some(c) => Err(self.error(ValidationErrorKind::InvalidEscape {
-                sequence: c as char,
+            Some(_) => Err(self.error(ValidationErrorKind::InvalidEscape {
+                sequence: crate::text::utf8::decode_char_at(self.input, self.offset),
             })),
             None => Err(self.error(ValidationErrorKind::UnclosedString)),
         }
@@ -1089,6 +1089,64 @@ mod tests {
         assert!(matches!(
             err.kind,
             ValidationErrorKind::InvalidEscape { sequence: 'q' }
+        ));
+    }
+
+    /// The byte after `\` (or at any other `UnexpectedCharacter`/`InvalidEscape`
+    /// offset) can be the lead byte of a multi-byte UTF-8 sequence; the
+    /// reported character must be the real decoded one, not a Latin-1 cast of
+    /// its lead byte (#1422).
+    #[test]
+    fn test_unexpected_character_decodes_multibyte_char_1422() {
+        let err = validate("\"\\日\"".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::InvalidEscape { sequence: '日' }
+        ));
+
+        let err = validate("{日: 1}".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "string key",
+                found: '日'
+            }
+        ));
+
+        let err = validate("{\"a\"日1}".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "':'",
+                found: '日'
+            }
+        ));
+
+        let err = validate("[1,2日".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "',' or ']'",
+                found: '日'
+            }
+        ));
+
+        let err = validate("{\"a\":1 日}".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "',' or '}'",
+                found: '日'
+            }
+        ));
+
+        let err = validate("🎉".as_bytes()).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            ValidationErrorKind::UnexpectedCharacter {
+                expected: "JSON value",
+                found: '🎉'
+            }
         ));
     }
 

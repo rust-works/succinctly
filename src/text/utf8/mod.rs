@@ -564,6 +564,46 @@ pub fn decode_code_point(input: &[u8]) -> Option<(u32, usize)> {
     Some((cp, len))
 }
 
+/// Decode the character at `offset` in `bytes` for embedding in an error message.
+///
+/// Three-way fallback (settled by #1187 for `yaml/parser.rs`'s
+/// `err_unexpected_char`, generalized here so `yaml/validate.rs` and
+/// `json/validate.rs` can share it instead of each re-deriving their own):
+/// a byte that starts a valid, complete UTF-8 sequence decodes to its real
+/// character; a byte that's present but doesn't decode (a bare continuation
+/// byte, an invalid lead byte, or a sequence truncated before `bytes` ends)
+/// falls back to a Latin-1 cast of that one byte, not `'\0'` -- a NUL would
+/// silently misrepresent a present-but-malformed byte as absent; only a
+/// fully out-of-bounds `offset` (true EOF) is `'\0'`.
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::text::utf8::decode_char_at;
+///
+/// // ASCII
+/// assert_eq!(decode_char_at(b"abc", 1), 'b');
+///
+/// // Multi-byte
+/// assert_eq!(decode_char_at("a日b".as_bytes(), 1), '日');
+///
+/// // Truncated/invalid sequence -- Latin-1 fallback on the lead byte
+/// assert_eq!(decode_char_at(&[0x41, 0xE6], 1), 0xE6 as char);
+///
+/// // Past the end of input -- true EOF
+/// assert_eq!(decode_char_at(b"abc", 3), '\0');
+/// ```
+pub fn decode_char_at(bytes: &[u8], offset: usize) -> char {
+    match bytes.get(offset) {
+        None => '\0',
+        Some(&byte) => bytes
+            .get(offset..)
+            .and_then(decode_code_point)
+            .and_then(|(cp, _len)| char::from_u32(cp))
+            .unwrap_or(byte as char),
+    }
+}
+
 /// Encode a Unicode code point as UTF-8.
 ///
 /// Returns `None` if the code point is invalid (surrogate or > U+10FFFF).
