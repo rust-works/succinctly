@@ -604,22 +604,23 @@ its own captured state and returns `Demand::Stop`, then inspects that state afte
 
 Each checked against the oracle. "already correct" means succinctly matches jq today.
 
-| Arm                                        | Needed for #820/#932/#987? | Note                                                                                                    |
-|--------------------------------------------|----------------------------|---------------------------------------------------------------------------------------------------------|
-| `Iterate`, `Range`, literals, field/index  | no, ever                   | side-effect-free producers; the drain already stops per value                                           |
-| `Break`                                    | no, ever                   | a leaf returning `QueryResult::Break`; drain maps it to `Escaped`                                       |
-| `And`/`Or`/`Alternative`                   | no — already correct       | `false and ("B"\|stderr)` etc. agree today                                                              |
-| `If` (branch selection)                    | no — already correct       | `eval_fanout` evaluates only the taken branch                                                           |
-| `If` (generator inside a branch)           | no                         | but `first(if true then (1,("B"\|stderr)) else 9 end)` leaks. Stage 5                                   |
-| `Try`/`Optional`                           | no                         | but `first(try (1,("B"\|stderr)) catch 9)` leaks. Stage 5                                               |
-| `Label`                                    | no                         | but `first(label $o \| (1,("B"\|stderr)))` leaks. Stage 5                                               |
-| `AsPattern`                                | no                         | but `first(1 as $x \| (1,("B"\|stderr)))` leaks. Stage 5                                                |
-| `FuncCall`/`FuncDef`                       | no                         | but `def f: (1,("B"\|stderr)); first(f)` leaks. Stage 5                                                 |
-| `FirstExpr`/`Limit`/`NthExpr` as producers | no                         | but `isempty(limit(3; 1, ("B"\|stderr)))` leaks — demand does not forward *through* a consumer. Stage 5 |
-| `Reduce`/`Foreach`                         | no                         | `reduce` has one output; `foreach`'s #534 fork machinery is a non-goal                                  |
-| **`Compare`**                              | **yes — for #932**         | Stage 4; see below                                                                                      |
-| **`Builtin::PathsFilter`**                 | **yes — for #987**         | Stage 3                                                                                                 |
-| **`Builtin::Inputs`**                      | **yes — for #1309**        | Stage 3.5. The one arm that is a *correctness* fix, not an optimization — see below                     |
+| Arm                                        | Needed for #820/#932/#987? | Note                                                                                                                                         |
+|--------------------------------------------|----------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| `Iterate`, literals, field/index           | no, ever                   | side-effect-free producers; the drain already stops per value                                                                                |
+| `Range` (own numeric output)               | no, ever                   | side-effect-free values; but its `from`/`to`/`step` *bound* expressions needed a native arm after all — #1556, see `jq-range-lazy-bounds.md` |
+| `Break`                                    | no, ever                   | a leaf returning `QueryResult::Break`; drain maps it to `Escaped`                                                                            |
+| `And`/`Or`/`Alternative`                   | no — already correct       | `false and ("B"\|stderr)` etc. agree today                                                                                                   |
+| `If` (branch selection)                    | no — already correct       | `eval_fanout` evaluates only the taken branch                                                                                                |
+| `If` (generator inside a branch)           | no                         | but `first(if true then (1,("B"\|stderr)) else 9 end)` leaks. Stage 5                                                                        |
+| `Try`/`Optional`                           | no                         | but `first(try (1,("B"\|stderr)) catch 9)` leaks. Stage 5                                                                                    |
+| `Label`                                    | no                         | but `first(label $o \| (1,("B"\|stderr)))` leaks. Stage 5                                                                                    |
+| `AsPattern`                                | no                         | but `first(1 as $x \| (1,("B"\|stderr)))` leaks. Stage 5                                                                                     |
+| `FuncCall`/`FuncDef`                       | no                         | but `def f: (1,("B"\|stderr)); first(f)` leaks. Stage 5                                                                                      |
+| `FirstExpr`/`Limit`/`NthExpr` as producers | no                         | but `isempty(limit(3; 1, ("B"\|stderr)))` leaks — demand does not forward *through* a consumer. Stage 5                                      |
+| `Reduce`/`Foreach`                         | no                         | `reduce` has one output; `foreach`'s #534 fork machinery is a non-goal                                                                       |
+| **`Compare`**                              | **yes — for #932**         | Stage 4; see below                                                                                                                           |
+| **`Builtin::PathsFilter`**                 | **yes — for #987**         | Stage 3                                                                                                                                      |
+| **`Builtin::Inputs`**                      | **yes — for #1309**        | Stage 3.5. The one arm that is a *correctness* fix, not an optimization — see below                                                          |
 
 **`Builtin::Inputs` breaks the "un-lazified is only a missed optimization" rule.**
 `drain_result`'s invariant is stated over *the values delivered to this sink*; it says
