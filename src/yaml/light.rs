@@ -2891,7 +2891,7 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
 /// Write a string with JSON escaping into a `String`.
 ///
 /// The buffered face of [`stream_json_string`], which owns the single
-/// implementation. Kept as its own function so the eleven `&mut String` call
+/// implementation. Kept as its own function so the ten `&mut String` call
 /// sites don't each have to discard an error that cannot happen.
 #[inline]
 fn write_json_string(output: &mut String, s: &str) {
@@ -8287,8 +8287,10 @@ mod tests {
         (ResolvedScalar::Float(f64::INFINITY), ".inf"),
         (ResolvedScalar::Float(f64::NEG_INFINITY), "-.inf"),
         (ResolvedScalar::Float(f64::NAN), ".nan"),
-        // Every escape class the shared `write_json_body_yq` has to handle,
-        // plus lengths on both sides of the SIMD chunk thresholds.
+        // Every escape class `stream_json_string`'s convention has to handle
+        // (the same convention as `write_json_body_yq`, kept as a separate
+        // copy -- see #965), plus lengths on both sides of the SIMD chunk
+        // thresholds.
         (ResolvedScalar::Str, ""),
         (ResolvedScalar::Str, "plain"),
         (ResolvedScalar::Str, "quote \" backslash \\"),
