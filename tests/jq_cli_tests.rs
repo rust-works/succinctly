@@ -16173,8 +16173,23 @@ fn test_jq_malformed_object_raises_off_the_lazy_path_1194() -> Result<()> {
 
     // A genuine I/O failure still takes the `anyhow` path and exits 1 --
     // the downcast must separate the two, not swallow everything.
-    let (_out, _stderr, code) = run_jq_full(&["-c", ".", "/nonexistent-file-1194"], None)?;
-    assert_eq!(code, 1, "a missing file is not a document error");
+    //
+    // `-s` is load-bearing, not decoration: the downcast being tested lives
+    // in the *materializing* branch of `run_jq`, and a bare `-c .` leaves
+    // `can_use_lazy_path` true, so it never reaches that branch at all and
+    // exits 1 from a different place entirely. Both spellings are asserted
+    // so the coincidence cannot be mistaken for coverage again.
+    for args in [
+        &["-c", ".", "/nonexistent-file-1194"][..],
+        &["-c", "-s", ".", "/nonexistent-file-1194"][..],
+    ] {
+        let (_out, stderr, code) = run_jq_full(args, None)?;
+        assert_eq!(code, 1, "{args:?}: a missing file is not a document error");
+        assert!(
+            !stderr.contains("Invalid JSON text"),
+            "{args:?} must not be reported as a malformed document: {stderr:?}"
+        );
+    }
 
     Ok(())
 }
@@ -16282,6 +16297,7 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
         &["-c", "."][..],
         &["-c", "length"][..],
         &["-c", "keys"][..],
+        &["-c", "keys_unsorted"][..],
         &["-c", "to_entries"][..],
         &["-c", "map_values(.)"][..],
         &["-c", "-s", "."][..], // --slurp: the owned `to_owned` family
@@ -16301,6 +16317,37 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
             stderr.contains("expected string key"),
             "{args:?}: stderr: {stderr:?}"
         );
+    }
+
+    Ok(())
+}
+
+/// #1194: `keys` raises on both fault shapes, not just the one.
+///
+/// `DocumentFields::keys` carries two separate raises -- one per field for a
+/// key that will not stringify, one after the walk for a trailing orphan --
+/// and only a document of each shape reaches both. `{invalid}` yields *no*
+/// field at all (its single child has nothing to pair with), so it exercises
+/// only the second and leaves the first cold; `{123: 1, "b": 2}` is the
+/// reverse.
+#[test]
+fn test_jq_malformed_object_keys_raises_on_both_faults_1194() -> Result<()> {
+    for input in [
+        "{invalid}",           // orphan: the post-walk check
+        r#"{123: 1, "b": 2}"#, // bad key: the per-field check
+        r#"{"a":1, "b"}"#,     // orphan *behind* a well-formed field
+    ] {
+        for filter in ["keys", "keys_unsorted"] {
+            let (out, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(
+                code, 5,
+                "{input} | {filter}: out: {out:?}, stderr: {stderr:?}"
+            );
+            assert!(
+                stderr.contains("Invalid JSON text"),
+                "{input} | {filter}: stderr: {stderr:?}"
+            );
+        }
     }
 
     Ok(())
