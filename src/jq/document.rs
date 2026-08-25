@@ -1652,3 +1652,74 @@ mod raw_key_hash_tests {
         assert_eq!(ascii_key_hash("aaaaaaaaé".as_bytes()), None);
     }
 }
+
+#[cfg(test)]
+mod checked_len_tests {
+    use super::{effective_len_checked, DocumentValue};
+    use crate::json::JsonIndex;
+
+    /// The two arms of [`effective_len_checked`] must agree about whether a
+    /// document is well formed (#1194).
+    ///
+    /// `collapse` picks between two entirely separate implementations -- the
+    /// `census` walk and `checked_len` -- and only the first is reachable
+    /// through a shipped binary today: `collapse` is true in jq mode, and the
+    /// no-collapse arm belongs to yq mode, whose parser validates and so can
+    /// never present a malformed member. That is exactly why the arms are
+    /// driven directly here. An unexercised copy of a predicate is how two
+    /// copies drift, and the pairing is the property worth pinning: whichever
+    /// arm a future format lands on, it must give the same verdict and the
+    /// same count.
+    #[test]
+    fn both_arms_agree_on_malformed_and_well_formed_objects_1194() {
+        for (json, expected) in [
+            (&br#"{"a":1,"b":2}"#[..], Some(2)),
+            // Collapsing is the one thing the arms legitimately differ on:
+            // jq's rule folds the repeat, yq's keeps both.
+            (&br#"{"a":1,"a":2}"#[..], None),
+            (b"{}", Some(0)),
+            (b"{invalid}", None),           // orphan, post-walk check
+            (br#"{123: 1, "b": 2}"#, None), // bad key, per-field check
+            (br#"{"a":1, "b"}"#, None),     // orphan behind a good field
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let fields = cursor.value().as_object().expect("an object");
+
+            let collapsed = effective_len_checked(&fields, true);
+            let plain = effective_len_checked(&fields, false);
+
+            assert_eq!(
+                collapsed.is_ok(),
+                plain.is_ok(),
+                "the arms disagree about {}: {collapsed:?} vs {plain:?}",
+                String::from_utf8_lossy(json)
+            );
+            if let Some(len) = expected {
+                assert_eq!(collapsed.as_ref().ok(), Some(&len));
+                assert_eq!(plain.as_ref().ok(), Some(&len));
+            }
+            if let Err(err) = &plain {
+                // Same cause, not merely the same verdict -- `checked_len`
+                // asks the offending key's list while the census arm asks
+                // the head, and `malformed_member_error` is a method rather
+                // than a per-site literal precisely so those coincide.
+                assert_eq!(err.message, collapsed.unwrap_err().message);
+                assert!(err.message.contains("Invalid JSON text"));
+            }
+        }
+    }
+
+    /// A key that will not *decode* is #1247's fault, not #1194's, on the
+    /// no-collapse arm too -- the distinction `key_is_malformed` exists to
+    /// make, checked on the copy of it that no shipped binary reaches.
+    #[test]
+    fn the_plain_arm_leaves_decode_failures_alone_1194() {
+        let json: &[u8] = br#"{"a\q":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+
+        assert_eq!(effective_len_checked(&fields, false).ok(), Some(2));
+    }
+}
