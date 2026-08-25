@@ -21851,3 +21851,27 @@ fn test_jq_recurse_select_write_through_tracked_var_snapshot_1591() -> Result<()
     assert_eq!(code, 0, "stderr: {stderr:?}");
     Ok(())
 }
+
+/// #1590's own repro, write side. `FoldRegister::resolve`'s own `tr` check
+/// used to re-derive "is the accumulator at the register" via bare
+/// structural equality (`input == self.value`) instead of the richer
+/// provenance `resolve_reduce`'s loop already tracks for final emission --
+/// so step 1's reconstruction (`{a:.a}`, demoted to untracked by
+/// `relocate`) still made step 2's bare `.` look genuinely trackable
+/// whenever it happened to equal the register's own value, silently
+/// writing `9` into a document jq refuses to touch at all (exit 5). This
+/// is the dangerous direction of the two-#1466-call-sites bug class --
+/// confirmed live against jq 1.7.1: exit 5, "Invalid path expression with
+/// result {"a":1}", document untouched.
+#[test]
+fn test_jq_reduce_reconstruction_step_no_longer_promotes_next_step_write_1590() -> Result<()> {
+    let filter = "(reduce (1,2) as $i (.; if $i==1 then {a: .a} else . end)) |= 9";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "must not write: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}

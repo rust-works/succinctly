@@ -190,5 +190,4 @@
 # by accident. Refusing is the safe direction: exit 5, nothing written, and
 # #985's revert is what the other direction looks like.
 fold_register_var_from_navigated_binding   path-tracking   a variable bound from a navigated position carries no snapshot marker — #1573
-fold_register_snapshot_via_nested_init     path-tracking   an inner fold's `Expr::Identity` on an untrackable input rebuilds the branch, losing the marker — #1573
 fold_register_empty_merge_artifact         path-tracking   jq accepts `$x + {}` only because an empty merge returns its left operand's pointer; mirrored `{} + $x` refuses there too, so there is no rule to model — #1466
