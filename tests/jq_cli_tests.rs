@@ -21404,6 +21404,33 @@ fn test_valid_escapes_still_materialize_1247() {
     assert_eq!(stdout.trim(), "2");
 }
 
+/// #1247: plain `.` (no `--sort-keys`/color/pretty flag) stays on the
+/// genuinely-lazy raw-byte output path and echoes an undecodable string
+/// verbatim, the same raw-passthrough class as `keys_unsorted` above -- but
+/// `--sort-keys` and `-C` both force a full materialize first
+/// (`write_output_jq_value`'s "complex output" branch), which must surface
+/// the decode failure now instead of silently printing the empty string it
+/// used to.
+#[test]
+fn test_sort_keys_and_color_force_materialize_and_surface_decode_failure_1247() {
+    let doc = r#"{"a": "\ud800"}"#;
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "."], Some(doc)).unwrap_or_else(|e| panic!("`.` failed to run: {e}"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), r#"{"a":"\ud800"}"#, "stderr: {stderr}");
+
+    for flag in ["--sort-keys", "-C"] {
+        let (stdout, stderr, code) = run_jq_full(&[flag, "-c", "."], Some(doc))
+            .unwrap_or_else(|e| panic!("`{flag}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{flag}` should fail\nstdout: {stdout}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{flag}` stderr: {stderr}"
+        );
+    }
+}
+
 /// #1194 (the half in #1247's scope): a *structurally* malformed value --
 /// one the semi-index accepted as a span but could not classify as any JSON
 /// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`

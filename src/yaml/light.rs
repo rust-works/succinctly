@@ -7707,6 +7707,52 @@ mod tests {
         let _ = z_cursor.tag();
     }
 
+    /// #1247 coverage: `YamlStringError::message()`'s `InvalidUtf8` arm and
+    /// `Display` (which now defers to `message()`) were never directly
+    /// exercised by any test — `InvalidEscape` reaches `.message()`
+    /// indirectly through other decode-failure paths, but nothing calls
+    /// `Display` at all. Mirrors `JsonError`'s own `test_json_error_display`
+    /// in `src/json/light.rs`, which covers its sibling type's variants via
+    /// `.to_string()` the same way.
+    #[test]
+    fn test_yaml_string_error_display() {
+        assert_eq!(
+            YamlStringError::InvalidUtf8.to_string(),
+            "invalid UTF-8 in string"
+        );
+        assert_eq!(
+            YamlStringError::InvalidEscape.to_string(),
+            "invalid escape sequence"
+        );
+    }
+
+    /// #1247 code review: `string_decode_error()`'s `Alias` arm resolves the
+    /// *whole* alias chain first (mirroring `as_str`'s own #1191 fix, per
+    /// the doc comment directly above the `Alias` arm), so a 2+-hop alias to
+    /// an undecodable string still reports the decode failure instead of
+    /// silently answering "not a decode failure" after only one hop. Never
+    /// exercised directly before — builds a 2-hop chain (`z` -> `a1` ->
+    /// `a0`) terminating in a double-quoted string with an invalid escape
+    /// sequence (`\q`, not one of the recognized single-char escapes), then
+    /// calls `string_decode_error()` on the still-unresolved `Alias` value.
+    #[test]
+    fn test_string_decode_error_resolves_alias_chain_1247() {
+        use crate::jq::document::DocumentValue;
+
+        let yaml = "a0: &a0 \"bad\\qescape\"\na1: &a1 *a0\nz: *a1\n";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let YamlValue::Mapping(fields) = first_doc(root) else {
+            panic!("expected root document to be a mapping");
+        };
+        let z = fields.find("z").expect("z field must exist");
+        assert!(
+            matches!(&z, YamlValue::Alias { .. }),
+            "expected z to still be an unresolved Alias value"
+        );
+        assert_eq!(z.string_decode_error(), Some("invalid escape sequence"));
+    }
+
     #[test]
     fn test_simple_mapping_navigation() {
         let yaml = b"name: Alice";

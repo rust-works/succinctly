@@ -868,6 +868,20 @@ fn query_result_to_owned_values(
     // A decode failure while materializing is an uncaught error like any
     // other (#1247): report it and yield nothing, exactly as the
     // `QueryResult::Error` arm below does.
+    //
+    // Both callers ([`evaluate_input`] above, `eval_owned_with_file_index`
+    // below) only ever produce a `result` rooted in an already-decoded
+    // `OwnedValue` re-serialized to JSON and reindexed -- `eval_owned_input`
+    // (this function's non-path-context caller) explicitly converts every
+    // `One`/`Many` it sees into `Owned`/`ManyOwned` before returning, and the
+    // path-tracking branch builds its own `Owned`/`ManyOwned` results
+    // throughout since a path is always a concrete `Vec<OwnedValue>`, never
+    // a lazy cursor. So a genuine decode failure in the `One`/`OneCursor`/
+    // `Many` arms below is defense-in-depth, not a reachable path today --
+    // same argument `eval_generic.rs`'s textually-similar bridge relies on
+    // (search "defense-in-depth" there). Kept as `Result` rather than
+    // `.unwrap()` so a real failure, if this invariant is ever violated,
+    // surfaces as a normal `EvalError` instead of a panic.
     macro_rules! materialized {
         ($e:expr) => {
             match $e {
