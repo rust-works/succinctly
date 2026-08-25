@@ -933,6 +933,41 @@ Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../
 [`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
 (the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
 
+## Deliberate divergences (ADR-0018 rule 4)
+
+### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
+
+Real jq DOM-parses the whole input before evaluating anything, so a parse error on one
+value in a multi-value stream kills the run outright — nothing after the bad value is
+even attempted:
+
+```console
+$ printf '1\n[xyz123]\n3\n' | jq -c 'to_entries'
+jq: error (at <stdin>:1): number (1) has no keys
+jq: parse error: Invalid numeric literal at line 2, column 8
+$ printf '1\n[xyz123]\n3\n' | succinctly jq -c 'to_entries'
+jq: error (at <stdin>:1): number (1) has no keys
+jq: error (at <stdin>:2): unexpected character
+jq: error (at <stdin>:3): number (3) has no keys
+```
+
+succinctly never parses the whole input up front (semi-indexing is per-record), and a
+structurally malformed value (#1194) or an undecodable string (#1247) now surfaces
+through the same `EvalError`/`ErrorSink` per-record-error-then-continue convention every
+other jq error already uses (`ErrorSink`, [#355](https://github.com/rust-works/succinctly/issues/355))
+— so `3` still gets processed here where real jq never reaches it. This is not new to
+[#1247](https://github.com/rust-works/succinctly/issues/1247): `ErrorSink`'s
+continue-past-one-error batch semantics predate it and already diverge from real jq's
+abort-on-parse-error for every ordinary evaluation error, not just a decode failure.
+[#1247](https://github.com/rust-works/succinctly/issues/1247)'s own design doc
+([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md), Stage 4)
+calls succinctly's behaviour "the more useful of the two" and treats it as settled — but
+none of ADR-0018's three permitted conditions actually cover it (the output is readable,
+nothing is corrupted or discarded, and the process does not die either way), so per rule 4
+it is recorded here as a still-open policy question, matching
+[yq Limitations](../yq/limitations.md)'s "Merge-flag `+` and `d` combined" precedent for a
+divergence accepted on its merits without fitting the letter of rule 4.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |

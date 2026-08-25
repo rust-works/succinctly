@@ -392,8 +392,19 @@ and the key to `""` — but the emitted document is parseable. *Why second:* emi
 unparseable output is a correctness bug independent of the whole `to_owned` question, and
 fixing it first means Stage 3's new error paths have a clean sink to fail into.
 
-**Stage 3 — make the `to_owned` family fallible (sites 11–16). ✅ landed.** The main
+**Stage 3 — make the `to_owned` family fallible (sites 11–15). ✅ landed.** The main
 change. *Why third:* everything it can raise now has somewhere correct to go.
+
+**Site 16 (`lazy.rs:606`) is not actually landed, despite an earlier version of this doc
+claiming it under this stage's "✅ landed."** `write_json_at_depth`'s raw-bytes key
+fallback (`LazyKeysArray`'s defensive branch for a key with no text range) still reads
+`if let Ok(s) = k.as_str() { write_json_body_jq(out, &s)?; }` with no `else` — on a decode
+failure it writes nothing, silently rendering the key as `""` rather than raising, same as
+before this stage. Confirmed by re-reading the site directly, not inferred. Low practical
+severity — the comment there is right that a JSON object key is always a text-range token,
+so this branch is close to unreachable — but "align for consistency" was never actually
+done, and the site inventory's own "Today" column already said so; only the stage-level
+"landed" summary overclaimed it.
 
 Implementation notes, all discovered while doing it:
 
@@ -427,10 +438,30 @@ Implementation notes, all discovered while doing it:
   verbatim. Neither loses data — both are the same raw-passthrough class as `jq '.'` —
   so both were left alone, and the tests say why.
 
-**Stage 4 — the `StandardJson::Error` arms (sites 17–20). ✅ landed.** Fixes
+**Stage 4 — the `StandardJson::Error` arms (sites 17–18). ✅ landed.** Fixes
 `[xyz123] → [null]`, i.e. #1194's in-scope half. Small once Stage 3 exists: the arms
 raise with the semi-index's own message, which is more specific than anything
 reconstructible at the materializer.
+
+**Sites 19–20 are not actually landed, despite an earlier version of this doc claiming
+all of 17–20 under this stage's "✅ landed."** Re-reading both directly:
+
+- **Site 19 (`eval.rs:427`)** still reads `StandardJson::Error(_) => OwnedValue::Null`,
+  unchanged. Low live risk *today*: `eval.rs`'s evaluator only processes JSON re-serialized
+  from an already-decoded `OwnedValue`, which by construction can't contain a structurally
+  malformed value, so this arm is dead in practice — but the doc's own site-inventory
+  rationale for including site 19 "anyway, as a cheap consistency fix" was never carried
+  out, and a future code path that starts feeding raw, unvalidated JSON through
+  `eval.rs::eval()` would silently reintroduce the bug with no test guarding against it.
+- **Site 20 (`json/light.rs:2098`, `stream_json_as_yaml`'s `StandardJson::Error` arm —
+  the JSON→YAML streaming output path)** also still writes `null` unchanged. This one is
+  architecturally the same class of gap Stage 6 below is about (a `core::fmt::Write`-only
+  error channel that cannot cleanly raise mid-stream) — it was miscategorized as a simple
+  Stage-4 fix rather than folded into Stage 6 alongside its YAML→JSON and YAML→YAML
+  siblings. See [yq Limitations § A bad escape in a streamed scalar still degrades
+  silently](../compliance/yq/limitations.md#a-bad-escape-in-a-streamed-scalar-still-degrades-silently-instead-of-raising)
+  for the two siblings that are recorded; this third one belongs in the same bucket once
+  Stage 6 is scoped.
 
 One site was reverted after being written. `print_json`'s `StandardJson::Error` arm
 (`jq_runner.rs`) walks child cursors lazily and streams as it goes, so by the time a
