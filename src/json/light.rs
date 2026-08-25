@@ -2043,6 +2043,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
     fn is_empty(&self) -> bool {
         JsonFields::is_empty(self)
     }
+
+    /// JSON is the one format that can present an unpaired child, so it is
+    /// the one format that overrides this (#1194). See the inherent
+    /// [`JsonFields::ends_unpaired`].
+    fn ends_unpaired(&self) -> bool {
+        JsonFields::ends_unpaired(self)
+    }
 }
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {

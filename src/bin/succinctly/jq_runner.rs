@@ -809,6 +809,27 @@ fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
 /// the input stream still processed (#355). Giving it a distinct type lets the
 /// single place that owns the sink tell the two apart by `downcast_ref`
 /// instead of matching on message text.
+/// Raise if a finished key walk ran out on an unpaired child (#1194).
+///
+/// `DistinctKeyCursors` records this as it walks, so asking costs a field
+/// read rather than a second pass over the keys -- which matters, because
+/// `keys_unsorted` over a 2 MB `wide` document is one of the workloads
+/// `scripts/perf-guard.py` pins.
+///
+/// `doc_text` is the document the last key came from. It is `None` only when
+/// the walk yielded nothing, and an object that yields no keys *and* ends
+/// unpaired is `{invalid}` -- already refused before the opening bracket by
+/// the `unpaired_tail` check, so this arm cannot be the one to report it.
+fn bail_if_keys_ended_unpaired<F: succinctly::jq::document::DocumentFields>(
+    keys: &DistinctKeyCursors<F>,
+    doc_text: Option<&[u8]>,
+) -> Result<()> {
+    match (keys.ended_unpaired(), doc_text) {
+        (true, Some(text)) => Err(MalformedJsonError(EvalError::malformed_json_text(text)).into()),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Debug)]
 pub struct MalformedJsonError(pub EvalError);
 
@@ -3749,20 +3770,30 @@ where
                 out.write_all(b"[]")?;
             } else if compact {
                 out.write_all(b"[")?;
-                for (i, (key, key_cursor)) in DistinctKeyCursors::new(fields, *collapse).enumerate()
-                {
+                // Iterated by `by_ref` so the walk's own
+                // answer to "did this object end on an orphan?" survives it
+                // (#1194). `unpaired_tail` above cannot see that: asked of
+                // the list's *head* it reports only on the first child, so
+                // `{"a":1, invalid}` reads as well formed there and used to
+                // print a complete, wrong `["a"]` at exit 0.
+                let mut keys = DistinctKeyCursors::new(fields, *collapse);
+                let mut doc_text: Option<&[u8]> = None;
+                for (i, (key, key_cursor)) in keys.by_ref().enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                     }
+                    doc_text = Some(key_cursor.text());
                     let SJ::String(k) = key else {
-                        // Unreachable: `first_malformed_member` above has
-                        // already rejected any non-string key, and does so
-                        // before the `[`. Kept because `key` is the open
-                        // `StandardJson` enum and this arm must bind
-                        // something -- raising rather than skipping means
-                        // that if the pre-pass and this loop ever disagree,
-                        // the result is an error and not the `[,"b"]` this
-                        // used to print at exit 0 (#1194).
+                        // Reachable, and the reason this writer can leave
+                        // a truncated `[` behind: the check above it is the
+                        // O(1) `unpaired_tail` one, which catches `{invalid}`
+                        // but says nothing about a key's *type*. Catching
+                        // that before the bracket would need a second walk
+                        // over every key, on a path `scripts/perf-guard.py`
+                        // pins -- so it is caught here instead, after the
+                        // bracket is already out. Raising still beats the
+                        // `[,"b"]` this used to print at exit 0 (#1194); see
+                        // `docs/compliance/jq/limitations.md`.
                         return Err(MalformedJsonError(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
@@ -3785,26 +3816,33 @@ where
                         out.write_all(raw)?;
                     }
                 }
+                bail_if_keys_ended_unpaired(&keys, doc_text)?;
                 out.write_all(b"]")?;
             } else {
                 out.write_all(b"[")?;
                 out.write_all(separator.as_bytes())?;
-                for (i, (key, key_cursor)) in DistinctKeyCursors::new(fields, *collapse).enumerate()
-                {
+                // See the compact branch above for why the iterator is kept
+                // alive past the loop (#1194).
+                let mut keys = DistinctKeyCursors::new(fields, *collapse);
+                let mut doc_text: Option<&[u8]> = None;
+                for (i, (key, key_cursor)) in keys.by_ref().enumerate() {
                     if i > 0 {
                         out.write_all(b",")?;
                         out.write_all(separator.as_bytes())?;
                     }
+                    doc_text = Some(key_cursor.text());
                     out.write_all(next_indent.as_bytes())?;
                     let SJ::String(k) = key else {
-                        // Unreachable: `first_malformed_member` above has
-                        // already rejected any non-string key, and does so
-                        // before the `[`. Kept because `key` is the open
-                        // `StandardJson` enum and this arm must bind
-                        // something -- raising rather than skipping means
-                        // that if the pre-pass and this loop ever disagree,
-                        // the result is an error and not the `[,"b"]` this
-                        // used to print at exit 0 (#1194).
+                        // Reachable, and the reason this writer can leave
+                        // a truncated `[` behind: the check above it is the
+                        // O(1) `unpaired_tail` one, which catches `{invalid}`
+                        // but says nothing about a key's *type*. Catching
+                        // that before the bracket would need a second walk
+                        // over every key, on a path `scripts/perf-guard.py`
+                        // pins -- so it is caught here instead, after the
+                        // bracket is already out. Raising still beats the
+                        // `[,"b"]` this used to print at exit 0 (#1194); see
+                        // `docs/compliance/jq/limitations.md`.
                         return Err(MalformedJsonError(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
@@ -3827,6 +3865,7 @@ where
                         out.write_all(raw)?;
                     }
                 }
+                bail_if_keys_ended_unpaired(&keys, doc_text)?;
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
                 out.write_all(b"]")?;
@@ -4332,6 +4371,46 @@ mod tests {
             standard_json_to_jq_value(value, &cursor).expect_err("an unpaired member is not JSON");
         assert!(
             err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194: `MalformedJsonError` exists to be `downcast_ref`'d out of an
+    /// `anyhow::Error` in `run_jq`, which reads its inner `EvalError` and
+    /// never formats the wrapper. `Display` is still required by
+    /// `std::error::Error`, so pin that it renders the message rather than
+    /// something like `MalformedJsonError(..)` -- a future `anyhow` context
+    /// chain would print it.
+    #[test]
+    fn test_malformed_json_error_displays_its_message_1194() {
+        let wrapped = MalformedJsonError(EvalError::new("Invalid JSON text: whatever"));
+        assert_eq!(wrapped.to_string(), "Invalid JSON text: whatever");
+
+        // And it survives the round trip `run_jq` actually performs.
+        let boxed: anyhow::Error = wrapped.into();
+        let recovered = boxed
+            .downcast_ref::<MalformedJsonError>()
+            .expect("run_jq recovers this by downcast");
+        assert_eq!(recovered.0.message, "Invalid JSON text: whatever");
+    }
+
+    /// #1194: the defensive arm of `EvalError::malformed_json_text`.
+    ///
+    /// It re-reads the document with the strict validator to name the error.
+    /// If the validator ever *disagrees* -- says the document is fine after a
+    /// swallow point has already fired -- the two layers have drifted apart,
+    /// and the right answer is still an error, not silence. Not reachable
+    /// through the CLI today, which is exactly why it is pinned here.
+    #[test]
+    fn test_malformed_json_text_still_errors_when_validator_disagrees_1194() {
+        let err = EvalError::malformed_json_text(br#"{"a":1}"#);
+        assert_eq!(err.message, "Invalid JSON text");
+
+        // The normal arm, for contrast: the validator's own reason is used.
+        let err = EvalError::malformed_json_text(b"{invalid}");
+        assert!(
+            err.message.contains("expected string key"),
             "message: {}",
             err.message
         );

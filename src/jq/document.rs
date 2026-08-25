@@ -500,6 +500,28 @@ pub trait DocumentFields: Sized + Clone {
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 
+    /// Whether this field list ends on a child with no sibling to pair as
+    /// its value -- structurally malformed input the format's index
+    /// accepted anyway (#1194).
+    ///
+    /// JSON overrides this: its semi-index recovers an object's members by
+    /// pairing the container's parenthesis-tree children two at a time and
+    /// checks neither the key's type nor the count's parity, so
+    /// `{"a":1,"b"}` indexes exactly as cleanly as `{"a":1}` does. Every
+    /// other format validates while parsing and can never present one, so
+    /// the default is `false` and costs them nothing.
+    ///
+    /// **Ask it of the list a walk has *finished* on, not the one it
+    /// starts from.** On an exhausted list this is O(1) -- the answer comes
+    /// from a `None` cursor without touching the tree. On the head of a
+    /// list it answers only for the *first* child, which is true just for a
+    /// single-member object like `{invalid}`: a trailing orphan behind any
+    /// well-formed field reads as `false`, which is the mistake #1194's own
+    /// first cut made in the `keys_unsorted` writer.
+    fn ends_unpaired(&self) -> bool {
+        false
+    }
+
     /// Walk one field, materializing only its key.
     ///
     /// [`uncons`](Self::uncons) builds a whole [`DocumentField`], which
@@ -1040,6 +1062,10 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// cursor only -- this iterator never reads a field's value, so
     /// `collapse_confirmed_repeat` never materializes one (#1514 review).
     collapsed: Option<Vec<(F::Value, F::Cursor)>>,
+    /// Whether the walk ran out on an unpaired child (#1194). Recorded as
+    /// the walk discovers it, because neither branch can answer afterwards:
+    /// `rest` is exhausted on one and stale mid-object on the other.
+    ended_unpaired: bool,
 }
 
 impl<F: DocumentFields> DistinctKeyCursors<F> {
@@ -1052,7 +1078,25 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
             seen: collapse.then(KeyHashes::new),
             yielded: 0,
             collapsed: None,
+            ended_unpaired: false,
         }
+    }
+
+    /// Whether the object ends on a child with no sibling to pair as its
+    /// value -- structurally malformed JSON the semi-index accepted (#1194).
+    ///
+    /// **Only meaningful once the iterator is exhausted**, since that is
+    /// when the walk finds out; it reads `false` until then. A streaming
+    /// consumer therefore learns this *after* writing its keys, which is
+    /// the deliberate trade: answering up front would cost a second walk
+    /// over every key, and `keys_unsorted` over a 2 MB `wide` document is
+    /// one of the six workloads `scripts/perf-guard.py` pins precisely
+    /// because it is sensitive to that.
+    ///
+    /// Always `false` for a format whose parser validates (everything but
+    /// JSON), via [`DocumentFields::ends_unpaired`]'s default.
+    pub fn ended_unpaired(&self) -> bool {
+        self.ended_unpaired
     }
 }
 
@@ -1068,16 +1112,29 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             self.yielded += 1;
             return Some((key.clone(), *cursor));
         }
-        let (key, key_cursor, tail) = self.rest.uncons_key()?;
+        let Some((key, key_cursor, tail)) = self.rest.uncons_key() else {
+            // Exhaustion and "the last child never got a value" are the
+            // same `None` from `uncons_key`. Ask now, while `rest` still
+            // holds the list the walk stopped on -- this is the only
+            // moment the two can be told apart (#1194).
+            self.ended_unpaired = self.rest.ends_unpaired();
+            return None;
+        };
         self.rest = tail;
         let repeat = self
             .seen
             .as_mut()
             .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)));
         if repeat {
-            let (collapsed, total) = collapse_confirmed_repeat(&self.all);
-            if collapsed.len() < total {
-                self.collapsed = Some(collapsed);
+            let confirmed = collapse_confirmed_repeat(&self.all);
+            // Recorded here as well as at exhaustion above: on the
+            // collapsing branch below `rest` stops mid-object and never
+            // reaches the `None` arm, so that arm would never see the
+            // orphan. `confirmed` covers the whole object, so it can.
+            self.ended_unpaired = confirmed.ends_unpaired;
+            let ConfirmedRepeat { keys, total, .. } = confirmed;
+            if keys.len() < total {
+                self.collapsed = Some(keys);
                 self.seen = None;
                 // Resumes at `yielded`, which the collapsed list's own
                 // prefix matches: every key emitted so far was a first
@@ -1112,8 +1169,7 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
 /// `census` would otherwise run (hash-collect, conditional exact-collision
 /// narrowing, then a value-materializing `all_fields()` walk) into one
 /// key-only walk (#1514 review).
-#[allow(clippy::type_complexity)] // STYLE-0004: (key, cursor) list plus a walked-field count; the nested tuple is intentional
-fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> (Vec<(F::Value, F::Cursor)>, usize) {
+fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> ConfirmedRepeat<F> {
     let mut slot_of: IndexMap<String, usize> = IndexMap::new();
     let mut out: Vec<(F::Value, F::Cursor)> = Vec::new();
     let mut total = 0usize;
@@ -1134,7 +1190,30 @@ fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> (Vec<(F::Value, F
         }
         walk = rest;
     }
-    (out, total)
+    ConfirmedRepeat {
+        // `walk` is the list this loop *finished* on, which is the only
+        // list `ends_unpaired` answers for (#1194). Free here: the walk had
+        // to run anyway to collapse the duplicate.
+        ends_unpaired: walk.ends_unpaired(),
+        keys: out,
+        total,
+    }
+}
+
+/// What [`collapse_confirmed_repeat`]'s single walk learned about an object.
+///
+/// A struct rather than the tuple this used to return: three unrelated
+/// answers ride out of one walk, and naming them is what let the third be
+/// added without a `clippy::type_complexity` waiver.
+struct ConfirmedRepeat<F: DocumentFields> {
+    /// The collapsed key list, first occurrence of each key in place.
+    keys: Vec<(F::Value, F::Cursor)>,
+    /// How many fields the walk actually saw, collapsed or not. Equal to
+    /// `keys.len()` exactly when nothing collapsed -- the signature of a
+    /// 64-bit hash collision rather than a real duplicate.
+    total: usize,
+    /// Whether the walk ran out on an unpaired child (#1194).
+    ends_unpaired: bool,
 }
 
 /// Collapse fields known to contain at least one repeated key.

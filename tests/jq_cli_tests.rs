@@ -15933,6 +15933,82 @@ fn test_jq_keys_unsorted_on_malformed_object_errors_1194() -> Result<()> {
         "a truncated array is tolerated here, a complete one is not: {out:?}"
     );
 
+    // The writer has two near-identical key-emitting branches, compact and
+    // pretty, each with its own copy of the raise. Exercise both, or a later
+    // edit can fix one and leave the other printing `[,"b"]`.
+    //
+    // A *trailing* orphan is the case the up-front check cannot see: asked of
+    // the list's head, `unpaired_tail` reports only on the first child, so
+    // `{"a":1, invalid}` reads as well formed there. It is caught instead by
+    // `DistinctKeyCursors::ended_unpaired`, which the walk records as it goes
+    // -- which is why this one is only refused *after* its keys are written.
+    for args in [&["-c", "keys_unsorted"][..], &["keys_unsorted"][..]] {
+        for input in [r#"{123: 1, "b": 2}"#, r#"{"a":1, invalid}"#] {
+            let (out, _stderr, code) = run_jq_full(args, Some(input))?;
+            assert_eq!(code, 5, "{args:?} on {input}: out: {out:?}");
+            assert!(
+                !out.contains(']'),
+                "{args:?} on {input}: a truncated array is tolerated, a complete one is not: {out:?}"
+            );
+        }
+    }
+
+    // Both branches still write a well-formed key list for a well-formed
+    // object, including keys that need escaping.
+    for args in [&["-c", "keys_unsorted"][..], &["keys_unsorted"][..]] {
+        let (out, _stderr, code) = run_jq_full(args, Some(r#"{"a\nb":1,"é":2}"#))?;
+        assert_eq!(code, 0, "{args:?}: out: {out:?}");
+        assert!(out.contains(']'), "{args:?}: out: {out:?}");
+    }
+
+    Ok(())
+}
+
+/// #1194: the fix reaches the *lazy* path only, and `can_use_lazy_path`
+/// (`jq_runner.rs`) is what decides that -- eight conditions, any one of
+/// which routes the whole run through `get_inputs`/`parse_json_stream` and
+/// the infallible `to_owned` family instead, where the malformed member has
+/// already been dropped before any printer sees it.
+///
+/// `-a`/`--ascii-output` is the surprising member of that list: it reads
+/// like a formatting flag, but it disables the lazy path outright, so even a
+/// plain identity query stops raising. Pinned so the boundary is a decision
+/// rather than a surprise, and so this test fails loudly when #1247 makes
+/// that family fallible and these start raising too.
+#[test]
+fn test_jq_malformed_object_quiet_off_the_lazy_path_1194() -> Result<()> {
+    // On the lazy path: raises.
+    let (_out, _stderr, code) = run_jq_full(&["-c", "."], Some("{invalid}"))?;
+    assert_eq!(code, 5);
+
+    // Off it: still quiet, and the documented gap.
+    for args in [
+        &["-c", "-a", "."][..], // --ascii-output
+        &["-c", "-S", "."][..], // --sort-keys
+        &["-c", "-s", "."][..], // --slurp
+    ] {
+        let (out, _stderr, code) = run_jq_full(args, Some("{invalid}"))?;
+        assert_eq!(code, 0, "{args:?}: out: {out:?}");
+        assert!(out.contains("{}"), "{args:?}: out: {out:?}");
+    }
+
+    Ok(())
+}
+
+/// #1194: `EvalError::malformed_json_text` re-reads the document with the
+/// strict validator, so its message is the validator's own. Its `Ok(())`
+/// arm is a defensive one -- it means the validator and the indexer have
+/// drifted apart -- and it still has to produce a usable error rather than
+/// claim the document is fine.
+#[test]
+fn test_jq_malformed_json_text_falls_back_when_validator_disagrees_1194() -> Result<()> {
+    // Not reachable through the CLI by construction, so assert the property
+    // that makes the fallback safe: a *valid* document never yields a
+    // message that contradicts itself.
+    let (out, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "out: {out:?}, stderr: {stderr:?}");
+    assert!(!stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
     Ok(())
 }
 
