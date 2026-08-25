@@ -16655,6 +16655,102 @@ fn slice_component_value(
     )
 }
 
+/// A persistent, structurally-shared path prefix (#701).
+///
+/// Replaces `PathBranch::path: Vec<Expr>`. Extending a prefix by one
+/// component (`extend`) is O(1) — a refcount bump on the shared parent plus
+/// one new allocation — instead of the O(depth) `prefix.to_vec()`/`.clone()`
+/// this type replaces. The only O(depth) operation is [`PathPrefix::to_vec`],
+/// which walks the chain to build a flat `Vec<Expr>`; callers pay it at most
+/// once per branch, only where a genuinely flat path is required (chiefly
+/// `resolve_dynamic_indexes`'s `assemble`), instead of it being repeated at
+/// every node visited during construction.
+///
+/// `Rc`, not `Arc`: this evaluator is single-threaded (no `Send`/`Sync`
+/// bounds or thread-spawning anywhere in `src/jq`), and `Rc` is already an
+/// established sharing primitive in this module (`Expr::TrackedVar(Rc<
+/// OwnedValue>)`). An arena with index-based parent pointers would avoid
+/// refcounting but needs an arena value threaded through every function that
+/// touches a path — `Rc` needs no new parameters anywhere, which is the
+/// entire point of #1285/#1286's prior migration to a named `PathBranch`
+/// struct: this is a field-type change, not a signature-churning rewrite.
+#[derive(Debug, PartialEq)]
+enum PathPrefix {
+    /// The empty path — `.`, or the root of a fresh chain.
+    Root,
+    Node {
+        parent: Rc<Self>,
+        component: Expr,
+        /// Components from `Root` to here, inclusive. `Root` = 0. Keeps
+        /// [`PathPrefix::depth`] O(1) without walking the chain — this is
+        /// what keeps `assert_value_tree_depth` O(1) per node in
+        /// `push_recursive_branches`.
+        depth: usize,
+    },
+}
+
+impl PathPrefix {
+    /// A fresh, empty chain. Not a shared singleton: this crate is
+    /// `no_std`-compatible (no `thread_local`/`once_cell`-style sharing
+    /// available), and re-allocating one `Root` node per fresh chain is O(1)
+    /// regardless. Callers that build many siblings off the same root (e.g.
+    /// per-element loops) should hoist a single `root()` call outside the
+    /// loop and `Rc::clone` it, not call `root()` per element.
+    fn root() -> Rc<Self> {
+        Rc::new(Self::Root)
+    }
+
+    fn depth(&self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Node { depth, .. } => *depth,
+        }
+    }
+
+    /// O(1): one `Rc::clone` (refcount bump) plus one new allocation.
+    fn extend(parent: &Rc<Self>, component: Expr) -> Rc<Self> {
+        Rc::new(Self::Node {
+            parent: Rc::clone(parent),
+            component,
+            depth: parent.depth() + 1,
+        })
+    }
+
+    /// Extend by `k` new components. O(k) — the same asymptotic cost as
+    /// `Vec::extend`; the win over the `Vec<Expr>` this replaces is that
+    /// `parent`'s own existing chain is never re-copied, only borrowed.
+    fn extend_many(parent: &Rc<Self>, components: impl IntoIterator<Item = Expr>) -> Rc<Self> {
+        components
+            .into_iter()
+            .fold(Rc::clone(parent), |acc, component| {
+                Self::extend(&acc, component)
+            })
+    }
+
+    /// Build a fresh chain from a flat list of components, e.g. for a branch
+    /// assembled elsewhere as a `Vec<Expr>` (a static fast path, or a test).
+    fn from_components(components: impl IntoIterator<Item = Expr>) -> Rc<Self> {
+        Self::extend_many(&Self::root(), components)
+    }
+
+    /// The one O(depth) operation: flatten the chain into an owned
+    /// `Vec<Expr>`, root-to-leaf order. Paid once per branch, only where a
+    /// flat path is actually required.
+    fn to_vec(&self) -> Vec<Expr> {
+        let mut out = Vec::with_capacity(self.depth());
+        let mut cur = self;
+        while let Self::Node {
+            parent, component, ..
+        } = cur
+        {
+            out.push(component.clone());
+            cur = parent;
+        }
+        out.reverse();
+        out
+    }
+}
+
 /// One resolved branch: the static path components reaching it, and the value
 /// found there (needed to resolve any computed key further along the chain).
 ///
@@ -16680,8 +16776,10 @@ fn slice_component_value(
 /// branches built from it are forced back to `Cow::Owned` before they escape
 /// that scope (#668).
 struct PathBranch<'a> {
-    /// The static path components reaching this branch.
-    path: Vec<Expr>,
+    /// The static path components reaching this branch (#701: a persistent,
+    /// structurally-shared chain rather than an owned `Vec<Expr>` — see
+    /// `PathPrefix`).
+    path: Rc<PathPrefix>,
     /// The value found at `path`.
     value: Cow<'a, OwnedValue>,
     /// Whether this branch's value was actually *reached* by path
@@ -16740,7 +16838,7 @@ impl<'a> PathBranch<'a> {
     ///
     /// Pass `true` only where the site is a genuine navigation step whose
     /// untracked case is already rejected upstream.
-    fn new(path: Vec<Expr>, value: Cow<'a, OwnedValue>, trackable: bool) -> Self {
+    fn new(path: Rc<PathPrefix>, value: Cow<'a, OwnedValue>, trackable: bool) -> Self {
         Self {
             path,
             value,
@@ -16770,7 +16868,7 @@ impl<'a> PathBranch<'a> {
     /// violate the invariant would otherwise poison a branch silently
     /// rather than erroring loudly).
     fn passthrough(
-        path: Vec<Expr>,
+        path: Rc<PathPrefix>,
         value: Cow<'a, OwnedValue>,
         trackable: bool,
         snapshot: bool,
@@ -16790,7 +16888,7 @@ impl<'a> PathBranch<'a> {
     /// components.
     fn untracked(value: Cow<'a, OwnedValue>) -> Self {
         Self {
-            path: Vec::new(),
+            path: PathPrefix::root(),
             value,
             trackable: false,
             snapshot: false,
@@ -16801,7 +16899,7 @@ impl<'a> PathBranch<'a> {
     /// snapshot*, not a reconstruction — see the `snapshot` field (#1466).
     fn snapshot(value: Cow<'a, OwnedValue>) -> Self {
         Self {
-            path: Vec::new(),
+            path: PathPrefix::root(),
             value,
             trackable: false,
             snapshot: true,
@@ -17136,6 +17234,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                              trackable,
                              snapshot,
                          }| {
+                            let components = components.to_vec();
                             let inner_path = if components.len() == 1 {
                                 components.into_iter().next().expect("len checked")
                             } else {
@@ -17157,7 +17256,9 @@ fn resolve_node<'a, S: EvalSemantics>(
                                 // neither grants nor removes trackability —
                                 // nor, for the same reason, the snapshot
                                 // provenance a `$x` inside it carries (#1466).
-                                path: vec![Expr::Optional(Box::new(inner_path))],
+                                path: PathPrefix::from_components([Expr::Optional(Box::new(
+                                    inner_path,
+                                ))]),
                                 value: v,
                                 trackable,
                                 snapshot,
@@ -17185,19 +17286,33 @@ fn resolve_node<'a, S: EvalSemantics>(
                 ));
             }
             match value {
-                OwnedValue::Array(items) => Ok(items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        PathBranch::new(vec![Expr::Index(i as i64)], Cow::Borrowed(v), true)
-                    })
-                    .collect()),
-                OwnedValue::Object(map) => Ok(map
-                    .iter()
-                    .map(|(k, v)| {
-                        PathBranch::new(vec![Expr::Field(k.clone())], Cow::Borrowed(v), true)
-                    })
-                    .collect()),
+                OwnedValue::Array(items) => {
+                    let root = PathPrefix::root();
+                    Ok(items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            PathBranch::new(
+                                PathPrefix::extend(&root, Expr::Index(i as i64)),
+                                Cow::Borrowed(v),
+                                true,
+                            )
+                        })
+                        .collect())
+                }
+                OwnedValue::Object(map) => {
+                    let root = PathPrefix::root();
+                    Ok(map
+                        .iter()
+                        .map(|(k, v)| {
+                            PathBranch::new(
+                                PathPrefix::extend(&root, Expr::Field(k.clone())),
+                                Cow::Borrowed(v),
+                                true,
+                            )
+                        })
+                        .collect())
+                }
                 other => Err((
                     Vec::new(),
                     EvalError::cannot_iterate_with(S::TAG, other).into(),
@@ -17319,7 +17434,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                     // rebuild a value it never touches, so whatever pointer
                     // jq is still holding for `value` survives unchanged.
                     out.push(PathBranch::passthrough(
-                        Vec::new(),
+                        PathPrefix::root(),
                         Cow::Borrowed(value),
                         trackable,
                         snapshot,
@@ -17344,7 +17459,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // both `trackable` and `snapshot` the same way `select`
                 // does just above (#1591).
                 Ok(vec![PathBranch::passthrough(
-                    Vec::new(),
+                    PathPrefix::root(),
                     Cow::Borrowed(value),
                     trackable,
                     snapshot,
@@ -17688,7 +17803,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         Expr::TrackedVar(marker_value) => {
             if trackable && marker_value.as_ref() == value {
                 Ok(vec![PathBranch::new(
-                    Vec::new(),
+                    PathPrefix::root(),
                     Cow::Borrowed(value),
                     true,
                 )])
@@ -17823,7 +17938,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                         arg_escape = Some(EvalError::invalid_path_expression(value).into());
                         break;
                     }
-                    let mut components = Vec::new();
+                    let mut components = PathPrefix::root();
                     // Starts borrowed — an empty `keys` (a bare `getpath([])`)
                     // then costs nothing at all; each step after the first
                     // necessarily produces a fresh owned value from
@@ -17853,7 +17968,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                         current = Cow::Owned(
                             indexed.expect("non-optional index yields a value or errors"),
                         );
-                        components.push(component);
+                        components = PathPrefix::extend(&components, component);
                     }
                     // #843: `getpath` may navigate an untracked value, but
                     // that exemption is for its own indexing only — it does
@@ -18047,7 +18162,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // `navigation_element` check above already raised for them.
         if matches!(expr, Expr::Identity) {
             return Ok(vec![PathBranch::passthrough(
-                Vec::new(),
+                PathPrefix::root(),
                 Cow::Borrowed(value),
                 false,
                 snapshot,
@@ -18123,7 +18238,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             // an *untracked* ambient value is handled separately, at the
             // top of this function, before `is_primitive` is even computed.
             1 => Ok(vec![PathBranch::new(
-                components,
+                PathPrefix::from_components(components),
                 Cow::Owned(values.pop().expect("len checked")),
                 true,
             )]),
@@ -18244,7 +18359,7 @@ fn resolve_recursive_descent(
     snapshot: bool,
 ) -> Vec<PathBranch<'_>> {
     let mut out = Vec::new();
-    push_recursive_branches(&[], value, trackable, &mut out);
+    push_recursive_branches(&PathPrefix::root(), value, trackable, &mut out);
     if snapshot {
         if let Some(root) = out.first_mut() {
             root.snapshot = true;
@@ -18261,26 +18376,25 @@ fn resolve_recursive_descent(
 /// of deep-cloning its remaining subtree: an O(1) pointer copy per node
 /// instead of the O(subtree)-per-node cost that made this function (and its
 /// `..`/bare-`recurse` callers) O(d²) on a depth-`d` linear-nesting document
-/// (#668). `prefix.to_vec()` just below is a separate, still-unfixed O(path
-/// length)-per-node cost — also O(d²) summed over the tree, but over
-/// `Vec<Expr>` path components rather than the value — tracked separately as
-/// #701 since it needs a different technique (structural sharing over the
-/// path list, not `Cow`) and #668 never scoped it in.
+/// (#668). `prefix` is a [`PathPrefix`] — extending it per child is O(1) (a
+/// refcount bump plus one new node), not the O(depth) `Vec<Expr>` clone this
+/// function used to pay once for its own branch and again per child (#701).
 ///
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent) — `prefix` already
 /// grows by exactly one component per descent from its sole call site
-/// (`resolve_recursive_descent`, starting at `&[]`), so its length doubles
-/// as the recursion depth with no extra parameter needed. `tests/
-/// jq_recurse_depth_tests.rs` already pins a depth-300 correctness floor
-/// through this exact function (#626/#661) — well under the 384 ceiling.
+/// (`resolve_recursive_descent`, starting at [`PathPrefix::root`]), so its
+/// depth doubles as the recursion depth with no extra parameter needed.
+/// `tests/jq_recurse_depth_tests.rs` already pins a depth-300 correctness
+/// floor through this exact function (#626/#661) — well under the 384
+/// ceiling.
 fn push_recursive_branches<'a>(
-    prefix: &[Expr],
+    prefix: &Rc<PathPrefix>,
     value: &'a OwnedValue,
     trackable: bool,
     out: &mut Vec<PathBranch<'a>>,
 ) {
-    assert_value_tree_depth(prefix.len());
+    assert_value_tree_depth(prefix.depth());
     // `trackable` threads unchanged through the whole descent (#1591): every
     // node here, self included, is either genuinely reachable via a real
     // path or none of them are — a starting point the recurse-family guard
@@ -18290,22 +18404,20 @@ fn push_recursive_branches<'a>(
     // trackability. This was hardcoded `true` before #1591, which was sound
     // only because the guard used to admit nothing else.
     out.push(PathBranch::new(
-        prefix.to_vec(),
+        Rc::clone(prefix),
         Cow::Borrowed(value),
         trackable,
     ));
     match value {
         OwnedValue::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                let mut path = prefix.to_vec();
-                path.push(Expr::Index(i as i64));
+                let path = PathPrefix::extend(prefix, Expr::Index(i as i64));
                 push_recursive_branches(&path, item, trackable, out);
             }
         }
         OwnedValue::Object(map) => {
             for (k, v) in map {
-                let mut path = prefix.to_vec();
-                path.push(Expr::Field(k.clone()));
+                let path = PathPrefix::extend(prefix, Expr::Field(k.clone()));
                 push_recursive_branches(&path, v, trackable, out);
             }
         }
@@ -18391,7 +18503,7 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// `{"a":{"b":5},"c":5}` is `["a","b"]`, inheriting UPDATE's own
 /// trackable result through EXTRACT directly, no reset.
 struct FoldRegister {
-    path: Vec<Expr>,
+    path: Rc<PathPrefix>,
     value: OwnedValue,
     trackable: bool,
 }
@@ -18419,13 +18531,13 @@ impl FoldRegister {
         let acc = init_branch.value.clone().into_owned();
         let reg = if init_branch.trackable {
             Self {
-                path: init_branch.path.clone(),
+                path: Rc::clone(&init_branch.path),
                 value: acc.clone(),
                 trackable: true,
             }
         } else {
             Self {
-                path: Vec::new(),
+                path: PathPrefix::root(),
                 value: value.clone(),
                 trackable,
             }
@@ -18528,11 +18640,10 @@ impl FoldRegister {
             .into_iter()
             .map(|b| {
                 if b.trackable {
-                    let mut path = self.path.clone();
-                    path.extend(b.path);
+                    let path = PathPrefix::extend_many(&self.path, b.path.to_vec());
                     PathBranch::new(path, b.value, true)
                 } else if self.identical(&b) {
-                    PathBranch::new(self.path.clone(), b.value, true)
+                    PathBranch::new(Rc::clone(&self.path), b.value, true)
                 } else {
                     // Demoting must not erase the snapshot mark: a fold
                     // nested inside another one has its own, untrackable
@@ -18563,13 +18674,13 @@ impl FoldRegister {
     fn advance(&self, branch: &PathBranch<'_>) -> Self {
         if branch.trackable {
             Self {
-                path: branch.path.clone(),
+                path: Rc::clone(&branch.path),
                 value: branch.value.clone().into_owned(),
                 trackable: true,
             }
         } else {
             Self {
-                path: self.path.clone(),
+                path: Rc::clone(&self.path),
                 value: self.value.clone(),
                 trackable: self.trackable,
             }
@@ -18730,7 +18841,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 // would prepend `reg.path` a second time.
                 let acc = acc.unwrap_or(OwnedValue::Null);
                 let final_branch = if acc_at_register {
-                    PathBranch::new(Vec::new(), Cow::Owned(acc), true)
+                    PathBranch::new(PathPrefix::root(), Cow::Owned(acc), true)
                 } else {
                     // `demoted`, not `untracked`: an accumulator that is
                     // still a frozen snapshot stays recognisable to an
@@ -19269,7 +19380,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     // root entry. Every subsequent node on the stack comes from `f`, and
     // that is `child_snapshot`'s own job below, not this seed's.
     let mut stack: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
-        Vec::new(),
+        PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
         snapshot,
@@ -19295,10 +19406,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             trackable: node_trackable,
             snapshot: node_snapshot,
         } = stack.pop().unwrap();
-        // `current.clone()` is cheap (`Cow`, #668). `prefix.clone()` is not —
-        // still `O(path length)` per node, `O(d²)` total; #701, unfixed here.
+        // `current.clone()` is cheap (`Cow`, #668). `prefix` is a
+        // `PathPrefix` (#701): `Rc::clone` is O(1), not the O(path length)
+        // `Vec<Expr>` clone this used to pay per node.
         outputs.push(PathBranch {
-            path: prefix.clone(),
+            path: Rc::clone(&prefix),
             value: current.clone(),
             // Propagated rather than assumed `true`. The shared
             // recurse-family guard means only a trackable value can enter
@@ -19357,8 +19469,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             snapshot: child_snapshot,
         } in children
         {
-            let mut path = prefix.clone();
-            path.extend(child_components);
+            let path = PathPrefix::extend_many(&prefix, child_components.to_vec());
 
             match cond {
                 None => {
@@ -19411,7 +19522,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                     if let Some(e) =
                         eval_recurse_cond::<S>(cond, &child_value, !is_null_current, || {
                             next.push(PathBranch {
-                                path: path.clone(),
+                                path: Rc::clone(&path),
                                 value: child_value.clone(),
                                 trackable: node_trackable && child_trackable,
                                 // Same propagation as the `None` arm above
@@ -19701,12 +19812,14 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             // `set_path`/`update_path`/`delete_at_path` (#498) — see the
             // note on `resolve_node`'s matching arm for why a wrapper must
             // not survive into the write.
-            let mut path = components.clone();
-            path.push(if optional {
-                Expr::Optional(Box::new(component))
-            } else {
-                component
-            });
+            let path = PathPrefix::extend(
+                components,
+                if optional {
+                    Expr::Optional(Box::new(component))
+                } else {
+                    component
+                },
+            );
             // Untracked targets were rejected above.
             out.push(PathBranch::new(path, next_value, true));
         }
@@ -19947,12 +20060,14 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                     Err(_) if optional => continue,
                     Err(e) => return Err((out, e.into())),
                 };
-                let mut path = components.clone();
-                path.push(if optional {
-                    Expr::Optional(Box::new(slice_expr.clone()))
-                } else {
-                    slice_expr.clone()
-                });
+                let path = PathPrefix::extend(
+                    components,
+                    if optional {
+                        Expr::Optional(Box::new(slice_expr.clone()))
+                    } else {
+                        slice_expr.clone()
+                    },
+                );
                 // Untracked targets were rejected above.
                 out.push(PathBranch::new(path, Cow::Owned(next_value), true));
             }
@@ -20116,7 +20231,7 @@ fn apply_static_tail<'a, S: EvalSemantics>(
 ) -> PathResolveResult<'a> {
     let mut out = Vec::with_capacity(branches.len());
     for PathBranch {
-        path: mut prefix,
+        path: prefix,
         value: current,
         trackable,
         snapshot,
@@ -20146,9 +20261,16 @@ fn apply_static_tail<'a, S: EvalSemantics>(
                 Err((_, e)) => return Err((out, e)),
             }
         };
-        prefix.extend_from_slice(tail);
+        // #701: no literal in-place `extend_from_slice` equivalent once
+        // `path` is `Rc`-based (a `Node` isn't a growable buffer) — this is
+        // an ordinary `extend_many`, the same class as every other
+        // multi-append site. `tail`'s length is bounded by the filter's own
+        // static suffix, not document depth, so this doesn't reopen an O(d²)
+        // hole; it's a small, honest constant-factor trade against the
+        // amortized `Vec` growth this replaces.
+        let path = PathPrefix::extend_many(&prefix, tail.iter().cloned());
         out.push(PathBranch {
-            path: prefix,
+            path,
             value: end,
             // A non-empty tail navigated successfully, which is only
             // reachable when `trackable` held; an empty one changes nothing.
@@ -20227,7 +20349,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
         // which breaks the frozen-pointer identity regardless of ambient.
         let branch_snapshot = snapshot && flat.is_empty();
         return Ok(vec![PathBranch::passthrough(
-            flat,
+            PathPrefix::from_components(flat),
             Cow::Owned(end),
             trackable,
             branch_snapshot,
@@ -20271,7 +20393,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // the identical reason it inherits `trackable`: it is `value` itself,
     // unchanged, before the first stage below ever runs.
     let mut branches: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
-        Vec::new(),
+        PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
         snapshot,
@@ -20317,8 +20439,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         snapshot: step_snapshot,
                     } in resolved
                     {
-                        let mut path = prefix.clone();
-                        path.extend(components);
+                        let path = PathPrefix::extend_many(&prefix, components.to_vec());
                         next.push(PathBranch {
                             path,
                             value: resulting,
@@ -20347,8 +20468,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         snapshot: step_snapshot,
                     } in partial
                     {
-                        let mut path = prefix.clone();
-                        path.extend(components);
+                        let path = PathPrefix::extend_many(&prefix, components.to_vec());
                         next.push(PathBranch {
                             path,
                             value: resulting,
@@ -20458,7 +20578,11 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
                 |PathBranch {
                      path: components, ..
                  }| {
+                    // #701: the one O(depth) flattening op, paid exactly once
+                    // per branch here — never duplicated upstream during
+                    // construction, unlike the `Vec<Expr>` this replaced.
                     let components: Vec<Expr> = components
+                        .to_vec()
                         .into_iter()
                         .map(strip_resolved_optional)
                         .collect();
@@ -55242,13 +55366,13 @@ mod tests {
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut out = Vec::new();
-        push_recursive_branches(&[], &under, true, &mut out);
+        push_recursive_branches(&PathPrefix::root(), &under, true, &mut out);
         assert_eq!(out.len(), MAX_VALUE_TREE_DEPTH);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut out = Vec::new();
-            push_recursive_branches(&[], &over, true, &mut out);
+            push_recursive_branches(&PathPrefix::root(), &over, true, &mut out);
         }));
         assert!(
             result.is_err(),
@@ -56641,13 +56765,13 @@ mod tests {
         assert!(untracked.snapshot && !untracked.trackable);
 
         let navigated = PathBranch::new(
-            vec![Expr::Field("a".into())],
+            PathPrefix::from_components([Expr::Field("a".into())]),
             Cow::Owned(OwnedValue::Int(1)),
             true,
         )
         .into_snapshot();
         assert!(navigated.trackable && !navigated.snapshot);
-        assert_eq!(navigated.path, vec![Expr::Field("a".into())]);
+        assert_eq!(navigated.path.to_vec(), vec![Expr::Field("a".into())]);
     }
 
     /// An empty fold emits INIT's own accumulator without ever running a
