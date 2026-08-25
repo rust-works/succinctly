@@ -63,7 +63,11 @@ identically one level down, as an *operand* of a binary operator
 `binary_fanout_each_generic` is handed is `eval_each_generic` itself; the sweep script
 attributes those cases to this same entry rather than pinning 20 more rows that say what the
 five already say. Closing them means mirroring Stage 5's `eval.rs` arm set into
-`eval_generic.rs` — the natural next increment of option (c), not a new mechanism.
+`eval_generic.rs` — the natural next increment of option (c), not a new mechanism, and
+already filed as [#1596](https://github.com/rust-works/succinctly/issues/1596) (duplicate:
+[#1604](https://github.com/rust-works/succinctly/issues/1604)). Its `Compare` sibling,
+[#1592](https://github.com/rust-works/succinctly/issues/1592), is what #1481 closed here —
+together with the `Arithmetic` half #1592 did not name.
 
 **Two lessons from #1481 worth carrying to that increment.** (i) *Both* operators need an
 arm, never just the one the repro used: `Compare` and `Arithmetic` share one loop but

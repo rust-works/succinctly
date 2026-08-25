@@ -19839,6 +19839,9 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
         // (#1565) does not touch this; these five shapes are pinned as an
         // explicit, documented known gap rather than fixed. jq: no stderr.
         //
+        // Tracked for fixing as #1596 (duplicate: #1604), the sibling of
+        // #1592, which #1481 closed for `Compare`/`Arithmetic`.
+        //
         // The same five shapes leak identically one level down, as an
         // *operand* of a binary operator (`first(10 == (if true then (1,
         // ("B"|stderr)) else 9 end))`, and the `+` spelling of it): the
