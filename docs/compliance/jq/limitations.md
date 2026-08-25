@@ -547,15 +547,18 @@ Reproducing that means validating every document up front, which costs roughly a
 index-building pass over the input — the whole advantage this crate is built for. `--validate`
 is the opt-in form for callers who want it (exit 3, its own separately-pinned code).
 
-**What still does not raise.** Every materializing route now does — `to_entries`, `keys`,
-`length`, `--slurp`, `--sort-keys`, `--ascii-output`, and any filter shape that costs the value
-its cursor (a comma, an `if`) — because #1247 made the `to_owned`/`cursor_to_owned` family
-fallible and this check rides along with it. Two lazy routes remain, and they share one cause:
-they stream, so they have no error channel to raise into.
+**What still does not raise.** Every route that *materializes* the object now does —
+`to_entries`, `keys`, `length` (in all three of its spellings, including `keys | length`),
+`--slurp`, `--sort-keys`, `--ascii-output`, and any filter shape that costs the value its cursor
+(a comma, an `if`) — because #1247 made the `to_owned`/`cursor_to_owned` family fallible and
+this check rides along with it. Three routes remain, for two different reasons: two of them
+stream, so they have no error channel to raise into; the third never walks the whole object, so
+it is not in a position to find the malformed member at all.
 
 ```
-$ echo '{invalid}'  | sjq -c '.[]'   # no output, exit 0   <- object iteration
-$ echo '[xyz123]'   | sjq -c .       # [null],    exit 0   <- a bareword in *value* position
+$ echo '{invalid}'        | sjq -c '.[]'                 # no output, exit 0
+$ echo '[xyz123]'         | sjq -c .                     # [null],    exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[]'     # 123 then "b", exit 0
 ```
 
 `.[]` walks the field list through `LazySource::Values`, whose `uncons` reports an unpaired
@@ -565,14 +568,32 @@ reason: by the time a nested error is discovered the opening bracket has been wr
 there yields a truncated document where every materializing route gives a clean diagnostic.
 Both are that document's Stage 6.
 
-`keys_unsorted` sits between the two: it streams, and refuses a non-string key only once its `[`
-is out, so a **truncated** array can reach stdout beside the exit 5. Pre-checking would mean a
-second walk over every key on a path `scripts/perf-guard.py` measures. The identity printer has
-no such limit — its check rides inside a walk it was already making, so a malformed object emits
-nothing at all.
+The third is `keys_unsorted`'s **positional** fast paths — `[]`, `[0]`, `[n]`, `first`, `last`.
+`#1514` and `#1599` deliberately took the whole-object probe *off* these arms: `first` and `[0]`
+answer from one `uncons_key` because collapsing keeps every key at its first position, so the
+answer holds whatever the rest of the object turns out to be. Restoring a #1194 check means
+restoring exactly the walk those two issues removed, which is why it is tracked separately
+(#1629) rather than folded in here. `keys_unsorted | length` is *not* in this set — it reaches
+`effective_len`, which walks, and so carries the check for free.
 
-`--preserve-input` still echoes the malformed text verbatim, since reproducing the input
-byte-for-byte is that flag's entire purpose.
+Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
+and finds a non-string key once its `[` is already out, so a **truncated** array can reach
+stdout beside the exit 5. Pre-checking would mean a second walk over every key on a path
+`scripts/perf-guard.py` measures.
+
+The identity printer has no such limit for an object malformed at the *top* level — its check
+rides inside a walk it was already making, so nothing is emitted at all. A malformed object
+*nested* inside a well-formed one is found only once its parent's opening bytes are written, so
+that case truncates like `keys_unsorted` does:
+
+```
+$ echo '{invalid}'        | sjq -c .   # (nothing),  exit 5
+$ echo '{"a": {invalid}}' | sjq -c .   # `{"a":`,    exit 5
+```
+
+`--preserve-input` is not an exception to any of this: it changes how values are *rendered*
+(number literals and escape sequences kept as written), not whether the document is accepted,
+so a malformed member raises under it exactly as it does without it.
 
 **A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
 validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects

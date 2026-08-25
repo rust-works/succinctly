@@ -732,6 +732,25 @@ fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, 
     key_hash_of(&field.key)
 }
 
+/// Whether this key is one the format's *grammar* never allowed -- a bare
+/// `123` or `invalid` where JSON demands a string (#1194).
+///
+/// The one definition of the #1194 key predicate, because it has to make a
+/// distinction that is easy to get wrong in only one of two places: a key
+/// that fails to *decode* also fails to stringify, but it is #1247's fault
+/// with the opposite answer -- sometimes deliberately preserved verbatim,
+/// per #1385's "a key that will not decode is never a duplicate". Testing
+/// `key_string().is_none()` alone reports an invalid escape as `expected
+/// string key`: the wrong cause, at the wrong severity.
+///
+/// `false` for every format whose parser validates, whose keys all
+/// stringify (issue #222 requires an override to answer `Some("")` rather
+/// than `None` for a key with no scalar form), so this costs YAML one
+/// predicate on a branch it never takes.
+pub(crate) fn key_is_malformed<V: DocumentValue>(key: &V) -> bool {
+    key.string_decode_error().is_none() && key.key_string().is_none()
+}
+
 /// An open-addressed set of key hashes: "have I seen this one?" answered
 /// as a walk goes, without holding the keys.
 ///
@@ -928,6 +947,16 @@ struct KeyCensus {
     unkeyed: usize,
     /// Whether any key occurred more than once.
     repeated: bool,
+    /// Whether the object holds a member the format's grammar never allowed
+    /// -- a non-string key, or a trailing child with no sibling to pair as
+    /// its value (#1194).
+    ///
+    /// Rides the census rather than taking a walk of its own: `length` is
+    /// the caller, and the census already visits every key. A separate
+    /// pre-check measured **+64%** on `length` over a 20 MB `wide`
+    /// document, which is what "only where the caller was going to walk
+    /// anyway" has to actually mean.
+    malformed: bool,
 }
 
 impl KeyCensus {
@@ -951,14 +980,24 @@ impl KeyCensus {
 fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut hashes: Vec<u64> = Vec::new();
     let mut unkeyed = 0usize;
+    let mut malformed = false;
     let mut walk = fields.clone();
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
         match key_hash_of(&key) {
             Some(hash) => hashes.push(hash),
-            None => unkeyed += 1,
+            // `key_hash_of` answers `None` for exactly the keys that do not
+            // stringify, so this is the only branch [`key_is_malformed`] can
+            // fire on -- and it is never taken by a well-formed document.
+            None => {
+                unkeyed += 1;
+                malformed |= key_is_malformed(&key);
+            }
         }
         walk = rest;
     }
+    // `walk` is the list this loop *finished* on, the only list
+    // `ends_unpaired` answers for (#1194), and asking it is O(1).
+    malformed |= walk.ends_unpaired();
     hashes.sort_unstable();
     let (shared, distinct_hashes) = shared_hashes(&hashes);
     if shared.is_empty() {
@@ -966,6 +1005,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
             distinct: distinct_hashes,
             unkeyed,
             repeated: false,
+            malformed,
         };
     }
 
@@ -998,6 +1038,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
         distinct: distinct_hashes - shared.len() + distinct_colliding,
         unkeyed,
         repeated,
+        malformed,
     }
 }
 
@@ -1318,6 +1359,55 @@ pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
         return fields.len();
     }
     census(fields).effective_len()
+}
+
+/// [`effective_len`], refusing an object whose members the format's grammar
+/// never allowed (#1194).
+///
+/// The count and the check come out of **one** walk, which is the whole
+/// point of putting the check here rather than in front of the call: both
+/// spellings of this question -- `length` and `keys | length` -- reach
+/// `effective_len`, and a caller-side pre-check both doubled the work and
+/// covered only the first spelling, leaving `{invalid} | length` erroring
+/// while `{invalid} | keys | length` answered `0`.
+///
+/// [`effective_len`] itself stays infallible for the two `eval.rs`-side
+/// callers, which reach `length` through the other evaluator and answer for
+/// an already-materialized value.
+pub fn effective_len_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<usize, EvalError> {
+    if !collapse {
+        return checked_len(fields);
+    }
+    let census = census(fields);
+    if census.malformed {
+        return Err(fields.malformed_member_error());
+    }
+    Ok(census.effective_len())
+}
+
+/// The plain field count, refusing a malformed member as it goes.
+///
+/// The no-collapse counterpart of the [`census`] path above, and likewise
+/// one walk rather than two: this *replaces* [`DocumentFields::len`]'s own
+/// walk instead of preceding it, and walks with `uncons_key` where `len`
+/// walks with `uncons`, so it materializes no value cursor (#1514).
+fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
+    let mut count = 0usize;
+    let mut walk = fields.clone();
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        if key_is_malformed(&key) {
+            return Err(walk.malformed_member_error());
+        }
+        count += 1;
+        walk = rest;
+    }
+    if walk.ends_unpaired() {
+        return Err(walk.malformed_member_error());
+    }
+    Ok(count)
 }
 
 /// An object's field names under the mode's duplicate-key rule, in
