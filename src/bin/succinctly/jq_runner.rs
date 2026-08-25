@@ -744,10 +744,16 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
     config: &OutputConfig,
     space_after_colon: &str,
 ) -> Result<()> {
-    // JSON grammar makes every key a string; anything else means the cursor
-    // did not resolve, and the value is written on its own as before.
+    // A key that is not a string is not a key: the document is malformed and
+    // only bracket-matching let it through (`{invalid: 1}`, `{123: 1}`).
+    //
+    // This used to `return Ok(())`, skipping the `:` below as well while the
+    // caller went on to print the value -- so `{invalid: 1}` came out as
+    // `{1}`, which no JSON parser can read, at exit 0 (#1194). Emitting
+    // unparseable output is strictly worse than the silent drop it was
+    // reasoned about as; raise instead.
     let StandardJson::String(key) = frame.cursor(field.key_bp).value() else {
-        return Ok(());
+        return Err(MalformedJsonError(EvalError::malformed_json_text(frame.text)).into());
     };
     if !config.ascii_output && !field.escaped {
         out.write_all(field.raw)?;
@@ -794,6 +800,25 @@ fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
         _ => OwnedValue::Bool(true),
     }
 }
+
+/// A document the semi-index accepted that is not, in fact, valid JSON (#1194).
+///
+/// The printer's failures are otherwise all I/O, which `anyhow` carries to the
+/// top and aborts on. This one is a *data* error and belongs in jq's own
+/// diagnostic channel -- exit 5 through the [`ErrorSink`], with the rest of
+/// the input stream still processed (#355). Giving it a distinct type lets the
+/// single place that owns the sink tell the two apart by `downcast_ref`
+/// instead of matching on message text.
+#[derive(Debug)]
+pub struct MalformedJsonError(pub EvalError);
+
+impl std::fmt::Display for MalformedJsonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.message)
+    }
+}
+
+impl std::error::Error for MalformedJsonError {}
 
 /// Validate JSON bytes and print a formatted error message if invalid.
 /// Returns Ok(()) if valid, Err with exit code if invalid.
@@ -1145,14 +1170,33 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 let results = evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink);
 
                 // Consume results to free memory after each value is written
+                let mut malformed = false;
                 for result in results {
                     had_output = true;
                     // For exit_status tracking, we need to check the last value
                     if args.exit_status {
                         last_output = Some(result.materialize());
                     }
-                    write_output_jq_value(&mut out, &result, &output_config)?;
+                    // A malformed document is a data error, not an I/O one: it
+                    // belongs in jq's diagnostic channel (exit 5) rather than
+                    // aborting the process through `anyhow` (#1194). The rest
+                    // of the stream is still processed, per #355 -- real jq
+                    // stops at the first parse error instead, a divergence
+                    // recorded in `docs/compliance/jq/limitations.md`.
+                    if let Err(e) = write_output_jq_value(&mut out, &result, &output_config) {
+                        match e.downcast_ref::<MalformedJsonError>() {
+                            Some(MalformedJsonError(err)) => {
+                                sink.report(DiagStyle::Jq, err, &at);
+                                malformed = true;
+                                break;
+                            }
+                            None => return Err(e),
+                        }
+                    }
                     // result is dropped here, freeing its memory immediately
+                }
+                if malformed {
+                    continue;
                 }
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process.
@@ -3073,7 +3117,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
 /// if and when that child cursor is itself materialized.
 fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
-    _parent_cursor: &JsonCursor<'a, W>,
+    parent_cursor: &JsonCursor<'a, W>,
 ) -> Result<JqValue<'a, W>, EvalError> {
     Ok(match value {
         StandardJson::Null => JqValue::Null,
@@ -3098,19 +3142,27 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => {
             // LAZY: Store cursor references instead of materializing values
             let mut map: IndexMap<String, JqValue<'a, W>> = IndexMap::new();
-            for f in fields {
+            let mut remaining = fields;
+            while let Some((f, rest)) = remaining.uncons() {
                 // A key that isn't `StandardJson::String` at all is a
-                // structurally malformed key, not a decode failure -- out of
-                // scope here (#1194's territory), same as before this fix.
+                // structurally malformed key, not a decode failure. This used
+                // to `continue`, dropping the field and everything that
+                // depended on it while `length` went on counting it (#1194).
                 let key = match f.key() {
                     StandardJson::String(s) => match s.as_str() {
                         Ok(cow) => cow.to_string(),
                         Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
                     },
-                    _ => continue,
+                    _ => return Err(EvalError::malformed_json_text(parent_cursor.text())),
                 };
                 // Use cursor for value instead of materializing
                 map.insert(key, JqValue::Cursor(f.value_cursor()));
+                remaining = rest;
+            }
+            // A child with no sibling to pair as a value: the object is
+            // malformed and `uncons` would drop it silently (#1194).
+            if remaining.ends_unpaired() {
+                return Err(EvalError::malformed_json_text(parent_cursor.text()));
             }
             JqValue::Object(map)
         }
@@ -3488,13 +3540,25 @@ where
                             index: c.index(),
                         };
                         let base = scratch.len();
-                        for field in fields {
-                            // The `_` arm is unreachable by JSON grammar --
-                            // every key is a string -- and exists only
-                            // because `key()` returns the open
-                            // `StandardJson` enum. An empty span writes
-                            // nothing, matching what this printer did with
-                            // a non-string key before #1385.
+                        // Driven by `uncons` rather than `for field in fields`
+                        // so the walk's final position survives the loop: the
+                        // `Iterator` adaptor discards it, and recovering it
+                        // afterwards would mean a second `uncons` per field --
+                        // the very re-walk the comment above measured at 8-9%
+                        // of `sjq '.'` over 10 MB. This is the same single
+                        // walk, just keeping its own tail.
+                        let mut remaining = fields;
+                        while let Some((field, rest)) = remaining.uncons() {
+                            // The `_` arm is *not* unreachable, whatever this
+                            // comment used to claim: nothing enforces the JSON
+                            // grammar on the default path, so `{invalid: 1}`
+                            // reaches here with a bareword key (#1194). It
+                            // used to record an empty span, which
+                            // `write_object_key` then wrote as nothing at all
+                            // -- including the colon -- producing `{1}`.
+                            // `write_object_key` raises now; the empty span
+                            // survives only because `PreparedField` needs
+                            // something to hold until it does.
                             let (raw, escaped) = match field.key() {
                                 StandardJson::String(k) => k.raw_and_escaped(),
                                 _ => (&b""[..], false),
@@ -3505,6 +3569,25 @@ where
                                 raw,
                                 escaped,
                             });
+                            remaining = rest;
+                        }
+                        // An odd number of BP children means the text was
+                        // never `key: value` -- `{invalid}`, `{"a"}`, or the
+                        // trailing `2` of `{invalid, "b":2}`. `uncons` drops
+                        // that child silently, so without this the object
+                        // printed as `{}` (or one field short) at exit 0
+                        // (#1194). Checked before the opening `{` is written
+                        // so the raise leaves no partial record behind.
+                        //
+                        // Free for a well-formed object: the walk ends with a
+                        // `None` key cursor, which `ends_unpaired` answers
+                        // without touching the BP tree at all.
+                        if remaining.ends_unpaired() {
+                            scratch.truncate(base);
+                            return Err(MalformedJsonError(EvalError::malformed_json_text(
+                                frame.text,
+                            ))
+                            .into());
                         }
                         let collapsed = if config.jq_compat {
                             collapse_duplicate_fields(&scratch[base..], &frame)
@@ -3633,60 +3716,82 @@ where
         // than branching mid-loop.
         JqValue::LazyKeysArray { fields, collapse } => {
             use succinctly::json::light::StandardJson as SJ;
+            // Same malformed-object check the `StandardJson::Object` arm makes,
+            // for the same reason and before the same opening bracket: an
+            // unpaired child means this was never a key list (#1194).
+            if let Some(tail) = fields.unpaired_tail() {
+                return Err(MalformedJsonError(EvalError::malformed_json_text(tail.text())).into());
+            }
             if fields.is_empty() {
                 out.write_all(b"[]")?;
             } else if compact {
                 out.write_all(b"[")?;
-                for (i, (key, _)) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
+                for (i, (key, key_cursor)) in DistinctKeyCursors::new(fields, *collapse).enumerate()
+                {
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    if let SJ::String(k) = key {
-                        let raw = k.raw_bytes();
-                        let content = &raw[1..raw.len().saturating_sub(1)];
-                        if !config.ascii_output && !content.contains(&b'\\') {
-                            out.write_all(raw)?;
-                        } else if let Ok(decoded) = k.as_str() {
-                            out.write_all(b"\"")?;
-                            let escaped = if config.ascii_output {
-                                escape_json_string_ascii(&decoded)
-                            } else {
-                                escape_json_string(&decoded)
-                            };
-                            out.write_all(escaped.as_bytes())?;
-                            out.write_all(b"\"")?;
+                    let SJ::String(k) = key else {
+                        // A non-string key writes nothing, but the separator
+                        // above already went out -- `{123: 1, "b": 2}` came
+                        // out as `[,"b"]`, unparseable, at exit 0 (#1194).
+                        return Err(MalformedJsonError(EvalError::malformed_json_text(
+                            key_cursor.text(),
+                        ))
+                        .into());
+                    };
+                    let raw = k.raw_bytes();
+                    let content = &raw[1..raw.len().saturating_sub(1)];
+                    if !config.ascii_output && !content.contains(&b'\\') {
+                        out.write_all(raw)?;
+                    } else if let Ok(decoded) = k.as_str() {
+                        out.write_all(b"\"")?;
+                        let escaped = if config.ascii_output {
+                            escape_json_string_ascii(&decoded)
                         } else {
-                            out.write_all(raw)?;
-                        }
+                            escape_json_string(&decoded)
+                        };
+                        out.write_all(escaped.as_bytes())?;
+                        out.write_all(b"\"")?;
+                    } else {
+                        out.write_all(raw)?;
                     }
                 }
                 out.write_all(b"]")?;
             } else {
                 out.write_all(b"[")?;
                 out.write_all(separator.as_bytes())?;
-                for (i, (key, _)) in DistinctKeyCursors::new(fields, *collapse).enumerate() {
+                for (i, (key, key_cursor)) in DistinctKeyCursors::new(fields, *collapse).enumerate()
+                {
                     if i > 0 {
                         out.write_all(b",")?;
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    if let SJ::String(k) = key {
-                        let raw = k.raw_bytes();
-                        let content = &raw[1..raw.len().saturating_sub(1)];
-                        if !config.ascii_output && !content.contains(&b'\\') {
-                            out.write_all(raw)?;
-                        } else if let Ok(decoded) = k.as_str() {
-                            out.write_all(b"\"")?;
-                            let escaped = if config.ascii_output {
-                                escape_json_string_ascii(&decoded)
-                            } else {
-                                escape_json_string(&decoded)
-                            };
-                            out.write_all(escaped.as_bytes())?;
-                            out.write_all(b"\"")?;
+                    let SJ::String(k) = key else {
+                        // A non-string key writes nothing, but the separator
+                        // above already went out -- `{123: 1, "b": 2}` came
+                        // out as `[,"b"]`, unparseable, at exit 0 (#1194).
+                        return Err(MalformedJsonError(EvalError::malformed_json_text(
+                            key_cursor.text(),
+                        ))
+                        .into());
+                    };
+                    let raw = k.raw_bytes();
+                    let content = &raw[1..raw.len().saturating_sub(1)];
+                    if !config.ascii_output && !content.contains(&b'\\') {
+                        out.write_all(raw)?;
+                    } else if let Ok(decoded) = k.as_str() {
+                        out.write_all(b"\"")?;
+                        let escaped = if config.ascii_output {
+                            escape_json_string_ascii(&decoded)
                         } else {
-                            out.write_all(raw)?;
-                        }
+                            escape_json_string(&decoded)
+                        };
+                        out.write_all(escaped.as_bytes())?;
+                        out.write_all(b"\"")?;
+                    } else {
+                        out.write_all(raw)?;
                     }
                 }
                 out.write_all(separator.as_bytes())?;
@@ -4159,23 +4264,44 @@ mod tests {
         assert_eq!(map.keys().collect::<Vec<_>>(), vec!["a", "b"]);
     }
 
-    /// #1192: a key that isn't `StandardJson::String` at all (structurally
-    /// malformed, not a decode failure) still silently drops the field --
-    /// unchanged from before this fix, and deliberately so (#1194's
-    /// territory). A bare numeric key with a valid sibling field reaches
-    /// the per-field drop (`{invalid}` alone does not -- see the matching
-    /// test in `eval_generic.rs` for why).
+    /// #1194: a key that isn't `StandardJson::String` at all (structurally
+    /// malformed, not a decode failure) raises instead of dropping the field.
+    ///
+    /// Inverted from the drop this asserted when #1192 wrote it, in step with
+    /// `eval_generic.rs`'s `test_owned_from_standard_json_raises_on_malformed_key_1194`
+    /// -- these two are textually-similar copies of the same conversion, and a
+    /// fix that moved only one would leave the CLI and the evaluator
+    /// disagreeing about whether the document is valid.
     #[test]
-    fn test_standard_json_to_jq_value_drops_structurally_malformed_key_1194() {
+    fn test_standard_json_to_jq_value_raises_on_malformed_key_1194() {
         let json: &[u8] = b"{123: 1, \"b\": 2}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let jq_value = standard_json_to_jq_value(value, &cursor).unwrap();
-        let JqValue::Object(map) = jq_value else {
-            panic!("expected an object");
-        };
-        assert_eq!(map.keys().collect::<Vec<_>>(), vec!["b"]);
+        let err =
+            standard_json_to_jq_value(value, &cursor).expect_err("a bare numeric key is not JSON");
+        assert!(
+            err.message.contains("expected string key"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194: an object whose children don't pair raises rather than
+    /// materializing as `{}`. The `unpaired_tail` half of the check above.
+    #[test]
+    fn test_standard_json_to_jq_value_raises_on_unpaired_field_1194() {
+        let json: &[u8] = b"{invalid}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err =
+            standard_json_to_jq_value(value, &cursor).expect_err("an unpaired member is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
     }
 
     /// #1192: `generic_result_to_jq_values`'s own `One`/`Many` arms --

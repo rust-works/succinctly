@@ -1098,6 +1098,37 @@ impl EvalError {
         ))
     }
 
+    /// `Invalid JSON text: <cause>` — a document the semi-index accepted that
+    /// is not, in fact, valid JSON (#1194).
+    ///
+    /// The semi-index recovers an object's members by pairing the container's
+    /// BP children two at a time, checking neither that a key is a string nor
+    /// that the count is even — `json::standard::is_delim` maps `:` and `,` to
+    /// the same nothing, so `{invalid}` and `{invalid: 1}` index exactly as
+    /// `{"a":1}` does. Once a materializer has actually *found* such a member,
+    /// this re-runs the strict validator over the same document to name the
+    /// real syntax error, which is far more specific than anything
+    /// reconstructible from the cursor alone.
+    ///
+    /// Reached only after a swallow point has already fired, so a well-formed
+    /// document never pays for the pass. Same shape as the `tonumber` path in
+    /// `eval.rs`, which re-parses on the error path purely to pick a better
+    /// message.
+    ///
+    /// Positions are deliberately left out of the message: they would be
+    /// relative to this document's own slice, while the caller reports a
+    /// location counted in the whole file. Carrying both would print two
+    /// numbers that disagree.
+    pub fn malformed_json_text(text: &[u8]) -> Self {
+        match crate::json::validate::validate(text) {
+            Err(err) => Self::new(format!("Invalid JSON text: {}", err.kind)),
+            // The validator disagreeing with the indexer means the two have
+            // drifted apart. Report the generic form rather than claim the
+            // document is fine when a swallow point has already fired.
+            Ok(()) => Self::new("Invalid JSON text"),
+        }
+    }
+
     /// `<builtin>() requires numeric inputs` — `gmtime`/`localtime` on a
     /// non-number input.
     pub fn datetime_requires_number(builtin: &str) -> Self {
