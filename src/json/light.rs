@@ -1006,9 +1006,53 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         self.key_cursor.is_none()
     }
 
+    /// Whether this field list ends on a lone child with no sibling to pair
+    /// as a value -- `{invalid}`, `{"a"}`, or the trailing `2` of
+    /// `{invalid, "b":2}` (#1194).
+    ///
+    /// The semi-index treats `:` and `,` alike (`json::standard::is_delim`),
+    /// so an object's members are recovered by pairing its BP children two at
+    /// a time. An odd child count means the text was never `key: value` at
+    /// all, and bracket-matching accepted it anyway.
+    ///
+    /// This is the exact condition [`uncons`](Self::uncons) discards when its
+    /// second `?` fires, named once here so the sites that must react to it
+    /// cannot drift apart from the site that detects it. O(1) -- the same
+    /// `next_sibling` test `uncons` already performs.
+    ///
+    /// Note this is *not* the negation of [`is_empty`](Self::is_empty): a
+    /// malformed list is non-empty **and** yields nothing from `uncons`.
+    ///
+    /// Returns the offending child's cursor rather than a bare `bool` so a
+    /// caller can reach the document text (`JsonCursor::text`) to diagnose it,
+    /// and its position to report it. Use
+    /// [`ends_unpaired`](Self::ends_unpaired) where only the answer matters.
+    #[inline]
+    pub fn unpaired_tail(&self) -> Option<JsonCursor<'a, W>> {
+        let key_cursor = self.key_cursor?;
+        match key_cursor.next_sibling() {
+            Some(_) => None,
+            None => Some(key_cursor),
+        }
+    }
+
+    /// Whether this field list ends on an unpaired child (#1194).
+    ///
+    /// Thin wrapper over [`unpaired_tail`](Self::unpaired_tail) so the
+    /// condition has exactly one definition -- two copies of a predicate
+    /// drift, and this one is checked from several modules.
+    #[inline]
+    pub fn ends_unpaired(&self) -> bool {
+        self.unpaired_tail().is_some()
+    }
+
     /// Get the first field and the remaining fields.
     ///
-    /// Returns `None` if there are no more fields.
+    /// Returns `None` if there are no more fields -- **or** if the list ends
+    /// on an unpaired child, which is structurally malformed JSON rather than
+    /// exhaustion. Callers that must tell those apart ask
+    /// [`ends_unpaired`](Self::ends_unpaired); see #1194 for why the
+    /// distinction is not folded into this return type.
     pub fn uncons(&self) -> Option<(JsonField<'a, W>, Self)> {
         let key_cursor = self.key_cursor?;
 

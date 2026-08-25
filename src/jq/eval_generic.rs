@@ -1149,22 +1149,30 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
-            for field in *fields {
+            let mut remaining = *fields;
+            while let Some((field, rest)) = remaining.uncons() {
                 // A key that isn't `StandardJson::String` at all (e.g.
                 // `StandardJson::Error`, a *structurally* malformed key like
-                // a bare non-string token) silently drops the field, same as
-                // before this fix -- that's #1194's territory, not #1192's:
-                // this fix only covers a key that passed structural
-                // validation but failed to *decode*.
+                // a bare non-string token) used to `continue`, dropping the
+                // field silently while `length` went on counting it. That is
+                // #1194, distinct from #1192's decode failures, and it raises
+                // now rather than degrading.
                 let key = match field.key() {
                     StandardJson::String(s) => match s.as_str() {
                         Ok(cow) => cow.to_string(),
                         Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
                     },
-                    _ => continue,
+                    _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
                 };
                 let value = owned_from_standard_json_at_depth(&field.value(), depth + 1)?;
                 map.insert(key, value);
+                remaining = rest;
+            }
+            // A child with no sibling to pair as a value -- `{invalid}`,
+            // `{"a"}`. `uncons` reports that as exhaustion, so without this
+            // the object materialized as `{}` (#1194).
+            if let Some(tail) = remaining.unpaired_tail() {
+                return Err(EvalError::malformed_json_text(tail.text()));
             }
             OwnedValue::Object(map)
         }
@@ -11153,29 +11161,64 @@ mod tests {
         );
     }
 
-    /// #1192: a key that isn't `StandardJson::String` at all (structurally
-    /// malformed, not a decode failure) still silently drops the field --
-    /// unchanged from before this fix, and deliberately so (#1194's
-    /// territory). `{invalid}` (#1194's own repro) doesn't reach the
-    /// dropping arm this test targets: its lone malformed field never gets
-    /// paired into a `JsonField` at all (a *different* #1194 swallow point,
-    /// `JsonFields::uncons()`'s own collapse of "no sibling to pair as a
-    /// value" into "no more fields"), so `{123: 1, "b": 2}` is used instead
-    /// -- a bare numeric key with a valid sibling field, which does reach
-    /// the per-field drop this fix's object handling deliberately leaves
-    /// alone.
+    /// #1194: a key that isn't `StandardJson::String` at all (structurally
+    /// malformed, not a decode failure) raises instead of silently dropping
+    /// the field.
+    ///
+    /// This test asserted the drop when #1192 wrote it, as that fix's
+    /// deliberately-out-of-scope neighbour. It is inverted here, not merely
+    /// updated: dropping the field deleted it from output while `length` went
+    /// on counting it -- the same disagreement #1385's own postmortem records
+    /// as the failure mode to avoid.
+    ///
+    /// `{123: 1, "b": 2}` is used rather than #1194's own `{invalid}` repro
+    /// because the two reach *different* checks: a bare numeric key with a
+    /// valid sibling exercises the per-field key test below, while
+    /// `{invalid}`'s lone child never pairs into a `JsonField` at all and is
+    /// caught by the `unpaired_tail` check after the loop (covered by
+    /// `test_owned_from_standard_json_raises_on_unpaired_field_1194`).
     #[test]
-    fn test_owned_from_standard_json_drops_structurally_malformed_key_1194() {
+    fn test_owned_from_standard_json_raises_on_malformed_key_1194() {
         let json: &[u8] = b"{123: 1, \"b\": 2}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let owned = owned_from_standard_json(&value).unwrap();
-        let OwnedValue::Object(map) = owned else {
-            panic!("expected an object");
-        };
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.get("b"), Some(&OwnedValue::from_number_literal("2")));
+        let err = owned_from_standard_json(&value).expect_err("a bare numeric key is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+        // The strict validator's own diagnosis, not a message reconstructed
+        // at the materializer.
+        assert!(
+            err.message.contains("expected string key"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194: an object whose children don't pair -- `{invalid}`, `{"a"}` --
+    /// raises rather than materializing as `{}`.
+    ///
+    /// The sibling of the test above, covering the *other* swallow point:
+    /// `JsonFields::uncons` collapses "no sibling to pair as a value" into
+    /// "no more fields", which is indistinguishable from a genuinely empty
+    /// object unless someone asks `unpaired_tail`.
+    #[test]
+    fn test_owned_from_standard_json_raises_on_unpaired_field_1194() {
+        for json in [&b"{invalid}"[..], &b"{\"a\"}"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let value = cursor.value();
+            let err = owned_from_standard_json(&value).expect_err("an unpaired member is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "input {:?} gave: {}",
+                core::str::from_utf8(json),
+                err.message
+            );
+        }
     }
 
     /// #1192: the `Ok` side of `eval_on_owned`'s `QueryResult::One` arm --
