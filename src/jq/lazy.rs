@@ -1420,4 +1420,109 @@ mod tests {
             "write_json/to_json_string should panic at MAX_VALUE_TREE_DEPTH (Object arm)"
         );
     }
+
+    /// #684/#1247: `lazy_keys_array_to_owned` is `LazyKeysArray`'s own
+    /// materializer -- the escape hatch `materialize`/`into_owned` reach for
+    /// `sort_keys`/color output/etc. Exercise it directly, both outcomes: a
+    /// clean object hits the `Ok(OwnedValue::Array(keys))` return, and an
+    /// object with an undecodable key hits the `Err` raised out of the
+    /// `DistinctKeyCursors` walk instead of the field silently vanishing.
+    #[test]
+    fn test_lazy_keys_array_to_owned_ok_and_err_1247() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = br#"{"b":1,"a":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert_eq!(
+            lazy_keys_array_to_owned(&fields, true).unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("b".to_string()),
+                OwnedValue::String("a".to_string()),
+            ])
+        );
+
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let err = lazy_keys_array_to_owned(&fields, true)
+            .expect_err("an undecodable key must not materialize");
+        assert!(err.message.contains("in object key"), "{}", err.message);
+    }
+
+    /// #1247: the same `LazyKeysArray` arms as above, reached this time
+    /// through `materialize`/`into_owned`'s recursive `Array`/`Object` cases
+    /// at depth > 0 -- e.g. `[keys_unsorted]`/`{x: keys_unsorted}` forced to
+    /// materialize by `--sort-keys`/`-C` at the CLI boundary
+    /// (`write_output_jq_value`'s "complex output" branch in
+    /// `jq_runner.rs`), rather than `lazy_keys_array_to_owned` being called
+    /// on a bare top-level `keys_unsorted` result.
+    #[test]
+    fn test_lazy_keys_array_nested_materialize_and_into_owned_1247() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let lazy_keys: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+
+        let nested_in_array = JqValue::Array(vec![lazy_keys.clone()]);
+        let err = nested_in_array
+            .materialize()
+            .expect_err("a nested undecodable key must not materialize");
+        assert!(err.message.contains("in object key"), "{}", err.message);
+
+        let nested_in_object: JqValue<'_, Vec<u64>> =
+            JqValue::Object(IndexMap::from([("x".to_string(), lazy_keys)]));
+        let err = nested_in_object
+            .into_owned()
+            .expect_err("a nested undecodable key must not materialize");
+        assert!(err.message.contains("in object key"), "{}", err.message);
+    }
+
+    /// #1194: sibling of `jq_runner.rs`'s `standard_json_to_jq_value` and its
+    /// own `test_standard_json_to_jq_value_raises_on_malformed_top_level_value_1194`
+    /// -- a bareword garbage token (`StandardJson::Error`, not a decode
+    /// failure) raises through `cursor_to_owned_at_depth`'s own `Error` arm
+    /// too, reached whenever `materialize`/`into_owned` walks a cursor whose
+    /// value is structurally malformed (e.g. `--sort-keys`/`-C` forcing a
+    /// full materialize of a query result that otherwise streams straight
+    /// from a cursor over raw document bytes).
+    #[test]
+    fn test_materialize_and_into_owned_error_on_malformed_top_level_value_1194() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"xyz123";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val = JqValue::from_cursor(cursor);
+        let err = val
+            .materialize()
+            .expect_err("a bareword is not a JSON value");
+        assert!(!err.message.is_empty(), "{err:?}");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        let err = val
+            .into_owned()
+            .expect_err("a bareword is not a JSON value");
+        assert!(!err.message.is_empty(), "{err:?}");
+    }
 }

@@ -1138,6 +1138,16 @@ fn into_lazy_items<V: DocumentValue>(
     result: GenericResult<V>,
 ) -> Result<Vec<LazyElem<V>>, Control> {
     match result {
+        // `One`/`Many` (this arm and the one below) are exhaustiveness only,
+        // not reachable through this function's one call site
+        // (`LazySeq::fold_one`): every element it hands `eval_single` here
+        // carries a concrete `Some(cursor)` (`c.value()`/`Some(c)`), and
+        // every native arm that can construct a bare `One`/`Many`
+        // (`Identity`, `Builtin::Select` and its cursor-preserving siblings)
+        // forwards a `Some` cursor into `OneCursor`/`ManyCursor` instead of
+        // `One`/`Many` -- `eval_on_owned` (the other `LazyElem` kind's path,
+        // `LazyElem::Owned`) never returns `One`/`Many` either, per its own
+        // `unreachable!` arms in `eval_on_many_owned` below.
         GenericResult::One(v) => Ok(vec![LazyElem::Owned(to_owned(&v).map_err(Control::Error)?)]),
         // Stays lazy: a `map(.foo)`-style navigational sub-expr keeps
         // composing without forcing materialization.
@@ -1738,6 +1748,13 @@ fn flatten_generic_results<V: DocumentValue>(
     let mut results = Vec::new();
     for r in items {
         match r.materialize_lazy() {
+            // `One`/`Many` are exhaustiveness only here too, same as
+            // `into_lazy_items`'s identical comment above: `items`' one
+            // source (`fold_pipe_stages`'s `ManyCursor(cs)` arm) evaluates
+            // `rest` per element via `eval_single(&rest, c.value(), optional,
+            // Some(c))`, and `c: V::Cursor` is always concrete -- the same
+            // "ambient cursor is always `Some`" invariant that rules out a
+            // bare `One`/`Many` reaching `into_lazy_items` rules it out here.
             GenericResult::One(v) => results.push(to_owned(&v).map_err(Control::Error)?),
             GenericResult::OneCursor(c) => {
                 results.push(to_owned_cursor(&c).map_err(Control::Error)?);
@@ -11828,5 +11845,483 @@ mod tests {
                 OwnedValue::String("c".to_string()),
             ])
         );
+    }
+
+    // ---- #1247 coverage: decode-failure arms added by the fallible
+    // `to_owned`/`to_owned_cursor` signature change (PR #1391). Every test
+    // below constructs a genuinely-reachable path to its target arm rather
+    // than forcing coverage artificially -- see each test's own doc comment
+    // for the trace. Several deliberately call the crate's cursor-less
+    // [`eval`] (not [`eval_with_cursor`]) directly: that is a real, `pub`,
+    // heavily-exercised entry point elsewhere in this test module (see
+    // `test_1048_computed_index_and_slice_zero_results_collapse_to_none`
+    // above and dozens like it), and it is the only way to construct a bare
+    // `GenericResult::One`/`Many` (as opposed to `OneCursor`/`ManyCursor`) --
+    // every native arm that can build one forwards a `Some` cursor into the
+    // cursor-carrying variant instead, so `One`/`Many` only ever arise when
+    // the ambient cursor is `None` to begin with.
+
+    /// `to_owned_with_comments` mirrors `to_owned`'s decode-failure checks
+    /// (#1247) -- this covers the object-key check specifically, since #1247
+    /// added it to this function too, not just `to_owned_at_depth`.
+    #[test]
+    fn test_to_owned_with_comments_errors_on_object_key_decode_failure_1247() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = to_owned_with_comments(&value, Some(&cursor))
+            .expect_err("an undecodable key must not materialize");
+        assert!(err.message.contains("in object key"), "{err:?}");
+    }
+
+    /// The value-side sibling of the test above: a field whose *value* (not
+    /// key) fails to decode propagates through the recursive
+    /// `to_owned_with_comments_at_depth` call for that field, not just the
+    /// top-level scalar case `to_owned`'s own tests already cover.
+    #[test]
+    fn test_to_owned_with_comments_errors_on_field_value_decode_failure_1247() {
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = to_owned_with_comments(&value, Some(&cursor))
+            .expect_err("an undecodable value must not materialize");
+        assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+    }
+
+    /// `to_owned_key_shape`'s array/object branches (#626/#670/#903) are a
+    /// shape-only fast path for a computed index/slice-bound candidate --
+    /// reached from `eval_index_expr`'s `keys` match when the key expression
+    /// resolves to a bare `GenericResult::One` (not `OneCursor`), which only
+    /// happens when the ambient cursor is `None`: `.[.]` at the top level,
+    /// evaluated through the cursor-less `eval()`, makes the key expression
+    /// (`.`, i.e. `Expr::Identity`) evaluate against a `None` cursor, giving
+    /// `GenericResult::One(document)`. An array/object document then hits
+    /// `to_owned_key_shape`'s array/object branch respectively; the
+    /// synthesized empty container is then rejected by `index_one_owned`
+    /// (neither branch there handles an array/object key), confirming the
+    /// fast path's synthesized shape reaches real indexing logic rather than
+    /// disappearing into an unused value.
+    #[test]
+    fn test_computed_index_self_as_key_rejects_array_and_object_shapes_1247() {
+        let array_json: &[u8] = b"[1,2,3]";
+        let index = JsonIndex::build(array_json);
+        let cursor = index.root(array_json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse(".[.]").unwrap(), value);
+        assert!(
+            result.is_error(),
+            "array self-index should be rejected, got {result:?}"
+        );
+
+        let object_json: &[u8] = b"{\"a\":1}";
+        let index = JsonIndex::build(object_json);
+        let cursor = index.root(object_json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse(".[.]").unwrap(), value);
+        assert!(
+            result.is_error(),
+            "object self-index should be rejected, got {result:?}"
+        );
+    }
+
+    /// `Expr::Array`'s native construction (#1168) materializes its inner
+    /// expression's `One`/`Many` results through `to_owned` -- reached the
+    /// same cursor-less way as the test above: `[.]` through `eval()`
+    /// (cursor `None`) makes `.` resolve to a bare `One`, and `[select(true,
+    /// true)]` makes the two-truthy-output `select` resolve to a bare
+    /// `Many` (`Builtin::Select`'s `pass_n` forwards a `None` cursor into
+    /// `Many`, not `ManyCursor`) -- both over a document that is itself an
+    /// undecodable string.
+    #[test]
+    fn test_array_construction_one_and_many_arms_decode_failure_1247() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("[.]").unwrap(), value);
+        assert!(result.is_error(), "[.] should surface the decode failure");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("[select(true,true)]").unwrap(), value);
+        assert!(
+            result.is_error(),
+            "[select(true,true)] should surface the decode failure"
+        );
+    }
+
+    /// `push_generic_owned_values` (`Expr::Compare`'s operand forker, #768)
+    /// materializes each operand's outputs through `to_owned`/`to_owned`;
+    /// its `One` arm is reached by `. == 1` (left operand is a bare `One`,
+    /// same cursor-less mechanism as the tests above), its `Many` arm by
+    /// `select(true,true) == 1` (left operand is a bare `Many`).
+    #[test]
+    fn test_compare_operand_one_and_many_arms_decode_failure_1247() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse(". == 1").unwrap(), value);
+        assert!(
+            result.is_error(),
+            ". == 1 should surface the decode failure"
+        );
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true) == 1").unwrap(), value);
+        assert!(
+            result.is_error(),
+            "select(true,true) == 1 should surface the decode failure"
+        );
+    }
+
+    /// `push_generic_truthiness`'s `Many` arm (`select`'s condition forker,
+    /// #378) is reached when the condition itself is a bare `Many` --
+    /// `select(select(true,true))` (the inner `select` supplies the outer
+    /// one's condition, and resolves to a bare `Many` the same way the
+    /// `Compare` test above does).
+    #[test]
+    fn test_select_condition_many_arm_decode_failure_1247() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(
+            &crate::jq::parse("select(select(true,true))").unwrap(),
+            value,
+        );
+        assert!(
+            result.is_error(),
+            "select(select(true,true)) should surface the decode failure"
+        );
+    }
+
+    /// `GenericResult::into_owned`'s `Many` arm (public API, used by every
+    /// non-streaming consumer) -- `select(true,true)` over an undecodable
+    /// document gives a bare `Many` (see the tests above for why), and
+    /// `.into_owned()` must report the decode failure as `Err`, not silently
+    /// drop it into the `Ok(None)` bucket `Error`/`Break` share.
+    #[test]
+    fn test_into_owned_many_arm_decode_failure_1247() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true)").unwrap(), value);
+        let err = result
+            .into_owned()
+            .expect_err("a Many of undecodable values must not materialize");
+        assert!(err.message.contains("invalid UTF-8"), "{err:?}");
+    }
+
+    /// `stream_json`/`stream_yaml`'s `One`/`Many` arms (#355, #1247) report a
+    /// decode failure through `stats.error` rather than writing to `out` --
+    /// same bare-`One`/bare-`Many` construction as the tests above
+    /// (`select(true)`/`select(true,true)` through the cursor-less `eval()`),
+    /// exercised against both output formats since the match arms (and the
+    /// shared `owned_or_stream_error` helper, #2532) are format-independent.
+    #[test]
+    fn test_stream_one_and_many_arms_report_decode_failure_1247() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let one = eval(&crate::jq::parse("select(true)").unwrap(), value);
+        assert!(matches!(one, GenericResult::One(_)), "{one:?}");
+        let mut out = String::new();
+        let stats = one
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "", "a decode failure must never reach stdout");
+        assert!(stats.error.is_some());
+        let mut out = String::new();
+        let stats = one
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let many = eval(&crate::jq::parse("select(true,true)").unwrap(), value);
+        assert!(matches!(many, GenericResult::Many(_)), "{many:?}");
+        let mut out = String::new();
+        let stats = many
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+        assert_eq!(stats.count, 0);
+        let mut out = String::new();
+        let stats = many
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+        assert_eq!(stats.count, 0);
+    }
+
+    /// `stream_json`/`stream_yaml`'s `LazyKeys { sorted: true, .. }` arm
+    /// falls back to `materialize_lazy_keys`, which decodes every key --
+    /// `keys` (not `keys_unsorted`, which stays lazy) over a document with an
+    /// undecodable key reaches this on both output formats. CLI-reachable:
+    /// `sjq keys`/`syq keys` over such a document.
+    #[test]
+    fn test_stream_sorted_lazy_keys_arm_reports_decode_failure_1247() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys").unwrap(), cursor);
+        assert!(matches!(
+            result,
+            GenericResult::LazyKeys { sorted: true, .. }
+        ));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+
+        let mut out = String::new();
+        let stats = result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+    }
+
+    /// `stream_json`'s `LazySeq` arm falls back to materializing each
+    /// `LazyElem` via `lazy_elem_to_owned` whenever
+    /// `sequence_streamable_cursors` answers `None` -- unconditional for
+    /// JSON, since `JsonCursor` never overrides
+    /// `supports_sequence_streaming` (stays the trait default `false`). A
+    /// plain `map(.)` over an array containing an undecodable element is
+    /// CLI-reachable (`sjq 'map(.)'`) and takes exactly this path.
+    #[test]
+    fn test_stream_json_lazyseq_fallback_reports_decode_failure_1247() {
+        let json: &[u8] = b"[\"\xff\xfe\"]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("map(.)").unwrap(), cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+    }
+
+    /// `stream_yaml`'s `LazySeq` arm equivalent of the JSON test above, but
+    /// `YamlCursor::supports_sequence_streaming` is `true`, so
+    /// `sequence_streamable_cursors` only answers `None` when at least one
+    /// drained item is `LazyElem::Owned` rather than `LazyElem::Cursor`.
+    /// `map(.x)` over `[{x: "\ud800"}, null]` produces exactly that mix:
+    /// `Expr::Field` on the object element stays a lazy `OneCursor` (into
+    /// `LazyElem::Cursor`), while `Expr::Field` on `null` returns
+    /// `GenericResult::Owned(Null)` (jq's "field access on null is null"
+    /// rule, into `LazyElem::Owned`) without ever decoding anything --
+    /// forcing the fallback to run and discover the first element's decode
+    /// failure (a lone UTF-16 surrogate, same invalid-escape shape used
+    /// throughout this file's JSON-side #1247 tests) only once it actually
+    /// materializes.
+    #[test]
+    fn test_stream_yaml_lazyseq_fallback_reports_decode_failure_1247() {
+        use crate::yaml::YamlIndex;
+
+        let yaml: &[u8] = br#"[{x: "\ud800"}, null]"#;
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index
+            .root(yaml)
+            .first_child()
+            .expect("YAML document should have content");
+        let result = eval_with_cursor(&crate::jq::parse("map(.x)").unwrap(), cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+    }
+
+    /// `fold_pipe_stages`'s `GenericResult::Many(vs)` arm re-evaluates the
+    /// next pipe stage per element with the ambient cursor forced to `None`
+    /// (`vs: Vec<V>` carries no cursor for its elements) -- so the *next*
+    /// stage's own result can itself be a bare `One`/`Many`/`ManyCursor`,
+    /// covering every nested-decode-failure arm this loop has. All four
+    /// cases below start from `select(true,true)` (bare `Many` of two copies
+    /// of the current value, via the cursor-less `eval()`) piped into a
+    /// second stage chosen so that stage's *own* evaluation (with the forced
+    /// `None` cursor) lands in a specific `GenericResult` shape:
+    /// - `.` (`Expr::Identity`) with `None` cursor => bare `One`.
+    /// - `.x` (`Expr::Field`) ignores the ambient cursor entirely, deriving
+    ///   its own fresh cursor from the object structurally => `OneCursor`.
+    /// - `select(true,true)` again (nested) => bare `Many`.
+    /// - `.[]` (`Expr::Iterate`) also ignores the ambient cursor => `ManyCursor`.
+    #[test]
+    fn test_fold_pipe_stages_many_arm_nested_shapes_decode_failure_1247() {
+        // `.` => bare `One`, decoding *successfully* -- the `Ok` side of
+        // the same match arm the failing case right below exercises the
+        // `Err` side of. Both copies `select(true,true)` produces are the
+        // same decodable value, so this must collect both rather than
+        // erroring.
+        let json: &[u8] = b"\"hello\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true) | .").unwrap(), value);
+        assert_eq!(
+            result.into_owned().unwrap().unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::String("hello".to_string()),
+                OwnedValue::String("hello".to_string()),
+            ])
+        );
+
+        // `.` => bare `One`.
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true) | .").unwrap(), value);
+        assert!(result.is_error(), "{result:?}");
+
+        // `.x` => `OneCursor`.
+        let json: &[u8] = b"{\"x\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true) | .x").unwrap(), value);
+        assert!(result.is_error(), "{result:?}");
+
+        // Nested `select(true,true)` => bare `Many`.
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(
+            &crate::jq::parse("select(true,true) | select(true,true)").unwrap(),
+            value,
+        );
+        assert!(result.is_error(), "{result:?}");
+
+        // `.[]` => `ManyCursor`.
+        let json: &[u8] = b"[\"\xff\xfe\"]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("select(true,true) | .[]").unwrap(), value);
+        assert!(result.is_error(), "{result:?}");
+    }
+
+    /// `fold_lazy_keys_stage`'s catch-all `_` arm (#1565) materializes every
+    /// key via `materialize_lazy_keys` for any following stage that isn't
+    /// one of the dedicated fast-path arms (`first`/`last`/`.[n]`/a leading
+    /// `map`, all guarded `!sorted`) -- `keys` (sorted) always falls here
+    /// regardless of what follows, since every one of those fast-path
+    /// guards is `if !sorted`. Not `keys | length`: `Builtin::Length` has
+    /// its own dedicated arm *without* a `!sorted` guard
+    /// (`effective_len`, #1514), which counts distinct keys without
+    /// decoding any of them and so never reaches this catch-all at all --
+    /// confirmed live (an earlier draft of this test used `length` and
+    /// failed to observe the decode error for exactly this reason). `.[0]`
+    /// does reach it: its own dedicated fast-path arm is guarded `!sorted`
+    /// too, so with `keys` (sorted) it falls through the same as any other
+    /// non-`length` stage. CLI-reachable: `sjq 'keys | .[0]'`.
+    #[test]
+    fn test_fold_lazy_keys_stage_catchall_decode_failure_1247() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys | .[0]").unwrap(), cursor);
+        assert!(result.is_error(), "{result:?}");
+    }
+
+    /// `each_lazy_keys_iterate_sink`'s sorted branch (#1599) decodes and
+    /// sorts every key via `effective_keys` before iterating -- reached by
+    /// `keys | .[]` (the demand-driven `Expr::Iterate` fan-out over a lazy
+    /// keys result) over a document with an undecodable key.
+    /// CLI-reachable: `sjq 'keys | .[]'`.
+    #[test]
+    fn test_each_lazy_keys_iterate_sink_sorted_decode_failure_1247() {
+        let json: &[u8] = b"{\"\xff\xfe\": 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys | .[]").unwrap(), cursor);
+        assert!(result.is_error(), "{result:?}");
+    }
+
+    /// `eval_index_expr`'s "key outer, target inner" loop takes its
+    /// `OneCursor`/`to_owned_cursor` conversion branch once at least one
+    /// earlier key/target pair has already materialized into `owned` (`any_owned`)
+    /// -- reached by `.[("z","a")]` where `"z"` is missing (materializes as
+    /// `Owned(Null)`, setting `any_owned`) and `"a"` exists with an
+    /// undecodable value (`OneCursor`, now hitting the `any_owned` branch's
+    /// `to_owned_cursor` call). The already-materialized prefix (`[null]`)
+    /// must survive as `Partial`, not vanish, matching #400/#494. This is
+    /// CLI-reachable: `sjq '.[("z","a")]'`.
+    #[test]
+    fn test_eval_index_expr_any_owned_cursor_conversion_decode_failure_1247() {
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse(r#".[("z","a")]"#).unwrap(), cursor);
+        match result {
+            GenericResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Null]);
+                assert!(e.message.contains("invalid UTF-8"), "{e:?}");
+            }
+            other => panic!("expected Partial([null], Error(..)), got {other:?}"),
+        }
+    }
+
+    /// `Builtin::ToEntries`'s object branch drops a field whose key doesn't
+    /// decode to a string at all via `field.key_str()` -- not #1247's own
+    /// undecodable-*content* check just above it (`string_decode_error`,
+    /// which only fires for a string-*shaped* span), but the older, still-
+    /// open #1194-class gap for a key that isn't string-shaped in the first
+    /// place. `{123: 1, "b": 2}` isn't valid JSON (jq itself would reject
+    /// it), but this crate's lenient semi-index still represents it
+    /// structurally -- `DocumentFields::uncons` hands back a field whose
+    /// `.key` is `StandardJson::Number`, `key_str()`'s default `as_str()`
+    /// answers `None` for it, and the field is silently skipped rather than
+    /// erroring. This is a known, pre-existing gap outside this coverage
+    /// pass's scope (the fallible-conversion logic itself is not to be
+    /// touched here) -- documented as current behavior, not asserted as
+    /// correct.
+    #[test]
+    fn test_to_entries_silently_drops_non_string_key_known_gap_1247() {
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("to_entries").unwrap(), cursor);
+        let entries = result.into_owned().unwrap().unwrap();
+        let OwnedValue::Array(entries) = entries else {
+            panic!("expected an array, got {entries:?}");
+        };
+        assert_eq!(
+            entries.len(),
+            1,
+            "the malformed `123` key is dropped: {entries:?}"
+        );
+        let OwnedValue::Object(entry) = &entries[0] else {
+            panic!("expected an object entry, got {:?}", entries[0]);
+        };
+        assert_eq!(entry.get("key"), Some(&OwnedValue::String("b".to_string())));
     }
 }

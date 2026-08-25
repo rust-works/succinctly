@@ -2984,6 +2984,17 @@ fn evaluate_input(
     // any other (#1247): report it to `sink` and yield nothing, so the next
     // input still runs and the exit code is still set (`ErrorSink`, #355).
     // Mirrors the `GenericResult::Error` arm below.
+    //
+    // Every `Err(e)` this macro's `One`/`Many`/`ManyCursor` call sites below
+    // can produce is defense-in-depth rather than reachable in practice:
+    // `cursor` is always rooted in `input.to_json()`, a fresh serialization
+    // of an already-decoded `OwnedValue` (a Rust `String`, which by
+    // construction can't hold an undecodable byte sequence, and whose
+    // escapes this crate's own serializer writes) -- same argument
+    // `eval_generic.rs`'s textually-similar bridge relies on (search
+    // "defense-in-depth" there). Kept as `Result` rather than `.unwrap()` so
+    // a real failure, if this invariant is ever violated, surfaces as a
+    // normal `EvalError` instead of a panic.
     macro_rules! materialized {
         ($e:expr) => {
             match $e {
@@ -4518,6 +4529,27 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// #1194: a top-level query *result* that is itself a bareword garbage
+    /// token (`StandardJson::Error`, not a decode failure) raises instead of
+    /// silently printing `null` -- the same class of fix as the malformed-key
+    /// and unpaired-field cases above, for the array/object match arm's own
+    /// fallthrough rather than either of their more specific checks. No
+    /// CLI-level test accompanies this for the same reason given on this
+    /// function's own doc comment: an ordinary `[xyz123] | to_entries`-style
+    /// filter resolves its result through `to_owned` (`eval_generic.rs`)
+    /// before it ever reaches this lazy `JqValue` conversion, so reaching
+    /// this exact arm needs a result cursor built directly, as below.
+    #[test]
+    fn test_standard_json_to_jq_value_raises_on_malformed_top_level_value_1194() {
+        let json: &[u8] = b"xyz123";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err =
+            standard_json_to_jq_value(value, &cursor).expect_err("a bareword is not a JSON value");
+        assert!(!err.message.is_empty(), "{err:?}");
     }
 
     /// #1194: `MalformedJsonError` exists to be `downcast_ref`'d out of an
