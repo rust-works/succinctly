@@ -1506,7 +1506,10 @@ fn partial<'a, W>(prefix: Vec<OwnedValue>, control: Control) -> QueryResult<'a, 
 /// input format, so this is a property of [`EvalSemantics`] rather than of the
 /// call site. Real yq has only a handful of these builtins and takes the first
 /// output for most of them; for the rest its lexer rejects the call outright,
-/// which makes jq's model unopposed there rather than a divergence.
+/// which makes jq's model unopposed there rather than a divergence. One
+/// builtin, `contains`, genuinely fans out in yq too but still aborts the
+/// whole call on an escape (`Self::AllClearedOnEscape`) rather than either of
+/// those two shapes — see its own doc comment, #1553.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgFanout {
     /// One result per argument output, as real jq does.
@@ -1525,16 +1528,29 @@ enum ArgFanout {
     /// #1279, which only has to keep the *outcome* an error rather than let
     /// yq mode start fanning out.
     RejectMany,
+    /// Every value is used, same as [`Self::All`] -- but if the argument's
+    /// own evaluation ended in an escape anywhere, the whole call reports
+    /// only that escape, with no output at all, via the same
+    /// [`clear_values_when_yq_argument_escaped`] both yq gates above already
+    /// use. `contains` is the one shared builtin that needs this third
+    /// shape: it genuinely fans out in real yq (unlike its `yq_native`-gated
+    /// neighbours below), but still aborts the whole call on an escape
+    /// rather than emitting a value it then raises over -- live-verified
+    /// against the pinned v4.53.3 (`contains(("a", error("boom")))` prints
+    /// nothing to stdout, just the error), #1553.
+    AllClearedOnEscape,
 }
 
 impl ArgFanout {
     /// The gate for a builtin real yq *has* and does *not* fan out.
     ///
     /// Live-probed against the pinned yq v4.53.3; each call site cites its own
-    /// probe. `contains` is deliberately **not** gated: it is the one shared
-    /// builtin that does fan out in real yq (`[.x | contains(("a","zz"))]` on
-    /// `abc` is `[true,false]`, matching jq), so gating it would introduce a
-    /// divergence rather than preserve one.
+    /// probe. `contains` is deliberately **not** gated by this one: it is a
+    /// shared builtin that genuinely does fan out in real yq
+    /// (`[.x | contains(("a","zz"))]` on `abc` is `[true,false]`, matching
+    /// jq) -- gating it here would introduce a divergence rather than
+    /// preserve one. It carries [`Self::contains_gate`] instead, for the
+    /// escape-clearing rule that fan-out alone doesn't cover.
     fn yq_native<S: EvalSemantics>() -> Self {
         if S::TAG == EvalTag::Yq {
             Self::FirstOnly
@@ -1555,6 +1571,18 @@ impl ArgFanout {
     fn reject_many_in_yq<S: EvalSemantics>() -> Self {
         if S::TAG == EvalTag::Yq {
             Self::RejectMany
+        } else {
+            Self::All
+        }
+    }
+
+    /// The gate for `contains`, the one shared builtin that fans out exactly
+    /// like jq in yq mode too, but still needs the yq-only "escape anywhere
+    /// clears the whole output" rule [`Self::yq_native`]/
+    /// [`Self::reject_many_in_yq`]'s gated builtins already get. #1553.
+    fn contains_gate<S: EvalSemantics>() -> Self {
+        if S::TAG == EvalTag::Yq {
+            Self::AllClearedOnEscape
         } else {
             Self::All
         }
@@ -1635,6 +1663,13 @@ fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(),
         // jq's rule 1: every value is used, and the argument's own control
         // fires *after* them (#1279).
         ArgFanout::All => Ok(()),
+
+        // Every value is kept here too -- identical to `All`. The escape
+        // clearing this gate is *for* already happened upstream in
+        // `fanout_arg`, before this function ever runs (same as the two yq
+        // gates below): this arm only has to answer for the non-escape case,
+        // where "every value is kept" is exactly `All`'s own rule (#1553).
+        ArgFanout::AllClearedOnEscape => Ok(()),
 
         // `has(("a","b"))` is `true` in real yq, and `setpath((["a"],["b"]); 1)`
         // is a count error. (succinctly's wording for that count error differs
@@ -7237,9 +7272,11 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Not gated to yq's first-output-only behaviour, unlike its neighbours:
         // real yq fans `contains` out too (live-verified against the pinned
         // v4.53.3 — `[.x | contains(("a","zz"))]` on `abc` is `[true,false]`,
-        // the same as jq), so this is the one shared builtin where the two
-        // reference tools agree.
-        ArgFanout::All,
+        // the same as jq). It still needs its own yq-only rule, though: an
+        // escape anywhere in the argument clears the whole output rather
+        // than jq's "emit the prefix, then raise" (#1553) — see
+        // `ArgFanout::contains_gate`'s doc comment.
+        ArgFanout::contains_gate::<S>(),
         |b| {
             if jq_kind(&input) != jq_kind(&b) {
                 return if optional {
@@ -55036,6 +55073,15 @@ mod tests {
         assert!(apply_arg_fanout(ArgFanout::All, &mut args).is_ok());
         assert_eq!(args.len(), 3);
 
+        // `AllClearedOnEscape` keeps every output too, on its own -- the
+        // escape-clearing half of this gate happens upstream in `fanout_arg`
+        // (see `first_only_gate_clears_its_values_when_the_argument_escaped_1534`'s
+        // companion test below), so this function alone cannot distinguish
+        // it from `All` (#1553).
+        let mut args = three();
+        assert!(apply_arg_fanout(ArgFanout::AllClearedOnEscape, &mut args).is_ok());
+        assert_eq!(args.len(), 3);
+
         // `FirstOnly` keeps exactly the first.
         let mut args = three();
         assert!(apply_arg_fanout(ArgFanout::FirstOnly, &mut args).is_ok());
@@ -55056,7 +55102,12 @@ mod tests {
         // An empty argument list is never refused, under any gate: zero
         // outputs means the builtin produces zero outputs (#1045), which is
         // not the "found N results" condition `RejectMany` exists to catch.
-        for gate in [ArgFanout::All, ArgFanout::FirstOnly, ArgFanout::RejectMany] {
+        for gate in [
+            ArgFanout::All,
+            ArgFanout::AllClearedOnEscape,
+            ArgFanout::FirstOnly,
+            ArgFanout::RejectMany,
+        ] {
             let mut args: Vec<OwnedValue> = Vec::new();
             assert!(apply_arg_fanout(gate, &mut args).is_ok());
             assert!(args.is_empty());
@@ -55101,6 +55152,32 @@ mod tests {
         assert_eq!(args.len(), 2);
     }
 
+    /// #1553: `AllClearedOnEscape` is `contains`'s own gate -- it must adopt
+    /// the same clearing behaviour `FirstOnly` does (unlike plain `All`,
+    /// pinned just above), while still keeping every value when there is no
+    /// escape at all (the "still fans out" half real yq's `contains`
+    /// needs, unlike `FirstOnly`'s truncation).
+    #[test]
+    fn all_cleared_on_escape_gate_clears_its_values_when_the_argument_escaped_1553() {
+        let escaped = || Some(Control::Error(EvalError::new("boom")));
+
+        // Values present *and* an escape: the escape wins outright, same as
+        // `FirstOnly`.
+        let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
+        let trailing = escaped();
+        assert!(clear_values_when_yq_argument_escaped(&mut args, &trailing));
+        assert!(args.is_empty(), "args={args:?}");
+        assert!(trailing.is_some(), "the control must still fire");
+
+        // No escape: every value survives -- unlike `FirstOnly`'s truncation,
+        // this is the "still fans out" half of the gate.
+        let mut args = vec![OwnedValue::int(1), OwnedValue::int(2)];
+        let trailing = None;
+        assert!(!clear_values_when_yq_argument_escaped(&mut args, &trailing));
+        assert!(apply_arg_fanout(ArgFanout::AllClearedOnEscape, &mut args).is_ok());
+        assert_eq!(args.len(), 2);
+    }
+
     /// #1537 companion: the yq-mode gates are named constructors, so mode
     /// selection lives in one place per gate rather than inline at each
     /// builtin. Pins that both resolve to `All` in jq mode and to their
@@ -55122,6 +55199,14 @@ mod tests {
         assert!(matches!(
             ArgFanout::reject_many_in_yq::<YqSemantics>(),
             ArgFanout::RejectMany
+        ));
+        assert!(matches!(
+            ArgFanout::contains_gate::<JqSemantics>(),
+            ArgFanout::All
+        ));
+        assert!(matches!(
+            ArgFanout::contains_gate::<YqSemantics>(),
+            ArgFanout::AllClearedOnEscape
         ));
     }
 
