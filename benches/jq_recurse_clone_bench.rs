@@ -26,9 +26,16 @@
 //! `del(..)` instead reaches `resolve_dynamic_indexes` and then applies
 //! `delete_at_path`/`delete_expr_paths_at` directly to the already-assembled
 //! static paths — no second walk of the original tree — so its cost tracks
-//! `push_recursive_branches`'s own share closely (measured: `del(..)`
-//! end-to-end 12.8ms vs `resolve_dynamic_indexes` 9.7ms at depth 400, both
-//! dominated by `push_recursive_branches`'s 8.2ms).
+//! `push_recursive_branches`'s own share closely.
+//!
+//! #701 found the depth-400 point in the list below panicking
+//! (`nesting depth exceeds limit of 384`, from `to_owned_at_depth`,
+//! unrelated to this file's own machinery — it fires before path-tracking
+//! even starts) — invisible until now because `cargo bench` isn't run by
+//! `cargo test`/CI. This file's depths are now derived from
+//! `MAX_VALUE_TREE_DEPTH` so they can't silently exceed it again; the old
+//! "measured... at depth 400" figures above were never actually
+//! reproducible as checked in and should not be trusted.
 //!
 //! `del(..)` also has no computed index anywhere in the query, so — like
 //! `path(..)` — it can never route through `eval_index_expr`/
@@ -57,7 +64,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult};
+use succinctly::jq::{eval, parse, JqSemantics, OwnedValue, QueryResult, MAX_VALUE_TREE_DEPTH};
 use succinctly::json::JsonIndex;
 
 /// `{"k": {"k": ... {} ... }}`, `depth` levels of `"k"` nesting, no other
@@ -72,9 +79,11 @@ fn linear_nest(depth: usize) -> Vec<u8> {
 
 fn bench_recurse_clone_depth(c: &mut Criterion) {
     let mut group = c.benchmark_group("jq_recurse_clone_depth");
-    // Matches #661/#626's depths so results stay comparable across this
-    // benchmark family.
-    for &depth in &[100usize, 200, 300, 400] {
+    // Matches #661/#626's depths (100/200/300) where possible so results
+    // stay comparable across this benchmark family; the top depth is derived
+    // from `MAX_VALUE_TREE_DEPTH` (384) rather than hardcoded 400, which
+    // panics past the limit (#701 — see the module doc above).
+    for &depth in &[100usize, 200, 300, MAX_VALUE_TREE_DEPTH - 9] {
         let json = linear_nest(depth);
         let index = JsonIndex::build(&json);
         let expr = parse("del(..)").expect("filter parses");
