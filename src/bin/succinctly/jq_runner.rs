@@ -2066,13 +2066,30 @@ fn read_stdin() -> Result<String> {
     // Lossy, not `read_to_string`: that refused the whole input on a stray
     // byte, reporting it as a *read* failure when the read had succeeded
     // (#1247). See `utf8_lossy_document` for why jq substitutes here.
-    Ok(String::from_utf8_lossy(&read_stdin_bytes()?).into_owned())
+    Ok(utf8_lossy_string(read_stdin_bytes()?))
 }
 
 /// Read a file to string.
 fn read_file(path: &Path) -> Result<String> {
     // Lossy for the same reason as `read_stdin` above.
-    Ok(String::from_utf8_lossy(&read_file_bytes(path)?).into_owned())
+    Ok(utf8_lossy_string(read_file_bytes(path)?))
+}
+
+/// Lossy UTF-8 decode that does not copy a document that is already valid.
+///
+/// `String::from_utf8_lossy(&bytes).into_owned()` allocates and copies the
+/// whole document even when it is valid, because the `Cow` it returns is
+/// `Borrowed` and `into_owned` must then clone it -- measured (pinned
+/// hardware, interleaved A/B) as the dominant cost of #1247's whole diff,
+/// +9.47% median on a cheap navigation query on x86_64, breaching the design
+/// doc's own +8% ceiling on a change that isn't the one doing the costing.
+/// Taking ownership of the existing buffer instead makes the valid path
+/// allocation-free.
+fn utf8_lossy_string(raw: Vec<u8>) -> String {
+    match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 /// Replace every invalid UTF-8 sequence in a *document* with U+FFFD, the
@@ -2975,7 +2992,7 @@ fn evaluate_input(
             sorted,
             collapse,
         } => {
-            let mut keys = effective_keys(&fields, collapse);
+            let mut keys = materialized!(effective_keys(&fields, collapse));
             if sorted {
                 keys.sort();
             }
@@ -3124,13 +3141,18 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             fields,
             sorted: true,
             collapse,
-        } => {
-            let mut keys = effective_keys(&fields, collapse);
-            keys.sort();
-            vec![JqValue::from_owned(OwnedValue::Array(
-                keys.into_iter().map(OwnedValue::String).collect(),
-            ))]
-        }
+        } => match effective_keys(&fields, collapse) {
+            Ok(mut keys) => {
+                keys.sort();
+                vec![JqValue::from_owned(OwnedValue::Array(
+                    keys.into_iter().map(OwnedValue::String).collect(),
+                ))]
+            }
+            Err(e) => {
+                sink.report(DiagStyle::Jq, &e, at);
+                vec![]
+            }
+        },
         // Same laziness as `LazyKeys` above, for array `keys`/
         // `keys_unsorted` (#684): `write_json`/`print_json` write the
         // `[0,1,...,len-1]` digits directly, no `Vec<OwnedValue::Int>`.
