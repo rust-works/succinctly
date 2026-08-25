@@ -6432,6 +6432,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
         ))
     }
 
+    /// The key-only walk (#1514), which until #1599 only JSON overrode --
+    /// so every YAML key walk went through the trait default, which calls
+    /// `uncons` and therefore builds the field's *value* as well. The
+    /// `keys`/`keys_unsorted` walkers never look at it.
+    fn uncons_key(&self) -> Option<(Self::Value, Self::Cursor, Self)> {
+        let (field, rest) = YamlFields::uncons(self)?;
+        Some((field.key(), field.key_cursor(), rest))
+    }
+
     fn find(&self, name: &str) -> Option<Self::Value> {
         YamlFields::find(self, name)
     }
