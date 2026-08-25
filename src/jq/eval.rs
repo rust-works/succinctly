@@ -3611,6 +3611,33 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Whether `select(cond)` should republish its input for the current truthy
+/// bit, under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq, #1613) vs jq's
+/// unconditional per-truthy-bit fanout (#378): `false` under jq (every
+/// truthy bit republishes, `already_emitted` never gates anything); `false`
+/// past the *first* truthy bit under yq (`already_emitted` caps the
+/// republish count at one). `already_emitted` is the caller's own running
+/// flag for one `select` evaluation, mutated in place on a true answer.
+///
+/// One definition shared by `builtin_select`, `eval_pipe_with_path_context_
+/// internal`'s `Select` arm, and `resolve_node`'s `Select` arm -- each of
+/// which independently hand-wrote this same three-line guard before, the
+/// "duplicated predicates diverge silently" shape CLAUDE.md's #106 lesson
+/// warns about (echoed by this file's own `ArgFanout`/`apply_arg_fanout`,
+/// #1537, the precedent for pulling a repeated gate into one place instead).
+/// `eval_generic.rs`'s native `Select` arm computes the analogous
+/// `truthy_count` differently, as a one-shot reduction over an
+/// already-fully-collected `Vec<bool>` rather than a per-bit gate, so it
+/// isn't a caller of this helper -- see its own comment for why that shape
+/// doesn't unify cleanly with this one.
+fn select_emits<S: EvalSemantics>(truthy: bool, already_emitted: &mut bool) -> bool {
+    if !truthy || (S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && *already_emitted) {
+        return false;
+    }
+    *already_emitted = true;
+    true
+}
+
 /// Evaluate `left op right` over every pairing jq's cartesian fanout
 /// produces, right operand outer / left operand inner (#768): `(1,2) + (10,20)`
 /// is `11,12,21,22` (right=10 held fixed while left runs 1,2; then right=20).
@@ -5999,10 +6026,8 @@ fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// (`select((false,false) and true)` yields nothing, matching jq — not the
 /// first-output-only answer `vs.first()` used to give) — restored by
 /// `eval_fanout` (#378). Under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq,
-/// #1613), that per-bit republish collapses to at most one: `already_emitted`
-/// suppresses every truthy bit after the first, while still walking every
-/// bit of `cond` (so a later error/break still escapes `eval_fanout`
-/// normally) and still emitting nothing for a purely-falsy condition.
+/// #1613), that per-bit republish collapses to at most one via
+/// `select_emits` — see its own doc comment.
 fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     value: StandardJson<'a, W>,
@@ -6011,8 +6036,7 @@ fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
     let mut already_emitted = false;
     eval_fanout(cond_result, |truthy| {
-        if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
-            already_emitted = true;
+        if select_emits::<S>(truthy, &mut already_emitted) {
             QueryResult::One(value.clone())
         } else {
             QueryResult::None
@@ -17275,21 +17299,20 @@ fn resolve_node<'a, S: EvalSemantics>(
         // raising `x`.
         //
         // Under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq, #1613) this forking
-        // collapses to at most one branch: live-verified, real yq's
+        // collapses to at most one branch via `select_emits` (see its own
+        // doc comment): live-verified, real yq's
         // `(.a[] | select((true,true))) |= . + 10` applies the update once
         // per element (`[11,12,13]`), where the per-truthy-bit fork above
         // (unpatched) applied it twice (`[21,22,23]`) — the same
         // value-position bug #1613 found, reached through `resolve_node`'s
         // independent path-tracking implementation of `select` rather than
-        // `eval_fanout`. `already_emitted` mirrors `builtin_select`'s own
-        // fix; `cond` is still walked to completion, so a later error/break
-        // still escapes with the correct (now-capped) prefix.
+        // `eval_fanout`. `cond` is still walked to completion, so a later
+        // error/break still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
             let mut already_emitted = false;
             resolve_cond_fork(cond_outputs, escape, |truthy, out| {
-                if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
-                    already_emitted = true;
+                if select_emits::<S>(truthy, &mut already_emitted) {
                     // `select` filters; it never navigates. The value handed
                     // back is the caller's own, so its trackability is too —
                     // and so is its snapshot mark (#1591): `select` cannot
@@ -24540,14 +24563,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
             );
-            // Collapses to at most one republish under yq semantics
-            // (`S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY`, #1613) — same
-            // `already_emitted` shape as the plain evaluator's
-            // `builtin_select`, see its doc comment for the reasoning.
+            // Collapses to at most one republish under yq semantics via
+            // `select_emits` (#1613) — see its own doc comment.
             let mut already_emitted = false;
             let select_result = eval_fanout(cond_result, |truthy| {
-                if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
-                    already_emitted = true;
+                if select_emits::<S>(truthy, &mut already_emitted) {
                     QueryResult::Owned(value.clone())
                 } else {
                     QueryResult::None
@@ -38088,7 +38108,7 @@ mod tests {
     #[test]
     fn test_builtin_select_yq_collapses_to_at_most_one_1613() {
         // Real yq's rule is "emit once iff any output is truthy", not jq's
-        // "emit once per truthy output" -- an `ADR-0018` rule-4 mode split
+        // "emit once per truthy output" -- an `ADR-0018` rule-2 mode split
         // (`eval_fanout` is shared by `eval_if`/`builtin_select`, but only
         // `select` needs a yq answer: yq's lexer rejects `if/then/else`
         // outright). Every row here is live-verified against yq v4.53.3;
@@ -38161,6 +38181,38 @@ mod tests {
             "(.a[] | select((true,true))) |= . + 10",
             Ok(r#"{"a":[21,22,23]}"#),
         )]);
+    }
+
+    #[test]
+    fn test_builtin_select_yq_path_context_arm_collapses_too_1613() {
+        // The third of the four independent `select` implementations:
+        // `eval_pipe_with_path_context_internal`'s own `Select` arm (not
+        // `builtin_select`, though it shares `eval_fanout` with it) — reached
+        // whenever `select(...)` sits in a pipe alongside a path-dependent
+        // builtin like `key`/`parent`/`file_index` (`needs_path_context`),
+        // not only under `--eval-all`. Unlike the other three sites, this one
+        // had no dedicated regression test before -- found during this
+        // issue's own review. Live-verified against yq v4.53.3:
+        // `.[] | select((true,true)) | key` on `{"a":1,"b":2}` gives
+        // `["a","b"]`, not `["a","a","b","b"]`.
+        assert_eq!(
+            outputs_yq(br#"{"a":1,"b":2}"#, "[.[] | select((true,true)) | key]"),
+            [r#"["a","b"]"#]
+        );
+    }
+
+    #[test]
+    fn test_builtin_select_jq_path_context_arm_fanout_unchanged_1613() {
+        // Companion pin for the jq side of the test just above, at the same
+        // site. `key` isn't a real jq builtin (a succinctly position-based
+        // navigation extension), so there's no oracle to diff against here —
+        // this pins succinctly jq's own existing behavior rather than
+        // verifying fidelity, confirming `select_emits::<JqSemantics>` still
+        // republishes once per truthy bit at this third site too.
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, "[.[] | select((true,true)) | key]"),
+            [r#"["a","a","b","b"]"#]
+        );
     }
 
     #[test]
