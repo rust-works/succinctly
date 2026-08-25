@@ -3051,13 +3051,30 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 
 /// Demand-aware `Expr::Iterate` fan-out for a `LazyKeys` (#1565).
 ///
-/// `!sorted` (`keys_unsorted`): reuses the exact same cons-list walk
-/// `fold_lazy_keys_stage`'s own `Expr::Iterate` arm uses to build its
-/// `ManyCursor` -- building that `Vec<V::Cursor>` costs the same as a real
-/// array's own `ManyCursor` build (the baseline `first(.[] | ...)` already
-/// pays, per #1461), so `first`'s saving here is entirely in the
-/// *downstream* per-element re-evaluation this function now gates, not in
-/// this structural step.
+/// `!sorted` (`keys_unsorted`): streams [`DistinctKeyCursors`] straight
+/// into the driver, so a consumer that stops early walks only the fields it
+/// actually reached. This arm used to run `document::collapsed_fields`
+/// (whose probe is a whole-object `census`: decode and fingerprint every
+/// key, then sort the fingerprints) and then collect every key cursor into
+/// a `Vec`, both *before* handing the first element downstream -- so
+/// `first(keys_unsorted | .[] | f)` on a wide object paid O(n log n) plus a
+/// full cons-list walk to produce one key (#1599).
+///
+/// Neither is needed here. "First occurrence wins" is an *online* rule, so
+/// the dedup rides along with the walk instead of preceding it -- exactly
+/// what `fold_lazy_keys_stage`'s own `Expr::Iterate` arm switched to in
+/// #1514, via the `distinct_key_cursors` wrapper. That arm has to hand back
+/// every cursor at once to build a `ManyCursor`, so it collects; this one
+/// drives elements one at a time and can consume the iterator directly.
+///
+/// The yielded sequence is identical either way, which is why this is a
+/// cost change and not a behaviour change: `DistinctKeyCursors` emits first
+/// occurrences in document order, and on confirming a real repeat switches
+/// to the exact collapsed list resuming at the count already yielded --
+/// which lines up, because that list opens with those same first
+/// occurrences. Unlike the `LazySeq` arm below, streaming raises no
+/// atomicity question: producing a key cursor runs no user filter, so there
+/// is no per-element failure that eager collection would have masked.
 ///
 /// `sorted` (`keys`): lexicographic order needs every key decoded and
 /// sorted first, unavoidably -- the same cost `materialize_lazy_keys` always
@@ -3075,24 +3092,9 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     if !sorted {
-        let cursors: Vec<V::Cursor> = match if collapse {
-            collapsed_fields(&fields)
-        } else {
-            None
-        } {
-            Some(collapsed) => collapsed.into_iter().map(|f| f.key_cursor).collect(),
-            None => {
-                let mut cursors = Vec::new();
-                let mut current = fields;
-                while let Some((field, next)) = current.uncons() {
-                    cursors.push(field.key_cursor);
-                    current = next;
-                }
-                cursors
-            }
-        };
         return drive_pipe_elements_generic::<S, V>(
-            cursors.into_iter().map(|c| Ok(GenericItem::OneCursor(c))),
+            DistinctKeyCursors::new(&fields, collapse)
+                .map(|(_, cursor)| Ok(GenericItem::OneCursor(cursor))),
             rest,
             optional,
             sink,

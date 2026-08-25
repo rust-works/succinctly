@@ -2930,6 +2930,61 @@ fn test_duplicate_keys_lazy_keys_fast_paths_1385() -> Result<()> {
     Ok(())
 }
 
+/// #1599: `each_lazy_keys_iterate_sink`'s `keys_unsorted` arm streams
+/// `DistinctKeyCursors` rather than running a whole-object `census` and
+/// collecting every key cursor before driving the first element. The
+/// sequence must be unchanged, which is what these pin -- the arm is only
+/// reachable through a *demand-aware* fan-out (`first`/`limit` wrapping
+/// `keys_unsorted | .[] | f`), so `test_duplicate_keys_lazy_keys_fast_paths_1385`
+/// above, which drives `fold_lazy_keys_stage`'s collecting arms, does not
+/// cover it.
+///
+/// `mid` is the case that matters: its duplicate sits at the *fourth*
+/// field, past three distinct keys already yielded. Streaming only learns
+/// of it on reaching it, and `DistinctKeyCursors` responds by switching to
+/// the exact collapsed list and resuming at the count already emitted -- so
+/// a consumer that stops before the repeat, exactly at it, or past it must
+/// all agree with jq. Every expectation below is jq 1.7.1's own output.
+#[test]
+fn test_lazy_keys_demand_sink_streams_collapse_1599() -> Result<()> {
+    // Duplicate at the head: the very first key is the repeated one.
+    let head = r#"{"b":1,"a":2,"b":3}"#;
+    for (filter, expected) in [
+        ("first(keys_unsorted | .[])", r#""b""#),
+        ("[limit(1; keys_unsorted | .[])]", r#"["b"]"#),
+        ("[limit(2; keys_unsorted | .[])]", r#"["b","a"]"#),
+        // Past the end of the collapsed object: still only two keys.
+        ("[limit(9; keys_unsorted | .[])]", r#"["b","a"]"#),
+        ("[keys_unsorted | .[] | .]", r#"["b","a"]"#),
+        // A non-empty `rest` after the iterate, so the driver threads each
+        // streamed cursor through a real downstream stage.
+        ("first(keys_unsorted | .[] | ascii_downcase)", r#""b""#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(head))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // Duplicate mid-stream: "a" repeats only as the fourth field.
+    let mid = r#"{"a":1,"b":2,"c":3,"a":4,"d":5}"#;
+    for (filter, expected) in [
+        ("first(keys_unsorted | .[])", r#""a""#),
+        // Stops before the repeat is ever reached.
+        ("[limit(3; keys_unsorted | .[])]", r#"["a","b","c"]"#),
+        // Crosses it: this is the switch-and-resume branch.
+        ("[limit(4; keys_unsorted | .[])]", r#"["a","b","c","d"]"#),
+        ("[limit(5; keys_unsorted | .[])]", r#"["a","b","c","d"]"#),
+        ("[keys_unsorted | .[] | .]", r#"["a","b","c","d"]"#),
+        ("keys_unsorted | length", "4"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(mid))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_jq_compat_default() -> Result<()> {
     // Test that jq-compat is now the default behavior
