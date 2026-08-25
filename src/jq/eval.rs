@@ -736,7 +736,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StandardJson::String(s) => {
                 let s_str = match s.as_str() {
                     Ok(s) => s,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid UTF-8 in string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 };
 
                 // Fast path: identity slice [:] returns original string without character counting
@@ -2798,6 +2798,12 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match eval_each::<W, S>(expr, value, optional, sink) {
+        // A decode failure (#1247) must never be caught by `try`/`catch`,
+        // same #1620 exclusion as `eval_try`'s identical arm -- propagates
+        // unchanged via the `other => other` wildcard's own reasoning.
+        Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+            Flow::Escaped(Control::Error(e))
+        }
         Flow::Escaped(Control::Error(e)) => match catch {
             Some(catch_expr) => {
                 eval_each_owned::<S>(catch_expr, &e.payload(), optional, &mut |o| {
@@ -5036,6 +5042,12 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let result = eval_single::<W, S>(expr, value, optional);
 
     match result {
+        // A decode failure (#1247) must never be caught by `try`/`catch`,
+        // any more than it's suppressed by `?` (#1620) -- jq's own
+        // equivalent is a parse-time rejection no program could ever catch
+        // either. Checked before the ordinary `Error` catch below so it
+        // falls through to `other => other` instead.
+        QueryResult::Error(e) if e.is_decode_failure() => QueryResult::Error(e),
         // If error, use catch handler or return nothing. jq runs the handler
         // with the *raised value* as its input, not the original input, so
         // `try error("boom") catch .` yields "boom".
@@ -5052,6 +5064,12 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(catch_expr) => eval_owned_input::<W, S>(catch_expr, &OwnedValue::Null, optional),
             None => QueryResult::None,
         },
+        // Same #1620 decode-failure exclusion as the bare `Error` arm above
+        // -- a `Partial` ending in a decode failure must still propagate
+        // uncaught, not run the catch handler.
+        QueryResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+            QueryResult::Partial(prefix, Control::Error(e))
+        }
         // The body produced some outputs before erroring (#400): emit them
         // (`try (1,2,error("x")) catch "c"` is `1`, `2`, `"c"`), then run the
         // catch handler and splice its own result — which may itself be
@@ -9429,19 +9447,14 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
             // that literal is valid RFC 8259 syntax (#966).
             QueryResult::Owned(OwnedValue::from_number_bytes(n.raw_bytes()))
         }
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                match tonumber_from_str(cow.as_ref()) {
-                    Ok(n) => QueryResult::Owned(n),
-                    Err(_) if optional => QueryResult::None,
-                    Err(e) => e.into(),
-                }
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
-            }
-        }
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => match tonumber_from_str(cow.as_ref()) {
+                Ok(n) => QueryResult::Owned(n),
+                Err(_) if optional => QueryResult::None,
+                Err(e) => e.into(),
+            },
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value))),
     }
@@ -9541,22 +9554,17 @@ fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Bool(b) => QueryResult::Owned(OwnedValue::Bool(*b)),
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                match cow.as_ref() {
-                    "true" => QueryResult::Owned(OwnedValue::Bool(true)),
-                    "false" => QueryResult::Owned(OwnedValue::Bool(false)),
-                    _ if optional => QueryResult::None,
-                    other => QueryResult::Error(EvalError::new(format!(
-                        "string ({other:?}) cannot be parsed as a boolean"
-                    ))),
-                }
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
-            }
-        }
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => match cow.as_ref() {
+                "true" => QueryResult::Owned(OwnedValue::Bool(true)),
+                "false" => QueryResult::Owned(OwnedValue::Bool(false)),
+                _ if optional => QueryResult::None,
+                other => QueryResult::Error(EvalError::new(format!(
+                    "string ({other:?}) cannot be parsed as a boolean"
+                ))),
+            },
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new(format!(
             "{} cannot be parsed as a boolean",
@@ -9670,8 +9678,8 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
                 let json_str = cow.as_ref();
                 // The whole string must be one JSON value: jq rejects `"0x10"`
                 // and `"1 2"` rather than reading the first value and dropping
@@ -9681,12 +9689,9 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
                     Err(_) if optional => QueryResult::None,
                     Err(_) => QueryResult::Error(EvalError::invalid_numeric_literal(json_str)),
                 }
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
             }
-        }
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(&to_owned(&value))),
     }
@@ -10076,19 +10081,16 @@ fn builtin_explode<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
                 let codepoints: Vec<OwnedValue> = cow
                     .chars()
                     .map(|c| OwnedValue::Int(c as u32 as i64))
                     .collect();
                 QueryResult::Owned(OwnedValue::Array(codepoints))
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
             }
-        }
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new("explode input must be a string")),
     }
@@ -10248,15 +10250,10 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // Check if the input string contains the pattern (simple substring match)
             match &value {
-                StandardJson::String(s) => {
-                    if let Ok(cow) = s.as_str() {
-                        QueryResult::Owned(OwnedValue::Bool(cow.contains(&pattern)))
-                    } else if optional {
-                        QueryResult::None
-                    } else {
-                        QueryResult::Error(EvalError::new("invalid string"))
-                    }
-                }
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => QueryResult::Owned(OwnedValue::Bool(cow.contains(&pattern))),
+                    Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+                },
                 _ if optional => QueryResult::None,
                 _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
             }
@@ -10297,8 +10294,9 @@ fn string_slice_pattern<W>(
     let (StandardJson::String(s), OwnedValue::Object(desc)) = (value, pattern) else {
         return None;
     };
-    let Ok(text) = s.as_str() else {
-        return Some(Err(EvalError::new("invalid string")));
+    let text = match s.as_str() {
+        Ok(text) => text,
+        Err(e) => return Some(Err(EvalError::decode_failure(e.message()))),
     };
     Some(SliceBounds::from_descriptor(desc).map(|bounds| {
         OwnedValue::String(slice::slice_str(
@@ -10381,21 +10379,20 @@ fn indices_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
-            if let Ok(cow) = s.as_str() {
-                let mut indices = Vec::new();
-                let mut start = 0;
-                while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
-                    indices.push(OwnedValue::Int((start + pos) as i64));
-                    start += pos + 1;
-                    if start >= cow.len() {
-                        break;
+            match s.as_str() {
+                Ok(cow) => {
+                    let mut indices = Vec::new();
+                    let mut start = 0;
+                    while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
+                        indices.push(OwnedValue::Int((start + pos) as i64));
+                        start += pos + 1;
+                        if start >= cow.len() {
+                            break;
+                        }
                     }
+                    QueryResult::Owned(OwnedValue::Array(indices))
                 }
-                QueryResult::Owned(OwnedValue::Array(indices))
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
+                Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
             }
         }
         StandardJson::Array(elements) => {
@@ -10466,16 +10463,15 @@ fn index_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
-            if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.find(pattern_str.as_str()) {
-                    QueryResult::Owned(OwnedValue::Int(pos as i64))
-                } else {
-                    QueryResult::Owned(OwnedValue::Null)
+            match s.as_str() {
+                Ok(cow) => {
+                    if let Some(pos) = cow.find(pattern_str.as_str()) {
+                        QueryResult::Owned(OwnedValue::Int(pos as i64))
+                    } else {
+                        QueryResult::Owned(OwnedValue::Null)
+                    }
                 }
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
+                Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
             }
         }
         StandardJson::Array(elements) => {
@@ -10596,16 +10592,15 @@ fn rindex_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
-            if let Ok(cow) = s.as_str() {
-                if let Some(pos) = cow.rfind(pattern_str.as_str()) {
-                    QueryResult::Owned(OwnedValue::Int(pos as i64))
-                } else {
-                    QueryResult::Owned(OwnedValue::Null)
+            match s.as_str() {
+                Ok(cow) => {
+                    if let Some(pos) = cow.rfind(pattern_str.as_str()) {
+                        QueryResult::Owned(OwnedValue::Int(pos as i64))
+                    } else {
+                        QueryResult::Owned(OwnedValue::Null)
+                    }
                 }
-            } else if optional {
-                QueryResult::None
-            } else {
-                QueryResult::Error(EvalError::new("invalid string"))
+                Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
             }
         }
         StandardJson::Array(elements) => {
@@ -11377,8 +11372,7 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let input = match &value {
                 StandardJson::String(s) => match s.as_str() {
                     Ok(cow) => cow.into_owned(),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12112,8 +12106,7 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let input = match &value {
                 StandardJson::String(s) => match s.as_str() {
                     Ok(cow) => cow.into_owned(),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12180,8 +12173,7 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let input = match &value {
                 StandardJson::String(s) => match s.as_str() {
                     Ok(cow) => cow.into_owned(),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12356,8 +12348,7 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let input = match &value {
                 StandardJson::String(s) => match s.as_str() {
                     Ok(cow) => cow.into_owned(),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12409,8 +12400,7 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12809,8 +12799,7 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -12891,8 +12880,7 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
     let input = match value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
@@ -13002,8 +12990,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
@@ -17613,8 +17600,11 @@ fn resolve_node<'a, S: EvalSemantics>(
             // path expressions any more than in value position (#791) —
             // only a genuine error or a break (below) reaches `catch`;
             // everything else propagates unchanged, as does an
-            // invalid-path-expression complaint (#530).
-            Err((prefix, EvalEscape::Error(e))) if !e.is_invalid_path_expression() => {
+            // invalid-path-expression complaint (#530) and, per the same
+            // reasoning, a decode failure (#1247, #1620).
+            Err((prefix, EvalEscape::Error(e)))
+                if !e.is_invalid_path_expression() && !e.is_decode_failure() =>
+            {
                 resolve_catch::<S>(catch.as_deref(), prefix, e.payload())
             }
             // `catch` catches a `break` the same way it catches a raised
@@ -28945,8 +28935,7 @@ fn builtin_strptime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let input = match &value {
                 StandardJson::String(s) => match s.as_str() {
                     Ok(cow) => cow.into_owned(),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
                 // #929: confirmed live: `5 | strptime("%Y")` raises "strptime/1
@@ -29367,8 +29356,7 @@ fn builtin_fromdate<W: Clone + AsRef<[u64]>>(
     let input = match &value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => cow.into_owned(),
-            Err(_) if optional => return QueryResult::None,
-            Err(_) => return QueryResult::Error(EvalError::new("invalid string")),
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
         // #929: `fromdate` is defined in terms of `strptime` in real jq, so
@@ -34577,6 +34565,56 @@ mod tests {
                 other => panic!("unexpected result: {:?}", other),
             }
         }};
+    }
+
+    /// #1620: a decode failure reached through this module's own dispatch
+    /// (the public `succinctly::jq::eval` library API, not the CLI's
+    /// `eval_generic.rs` bridge) must not be suppressed by `?` -- same rule,
+    /// same reasoning, as `eval_generic.rs`'s `Expr::Optional` arm. Exercises
+    /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
+    /// site checked `optional` before the decode check and silently
+    /// swallowed the failure as `QueryResult::None`.
+    #[test]
+    fn test_optional_does_not_suppress_decode_failure_1620() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a | tonumber?",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1620: `try`/`catch` -- `eval_try`, this module's own native
+    /// dispatch for both `Expr::Try` and `Expr::Optional` -- must not catch
+    /// a decode failure either. Uses `tonumber`, not `length`: `eval.rs`'s
+    /// own `builtin_length` silently substitutes `0` on a decode failure
+    /// instead of raising at all -- a separate, `to_owned`-family-shaped gap
+    /// (also not reachable via the CLI), out of #1620's scope.
+    #[test]
+    fn test_try_catch_does_not_catch_decode_failure_1620() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "try (.a | tonumber) catch \"caught\"",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1620 negative control: an *ordinary* type error must still be
+    /// suppressed by `?` and caught by `try`/`catch` here, proving the new
+    /// exclusion is scoped to decode failures only.
+    #[test]
+    fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
+        query!(b"{\"a\": 1}", ".a | keys?", QueryResult::None => {});
+        query!(
+            b"{\"a\": 1}",
+            "try (.a | keys) catch \"caught\"",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "caught");
+            }
+        );
     }
 
     /// #1067: pins `collapse_vec`'s own 0/1/2+ shape, independent of any

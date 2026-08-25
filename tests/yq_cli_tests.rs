@@ -22008,6 +22008,72 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
     Ok(())
 }
 
+/// #1620: a decode failure must never be suppressed by `?`, matching how
+/// `try`/`catch` already never catches one -- real yq's equivalent is a
+/// parse-time rejection no program could ever catch either. `\q` is not a
+/// YAML escape, so the scalar is structurally valid but undecodable, same
+/// repro as `test_decode_failure_does_not_corrupt_json_output_1247` above.
+///
+/// `.a?` (no downstream builtin) is deliberately not included: bare field
+/// access never decodes the string at all, so there is no decode failure for
+/// `?` to have swallowed in the first place -- same reasoning as the jq-side
+/// pin in `jq_cli_tests.rs`.
+#[test]
+fn test_decode_failure_not_suppressed_by_optional_1620() -> Result<()> {
+    let input = "a: \"x\\qy\"\nb: 2\n";
+    for filter in [".a | length?", "to_entries?"] {
+        let (output, stderr, exit_code) = run_yq_stdin_with_stderr(filter, input, &[])?;
+        assert_ne!(
+            exit_code, 0,
+            "`{filter}` should fail, not be suppressed by `?`\noutput: {output:?}"
+        );
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` should name the decode failure\nstderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #1620 regression pin: `try`/`catch` must keep NOT catching a decode
+/// failure -- already true before this fix, now true by design. Paired with
+/// the `?` case above so neither mechanism can silently start suppressing
+/// this again.
+#[test]
+fn test_decode_failure_not_caught_by_try_catch_1620() -> Result<()> {
+    let input = "a: \"x\\qy\"\n";
+    let filter = "try (.a | length) catch \"caught\"";
+    let (output, stderr, exit_code) = run_yq_stdin_with_stderr(filter, input, &[])?;
+    assert_ne!(exit_code, 0, "should still fail\noutput: {output:?}");
+    assert!(
+        !output.contains("caught"),
+        "should not have run the catch handler\noutput: {output:?}"
+    );
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "should name the decode failure\nstderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1620 negative control: an *ordinary* type error (not a decode failure)
+/// must still be suppressed by `?` and caught by `try`/`catch` exactly as
+/// before -- proves the new decode-failure exclusion is scoped to decode
+/// failures only, not a general regression of `?`/`try` suppression.
+#[test]
+fn test_ordinary_type_error_still_suppressed_and_caught_1620() -> Result<()> {
+    let input = "a: 1\n";
+
+    let (output, exit_code) = run_yq_stdin(".a | keys?", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "");
+
+    let (output, exit_code) = run_yq_stdin("try (.a | keys) catch \"caught\"", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "caught");
+    Ok(())
+}
+
 /// #1242: `succinctly yq` accepted a document with a dangling
 /// non-continuable UTF-8 byte, indexed it, and handed back `null` for the
 /// scalar that byte was in -- at exit 0, with `--validate` no help because

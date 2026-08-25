@@ -621,7 +621,7 @@ pub trait DocumentFields: Sized + Clone {
             // other key-materializing site (#1247): an undecodable key must
             // raise here, not silently vanish once `key_str` stringifies it.
             if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::new(format!("{reason} in object key")));
+                return Err(EvalError::decode_failure(format!("{reason} in object key")));
             }
             // A key that will not stringify at all never allowed by the
             // format's grammar in the first place -- structurally malformed,
