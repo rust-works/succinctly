@@ -12851,7 +12851,10 @@ mod tests {
         let Some(YamlValue::Mapping(item)) = root.find("item") else {
             panic!("item must be a mapping");
         };
-        assert_eq!(item.keys(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            item.keys().expect("decodable keys"),
+            vec!["a".to_string(), "b".to_string()]
+        );
         assert_eq!(item.len(), 2);
         assert!(!item.is_empty());
     }
