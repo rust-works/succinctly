@@ -404,7 +404,13 @@ fn yaml_validate_guard(
     if !validate {
         return None;
     }
-    match succinctly::yaml::validate::validate(input) {
+    // `Validator` directly, not the top-level `validate()` wrapper: the
+    // encoding pass above already confirmed `input` is valid UTF-8, so
+    // `validate()`'s own leading `validate_utf8` call (needed for its other
+    // caller, `succinctly yaml validate`, which has no such upfront check)
+    // would just re-scan the same unmodified buffer for a result already
+    // known.
+    match succinctly::yaml::validate::Validator::new(input).validate() {
         Ok(()) => None,
         Err(err) => {
             print_yaml_validation_error(&err, input, filename);
@@ -1591,7 +1597,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sorted,
             collapse,
         } => {
-            let mut keys = effective_keys(&fields, collapse);
+            let mut keys = materialized!(effective_keys(&fields, collapse));
             if sorted {
                 keys.sort();
             }
