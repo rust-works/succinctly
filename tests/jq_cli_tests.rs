@@ -16266,6 +16266,82 @@ fn test_jq_malformed_object_raises_however_the_value_is_reached_1194() -> Result
     Ok(())
 }
 
+/// #1194: a **non-string key** raises from every route a trailing orphan
+/// does.
+///
+/// The two faults reach different checks -- a bad key is caught per field,
+/// an orphan only once the walk ends and asks `ends_unpaired` -- so the
+/// tests around this one, which all use `{invalid}`, exercise only the
+/// second. `{123: 1, "b": 2}` is the first, and it is the shape whose
+/// symptom this issue opened on: `length` said 2 while `keys` listed one
+/// name.
+#[test]
+fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()> {
+    let input = r#"{123: 1, "b": 2}"#;
+    for args in [
+        &["-c", "."][..],
+        &["-c", "length"][..],
+        &["-c", "keys"][..],
+        &["-c", "to_entries"][..],
+        &["-c", "map_values(.)"][..],
+        &["-c", "-s", "."][..], // --slurp: the owned `to_owned` family
+        &["-c", "-S", "."][..], // --sort-keys: ditto
+        &["-c", "-a", "."][..], // --ascii-output: ditto
+        &["-c", "., ."][..],    // loses its cursor to `Many`
+    ] {
+        let (out, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("jq: error"),
+            "{args:?} must report in jq's channel: {stderr:?}"
+        );
+        // The strict validator's own diagnosis of *this* fault, not the
+        // orphan wording -- getting the cause right is half the fix.
+        assert!(
+            stderr.contains("expected string key"),
+            "{args:?}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1194: every spelling of "how many members does this object have"
+/// agrees.
+///
+/// `length` and `keys | length` reach `effective_len` by different routes
+/// -- `Builtin::Length`'s object arm and `fold_lazy_keys_stage`'s -- and
+/// while only the first was checked, `{invalid} | length` raised at exit 5
+/// while `{invalid} | keys | length` answered `0` at exit 0. That is the
+/// same one-document-two-answers split #1385's postmortem names, which is
+/// what this issue exists to remove, so a fix that leaves it standing has
+/// only moved it one pipe stage along.
+#[test]
+fn test_jq_malformed_object_length_agrees_across_spellings_1194() -> Result<()> {
+    for input in ["{invalid}", r#"{123: 1, "b": 2}"#, r#"{invalid, "b":2}"#] {
+        for filter in ["length", "keys | length", "keys_unsorted | length"] {
+            let (out, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(
+                code, 5,
+                "{input} | {filter}: out: {out:?}, stderr: {stderr:?}"
+            );
+        }
+    }
+
+    // And they still agree on a *well-formed* object, including one whose
+    // duplicate key collapses -- the check rides the census walk, so a
+    // mistake there would show up as a wrong count, not just a wrong exit.
+    for (input, expected) in [(r#"{"a":1,"b":2}"#, "2"), (r#"{"a":1,"b":2,"a":3}"#, "2")] {
+        for filter in ["length", "keys | length", "keys_unsorted | length"] {
+            let (out, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(code, 0, "{input} | {filter}: stderr: {stderr:?}");
+            assert_eq!(out.trim(), expected, "{input} | {filter}");
+        }
+    }
+
+    Ok(())
+}
+
 /// #1194 stays out of #966's way: a malformed *number* nested inside an
 /// already-recognized container still degrades to `null` at exit 0. This
 /// fix is about object member *structure*, not number grammar, and the two

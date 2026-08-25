@@ -22,9 +22,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, collapsed_fields_if, effective_fields, effective_keys, effective_len,
-    DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
-    IndentSpec,
+    collapsed_fields, collapsed_fields_if, effective_fields, effective_keys, effective_len_checked,
+    key_is_malformed, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, collapse_vec, eval as full_eval, eval_each_owned,
@@ -125,21 +125,28 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
 /// does not -- a key that will not stringify, or a child with nothing to pair
 /// it with (#1194). `None` when every member is well formed.
 ///
-/// For callers whose own return type is infallible (`DocumentFields::len`) but
-/// whose *caller* has an error channel. One key-only walk, and only where the
-/// caller was going to walk anyway -- `ends_unpaired` alone is O(1) but sees
-/// only a trailing orphan, never a bad key.
+/// For a caller that has an error channel but no walk of its own to hang the
+/// check on -- `to_entries`, whose `effective_fields` reports an unpaired
+/// trailing child as plain exhaustion. A key-only walk, negligible there next
+/// to materializing every value, which that builtin does anyway.
+///
+/// `length` deliberately does **not** use this: it reaches
+/// [`effective_len_checked`], which folds the same check into the walk it was
+/// already making. A pre-check in front of that call measured +64% on a 20 MB
+/// `wide` document, and answered only for the `length` spelling -- never
+/// `keys | length`, which reaches `effective_len` by a different route.
+///
+/// `ends_unpaired` alone would be O(1), but it sees only a trailing orphan,
+/// never a bad key.
 fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
     let mut walk = fields.clone();
     while let Some((key, _cursor, rest)) = walk.uncons_key() {
-        // A key that fails to *decode* has no stringified name either, but it
-        // is #1247's failure, not #1194's, and the two want opposite answers:
-        // an undecodable key is deliberately preserved verbatim in places
-        // (#1385's "a key that will not decode is never a duplicate"), while a
-        // key the grammar never allowed must raise. Leave decode failures to
-        // the `string_decode_error` checks that already surround this, or this
-        // walk hijacks them and reports the wrong cause.
-        if key.string_decode_error().is_none() && key.key_string().is_none() {
+        // `key_is_malformed` rather than a `key_string().is_none()` test
+        // written out here: it is the one definition of the distinction
+        // between #1194's structurally-impossible key and #1247's merely
+        // undecodable one, which want opposite answers and which the first
+        // cut of this function conflated. See its own doc comment.
+        if key_is_malformed(&key) {
             return Some(walk.malformed_member_error());
         }
         walk = rest;
@@ -3013,13 +3020,23 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         //
         // Order-independent for both `keys` and
         // `keys_unsorted` — the one fast path #683 adds for
-        // sorted `keys`. `effective_len` counts distinct keys
-        // in one walk without materializing the field list,
-        // and is `fields.len()` outright when `collapse` is
-        // false.
-        Expr::Builtin(Builtin::Length) => {
-            GenericResult::Owned(OwnedValue::Int(effective_len(&fields, collapse) as i64))
-        }
+        // sorted `keys`. `effective_len_checked` counts
+        // distinct keys in one walk without materializing the
+        // field list, and is a plain counting walk outright
+        // when `collapse` is false.
+        //
+        // `_checked` for the same reason `Builtin::Length`'s own object arm
+        // uses it: this is the *other* spelling of "how many members does
+        // this object have", and while it answered from the unchecked
+        // `effective_len`, `{invalid} | length` raised while `{invalid} |
+        // keys | length` said `0` -- the two-answers-for-one-document split
+        // #1385's postmortem names, reintroduced one pipe stage further
+        // along. The check costs nothing extra: it rides that same walk
+        // (#1194).
+        Expr::Builtin(Builtin::Length) => match effective_len_checked(&fields, collapse) {
+            Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
+            Err(err) => GenericResult::Error(err),
+        },
         // Document order is a valid answer only for
         // `keys_unsorted`. `keys` needs lexicographic order
         // for these and falls through to the shared
@@ -5741,18 +5758,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // #1194: `effective_len` counts a member whose key never
                 // stringifies (`census`'s `unkeyed`), so `length` answered 1
                 // for `{invalid: 1}` while `keys` listed none. Refuse rather
-                // than pick one of two wrong numbers. `len` is infallible by
-                // design -- the error channel is here, where the builtin
-                // already has one.
-                if let Some(err) = malformed_object_member(&fields) {
-                    return GenericResult::Error(err);
-                }
+                // than pick one of two wrong numbers.
+                //
+                // `_checked` rather than a guard in front of the call: the
+                // check rides the census walk this already makes, and it is
+                // shared with the `keys | length` spelling in
+                // `fold_lazy_keys_stage`, which reaches `effective_len` by a
+                // route no guard here can see.
+                //
                 // Distinct keys in jq mode (#1385) -- `{"a":1,"a":2}|length`
                 // is 1, because the object jq built only ever had one member.
-                GenericResult::Owned(OwnedValue::Int(effective_len(
-                    &fields,
-                    S::COLLAPSE_DUPLICATE_KEYS,
-                ) as i64))
+                match effective_len_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                    Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
+                    Err(err) => GenericResult::Error(err),
+                }
             } else if let Some(i) = value.as_i64() {
                 // checked_abs: i64::MIN has no i64 absolute value; use f64
                 GenericResult::Owned(match i.checked_abs() {
@@ -5886,6 +5905,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // `continue` here was #1194's third drop site: an entry
                     // vanished from the array while `length` still counted
                     // the member it came from.
+                    //
+                    // Unreachable as it stands -- `malformed_object_member`
+                    // above has already proved every key stringifies -- but
+                    // `key_str` is an `Option` and something has to be
+                    // written here. Report the same cause rather than invent
+                    // a second one, so that if the pre-check is ever moved
+                    // this arm is still right rather than merely quiet.
                     let Some(key) = field.key_str() else {
                         return GenericResult::Error(fields.malformed_member_error());
                     };
@@ -12882,5 +12908,40 @@ mod tests {
             malformed_object_member(&fields).is_none(),
             "an undecodable key is #1247's fault, not #1194's"
         );
+    }
+
+    /// #1194: both materializing conversions raise on a non-string key.
+    ///
+    /// Driven directly rather than through a filter because these two are
+    /// copies of each other reached from different domains -- `to_owned`
+    /// from a value, `to_owned_cursor` from a cursor -- and which one a
+    /// given CLI invocation lands on depends on the filter's shape, so a
+    /// filter-level test cannot pin *both* arms on purpose. Both were
+    /// uncovered when this check was added; a fix that moved only one would
+    /// leave the value and cursor domains disagreeing about whether the same
+    /// document is valid.
+    ///
+    /// The orphan half (`{invalid}`) is exercised by the CLI tests; this is
+    /// the bad-key half, which reaches the other check entirely.
+    #[test]
+    fn test_both_owned_conversions_raise_on_non_string_key_1194() {
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let value_err = to_owned(&cursor.value()).expect_err("the value domain must raise");
+        let cursor_err = to_owned_cursor(&cursor).expect_err("the cursor domain must raise");
+
+        for err in [&value_err, &cursor_err] {
+            assert!(
+                err.message.contains("expected string key"),
+                "message: {}",
+                err.message
+            );
+        }
+        // One document, one cause, however it is reached -- the reason
+        // `malformed_member_error` is a method rather than a literal per
+        // call site.
+        assert_eq!(value_err.message, cursor_err.message);
     }
 }
