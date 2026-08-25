@@ -527,6 +527,38 @@ drawn at the printer deliberately, and
 `test_preserve_input_duplicate_keys_are_output_only_1385` pins both halves so it cannot
 drift silently.
 
+**A malformed object member is caught when it is read, not when the document is.** The
+semi-index recovers an object's members by pairing the container's parenthesis-tree children
+two at a time; `:` and `,` carry the same (absent) meaning to it, so `{invalid: 1}` indexes
+exactly as `{"a":1}` does, and neither the key's type nor the child count's parity is
+checked while indexing. Reading such a member raises `Invalid JSON text: <the strict
+validator's own reason>` and exits 5, matching jq's exit code — but only once something
+actually reads it:
+
+```
+$ echo '{"ok":1,"x":{bad}}' | jq  .ok        # parse error: Invalid numeric literal, exit 5
+$ echo '{"ok":1,"x":{bad}}' | sjq .ok        # 1, exit 0
+$ echo '{invalid}' | jq  empty               # parse error, exit 5
+$ echo '{invalid}' | sjq empty               # no output, exit 0
+```
+
+jq builds a DOM before the program runs, so it rejects the document whatever the filter is.
+Reproducing that means validating every document up front, which costs roughly a second
+index-building pass over the input — the whole advantage this crate is built for. `--validate`
+is the opt-in form for callers who want it (exit 3, its own separately-pinned code).
+
+Two consequences worth stating plainly. A **truncated array** can reach stdout alongside the
+exit 5 from `keys_unsorted` over an object with a non-string key: that writer streams and
+cannot rewind, and pre-checking would mean a second walk over every key on a path
+`scripts/perf-guard.py` measures. The identity printer has no such limit — it checks inside a
+walk it was already making, so a malformed object emits nothing at all. And **`--preserve-input`
+still echoes the malformed text verbatim**, since reproducing the input byte-for-byte is that
+flag's entire purpose.
+
+Only the *object member* half of this is closed. A bareword in **value** position
+(`[xyz123]` → `[null]`) still degrades silently; it reaches a different swallow point, in the
+infallible `to_owned`/`cursor_to_owned` family. See #1194 and #1247.
+
 **A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
 validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects
 outright with `Invalid escape` / `Invalid \uXXXX\uXXXX surrogate pair escape` — still
