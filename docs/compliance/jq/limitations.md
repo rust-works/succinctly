@@ -561,9 +561,10 @@ them. Anything that first materializes an `OwnedValue` goes through the infallib
 `to_owned`/`cursor_to_owned` family, where the member has already been dropped before any
 printer sees it — so it degrades quietly.
 
-That boundary is drawn by **the filter's shape, not just which builtin is called**. Anything
-that costs the value its cursor — a comma, an `if`, `--slurp`, `--sort-keys`, `to_entries` —
-lands on the quiet side:
+Two separate things push a run onto the quiet side.
+
+**The filter's shape.** Anything that costs the value its cursor — a comma, an `if` — hands
+the printer an `OwnedValue` instead:
 
 ```
 $ echo '{invalid}' | sjq -c .                     # error, exit 5
@@ -572,12 +573,27 @@ $ echo '{invalid}' | sjq -c 'select(true)'        # error, exit 5   (still a cur
 $ echo '{invalid}' | sjq -c ., .                  # {} {}, exit 0   (comma -> Many)
 $ echo '{invalid}' | sjq -c 'if .a then 1 else . end'   # {}, exit 0
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys, length' # ["b"] then 2, exit 0
-$ echo '{123: 1, "b": 2}' | sjq -c -s .           # [{"b":2}], exit 0
 ```
 
 This is the same cursor-vs-owned split that already governs anchor and comment preservation
 in yq mode (ADR-0017; a multi-result filter loses its cursor to `GenericResult::Many`), now
 visible on the jq side too.
+
+**A flag that disables the lazy path.** `can_use_lazy_path` (`jq_runner.rs`) is false for
+`--slurp`, `--raw-input`, `--input-dsv`, `--seq`, `--sort-keys`, colour output,
+**`--ascii-output`**, and any use of the `input`/`inputs` builtins. Any one of them routes the
+whole run through `parse_json_stream` and the infallible family, so even a plain identity
+query stops raising:
+
+```
+$ echo '{invalid}' | sjq -c .        # error, exit 5
+$ echo '{invalid}' | sjq -c -a .     # {}, exit 0   <- -a is a formatting flag, but it
+$ echo '{invalid}' | sjq -c -S .     # {}, exit 0      disables the lazy path outright
+$ echo '{invalid}' | sjq -c -s .     # [{}], exit 0
+```
+
+`-a` is the surprising one: nothing about ASCII escaping suggests it should change whether a
+document is accepted.
 
 So `length` and `keys` can still disagree about how many members an object has
 (`{invalid: 1}` counts 1 and lists none), which is the failure mode #1385's own postmortem
