@@ -1018,22 +1018,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// hand, and 7 of the 8 used `self.peek().map_or('\0', |b| b as char)`
     /// -- a Latin-1 cast, not a real UTF-8 decode, so a multi-byte character
     /// at the offending position rendered as mojibake instead of itself.
-    /// Decodes via [`crate::text::utf8::decode_code_point`] instead,
+    /// Decodes via [`text::utf8::decode_char_at`] instead, which (#1422)
+    /// generalized this function's own three-way fallback logic into a
+    /// shared primitive `yaml/validate.rs` and `json/validate.rs` also use,
     /// against the byte slice starting at `offset` (not just the one byte
     /// `self.peek()`/`self.input[offset]` would give, which isn't enough to
     /// decode a multi-byte sequence).
-    ///
-    /// Three cases, matching the old per-site fallbacks exactly rather than
-    /// collapsing them together: true EOF (`offset` past the end) is `'\0'`,
-    /// same as the old `self.peek().map_or('\0', ...)`. A byte that *is*
-    /// present but doesn't decode as valid UTF-8 there (a lone continuation
-    /// byte, an invalid lead byte, or a sequence truncated by EOF) falls
-    /// back to the old Latin-1 cast of that one byte, not `'\0'` -- an
-    /// earlier version of this helper used `'\0'` for this case too, which
-    /// silently embedded a literal NUL byte into the error string for any
-    /// malformed (not just missing) input, something the old per-site code
-    /// never did (a raw byte cast never fails). Only a byte that decodes
-    /// correctly gets the real, corrected character.
     ///
     /// Takes `offset` explicitly rather than reading `self.pos`: the one
     /// site with a genuinely different call shape
@@ -1041,8 +1031,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// via a local scan cursor, before `self.pos` itself has advanced past
     /// it.
     ///
-    /// The `None` (true-EOF) arm carries no coverage from any test, before
-    /// or after this helper's own introduction: two of the 8 call sites
+    /// The `None`/true-EOF fallback inside `decode_char_at` carries no
+    /// coverage from any test reaching *this* function, before or after
+    /// #1187's introduction of it: two of the 8 call sites
     /// (`parse_flow_sequence_inner`/`parse_flow_mapping_inner`'s comma
     /// checks) have their own dedicated `self.peek().is_none()` ->
     /// `YamlError::UnexpectedEof` guard immediately before reaching this
@@ -1053,18 +1044,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// rigor as `parse_block_scalar_header`'s catch-all below, so kept as a
     /// real (not `unreachable!()`) fallback rather than a proven-dead one.
     fn err_unexpected_char(&self, offset: usize, context: &'static str) -> YamlError {
-        let char = match self.input.get(offset) {
-            None => '\0',
-            Some(&byte) => self
-                .input
-                .get(offset..)
-                .and_then(text::utf8::decode_code_point)
-                .and_then(|(cp, _len)| char::from_u32(cp))
-                .unwrap_or(byte as char),
-        };
         YamlError::UnexpectedCharacter {
             offset,
-            char,
+            char: text::utf8::decode_char_at(self.input, offset),
             context,
         }
     }
