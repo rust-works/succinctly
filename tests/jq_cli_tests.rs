@@ -21591,3 +21591,25 @@ fn test_raw_input_still_substitutes_under_validate_1247() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1591's own repro, write side (the read/`path()` side is pinned by
+/// `test_fold_register_accepts_variable_snapshot_through_combinators_1591`
+/// in `src/jq/eval.rs`'s unit tests). `recurse`'s `if . == $x then .a else
+/// $x end` visits `.a`'s value, whose `else` branch hands back `$x`'s own
+/// frozen value with no navigation — a `resolve_recurse` seed/child-queueing
+/// bug (three sites) dropped that mark, and separately `select` had no
+/// ambient `snapshot` parameter to inherit it from at all, so the value
+/// reaching `FoldRegister::identical` looked indistinguishable from a
+/// reconstruction and the whole path was refused where jq accepts and
+/// writes. Confirmed live against jq 1.7.1: `9` on stdout, exit 0, the
+/// document replaced by the write.
+#[test]
+fn test_jq_recurse_select_write_through_tracked_var_snapshot_1591() -> Result<()> {
+    let filter = "(. as $x | reduce (1) as $i (.; \
+                   limit(3; recurse(if . == $x then .a else $x end)) | \
+                   select(. == $x))) |= 9";
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"v":1}}"#))?;
+    assert_eq!(stdout.trim(), "9", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    Ok(())
+}
