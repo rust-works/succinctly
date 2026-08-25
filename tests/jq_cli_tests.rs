@@ -2201,6 +2201,27 @@ fn test_arithmetic_compare_cartesian_fanout_error_and_break_issue_768() -> Resul
 }
 
 #[test]
+fn test_arithmetic_mod_reached_through_lazy_eval_each_1481() -> Result<()> {
+    // `eval_each`'s own `Expr::Arithmetic` arm (#1481) is a *second* copy of
+    // the `ArithOp` match, textually distinct from `eval_arithmetic`'s (the
+    // one a bare top-level `%` reaches) -- it only runs when arithmetic sits
+    // inside a lazy consumer built by `eval.rs`'s own evaluator, which the
+    // default CLI path only reaches once a filter touches `input`/`inputs`
+    // (`eval_generic.rs`'s `takes_input_queue_bridge` gate, #1504). Every
+    // other `ArithOp` arm there already had coverage; only `Mod` didn't.
+    //
+    // Ordering here is the same right-outer/left-inner fanout as `Compare`
+    // (verified against the pinned oracle): `input` (bridging in and
+    // consuming the 2nd stdin document, since the 1st is already `.` for
+    // this top-level iteration) prints first, then the four `(10,7) %
+    // (3,2)` pairings.
+    let (stdout, _, code) = run_jq_full(&["-c", "input, ((10,7) % (3,2))"], Some("1\n2\n"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "2\n1\n1\n0\n1\n");
+    Ok(())
+}
+
+#[test]
 fn test_array_construction() -> Result<()> {
     let (output, code) = run_jq_stdin("[.a, .b, .c]", r#"{"a":1,"b":2,"c":3}"#, &["-c"])?;
     assert_eq!(code, 0);
