@@ -2930,57 +2930,130 @@ fn test_duplicate_keys_lazy_keys_fast_paths_1385() -> Result<()> {
     Ok(())
 }
 
-/// #1599: `each_lazy_keys_iterate_sink`'s `keys_unsorted` arm streams
-/// `DistinctKeyCursors` rather than running a whole-object `census` and
-/// collecting every key cursor before driving the first element. The
-/// sequence must be unchanged, which is what these pin -- the arm is only
-/// reachable through a *demand-aware* fan-out (`first`/`limit` wrapping
-/// `keys_unsorted | .[] | f`), so `test_duplicate_keys_lazy_keys_fast_paths_1385`
-/// above, which drives `fold_lazy_keys_stage`'s collecting arms, does not
-/// cover it.
+/// #1599: the `keys_unsorted` arms that no longer run a whole-object
+/// `census` before answering -- `each_lazy_keys_iterate_sink` (which now
+/// streams `DistinctKeyCursors` instead of collapsing-then-collecting) and
+/// `fold_lazy_keys_stage`'s new `.[0]` arm.
 ///
-/// `mid` is the case that matters: its duplicate sits at the *fourth*
-/// field, past three distinct keys already yielded. Streaming only learns
-/// of it on reaching it, and `DistinctKeyCursors` responds by switching to
-/// the exact collapsed list and resuming at the count already emitted -- so
-/// a consumer that stops before the repeat, exactly at it, or past it must
-/// all agree with jq. Every expectation below is jq 1.7.1's own output.
+/// **Reaching the streaming arm takes care.** It is used only for a
+/// `.[]` stage driven by a *demand-aware* consumer, which in practice
+/// means `first(...)`: `limit(n; ...)` does not route through it (its
+/// elements arrive as owned strings, not cursors), and a collecting
+/// `[keys_unsorted | .[]]` takes `fold_lazy_keys_stage`'s `Expr::Iterate`
+/// arm instead. So only the `first(...)` rows below actually exercise the
+/// rewrite; the others are here to pin that the *other* paths kept their
+/// answers, which is the property that makes this a cost change.
+///
+/// The `select(...)` rows are the ones that matter most: a bare
+/// `first(keys_unsorted | .[])` stops after a single element, so it never
+/// reaches `DistinctKeyCursors`'s repeat handling at all. A predicate that
+/// does not match until *after* the duplicate forces the walk through
+/// `collapse_confirmed_repeat` and its resume-at-`yielded` path -- the one
+/// branch of the rewrite that can reorder or drop a key if it is wrong.
+///
+/// Every expectation is jq 1.7.1's own output.
 #[test]
 fn test_lazy_keys_demand_sink_streams_collapse_1599() -> Result<()> {
     // Duplicate at the head: the very first key is the repeated one.
     let head = r#"{"b":1,"a":2,"b":3}"#;
     for (filter, expected) in [
+        // -- reaches the streaming arm --
         ("first(keys_unsorted | .[])", r#""b""#),
-        ("[limit(1; keys_unsorted | .[])]", r#"["b"]"#),
+        // Walks the whole object without matching: the repeat is reached
+        // and resolved, and still nothing is emitted.
+        ("[first(keys_unsorted | .[] | select(. == \"zzz\"))]", "[]"),
+        // Matches only the key *after* the duplicate.
+        ("first(keys_unsorted | .[] | select(. == \"a\"))", r#""a""#),
+        // -- other paths, pinned to the same answers --
         ("[limit(2; keys_unsorted | .[])]", r#"["b","a"]"#),
-        // Past the end of the collapsed object: still only two keys.
         ("[limit(9; keys_unsorted | .[])]", r#"["b","a"]"#),
         ("[keys_unsorted | .[] | .]", r#"["b","a"]"#),
-        // A non-empty `rest` after the iterate, so the driver threads each
-        // streamed cursor through a real downstream stage.
-        ("first(keys_unsorted | .[] | ascii_downcase)", r#""b""#),
+        // `.[0]`'s own no-census arm, and the neighbours that must keep
+        // paying for one: a repeated key makes them differ.
+        ("keys_unsorted | .[0]", r#""b""#),
+        ("keys_unsorted | .[1]", r#""a""#),
+        ("keys_unsorted | .[-1]", r#""a""#),
+        ("keys_unsorted | .[9]", "null"),
+        ("keys | .[0]", r#""a""#),
     ] {
         let (out, _, code) = run_jq_full(&["-c", filter], Some(head))?;
         assert_eq!(code, 0, "filter {filter}");
         assert_eq!(out.trim(), expected, "filter {filter}");
     }
 
-    // Duplicate mid-stream: "a" repeats only as the fourth field.
+    // Duplicate mid-stream: "a" repeats only as the fourth field, so a
+    // consumer has already been handed three keys before the collapse is
+    // discovered.
     let mid = r#"{"a":1,"b":2,"c":3,"a":4,"d":5}"#;
     for (filter, expected) in [
         ("first(keys_unsorted | .[])", r#""a""#),
-        // Stops before the repeat is ever reached.
-        ("[limit(3; keys_unsorted | .[])]", r#"["a","b","c"]"#),
-        // Crosses it: this is the switch-and-resume branch.
-        ("[limit(4; keys_unsorted | .[])]", r#"["a","b","c","d"]"#),
-        ("[limit(5; keys_unsorted | .[])]", r#"["a","b","c","d"]"#),
+        // Stops before the repeat is reached.
+        ("first(keys_unsorted | .[] | select(. == \"b\"))", r#""b""#),
+        // Lands exactly on the field that repeats.
+        ("first(keys_unsorted | .[] | select(. == \"c\"))", r#""c""#),
+        // Past it: this is the switch-and-resume branch. "d" is only
+        // reachable by continuing correctly *through* the collapse.
+        ("first(keys_unsorted | .[] | select(. == \"d\"))", r#""d""#),
+        // Never matches, so the walk runs to completion through the repeat.
+        ("[first(keys_unsorted | .[] | select(. == \"zzz\"))]", "[]"),
+        // A downstream stage that actually transforms, so an empty or
+        // dropped `rest` could not pass: the key is a string, not a number.
+        ("first(keys_unsorted | .[] | length)", "1"),
         ("[keys_unsorted | .[] | .]", r#"["a","b","c","d"]"#),
+        ("keys_unsorted | .[0]", r#""a""#),
+        ("keys_unsorted | .[3]", r#""d""#),
         ("keys_unsorted | length", "4"),
     ] {
         let (out, _, code) = run_jq_full(&["-c", filter], Some(mid))?;
         assert_eq!(code, 0, "filter {filter}");
         assert_eq!(out.trim(), expected, "filter {filter}");
     }
+
+    // An uppercase key proves the trailing stage is really applied, which
+    // a lowercase one could not: without `rest` the answer would be "B".
+    let upper = r#"{"B":1,"a":2}"#;
+    let (out, _, code) = run_jq_full(
+        &["-c", "first(keys_unsorted | .[] | ascii_downcase)"],
+        Some(upper),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#""b""#);
+
+    Ok(())
+}
+
+/// #1599: the cursor a collapsed duplicate key reports moved, and this
+/// pins where it landed.
+///
+/// The old collapse-then-collect path built its cursors from
+/// `collapse_repeated`, which overwrites the surviving slot with the
+/// *last* occurrence's `key_cursor`, so `first(keys_unsorted | .[] |
+/// column)` on `{"b":1,"a":2,"b":3}` reported column 14 -- the second
+/// `"b"`. Streaming emits the first occurrence, so it now reports 2.
+///
+/// 2 is the answer the collecting path (`[keys_unsorted | .[] | column]`
+/// => `[2,8]`) has always given, so this removes a disagreement between
+/// two spellings of the same query rather than introducing one; it is also
+/// the position jq's own first-occurrence-wins rule points at. Recorded as
+/// a deliberate change because the value is observable through the
+/// position builtins (`column`/`line`) and through `anchor`/`style` in yq
+/// mode, and nothing else pins it.
+#[test]
+fn test_lazy_keys_streaming_reports_first_occurrence_cursor_1599() -> Result<()> {
+    let head = r#"{"b":1,"a":2,"b":3}"#;
+    let (out, _, code) = run_jq_full(&["-c", "first(keys_unsorted | .[] | column)"], Some(head))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2", "streamed cursor is the first occurrence");
+
+    // The collecting path agrees, and always did.
+    let (out, _, code) = run_jq_full(&["-c", "[keys_unsorted | .[] | column]"], Some(head))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,8]");
+
+    // `.[0]`'s no-census arm reports the same position.
+    let (out, _, code) = run_jq_full(&["-c", "keys_unsorted | .[0] | column"], Some(head))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
 
     Ok(())
 }

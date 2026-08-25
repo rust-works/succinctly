@@ -21759,3 +21759,65 @@ fn test_first_over_lazy_prefix_applies_every_stage_1565() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1599: the yq half of `each_lazy_keys_iterate_sink`'s rewrite.
+///
+/// The streaming arm is generic over `S: EvalSemantics` and
+/// `each_lazy_keys_iterate_sink::<YqSemantics, YamlValue>` is a live
+/// monomorphization, so yq exercises it with `collapse = false` -- the
+/// branch where `DistinctKeyCursors` carries no dedup probe at all and
+/// every occurrence of a repeated mapping key must survive. That is the
+/// opposite of jq's rule, and nothing else in the suite pins it through
+/// this path, so a future change that made the streaming arm collapse
+/// unconditionally would pass every jq test while silently dropping YAML
+/// duplicate keys.
+///
+/// `first(...)` is what routes a `.[]` stage into the streaming arm; the
+/// `select(...)` rows keep the walk going past the duplicate rather than
+/// stopping on the first element.
+#[test]
+fn test_lazy_keys_streaming_preserves_yaml_duplicates_1599() -> Result<()> {
+    let dup = "b: 1\na: 2\nb: 3\n";
+
+    // yq keeps every occurrence, unlike jq's first-wins collapse.
+    let (out, code) = run_yq_stdin("[keys | .[]]", dup, &["--jq-extensions", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","a","b"]"#);
+
+    // Through the streaming arm: stops at the first key.
+    let (out, code) = run_yq_stdin(
+        "first(keys | .[])",
+        dup,
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#""b""#);
+
+    // Through the streaming arm, walking the whole mapping without
+    // matching -- so the repeated key is reached, and must not end the
+    // walk early or be treated as a collapse.
+    let (out, code) = run_yq_stdin(
+        "[first(keys | .[] | select(. == \"zzz\"))]",
+        dup,
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+
+    // A mapping whose duplicate sits mid-stream: "d" is only reachable by
+    // continuing correctly through the repeated "a".
+    let mid = "a: 1\nb: 2\nc: 3\na: 4\nd: 5\n";
+    let (out, code) = run_yq_stdin(
+        "first(keys | .[] | select(. == \"d\"))",
+        mid,
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#""d""#);
+
+    let (out, code) = run_yq_stdin("[keys | .[]]", mid, &["--jq-extensions", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["a","b","c","a","d"]"#);
+
+    Ok(())
+}
