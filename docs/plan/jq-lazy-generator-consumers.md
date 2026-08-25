@@ -40,8 +40,9 @@ already be closed by option (c)/#1461's `Pipe` arm by the time this was written;
 argument (`Expr::Compare`), which Stage 2b's sibling walk does not reach; and
 `("A"|stderr) == (("B"|stderr), ("C"|stderr))`, a *top-level* compare, which never reaches
 `eval_each` at all. Both compare shapes are closed as of #1481: `eval_generic.rs` gained its
-own `binary_fanout_each_generic`/`eval_each_generic`-`Expr::Compare`-arm pair, mirroring
-`eval.rs`'s `binary_fanout_each`/`eval_each` machinery, and `eval_single`'s own top-level
+own `binary_fanout_each_generic`, plus native `eval_each_generic` arms for **both**
+`Expr::Compare` and `Expr::Arithmetic`, mirroring `eval.rs`'s
+`binary_fanout_each`/`eval_each` machinery, and `eval_single`'s own top-level
 `Expr::Compare` arm now routes through it instead of a standalone eager loop. #1481 also closed
 a second, distinct gap in the same family: even where a lazy arm already existed
 (`eval.rs`'s `eval_each`), the *eager* callers reaching `Expr::Compare`/`Expr::Arithmetic`
@@ -51,6 +52,28 @@ interleaves them; with `input`/`inputs` operands this changed delivered *values*
 stderr order (`(input) + (input, input)` over `"a" "b" "c" "d"` was `["ca","db"]` instead of
 jq's `["ba","dc"]`). See [issue #1481](https://github.com/rust-works/succinctly/issues/1481)
 for the full repro set and `scripts/jq-fanout-oracle-sweep.sh` for the verification sweep.
+
+**What is still divergent, and where it is pinned.** Five shapes remain, all in
+`test_short_circuit_side_effect_leaks_820_932_987`: `first(...)` over an `Expr::If`, `Try`,
+`Label`, `As` or `Limit`. Those five are the arm set `eval_each_generic` still lacks — it
+has native arms for `Comma`/`Pipe`/`Paren` (option (c)/#1461) and `Compare`/`Arithmetic`
+(#1481) only, so anything else falls to its eager `_` fallback. The same five leak
+identically one level down, as an *operand* of a binary operator
+(`first(10 == (if true then (1, ("B"|stderr)) else 9 end))`), because the operand strategy
+`binary_fanout_each_generic` is handed is `eval_each_generic` itself; the sweep script
+attributes those cases to this same entry rather than pinning 20 more rows that say what the
+five already say. Closing them means mirroring Stage 5's `eval.rs` arm set into
+`eval_generic.rs` — the natural next increment of option (c), not a new mechanism.
+
+**Two lessons from #1481 worth carrying to that increment.** (i) *Both* operators need an
+arm, never just the one the repro used: `Compare` and `Arithmetic` share one loop but
+dispatch through separate `Expr` variants, and a fix that stopped at `Compare` left
+`first(10 + (1, ("B"|stderr)))` leaking while `first(10 == (1, ("B"|stderr)))` no longer did.
+(ii) A sweep's own scaffolding can hide the site it exists to test: wrapping every generated
+filter in `label $o | ...` (so a `break $o` terminator has a target) routes the whole filter
+through `eval_generic.rs`'s wildcard into `eval.rs`, since `Expr::Label` has no native
+`eval_single` arm there — which made an entire 490-case sweep blind to the `eval_generic.rs`
+copy of the loop. The wrapper is now applied to the `break $o` terminator alone.
 
 **One divergence Stage 5's own oracle sweep found and did not attempt.** `?//`-alternatives
 wrapped in a short-circuiting consumer: real jq's builtins are macro-expanded `label $out |
@@ -1169,8 +1192,14 @@ the reasoning behind each placement:
    sibling uses a per-operand hybrid (`eval_each_owned` when an operand doesn't itself need
    path context, the pre-existing eager path when it does); and `eval_generic.rs`'s own
    `Expr::Compare` arm — finding (a) above, `first((1,2) == (10, ("B"|stderr)))` included —
-   was rewired onto a new `binary_fanout_each_generic`/`eval_each_generic`-`Expr::Compare`
-   pair mirroring `eval.rs`'s machinery, closing both findings together.
+   was rewired onto a new `binary_fanout_each_generic` plus native `eval_each_generic` arms
+   for `Expr::Compare` *and* `Expr::Arithmetic`, mirroring `eval.rs`'s machinery, closing
+   both findings together. The `Arithmetic` arm is not decoration: the two variants share
+   one loop but dispatch separately, so with only the `Compare` arm
+   `first(10 + (1, ("B"|stderr)))` still leaked while `first(10 == (1, ("B"|stderr)))` did
+   not. The single `ArithOp` → `arith_*` dispatch all four `combine` sites now share lives
+   in `eval::arith_combine`, the structural twin of `apply_compare_op`; it was written out
+   at three sites before #1481 and would have become five.
 
    **Two things review added afterwards.** (i) #1459's own severity line — "Low (stray
    stderr write; no wrong output, no data loss)" — is true of its `IN(src; s)` repro and
