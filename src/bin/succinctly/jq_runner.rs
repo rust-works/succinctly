@@ -1170,7 +1170,6 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 let results = evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink);
 
                 // Consume results to free memory after each value is written
-                let mut malformed = false;
                 for result in results {
                     had_output = true;
                     // For exit_status tracking, we need to check the last value
@@ -1179,24 +1178,22 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     }
                     // A malformed document is a data error, not an I/O one: it
                     // belongs in jq's diagnostic channel (exit 5) rather than
-                    // aborting the process through `anyhow` (#1194). The rest
-                    // of the stream is still processed, per #355 -- real jq
-                    // stops at the first parse error instead, a divergence
-                    // recorded in `docs/compliance/jq/limitations.md`.
+                    // aborting the process through `anyhow` (#1194). Stop
+                    // emitting results for *this* document, but fall through
+                    // to the halt check below and carry on with the rest of
+                    // the stream (#355) -- real jq stops at the first parse
+                    // error instead, a divergence recorded in
+                    // `docs/compliance/jq/limitations.md`.
                     if let Err(e) = write_output_jq_value(&mut out, &result, &output_config) {
                         match e.downcast_ref::<MalformedJsonError>() {
                             Some(MalformedJsonError(err)) => {
                                 sink.report(DiagStyle::Jq, err, &at);
-                                malformed = true;
                                 break;
                             }
                             None => return Err(e),
                         }
                     }
                     // result is dropped here, freeing its memory immediately
-                }
-                if malformed {
-                    continue;
                 }
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process.
@@ -3115,6 +3112,13 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
 /// array/object children stay lazy (`JqValue::Cursor`) rather than
 /// recursively converting -- a decode failure nested deeper is caught later,
 /// if and when that child cursor is itself materialized.
+///
+/// Also errors (#1194) on a *structurally* malformed member -- a key that is
+/// not a string, or a child with no sibling to pair as its value. That is a
+/// different failure from a decode failure: the text was never `key: value`,
+/// and the semi-index accepted it only because bracket matching did.
+/// `parent_cursor` supplies the document text the strict validator re-reads
+/// to name the error; it was unused before that.
 fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     parent_cursor: &JsonCursor<'a, W>,

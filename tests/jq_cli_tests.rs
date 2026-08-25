@@ -15973,6 +15973,38 @@ fn test_jq_malformed_object_in_stream_keeps_good_documents_1194() -> Result<()> 
     Ok(())
 }
 
+/// #1194: pins where the fix stops, so the boundary is explicit rather than
+/// accidental.
+///
+/// A value that keeps its cursor reaches a printer that checks; one that has
+/// been materialized into an `OwnedValue` went through the infallible
+/// `to_owned`/`cursor_to_owned` family, which dropped the malformed member
+/// before any printer saw it. The filter's *shape* decides which -- a comma
+/// or an `if` costs the value its cursor -- the same cursor-vs-owned split
+/// ADR-0017 already describes for yq's anchor preservation.
+///
+/// Closing this needs that family to become fallible, which is #1247's
+/// architectural change, not this one's. If a later fix makes these raise,
+/// this test should be inverted and the matching section of
+/// `docs/compliance/jq/limitations.md` deleted.
+#[test]
+fn test_jq_malformed_object_still_quiet_once_materialized_1194() -> Result<()> {
+    // Keeps its cursor: raises.
+    for filter in [".", "(.)", "select(true)"] {
+        let (out, _stderr, code) = run_jq_full(&["-c", filter], Some("{invalid}"))?;
+        assert_eq!(code, 5, "{filter} should raise; out: {out:?}");
+    }
+
+    // Loses its cursor: still quiet, and this is the documented gap.
+    for filter in ["., .", "if .a then 1 else . end"] {
+        let (out, _stderr, code) = run_jq_full(&["-c", filter], Some("{invalid}"))?;
+        assert_eq!(code, 0, "{filter}: out: {out:?}");
+        assert!(out.contains("{}"), "{filter}: out: {out:?}");
+    }
+
+    Ok(())
+}
+
 /// #1194 stays out of #966's way: a malformed *number* nested inside an
 /// already-recognized container still degrades to `null` at exit 0. This
 /// fix is about object member *structure*, not number grammar, and the two

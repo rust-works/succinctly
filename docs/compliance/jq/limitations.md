@@ -555,18 +555,29 @@ walk it was already making, so a malformed object emits nothing at all. And **`-
 still echoes the malformed text verbatim**, since reproducing the input byte-for-byte is that
 flag's entire purpose.
 
-**Which surfaces raise, precisely.** The two that write JSON straight from the cursor do —
-the identity printer and `keys_unsorted` — as do the two `Result`-returning materializers
-behind them. Everything that materializes through the infallible `to_owned` /
-`cursor_to_owned` family still degrades quietly, and on the same document:
+**Which surfaces raise, precisely.** Only the ones that write JSON straight from a *cursor*:
+the identity printer and `keys_unsorted`, plus the two `Result`-returning materializers behind
+them. Anything that first materializes an `OwnedValue` goes through the infallible
+`to_owned`/`cursor_to_owned` family, where the member has already been dropped before any
+printer sees it — so it degrades quietly.
+
+That boundary is drawn by **the filter's shape, not just which builtin is called**. Anything
+that costs the value its cursor — a comma, an `if`, `--slurp`, `--sort-keys`, `to_entries` —
+lands on the quiet side:
 
 ```
-$ echo '{123: 1, "b": 2}' | sjq -c .                # error, exit 5
-$ echo '{123: 1, "b": 2}' | sjq -c keys_unsorted    # error, exit 5
-$ echo '{123: 1, "b": 2}' | sjq -c to_entries       # [{"key":"b","value":2}], exit 0
-$ echo '{123: 1, "b": 2}' | sjq -c 'keys, length'   # ["b"] then 2, exit 0
-$ echo '{123: 1, "b": 2}' | sjq -c -s .             # [{"b":2}], exit 0
+$ echo '{invalid}' | sjq -c .                     # error, exit 5
+$ echo '{invalid}' | sjq -c '(.)'                 # error, exit 5   (still a cursor)
+$ echo '{invalid}' | sjq -c 'select(true)'        # error, exit 5   (still a cursor)
+$ echo '{invalid}' | sjq -c ., .                  # {} {}, exit 0   (comma -> Many)
+$ echo '{invalid}' | sjq -c 'if .a then 1 else . end'   # {}, exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys, length' # ["b"] then 2, exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c -s .           # [{"b":2}], exit 0
 ```
+
+This is the same cursor-vs-owned split that already governs anchor and comment preservation
+in yq mode (ADR-0017; a multi-result filter loses its cursor to `GenericResult::Many`), now
+visible on the jq side too.
 
 So `length` and `keys` can still disagree about how many members an object has
 (`{invalid: 1}` counts 1 and lists none), which is the failure mode #1385's own postmortem
