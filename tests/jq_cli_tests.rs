@@ -16134,33 +16134,47 @@ fn test_jq_keys_unsorted_on_malformed_object_errors_1194() -> Result<()> {
     Ok(())
 }
 
-/// #1194: the fix reaches the *lazy* path only, and `can_use_lazy_path`
-/// (`jq_runner.rs`) is what decides that -- eight conditions, any one of
-/// which routes the whole run through `get_inputs`/`parse_json_stream` and
-/// the infallible `to_owned` family instead, where the malformed member has
-/// already been dropped before any printer sees it.
+/// #1194: a malformed member raises whether or not the run takes the lazy
+/// path.
 ///
-/// `-a`/`--ascii-output` is the surprising member of that list: it reads
-/// like a formatting flag, but it disables the lazy path outright, so even a
-/// plain identity query stops raising. Pinned so the boundary is a decision
-/// rather than a surprise, and so this test fails loudly when #1247 makes
-/// that family fallible and these start raising too.
+/// `can_use_lazy_path` (`jq_runner.rs`) is false for eight flags, and each
+/// routes the whole run through `get_inputs`/`parse_json_stream` and the
+/// `to_owned` family rather than the cursor-writing printers. Until #1247
+/// made that family fallible, this test asserted those flags **stayed
+/// quiet** — `-a` being the surprising member, a formatting flag that
+/// decided whether a document was accepted. It is inverted here, which is
+/// exactly what it was written to announce.
+///
+/// Exit 5, not 1: these errors reach the `ErrorSink`, not `anyhow`. Getting
+/// that wrong is easy and invisible — the message looks right and only the
+/// exit code and the `Error:`-vs-`jq: error` prefix differ — so both are
+/// asserted.
 #[test]
-fn test_jq_malformed_object_quiet_off_the_lazy_path_1194() -> Result<()> {
-    // On the lazy path: raises.
-    let (_out, _stderr, code) = run_jq_full(&["-c", "."], Some("{invalid}"))?;
+fn test_jq_malformed_object_raises_off_the_lazy_path_1194() -> Result<()> {
+    // On the lazy path.
+    let (_out, stderr, code) = run_jq_full(&["-c", "."], Some("{invalid}"))?;
     assert_eq!(code, 5);
+    assert!(stderr.contains("jq: error"), "stderr: {stderr:?}");
 
-    // Off it: still quiet, and the documented gap.
+    // And off it.
     for args in [
         &["-c", "-a", "."][..], // --ascii-output
         &["-c", "-S", "."][..], // --sort-keys
         &["-c", "-s", "."][..], // --slurp
     ] {
-        let (out, _stderr, code) = run_jq_full(args, Some("{invalid}"))?;
-        assert_eq!(code, 0, "{args:?}: out: {out:?}");
-        assert!(out.contains("{}"), "{args:?}: out: {out:?}");
+        let (out, stderr, code) = run_jq_full(args, Some("{invalid}"))?;
+        assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("jq: error"),
+            "{args:?} must report in jq's channel, not anyhow's: {stderr:?}"
+        );
+        assert!(!out.contains("{}"), "{args:?}: out: {out:?}");
     }
+
+    // A genuine I/O failure still takes the `anyhow` path and exits 1 --
+    // the downcast must separate the two, not swallow everything.
+    let (_out, _stderr, code) = run_jq_full(&["-c", ".", "/nonexistent-file-1194"], None)?;
+    assert_eq!(code, 1, "a missing file is not a document error");
 
     Ok(())
 }
@@ -16219,33 +16233,34 @@ fn test_jq_malformed_object_in_stream_keeps_good_documents_1194() -> Result<()> 
     Ok(())
 }
 
-/// #1194: pins where the fix stops, so the boundary is explicit rather than
-/// accidental.
+/// #1194: the filter's shape no longer decides whether a malformed document
+/// is accepted.
 ///
-/// A value that keeps its cursor reaches a printer that checks; one that has
-/// been materialized into an `OwnedValue` went through the infallible
-/// `to_owned`/`cursor_to_owned` family, which dropped the malformed member
-/// before any printer saw it. The filter's *shape* decides which -- a comma
-/// or an `if` costs the value its cursor -- the same cursor-vs-owned split
-/// ADR-0017 already describes for yq's anchor preservation.
+/// A value that keeps its cursor reaches a printer that checks; one that a
+/// comma or an `if` has materialized into an `OwnedValue` goes through the
+/// `to_owned`/`cursor_to_owned` family instead -- the same cursor-vs-owned
+/// split ADR-0017 describes for yq's anchor preservation. While that family
+/// was infallible this test asserted the two halves **disagreed**, with the
+/// materializing side staying quiet; #1247 made it fallible and this closes
+/// the gap on both sides.
 ///
-/// Closing this needs that family to become fallible, which is #1247's
-/// architectural change, not this one's. If a later fix makes these raise,
-/// this test should be inverted and the matching section of
-/// `docs/compliance/jq/limitations.md` deleted.
+/// Kept rather than folded into the sweep above because the point is the
+/// *pairing*: these filters must agree, and a future change that makes one
+/// path fallible without the other should fail here loudly.
 #[test]
-fn test_jq_malformed_object_still_quiet_once_materialized_1194() -> Result<()> {
-    // Keeps its cursor: raises.
+fn test_jq_malformed_object_raises_however_the_value_is_reached_1194() -> Result<()> {
+    // Keeps its cursor.
     for filter in [".", "(.)", "select(true)"] {
         let (out, _stderr, code) = run_jq_full(&["-c", filter], Some("{invalid}"))?;
         assert_eq!(code, 5, "{filter} should raise; out: {out:?}");
+        assert!(out.trim().is_empty(), "{filter}: out: {out:?}");
     }
 
-    // Loses its cursor: still quiet, and this is the documented gap.
+    // Loses it to a comma or a conditional.
     for filter in ["., .", "if .a then 1 else . end"] {
         let (out, _stderr, code) = run_jq_full(&["-c", filter], Some("{invalid}"))?;
-        assert_eq!(code, 0, "{filter}: out: {out:?}");
-        assert!(out.contains("{}"), "{filter}: out: {out:?}");
+        assert_eq!(code, 5, "{filter}: out: {out:?}");
+        assert!(!out.contains("{}"), "{filter}: out: {out:?}");
     }
 
     Ok(())
