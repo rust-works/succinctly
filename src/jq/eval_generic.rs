@@ -5524,7 +5524,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
             let mut bits = Vec::new();
             let cond_control = push_generic_truthiness(cond_result, &mut bits);
-            let truthy_count = bits.iter().filter(|&&b| b).count();
+            // Under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq, #1613), the
+            // republish count collapses to at most one whenever *any* bit is
+            // truthy, rather than one per truthy bit — `cond` is still
+            // walked to completion either way, so a later error/break in
+            // `cond` still escapes via `cond_control` below with a correctly
+            // truncated `Partial` prefix.
+            let truthy_count = if S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY {
+                usize::from(bits.iter().any(|&b| b))
+            } else {
+                bits.iter().filter(|&&b| b).count()
+            };
 
             // `select` never changes position — every truthy output IS the
             // input node, so forward the incoming cursor (if any) rather
@@ -9373,6 +9383,31 @@ mod tests {
                 ]);
                 2
             ]
+        );
+    }
+
+    #[test]
+    fn test_json_select_yq_collapses_to_at_most_one_1613() {
+        // yq-mode counterpart of the test just above: `Builtin::Select`'s
+        // native arm here (not `eval.rs`'s `eval_fanout`) computes
+        // `truthy_count` directly from the collected bits, so the fix is a
+        // one-line change to that count rather than a per-bit closure -- but
+        // the observable contract is identical: under
+        // `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY`, two truthy elements forward
+        // the outer cursor *once*, not twice. Live-verified against yq
+        // v4.53.3.
+        let json = b"[true,false,true]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse("select(.[])").unwrap();
+
+        let result = eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(json));
+        assert_eq!(
+            result.collect_owned().unwrap(),
+            vec![OwnedValue::Array(vec![
+                OwnedValue::Bool(true),
+                OwnedValue::Bool(false),
+                OwnedValue::Bool(true)
+            ])]
         );
     }
 

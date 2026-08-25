@@ -172,6 +172,22 @@ pub trait EvalSemantics: Copy + Default {
     /// a count `try_reserve_exact` alone would happily allocate (a few
     /// hundred MB, say) still must refuse in yq mode, since real yq does.
     const MAX_STRING_REPEAT_BYTES: Option<u128>;
+    /// If true (yq, #1613), `select(cond)` republishes its input **once** if
+    /// *any* output of a multi-output `cond` is truthy, never duplicated --
+    /// live-verified against yq v4.53.3: `select((true,true))` on `1` yields
+    /// `1`, not `1,1`. `cond` is still evaluated to completion (not
+    /// short-circuited at the first truthy bit), so a later error/break in
+    /// `cond` still escapes after a truthy prefix -- only the *count* of
+    /// republished outputs collapses to at most one, mirroring
+    /// `eval_fanout`'s existing `Partial`-prefix handling exactly.
+    ///
+    /// If false (jq), `select` shares `if/then/else`'s per-truthy-bit fanout
+    /// unconditionally (`eval_fanout`, #378): `select((true,true))` yields
+    /// `1,1`, one republish per truthy output. `eval_if`/`if...end` keeps
+    /// this jq rule regardless of the flag -- yq's lexer rejects
+    /// `if`/`then`/`else` outright, so there is no yq answer for it to
+    /// diverge from.
+    const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -197,6 +213,7 @@ impl EvalSemantics for JqSemantics {
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = None;
+    const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -224,6 +241,7 @@ impl EvalSemantics for YqSemantics {
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = Some(10 * 1024 * 1024);
+    const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -5980,15 +5998,21 @@ fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// A multi-output condition republishes `value` once per truthy output
 /// (`select((false,false) and true)` yields nothing, matching jq — not the
 /// first-output-only answer `vs.first()` used to give) — restored by
-/// `eval_fanout` (#378).
+/// `eval_fanout` (#378). Under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq,
+/// #1613), that per-bit republish collapses to at most one: `already_emitted`
+/// suppresses every truthy bit after the first, while still walking every
+/// bit of `cond` (so a later error/break still escapes `eval_fanout`
+/// normally) and still emitting nothing for a purely-falsy condition.
 fn builtin_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
+    let mut already_emitted = false;
     eval_fanout(cond_result, |truthy| {
-        if truthy {
+        if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
+            already_emitted = true;
             QueryResult::One(value.clone())
         } else {
             QueryResult::None
@@ -17249,10 +17273,23 @@ fn resolve_node<'a, S: EvalSemantics>(
         // Confirmed against jq 1.7.1: `path(select((true, error("x"))))`
         // prints `[]` (the branch for the already-produced `true`) before
         // raising `x`.
+        //
+        // Under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq, #1613) this forking
+        // collapses to at most one branch: live-verified, real yq's
+        // `(.a[] | select((true,true))) |= . + 10` applies the update once
+        // per element (`[11,12,13]`), where the per-truthy-bit fork above
+        // (unpatched) applied it twice (`[21,22,23]`) — the same
+        // value-position bug #1613 found, reached through `resolve_node`'s
+        // independent path-tracking implementation of `select` rather than
+        // `eval_fanout`. `already_emitted` mirrors `builtin_select`'s own
+        // fix; `cond` is still walked to completion, so a later error/break
+        // still escapes with the correct (now-capped) prefix.
         Expr::Builtin(Builtin::Select(cond)) => {
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
+            let mut already_emitted = false;
             resolve_cond_fork(cond_outputs, escape, |truthy, out| {
-                if truthy {
+                if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
+                    already_emitted = true;
                     // `select` filters; it never navigates. The value handed
                     // back is the caller's own, so its trackability is too —
                     // and so is its snapshot mark (#1591): `select` cannot
@@ -19044,7 +19081,7 @@ fn eval_recurse_cond<S: EvalSemantics>(
 fn resolve_cond_fork<'a>(
     cond_outputs: Vec<OwnedValue>,
     cond_escape: Option<EvalEscape>,
-    dispatch: impl Fn(bool, &mut Vec<PathBranch<'a>>) -> Option<EvalEscape>,
+    mut dispatch: impl FnMut(bool, &mut Vec<PathBranch<'a>>) -> Option<EvalEscape>,
 ) -> PathResolveResult<'a> {
     let mut out = Vec::new();
     for c in cond_outputs {
@@ -24503,8 +24540,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
             );
+            // Collapses to at most one republish under yq semantics
+            // (`S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY`, #1613) — same
+            // `already_emitted` shape as the plain evaluator's
+            // `builtin_select`, see its doc comment for the reasoning.
+            let mut already_emitted = false;
             let select_result = eval_fanout(cond_result, |truthy| {
-                if truthy {
+                if truthy && !(S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && already_emitted) {
+                    already_emitted = true;
                     QueryResult::Owned(value.clone())
                 } else {
                     QueryResult::None
@@ -34449,6 +34492,22 @@ mod tests {
             .collect()
     }
 
+    /// Like `outputs`, but evaluates with `YqSemantics` -- for exercising
+    /// evaluator-semantics divergences (not yq-only syntax, which needs
+    /// `yq_query!`'s `ParserMode::Yq` parse instead). Plain `parse` is fine
+    /// here since every filter this feeds it is valid under either parser
+    /// mode; only the `S` type parameter governs which semantics run.
+    fn outputs_yq(json: &[u8], filter: &str) -> Vec<String> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(filter).unwrap();
+        eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect()
+    }
+
     // `eval_owned_multi`'s cardinality-preserving contract (#570), exercised
     // directly rather than through any of the four call sites it was filed to
     // unblock — `eval_owned_expr` collapses a multi-output result into a
@@ -38024,6 +38083,84 @@ mod tests {
         assert!(outputs(b"1", "select((false,false) and true)").is_empty());
         assert_eq!(outputs(b"1", "select((true,false) and true)"), ["1"]);
         assert_eq!(outputs(b"1", "select((true,true))"), ["1", "1"]);
+    }
+
+    #[test]
+    fn test_builtin_select_yq_collapses_to_at_most_one_1613() {
+        // Real yq's rule is "emit once iff any output is truthy", not jq's
+        // "emit once per truthy output" -- an `ADR-0018` rule-4 mode split
+        // (`eval_fanout` is shared by `eval_if`/`builtin_select`, but only
+        // `select` needs a yq answer: yq's lexer rejects `if/then/else`
+        // outright). Every row here is live-verified against yq v4.53.3;
+        // jq's own per-bit fanout above must stay exactly as it was.
+        assert!(outputs_yq(b"1", "select((false,false))").is_empty());
+        assert_eq!(outputs_yq(b"1", "select((true,false))"), ["1"]);
+        assert_eq!(outputs_yq(b"1", "select((false,true))"), ["1"]);
+        assert_eq!(outputs_yq(b"1", "select((true,true))"), ["1"]);
+        assert_eq!(outputs_yq(b"1", "select((true,false,true))"), ["1"]);
+        assert_eq!(outputs_yq(b"1", "select((true,true,true))"), ["1"]);
+        // Non-literal spelling too (#1613's own acceptance criteria): a
+        // literal-only test would not have caught this, since the bug is in
+        // how outputs are *counted*, not in how truthiness is computed.
+        assert_eq!(outputs_yq(b"1", "select((. == 1, . == 1))"), ["1"]);
+        assert!(outputs_yq(b"1", "select((. == 1, . == 2) and false)").is_empty());
+    }
+
+    #[test]
+    fn test_builtin_select_yq_collapse_still_escapes_after_a_truthy_prefix_1613() {
+        // Collapsing to "at most one" only caps the republish *count* -- it
+        // doesn't change error/break propagation. `cond` is still walked to
+        // completion, so an error after an already-truthy bit still escapes,
+        // carrying the (now-capped, one-element) prefix rather than silently
+        // discarding it. Live-verified against yq v4.53.3:
+        // `select((true, error("boom")))` raises "boom" (not silently
+        // dropped) -- the same `Partial`-prefix shape jq's own
+        // `select((true, error("x")))` already uses (see `Expr::Builtin
+        // (Builtin::Select(cond))`'s doc comment in `resolve_node`).
+        yq_query!(br"1", r#"select((true, error("boom")))"#,
+            QueryResult::Partial(vs, Control::Error(_)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_select_yq_collapse_also_applies_through_an_assignment_1613() {
+        // `select`'s per-truthy-bit forking is independently reimplemented a
+        // *fourth* time in `resolve_node`'s path-tracking `Expr::Builtin
+        // (Builtin::Select(cond))` arm (`resolve_cond_fork`, reached by
+        // `|=`/`=`/`del()`/`path()`, not `eval_fanout`) -- found live while
+        // fixing this issue, not in its original scope. Unpatched, a
+        // multi-truthy condition inside `|=` applied the update *once per
+        // truthy bit* instead of once: `(.a[] | select((true,true))) |= . +
+        // 10` on `[1,2,3]` gave `[21,22,23]` (each element updated twice)
+        // where real yq v4.53.3 gives `[11,12,13]`. jq mode is intentionally
+        // unaffected -- confirmed live, real jq's own `(.a[] | select((true,
+        // true))) |= . + 10` on `[1,2,3]` gives `[21,22,23]`, matching its
+        // per-bit `eval_fanout` rule exactly.
+        let json: &[u8] = br#"{"a":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("(.a[] | select((true,true))) |= . + 10").unwrap();
+        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(out, vec![r#"{"a":[11,12,13]}"#]);
+    }
+
+    #[test]
+    fn test_builtin_select_jq_assignment_fanout_unchanged_1613() {
+        // Companion regression pin for the jq side of the test just above:
+        // `resolve_node`'s `Select` arm keeps its pre-existing per-truthy-bit
+        // fanout under `JqSemantics`, applying `|=`'s update once per truthy
+        // bit. Live-verified against jq 1.7.1.
+        assert_outcomes(&[(
+            br#"{"a":[1,2,3]}"#,
+            "(.a[] | select((true,true))) |= . + 10",
+            Ok(r#"{"a":[21,22,23]}"#),
+        )]);
     }
 
     #[test]
