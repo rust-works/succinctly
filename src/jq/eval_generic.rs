@@ -11101,10 +11101,15 @@ mod tests {
         let value = index.root(json).value();
 
         let expr = crate::jq::parse("map(1/0) == 1").unwrap();
-        match eval(&expr, value) {
-            GenericResult::Error(e) => assert!(e.message.contains("divided")),
-            other => panic!("expected Error, got {other:?}"),
-        }
+        // `assert!(matches!(..))` rather than a `match` with a `panic!`
+        // fallback: the fallback arm is only ever reached by a *failing*
+        // test, so it reads as a permanently uncovered line in the coverage
+        // diff (#1601). Same style as
+        // `test_generic_compare_operand_lazy_seq_break_and_halt_propagate_1481`
+        // just above.
+        assert!(
+            matches!(eval(&expr, value), GenericResult::Error(ref e) if e.message.contains("divided"))
+        );
     }
 
     #[test]
@@ -11118,10 +11123,15 @@ mod tests {
         let value = index.root(json).value();
 
         let expr = crate::jq::parse("1 == map(1/0)").unwrap();
-        match eval(&expr, value) {
-            GenericResult::Error(e) => assert!(e.message.contains("divided")),
-            other => panic!("expected Error, got {other:?}"),
-        }
+        // `assert!(matches!(..))` rather than a `match` with a `panic!`
+        // fallback: the fallback arm is only ever reached by a *failing*
+        // test, so it reads as a permanently uncovered line in the coverage
+        // diff (#1601). Same style as
+        // `test_generic_compare_operand_lazy_seq_break_and_halt_propagate_1481`
+        // just above.
+        assert!(
+            matches!(eval(&expr, value), GenericResult::Error(ref e) if e.message.contains("divided"))
+        );
     }
 
     #[test]
@@ -11142,6 +11152,93 @@ mod tests {
 
         let expr = crate::jq::parse("map(halt_error(7)) == 1").unwrap();
         assert!(matches!(eval(&expr, value), GenericResult::Halt(7)));
+    }
+
+    #[test]
+    fn generic_arithmetic_fanout_combine_error_escapes_1481() {
+        // `binary_fanout_each_generic`'s `Err(e)` arm -- the one only the
+        // `Expr::Arithmetic` caller can reach, since both `Expr::Compare`
+        // call sites wrap the infallible `apply_compare_op` in `Ok(...)`.
+        // `first(...)` is what routes a top-level `+` through
+        // `eval_each_generic` at all (`Expr::Arithmetic` has no native
+        // `eval_single` arm, so a *bare* `("a",1) + 1` bridges out to
+        // `eval.rs`'s own fanout instead).
+        //
+        // Right is the outer loop, so the single right candidate `1` pairs
+        // with left's first candidate `"a"` -- `arith_combine` fails, and
+        // the failure aborts the whole fanout as the caller's error rather
+        // than skipping that one pairing and going on to `1 + 1`. Oracle:
+        // pinned jq 1.7.1 `jq -n 'first(("a",1) + 1)'` is exit-5 with
+        // `string ("a") and number (1) cannot be added`, *not* `2`.
+        assert!(matches!(
+            summarize(b"null", r#"first(("a",1) + 1)"#),
+            Summary::Error(ref m) if m.contains("cannot be added")
+        ));
+    }
+
+    #[test]
+    fn generic_arithmetic_fanout_combine_error_beats_later_right_candidate_1481() {
+        // The same `Err(e)` arm, this time proving the abort really is an
+        // abort of the *outer* (right) loop and not just of the inner one:
+        // right's first candidate `"a"` already fails to combine, so right's
+        // second candidate -- `error("x")`, which would report a different
+        // message -- is never pulled. Oracle: pinned jq 1.7.1
+        // `jq -n 'first(1 + ("a", error("x")))'` reports the arithmetic
+        // error, not `x`.
+        assert!(matches!(
+            summarize(b"null", r#"first(1 + ("a", error("x")))"#),
+            Summary::Error(ref m) if m.contains("cannot be added")
+        ));
+    }
+
+    #[test]
+    fn generic_arithmetic_fanout_first_stops_before_the_failing_pairing_1481() {
+        // The complement of the two above: when the *first* pairing succeeds,
+        // `first` stops the generator before the pairing that would have
+        // failed is ever combined, so the `Err(e)` arm is not reached and no
+        // error surfaces. Oracle: pinned jq 1.7.1
+        // `jq -n 'first((1,"a") + 1)'` prints `2`.
+        assert_eq!(
+            summarize(b"null", r#"first((1,"a") + 1)"#),
+            Summary::Values(vec!["2".to_string()])
+        );
+    }
+
+    #[test]
+    fn generic_arithmetic_fanout_combine_error_optional_is_unreachable_via_parser_1481() {
+        // The other half of `binary_fanout_each_generic`'s `Err(e)` arm: when
+        // `optional` is set, the failed pairing aborts the fanout as a plain
+        // `Flow::Exhausted` (empty output) instead of `Flow::Escaped`.
+        //
+        // No real query reaches it. Post-#693 the only place this module ever
+        // forces `optional = true` is `eval_single`'s
+        // `Expr::Optional(IndexExpr | SliceExpr)` special case, which threads
+        // it into `index_one_generic`/`slice_one_generic` only -- never into
+        // `eval_each_generic`. Every other caller passes the ambient
+        // `optional`, which starts `false` at every public entry point (the
+        // same observation `eval_first_or_last_generic` records for its own
+        // dispatch, and `eval_on_owned`/`eval_single`'s `_` arm for theirs).
+        // So drive the private dispatcher directly to pin the arm, exactly as
+        // `test_generic_plain_map_optional_on_non_container_is_unreachable_via_parser_725`
+        // already does for `Builtin::Map`'s matching `optional` guard.
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse(r#"("a",1) + 1"#).unwrap();
+        assert!(matches!(expr, Expr::Arithmetic { .. }));
+
+        let mut seen = 0usize;
+        let flow = eval_each_generic::<JqSemantics, _>(&expr, value, true, None, &mut |_item| {
+            seen += 1;
+            Demand::Continue
+        });
+
+        // Swallowed, not escaped -- and swallowed *before* the second (valid)
+        // `1 + 1` pairing, since the whole fanout aborts rather than skipping
+        // just the pairing that failed.
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(seen, 0);
     }
 
     #[test]
