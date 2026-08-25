@@ -494,6 +494,18 @@ otherwise already correct, and it can be reverted independently if the perf gate
   `Failed to read file` when the read had in fact succeeded.
 - Scope is document input only. `--raw-input` shares the jq path (jq substitutes there
   too); DSV input, `--arg`/`--argjson` and `--rawfile` are untouched.
+- **`--validate` is excluded, and getting that wrong was a live regression** caught in
+  review. The substitution originally ran at read time, before `validate_json_input`, so
+  the strict validator was handed an already-repaired document: `sjq --validate` exited 0
+  on a file `succinctly json validate` still rejects with exit 1, silently dropping RFC
+  8259 §8.1's mandatory UTF-8 check from the one flag whose entire purpose is strictness —
+  and contradicting this document's own "What the existing validators already catch" table
+  two sections up. Both routes had it (the lazy path substituted into `raw_inputs`; the
+  materializing one decoded to a `String` in `get_inputs` first). Fixed by skipping the
+  substitution under `--validate` entirely: nothing is lost, because any document that
+  would have been substituted is a document the validator rejects. Pinned by
+  `test_validate_still_rejects_invalid_utf8_1247` and, for the modes that never validate,
+  `test_raw_input_still_substitutes_under_validate_1247`.
 - Our `Utf8Error` offsets were checked against yq's for all six error kinds (invalid lead,
   bad continuation, overlong, surrogate, out-of-range, truncated) and agree exactly.
 

@@ -21487,3 +21487,80 @@ fn test_valid_multibyte_document_is_untouched_1247() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout.trim(), doc);
 }
+
+/// #1247: `--validate` must still reject a non-UTF-8 document, even though
+/// the *unvalidated* path now substitutes U+FFFD for those same bytes.
+///
+/// The two pull in opposite directions and the substitution won by accident:
+/// it ran at read time, before `validate_json_input`, so the strict
+/// validator was handed an already-repaired document and found nothing
+/// wrong. `sjq --validate` exited 0 on a file `succinctly json validate`
+/// still rejects with exit 1 -- silently dropping the one check RFC 8259
+/// §8.1 makes mandatory, on the flag whose entire purpose is strictness.
+///
+/// Both routes are pinned because they read the document through different
+/// code: the lazy path (default) reads raw bytes, and the materializing one
+/// (`-S`, and every other flag that forces it) decodes to a `String` first.
+/// The escape and surrogate cases never regressed -- they are not encoding
+/// errors and the substitution cannot touch them -- but they are asserted
+/// alongside so a future change cannot fix one class by breaking another.
+#[test]
+fn test_validate_still_rejects_invalid_utf8_1247() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"a\":\"\xff\xfe\",\"b\":1}")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    for args in [
+        &["--validate", "-c", ".", path][..],
+        // `-S` and `-s` each force the materializing path, which decodes the
+        // document to a `String` before any validation can see its bytes.
+        &["--validate", "-c", "-S", ".", path][..],
+        &["--validate", "-c", "-s", ".", path][..],
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(args, None).unwrap_or_else(|e| panic!("{args:?} failed to run: {e}"));
+        assert_eq!(code, 3, "{args:?}\nstdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("invalid UTF-8"),
+            "{args:?} should name the encoding failure: {stderr}"
+        );
+        assert_eq!(stdout, "", "{args:?} must produce no output");
+    }
+
+    // Not an encoding error, so the substitution was never involved: these
+    // are asserted only to keep all three `--validate` failure classes in
+    // one place.
+    for (doc, expected) in [
+        (r#"{"a":"\ud800"}"#, "unpaired surrogate"),
+        (r#"{"a":"\q"}"#, "invalid escape sequence"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["--validate", "-c", "."], Some(doc))
+            .unwrap_or_else(|e| panic!("failed to run: {e}"));
+        assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stderr.contains(expected), "stderr: {stderr}");
+    }
+    Ok(())
+}
+
+/// #1247 guard: fixing `--validate` must not take the substitution away from
+/// the modes that never validate. `-R` reads bytes as text by design, and a
+/// stray byte there is not a JSON error to report -- it is content.
+#[test]
+fn test_raw_input_still_substitutes_under_validate_1247() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a\xffb\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    for args in [
+        &["-R", "-c", ".", path][..],
+        &["-R", "--validate", "-c", ".", path][..],
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(args, None).unwrap_or_else(|e| panic!("{args:?} failed to run: {e}"));
+        assert_eq!(code, 0, "{args:?}\nstderr: {stderr}");
+        assert_eq!(stdout.trim(), "\"a\u{fffd}b\"", "{args:?}");
+    }
+    Ok(())
+}

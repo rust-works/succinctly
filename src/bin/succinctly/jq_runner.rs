@@ -1132,12 +1132,25 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // This preserves original number formatting like "4e4"
         let files = get_input_files(&args);
         let raw_inputs: Vec<Vec<u8>> = if files.is_empty() {
-            vec![utf8_lossy_document(read_stdin_bytes()?)]
+            vec![read_stdin_bytes()?]
         } else {
             files
                 .iter()
-                .map(|path| read_file_bytes(path).map(utf8_lossy_document))
+                .map(|path| read_file_bytes(path))
                 .collect::<Result<Vec<_>>>()?
+        };
+        // Substitution is skipped under `--validate` so the strict validator
+        // in the loop below still sees the *original* bytes (#1247).
+        // Substituting first silently repaired a non-UTF-8 document, leaving
+        // the one check `--validate` exists to perform with nothing to find:
+        // `sjq --validate` exited 0 where `succinctly json validate` on the
+        // same file still exits 1. Nothing is lost by skipping it here --
+        // any document that would have been substituted is a document
+        // `validate_json_input` rejects.
+        let raw_inputs: Vec<Vec<u8>> = if args.validate {
+            raw_inputs
+        } else {
+            raw_inputs.into_iter().map(utf8_lossy_document).collect()
         };
 
         // Check if we can use the identity fast path (raw bytes output, no materialization)
@@ -1580,22 +1593,63 @@ fn get_inputs(
     // Get input files
     let files = get_input_files(args);
 
-    // Collect raw input from files or stdin
-    let raw_inputs = if files.is_empty() {
-        match read_stdin() {
-            Ok(s) => vec![(None, s)],
+    // Collect raw input from files or stdin. Read as bytes and decode below
+    // rather than through `read_to_string`, which refused the whole input on
+    // a stray byte and reported it as a *read* failure when the read had in
+    // fact succeeded (#1247).
+    let raw_bytes: Vec<(Option<usize>, Vec<u8>)> = if files.is_empty() {
+        match read_stdin_bytes() {
+            Ok(b) => vec![(None, b)],
             Err(e) => return Ok(Err(e)),
         }
     } else {
         let mut inputs = Vec::new();
         for (idx, path) in files.iter().enumerate() {
-            match read_file(path) {
-                Ok(s) => inputs.push((Some(idx), s)),
+            match read_file_bytes(path) {
+                Ok(b) => inputs.push((Some(idx), b)),
                 Err(e) => return Ok(Err(e)),
             }
         }
         inputs
     };
+
+    // JSON input mode is the only mode that runs the strict validator at all
+    // -- `-R`, `--seq` and DSV never do, and must not start now.
+    let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
+
+    // All reads happen first, then decoding: a later file's read error still
+    // outranks an earlier file's content error, as it did before.
+    let mut raw_inputs: Vec<(Option<usize>, String)> = Vec::with_capacity(raw_bytes.len());
+    for (file_idx, raw) in raw_bytes {
+        // `String::from_utf8`, not `String::from_utf8_lossy(&raw).into_owned()`:
+        // the latter allocates and copies the whole document even when it is
+        // valid, because the `Cow` it returns is `Borrowed` and `into_owned`
+        // must then clone it -- measured (pinned hardware, interleaved A/B)
+        // as the dominant cost of #1247's whole diff, +9.47% median on a
+        // cheap navigation query on x86_64. Taking ownership of the buffer
+        // that already exists makes the valid path allocation-free.
+        let raw = match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(e) => {
+                // The substitution below is jq's own behaviour for a
+                // non-UTF-8 document (see `utf8_lossy_document`), but it must
+                // not run *before* `--validate` (#1247): repairing the
+                // document first left the strict validator -- whose whole job
+                // is to reject exactly this -- with nothing to find, so
+                // `sjq --validate` exited 0 where `succinctly json validate`
+                // on the same file still exits 1. `validate_json_input` fails
+                // on any input that reaches here, so the substitution after
+                // it is unreachable in JSON mode; it stays for the modes that
+                // never validate.
+                if args.validate && json_input_mode {
+                    let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                    validate_json_input(e.as_bytes(), filename.as_deref())?;
+                }
+                String::from_utf8_lossy(e.as_bytes()).into_owned()
+            }
+        };
+        raw_inputs.push((file_idx, raw));
+    }
 
     let mut locations = InputLocations::new(
         files
@@ -2061,37 +2115,6 @@ impl ErrorAt<'_> {
     }
 }
 
-/// Read stdin to string.
-fn read_stdin() -> Result<String> {
-    // Lossy, not `read_to_string`: that refused the whole input on a stray
-    // byte, reporting it as a *read* failure when the read had succeeded
-    // (#1247). See `utf8_lossy_document` for why jq substitutes here.
-    Ok(utf8_lossy_string(read_stdin_bytes()?))
-}
-
-/// Read a file to string.
-fn read_file(path: &Path) -> Result<String> {
-    // Lossy for the same reason as `read_stdin` above.
-    Ok(utf8_lossy_string(read_file_bytes(path)?))
-}
-
-/// Lossy UTF-8 decode that does not copy a document that is already valid.
-///
-/// `String::from_utf8_lossy(&bytes).into_owned()` allocates and copies the
-/// whole document even when it is valid, because the `Cow` it returns is
-/// `Borrowed` and `into_owned` must then clone it -- measured (pinned
-/// hardware, interleaved A/B) as the dominant cost of #1247's whole diff,
-/// +9.47% median on a cheap navigation query on x86_64, breaching the design
-/// doc's own +8% ceiling on a change that isn't the one doing the costing.
-/// Taking ownership of the existing buffer instead makes the valid path
-/// allocation-free.
-fn utf8_lossy_string(raw: Vec<u8>) -> String {
-    match String::from_utf8(raw) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    }
-}
-
 /// Replace every invalid UTF-8 sequence in a *document* with U+FFFD, the
 /// way real jq does (#1247).
 ///
@@ -2107,8 +2130,12 @@ fn utf8_lossy_string(raw: Vec<u8>) -> String {
 /// whole-input SIMD pass (~1.1 ms on 8.4 MB) and only a document that
 /// actually fails it pays for a copy.
 ///
-/// Document input only. `--raw-input` shares this path (jq substitutes
-/// there too), but DSV input, `--arg`/`--argjson` and `--rawfile` do not.
+/// Document input only, and only when `--validate` is off: the strict
+/// validator has to see the original bytes, or the substitution repairs the
+/// document out from under the one check that is supposed to reject it
+/// (#1247). `--raw-input` gets the same substitution (jq substitutes there
+/// too) via `get_inputs`' own decode; DSV input, `--arg`/`--argjson` and
+/// `--rawfile` get none.
 fn utf8_lossy_document(raw: Vec<u8>) -> Vec<u8> {
     match succinctly::text::utf8::validate_utf8(&raw) {
         Ok(()) => raw,
