@@ -18280,6 +18280,27 @@ impl FoldRegister {
         (reg, acc)
     }
 
+    /// A branch's provenance *relative to this register* — `(at_register,
+    /// snapshot)`, exactly the pair [`FoldRegister::resolve`] needs for its
+    /// own `at_register`/`snapshot` parameters (#1590).
+    ///
+    /// `branch` must already be one of this register's own relocated
+    /// outputs (i.e. it came from this same `reg`'s own `resolve()`/`enter()`
+    /// call, not an arbitrary branch) — `relocate` has already folded every
+    /// clause [`FoldRegister::identical`] admits into a uniform shape (a
+    /// navigation that never left the register's path, or an
+    /// identical()-recognised snapshot/null/bool, both re-tagged `trackable:
+    /// true, path: self.path`), so `branch.trackable && branch.path ==
+    /// self.path` alone already answers "is `branch` still at *this*
+    /// register" without a second `identical()` call here. `None` (no
+    /// branch survived a step, or this is a fresh accumulator with nothing
+    /// to compare) answers `(false, false)`.
+    fn branch_provenance(&self, branch: Option<&PathBranch<'_>>) -> (bool, bool) {
+        let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
+        let snapshot = branch.is_some_and(|b| b.snapshot);
+        (at_register, snapshot)
+    }
+
     /// Resolve `expr` (`UPDATE` or `EXTRACT`) against one fold step's own
     /// input, relocating every resulting branch through this register.
     ///
@@ -18291,20 +18312,26 @@ impl FoldRegister {
     /// literal subpart of the original document, mirroring
     /// `eval_owned_expr_fork`'s identical convention in the value-position
     /// evaluators this parallels.
+    ///
+    /// `at_register`/`snapshot` (#1590) are `input`'s own provenance —
+    /// exactly [`FoldRegister::branch_provenance`]'s answer for whichever
+    /// branch `input` itself came from, threaded into the *next* step's
+    /// `tr` instead of being independently re-derived here. Before #1590
+    /// this compared `input == self.value` by bare structural equality,
+    /// which wrongly promoted a *reconstruction* that happened to land on
+    /// the register's own value: a previous step demoted to untracked by
+    /// `relocate` (a freshly-built object, no snapshot, no path) could
+    /// still make this step's own bare `.` look genuinely trackable,
+    /// reopening #1466's bug class through this second call site.
     fn resolve<'a, S: EvalSemantics>(
         &self,
         expr: &Expr,
         input: OwnedValue,
+        at_register: bool,
+        snapshot: bool,
     ) -> PathResolveResult<'a> {
-        let tr = self.trackable && input == self.value;
-        // Ambient `snapshot` is always `false` here (#1591): `input` is a
-        // freshly-computed `OwnedValue` from ordinary (non-path) evaluation
-        // of the previous UPDATE step, never itself a value this resolver
-        // can prove came from an untouched `$x` reference. A bare `$x`
-        // *inside* `expr` still gets its own snapshot mark correctly —
-        // `Expr::TrackedVar`'s arm derives that fresh from comparing its own
-        // frozen value against `input`, independent of this ambient flag.
-        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr, false) {
+        let tr = self.trackable && at_register;
+        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr, snapshot) {
             Ok(branches) => Ok(self.relocate(branches)),
             Err((prefix, e)) => Err((self.relocate(prefix), e)),
         }
@@ -18500,7 +18527,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 }
             };
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            match reg.resolve::<S>(substituted, acc_input) {
+            match reg.resolve::<S>(substituted, acc_input, acc_at_register, acc_snapshot) {
                 Ok(branches) => {
                     // Only the last output of a multi-output UPDATE
                     // becomes the new accumulator (same rule as
@@ -18512,17 +18539,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     //
                     // What is carried forward is only whether jq would still
                     // be holding this exact value at the register — its
-                    // provenance, not its path (#1466). `b.trackable &&
-                    // b.path == reg.path` is precisely that, because
-                    // `relocate` has already folded every clause
-                    // `FoldRegister::identical` admits into this shape: a
-                    // navigation that landed back on the register, a frozen
-                    // snapshot, or a `null`/`true`/`false` that matched.
+                    // provenance, not its path (#1466), via
+                    // `FoldRegister::branch_provenance` (#1590).
                     let last = branches.into_iter().last();
-                    acc_at_register = last
-                        .as_ref()
-                        .is_some_and(|b| b.trackable && b.path == reg.path);
-                    acc_snapshot = last.as_ref().is_some_and(|b| b.snapshot);
+                    (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref());
                     acc = last.map(|b| b.value.into_owned());
                 }
                 Err((_prefix, e)) => {
@@ -18640,6 +18660,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_branch in &init_branches {
         let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
+        // `state`'s own provenance (#1590), mirroring `resolve_reduce`'s
+        // `acc_at_register`/`acc_snapshot` exactly — see `FoldRegister::resolve`'s
+        // own doc comment for why this can no longer be re-derived from a
+        // bare `==` inside `resolve` itself.
+        let mut state_at_register = init_branch.trackable;
+        let mut state_snapshot = init_branch.snapshot;
         let mut aborted: Option<Control> = None;
         'input: for step in &substituted {
             if let Some(control) = charge_budget(&mut budget, "foreach") {
@@ -18653,7 +18679,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     break;
                 }
             };
-            let update_branches = match reg.resolve::<S>(substituted_update, state) {
+            let update_branches = match reg.resolve::<S>(
+                substituted_update,
+                state,
+                state_at_register,
+                state_snapshot,
+            ) {
                 Ok(branches) => branches,
                 Err((_prefix, e)) => {
                     aborted = Some(e.into());
@@ -18667,9 +18698,21 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         break 'input;
                     }
                     let extract_reg = reg.advance(update_branch);
-                    match extract_reg
-                        .resolve::<S>(ext_expr, update_branch.value.clone().into_owned())
-                    {
+                    // `update_branch` is itself already relocated (it's
+                    // `reg.resolve()`'s own output above), and `advance()`
+                    // built `extract_reg` from this same branch, so
+                    // `extract_reg`'s own `branch_provenance` of it answers
+                    // exactly `update_branch`'s `(trackable, snapshot)` —
+                    // structurally, not by a second `identical()` check
+                    // (#1590).
+                    let (extract_at_register, extract_snapshot) =
+                        extract_reg.branch_provenance(Some(update_branch));
+                    match extract_reg.resolve::<S>(
+                        ext_expr,
+                        update_branch.value.clone().into_owned(),
+                        extract_at_register,
+                        extract_snapshot,
+                    ) {
                         Ok(branches) => out.extend(branches),
                         Err((prefix, e)) => {
                             out.extend(prefix);
@@ -18696,14 +18739,13 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 }
             }
             // Only the last UPDATE output carries forward as state for the
-            // next source element — same rule as `eval_foreach`.
-            // Trackability is discarded here too, for the same reason as
-            // `resolve_reduce`'s identical step: the next iteration
-            // re-derives it from scratch against the same fixed `reg`.
-            state = update_branches
-                .into_iter()
-                .last()
-                .map_or(OwnedValue::Null, |b| b.value.into_owned());
+            // next source element — same rule as `eval_foreach`. Its
+            // provenance carries forward too now (#1590), mirroring
+            // `resolve_reduce`'s `acc_at_register`/`acc_snapshot` update via
+            // `FoldRegister::branch_provenance`.
+            let last = update_branches.into_iter().last();
+            (state_at_register, state_snapshot) = reg.branch_provenance(last.as_ref());
+            state = last.map_or(OwnedValue::Null, |b| b.value.into_owned());
         }
         // The source stream's own trailing control belongs to this fork
         // too, applied after its own inner loop — mirrors `eval_foreach`'s
@@ -56029,6 +56071,89 @@ mod tests {
         assert_eq!(outputs(json, "path(getpath(empty))"), Vec::<String>::new());
     }
 
+    /// #1590: `FoldRegister::resolve`'s own `tr` used to re-derive "is the
+    /// accumulator at the register" from scratch via bare `input ==
+    /// self.value` — which wrongly promoted a *reconstruction* that
+    /// happened to land on the register's own value. Fixed by threading
+    /// the already-computed `(acc_at_register, acc_snapshot)` /
+    /// `(state_at_register, state_snapshot)` pair (the same provenance
+    /// `resolve_reduce`'s final emission already relies on) into the
+    /// *next* step's own `resolve()` call instead of re-deriving it.
+    ///
+    /// The issue's own headline repro is first (read then write); the rest
+    /// covers `foreach`'s identical bug at both its UPDATE call and its
+    /// EXTRACT call (found independently while fixing this, not named in
+    /// the issue), a three-step chain (only the reconstructing middle step
+    /// should ever demote), and confirms the ordinary accept/refuse cases
+    /// this change must not regress — each independently confirmed against
+    /// jq 1.7.1, and each a case pristine `main` (pre-#1590) gets wrong.
+    #[test]
+    fn test_fold_register_resolve_per_step_provenance_1590() {
+        // The issue's own repro, read side.
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                "path(reduce (1,2) as $i (.; if $i==1 then {a: .a} else . end))"
+            ),
+            Vec::<String>::new()
+        );
+        query!(br#"{"a":1}"#,
+            "path(reduce (1,2) as $i (.; if $i==1 then {a: .a} else . end))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+        // `foreach`'s identical bug at its own UPDATE call — found while
+        // fixing this, not in the issue's own repro.
+        query!(br#"{"a":1}"#,
+            "path(foreach (1,2) as $i (.; if $i==1 then {a: .a} else . end; .))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+        // A three-step chain: only the reconstructing middle step should
+        // ever demote — the third step's bare `.` must not wrongly inherit
+        // trackability from a step two steps back.
+        query!(br#"{"a":1}"#,
+            "path(reduce (1,2,3) as $i (.; if $i==1 then . elif $i==2 then {a: .a} else . end))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+        // Regression guards: genuine navigation staying at the register
+        // across multiple steps must still accept.
+        let json = br#"{"a":{"b":1}}"#;
+        assert_eq!(outputs(json, "path(reduce (1,2) as $i (.; .))"), [r"[]"]);
+        assert_eq!(
+            outputs(json, "path(reduce (1,2,3) as $i (.a; .))"),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(json, "path(foreach (1,2) as $i (.; .; .))"),
+            [r"[]", r"[]"]
+        );
+        // A `TrackedVar` snapshot flowing straight to final emission (no
+        // UPDATE step ever navigates) must still accept — this is
+        // `resolve_reduce`'s own INIT-seeded `acc_snapshot`, unaffected by
+        // this change but pinned here alongside its sibling to keep the two
+        // provenance paths (INIT-seeded vs. per-step-threaded) covered by
+        // the same test.
+        assert_eq!(
+            outputs(br#"{"a":1}"#, "path(. as $x | reduce (1) as $i (0; $x))"),
+            [r"[]"]
+        );
+        // foreach's EXTRACT call has the identical bug at its own call
+        // site (`extract_reg.resolve`) — an UPDATE branch that reconstructs
+        // to match the outer register must not make EXTRACT's own `.` look
+        // trackable either.
+        query!(br#"{"a":1}"#,
+            "path(foreach (1) as $i (.; {a: .a}; .))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, r#"Invalid path expression with result {"a":1}"#);
+            }
+        );
+    }
+
     /// A narrow, cosmetic gap the guard-loosening above exposed rather than
     /// caused: `resolve_recurse` was previously unreachable with an
     /// untracked seed at all (its own `debug_assert!` required
@@ -56064,26 +56189,20 @@ mod tests {
     /// is what the other direction looks like. Pinned so the set cannot
     /// grow silently, and so closing any of them is a visible edit here.
     ///
-    /// Two distinct causes:
+    /// A variable bound from a *navigated* position (`.a as $y`) is not
+    /// `is_identity_passthrough`, so it never becomes an `Expr::TrackedVar`
+    /// and carries no snapshot mark at all. jq holds the document's own
+    /// `.a` pointer there and accepts. This is `limitations.md`'s
+    /// divergence 1 — "current input conflated with a variable's own bound
+    /// position" — which the old value comparison happened to paper over
+    /// inside folds.
     ///
-    /// - A variable bound from a *navigated* position (`.a as $y`) is not
-    ///   `is_identity_passthrough`, so it never becomes an
-    ///   `Expr::TrackedVar` and carries no snapshot mark at all. jq holds
-    ///   the document's own `.a` pointer there and accepts. This is
-    ///   `limitations.md`'s divergence 1 — "current input conflated with a
-    ///   variable's own bound position" — which the old value comparison
-    ///   happened to paper over inside folds.
-    /// - `FoldRegister::resolve` always starts each UPDATE/EXTRACT
-    ///   resolution with ambient `snapshot: false` (#1591), since `input` is
-    ///   a freshly-computed `OwnedValue` from ordinary value evaluation of
-    ///   the *previous* step, never itself provably a snapshot — except on
-    ///   the very first step, where `input` is exactly INIT's own
-    ///   accumulator, which *can* itself have been a snapshot. `resolve_leaf`
-    ///   and every ordinary pass-through combinator now correctly forward an
-    ///   ambient mark when they have one (#1591); this is a narrower,
-    ///   different gap that mark-threading alone does not reach, since
-    ///   `FoldRegister::resolve` is a *re-entry* point, not a combinator in
-    ///   the walk.
+    /// (This list used to have a second cause — `FoldRegister::resolve`
+    /// always starting UPDATE/EXTRACT's own ambient `snapshot` at `false`,
+    /// even on a fold's first step where `input` is exactly INIT's own
+    /// accumulator — but #1590 closed that one by threading real per-step
+    /// provenance instead of re-deriving `tr`/`snapshot` from scratch; see
+    /// `test_fold_register_resolve_per_step_provenance_1590`.)
     ///
     /// jq's own answers, confirmed live, are in the comments.
     #[test]
@@ -56106,17 +56225,14 @@ mod tests {
         // an empty merge hands back its left operand's pointer unchanged.
         // The mirrored `{} + $x` refuses in jq too (asserted below), so
         // there is no rule to model here, only an implementation detail.
-        // The nested-fold row is the second cause: the *inner* reduce's own
-        // INIT (`$x`) resolves to an untracked snapshot branch, but
-        // `FoldRegister::resolve` starts UPDATE (`.`)'s own ambient
-        // `snapshot` at `false` regardless (#1591) — a different, narrower
-        // gap than the general combinator-threading one #1591 closed (see
-        // that test's own doc comment above).
+        // (The nested-fold case this list used to include here —
+        // `reduce (1) as $j ($x; .)`'s own INIT-is-a-snapshot shape — is
+        // fixed by #1590 and moved to
+        // `test_fold_register_resolve_per_step_provenance_1590`.)
         for filter in [
             "path(. as $x | reduce (1) as $i (0; $x + {}))",
             "path(. as $x | reduce (1) as $i (0; $x * {}))",
             "path(. as $x | reduce (1) as $i (0; $x + null))",
-            "path(. as $x | reduce (1) as $i (0; reduce (1) as $j ($x; .)))",
         ] {
             query!(br#"{"a":1}"#, filter,
                 QueryResult::Error(e) => {
