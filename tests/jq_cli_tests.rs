@@ -15861,15 +15861,16 @@ fn test_jq_binary_op_success_paths_unaffected_1199() -> Result<()> {
 /// negative, so it takes the existing negative-count-returns-null branch
 /// instead).
 ///
-/// Positive `infinite` (and a very large finite magnitude like `1e10`) are
-/// deliberately not covered here: truncating either yields a huge repeat
-/// count fed to `String::repeat`, an unbounded-allocation hang/OOM hazard,
-/// not a panic -- and that exact hazard already exists, unguarded, for a
-/// same-magnitude `Int` operand (`"ab" * 10000000000`) on `main` today, so
-/// it's a pre-existing characteristic of this arm rather than something
-/// #1230 introduced. Live-verified against real jq: `timeout 3 jq -cn
-/// '(infinite) * "ab"'` hangs (no output, no error) rather than rejecting
-/// the input, so there's no clean "must error" behavior to pin here either.
+/// Positive `infinite` used to be deliberately uncovered here: truncating it
+/// saturates to `i64::MAX`, a huge repeat count that used to reach
+/// `String::repeat` unguarded (an unbounded-allocation hang/OOM hazard, not
+/// a panic -- confirmed live against real jq at the time: `timeout 3 jq -cn
+/// '(infinite) * "ab"'` hangs, no output, no error). #1612 closed that
+/// hazard (`try_reserve_exact` instead of `String::repeat` directly), so
+/// this is now exactly the same "byte length no allocator can satisfy"
+/// case as the huge-`Int`-operand cases pinned in
+/// `test_arithmetic_mul_string_repetition_overflow_1612` (`src/jq/eval.rs`)
+/// -- covered by name there instead of duplicated here.
 ///
 /// Note real jq's own `nan * "ab"` returns `null` (verified: jq-1.7.1),
 /// not `""` -- but that's `(int)NaN` C-cast undefined behavior (platform-
@@ -21870,6 +21871,60 @@ fn test_jq_reduce_reconstruction_step_no_longer_promotes_next_step_write_1590() 
     assert_eq!(stdout, "", "must not write: stderr: {stderr:?}");
     assert!(
         stderr.contains(r#"Invalid path expression with result {"a":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1612's own repro, run through the real CLI process end-to-end (not
+/// just the library-level `EvalError` path) -- the whole point of the fix
+/// is that this no longer panics with a Rust `capacity overflow` message
+/// and `RUST_BACKTRACE` note (exit 101), but exits cleanly with a jq-style
+/// error (exit 5) instead. Confirmed live against jq 1.7.1: jq itself does
+/// not error on this filter at all -- it just keeps running rather than
+/// answering promptly (never observed to terminate one way or the other),
+/// so there is no oracle wording to match here, only the requirement that
+/// succinctly dies cleanly instead of with a panic.
+#[test]
+fn test_jq_string_repeat_huge_count_does_not_panic_1612() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".s * .n"],
+        Some(r#"{"s":"ab","n":123456789012345678901234567890}"#),
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Cannot repeat string to"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1612's guard is shared by the compound-assignment route too
+/// (`.path *= n` desugars through `eval_compound_assign` into
+/// `eval_update`, a textually distinct evaluator path from the bare `*`
+/// above) -- confirmed here rather than assumed, since a future change to
+/// `eval_update`'s own error handling could regress this route
+/// independently of `arith_mul` itself while the bare-`*` test above stays
+/// green.
+#[test]
+fn test_jq_string_repeat_huge_count_compound_assign_does_not_panic_1612() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".s *= .n"],
+        Some(r#"{"s":"ab","n":123456789012345678901234567890}"#),
+    )?;
+    assert_eq!(stdout, "", "must not write: stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Cannot repeat string to"),
         "stderr: {stderr:?}"
     );
     assert_eq!(code, 5, "stderr: {stderr:?}");

@@ -21989,3 +21989,48 @@ fn test_yq_accepts_multibyte_utf8_1242() -> Result<()> {
     assert_eq!(output.trim(), r#"{"a":"café","b":"日本語","c":"😀"}"#);
     Ok(())
 }
+
+/// #1612's yq-mode cap, run through the real CLI process end-to-end --
+/// real yq's own explicit ~10MiB safety cap means `succinctly yq` must
+/// answer with yq's own specific wording (`would exceed 10485760 bytes`),
+/// not jq mode's generic `Cannot repeat string to <n> bytes` -- confirming
+/// the cap fires *before* any allocation is even attempted, the same way
+/// real yq's own refusal does, rather than happening to produce the same
+/// outcome by coincidentally also failing a real allocation attempt.
+#[test]
+fn test_yq_string_repeat_cap_does_not_abort_1612() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".s * .n", "s: ab\nn: 999999999999999999\n", &[])?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("memory allocation"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("would exceed 10485760 bytes"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1612's yq-mode cap is shared by the compound-assignment route too
+/// (`.path *= n`, a textually distinct evaluator path from the bare `*`
+/// above) -- see the sibling jq-mode test's own doc comment for why this
+/// is checked independently rather than assumed.
+#[test]
+fn test_yq_string_repeat_cap_compound_assign_does_not_abort_1612() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".s *= .n", "s: ab\nn: 999999999999999999\n", &[])?;
+    assert_eq!(stdout, "", "must not write: stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("memory allocation"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("would exceed 10485760 bytes"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    Ok(())
+}
