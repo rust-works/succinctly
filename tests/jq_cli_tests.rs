@@ -3009,6 +3009,19 @@ fn test_lazy_keys_demand_sink_streams_collapse_1599() -> Result<()> {
         assert_eq!(out.trim(), expected, "filter {filter}");
     }
 
+    // An empty object has no field 0, so the new `.[0]` arm's `uncons_key`
+    // answers `None`. jq returns null rather than erroring here, same as
+    // for an out-of-range index (#307).
+    for (filter, expected) in [
+        ("keys_unsorted | .[0]", "null"),
+        ("keys_unsorted | first", "null"),
+        ("keys_unsorted | .[1]", "null"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some("{}"))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
     // An uppercase key proves the trailing stage is really applied, which
     // a lowercase one could not: without `rest` the answer would be "B".
     let upper = r#"{"B":1,"a":2}"#;
