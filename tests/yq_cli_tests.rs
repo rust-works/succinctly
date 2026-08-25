@@ -21392,6 +21392,77 @@ fn test_yq_first_only_gate_still_takes_the_first_output_1534() -> Result<()> {
     Ok(())
 }
 
+/// #1553: `contains` is the one shared builtin real yq fans out exactly like
+/// jq -- but it still needs the yq-only "an escape anywhere clears the whole
+/// output" rule #1534 gave `has`/`split`/`join`. It cannot use `FirstOnly`
+/// (that would wrongly truncate the non-error multi-output case), so it
+/// carries its own gate, `ArgFanout::AllClearedOnEscape`.
+///
+/// Live-captured from the pinned yq v4.53.3:
+///
+/// ```text
+/// $ printf 'x: "abc"\n' | yq '.x | contains(("a", error("boom")))'
+/// Error: boom          <- stderr only; stdout empty, exit 1
+/// ```
+///
+/// succinctly used to print `true` to stdout *and* raise, the same
+/// prefix-then-raise shape #1534 fixed for its three gated builtins.
+#[test]
+fn test_yq_contains_gate_emits_nothing_when_the_argument_escapes_1553() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#".x | contains(("a", error("boom")))"#,
+        "x: \"abc\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+    Ok(())
+}
+
+/// #1553 companion: an escape *before* any output was produced must still
+/// propagate. `yq '.x | contains(error("boom"))'` is `Error: boom`.
+#[test]
+fn test_yq_contains_gate_still_propagates_an_immediate_escape_1553() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#".x | contains(error("boom"))"#,
+        "x: \"abc\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+    Ok(())
+}
+
+/// #1553 guard: the gate's ordinary job -- genuinely fanning out, unlike
+/// `FirstOnly` -- is untouched. `[.x | contains(("a","zz"))]` on `abc` is
+/// `[true,false]`, matching both jq and real yq v4.53.3.
+#[test]
+fn test_yq_contains_gate_still_fans_out_with_no_escape_1553() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"[.x | contains(("a","zz"))]"#,
+        "x: \"abc\"\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[true,false]");
+    Ok(())
+}
+
+/// #1553 regression guard: jq mode keeps its own unaffected rule -- `body`'s
+/// prefix survives, then the escape fires (#1279 rule 2), matching jq 1.7.1's
+/// `contains(("a", error("boom")))` -> stdout `true`, then exit 5.
+#[test]
+fn test_jq_contains_still_emits_the_prefix_before_an_escape_1553() -> Result<()> {
+    let (out, err, code) =
+        run_jq_stdin_with_stderr(r#"contains(("a", error("boom")))"#, r#""abc""#, &["-c"])?;
+    assert_eq!(out.trim(), "true", "out: {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 5, "err: {err:?}");
+    Ok(())
+}
+
 /// #1533 (single-argument half): `ArgFanout::RejectMany` used to test
 /// `args.len() > 1` before ever looking at the argument's own trailing
 /// control, so a real `error(...)` inside the generator was masked by
