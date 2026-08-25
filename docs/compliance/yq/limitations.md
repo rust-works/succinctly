@@ -379,16 +379,20 @@ per-mode-wholesale — all rows live-verified against yq v4.53.3:
 | `flatten(n)` | literal depth only — `bad expression, please check expression syntax` | gated off |
 | `getpath`, `range`, `nth`, `limit`, `combinations`, `paths`, `ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `index`, `rindex`, `indices`, `inside`, `splits`, `scan`, `gsub`, `strftime`, `strptime`, `bsearch`, `pow` | **lexer-rejected — the builtin does not exist** | fans out; unopposed extension |
 
-There are **two** gate predicates, so the audit is both greps —
-`grep -E 'ArgFanout::(yq_native|reject_many_in_yq)' src/jq/eval.rs`. Each is named rather than
-inlined precisely so that stays a grep (CLAUDE.md's #106 lesson).
+There are **three** gate predicates, so the audit is all three greps —
+`grep -E 'ArgFanout::(yq_native|reject_many_in_yq|contains_gate)' src/jq/eval.rs`. Each is named
+rather than inlined precisely so that stays a grep (CLAUDE.md's #106 lesson). `contains_gate`
+is `contains`'s own gate (#1553): unlike the other two, it does not change whether the argument
+fans out (`contains` genuinely fans out in both modes, the table row above) — it only adds the
+no-prefix escape rule below.
 
 ### The prefix rule is where the two modes deliberately part
 
 jq emits the outputs a prefix earned and *then* fires the argument's trailing control (#1277's
 rule 2). Real yq does not: an escape anywhere in a gated argument produces the escape alone,
 with nothing printed first — live-verified against v4.53.3 for `has`, `split` and `join`
-(#1534), and for `delpaths` (#1533):
+(#1534), for `delpaths` (#1533), and for `contains` (#1553, `ArgFanout::AllClearedOnEscape` —
+the one gate that keeps every value on the *non*-escaping path, unlike the other two):
 
 ```bash
 $ printf 'a: 1\n' | yq            'has(("a","b", error("boom")))'   # Error: boom, stdout empty
@@ -425,10 +429,15 @@ which was true only before #1534.
   every escaping/clean combination). `fanout_two_args` now always evaluates inner before
   reporting outer's own violation, matching real yq's own evaluation order rather than just its
   final answer. See `test_yq_setpath_reject_many_prefers_inner_violation_over_outer_1533`.
-- **`contains` on an escaping argument**
-  ([#1553](https://github.com/rust-works/succinctly/issues/1553)). `contains` is ungated because
-  real yq fans it out, but real yq still emits nothing when its argument escapes, where
-  succinctly emits the prefix first.
+- **`contains` on an escaping argument** ([#1553](https://github.com/rust-works/succinctly/issues/1553),
+  now closed). `contains` stays ungated for fan-out — real yq genuinely fans it out, unlike its
+  `yq_native`-gated neighbours — but needed its own gate for the no-prefix escape rule, since
+  neither existing gate fit: `FirstOnly` would wrongly truncate the ordinary non-error
+  multi-output case, and `RejectMany` refuses multi-output outright, which `contains` never
+  does. `ArgFanout::AllClearedOnEscape` keeps every value like `All` on the non-escaping path,
+  but routes through the same eager, escape-clearing `fanout_arg` machinery `FirstOnly`/
+  `RejectMany` already use. Confirmed by
+  `test_yq_contains_gate_emits_nothing_when_the_argument_escapes_1553` and its siblings.
 
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
