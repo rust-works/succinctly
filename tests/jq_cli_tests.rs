@@ -2202,13 +2202,16 @@ fn test_arithmetic_compare_cartesian_fanout_error_and_break_issue_768() -> Resul
 
 #[test]
 fn test_arithmetic_mod_reached_through_lazy_eval_each_1481() -> Result<()> {
-    // `eval_each`'s own `Expr::Arithmetic` arm (#1481) is a *second* copy of
-    // the `ArithOp` match, textually distinct from `eval_arithmetic`'s (the
-    // one a bare top-level `%` reaches) -- it only runs when arithmetic sits
-    // inside a lazy consumer built by `eval.rs`'s own evaluator, which the
-    // default CLI path only reaches once a filter touches `input`/`inputs`
-    // (`eval_generic.rs`'s `takes_input_queue_bridge` gate, #1504). Every
-    // other `ArithOp` arm there already had coverage; only `Mod` didn't.
+    // `eval_each`'s own `Expr::Arithmetic` arm (#1481) only runs when
+    // arithmetic sits inside a lazy consumer built by `eval.rs`'s own
+    // evaluator, which the default CLI path only reaches once a filter
+    // touches `input`/`inputs` (`eval_generic.rs`'s
+    // `takes_input_queue_bridge` gate, #1504) -- hence the otherwise-odd
+    // leading `input`. This pins that the lazy arm computes the same values
+    // in the same order as the eager `eval_arithmetic` a bare top-level `%`
+    // reaches; both now dispatch through the single shared `arith_combine`,
+    // so this is a route test, not a second copy of the `ArithOp` match to
+    // keep in sync (that duplication is what `arith_combine` removed).
     //
     // Ordering here is the same right-outer/left-inner fanout as `Compare`
     // (verified against the pinned oracle): `input` (bridging in and
@@ -19667,16 +19670,32 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
         // operands' evaluation instead of finishing the right one first:
         // `eval_binary_fanout` routes through `eval_each`, the path-context
         // sibling through a per-operand `needs_path_context` hybrid, and
-        // `eval_generic.rs`'s `Expr::Compare` arm through a new
-        // `binary_fanout_each_generic`/`eval_each_generic` pair mirroring
-        // `eval.rs`'s own machinery. A bare top-level compare now interleaves
-        // the same way the `all(...)`-wrapped spelling of this exact compare
-        // already did above (`isempty`/`limit`/etc. section) -- `B A C A`,
-        // not `B C A A`.
+        // `eval_generic.rs` gained a `binary_fanout_each_generic` plus
+        // native `eval_each_generic` arms mirroring `eval.rs`'s own
+        // machinery. A bare top-level compare now interleaves the same way
+        // the `all(...)`-wrapped spelling of this exact compare already did
+        // above (`isempty`/`limit`/etc. section) -- `B A C A`, not `B C A A`.
+        //
+        // `Expr::Compare` and `Expr::Arithmetic` share one loop, so every
+        // shape below is pinned in *both* spellings: fixing only the compare
+        // half is precisely the mistake that left `first(10 + ...)` leaking
+        // while `first(10 == ...)` no longer did.
         (
             &["-cn", r#"[("A"|stderr) == (("B"|stderr), ("C"|stderr))]"#],
             None,
             "[false,false]\n",
+            "BACA",
+            0,
+        ),
+        // The same top-level shape spelled with `+` instead of `==`. This is
+        // the half that reaches `eval.rs`'s `eval_binary_fanout` through
+        // `eval_generic`'s `eval_on_owned` bridge (arithmetic has no native
+        // `eval_single` arm there), so it pins a different route to the same
+        // loop than the compare row above.
+        (
+            &["-cn", r#"[("A"|stderr) + (("B"|stderr), ("C"|stderr))]"#],
+            None,
+            "[\"AB\",\"AC\"]\n",
             "BACA",
             0,
         ),
@@ -19691,6 +19710,44 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             None,
             "[false]\n",
             "",
+            0,
+        ),
+        // The `Expr::Arithmetic` twin of the row above. It is a *separate*
+        // arm on the same loop: `eval_each_generic` dispatches per `Expr`
+        // variant, so `Compare` having one said nothing about `+`, and until
+        // both existed this spelling still ran the `stderr` candidate
+        // `first` never asked for while the `==` spelling above did not.
+        (
+            &["-cn", r#"[first(10 + (1, ("B"|stderr)))]"#],
+            None,
+            "[11]\n",
+            "",
+            0,
+        ),
+        // Same arm, with a *halt* rather than a stderr write past the
+        // needed candidate -- the eager fallback used to take the whole
+        // process down at exit 3 here, which is the loudest form this leak
+        // takes.
+        (
+            &["-cn", r#"[first(10 + (1, 2, ("m"|halt_error(3))))]"#],
+            None,
+            "[11]\n",
+            "",
+            0,
+        ),
+        // Both operands generating, arithmetic spelling: pins the
+        // interleaved order (`X A`, right's first candidate then left)
+        // *and* the stop, rather than only the stop -- the compare rows
+        // above cannot show order, since `first` takes one output either
+        // way.
+        (
+            &[
+                "-cn",
+                r#"[first(("A"|stderr) + (("X"|stderr), ("Y"|stderr)))]"#,
+            ],
+            None,
+            "[\"AX\"]\n",
+            "XA",
             0,
         ),
         // Acceptance-criteria repro: a bare top-level compare whose *left*
@@ -19773,14 +19830,24 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
         // `Expr::If`/`Try`/`Label`/`As`/`Limit` have no native
-        // `eval_each_generic` arm (#1461's own doc comment scopes it to
-        // `Comma`/`Pipe`/`Paren` only), so when one of these is `first`'s
-        // argument's top-level shape, evaluation falls through to eager
-        // `eval_single` and a sibling branch's side effect fires even though
-        // `first` never needed it. Out of scope by design -- fixing
+        // `eval_each_generic` arm (#1461 scoped it to `Comma`/`Pipe`/`Paren`;
+        // #1481 added `Compare`/`Arithmetic`), so when one of these is
+        // `first`'s argument's top-level shape, evaluation falls through to
+        // eager `eval_single` and a sibling branch's side effect fires even
+        // though `first` never needed it. Out of scope by design -- fixing
         // `fold_pipe_stages`'s `LazyKeys`/`LazyIndexRange`/`LazySeq` gap
         // (#1565) does not touch this; these five shapes are pinned as an
         // explicit, documented known gap rather than fixed. jq: no stderr.
+        //
+        // The same five shapes leak identically one level down, as an
+        // *operand* of a binary operator (`first(10 == (if true then (1,
+        // ("B"|stderr)) else 9 end))`, and the `+` spelling of it): the
+        // operand strategy `binary_fanout_each_generic` is handed is
+        // `eval_each_generic` itself, so it inherits exactly this arm set.
+        // `scripts/jq-fanout-oracle-sweep.sh` attributes those 20 cases to
+        // this entry rather than reporting them as unexplained -- pinning
+        // every one of them here would be 20 more rows saying what these
+        // five already say.
         (
             &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
             None,
