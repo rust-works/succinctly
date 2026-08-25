@@ -955,6 +955,36 @@ impl EvalError {
             .starts_with(Self::INVALID_PATH_EXPRESSION_PREFIX)
     }
 
+    /// A decode failure while materializing a lazily-indexed document value
+    /// (#1247): invalid UTF-8, an unrecoverable escape, or a malformed
+    /// number literal. Unlike an ordinary type-mismatch error, this must
+    /// never be suppressed by `?` or caught by `try`/`catch` (#1620) — jq's
+    /// own equivalent is a parse-time rejection no program could ever catch
+    /// either.
+    pub fn decode_failure(reason: impl Into<String>) -> Self {
+        Self::new(reason)
+    }
+
+    /// Whether this is a [`Self::decode_failure`] — see #1620. Every
+    /// `?`/`try`/`catch` boundary consults this so a decode failure passes
+    /// through unmatched instead of being suppressed, the same way
+    /// [`Self::is_invalid_path_expression`] exempts its own narrow error
+    /// class without leaving the ordinary catchable `Error` channel.
+    pub fn is_decode_failure(&self) -> bool {
+        let base = self
+            .message
+            .strip_suffix(" in object key")
+            .unwrap_or(&self.message);
+        matches!(
+            base,
+            "invalid UTF-8 in string"
+                | "invalid number format"
+                | "invalid escape sequence in string"
+                | "invalid unicode escape sequence"
+                | "invalid escape sequence"
+        )
+    }
+
     /// `Cannot check whether <container> has a <key type> key`.
     pub fn cannot_check_has(container_type: &str, key_type: &str) -> Self {
         Self::new(format!(

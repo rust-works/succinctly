@@ -570,6 +570,17 @@ what Stage 6 is left with is bad escapes only.
    (it happens before the program runs). Decide explicitly whether that is acceptable or
    whether these need `Halt`-like uncatchability. This is a genuine semantic difference
    from both oracles and the design above does not resolve it.
+
+   **Resolved by #1620**: uncatchable both ways, but *not* via `Halt` -- `Halt` is
+   whole-process-fatal (aborts every remaining record in a multi-document stream), which
+   would trade this divergence for a worse one against the already-accepted "a malformed
+   value doesn't abort the rest of the stream" divergence below. Instead, `EvalError` grew a
+   `decode_failure`/`is_decode_failure` pair (`src/jq/error.rs`), mirroring the existing
+   `is_invalid_path_expression` precedent: a decode failure still travels through the
+   ordinary `Control::Error`/`GenericResult::Error`/`QueryResult::Error` channel (so it stays
+   per-record), but every `?`/`try`/`catch` boundary in both evaluators now checks
+   `is_decode_failure()` first and lets it pass through unmatched instead of suppressing or
+   catching it.
 2. **JSONTestSuite `i_` cases.** `tests/json_test_suite.rs` covers implementation-defined
    inputs; making decode failures loud can flip them in either direction. Check what the
    suite currently expects *before* regenerating anything.
@@ -626,6 +637,8 @@ what Stage 6 is left with is bad escapes only.
 
 - [#1247](https://github.com/rust-works/succinctly/issues/1247) — the issue this document
   is the deliverable for.
+- [#1620](https://github.com/rust-works/succinctly/issues/1620) (resolved) — Open Risk 1,
+  decode-failure catchability, filed and settled per this document's own follow-up list.
 - [#1192](https://github.com/rust-works/succinctly/issues/1192) (closed) — fixed two
   sibling copies and established the `EvalError` wording convention reused here.
 - [#1098](https://github.com/rust-works/succinctly/issues/1098) (closed) — the original
@@ -653,5 +666,6 @@ Not yet filed. Once this document is reviewed:
 1. One implementation issue per stage above, linking back here.
 2. **`JsonFields::uncons` cannot represent a malformed field** — #1194's headline repro
    (`{invalid} → {}`), see Correction 3.
-3. **Decide catchability of decode errors** — Open Risk 1, if it is not settled during
-   Stage 3's review.
+3. ~~**Decide catchability of decode errors** — Open Risk 1, if it is not settled during
+   Stage 3's review.~~ Filed as [#1620](https://github.com/rust-works/succinctly/issues/1620),
+   resolved there -- see Open Risk 1 above.

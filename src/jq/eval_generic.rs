@@ -167,7 +167,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
             // invisible. Wording matches the sibling `owned_from_standard_json`
             // conversion #1192 fixed first.
             if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::new(format!("{reason} in object key")));
+                return Err(EvalError::decode_failure(format!("{reason} in object key")));
             }
             // A key that will not stringify at all is not a decode failure --
             // it is a key JSON's grammar never allowed (`{123: 1}`), which
@@ -219,7 +219,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // decode. Raising here is #1247's core fix; the deferral comment that
         // used to sit in the `else` below (naming #1098 and PR #1190's
         // reverted `panic!`) described exactly this and is now resolved.
-        Err(EvalError::new(reason.to_string()))
+        Err(EvalError::decode_failure(reason))
     } else if value.is_error() {
         // A *structurally* malformed value -- `[xyz123]`, `[tru]` -- which
         // the semi-index accepted as a span but could not classify as any
@@ -271,7 +271,7 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         while let Some((field, rest)) = f.uncons() {
             // Same key ordering as `to_owned_at_depth` above, same reason.
             if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::new(format!("{reason} in object key")));
+                return Err(EvalError::decode_failure(format!("{reason} in object key")));
             }
             // Same two #1194 checks as `to_owned_at_depth` above, same
             // reasons -- these two conversions are copies of each other and a
@@ -368,26 +368,6 @@ fn to_owned_with_cursor<V: DocumentValue>(
 /// caller takes the fallible one above.
 fn to_owned_for_diagnostic<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> OwnedValue {
     to_owned_with_cursor(value, cursor).unwrap_or(OwnedValue::Null)
-}
-
-/// The error a builtin should raise when its type dispatch fell through.
-///
-/// Those dispatches are chains of `as_str()`/`as_array()`/`as_i64()`/...
-/// tests, so a string scalar whose bytes don't decode fails *every* one and
-/// lands in the same `else` as a genuine type mismatch. Reporting the type
-/// error there is actively misleading -- `{"a":"\ud800"} | .a | length` said
-/// `null (null) has no length` about a value that is a perfectly good string
-/// token, naming a symptom two steps removed from the cause. Check for the
-/// decode failure first and report that instead (#1247); everything else
-/// keeps the caller's own wording, which the jq oracle tests pin.
-fn type_error_or_decode_failure<V: DocumentValue>(
-    value: &V,
-    type_error: impl FnOnce() -> EvalError,
-) -> EvalError {
-    match value.string_decode_error() {
-        Some(reason) => EvalError::new(reason.to_string()),
-        None => type_error(),
-    }
 }
 
 /// The jq `type` name for `value` at `cursor`, resolving an explicit YAML
@@ -706,7 +686,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         while let Some((field, rest)) = f.uncons() {
             // Same key ordering as `to_owned_at_depth`, same reason (#1247).
             if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::new(format!("{reason} in object key")));
+                return Err(EvalError::decode_failure(format!("{reason} in object key")));
             }
             if let Some(key) = field.key_str() {
                 let key = key.into_owned();
@@ -1647,7 +1627,12 @@ fn finish_fork_generic<V: DocumentValue>(
 ) -> GenericResult<V> {
     match control {
         None => owned_vec_to_generic_result(outputs),
-        Some(Control::Error(_)) if optional => owned_vec_to_generic_result(outputs),
+        // A decode failure (#1620) is never silenced by an ambient
+        // `optional`, unlike an ordinary trailing error -- see
+        // `Expr::Optional`'s own arm above for the full rationale.
+        Some(Control::Error(ref e)) if optional && !e.is_decode_failure() => {
+            owned_vec_to_generic_result(outputs)
+        }
         Some(control) => partial_generic(outputs, control),
     }
 }
@@ -3779,12 +3764,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     GenericResult::ManyCursor(cursors)
                 }
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::cannot_iterate_with(S::TAG, &to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::cannot_iterate_with(
+                    S::TAG,
+                    &to_owned_for_diagnostic(&value, cursor),
+                ))
             }
         }
 
@@ -3814,6 +3802,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // ordinary `empty`, so the fan-out wrongly kept going instead of
         // stopping (#693).
         Expr::Optional(inner) => match eval_single::<S, _>(inner, value, optional, cursor) {
+            // A decode failure (#1247) must never be suppressed by `?`, any
+            // more than it's caught by `try`/`catch` -- jq's own equivalent
+            // is a parse-time rejection no program could ever catch either
+            // (#1620). Checked before the ordinary `Error`/`Break` catch
+            // below so it falls through to `other => other` instead.
+            GenericResult::Error(e) if e.is_decode_failure() => GenericResult::Error(e),
             GenericResult::Error(_) | GenericResult::Break(_) => GenericResult::None,
             // `prefix` is never empty here: `partial_generic` (and
             // `eval::partial`, its mirror) already collapse an empty prefix
@@ -3828,6 +3822,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // `eval::eval_try`'s identical jq-mode arm calls into and which
             // already routes its own prefix-collapse through
             // `owned_vec_to_result`/`collapse_vec`.
+            //
+            // Same #1620 decode-failure exclusion as the bare `Error` arm
+            // above -- a `Partial` ending in a decode failure must still
+            // propagate uncaught, not collapse its prefix into `None`.
+            GenericResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+                GenericResult::Partial(prefix, Control::Error(e))
+            }
             GenericResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => collapse_vec(
                 prefix,
                 || GenericResult::None,
@@ -3848,6 +3849,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // errored/exit-5 here before this arm existed).
             GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
                 Ok(owned) => GenericResult::Owned(owned),
+                // Same #1620 exclusion as above: a decode failure surfacing
+                // only once the `LazySeq` is forced must still propagate
+                // uncaught, checked before the ordinary `Error`/`Break`
+                // catch right below.
+                Err(Control::Error(e)) if e.is_decode_failure() => GenericResult::Error(e),
                 Err(Control::Error(_) | Control::Break(_)) => GenericResult::None,
                 // Unlike `Error`/`Break` just above, `?` must NOT catch a
                 // `halt` (verified against real jq: `("x"|halt_error)? //
@@ -5616,12 +5622,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(LazySeq::new(source).push_map(f, S::TAG))
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::cannot_iterate_with(S::TAG, &to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::cannot_iterate_with(
+                    S::TAG,
+                    &to_owned_for_diagnostic(&value, cursor),
+                ))
             }
         }
 
@@ -5790,12 +5799,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 })
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f.abs()))
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::has_no_length(&to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::has_no_length(&to_owned_for_diagnostic(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -5819,12 +5830,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // yet; `length`, `.[]`, `.[n]`, `first`, and `last` can all
                 // answer directly from `len` (see the `Pipe` dispatch below).
                 GenericResult::LazyIndexRange(elements.len())
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -5843,12 +5856,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(elements) = value.as_array() {
                 // Same laziness as the array branch of `Keys` above (#684).
                 GenericResult::LazyIndexRange(elements.len())
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -5908,7 +5923,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // Key decode checked before `key_str`, as everywhere else
                     // (#1247) -- YAML stringifies an undecodable key to `""`.
                     if let Some(reason) = field.key.string_decode_error() {
-                        return GenericResult::Error(EvalError::new(format!(
+                        return GenericResult::Error(EvalError::decode_failure(format!(
                             "{reason} in object key"
                         )));
                     }
@@ -5934,6 +5949,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     entries.push(OwnedValue::Object(entry));
                 }
                 GenericResult::Owned(OwnedValue::Array(entries))
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else {
                 // No `optional`-guarded arm here: `Builtin::ToEntries` isn't
                 // `IndexExpr`/`SliceExpr`, so #693's dispatch never forces
@@ -5941,9 +5958,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // evaluates it at the ambient `optional` (normally `false`)
                 // and lets the outer `Expr::Optional`/`eval_try`-style catch
                 // convert the resulting `Error` to `None` once instead.
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::has_no_keys(&to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -6117,12 +6134,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Err(_) if optional => GenericResult::None,
                     Err(e) => GenericResult::Error(e),
                 }
+            } else if let Some(reason) = value.string_decode_error() {
+                GenericResult::Error(EvalError::decode_failure(reason))
             } else if optional {
                 GenericResult::None
             } else {
-                GenericResult::Error(type_error_or_decode_failure(&value, || {
-                    EvalError::cannot_parse_as_number(&to_owned_for_diagnostic(&value, cursor))
-                }))
+                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned_for_diagnostic(
+                    &value, cursor,
+                )))
             }
         }
 
@@ -6307,6 +6326,67 @@ mod tests {
             "message: {}",
             err.message
         );
+    }
+
+    /// #1620: `?` must not suppress a decode failure -- `Expr::Optional`'s
+    /// own arm now excludes it explicitly (see its doc comment), instead of
+    /// folding it into the ordinary `Error`/`Break` -> `None` catch every
+    /// other error takes.
+    #[test]
+    fn test_generic_optional_does_not_suppress_decode_failure_1620() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(
+            &Expr::Optional(Box::new(Expr::Builtin(Builtin::Length))),
+            value,
+        );
+
+        match result {
+            GenericResult::Error(e) => assert!(
+                e.is_decode_failure() && e.message.contains("invalid UTF-8"),
+                "message: {}",
+                e.message
+            ),
+            other => panic!("expected an uncaught decode-failure error, got {other:?}"),
+        }
+    }
+
+    /// #1620: `try`/`catch` -- routed through the reindex-bridge wildcard
+    /// since this module has no native `Expr::Try` arm (see that arm's own
+    /// doc comment) -- must not catch a decode failure either.
+    #[test]
+    fn test_generic_try_catch_does_not_catch_decode_failure_1620() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(
+            &Expr::Try {
+                expr: Box::new(Expr::Pipe(vec![
+                    Expr::Field("a".to_string()),
+                    Expr::Builtin(Builtin::Length),
+                ])),
+                catch: Some(Box::new(Expr::Literal(Literal::String(
+                    "caught".to_string(),
+                )))),
+            },
+            value,
+        );
+
+        match result {
+            GenericResult::Error(e) => assert!(
+                e.is_decode_failure() && e.message.contains("invalid UTF-8"),
+                "message: {}",
+                e.message
+            ),
+            other => panic!("expected an uncaught decode-failure error, got {other:?}"),
+        }
     }
 
     /// #1247: a valid document still materializes unchanged -- the guard

@@ -21808,6 +21808,85 @@ fn test_sort_keys_and_color_force_materialize_and_surface_decode_failure_1247() 
     }
 }
 
+/// #1620: a decode failure must never be suppressed by `?`, matching how
+/// `try`/`catch` already never catches one -- real jq's equivalent is a
+/// parse-time rejection no program could ever catch either. Before this fix,
+/// `?` swallowed the same failure `test_decode_failure_surfaces_as_error_1247`
+/// pins as uncaught: `.a | length?` on `{"a":"\ud800"}` silently produced no
+/// output at exit 0 instead of erroring. Every filter here now errors, same
+/// as its bare (non-`?`) counterpart.
+///
+/// `.a?` (no downstream builtin) is deliberately not included: bare field
+/// access never decodes the string at all -- it only echoes the raw token --
+/// so there is no decode failure for `?` to have swallowed in the first
+/// place.
+#[test]
+fn test_decode_failure_not_suppressed_by_optional_1620() {
+    let doc = r#"{"a": "\ud800"}"#;
+    for filter in [
+        ".a | length?",
+        ".a | tonumber?",
+        "to_entries?",
+        "[.a] | sort?",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_ne!(
+            code, 0,
+            "`{filter}` should fail, not be suppressed by `?`\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{filter}` should name the decode failure\nstderr: {stderr}"
+        );
+    }
+}
+
+/// #1620 regression pin: `try`/`catch` must keep NOT catching a decode
+/// failure -- already true before this fix (by accident, per #1620's own
+/// analysis), now true by design. Paired with the `?` case above so neither
+/// mechanism can silently start suppressing this again.
+#[test]
+fn test_decode_failure_not_caught_by_try_catch_1620() {
+    let doc = r#"{"a": "\ud800"}"#;
+    for filter in [
+        r#"try (.a | length) catch "caught""#,
+        r#"try (.a | ascii_downcase) catch "caught""#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{filter}` should still fail\nstdout: {stdout}");
+        assert!(
+            !stdout.contains("caught"),
+            "`{filter}` should not have run the catch handler\nstdout: {stdout}"
+        );
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "`{filter}` should name the decode failure\nstderr: {stderr}"
+        );
+    }
+}
+
+/// #1620 negative control: an *ordinary* type error (not a decode failure)
+/// must still be suppressed by `?` and caught by `try`/`catch` exactly as
+/// before -- proves the new decode-failure exclusion is scoped to decode
+/// failures only, not a general regression of `?`/`try` suppression.
+#[test]
+fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
+    let doc = r#"{"a": 1}"#;
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | keys?"], Some(doc))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "", "stdout: {stdout}");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"try (.a | keys) catch "caught""#], Some(doc))
+            .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), r#""caught""#);
+}
+
 /// #1194 (the half in #1247's scope): a *structurally* malformed value --
 /// one the semi-index accepted as a span but could not classify as any JSON
 /// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
