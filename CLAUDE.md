@@ -806,6 +806,13 @@ For detailed documentation on optimization techniques used in this project, see 
   - Outputs byte-identical pre↔post on all 80 yq A/B configurations
   - Key insight: derive, don't store, what the text already encodes; transient build allocations can dwarf the retained structure (2-bit-per-byte scratch was 6-13× the stored bitvector)
   - See [docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-](docs/parsing/yaml.md#o4-seq_items-bitvector-elimination--accepted-) for full analysis
+- ✅ O5 (Lazy-Keys Cursor+Value Reuse): **-5.3% to -8.4%** on yq/jq queries that walk every key, issues #1599/#1606/#1609
+  - `each_lazy_keys_iterate_sink`'s streaming `keys_unsorted` arm (#1599) discarded each key's already-decoded value and let downstream re-derive it via a second `V::Cursor::value()` resolve — for YAML a full scalar decode, not a cheap re-read
+  - New `GenericItem::OneCursorValue(V::Cursor, V)` variant carries the value through instead; 3 edits in `src/jq/eval_generic.rs`, no changes to `document.rs`/`yaml/light.rs`/`json/light.rs`
+  - **Measured** (Apple M4 Pro, interleaved A/B, 100K/1M-key flat mappings): walks-all shape -5.3% to -8.4% (both yq and jq), early-exit shape unchanged (within noise) — #1599's -34% early-exit win fully preserved, batching-window idea #1609 floated was not needed
+  - `size_of::<GenericItem<V>>()` measured unchanged (176/192 bytes) — the new variant fit inside the enum's existing footprint, no boxing needed
+  - Key insight: a doc comment naming a redundancy (#1514) can be verified by reading the call graph, not just profiled; format-dependent magnitude (YAML full decode vs JSON single-byte dispatch) doesn't mean the underlying inefficiency isn't present in the cheaper format too
+  - See [docs/parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-](docs/parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-) for full analysis
 - ✅ O5 (CS-Poppy Combined Sampling for BP Select): **4× smaller YAML select index**, mixed select1 speed by platform, issue #64
   - Replaced `WithSelect`'s sampled `(word, cumulative)` pairs with `WithCsPoppy`: `u32` entry points into BP's own rank directory (`rank_l1`/`rank_l2`) instead of a parallel structure
   - Step A (narrow `SelectIndex<u32>` for BP, `len <= u32::MAX` bits) + Step B (`WithCsPoppy`) together take the BP select index from 25% to 6.25% of the bitmap — a 4x reduction, measured via real `select_heap_size()`, not derived

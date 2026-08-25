@@ -5119,6 +5119,130 @@ removed O(1) bit test.
 
 ---
 
+## O5: Lazy-Keys Cursor+Value Reuse — Accepted ✅
+
+**Issues**: [#1599](https://github.com/rust-works/succinctly/issues/1599) (streamed
+`keys_unsorted` fan-out, origin of the trade this closes),
+[#1606](https://github.com/rust-works/succinctly/pull/1606) (partial fix: `YamlFields`
+`uncons_key` override, +11.1% → +5.0%), [#1609](https://github.com/rust-works/succinctly/issues/1609)
+(this issue: the remaining ~5%)
+
+### Problem
+
+`each_lazy_keys_iterate_sink`'s `!sorted` (`keys_unsorted`/yq `keys`) arm
+([src/jq/eval_generic.rs](../../src/jq/eval_generic.rs)) streams `DistinctKeyCursors`
+directly into the pipe driver — a big win for early-exit consumers (#1599), but on a query
+that walks every key and matches none, it regressed **+5.0%** in yq mode versus the older
+collect-then-drive path. #1606 closed roughly half of that (+11.1% → +5.0%) by giving
+`YamlFields` its own `uncons_key` override; this issue is the residue.
+
+Root cause: `DistinctKeyCursors::next()` ([src/jq/document.rs](../../src/jq/document.rs))
+calls `uncons_key()`, which already decodes each key's value (needed for the duplicate-key
+hash probe) — but the construction site threw that value away and kept only the cursor:
+
+```rust
+DistinctKeyCursors::new(fields, collapse)
+    .map(|(_, cursor)| Ok(GenericItem::OneCursor(cursor)))
+```
+
+Downstream, `continue_pipe_element_generic`'s `OneCursor` arm calls `c.value()` to get the
+value back — the *same* `YamlCursor::value()` resolve `uncons_key()` already ran, a second
+time, per key. For YAML that is not a cheap re-read: root check, `is_container()`, seq-item
+unwrap, alias/anchor handling, a block-vs-scalar lookahead, and for plain scalars a `\n`
+scan. JSON's `JsonCursor::value()` is a cheap single-byte dispatch, which is why the
+equivalent JSON shape was *not* regressed by #1599 — the mechanism is real but
+format-dependent in magnitude, exactly matching what #1609 observed.
+
+### Solution
+
+A new `GenericItem` variant, `OneCursorValue(V::Cursor, V)`, carries the already-decoded
+key alongside its cursor so the second decode never happens. Three edits, all in
+`src/jq/eval_generic.rs`:
+
+1. `enum GenericItem` gains `OneCursorValue(V::Cursor, V)`, documented as a one-site-only
+   optimization — every other cursor site (`.[]` iteration via `uncons_cursor`, etc.) has no
+   value decoded yet, so pairing one in there would be new cost, not a freebie.
+2. The construction site keeps the value instead of discarding it:
+   `.map(|(value, cursor)| Ok(GenericItem::OneCursorValue(cursor, value)))`.
+3. `continue_pipe_element_generic` gets a new arm identical to `OneCursor`'s, minus the
+   `c.value()` call. `generic_item_to_result` (the only other exhaustive match the compiler
+   forces) collapses `OneCursorValue` back to plain `GenericResult::OneCursor`, deliberately
+   dropping the pre-decoded value — its only caller is `first(...)`/`last(...)`'s
+   single-item capture, once per builtin call rather than once per key, so re-deriving there
+   costs nothing that matters.
+
+No changes to `document.rs`, `yaml/light.rs`, `json/light.rs`, or the older, JSON-only,
+non-generic evaluator (`src/jq/eval.rs` — its own `keys`/`keys_unsorted` eagerly collects a
+`Vec<String>` with no cursor at all, so this fix has no counterpart to apply there).
+
+**Size**: `size_of::<GenericItem<V>>()` was measured before and after, for both `V`. It did
+not change (176 bytes for `StandardJson`, 192 for `YamlValue`, in both cases) —
+`GenericItem::LazySeq`'s payload was already the size-driving variant, so the new variant
+fits inside the existing footprint at zero cost. Confirmed empirically rather than assumed;
+no boxing was needed.
+
+### Benchmark Results
+
+Apple M4 Pro, interleaved A/B (`scripts/ab-cli.py`, 9 reps, `--control` noise floor
+±0.5%, output identity gated — 0 differences across every configuration below), flat
+mapping fixtures generated inline (~1.9 MB/100K keys, ~19 MB/1M keys):
+
+| Shape                                                    | Size | Before med | After med | Δ (median) |
+|-----------------------------------------------------------|------|-----------:|----------:|-----------:|
+| yq `first(keys \| .[] \| select(. == "zzz"))` (walks all)  | 100K |    57.6 ms |   54.6 ms | **−5.3%**  |
+| yq `first(keys \| .[] \| select(. == "zzz"))` (walks all)  | 1M   |   555.2 ms |  515.5 ms | **−7.1%**  |
+| yq `first(keys \| .[])` (early exit)                       | 100K |    12.9 ms |   12.9 ms |   −0.0%    |
+| yq `first(keys \| .[])` (early exit)                       | 1M   |   102.9 ms |  101.1 ms |   −1.8%    |
+| jq `first(keys_unsorted \| .[] \| select(. == "zzz"))`      | 1M   |   404.6 ms |  370.6 ms | **−8.4%**  |
+| jq `first(keys_unsorted \| .[])` (early exit)               | 1M   |    34.8 ms |   35.2 ms |   +0.9%    |
+
+The walks-all regression this issue tracks is fully closed and then some (−5.3% to −8.4%,
+well outside the noise floor at both sizes), the effect is flat across a 10x size range
+(consistent with an O(1)-per-key mechanism, not a curved one), and #1599's early-exit win is
+fully preserved (both early-exit deltas are within the ±0.5–1.8% noise band established by
+the control run). JSON, included as a control group since the fix applies to `StandardJson`
+too, improved rather than regressed — the redundant decode was real there too, just cheaper
+per call.
+
+Given the walks-all regression closed with early-exit preserved, the batching-window idea
+`#1609` also floated (pull N cursors, drive them, repeat) was not needed and was not built —
+the dominant cost was the redundant decode, not interleaving/locality.
+
+### Tests
+
+`tests/jq_cli_tests.rs`'s existing `test_lazy_keys_demand_sink_streams_collapse_1599` and
+`test_lazy_keys_streaming_reports_first_occurrence_cursor_1599` continue to pin the #1599
+streaming semantics unmodified. New in `tests/yq_cli_tests.rs`:
+`test_keys_unsorted_streamed_key_anchor_1609`, `test_keys_unsorted_streamed_key_style_1609`,
+and `test_keys_unsorted_streamed_key_position_1609` — confirming `anchor`/`style`/`line`/
+`column` read through a streamed key's cursor identically to before the fix (verified
+directly against a before/after binary pair, not just plausible-looking output).
+
+### Key Learnings
+
+1. **A doc-comment claim ("re-deriving the key materializes it a second time") can be
+   verified by reading the call graph, not just profiled** — `DistinctKeyCursors`'s own doc
+   comment already named this exact redundancy (#1514); #1609 rediscovered it independently
+   and confirmed it was real, not just plausible.
+2. **Enum-size-bloat risk is worth measuring, not assuming** — a naive read suggested
+   pairing a cursor with a value could grow `GenericItem` and regress every other pipe
+   stage; measuring showed the enum's size was already set by a larger variant, so the
+   worry was unfounded here, but this repo's `#[repr]`-sensitive types generally warrant the
+   same check before rather than after landing.
+3. **Format-dependent magnitude, format-independent mechanism**: the same redundant-decode
+   fix helped JSON *and* YAML, but by very different amounts (`JsonCursor::value()` is a
+   single-byte dispatch, `YamlCursor::value()` is not) — a shape reported as "not regressed"
+   for one format doesn't mean the underlying inefficiency isn't there, only that it's
+   cheap enough not to show.
+
+### Files Modified
+
+- `src/jq/eval_generic.rs` — `GenericItem::OneCursorValue` variant, construction site,
+  `continue_pipe_element_generic` arm, `generic_item_to_result` arm
+- `tests/yq_cli_tests.rs` — three new `_1609` regression tests
+
+---
+
 ## See Also
 
 - [YamlIndex wiki page](yaml-index.md) — concept overview, dependencies, and academic references

@@ -10055,6 +10055,66 @@ fn test_style_builtin_anchor_prefix_does_not_mask_style() -> Result<()> {
     Ok(())
 }
 
+/// #1609: `each_lazy_keys_iterate_sink`'s `keys_unsorted` arm streams a
+/// `GenericItem::OneCursorValue` carrying the key's already-decoded value
+/// alongside its cursor (avoiding a redundant `YamlCursor::value()` resolve
+/// per key). `anchor`/`style` read metadata off the *cursor* half of that
+/// pair, so an anchored/styled key is the concrete check that the cursor
+/// threaded through the new variant is the same one the old
+/// `OneCursor` + `.value()` path would have produced.
+#[test]
+fn test_keys_unsorted_streamed_key_anchor_1609() -> Result<()> {
+    let input = "&x a: 1\nb: 2\n";
+    let (output, code) = run_yq_stdin("keys_unsorted | .[0] | anchor", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "x");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[1] | anchor", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "");
+
+    Ok(())
+}
+
+#[test]
+fn test_keys_unsorted_streamed_key_style_1609() -> Result<()> {
+    let cases = [
+        ("\"a\": 1\nb: 2\n", "\"double\""),
+        ("'a': 1\nb: 2\n", "\"single\""),
+        ("a: 1\nb: 2\n", "\"\""),
+    ];
+
+    for (input, expected) in cases {
+        let (output, code) = run_yq_stdin("keys_unsorted | .[0] | style", input, &["-o=json"])?;
+        assert_eq!(code, 0, "input: {input:?}");
+        assert_eq!(output.trim(), expected, "input: {input:?}");
+    }
+
+    Ok(())
+}
+
+/// #1609: `line`/`column` through a streamed `keys_unsorted` element must
+/// still report the key's own position, not something the cursor+value
+/// pairing accidentally shifted.
+#[test]
+fn test_keys_unsorted_streamed_key_position_1609() -> Result<()> {
+    let input = "a: 1\nbb: 2\nccc: 3\n";
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[2]", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "ccc");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[2] | line", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3");
+
+    let (output, code) = run_yq_stdin("keys_unsorted | .[2] | column", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1");
+
+    Ok(())
+}
+
 /// The DOM path's `evaluate_yaml_cursor` (`yq_runner.rs`) has its own
 /// `GenericResult::LazySeq` arm. `can_use_m2_streaming` rejects
 /// `Builtin::Map` outright, so any top-level `map(f)` query takes this DOM

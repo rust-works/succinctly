@@ -3469,6 +3469,15 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// one at a time as `Owned` strings -- matching `materialize_lazy_keys`'s
 /// existing behaviour of not preserving a cursor for sorted keys (no new
 /// capability, no regression, just demand-aware instead of eager).
+///
+/// **`!sorted` yields `OneCursorValue`, not `OneCursor`** (#1609):
+/// `DistinctKeyCursors::next` already decodes each key's value for its own
+/// duplicate-key hashing, so throwing it away here and letting
+/// `continue_pipe_element_generic` re-derive it via `OneCursor`'s
+/// `c.value()` would decode every key twice -- for YAML a real cost (a full
+/// scalar resolve, not a cheap re-read), measurable as a ~5% regression on
+/// a query that walks every key and matches none. Carrying the value
+/// through instead removes that redundancy without changing output.
 fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     fields: &V::Fields,
     sorted: bool,
@@ -3480,7 +3489,7 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     if !sorted {
         return drive_pipe_elements_generic::<S, V>(
             DistinctKeyCursors::new(fields, collapse)
-                .map(|(_, cursor)| Ok(GenericItem::OneCursor(cursor))),
+                .map(|(value, cursor)| Ok(GenericItem::OneCursorValue(cursor, value))),
             rest,
             optional,
             sink,
@@ -4122,21 +4131,36 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 /// One output on its way to the sink installed by [`eval_each_generic`]
 /// (#1461, mirroring `eval::Item`).
 ///
-/// Six variants, matching the six single-output shapes of [`GenericResult`]
-/// -- `None`/`Error`/`Break`/`Halt`/`Partial`/`Many`/`ManyCursor`/`ManyOwned`
-/// are multi-output or terminal and are never represented as one item;
-/// [`drain_result_generic`] handles those directly. `LazyKeys`/
-/// `LazyIndexRange`/`LazySeq` are carried opaque rather than decomposed:
-/// only [`fold_pipe_stages`]'s own per-variant switch knows how to thread
-/// one of them through a *further* pipe stage (its `map`/`select`/`first`/
-/// `.[n]` composability fast paths, #724/#725) -- collapsing one to
-/// `Owned`/`One` before that switch runs is exactly the regression #1503
-/// review found and reverted. No `Debug` derive, matching `eval::Item`'s own
-/// omission: `V::Cursor` has no guaranteed `Debug` bound (see `LazyElem`'s
-/// own comment above for why that is deliberate here too).
+/// Matches the six single-output shapes of [`GenericResult`] plus one extra,
+/// `OneCursorValue` -- `None`/`Error`/`Break`/`Halt`/`Partial`/`Many`/
+/// `ManyCursor`/`ManyOwned` are multi-output or terminal and are never
+/// represented as one item; [`drain_result_generic`] handles those directly.
+/// `LazyKeys`/`LazyIndexRange`/`LazySeq` are carried opaque rather than
+/// decomposed: only [`fold_pipe_stages`]'s own per-variant switch knows how
+/// to thread one of them through a *further* pipe stage (its
+/// `map`/`select`/`first`/`.[n]` composability fast paths, #724/#725) --
+/// collapsing one to `Owned`/`One` before that switch runs is exactly the
+/// regression #1503 review found and reverted. No `Debug` derive, matching
+/// `eval::Item`'s own omission: `V::Cursor` has no guaranteed `Debug` bound
+/// (see `LazyElem`'s own comment above for why that is deliberate here too).
+///
+/// `OneCursorValue(V::Cursor, V)` has no [`GenericResult`] counterpart --
+/// it exists purely as a per-item optimization at one construction site,
+/// [`each_lazy_keys_iterate_sink`]'s `!sorted` arm. `DistinctKeyCursors`
+/// already decodes each key's value as a side effect of walking (it needs
+/// it for duplicate-key hashing), so pairing that value with its cursor
+/// here lets [`continue_pipe_element_generic`] skip a second, identical
+/// `V::Cursor::value()` resolve -- for YAML specifically not a cheap
+/// re-read but a full scalar decode (#1609). **Do not use this variant
+/// anywhere else.** Every other `OneCursor` site (`.[]` iteration via
+/// `uncons_cursor`, etc.) has no value decoded yet, so pairing one in would
+/// be new cost, not a freebie -- `OneCursor` alone stays correct there.
 enum GenericItem<V: DocumentValue> {
     One(V),
     OneCursor(V::Cursor),
+    /// See the enum doc comment -- only ever constructed by
+    /// [`each_lazy_keys_iterate_sink`]'s streaming `keys_unsorted` arm.
+    OneCursorValue(V::Cursor, V),
     Owned(OwnedValue),
     LazyKeys {
         fields: V::Fields,
@@ -4414,6 +4438,12 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
         GenericItem::OneCursor(c) => {
             eval_each_pipe_generic::<S, V>(rest.stages(), c.value(), optional, Some(c), sink)
         }
+        // Same as the `OneCursor` arm above, minus the `c.value()` resolve
+        // -- `v` was already decoded by whoever built this item (#1609), so
+        // re-deriving it here would just repeat that work.
+        GenericItem::OneCursorValue(c, v) => {
+            eval_each_pipe_generic::<S, V>(rest.stages(), v, optional, Some(c), sink)
+        }
         GenericItem::Owned(o) => eval_each_owned::<S>(rest.owned(), &o, optional, &mut |o| {
             sink(GenericItem::Owned(o))
         }),
@@ -4536,10 +4566,20 @@ fn each_take_first_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// Convert a captured [`GenericItem`] back to the [`GenericResult`] shape it
 /// came from -- the inverse of [`drain_result_generic`]'s single-item arms.
+///
+/// `OneCursorValue` has no `GenericResult` counterpart to convert to, so it
+/// collapses to plain `OneCursor` here, dropping the pre-decoded value
+/// (#1609). That's fine: this function's only caller for a single captured
+/// item is `each_take_first_generic`'s `first(...)`/`last(...)` path, once
+/// per builtin call rather than once per key, so re-deriving the value via
+/// `GenericResult::OneCursor`'s later `.value()` costs nothing that matters
+/// -- adding a matching `GenericResult` variant just to avoid that one cold
+/// re-decode isn't worth `GenericResult`'s much larger consumer set.
 fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResult<V> {
     match item {
         GenericItem::One(v) => GenericResult::One(v),
         GenericItem::OneCursor(c) => GenericResult::OneCursor(c),
+        GenericItem::OneCursorValue(c, _v) => GenericResult::OneCursor(c),
         GenericItem::Owned(o) => GenericResult::Owned(o),
         GenericItem::LazyKeys {
             fields,
