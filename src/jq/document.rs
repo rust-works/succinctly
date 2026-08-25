@@ -549,6 +549,25 @@ pub trait DocumentFields: Sized + Clone {
         false
     }
 
+    /// The error to raise for a member this format's index accepted but the
+    /// format's grammar does not -- an unpaired child, or a key that is not a
+    /// string (#1194).
+    ///
+    /// A method rather than a fixed string at each call site so that one
+    /// document reports the *same* cause however it is reached. JSON overrides
+    /// it to re-run its strict validator, which names the real syntax error
+    /// (`expected string key, found 'i'`); the generic evaluator cannot do
+    /// that itself, because [`DocumentCursor`] exposes `text_position` but not
+    /// the document bytes the validator needs.
+    ///
+    /// The default is unreachable for every format shipped today --
+    /// [`ends_unpaired`](Self::ends_unpaired) is `false` and every key
+    /// stringifies -- so it exists to keep a future format honest rather than
+    /// to be seen.
+    fn malformed_member_error(&self) -> EvalError {
+        EvalError::new("Invalid document text: malformed object member")
+    }
+
     /// Walk one field, materializing only its key.
     ///
     /// [`uncons`](Self::uncons) builds a whole [`DocumentField`], which
@@ -604,10 +623,18 @@ pub trait DocumentFields: Sized + Clone {
             if let Some(reason) = field.key.string_decode_error() {
                 return Err(EvalError::new(format!("{reason} in object key")));
             }
-            if let Some(key) = field.key_str() {
-                keys.push(key.into_owned());
-            }
+            // A key that will not stringify at all never allowed by the
+            // format's grammar in the first place -- structurally malformed,
+            // not a decode failure (#1194). It used to be skipped, so `keys`
+            // reported one name fewer than `length` counted members.
+            let Some(key) = field.key_str() else {
+                return Err(fields.malformed_member_error());
+            };
+            keys.push(key.into_owned());
             fields = rest;
+        }
+        if fields.ends_unpaired() {
+            return Err(fields.malformed_member_error());
         }
         Ok(keys)
     }

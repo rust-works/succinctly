@@ -1287,7 +1287,25 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         );
         let (inputs, locations) = match get_inputs(&args, force_read_under_null_input) {
             Ok(Ok(inputs)) => inputs,
-            Ok(Err(e)) => return Err(e),
+            // A malformed or undecodable document is a data error, so it goes
+            // out in jq's own diagnostic shape at exit 5 rather than through
+            // `anyhow` at exit 1 with an `Error:` prefix jq never prints
+            // (#1194). Everything else here really is I/O and keeps the
+            // `anyhow` path.
+            //
+            // Line 0, the same placeholder the lazy path prints when it has
+            // no better position: this route reads the whole stream up front
+            // and fails before any per-document offset exists. Reusing the
+            // existing shape beats introducing a second rendering.
+            Ok(Err(e)) => match e.downcast::<MalformedJsonError>() {
+                Ok(MalformedJsonError(err)) => {
+                    let files = get_input_files(&args);
+                    let file = files.first().map(|p| p.to_string_lossy().to_string());
+                    sink.report(DiagStyle::Jq, &err, &InputLocation::at(file.as_deref(), 0));
+                    return Ok(DiagStyle::Jq.error_exit_code());
+                }
+                Err(e) => return Err(e),
+            },
             Err(exit_code) => return Ok(exit_code), // Validation error
         };
 
@@ -2665,8 +2683,12 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
                     .map(|(start, end)| {
                         crate::output::json_bytes_to_owned_value(&bytes[start..end])
                     })
+                    // Wrapped rather than flattened, for the same reason as
+                    // the sibling site in `parse_json_stream_strict`: the
+                    // caller reports a document error in jq's channel at
+                    // exit 5, and can only recognise it by type (#1194).
                     .collect::<core::result::Result<Vec<_>, _>>()
-                    .map_err(|de| anyhow::anyhow!("{de}")),
+                    .map_err(|de| anyhow::Error::from(MalformedJsonError(de))),
                 Err(_) => Err(e),
             }
         }
@@ -2704,8 +2726,13 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             .position(|b| !b.is_ascii_whitespace())
             .map_or(prev_end, |offset| prev_end + offset);
         values.push(
+            // Wrapped, not flattened to an `anyhow!` string: this is a data
+            // error about the document, so the caller has to be able to tell
+            // it apart from an I/O failure and report it in jq's own channel
+            // at exit 5. Flattening lost that, and the run exited 1 with an
+            // `Error:` prefix jq never prints (#1194).
             crate::output::json_bytes_to_owned_value(&bytes[start..end])
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+                .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?,
         );
         prev_end = end;
     }

@@ -1771,7 +1771,7 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
-use crate::jq::{nonfinite_display_string, YqSemantics};
+use crate::jq::{nonfinite_display_string, EvalError, YqSemantics};
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     type Value = StandardJson<'a, W>;
@@ -2073,6 +2073,25 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
 
     fn is_empty(&self) -> bool {
         JsonFields::is_empty(self)
+    }
+
+    /// Re-runs the strict validator over this object's own document to name
+    /// the real syntax error, rather than the generic wording the trait
+    /// default has to settle for (#1194).
+    ///
+    /// Reachable only once a malformed member has already been found, so a
+    /// well-formed document never pays for the pass. The cursor is what makes
+    /// this possible here and not in the generic evaluator: `JsonCursor` keeps
+    /// the document text, where `DocumentCursor` exposes only a position.
+    ///
+    /// Falls back to the trait default's shape when the list is somehow empty
+    /// -- there is no cursor to read a document from, and inventing a position
+    /// would be worse than saying less.
+    fn malformed_member_error(&self) -> EvalError {
+        match self.key_cursor {
+            Some(cursor) => EvalError::malformed_json_text(cursor.text()),
+            None => EvalError::new("Invalid JSON text"),
+        }
     }
 
     /// JSON is the one format that can present an unpaired child, so it is

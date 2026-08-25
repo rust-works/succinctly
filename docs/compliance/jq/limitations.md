@@ -547,60 +547,32 @@ Reproducing that means validating every document up front, which costs roughly a
 index-building pass over the input — the whole advantage this crate is built for. `--validate`
 is the opt-in form for callers who want it (exit 3, its own separately-pinned code).
 
-Two consequences worth stating plainly. A **truncated array** can reach stdout alongside the
-exit 5 from `keys_unsorted` over an object with a non-string key: that writer streams and
-cannot rewind, and pre-checking would mean a second walk over every key on a path
-`scripts/perf-guard.py` measures. The identity printer has no such limit — it checks inside a
-walk it was already making, so a malformed object emits nothing at all. And **`--preserve-input`
-still echoes the malformed text verbatim**, since reproducing the input byte-for-byte is that
-flag's entire purpose.
-
-**Which surfaces raise, precisely.** Only the ones that write JSON straight from a *cursor*:
-the identity printer and `keys_unsorted`, plus the two `Result`-returning materializers behind
-them. Anything that first materializes an `OwnedValue` goes through the infallible
-`to_owned`/`cursor_to_owned` family, where the member has already been dropped before any
-printer sees it — so it degrades quietly.
-
-Two separate things push a run onto the quiet side.
-
-**The filter's shape.** Anything that costs the value its cursor — a comma, an `if` — hands
-the printer an `OwnedValue` instead:
+**What still does not raise.** Every materializing route now does — `to_entries`, `keys`,
+`length`, `--slurp`, `--sort-keys`, `--ascii-output`, and any filter shape that costs the value
+its cursor (a comma, an `if`) — because #1247 made the `to_owned`/`cursor_to_owned` family
+fallible and this check rides along with it. Two lazy routes remain, and they share one cause:
+they stream, so they have no error channel to raise into.
 
 ```
-$ echo '{invalid}' | sjq -c .                     # error, exit 5
-$ echo '{invalid}' | sjq -c '(.)'                 # error, exit 5   (still a cursor)
-$ echo '{invalid}' | sjq -c 'select(true)'        # error, exit 5   (still a cursor)
-$ echo '{invalid}' | sjq -c ., .                  # {} {}, exit 0   (comma -> Many)
-$ echo '{invalid}' | sjq -c 'if .a then 1 else . end'   # {}, exit 0
-$ echo '{123: 1, "b": 2}' | sjq -c 'keys, length' # ["b"] then 2, exit 0
+$ echo '{invalid}'  | sjq -c '.[]'   # no output, exit 0   <- object iteration
+$ echo '[xyz123]'   | sjq -c .       # [null],    exit 0   <- a bareword in *value* position
 ```
 
-This is the same cursor-vs-owned split that already governs anchor and comment preservation
-in yq mode (ADR-0017; a multi-result filter loses its cursor to `GenericResult::Many`), now
-visible on the jq side too.
+`.[]` walks the field list through `LazySource::Values`, whose `uncons` reports an unpaired
+child as plain exhaustion and returns `Option`, not `Result`. `[xyz123]`'s identity path reaches
+`print_json`'s `StandardJson::Error` arm, which #1247's own design doc deferred for the same
+reason: by the time a nested error is discovered the opening bracket has been written, so bailing
+there yields a truncated document where every materializing route gives a clean diagnostic.
+Both are that document's Stage 6.
 
-**A flag that disables the lazy path.** `can_use_lazy_path` (`jq_runner.rs`) is false for
-`--slurp`, `--raw-input`, `--input-dsv`, `--seq`, `--sort-keys`, colour output,
-**`--ascii-output`**, and any use of the `input`/`inputs` builtins. Any one of them routes the
-whole run through `parse_json_stream` and the infallible family, so even a plain identity
-query stops raising:
+`keys_unsorted` sits between the two: it streams, and refuses a non-string key only once its `[`
+is out, so a **truncated** array can reach stdout beside the exit 5. Pre-checking would mean a
+second walk over every key on a path `scripts/perf-guard.py` measures. The identity printer has
+no such limit — its check rides inside a walk it was already making, so a malformed object emits
+nothing at all.
 
-```
-$ echo '{invalid}' | sjq -c .        # error, exit 5
-$ echo '{invalid}' | sjq -c -a .     # {}, exit 0   <- -a is a formatting flag, but it
-$ echo '{invalid}' | sjq -c -S .     # {}, exit 0      disables the lazy path outright
-$ echo '{invalid}' | sjq -c -s .     # [{}], exit 0
-```
-
-`-a` is the surprising one: nothing about ASCII escaping suggests it should change whether a
-document is accepted.
-
-So `length` and `keys` can still disagree about how many members an object has
-(`{invalid: 1}` counts 1 and lists none), which is the failure mode #1385's own postmortem
-names. Closing the rest needs that family to become fallible — the same architectural change
-#1247 is about, tracked there rather than duplicated here. A bareword in **value** position
-(`[xyz123]` → `[null]`) reaches that family too, which is why this issue's second repro is
-not fixed alongside its first.
+`--preserve-input` still echoes the malformed text verbatim, since reproducing the input
+byte-for-byte is that flag's entire purpose.
 
 **A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
 validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects

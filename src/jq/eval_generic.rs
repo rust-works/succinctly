@@ -121,6 +121,32 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_at_depth(value, 0)
 }
 
+/// The error for an object member the format's index accepted but its grammar
+/// does not -- a key that will not stringify, or a child with nothing to pair
+/// it with (#1194). `None` when every member is well formed.
+///
+/// For callers whose own return type is infallible (`DocumentFields::len`) but
+/// whose *caller* has an error channel. One key-only walk, and only where the
+/// caller was going to walk anyway -- `ends_unpaired` alone is O(1) but sees
+/// only a trailing orphan, never a bad key.
+fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
+    let mut walk = fields.clone();
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        // A key that fails to *decode* has no stringified name either, but it
+        // is #1247's failure, not #1194's, and the two want opposite answers:
+        // an undecodable key is deliberately preserved verbatim in places
+        // (#1385's "a key that will not decode is never a duplicate"), while a
+        // key the grammar never allowed must raise. Leave decode failures to
+        // the `string_decode_error` checks that already surround this, or this
+        // walk hijacks them and reports the wrong cause.
+        if key.string_decode_error().is_none() && key.key_string().is_none() {
+            return Some(walk.malformed_member_error());
+        }
+        walk = rest;
+    }
+    walk.ends_unpaired().then(|| walk.malformed_member_error())
+}
+
 fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedValue, EvalError> {
     assert_nesting_depth(depth);
     // Check containers first (arrays and objects have no type ambiguity)
@@ -136,13 +162,27 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
             if let Some(reason) = field.key.string_decode_error() {
                 return Err(EvalError::new(format!("{reason} in object key")));
             }
-            if let Some(key) = field.key_str() {
-                map.insert(
-                    key.into_owned(),
-                    to_owned_at_depth(&field.value, depth + 1)?,
-                );
-            }
+            // A key that will not stringify at all is not a decode failure --
+            // it is a key JSON's grammar never allowed (`{123: 1}`), which
+            // the semi-index accepted because `:` and `,` mean the same
+            // nothing to it. Dropping the field silently is #1194: it
+            // vanished from output while `length` went on counting it, the
+            // disagreement #1385's postmortem names as the thing to avoid.
+            let Some(key) = field.key_str() else {
+                return Err(f.malformed_member_error());
+            };
+            map.insert(
+                key.into_owned(),
+                to_owned_at_depth(&field.value, depth + 1)?,
+            );
             f = rest;
+        }
+        // The walk ran out -- but on an unpaired child, or genuinely? Only
+        // the list it *finished* on can tell those apart, and `uncons`
+        // reports both as `None` (#1194). `false` for every format whose
+        // parser validates, so this costs YAML nothing.
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
         }
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
@@ -226,13 +266,21 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             if let Some(reason) = field.key.string_decode_error() {
                 return Err(EvalError::new(format!("{reason} in object key")));
             }
-            if let Some(key) = field.key_str() {
-                map.insert(
-                    key.into_owned(),
-                    to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
-                );
-            }
+            // Same two #1194 checks as `to_owned_at_depth` above, same
+            // reasons -- these two conversions are copies of each other and a
+            // fix that moved only one would leave the cursor and value
+            // domains disagreeing about whether a document is valid.
+            let Some(key) = field.key_str() else {
+                return Err(f.malformed_member_error());
+            };
+            map.insert(
+                key.into_owned(),
+                to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
+            );
             f = rest;
+        }
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
         }
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
@@ -5690,6 +5738,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(elements) = value.as_array() {
                 GenericResult::Owned(OwnedValue::Int(elements.len() as i64))
             } else if let Some(fields) = value.as_object() {
+                // #1194: `effective_len` counts a member whose key never
+                // stringifies (`census`'s `unkeyed`), so `length` answered 1
+                // for `{invalid: 1}` while `keys` listed none. Refuse rather
+                // than pick one of two wrong numbers. `len` is infallible by
+                // design -- the error channel is here, where the builtin
+                // already has one.
+                if let Some(err) = malformed_object_member(&fields) {
+                    return GenericResult::Error(err);
+                }
                 // Distinct keys in jq mode (#1385) -- `{"a":1,"a":2}|length`
                 // is 1, because the object jq built only ever had one member.
                 GenericResult::Owned(OwnedValue::Int(effective_len(
@@ -5808,6 +5865,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else if let Some(fields) = value.as_object() {
+                // Up front, because `effective_fields` reports an unpaired
+                // trailing child as plain exhaustion -- the loop below would
+                // simply see one member fewer and never notice (#1194). The
+                // key-only walk is negligible here next to materializing
+                // every value, which this builtin does anyway.
+                if let Some(err) = malformed_object_member(&fields) {
+                    return GenericResult::Error(err);
+                }
                 // A loop for the same reason as the array arm above.
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for field in effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
@@ -5818,8 +5883,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                             "{reason} in object key"
                         )));
                     }
+                    // `continue` here was #1194's third drop site: an entry
+                    // vanished from the array while `length` still counted
+                    // the member it came from.
                     let Some(key) = field.key_str() else {
-                        continue;
+                        return GenericResult::Error(fields.malformed_member_error());
                     };
                     let mut entry = IndexMap::new();
                     entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
@@ -12737,38 +12805,82 @@ mod tests {
         }
     }
 
-    /// `Builtin::ToEntries`'s object branch drops a field whose key doesn't
-    /// decode to a string at all via `field.key_str()` -- not #1247's own
-    /// undecodable-*content* check just above it (`string_decode_error`,
-    /// which only fires for a string-*shaped* span), but the older, still-
-    /// open #1194-class gap for a key that isn't string-shaped in the first
-    /// place. `{123: 1, "b": 2}` isn't valid JSON (jq itself would reject
-    /// it), but this crate's lenient semi-index still represents it
-    /// structurally -- `DocumentFields::uncons` hands back a field whose
-    /// `.key` is `StandardJson::Number`, `key_str()`'s default `as_str()`
-    /// answers `None` for it, and the field is silently skipped rather than
-    /// erroring. This is a known, pre-existing gap outside this coverage
-    /// pass's scope (the fallible-conversion logic itself is not to be
-    /// touched here) -- documented as current behavior, not asserted as
-    /// correct.
+    /// `Builtin::ToEntries` raises on a key that isn't string-shaped at all,
+    /// rather than dropping the entry (#1194).
+    ///
+    /// This asserted the drop when #1247's coverage pass wrote it, as a
+    /// known gap deliberately left alone there. It is the older, distinct
+    /// sibling of #1247's own `string_decode_error` check just above it:
+    /// that one fires for a string-*shaped* span whose bytes won't decode,
+    /// while `{123: 1, "b": 2}` has a key JSON's grammar never allowed. The
+    /// lenient semi-index represents it structurally -- `uncons` hands back
+    /// a field whose `.key` is `StandardJson::Number` -- so nothing but an
+    /// explicit check can tell it from a well-formed object.
+    ///
+    /// Inverted rather than deleted: dropping the entry left `to_entries`
+    /// one shorter than `length` counted, the disagreement #1385's own
+    /// postmortem names as the failure mode to avoid.
     #[test]
-    fn test_to_entries_silently_drops_non_string_key_known_gap_1247() {
+    fn test_to_entries_raises_on_non_string_key_1194() {
         let json: &[u8] = b"{123: 1, \"b\": 2}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let result = eval_with_cursor(&crate::jq::parse("to_entries").unwrap(), cursor);
-        let entries = result.into_owned().unwrap().unwrap();
-        let OwnedValue::Array(entries) = entries else {
-            panic!("expected an array, got {entries:?}");
+        let GenericResult::Error(err) = result else {
+            panic!("expected an error, got {result:?}");
         };
-        assert_eq!(
-            entries.len(),
-            1,
-            "the malformed `123` key is dropped: {entries:?}"
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
         );
-        let OwnedValue::Object(entry) = &entries[0] else {
-            panic!("expected an object entry, got {:?}", entries[0]);
+        // The strict validator's own diagnosis, not a message invented here.
+        assert!(
+            err.message.contains("expected string key"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194: an object whose children don't pair raises from `to_entries`
+    /// too, not just one with a bad key.
+    ///
+    /// The two conditions reach different checks -- a bad key is caught
+    /// per-field, an orphan only once the walk ends -- so a fix for one can
+    /// silently miss the other.
+    #[test]
+    fn test_to_entries_raises_on_unpaired_member_1194() {
+        let json: &[u8] = b"{invalid}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("to_entries").unwrap(), cursor);
+        let GenericResult::Error(err) = result else {
+            panic!("expected an error, got {result:?}");
         };
-        assert_eq!(entry.get("key"), Some(&OwnedValue::String("b".to_string())));
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194 must not hijack #1247's decode failures: an *undecodable* key
+    /// has no stringified name either, but it is a different fault with a
+    /// different answer -- sometimes deliberately preserved verbatim
+    /// (#1385's "a key that will not decode is never a duplicate").
+    ///
+    /// Regression guard for a real bug in this fix's first cut, which tested
+    /// only `key_string().is_none()` and so reported an invalid escape as
+    /// `expected string key` -- the wrong cause, and at the wrong severity.
+    #[test]
+    fn test_malformed_member_check_leaves_decode_failures_alone_1194() {
+        let json: &[u8] = br#"{"a\q":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        assert!(
+            malformed_object_member(&fields).is_none(),
+            "an undecodable key is #1247's fault, not #1194's"
+        );
     }
 }
