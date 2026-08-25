@@ -96,7 +96,20 @@ X_TERMS=(
 # regardless of how many times a shape evaluates it — every case gets the
 # same stdin; jq/succinctly alike leave it unread when a filter never calls
 # `input`/`inputs`.
+#
+# **Fed from a file, never a pipe.** `printf ... | jq` looks equivalent and is
+# not: most filters here never read stdin, so the consumer exits with the
+# writer still holding data, `printf` dies of SIGPIPE, and `set -o pipefail`
+# promotes that 141 to the pipeline's status — which this script would then
+# record as the *oracle's* exit code. It is load-dependent, so it passes in
+# isolation and fails when something else is using the machine: 5 phantom
+# "divergences" whose stdout and stderr matched exactly, differing only in an
+# exit code neither binary actually returned. Same family as the
+# `cargo test | grep | tail` false-green. A redirect has no writer to kill.
 STDIN_DOCS='1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20'
+STDIN_FILE="$(mktemp -t jq-fanout-sweep-stdin)"
+trap 'rm -f "$STDIN_FILE" /tmp/jq-fanout-sweep.err /tmp/succ-fanout-sweep.err' EXIT
+printf '%s' "$STDIN_DOCS" > "$STDIN_FILE"
 
 # Attribute a divergence to an already-tracked gap, or return 1 for "this is
 # new, look at it". Keep every entry tied to an issue number: an unattributed
@@ -142,9 +155,9 @@ run_case() {
   total=$((total + 1))
 
   local jq_out jq_err jq_code succ_out succ_err succ_code
-  jq_out="$(printf '%s' "$STDIN_DOCS" | "$JQ" -cn "$filter" 2>/tmp/jq-fanout-sweep.err)" && jq_code=0 || jq_code=$?
+  jq_out="$("$JQ" -cn "$filter" <"$STDIN_FILE" 2>/tmp/jq-fanout-sweep.err)" && jq_code=0 || jq_code=$?
   jq_err="$(cat /tmp/jq-fanout-sweep.err)"
-  succ_out="$(printf '%s' "$STDIN_DOCS" | "$SUCC" jq -cn "$filter" 2>/tmp/succ-fanout-sweep.err)" && succ_code=0 || succ_code=$?
+  succ_out="$("$SUCC" jq -cn "$filter" <"$STDIN_FILE" 2>/tmp/succ-fanout-sweep.err)" && succ_code=0 || succ_code=$?
   succ_err="$(cat /tmp/succ-fanout-sweep.err)"
 
   if [[ "$jq_out" != "$succ_out" || "$jq_err" != "$succ_err" || "$jq_code" != "$succ_code" ]]; then
@@ -187,8 +200,6 @@ for g in "${G_SHAPES[@]}"; do
     run_case "arith/first" "$open[first($arith_core)]"
   done
 done
-
-rm -f /tmp/jq-fanout-sweep.err /tmp/succ-fanout-sweep.err
 
 printf '%s' "$divergence_log"
 echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known =="
