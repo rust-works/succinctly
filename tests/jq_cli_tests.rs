@@ -15853,6 +15853,146 @@ fn test_jq_nested_malformed_number_still_becomes_null_not_fabricated_1171() -> R
     Ok(())
 }
 
+/// #1194: an object member the semi-index accepted but JSON does not is a
+/// parse error (exit 5), not a field that quietly disappears.
+///
+/// The semi-index pairs an object's BP children two at a time and checks
+/// neither the key's type nor the count's parity, so every shape below
+/// indexed exactly like `{"a":1}` and printed at exit 0.
+#[test]
+fn test_jq_malformed_object_member_errors_not_silently_dropped_1194() -> Result<()> {
+    // (input, what it used to print)
+    let cases = [
+        ("{invalid}", "{}"),
+        ("{abc}", "{}"),
+        (r#"{"a"}"#, "{}"),
+        ("{1}", "{}"),
+        ("{invalid: 1}", "{1}"),
+        (r#"{invalid, "b":2}"#, r#"{"b"}"#),
+        (r#"{"a":1, invalid}"#, r#"{"a":1}"#),
+        (r#"{123: 1, "b": 2}"#, r#"{1,"b":2}"#),
+    ];
+
+    for (input, previously) in cases {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input} should exit 5, got {code}; out: {out:?}");
+        assert!(
+            out.trim().is_empty(),
+            "{input} should print nothing (it used to print {previously}), got: {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input} should name the cause on stderr, got: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1194: the diagnostic is the strict validator's own, not a generic
+/// "something was wrong" -- the two surfaces (`--validate` and the default
+/// path) should agree about *why* a document is malformed.
+#[test]
+fn test_jq_malformed_object_reports_the_validators_reason_1194() -> Result<()> {
+    for (input, reason) in [
+        ("{invalid}", "expected string key"),
+        ("{1}", "expected string key"),
+        (r#"{"a"}"#, "expected ':'"),
+    ] {
+        let (_out, stderr, _code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert!(
+            stderr.contains(reason),
+            "{input} should report {reason:?}, got: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1194: `keys_unsorted` printed `[,"b"]` -- unparseable, at exit 0 --
+/// because its writer skipped a non-string key while still emitting the
+/// comma before it. Same class as `{invalid: 1}` printing `{1}`.
+#[test]
+fn test_jq_keys_unsorted_on_malformed_object_errors_1194() -> Result<()> {
+    for input in ["{invalid}", r#"{123: 1, "b": 2}"#] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}");
+        assert!(out.trim().is_empty(), "{input}: out: {out:?}");
+    }
+
+    Ok(())
+}
+
+/// #1194: nothing partial reaches stdout for a malformed top-level object.
+///
+/// The check runs in the printer's prepare loop, before the opening `{` is
+/// written -- an earlier cut of this fix raised from `write_object_key`
+/// instead and left a stray `{` behind. Whatever a run does emit must be
+/// readable by a real JSON parser.
+#[test]
+fn test_jq_malformed_object_leaves_no_partial_output_1194() -> Result<()> {
+    for input in ["{invalid: 1}", r#"{123: 1, "b": 2}"#, r#"{invalid, "b":2}"#] {
+        let (out, _stderr, _code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert!(
+            !out.contains('{'),
+            "{input} left a partial container on stdout: {out:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1194: a malformed document does not stop the good ones either side of
+/// it (`ErrorSink`, #355), but the run still exits non-zero.
+///
+/// Real jq aborts the whole stream at its first parse error instead. That
+/// divergence predates this fix and is recorded in
+/// `docs/compliance/jq/limitations.md`.
+#[test]
+fn test_jq_malformed_object_in_stream_keeps_good_documents_1194() -> Result<()> {
+    let (out, _stderr, code) = run_jq_full(&["-c", "."], Some("{\"a\":1}\n{invalid}\n{\"z\":9}"))?;
+    assert_eq!(code, 5, "out: {out:?}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"z":9}"#], "out: {out:?}");
+
+    Ok(())
+}
+
+/// #1194 stays out of #966's way: a malformed *number* nested inside an
+/// already-recognized container still degrades to `null` at exit 0. This
+/// fix is about object member *structure*, not number grammar, and the two
+/// have deliberately opposite conventions.
+#[test]
+fn test_jq_malformed_nested_number_unaffected_by_1194() -> Result<()> {
+    for (input, expected) in [(r#"{"a": 1.2.3}"#, r#"{"a":null}"#), ("[xyz123]", "[null]")] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "{input}: out: {out:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
+/// #1194: a well-formed object with a bare-word-looking *string* key, or a
+/// numeric-looking quoted key, is untouched -- the check tests the key's
+/// type, not its spelling.
+#[test]
+fn test_jq_wellformed_objects_unaffected_by_1194() -> Result<()> {
+    for input in [
+        r#"{"invalid":1}"#,
+        r#"{"123":1}"#,
+        "{}",
+        r#"{"a":{},"b":[]}"#,
+        r#"{"a":1,"a":2}"#,
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(!out.trim().is_empty(), "{input} produced no output");
+    }
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

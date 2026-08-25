@@ -3556,13 +3556,20 @@ where
                             // used to record an empty span, which
                             // `write_object_key` then wrote as nothing at all
                             // -- including the colon -- producing `{1}`.
-                            // `write_object_key` raises now; the empty span
-                            // survives only because `PreparedField` needs
-                            // something to hold until it does.
-                            let (raw, escaped) = match field.key() {
-                                StandardJson::String(k) => k.raw_and_escaped(),
-                                _ => (&b""[..], false),
+                            //
+                            // Raised here rather than left to
+                            // `write_object_key` so the whole object is
+                            // rejected before its opening `{` goes out: that
+                            // one still raises, but by then the brace has been
+                            // written and stdout carries a stray `{`.
+                            let StandardJson::String(k) = field.key() else {
+                                scratch.truncate(base);
+                                return Err(MalformedJsonError(EvalError::malformed_json_text(
+                                    frame.text,
+                                ))
+                                .into());
                             };
+                            let (raw, escaped) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
                                 value_bp: field.value_cursor().bp_position(),
@@ -3716,11 +3723,15 @@ where
         // than branching mid-loop.
         JqValue::LazyKeysArray { fields, collapse } => {
             use succinctly::json::light::StandardJson as SJ;
-            // Same malformed-object check the `StandardJson::Object` arm makes,
-            // for the same reason and before the same opening bracket: an
-            // unpaired child means this was never a key list (#1194).
-            if let Some(tail) = fields.unpaired_tail() {
-                return Err(MalformedJsonError(EvalError::malformed_json_text(tail.text())).into());
+            // Same malformed-object check the `StandardJson::Object` arm
+            // makes, for the same reason (#1194) -- but it has to happen
+            // up front here, before the `[`, because this writer streams
+            // straight to `out` and cannot rewind. The object arm gets the
+            // check for free inside a walk it was making anyway; this one
+            // pays for a separate pass over the keys, which is the price of
+            // never emitting a bracket it cannot close.
+            if let Some(bad) = fields.first_malformed_member() {
+                return Err(MalformedJsonError(EvalError::malformed_json_text(bad.text())).into());
             }
             if fields.is_empty() {
                 out.write_all(b"[]")?;
@@ -3732,9 +3743,14 @@ where
                         out.write_all(b",")?;
                     }
                     let SJ::String(k) = key else {
-                        // A non-string key writes nothing, but the separator
-                        // above already went out -- `{123: 1, "b": 2}` came
-                        // out as `[,"b"]`, unparseable, at exit 0 (#1194).
+                        // Unreachable: `first_malformed_member` above has
+                        // already rejected any non-string key, and does so
+                        // before the `[`. Kept because `key` is the open
+                        // `StandardJson` enum and this arm must bind
+                        // something -- raising rather than skipping means
+                        // that if the pre-pass and this loop ever disagree,
+                        // the result is an error and not the `[,"b"]` this
+                        // used to print at exit 0 (#1194).
                         return Err(MalformedJsonError(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
@@ -3769,9 +3785,14 @@ where
                     }
                     out.write_all(next_indent.as_bytes())?;
                     let SJ::String(k) = key else {
-                        // A non-string key writes nothing, but the separator
-                        // above already went out -- `{123: 1, "b": 2}` came
-                        // out as `[,"b"]`, unparseable, at exit 0 (#1194).
+                        // Unreachable: `first_malformed_member` above has
+                        // already rejected any non-string key, and does so
+                        // before the `[`. Kept because `key` is the open
+                        // `StandardJson` enum and this arm must bind
+                        // something -- raising rather than skipping means
+                        // that if the pre-pass and this loop ever disagree,
+                        // the result is an error and not the `[,"b"]` this
+                        // used to print at exit 0 (#1194).
                         return Err(MalformedJsonError(EvalError::malformed_json_text(
                             key_cursor.text(),
                         ))
