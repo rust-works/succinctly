@@ -7321,16 +7321,23 @@ fn test_trailing_content_after_flow_collection_reports_real_utf8_char_1187() -> 
 /// just at true EOF but for *any* byte that isn't valid UTF-8 at that
 /// offset -- silently embedding a literal NUL byte into the error string
 /// for a malformed (not just missing) byte, something the old
-/// `byte as char` cast never did (a raw cast never fails). A single
-/// non-UTF-8 byte (`0xFF`, never a valid lead byte) must still render as
-/// the same visible Latin-1 character the old code showed, not `'\0'`.
+/// `byte as char` cast never did (a raw cast never fails). This is still
+/// pinned by `test_trailing_content_after_flow_collection_reports_real_utf8_char_1187`
+/// above via a genuinely valid-but-unexpected character ('日').
+///
+/// A raw invalid UTF-8 lead byte specifically no longer reaches
+/// `err_unexpected_char` at all: #1242's whole-document UTF-8 precheck now
+/// rejects it before parsing begins, matching real yq (`bad file '-':
+/// yaml: offset 10: invalid leading UTF-8 octet`, exit 1, confirmed against
+/// yq v4.53.3) rather than letting the parser stumble onto the byte deep
+/// inside a flow collection and describe it as an "unexpected character".
 #[test]
 fn test_err_unexpected_char_invalid_byte_does_not_embed_nul_1187() -> Result<()> {
     let (_, stderr, code) =
         run_yq_stdin_bytes_with_stderr(".", b"a: [1, 2] \xff\n", &["-o", "json", "-I0"])?;
     assert_ne!(code, 0);
     assert!(
-        stderr.contains("unexpected character '\u{FF}'"),
+        stderr.contains("invalid UTF-8 lead byte"),
         "stderr: {stderr}"
     );
     assert!(
