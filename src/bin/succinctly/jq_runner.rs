@@ -3723,15 +3723,23 @@ where
         // than branching mid-loop.
         JqValue::LazyKeysArray { fields, collapse } => {
             use succinctly::json::light::StandardJson as SJ;
-            // Same malformed-object check the `StandardJson::Object` arm
-            // makes, for the same reason (#1194) -- but it has to happen
-            // up front here, before the `[`, because this writer streams
-            // straight to `out` and cannot rewind. The object arm gets the
-            // check for free inside a walk it was making anyway; this one
-            // pays for a separate pass over the keys, which is the price of
-            // never emitting a bracket it cannot close.
-            if let Some(bad) = fields.first_malformed_member() {
-                return Err(MalformedJsonError(EvalError::malformed_json_text(bad.text())).into());
+            // The unpaired-child half of #1194, checked before the `[` --
+            // it is O(1) (`ends_unpaired` answers from a `None` cursor
+            // without touching the BP tree), so it is free on well-formed
+            // input.
+            //
+            // The non-string-key half is *not* checked up front, and that is
+            // deliberate. This writer streams straight to `out` and cannot
+            // rewind, so catching it early would mean a second walk over
+            // every key -- and `keys_unsorted` over a 2 MB `wide` document is
+            // one of the workloads `scripts/perf-guard.py` pins precisely
+            // because it is sensitive to exactly that. The per-key arms below
+            // raise instead, which can leave a truncated array on stdout
+            // alongside the exit 5. That divergence is recorded in
+            // `docs/compliance/jq/limitations.md`; it is the same trade the
+            // YAML streaming path already makes, and for the same reason.
+            if let Some(tail) = fields.unpaired_tail() {
+                return Err(MalformedJsonError(EvalError::malformed_json_text(tail.text())).into());
             }
             if fields.is_empty() {
                 out.write_all(b"[]")?;

@@ -1046,32 +1046,6 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         self.unpaired_tail().is_some()
     }
 
-    /// The first member the semi-index accepted that JSON's grammar does not
-    /// -- a key that is not a string, or a child with nothing to pair it with
-    /// (#1194). Returns that child's cursor, or `None` if every member is
-    /// well formed.
-    ///
-    /// Every JSON key is a string; the semi-index never checks, because
-    /// `json::standard::is_delim` gives `:` and `,` the same (absent) meaning,
-    /// so `{123: 1}` indexes exactly as `{"a": 1}` does.
-    ///
-    /// **This walks the whole field list.** Prefer testing each key inside a
-    /// walk the caller is making anyway; this exists for callers that must
-    /// answer the question *before* emitting anything, where discovering it
-    /// mid-stream would leave an unclosed container on the output. The
-    /// streaming `keys` writer is the case in point: it cannot retract the
-    /// `[` it has already written.
-    pub fn first_malformed_member(&self) -> Option<JsonCursor<'a, W>> {
-        let mut fields = *self;
-        while let Some((field, rest)) = fields.uncons() {
-            if !matches!(field.key(), StandardJson::String(_)) {
-                return Some(field.key_cursor());
-            }
-            fields = rest;
-        }
-        fields.unpaired_tail()
-    }
-
     /// Get the first field and the remaining fields.
     ///
     /// Returns `None` if there are no more fields -- **or** if the list ends
