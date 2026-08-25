@@ -2888,57 +2888,18 @@ fn write_yaml_value_as_json<W: AsRef<[u64]>>(output: &mut String, value: YamlVal
     }
 }
 
-/// Write a string with JSON escaping.
+/// Write a string with JSON escaping into a `String`.
 ///
-/// Uses a fast path for ASCII-only strings without special characters,
-/// which is the common case for YAML data.
-///
-/// Uses SIMD (NEON on ARM64) to scan for escapable characters in 16-byte chunks,
-/// with automatic scalar fallback for short strings and remainders.
+/// The buffered face of [`stream_json_string`], which owns the single
+/// implementation. Kept as its own function so the eleven `&mut String` call
+/// sites don't each have to discard an error that cannot happen.
+#[inline]
 fn write_json_string(output: &mut String, s: &str) {
-    output.push('"');
-
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // Find the next byte that needs escaping using SIMD
-        // The SIMD function handles short strings internally with scalar fallback
-        let escape_pos = find_json_escape(bytes, i);
-
-        // Copy the safe span directly
-        if i < escape_pos {
-            // SAFETY: We're copying valid UTF-8 bytes that don't contain
-            // any multi-byte sequence starters that would be split
-            output.push_str(&s[i..escape_pos]);
-        }
-
-        i = escape_pos;
-
-        // Handle the escape character if any
-        if i < len {
-            let b = bytes[i];
-            match b {
-                b'"' => output.push_str("\\\""),
-                b'\\' => output.push_str("\\\\"),
-                b'\n' => output.push_str("\\n"),
-                b'\r' => output.push_str("\\r"),
-                b'\t' => output.push_str("\\t"),
-                b if b < 0x20 => {
-                    // Control character - use \uXXXX
-                    output.push_str("\\u00");
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    output.push(HEX[(b >> 4) as usize] as char);
-                    output.push(HEX[(b & 0xf) as usize] as char);
-                }
-                _ => {} // Not an escape character (shouldn't happen)
-            }
-            i += 1;
-        }
-    }
-
-    output.push('"');
+    // `String`'s `fmt::Write` impl forwards to `push_str` and always returns
+    // `Ok`, so there is no error to propagate -- the same reasoning
+    // `jq::escape::escape_json_body` states for the other side of this same
+    // generic/buffered split.
+    let _ = stream_json_string(output, s);
 }
 
 // ============================================================================
@@ -3355,20 +3316,22 @@ fn write_yaml_string_to_json_at(
 }
 
 /// Fast integer to string formatting without allocation.
-/// Writes the integer directly to the output string.
+///
+/// Generic over the sink so the streaming JSON writer gets the same
+/// hand-rolled digit loop the buffered one always had -- it used to fall back
+/// to `write!(out, "{n}")` and the whole `core::fmt` machinery behind it
+/// (#965).
 #[inline]
-fn write_i64(output: &mut String, mut n: i64) {
+fn write_i64<W: core::fmt::Write>(output: &mut W, mut n: i64) -> core::fmt::Result {
     if n == 0 {
-        output.push('0');
-        return;
+        return output.write_char('0');
     }
 
     if n < 0 {
-        output.push('-');
+        output.write_char('-')?;
         // Handle MIN value specially to avoid overflow
         if n == i64::MIN {
-            output.push_str("9223372036854775808");
-            return;
+            return output.write_str("9223372036854775808");
         }
         n = -n;
     }
@@ -3384,7 +3347,7 @@ fn write_i64(output: &mut String, mut n: i64) {
     }
 
     // SAFETY: buf contains only ASCII digits
-    output.push_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+    output.write_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) })
 }
 
 /// Formats a finite `f64`, always keeping a fractional part.
@@ -3542,12 +3505,6 @@ fn format_float_yq_with(f: f64, ordinary_magnitude: impl FnOnce(f64) -> String) 
     }
 }
 
-/// Fast f64 to string formatting.
-#[inline]
-fn write_f64(output: &mut String, f: f64) {
-    output.push_str(&format_float_with_fraction(f));
-}
-
 /// If `canonicalize` and `resolved` is a finite `Float`, the value to
 /// re-serialize through bare `f64` `Display` instead of the scalar's own
 /// source-text spelling -- matching the DOM path's
@@ -3583,22 +3540,22 @@ fn json_sourced_canonical_float(resolved: ResolvedScalar, canonicalize: bool) ->
 
 /// Fast YAML scalar to JSON conversion.
 ///
-/// Resolution is delegated to [`resolve_plain`] (YAML 1.2 core schema);
-/// this function only maps the resolution onto the JSON output buffer.
-/// Numeric values are emitted from the parsed value, never echoed from the
-/// source text (hex/octal like `0x2A` must appear as `42` in JSON).
+/// The buffered face of [`stream_yaml_scalar_as_json`]. Resolution is
+/// delegated to [`resolve_plain`] (YAML 1.2 core schema); this function only
+/// maps the resolution onto the JSON output buffer. Numeric values are
+/// emitted from the parsed value, never echoed from the source text
+/// (hex/octal like `0x2A` must appear as `42` in JSON).
 #[inline]
 fn write_yaml_scalar_as_json(output: &mut String, str_val: &str, canonicalize: bool) {
-    write_resolved_scalar_as_json(output, resolve_plain(str_val), str_val, canonicalize);
+    let _ = stream_yaml_scalar_as_json(output, str_val, canonicalize);
 }
 
-/// Write an already-resolved scalar as JSON. `str_val` is the original
-/// source text, used for the `Str` case (and only if `resolved` didn't come
-/// from resolving it, e.g. tag-forced `!!str` on non-string content), and
-/// for a preservable `Float` literal (#993) -- kept in lockstep with the
-/// streaming sibling [`stream_resolved_scalar_as_json`]. `canonicalize`
-/// (#996) is [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers) --
-/// see [`json_sourced_canonical_float`].
+/// Write an already-resolved scalar as JSON into a `String`.
+///
+/// The buffered face of [`stream_resolved_scalar_as_json`], which owns the
+/// single implementation and documents every arm. See
+/// [`write_json_string`] for why the error is discarded rather than
+/// propagated.
 #[inline]
 fn write_resolved_scalar_as_json(
     output: &mut String,
@@ -3606,69 +3563,52 @@ fn write_resolved_scalar_as_json(
     str_val: &str,
     canonicalize: bool,
 ) {
-    if let Some(f) = json_sourced_canonical_float(resolved, canonicalize) {
-        // Bare `Display`, not `write_f64` (which forces a trailing `.0`
-        // via `format_float_with_fraction` -- correct for genuine YAML
-        // source text, wrong here: real yq drops it for JSON-sourced
-        // input, matching `OwnedValue::to_json`'s own bare-Float arm).
-        output.push_str(&f.to_string());
-        return;
-    }
-    match resolved {
-        ResolvedScalar::Null => output.push_str("null"),
-        ResolvedScalar::Bool(true) => output.push_str("true"),
-        ResolvedScalar::Bool(false) => output.push_str("false"),
-        ResolvedScalar::Int(n) => write_i64(output, n),
-        // See `stream_resolved_scalar_as_json`'s matching arm for why this
-        // echoes `str_val` (or a normalized, JSON-safe variant of it,
-        // #954) rather than always reconstructing from `f` (#993). No
-        // separate `is_finite()` check needed here: `resolve_plain`/
-        // `resolve_tagged` (this function's only callers) never produce a
-        // non-finite `ResolvedScalar::Float` in the first place --
-        // `parse_float` rejects an overflowing/underflowing literal to
-        // `Str` before this arm is ever reached. `is_preservable_float_literal`'s
-        // own digit cap does NOT bound magnitude (#1008): a 4-digit
-        // `1e400` sails through it trivially, so it must not be relied on
-        // for finiteness.
-        ResolvedScalar::Float(_) if is_preservable_float_literal(str_val) => {
-            output.push_str(str_val);
-        }
-        ResolvedScalar::Float(f) => match preservable_float_literal_text(str_val) {
-            Some(normalized) => output.push_str(&normalized),
-            None if f.is_finite() => write_f64(output, f),
-            // JSON cannot represent the `.inf`/`.nan` family.
-            None => output.push_str("null"),
-        },
-        ResolvedScalar::Str => write_json_string(output, str_val),
-    }
+    let _ = stream_resolved_scalar_as_json(output, resolved, str_val, canonicalize);
 }
 
 // ============================================================================
 // Streaming JSON Output (core::fmt::Write based)
 // ============================================================================
 
-/// Stream a string with JSON escaping.
+/// Stream a string as a quoted, JSON-escaped value.
+///
+/// The single string writer for both sinks: the buffered twin
+/// [`write_json_string`] is a wrapper over this. It used to be the other way
+/// round -- the buffered one carried the SIMD escape scan (O3, #87) and this
+/// one ran a scalar byte-at-a-time loop, so the streaming YAML->JSON path
+/// (P9's hot path) never got the optimization and a change to the escape
+/// convention could only ever reach one of them (#965).
+///
+/// Deliberately *not* delegating to `jq::escape::write_json_body_yq`, which
+/// is the same convention and the same scan: measured on pinned hardware,
+/// the `#[inline]` this path needs to stay competitive costs the jq callers
+/// of that function up to 14% on x86_64 (`arrays keys_unsorted`, 7950X).
+/// The two callers want opposite inlining, so they keep separate copies --
+/// see #965 for the numbers.
+///
+/// `#[inline]` is load-bearing here, matching O3's own finding that this path
+/// is sensitive to call overhead on short strings: without it the streaming
+/// path reads ~+1% across the yq corpus instead of neutral-to-faster.
+#[inline]
 fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fmt::Result {
     out.write_char('"')?;
 
     let bytes = s.as_bytes();
+    let len = bytes.len();
     let mut i = 0;
 
-    while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'"' || b == b'\\' || b < 0x20 {
-                break;
-            }
-            i += 1;
+    while i < len {
+        // The SIMD scan handles short strings internally with a scalar
+        // fallback; `find_json_escape` is `#[inline(always)]` for that reason.
+        let escape_pos = find_json_escape(bytes, i);
+
+        if i < escape_pos {
+            out.write_str(&s[i..escape_pos])?;
         }
 
-        if start < i {
-            out.write_str(&s[start..i])?;
-        }
+        i = escape_pos;
 
-        if i < bytes.len() {
+        if i < len {
             let b = bytes[i];
             match b {
                 b'"' => out.write_str("\\\"")?,
@@ -3676,13 +3616,14 @@ fn stream_json_string<Out: core::fmt::Write>(out: &mut Out, s: &str) -> core::fm
                 b'\n' => out.write_str("\\n")?,
                 b'\r' => out.write_str("\\r")?,
                 b'\t' => out.write_str("\\t")?,
-                b if b < 0x20 => {
+                // `find_json_escape` only stops on the four cases above and
+                // on `< 0x20`, so nothing else can reach here.
+                b => {
                     out.write_str("\\u00")?;
                     const HEX: &[u8; 16] = b"0123456789abcdef";
                     out.write_char(HEX[(b >> 4) as usize] as char)?;
                     out.write_char(HEX[(b & 0xf) as usize] as char)?;
                 }
-                _ => unreachable!(),
             }
             i += 1;
         }
@@ -4084,10 +4025,17 @@ fn stream_yaml_scalar_as_json<Out: core::fmt::Write>(
     stream_resolved_scalar_as_json(out, resolve_plain(str_val), str_val, canonicalize)
 }
 
-/// Stream an already-resolved scalar as JSON. `str_val` is the original
-/// source text, used for the `Str` case (and only if `resolved` didn't come
-/// from resolving it, e.g. tag-forced `!!str` on non-string content), and
-/// for a preservable `Float` literal (#993).
+/// Stream an already-resolved scalar as JSON.
+///
+/// The single implementation behind both sinks --
+/// [`write_resolved_scalar_as_json`] is this function's `&mut String` face.
+/// They used to be two independent `match`es over [`ResolvedScalar`], kept in
+/// lockstep by hand, so a new variant or another literal-fidelity fix like
+/// #918 had to be applied twice and could silently reach only one (#965).
+///
+/// `str_val` is the original source text, used for the `Str` case (and only if
+/// `resolved` didn't come from resolving it, e.g. tag-forced `!!str` on
+/// non-string content), and for a preservable `Float` literal (#993).
 ///
 /// `canonicalize` (#996) is
 /// [`YamlIndex::canonicalize_numbers`](super::index::YamlIndex::canonicalize_numbers)
@@ -4113,7 +4061,7 @@ fn stream_resolved_scalar_as_json<Out: core::fmt::Write>(
         ResolvedScalar::Null => out.write_str("null"),
         ResolvedScalar::Bool(true) => out.write_str("true"),
         ResolvedScalar::Bool(false) => out.write_str("false"),
-        ResolvedScalar::Int(n) => write!(out, "{n}"),
+        ResolvedScalar::Int(n) => write_i64(out, n),
         // Echo the source text (or a normalized, JSON-safe variant of it,
         // #954) when it's already safe to preserve (`number_literal()`
         // below uses the same predicate for the DOM path) -- this is what
@@ -8305,6 +8253,130 @@ mod tests {
                 core::str::from_utf8(yaml).unwrap()
             );
         }
+    }
+
+    /// Every `ResolvedScalar` shape the two JSON-text writers can disagree
+    /// about, paired with source text that exercises each arm's own branch.
+    ///
+    /// `Float` deliberately includes non-finite values: `resolve_plain`/
+    /// `resolve_tagged` never produce one (`parse_float` rejects an
+    /// overflowing literal to `Str` upstream), so these only reach the
+    /// defensive `None => "null"` arm -- which is exactly the kind of arm a
+    /// hand-maintained second copy used to be able to miss.
+    const RESOLVED_SCALAR_DRIFT_CASES: &[(ResolvedScalar, &str)] = &[
+        (ResolvedScalar::Null, "null"),
+        (ResolvedScalar::Null, "~"),
+        (ResolvedScalar::Bool(true), "true"),
+        (ResolvedScalar::Bool(false), "FALSE"),
+        (ResolvedScalar::Int(0), "0"),
+        (ResolvedScalar::Int(42), "0x2A"),
+        (ResolvedScalar::Int(-1), "-1"),
+        (ResolvedScalar::Int(i64::MIN), "-9223372036854775808"),
+        (ResolvedScalar::Int(i64::MAX), "9223372036854775807"),
+        // Preservable literals: echoed verbatim (#993).
+        (ResolvedScalar::Float(1.0), "1.0"),
+        (ResolvedScalar::Float(1.5), "1.50"),
+        (ResolvedScalar::Float(f64::INFINITY), "1e400"),
+        // Normalizable literals: rewritten to a JSON-safe spelling (#954).
+        (ResolvedScalar::Float(1.0), "1."),
+        (ResolvedScalar::Float(0.5), "+.5"),
+        (ResolvedScalar::Float(1.0), "01.0"),
+        // Neither: reconstructed, or nulled when JSON has no literal for it.
+        (ResolvedScalar::Float(1.0), "not a float literal"),
+        (ResolvedScalar::Float(1.0e21), "1.0e21"),
+        (ResolvedScalar::Float(f64::INFINITY), ".inf"),
+        (ResolvedScalar::Float(f64::NEG_INFINITY), "-.inf"),
+        (ResolvedScalar::Float(f64::NAN), ".nan"),
+        // Every escape class the shared `write_json_body_yq` has to handle,
+        // plus lengths on both sides of the SIMD chunk thresholds.
+        (ResolvedScalar::Str, ""),
+        (ResolvedScalar::Str, "plain"),
+        (ResolvedScalar::Str, "quote \" backslash \\"),
+        (ResolvedScalar::Str, "tab \t newline \n return \r"),
+        (
+            ResolvedScalar::Str,
+            "control \u{1} and \u{1f} and del \u{7f}",
+        ),
+        (
+            ResolvedScalar::Str,
+            "café ☮ 😁 multibyte past a 32-byte AVX2 chunk",
+        ),
+        (
+            ResolvedScalar::Str,
+            "a long ascii run with no escapes at all, comfortably past sixty-four bytes",
+        ),
+        (
+            ResolvedScalar::Str,
+            "long enough for the SIMD loop, then \" an escape near the very end",
+        ),
+    ];
+
+    /// `write_resolved_scalar_as_json` is the `&mut String` face of
+    /// `stream_resolved_scalar_as_json`; they must stay byte-identical.
+    ///
+    /// They used to be two independently hand-maintained `match`es whose
+    /// `Str` arms did not even share an implementation -- the buffered one
+    /// scanned with SIMD, the streaming one byte-at-a-time (#965). This is
+    /// the regression guard for the collapse: if anyone re-splits them, or
+    /// adds a `ResolvedScalar` variant to one arm only, this fails.
+    #[test]
+    fn write_and_stream_resolved_scalar_as_json_agree() {
+        for canonicalize in [false, true] {
+            for (resolved, str_val) in RESOLVED_SCALAR_DRIFT_CASES {
+                let mut buffered = String::new();
+                write_resolved_scalar_as_json(&mut buffered, *resolved, str_val, canonicalize);
+
+                let mut streamed = String::new();
+                stream_resolved_scalar_as_json(&mut streamed, *resolved, str_val, canonicalize)
+                    .expect("writing into a String cannot fail");
+
+                assert_eq!(
+                    buffered, streamed,
+                    "buffered/streaming drift for {resolved:?} with {str_val:?} \
+                     (canonicalize={canonicalize})"
+                );
+            }
+        }
+    }
+
+    /// Anchors a few of the drift cases to concrete output, so the test above
+    /// cannot pass by both writers becoming wrong in the same way.
+    #[test]
+    fn resolved_scalar_as_json_pins_the_awkward_arms() {
+        let pin = |resolved: ResolvedScalar, str_val: &str, canonicalize: bool| {
+            let mut out = String::new();
+            write_resolved_scalar_as_json(&mut out, resolved, str_val, canonicalize);
+            out
+        };
+
+        // i64::MIN is the one integer the hand-rolled digit loop cannot
+        // negate, so it has its own branch in `write_i64`.
+        assert_eq!(
+            pin(ResolvedScalar::Int(i64::MIN), "-9223372036854775808", false),
+            "-9223372036854775808"
+        );
+        assert_eq!(pin(ResolvedScalar::Int(0), "0", false), "0");
+        // Hex is emitted from the parsed value, never echoed.
+        assert_eq!(pin(ResolvedScalar::Int(42), "0x2A", false), "42");
+        // A trailing zero survives (#993); a whole float keeps its `.0` (#169).
+        assert_eq!(pin(ResolvedScalar::Float(1.5), "1.50", false), "1.50");
+        assert_eq!(
+            pin(ResolvedScalar::Float(1.0), "not a float literal", false),
+            "1.0"
+        );
+        // ...but not once the scalar is known to be JSON-sourced (#996).
+        assert_eq!(pin(ResolvedScalar::Float(1.5), "1.50", true), "1.5");
+        // JSON has no `.inf`/`.nan` literal.
+        assert_eq!(pin(ResolvedScalar::Float(f64::NAN), ".nan", false), "null");
+        // yq's escape convention: `\u00xx` for C0, DEL left raw (#385).
+        assert_eq!(
+            pin(ResolvedScalar::Str, "a\u{1}b\u{7f}c", false),
+            "\"a\\u0001b\u{7f}c\""
+        );
+        assert_eq!(
+            pin(ResolvedScalar::Str, "q\"b\\t\tn\n", false),
+            "\"q\\\"b\\\\t\\tn\\n\""
+        );
     }
 
     /// Values ≥ 16 bytes with multibyte UTF-8, long enough to enter the SIMD
