@@ -27,8 +27,8 @@ use super::document::{
     IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, collapse_vec, eval as full_eval, eval_each_owned, format_owned,
-    index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
+    apply_compare_op, arith_combine, collapse_vec, eval as full_eval, eval_each_owned,
+    format_owned, index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, tonumber_from_str, Control, Demand, EvalError, EvalSemantics, EvalTag,
     Flow, JqSemantics, QueryResult, YqSemantics,
@@ -4179,16 +4179,30 @@ fn drain_result_generic<V: DocumentValue>(
 /// instead of `eval_single`'s own eager, always-materialize-everything
 /// dispatch for the same three variants.
 ///
-/// Scoped to `Comma`/`Pipe`/`Paren`/`Compare` -- mirroring `eval.rs`'s still
-/// wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/...) remains out of scope
-/// here; those shapes still fall to the `_` fallback below. `Compare` gained
-/// a native arm for #1481, mirroring `eval.rs`'s own `Expr::Compare` arm
-/// (#1459/Stage 4): this closes the interleaving gap both for a bare
-/// top-level compare (`eval_single`'s own arm now routes through this same
-/// machinery, see `eval_compare_generic`) and for a compare reached through
-/// this module's own lazy consumers (`first`/`last`), which previously fell
-/// through to the eager `_` fallback for any non-`Comma`/`Pipe`/`Paren`
-/// argument.
+/// Scoped to `Comma`/`Pipe`/`Paren`/`Compare`/`Arithmetic` -- mirroring
+/// `eval.rs`'s still wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/...)
+/// remains out of scope here; those shapes still fall to the `_` fallback
+/// below, and the five of them are pinned as an explicit known gap in
+/// `test_short_circuit_side_effect_leaks_820_932_987`.
+///
+/// `Compare` and `Arithmetic` both gained native arms for #1481, mirroring
+/// `eval.rs`'s own pair (#1459/Stage 4 for `Compare`, #1481 for
+/// `Arithmetic`). They close the interleaving gap both for a bare top-level
+/// binary operator (`eval_single`'s own `Expr::Compare` arm routes through
+/// this same machinery via `eval_compare_generic`; `Expr::Arithmetic` has no
+/// native `eval_single` arm and instead reaches `eval.rs`'s already-fixed
+/// `eval_binary_fanout` through the `eval_on_owned` bridge) and for one
+/// reached through this module's own lazy consumers (`first`/`last`), which
+/// previously fell through to the eager `_` fallback for any
+/// non-`Comma`/`Pipe`/`Paren` argument.
+///
+/// **Both operators need arms, not just `Compare`.** They share one loop, so
+/// a fix that stopped at `Compare` left the exactly-parallel arithmetic
+/// spelling divergent: `first(10 + (1, ("B"|stderr)))` still ran the
+/// side-effecting candidate `first` never asked for, while
+/// `first(10 == (1, ("B"|stderr)))` no longer did (both oracle-verified
+/// against pinned jq 1.7.1; pinned together in
+/// `test_short_circuit_side_effect_shapes_already_match_jq_820`).
 fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -4236,6 +4250,28 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
                     *op, &left_val, &right_val,
                 )))
             },
+            sink,
+        ),
+        // #1481: the `Expr::Compare` arm's twin, identical but for the
+        // `combine` it supplies -- they share `binary_fanout_each_generic`
+        // the same way `eval.rs`'s `Expr::Compare`/`Expr::Arithmetic` arms
+        // share `binary_fanout_each`, so every note above (loop order,
+        // hardcoded `optional: false` on the operands, where the ambient
+        // `optional` is consulted instead) applies verbatim here.
+        //
+        // Unlike `apply_compare_op`, [`arith_combine`] is genuinely fallible
+        // (`"a" + 1`, `1 / 0`), so this is the arm that first exercises
+        // `binary_fanout_each_generic`'s `Err(e)` path -- the one its own
+        // comment said was written generically and left ready for a fallible
+        // caller.
+        Expr::Arithmetic { op, left, right } => binary_fanout_each_generic::<V>(
+            |operand, operand_sink| {
+                eval_each_generic::<S, V>(operand, value.clone(), false, cursor, operand_sink)
+            },
+            left,
+            right,
+            optional,
+            |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
@@ -4537,19 +4573,15 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             };
             match combine(left_val, right_val.clone()) {
                 Ok(v) => sink(GenericItem::Owned(v)),
-                // Unreached by any current caller, not just untested: both of
-                // this function's call sites (`eval_compare_generic` and
-                // `eval_each_generic`'s own `Expr::Compare` arm) wrap the
-                // infallible `apply_compare_op` in `Ok(...)` -- `CompareOp`
-                // has no failure mode. `combine` is still typed fallibly, not
-                // simplified to `OwnedValue`, to mirror `eval.rs`'s own
-                // `binary_fanout_each` (whose `Expr::Arithmetic` caller *can*
-                // fail here, e.g. division by zero) and stay ready for a
-                // fallible caller of its own -- `Expr::Arithmetic` has no
-                // native `eval_each_generic` arm today (see that function's
-                // doc comment), but if one is ever added, this is the arm
-                // that already handles it correctly rather than needing this
-                // whole loop's error plumbing designed from scratch.
+                // Reached by the `Expr::Arithmetic` caller only: the two
+                // `Expr::Compare` call sites wrap the infallible
+                // `apply_compare_op` in `Ok(...)` (`CompareOp` has no failure
+                // mode), while `arith_combine` fails on `"a" + 1`, `1 / 0`,
+                // and friends. Same policy as `eval.rs`'s
+                // `binary_fanout_each`: a `combine` error aborts the *whole*
+                // fanout rather than skipping just that pairing, whatever was
+                // already pushed stands, and `optional` decides whether the
+                // failure itself survives.
                 Err(e) => {
                     abort = Some(if optional {
                         Flow::Exhausted
@@ -4580,10 +4612,14 @@ fn binary_fanout_each_generic<V: DocumentValue>(
 /// Collecting wrapper over [`binary_fanout_each_generic`] for `eval_single`'s
 /// `Expr::Compare` arm (#1481) -- mirrors `eval.rs`'s
 /// `eval_binary_fanout`/`binary_fanout_core` pairing, wired directly to the
-/// lazy `eval_each_generic` operand strategy since this file has no eager
-/// sibling (`Expr::Arithmetic` has no native arm here at all, see
-/// `eval_each_generic`'s own doc comment) that still needs an eager one kept
-/// around.
+/// lazy `eval_each_generic` operand strategy since this file never had an
+/// eager sibling that still needs one kept around.
+///
+/// `Expr::Arithmetic` needs no counterpart here: it has no native
+/// `eval_single` arm at all, so a bare top-level `a + b` reaches `eval.rs`'s
+/// own (already interleaved) `eval_binary_fanout` through the `eval_on_owned`
+/// bridge. Only the *lazy* side needed an arm, and that one lives in
+/// [`eval_each_generic`].
 fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
     op: CompareOp,
     left: &Expr,
