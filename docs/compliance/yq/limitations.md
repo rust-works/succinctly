@@ -658,7 +658,7 @@ conversion).
 Not divergences — these are ADR-0018 rule 2 working correctly. The same filter text means
 different things in `sjq` and `syq` because the two reference tools disagree, and succinctly
 follows each one in its own mode. The behavioural axis is `EvalSemantics`
-([src/jq/eval.rs](../../../src/jq/eval.rs)) — eleven `const`s plus an `EvalTag` identity tag
+([src/jq/eval.rs](../../../src/jq/eval.rs)) — twelve `const`s plus an `EvalTag` identity tag
 — together with a handful of `S::TAG` tests at individual call sites:
 
 | Behaviour | `succinctly jq` (jq 1.7.1) | `succinctly yq` (yq v4.53.3) |
@@ -677,9 +677,10 @@ follows each one in its own mode. The behavioural axis is `EvalSemantics`
 | `2.0 == 2` | `true` | `false` (strict int/float distinction) |
 | Bare `halt_error` exit code | `5` | `1` |
 | `7 + null` / `null - 7` | `7` / error | error / `7` |
+| String-repeat (`s * n`) allocation limit | none — refuses only once the allocation genuinely can't be made (#1612) | explicit ~10MiB cap (`MAX_STRING_REPEAT_BYTES`), matching real yq's own deliberate refusal before any allocation is attempted |
 
-Ten of these rows are `EvalSemantics` constants, each carrying its live-verification note in
-the trait's doc comments — `7 + null` / `null - 7` is one row over two constants,
+Eleven of these rows are `EvalSemantics` constants, each carrying its live-verification note
+in the trait's doc comments — `7 + null` / `null - 7` is one row over two constants,
 `ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE` and `SUB_LEFT_NULL_IS_IDENTITY`. **Four are not.**
 Bare `sub`, container `@uri`/`@base64`, and `@base64d`'s malformed-padding strictness are all
 `S::TAG == EvalTag::Yq` tests at their call sites in

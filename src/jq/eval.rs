@@ -147,6 +147,31 @@ pub trait EvalSemantics: Copy + Default {
     /// The jq CLI's `--preserve-input` extension keeps every occurrence
     /// regardless, via its own `jq_compat` gate -- ADR-0018 rule 5.
     const COLLAPSE_DUPLICATE_KEYS: bool;
+    /// A deliberate, artificial byte-length cap string-repeat (`s * n`)
+    /// refuses past, entirely separate from whatever the host can actually
+    /// allocate — `None` for jq, which has no such cap and lets any count
+    /// through to a real allocation attempt, exactly as jq does. `arith_mul`'s
+    /// own string-repeat arm still guards *that* attempt itself, via
+    /// `try_reserve_exact` rather than an infallible `String::repeat`
+    /// (#1612, same technique #1017's own `pad_with_nulls` already
+    /// established for this bug class) — so jq mode refusing past this
+    /// cap is not the only thing standing between a huge `n` and the
+    /// embedder's process going down; it is jq mode's *only* refusal, but
+    /// yq mode's own cap fires first, well before its own `try_reserve_exact`
+    /// call would ever have anything to say.
+    ///
+    /// yq is different: real yq v4.53.3 refuses *before* attempting the
+    /// allocation at all, with its own explicit, deliberate safety cap.
+    /// Confirmed live: `"ab" * 5242880` (10485760 bytes) succeeds; `"ab" *
+    /// 5242881` (10485762 bytes) refuses with `result of repeating string
+    /// (2 bytes) by 5242881 would exceed 10485760 bytes` — the boundary is
+    /// an exact `10 * 1024 * 1024`, not an approximation. Matching this
+    /// (rather than relying solely on `try_reserve_exact` catching a real
+    /// allocation failure) keeps `succinctly yq` bug-for-bug faithful to
+    /// yq's own deliberately conservative behavior, not just crash-free —
+    /// a count `try_reserve_exact` alone would happily allocate (a few
+    /// hundred MB, say) still must refuse in yq mode, since real yq does.
+    const MAX_STRING_REPEAT_BYTES: Option<u128>;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -171,6 +196,7 @@ impl EvalSemantics for JqSemantics {
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = false;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = false;
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
+    const MAX_STRING_REPEAT_BYTES: Option<u128> = None;
 }
 
 /// yq-compatible evaluation semantics.
@@ -197,6 +223,7 @@ impl EvalSemantics for YqSemantics {
     const ADD_RIGHT_NULL_REQUIRES_CONCAT_TYPE: bool = true;
     const SUB_LEFT_NULL_IS_IDENTITY: bool = true;
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
+    const MAX_STRING_REPEAT_BYTES: Option<u128> = Some(10 * 1024 * 1024);
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -4309,7 +4336,50 @@ fn arith_mul<S: EvalSemantics>(
                     if n < 0 {
                         Ok(OwnedValue::Null)
                     } else {
-                        Ok(OwnedValue::String(s.repeat(n as usize)))
+                        // `n` comes from the document, so an absurd count
+                        // asks for an absurd allocation (#1612, same class
+                        // as `cannot_grow_array`/#1017). `u128` for the
+                        // product avoids overflow happening a second time,
+                        // in the multiplication used to compute *whether*
+                        // it overflows.
+                        let total = s.len() as u128 * n as u128;
+                        // yq mode refuses outright past its own deliberate
+                        // cap, before ever attempting an allocation -- see
+                        // `MAX_STRING_REPEAT_BYTES`'s own doc comment.
+                        if let Some(max) = S::MAX_STRING_REPEAT_BYTES {
+                            if total > max {
+                                return Err(string_repeat_would_exceed_cap(s.len(), n, max));
+                            }
+                        }
+                        // jq mode has no cap of its own and simply attempts
+                        // the allocation, exactly as jq does -- but
+                        // `try_reserve_exact`, not `String::repeat`
+                        // directly, same technique #1017's own
+                        // `pad_with_nulls` already established for this bug
+                        // class. `String::repeat` answers *either* an
+                        // unrepresentable byte length (past what an
+                        // allocator `Layout` permits: `isize::MAX`, not
+                        // `usize::MAX` -- Rust's own allocator API requires
+                        // every layout's size to fit an `isize`) *or* a
+                        // representable-but-actually-unallocatable one
+                        // (genuine OOM) the same unconditional way: a panic
+                        // for the former, an abort for the latter -- both
+                        // take the embedder's process down regardless.
+                        // `try_reserve_exact` reports *both* as an
+                        // `Err(TryReserveError)` instead, so this closes the
+                        // whole class in one guard rather than only the
+                        // Layout-overflow half of it.
+                        let Ok(len) = usize::try_from(total) else {
+                            return Err(cannot_repeat_string(total));
+                        };
+                        let mut result = String::new();
+                        if result.try_reserve_exact(len).is_err() {
+                            return Err(cannot_repeat_string(total));
+                        }
+                        for _ in 0..n {
+                            result.push_str(&s);
+                        }
+                        Ok(OwnedValue::String(result))
                     }
                 }
                 // Type mismatch -- `left`/`right` were never consumed by
@@ -4321,6 +4391,29 @@ fn arith_mul<S: EvalSemantics>(
             }
         }
     }
+}
+
+/// Refusal for a string-repeat byte length that cannot be allocated (jq
+/// mode only reaches this — yq mode's own `MAX_STRING_REPEAT_BYTES` cap
+/// always refuses first, well before this bound).
+///
+/// Not a jq sentence: confirmed live, jq does not error on any filter that
+/// reaches this — it just keeps running rather than answering promptly
+/// (`"ab" * 1e30` was still running after several seconds, never observed
+/// to terminate one way or the other) — so there is no wording to
+/// reproduce here. See `docs/compliance/jq/limitations.md`.
+fn cannot_repeat_string(total: u128) -> EvalError {
+    EvalError::new(format!("Cannot repeat string to {total} bytes"))
+}
+
+/// Real yq v4.53.3's own wording for its `MAX_STRING_REPEAT_BYTES` cap,
+/// reproduced verbatim (confirmed live) — `s_len`/`n` name the *inputs*
+/// (the string's own byte length and the repeat count), not `total`, which
+/// yq's own message doesn't otherwise mention.
+fn string_repeat_would_exceed_cap(s_len: usize, n: i64, max: u128) -> EvalError {
+    EvalError::new(format!(
+        "result of repeating string ({s_len} bytes) by {n} would exceed {max} bytes"
+    ))
 }
 
 /// Merge two values for `*`/`*=` where `right` merges into a position
@@ -35231,6 +35324,102 @@ mod tests {
         // (jqlang/jq#1593).
         query!(br#"{"s": "ab", "n": -1.5}"#, ".s * .n",
             QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    /// #1612: a repeat count from the document can ask for a byte length
+    /// no allocation can ever satisfy -- either because it doesn't even fit
+    /// an allocator `Layout` (past `isize::MAX`, not `usize::MAX`), which
+    /// used to make `String::repeat` answer with an unconditional
+    /// `capacity overflow` *panic*, or because it's representable but the
+    /// host genuinely has no that much memory, which used to abort the
+    /// process on real allocation failure -- `try_reserve_exact` (not
+    /// `String::repeat` directly) reports both the same way, as a catchable
+    /// `EvalError`. jq mode has no cap of its own beyond what can actually
+    /// be allocated; ordinary large-but-representable counts still succeed
+    /// exactly as before
+    /// (`test_arithmetic_mul_string_repetition_float_count_1230`'s own
+    /// cases are unaffected by this fix). Both operand orderings share the
+    /// same match arm (`s * n` and `n * s`), so both are exercised here.
+    #[test]
+    fn test_arithmetic_mul_string_repetition_overflow_1612() {
+        query!(br#"{"s": "ab", "n": 123456789012345678901234567890}"#, ".s * .n",
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("Cannot repeat string to"), "{}", e.message);
+            }
+        );
+        // The other operand ordering (`n * s`) is a *different* match-arm
+        // pattern, not just a swapped argument to the same code -- must be
+        // exercised on its own.
+        query!(br#"{"s": "ab", "n": 123456789012345678901234567890}"#, ".n * .s",
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("Cannot repeat string to"), "{}", e.message);
+            }
+        );
+        // A product that overflows `usize` itself (not just `isize`) --
+        // needs a 3+ byte string, since `2 * i64::MAX` alone still (just)
+        // fits a 64-bit `usize`.
+        query!(br#"{"s": "abc", "n": 123456789012345678901234567890}"#, ".s * .n",
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("Cannot repeat string to"), "{}", e.message);
+            }
+        );
+        // A count that fits `usize` but not `isize` (`Layout`'s own
+        // requirement) still refuses -- not just counts that overflow
+        // `usize` outright.
+        query!(br#"{"s": "ab", "n": 9223372036854775807}"#, ".s * .n",
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("Cannot repeat string to"), "{}", e.message);
+            }
+        );
+        // Positive `infinite` truncates (via `as i64`) to the same
+        // `i64::MAX` saturation, previously an unguarded hang/OOM hazard
+        // (#1199's own review found and deliberately left this uncovered);
+        // now refuses cleanly like any other unrepresentable count.
+        query!(br#"{"s": "ab"}"#, ".s * infinite",
+            QueryResult::Error(e) => {
+                assert!(e.message.starts_with("Cannot repeat string to"), "{}", e.message);
+            }
+        );
+        // Ordinary large-but-representable counts are unaffected.
+        query!(br#"{"s": "ab", "n": 1000000}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::String(s)) if s.len() == 2_000_000 => {}
+        );
+    }
+
+    /// #1612: real yq v4.53.3 never relies on the OS at all -- it refuses
+    /// with its own explicit, deliberate cap (confirmed live: exactly
+    /// `10 * 1024 * 1024` bytes succeeds, one more refuses), which is *far*
+    /// below `isize::MAX` and so a genuine additional divergence beyond
+    /// jq mode's own capacity-overflow guard: without this, `succinctly yq`
+    /// still crashed (a real allocator abort, not a Rust panic, but the
+    /// same "takes the embedder's process down" outcome) on a count well
+    /// under `isize::MAX` but past what any real machine can allocate.
+    #[test]
+    fn test_yq_arithmetic_mul_string_repetition_cap_1612() {
+        // Exactly at the cap: succeeds.
+        yq_query!(br#"{"s": "ab", "n": 5242880}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::String(s)) if s.len() == 10_485_760 => {}
+        );
+        // One byte over: refuses, with real yq's own exact wording.
+        yq_query!(br#"{"s": "ab", "n": 5242881}"#, ".s * .n",
+            QueryResult::Error(e) => {
+                assert_eq!(
+                    e.message,
+                    "result of repeating string (2 bytes) by 5242881 would exceed 10485760 bytes"
+                );
+            }
+        );
+        // A count nowhere near `isize::MAX` still refuses in yq mode --
+        // the case that used to reach a real allocator abort.
+        yq_query!(br#"{"s": "ab", "n": 999999999999999999}"#, ".s * .n",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("would exceed 10485760 bytes"), "{}", e.message);
+            }
+        );
+        // jq mode's own cases are unaffected by the yq-only cap.
+        query!(br#"{"s": "ab", "n": 5242881}"#, ".s * .n",
+            QueryResult::Owned(OwnedValue::String(s)) if s.len() == 10_485_762 => {}
         );
     }
 

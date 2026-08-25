@@ -627,6 +627,22 @@ refuses with `Cannot grow array to <n> elements` — succinctly's own wording, s
 no jq sentence to copy. Only the impossible is refused; every length that fits in memory
 still pads, so `[1,2] | setpath([5]; 9)` still agrees with jq.
 
+String repetition (`s * n`) has the identical shape (#1612): `n` comes from the document, so
+`"ab" * 1e30` asks for a byte length `String::repeat` cannot even represent, which used to
+panic with `capacity overflow` rather than the `EvalError` `setpath`'s own case above already
+gets. Confirmed live, jq itself does not error on this filter at all — it just keeps running
+rather than answering promptly (never observed to terminate one way or the other; there is no
+jq sentence to reproduce because no output was ever captured to reproduce). succinctly now
+refuses with `Cannot repeat string to <n> bytes` — succinctly's own wording — once the
+requested allocation cannot actually be made, checked via `String::try_reserve_exact` rather
+than the infallible `String::repeat` (the same technique the `setpath` case above already
+uses): this covers both an unrepresentable byte length (past `isize::MAX`) and a
+representable-but-genuinely-unallocatable one alike, in one guard. Every length that fits
+still repeats, so `"ab" * 3` and #1230's float-count cases are unaffected.
+
+This guard is jq-mode-only. See [yq Limitations](../yq/limitations.md) for `succinctly yq`
+mode, which refuses much earlier via its own, separate cap.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
