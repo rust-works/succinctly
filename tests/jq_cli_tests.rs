@@ -21267,8 +21267,8 @@ fn test_jq_lazy_fanout_preserves_prefix_and_trailing_control_1531() -> Result<()
 /// #1247: an object key that fails to decode must not hide the *valid*
 /// fields after it. `JsonFields::find`/`find_cursor` used to `?` out of the
 /// whole search on the first undecodable key, so `.b` answered `null` here
-/// even though `keys_unsorted`/`length` -- which never decode a key -- both
-/// still reported `b`. That inconsistency is the reason this is worth an
+/// even though `length` -- which never decodes a key at all (`fields.len()`)
+/// -- still reported `2`. That inconsistency is the reason this is worth an
 /// end-to-end test and not just a unit one: the two halves of the CLI
 /// disagreed with each other about whether the field existed.
 ///
@@ -21285,12 +21285,58 @@ fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(stdout.trim(), "2", "stderr: {stderr}");
 
-    // The half that was already right, pinned so the two can't drift apart
-    // again in the other direction.
-    let (stdout, _, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
+    // `length` genuinely never decodes a key -- pinned so the two can't
+    // drift apart again in the other direction.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "length"], Some(input))
+        .unwrap_or_else(|e| panic!("`length` failed to run: {e}"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "2", "stderr: {stderr}");
+
+    // `keys_unsorted` alone stays on the genuinely-lazy native path (#685),
+    // which streams each key's raw byte span straight to output without
+    // ever attempting to decode it -- so it echoes the bad key verbatim
+    // rather than raising or dropping it, the same raw-passthrough class as
+    // `jq '.'`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(input))
+        .unwrap_or_else(|e| panic!("`keys_unsorted` failed to run: {e}"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), r#"["\ud800","b"]"#, "stderr: {stderr}");
+}
+
+/// #1247 follow-up: `keys_unsorted` piped into anything else -- even just a
+/// second comma-generator result, as here -- can no longer stay on the
+/// genuinely-lazy raw-byte path `test_undecodable_object_key_does_not_hide_later_fields_1247`
+/// pins above; it has to materialize through the same escape-hatch fallback
+/// (`materialize_lazy_keys`/`effective_keys`, #140) that `keys` (sorted) and
+/// `{x: keys_unsorted}` (object construction) already went through. That
+/// fallback decodes every key via `key_str()`, so it inherits #1247's core
+/// rule: an undecodable key raises instead of silently vanishing. Before
+/// this test's fix, the fallback silently dropped the bad key instead
+/// (`keys_unsorted, length` printed `["b"]` then `2`, exit 0) -- the same
+/// swallow this whole issue exists to close, just reachable from a third
+/// angle the original #1247 sweep missed.
+#[test]
+fn test_undecodable_key_in_materialized_keys_unsorted_surfaces_as_error_1247() {
+    let input = r#"{"\ud800": 1, "b": 2}"#;
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
         .unwrap_or_else(|e| panic!("`keys_unsorted, length` failed to run: {e}"));
-    assert_eq!(code, 0);
-    assert_eq!(stdout.lines().last(), Some("2"));
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("invalid unicode escape sequence in object key"),
+        "stderr: {stderr}"
+    );
+
+    // Same fallback, reached via sorting instead of a second comma result:
+    // `keys` (sorted) always needed a full decode to sort by, even before
+    // this fix, and already raised.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "keys"], Some(input))
+        .unwrap_or_else(|e| panic!("`keys` failed to run: {e}"));
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stderr.contains("invalid unicode escape sequence in object key"),
+        "stderr: {stderr}"
+    );
 }
 
 /// #1247 core: a string scalar the semi-index accepted but that cannot be

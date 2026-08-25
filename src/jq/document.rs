@@ -5,6 +5,8 @@
 //! intermediate conversion.
 
 #[cfg(not(test))]
+use alloc::format;
+#[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
@@ -12,6 +14,8 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 use indexmap::{IndexMap, IndexSet};
 #[cfg(test)]
 use std::borrow::Cow;
+
+use super::error::EvalError;
 
 /// Indentation configuration for cursor/lazy streaming output.
 ///
@@ -590,16 +594,22 @@ pub trait DocumentFields: Sized + Clone {
     }
 
     /// Collect all field names.
-    fn keys(&self) -> Vec<String> {
+    fn keys(&self) -> Result<Vec<String>, EvalError> {
         let mut keys = Vec::new();
         let mut fields = self.clone();
         while let Some((field, rest)) = fields.uncons() {
+            // Before `key_str`, not after -- same ordering rule as every
+            // other key-materializing site (#1247): an undecodable key must
+            // raise here, not silently vanish once `key_str` stringifies it.
+            if let Some(reason) = field.key.string_decode_error() {
+                return Err(EvalError::new(format!("{reason} in object key")));
+            }
             if let Some(key) = field.key_str() {
                 keys.push(key.into_owned());
             }
             fields = rest;
         }
-        keys
+        Ok(keys)
     }
 }
 
@@ -1292,21 +1302,24 @@ pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
 /// `IndexSet`, whose `insert` keeps the first occurrence's position and
 /// discards later equal ones -- the whole rule, since a key array carries
 /// no values for "last value wins" to choose between.
-pub fn effective_keys<F: DocumentFields>(fields: &F, collapse: bool) -> Vec<String> {
-    let keys = fields.keys();
+pub fn effective_keys<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<String>, EvalError> {
+    let keys = fields.keys()?;
     if !collapse {
-        return keys;
+        return Ok(keys);
     }
     let mut hashes: Vec<u64> = keys.iter().map(|key| key_hash(key.as_bytes())).collect();
     hashes.sort_unstable();
     if !hashes_repeat(&hashes) {
-        return keys;
+        return Ok(keys);
     }
     let mut seen: IndexSet<String> = IndexSet::with_capacity(keys.len());
     for key in keys {
         seen.insert(key);
     }
-    seen.into_iter().collect()
+    Ok(seen.into_iter().collect())
 }
 
 /// A single field from an object.

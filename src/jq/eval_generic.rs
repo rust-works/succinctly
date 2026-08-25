@@ -757,12 +757,14 @@ fn materialize_lazy_keys<V: DocumentValue>(
     fields: &V::Fields,
     sorted: bool,
     collapse: bool,
-) -> OwnedValue {
-    let mut keys = effective_keys(fields, collapse);
+) -> Result<OwnedValue, EvalError> {
+    let mut keys = effective_keys(fields, collapse)?;
     if sorted {
         keys.sort();
     }
-    OwnedValue::Array(keys.into_iter().map(OwnedValue::String).collect())
+    Ok(OwnedValue::Array(
+        keys.into_iter().map(OwnedValue::String).collect(),
+    ))
 }
 
 /// An object's key cursors in document order, with a repeated key dropped
@@ -1149,9 +1151,9 @@ fn into_lazy_items<V: DocumentValue>(
             fields,
             sorted,
             collapse,
-        } => Ok(vec![LazyElem::Owned(materialize_lazy_keys::<V>(
-            &fields, sorted, collapse,
-        ))]),
+        } => Ok(vec![LazyElem::Owned(
+            materialize_lazy_keys::<V>(&fields, sorted, collapse).map_err(Control::Error)?,
+        )]),
         GenericResult::LazyIndexRange(len) => {
             Ok(vec![LazyElem::Owned(materialize_lazy_index_range(len))])
         }
@@ -1938,7 +1940,10 @@ impl<V: DocumentValue> GenericResult<V> {
                 fields,
                 sorted,
                 collapse,
-            } => Self::Owned(materialize_lazy_keys::<V>(&fields, sorted, collapse)),
+            } => match materialize_lazy_keys::<V>(&fields, sorted, collapse) {
+                Ok(owned) => Self::Owned(owned),
+                Err(e) => Self::Error(e),
+            },
             Self::LazyIndexRange(len) => Self::Owned(materialize_lazy_index_range(len)),
             Self::LazySeq(seq) => match seq.materialize_atomic() {
                 Ok(owned) => Self::Owned(owned),
@@ -2090,7 +2095,12 @@ impl<V: DocumentValue> GenericResult<V> {
                     // Fallback: materialize+sort. Sorting requires seeing
                     // every key first, so this can't stream lazily like the
                     // unsorted case below.
-                    let owned = materialize_lazy_keys::<V>(fields, true, *collapse);
+                    let Some(owned) = owned_or_stream_error(
+                        materialize_lazy_keys::<V>(fields, true, *collapse),
+                        &mut stats,
+                    ) else {
+                        return Ok(stats);
+                    };
                     owned.stream_json(out, indent, sort_keys)?;
                 } else {
                     // Genuinely lazy (#685): each key is pulled from
@@ -2323,7 +2333,12 @@ impl<V: DocumentValue> GenericResult<V> {
                 if *sorted {
                     // Fallback: materialize+sort. See `stream_json`'s
                     // `LazyKeys` arm above — same reasoning.
-                    let owned = materialize_lazy_keys::<V>(fields, true, *collapse);
+                    let Some(owned) = owned_or_stream_error(
+                        materialize_lazy_keys::<V>(fields, true, *collapse),
+                        &mut stats,
+                    ) else {
+                        return Ok(stats);
+                    };
                     owned.stream_yaml(out, indent, sort_keys)?;
                 } else {
                     // Genuinely lazy (#685): see `stream_json`'s
@@ -3070,11 +3085,10 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         ),
         // No probe: `materialize_lazy_keys` applies the
         // collapse rule itself, through `effective_keys`.
-        _ => eval_on_owned::<S, _>(
-            expr,
-            materialize_lazy_keys::<V>(&fields, sorted, collapse),
-            optional,
-        ),
+        _ => match materialize_lazy_keys::<V>(&fields, sorted, collapse) {
+            Ok(owned) => eval_on_owned::<S, _>(expr, owned, optional),
+            Err(e) => GenericResult::Error(e),
+        },
     }
 }
 
@@ -3390,7 +3404,10 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         );
     }
 
-    let mut keys = effective_keys(fields, collapse);
+    let mut keys = match effective_keys(fields, collapse) {
+        Ok(keys) => keys,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
     keys.sort();
     drive_pipe_elements_generic::<S, V>(
         keys.into_iter()
@@ -4740,7 +4757,15 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             match index_one_generic::<V>(t.clone(), k, optional) {
                 GenericResult::OneCursor(c) => {
                     if any_owned {
-                        owned.push(owned_or_err!(to_owned_cursor(&c)));
+                        // Not `owned_or_err!`: that bare-returns and would
+                        // discard every key/target pair already resolved
+                        // into `owned` ahead of this one. The already-indexed
+                        // prefix must survive as `Partial`, same as the
+                        // `GenericResult::Error` arm below.
+                        match to_owned_cursor(&c) {
+                            Ok(v) => owned.push(v),
+                            Err(e) => return partial_generic(owned, Control::Error(e)),
+                        }
                     } else {
                         cursors.push(c);
                     }
