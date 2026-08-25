@@ -4508,8 +4508,8 @@ fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResu
 /// `try`, not here.
 fn generic_item_into_owned<V: DocumentValue>(item: GenericItem<V>) -> Result<OwnedValue, Control> {
     match generic_item_to_result(item).materialize_lazy() {
-        GenericResult::One(v) => Ok(to_owned(&v)),
-        GenericResult::OneCursor(c) => Ok(to_owned_cursor(&c)),
+        GenericResult::One(v) => to_owned(&v).map_err(Control::Error),
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).map_err(Control::Error),
         GenericResult::Owned(v) => Ok(v),
         GenericResult::Error(e) => Err(Control::Error(e)),
         GenericResult::Break(label) => Err(Control::Break(label)),
@@ -11081,7 +11081,7 @@ mod tests {
 
         let expr = crate::jq::parse(". == .").unwrap();
         assert_eq!(
-            eval(&expr, value).into_owned().unwrap(),
+            eval(&expr, value).into_owned().unwrap().unwrap(),
             OwnedValue::Bool(true)
         );
     }
