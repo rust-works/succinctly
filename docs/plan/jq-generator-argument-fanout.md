@@ -356,6 +356,9 @@ run `./scripts/sync-jq-golden.sh` with the pinned jq on `PATH`.
 - [#820](https://github.com/rust-works/succinctly/issues/820) and [jq-lazy-generator-consumers.md](jq-lazy-generator-consumers.md) — the opposite bug, and the source of the rule that an ordinary builtin's argument may never get a stopping sink.
 - [#840](https://github.com/rust-works/succinctly/issues/840) — `sub`/`gsub` multi-output replacement; closed by Stage 9.
 - [#1045](https://github.com/rust-works/succinctly/issues/1045), [#1164](https://github.com/rust-works/succinctly/issues/1164) — the zero-output and trailing-escape fixes this work completes.
+- [#1556](https://github.com/rust-works/succinctly/issues/1556) and
+  [jq-range-lazy-bounds.md](jq-range-lazy-bounds.md) — the sixth review finding (below),
+  closed by its own design doc rather than branch-local like the other five.
 - [ADR-0018](../adrs/adr-0018.md) — the reference-fidelity rule the yq gates answer to.
 
 ## Follow-ups
@@ -389,7 +392,12 @@ its resolved prefix), [#1534](https://github.com/rust-works/succinctly/issues/15
 `FirstOnly` gate emitting a value it then raises over),
 [#1537](https://github.com/rust-works/succinctly/issues/1537) (the `ArgFanout` dispatch
 duplicated five times), and the single-argument half of
-[#1533](https://github.com/rust-works/succinctly/issues/1533).
+[#1533](https://github.com/rust-works/succinctly/issues/1533). The sixth,
+[#1556](https://github.com/rust-works/succinctly/issues/1556), was `range`'s own bound
+resolution — left on the eager `stream_outputs` pattern from the start (Stage 6's own
+bespoke-triple-loop decision, above), not one of #1531's shared `fanout_arg`/`fanout_two_args`
+call sites — and needed its own design pass rather than a branch-local fix; see
+[jq-range-lazy-bounds.md](jq-range-lazy-bounds.md).
 
 #1531's lazy pull is the one that changed a documented conclusion: it closed the last golden
 known-failure, the #820 eager-argument residue this design had recorded as out of scope.
