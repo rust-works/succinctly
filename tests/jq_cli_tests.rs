@@ -3071,6 +3071,62 @@ fn test_lazy_keys_streaming_reports_first_occurrence_cursor_1599() -> Result<()>
     Ok(())
 }
 
+/// #1598: `continue_pipe_element_generic` used to rebuild the remaining
+/// pipe as an owned `Expr` for *every* element it was handed. The owned
+/// pipe is now built once per driver and cached, which makes correctness
+/// depend on something it did not before: that the cache never outlives
+/// the `rest` slice it was built from.
+///
+/// It cannot, because both drivers hold `rest` fixed for their whole loop
+/// — but nothing in the type system says so, so these pin it. The rows
+/// that matter are the ones with *two* `first(...)` calls carrying
+/// different trailing pipes: a cache leaking from the first driver into
+/// the second would answer the second query with the first one's stages,
+/// which is exactly the silent wrong answer this shape would produce.
+///
+/// `keys` (sorted) is the spelling that reaches the `Owned` arm — its
+/// branch yields each key as an owned string rather than a cursor — and a
+/// predicate that does not match keeps the driver pulling, so the loop
+/// runs once per key instead of stopping at the first. Every expectation
+/// is jq 1.7.1's own output.
+#[test]
+fn test_pipe_element_rest_cache_survives_multiple_drivers_1598() -> Result<()> {
+    let input = r#"{"b":1,"a":2,"c":3}"#;
+    for (filter, expected) in [
+        // Never matches: the driver walks every key through the `Owned`
+        // arm and still yields nothing.
+        (r#"[first(keys | .[] | select(. == "zzz"))]"#, "[]"),
+        // Matches only the last key, so the loop runs to the end.
+        (r#"first(keys | .[] | select(. == "c"))"#, r#""c""#),
+        // Two drivers, different trailing pipes, in one program.
+        (
+            r#"[first(keys | .[] | select(. == "c")), first(keys | .[] | ascii_upcase)]"#,
+            r#"["c","A"]"#,
+        ),
+        // Same, but both trailing pipes are multi-stage and differ in
+        // both length and content.
+        (
+            r#"[first(keys | .[] | select(. == "c") | ascii_upcase), first(keys | .[] | select(. == "b"))]"#,
+            r#"["C","b"]"#,
+        ),
+        // A longer trailing pipe: more stages is a bigger owned `Expr`,
+        // and the stage order still has to be preserved exactly.
+        (
+            r#"first(keys | .[] | tostring | select(. == "c") | ascii_upcase)"#,
+            r#""C""#,
+        ),
+        // The non-`first` spelling, which drives the same arm without an
+        // early stop.
+        (r#"[keys | .[] | select(. == "c")]"#, r#"["c"]"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_jq_compat_default() -> Result<()> {
     // Test that jq-compat is now the default behavior
