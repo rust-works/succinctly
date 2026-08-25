@@ -893,6 +893,37 @@ fn test_parity_number_literal_reaches_more_numeric_arg_builtins_387() {
     assert_parity(br"[2020.0,0,1,0,0,0,3,0]", r#"strftime("%Y-%m-%d")"#);
 }
 
+/// #1556: `range`'s bound resolution moved from a bespoke triple-nested
+/// `stream_outputs` loop to `each_range` (a native `eval_each` lazy arm),
+/// with `eval_range` itself becoming a thin wrapper over it. `eval_generic.rs`
+/// has no `Expr::Range` handling of its own and always bridges into
+/// `eval.rs` for this builtin, so this pins that relationship: a future
+/// native `eval_generic.rs` arm for `Range` cannot silently diverge in the
+/// *values* it produces without this test catching it (laziness itself --
+/// which document `input` pops -- is a CLI-level, not a values-only,
+/// concern, and is covered by `tests/jq_cli_tests.rs` instead).
+#[test]
+fn test_parity_range_multi_output_bounds_1556() {
+    for (json, filter, expected) in [
+        (br"null".as_slice(), "range((1,2))", "[0,0,1]"),
+        (br"null", "range((0,1);(2,3))", "[0,1,0,1,2,1,1,2]"),
+        (br"null", "range(0;6;(2,3))", "[0,2,4,0,3]"),
+        (
+            br"null",
+            "range((0,1);(2,3);(1,2))",
+            "[0,1,0,0,1,2,0,2,1,1,1,2,1]",
+        ),
+    ] {
+        let full = full_outputs(json, &format!("[{filter}]"));
+        assert_eq!(
+            as_strs(&full),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}`"
+        );
+        assert_parity(json, &format!("[{filter}]"));
+    }
+}
+
 /// A slice is a path component (#366), so it reaches `path()`, `getpath`,
 /// `setpath`, `delpaths`, `=`, `|=` and `del()`. The CLI drives the generic
 /// evaluator, which has no `Expr::Slice` arm of its own and round-trips to the

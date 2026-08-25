@@ -1143,6 +1143,40 @@ fn test_yq_paths_preserves_nested_duplicate_mapping_keys_868() -> Result<()> {
     Ok(())
 }
 
+/// #1556: `range`'s bound resolution moved to a native `eval_each` lazy arm
+/// (`each_range`), shared unmodified with yq mode via `<S: EvalSemantics>`.
+/// yq mode has no `input` builtin at all, so the jq-mode headline repro
+/// (`first(range(1, input)), input`) doesn't apply here -- this instead
+/// pins the two things that do: multi-output bound fan-out still produces
+/// the same values (Stage 6, unaffected by this refactor), and a wrapping
+/// `isempty` still stops `range` before a later comma branch's `stderr`
+/// write runs (`isempty`/`range` are both succinctly extensions in yq mode,
+/// gated behind `--jq-extensions`).
+#[test]
+fn test_yq_range_multi_output_bound_fanout_and_laziness_1556() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "[range((0,1);(2,3))]",
+        "null\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?}");
+    assert_eq!(output.trim(), "[0,1,0,1,2,1,1,2]");
+
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        "isempty(range(1, (\"B\" | stderr))), \"after\"",
+        "null\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?} stderr: {stderr:?}");
+    assert_eq!(output, "false\n\"after\"\n");
+    assert_eq!(
+        stderr, "",
+        "isempty must stop range before its bound's second comma branch runs"
+    );
+
+    Ok(())
+}
+
 /// Updated for #1398: `paths` on `--input-format json` input must now agree
 /// with YAML input (both preserve every duplicate-key occurrence, matching
 /// `to_entries`'s own format-independent behavior) rather than applying
