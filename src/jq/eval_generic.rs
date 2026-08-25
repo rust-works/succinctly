@@ -4478,6 +4478,17 @@ fn generic_item_into_owned<V: DocumentValue>(item: GenericItem<V>) -> Result<Own
         GenericResult::Error(e) => Err(Control::Error(e)),
         GenericResult::Break(label) => Err(Control::Break(label)),
         GenericResult::Halt(code) => Err(Control::Halt(code)),
+        // Provably dead, not just unlikely: `generic_item_to_result` can only
+        // ever produce `One`/`OneCursor`/`Owned`/`LazyKeys`/`LazyIndexRange`/
+        // `LazySeq` -- `GenericItem`'s own variant set -- and
+        // `materialize_lazy` folds the three lazy ones into
+        // `Owned`/`Error`/`Break`/`Halt`. That leaves exactly the six arms
+        // above; `GenericResult`'s other variants (`Many`/`ManyCursor`/
+        // `ManyOwned`/`None`/`Partial`) have no `GenericItem` counterpart and
+        // can never reach this match. No coverage-diff test can close this
+        // arm without adding a new `GenericItem` variant to alias into one of
+        // them -- see #1064 for the established precedent of documenting
+        // rather than forcing coverage of a structurally unreachable arm.
         _ => {
             unreachable!("a single GenericItem never materializes to a multi-output or lazy shape")
         }
@@ -4526,6 +4537,19 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             };
             match combine(left_val, right_val.clone()) {
                 Ok(v) => sink(GenericItem::Owned(v)),
+                // Unreached by any current caller, not just untested: both of
+                // this function's call sites (`eval_compare_generic` and
+                // `eval_each_generic`'s own `Expr::Compare` arm) wrap the
+                // infallible `apply_compare_op` in `Ok(...)` -- `CompareOp`
+                // has no failure mode. `combine` is still typed fallibly, not
+                // simplified to `OwnedValue`, to mirror `eval.rs`'s own
+                // `binary_fanout_each` (whose `Expr::Arithmetic` caller *can*
+                // fail here, e.g. division by zero) and stay ready for a
+                // fallible caller of its own -- `Expr::Arithmetic` has no
+                // native `eval_each_generic` arm today (see that function's
+                // doc comment), but if one is ever added, this is the arm
+                // that already handles it correctly rather than needing this
+                // whole loop's error plumbing designed from scratch.
                 Err(e) => {
                     abort = Some(if optional {
                         Flow::Exhausted
@@ -4584,7 +4608,12 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         &mut |item: GenericItem<V>| {
             match item {
                 GenericItem::Owned(v) => out.push(v),
-                // `combine` above always produces `GenericItem::Owned`.
+                // Structurally dead, not just untested: `binary_fanout_each_generic`
+                // has exactly one call to `sink` on its success path
+                // (`sink(GenericItem::Owned(v))` after a successful `combine`)
+                // -- there is no second call site that could hand this
+                // closure anything else, regardless of which `combine` a
+                // future caller passes.
                 _ => unreachable!("combine always produces GenericItem::Owned"),
             }
             Demand::Continue
@@ -10979,6 +11008,86 @@ mod tests {
             summarize(b"null", r#"first(empty == (10, error("x")))"#),
             Summary::Error("x".to_string())
         );
+    }
+
+    #[test]
+    fn test_generic_compare_operand_bare_one_via_cursor_less_entry_1481() {
+        // Same cursor-less-entry mechanism as
+        // `test_computed_index_key_bare_one_and_many_via_cursor_less_entry`
+        // below: entering through `eval()` rather than the CLI's
+        // `eval_with_cursor()` gives `Expr::Identity` a `None` ambient
+        // cursor, so each operand of `. == .` yields `GenericItem::One`, not
+        // `OneCursor`. That's the only way to reach
+        // `generic_item_into_owned`'s `One` arm -- `jq_runner.rs` always
+        // threads a real cursor through `eval_with_cursor`, so no CLI
+        // invocation can reach it.
+        let json = b"5";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse(". == .").unwrap();
+        assert_eq!(
+            eval(&expr, value).into_owned().unwrap(),
+            OwnedValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_generic_compare_left_operand_lazy_seq_error_propagates_1481() {
+        // A `LazySeq` operand (`map(f)`) that errors on materialization --
+        // forced by `generic_item_into_owned`, which
+        // `binary_fanout_each_generic` calls on every pulled item -- aborts
+        // the whole fanout rather than just that pairing. On the *left*
+        // operand this exercises `binary_fanout_each_generic`'s left-error
+        // propagation (the inner sink's own `Err(control)` arm, plus the
+        // `if abort.is_some() { return Demand::Stop }` check once `inner`
+        // returns).
+        let json = b"[1,2]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(1/0) == 1").unwrap();
+        match eval(&expr, value) {
+            GenericResult::Error(e) => assert!(e.message.contains("divided")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_compare_right_operand_lazy_seq_error_propagates_1481() {
+        // Mirror of the above with the erroring `LazySeq` on the *right*
+        // operand, exercising `binary_fanout_each_generic`'s other
+        // error-propagation arm (`right_item`'s own `Err(control)` match,
+        // reached before `left` is ever pulled).
+        let json = b"[1,2]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("1 == map(1/0)").unwrap();
+        match eval(&expr, value) {
+            GenericResult::Error(e) => assert!(e.message.contains("divided")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_generic_compare_operand_lazy_seq_break_and_halt_propagate_1481() {
+        // `generic_item_into_owned`'s `Break`/`Halt` arms: a `break`/
+        // `halt_error` inside a `map(f)` operand aborts materialization with
+        // `Control::Break`/`Control::Halt`, not `Control::Error` -- and
+        // `binary_fanout_each_generic` carries either straight out as the
+        // fanout's own `Flow::Escaped`.
+        let json = b"[1,2]";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = crate::jq::parse("map(if . == 2 then break $out else . end) == 1").unwrap();
+        assert!(
+            matches!(eval(&expr, value.clone()), GenericResult::Break(ref label) if label == "out")
+        );
+
+        let expr = crate::jq::parse("map(halt_error(7)) == 1").unwrap();
+        assert!(matches!(eval(&expr, value), GenericResult::Halt(7)));
     }
 
     #[test]
