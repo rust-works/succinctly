@@ -3114,9 +3114,21 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // to stop stage 1 too -- that is the whole point of the lazy `Pipe` arm --
     // but the two cases surface differently to our own caller.
     let mut downstream: Option<Flow> = None;
-    // Built once, outside the driver closure, so an Owned item mid-pipe
-    // doesn't re-clone `rest` per value.
-    let rest_pipe = Expr::Pipe(rest.to_vec());
+    // Built at most once, and only if an `Owned` item actually arrives
+    // (#1598). This used to be unconditional, so an all-`Borrowed` chain --
+    // the common case -- allocated a `Vec` and deep-cloned every remaining
+    // stage that nothing then read, once per call, and this function is
+    // itself the per-item recursion below.
+    //
+    // Measured neutral (Apple M5 Max, 200k elements, 1/4/8-stage borrowed
+    // chains: -0.4% / +0.7% / -0.3%), so this is dead-work removal for
+    // clarity, not a speed fix -- do not cite it as one. The superlinear
+    // cost curve those chains do show is the per-stage evaluation itself,
+    // not this clone: rebuilding with the allocation gone moves nothing.
+    // `eval_generic`'s twin of this driver carries the same cache as a
+    // `RestPipe`; here the `Owned` arm is the only reader, so a plain
+    // `Option` is enough.
+    let mut rest_pipe: Option<Expr> = None;
     let upstream = {
         let mut driver = |item: Item<'a, W>| -> Demand {
             let flow = match item {
@@ -3129,7 +3141,8 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // (#820: an eager fallback here silently drained inputs a
                 // downstream sink never asked for).
                 Item::Owned(v) => {
-                    eval_each_owned::<S>(&rest_pipe, &v, optional, &mut |o| sink(Item::Owned(o)))
+                    let rest_pipe = rest_pipe.get_or_insert_with(|| Expr::Pipe(rest.to_vec()));
+                    eval_each_owned::<S>(rest_pipe, &v, optional, &mut |o| sink(Item::Owned(o)))
                 }
             };
             match flow {

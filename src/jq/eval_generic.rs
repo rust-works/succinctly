@@ -3036,22 +3036,17 @@ fn drive_pipe_elements_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    // One cache for the whole drive, so a `rest` pipe that has to be owned
-    // for an `Owned` element is built on the first one and reused by every
-    // element after it (#1598).
-    let mut rest_pipe: Option<Expr> = None;
+    // One `RestPipe` for the whole drive, so an owned copy is built on the
+    // first `Owned` element and reused by every element after it (#1598).
+    let mut rest = RestPipe::new(rest);
     for element in elements {
         match element {
-            Ok(item) => match continue_pipe_element_generic::<S, V>(
-                item,
-                rest,
-                optional,
-                &mut rest_pipe,
-                sink,
-            ) {
-                Flow::Exhausted => continue,
-                other => return other,
-            },
+            Ok(item) => {
+                match continue_pipe_element_generic::<S, V>(item, &mut rest, optional, sink) {
+                    Flow::Exhausted => continue,
+                    other => return other,
+                }
+            }
             Err(Control::Error(e)) => return drain_result_generic(GenericResult::Error(e), sink),
             Err(Control::Break(label)) => {
                 return drain_result_generic(GenericResult::Break(label), sink);
@@ -3946,6 +3941,48 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// The stages after the current one, plus the owned `Expr::Pipe` copy an
+/// `Owned` element needs -- built at most once, and only if such an element
+/// actually arrives (#1598).
+///
+/// `eval_each_owned` takes an `&Expr`, and the only way to present a `rest`
+/// *slice* as one is to own a copy: a `Vec` allocation plus a recursive
+/// `Expr` clone per stage. Doing that inside the per-element call meant
+/// paying it once per element; a driver builds one of these instead and
+/// reuses it for its whole loop.
+///
+/// The slice and its owned copy are one value rather than two parameters on
+/// purpose. Correctness requires that a cached pipe is only ever used with
+/// the `rest` it was built from -- a mismatch would evaluate elements
+/// against the wrong stages, which is a wrong answer rather than a crash.
+/// Pairing them here makes that mismatch unrepresentable instead of relying
+/// on every call site to keep two arguments in step.
+struct RestPipe<'a> {
+    stages: &'a [Expr],
+    owned: Option<Expr>,
+}
+
+impl<'a> RestPipe<'a> {
+    fn new(stages: &'a [Expr]) -> Self {
+        Self {
+            stages,
+            owned: None,
+        }
+    }
+
+    /// The stages themselves, for the arms that can consume a slice.
+    fn stages(&self) -> &'a [Expr] {
+        self.stages
+    }
+
+    /// The same stages as one owned `Expr`, cloning on first use only.
+    fn owned(&mut self) -> &Expr {
+        let stages = self.stages;
+        self.owned
+            .get_or_insert_with(|| Expr::Pipe(stages.to_vec()))
+    }
+}
+
 /// Continue a pipe through one already-produced item: recurse the *rest* of
 /// the pipe against it, honoring `sink`'s `Demand` throughout. Shared by
 /// [`eval_each_pipe_generic`]'s own driver and [`fold_pipe_stages_sink`]'s
@@ -3964,34 +4001,35 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// dispatch below.
 fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
     item: GenericItem<V>,
-    rest: &[Expr],
+    rest: &mut RestPipe<'_>,
     optional: bool,
-    rest_pipe: &mut Option<Expr>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     match item {
-        GenericItem::One(v) => eval_each_pipe_generic::<S, V>(rest, v, optional, None, sink),
+        GenericItem::One(v) => {
+            eval_each_pipe_generic::<S, V>(rest.stages(), v, optional, None, sink)
+        }
         GenericItem::OneCursor(c) => {
-            eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+            eval_each_pipe_generic::<S, V>(rest.stages(), c.value(), optional, Some(c), sink)
         }
-        GenericItem::Owned(o) => {
-            // Built once per driver, not once per element (#1598).
-            // `eval_each_owned` needs an `&Expr`, and the only way to
-            // present a `rest` *slice* as one is to own a copy -- which is
-            // a `Vec` allocation plus a recursive `Expr` clone per stage.
-            // Callers hand in the cache so it survives their whole loop;
-            // it stays `None` on the cursor arms above, which never need
-            // it, so a path that yields no `Owned` item still allocates
-            // nothing.
-            let rest_pipe = rest_pipe.get_or_insert_with(|| Expr::Pipe(rest.to_vec()));
-            eval_each_owned::<S>(rest_pipe, &o, optional, &mut |o| {
-                sink(GenericItem::Owned(o))
-            })
-        }
+        GenericItem::Owned(o) => eval_each_owned::<S>(rest.owned(), &o, optional, &mut |o| {
+            sink(GenericItem::Owned(o))
+        }),
         item @ (GenericItem::LazyKeys { .. }
         | GenericItem::LazyIndexRange(_)
         | GenericItem::LazySeq(_)) => {
-            fold_pipe_stages_sink::<S, V>(generic_item_to_result(item), rest, optional, sink)
+            // Note: this arm cannot use the cache -- `fold_pipe_stages_sink`
+            // owns its own stage cursor and rebuilds a pipe from
+            // `stages[j..]`, a different slice than `rest`. It is documented
+            // as reachable only once per pulled element, so it is not a
+            // per-element clone today; #1611 tracks folding it in if that
+            // ever changes.
+            fold_pipe_stages_sink::<S, V>(
+                generic_item_to_result(item),
+                rest.stages(),
+                optional,
+                sink,
+            )
         }
     }
 }
@@ -4047,17 +4085,11 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
 
     let mut downstream: Option<Flow> = None;
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
-    // this closure also runs once per element of `first`'s output.
-    let mut rest_pipe: Option<Expr> = None;
+    // this closure also runs once per item stage 1 produces.
+    let mut rest = RestPipe::new(rest);
     let upstream = {
         let mut driver = |item: GenericItem<V>| -> Demand {
-            let flow = continue_pipe_element_generic::<S, V>(
-                item,
-                rest,
-                optional,
-                &mut rest_pipe,
-                &mut *sink,
-            );
+            let flow = continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink);
             match flow {
                 Flow::Exhausted => Demand::Continue,
                 other => {
