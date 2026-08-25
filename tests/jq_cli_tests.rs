@@ -3071,30 +3071,41 @@ fn test_lazy_keys_streaming_reports_first_occurrence_cursor_1599() -> Result<()>
     Ok(())
 }
 
-/// #1598: `continue_pipe_element_generic` used to rebuild the remaining
-/// pipe as an owned `Expr` for *every* element it was handed. The owned
-/// pipe is now built once per driver and cached, which makes correctness
-/// depend on something it did not before: that the cache never outlives
-/// the `rest` slice it was built from.
+/// #1598: the shapes that drive `continue_pipe_element_generic`'s `Owned`
+/// arm, which now reads its owned copy of the remaining pipe from a
+/// `RestPipe` cache instead of rebuilding one per element.
 ///
-/// It cannot, because both drivers hold `rest` fixed for their whole loop
-/// — but nothing in the type system says so, so these pin it. The rows
-/// that matter are the ones with *two* `first(...)` calls carrying
-/// different trailing pipes: a cache leaking from the first driver into
-/// the second would answer the second query with the first one's stages,
-/// which is exactly the silent wrong answer this shape would produce.
+/// **What these do and do not prove.** They are a behavioural guard, not a
+/// regression pin: every row below passes identically on the pre-change
+/// binary, because the mispairing the cache could in principle suffer --
+/// a cached pipe used with a `rest` it was not built from -- is not
+/// expressible once `RestPipe` owns both halves as one value. That is the
+/// real protection; these rows exist so that a future change widening the
+/// cache's scope (sharing one across drivers, or hoisting it above a loop
+/// that varies `rest`) fails visibly here rather than silently evaluating
+/// elements against the wrong stages.
 ///
-/// `keys` (sorted) is the spelling that reaches the `Owned` arm — its
-/// branch yields each key as an owned string rather than a cursor — and a
-/// predicate that does not match keeps the driver pulling, so the loop
-/// runs once per key instead of stopping at the first. Every expectation
-/// is jq 1.7.1's own output.
+/// Reaching the arm at all takes care, so the rows are chosen to spread
+/// across the drivers that get there, not just the convenient one:
+///
+/// - `keys` (sorted) yields each key as an owned string, driving
+///   `each_lazy_keys_iterate_sink` -> `drive_pipe_elements_generic`. A
+///   predicate that does not match keeps the driver pulling, so the loop
+///   runs once per key rather than stopping at the first element.
+/// - a bare comma stream (`(1,2,3) | f`) drives `eval_each_pipe_generic`'s
+///   own closure, which carries the *second* cache the change adds -- the
+///   `keys` rows leave it untouched, because stage 1 there hands back a
+///   single `LazyKeys` item.
+/// - `keys` over an array reaches `each_lazy_index_range_iterate_sink`,
+///   and `map(f) | .[] | g` reaches `each_lazy_seq_iterate_sink`; both
+///   land on the same cached arm by a different route.
+///
+/// Every expectation is jq 1.7.1's own output.
 #[test]
-fn test_pipe_element_rest_cache_survives_multiple_drivers_1598() -> Result<()> {
-    let input = r#"{"b":1,"a":2,"c":3}"#;
+fn test_pipe_element_rest_cache_across_drivers_1598() -> Result<()> {
+    let object = r#"{"b":1,"a":2,"c":3}"#;
     for (filter, expected) in [
-        // Never matches: the driver walks every key through the `Owned`
-        // arm and still yields nothing.
+        // Never matches: walks every key through the `Owned` arm.
         (r#"[first(keys | .[] | select(. == "zzz"))]"#, "[]"),
         // Matches only the last key, so the loop runs to the end.
         (r#"first(keys | .[] | select(. == "c"))"#, r#""c""#),
@@ -3103,23 +3114,41 @@ fn test_pipe_element_rest_cache_survives_multiple_drivers_1598() -> Result<()> {
             r#"[first(keys | .[] | select(. == "c")), first(keys | .[] | ascii_upcase)]"#,
             r#"["c","A"]"#,
         ),
-        // Same, but both trailing pipes are multi-stage and differ in
-        // both length and content.
+        // Both trailing pipes multi-stage, differing in length and content.
         (
             r#"[first(keys | .[] | select(. == "c") | ascii_upcase), first(keys | .[] | select(. == "b"))]"#,
             r#"["C","b"]"#,
         ),
-        // A longer trailing pipe: more stages is a bigger owned `Expr`,
-        // and the stage order still has to be preserved exactly.
+        // A longer trailing pipe: stage order must survive the caching.
         (
             r#"first(keys | .[] | tostring | select(. == "c") | ascii_upcase)"#,
             r#""C""#,
         ),
-        // The non-`first` spelling, which drives the same arm without an
-        // early stop.
+        // The non-`first` spelling, driving the arm without an early stop.
         (r#"[keys | .[] | select(. == "c")]"#, r#"["c"]"#),
     ] {
-        let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(object))?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // The other three drivers. `(1,2,3) | f` is the one that exercises
+    // `eval_each_pipe_generic`'s own cache with more than one `Owned` item.
+    let array = "[1,2,3]";
+    for (filter, expected) in [
+        (r"[(1,2,3) | tostring]", r#"["1","2","3"]"#),
+        (r#"[("a","b") | ascii_upcase]"#, r#"["A","B"]"#),
+        // Two comma-stream drivers with different trailing pipes.
+        (
+            r#"[first((1,2,3) | tostring), first(("x","y") | ascii_upcase)]"#,
+            r#"["1","X"]"#,
+        ),
+        // `keys` over an array -> index-range driver, owned integer items.
+        (r"[[10,20,30] | keys | .[] | . + 1]", "[1,2,3]"),
+        // `map(f) | .[] | g` -> lazy-seq driver.
+        (r"[map(.+1) | .[] | tostring]", r#"["2","3","4"]"#),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(array))?;
         assert_eq!(code, 0, "filter {filter}");
         assert_eq!(out.trim(), expected, "filter {filter}");
     }
