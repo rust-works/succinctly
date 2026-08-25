@@ -2703,6 +2703,22 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::ManyCursor(cursors)
             }
         }
+        // `.[0]` is `first` by another spelling, so it takes
+        // the `Builtin::First` arm's reasoning below rather
+        // than the general positional one: collapsing keeps a
+        // repeated key at its *first* position, so field 0 in
+        // document order is the answer whatever the rest of
+        // the object turns out to hold. Only a *non-zero*
+        // index can be displaced by an earlier key collapsing
+        // away, which is why the arm below still probes
+        // (#1599 -- #1514 moved the probe off the guard, but
+        // left this spelling paying it).
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted && *idx == 0 => {
+            match fields.uncons_key() {
+                Some((_, key_cursor, _)) => GenericResult::OneCursor(key_cursor),
+                None => GenericResult::Owned(OwnedValue::Null),
+            }
+        }
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
             // Positional: a collapsed object has fewer
             // members, so `.[n]` lands elsewhere. This is one
@@ -3052,8 +3068,7 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// Demand-aware `Expr::Iterate` fan-out for a `LazyKeys` (#1565).
 ///
 /// `!sorted` (`keys_unsorted`): streams [`DistinctKeyCursors`] straight
-/// into the driver, so a consumer that stops early walks only the fields it
-/// actually reached. This arm used to run `document::collapsed_fields`
+/// into the driver. This arm used to run `document::collapsed_fields`
 /// (whose probe is a whole-object `census`: decode and fingerprint every
 /// key, then sort the fingerprints) and then collect every key cursor into
 /// a `Vec`, both *before* handing the first element downstream -- so
@@ -3067,14 +3082,34 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// every cursor at once to build a `ManyCursor`, so it collects; this one
 /// drives elements one at a time and can consume the iterator directly.
 ///
-/// The yielded sequence is identical either way, which is why this is a
-/// cost change and not a behaviour change: `DistinctKeyCursors` emits first
-/// occurrences in document order, and on confirming a real repeat switches
-/// to the exact collapsed list resuming at the count already yielded --
-/// which lines up, because that list opens with those same first
-/// occurrences. Unlike the `LazySeq` arm below, streaming raises no
-/// atomicity question: producing a key cursor runs no user filter, so there
-/// is no per-element failure that eager collection would have masked.
+/// **The early exit is not unconditional.** It holds until a repeated key
+/// is *reached*: at that point `DistinctKeyCursors` calls
+/// `collapse_confirmed_repeat`, which walks the rest of the object and
+/// owns a `String` per distinct key. So `first` over an object whose
+/// second field repeats its first still pays a full walk. That is never
+/// worse than the old path, which paid `census` plus `collapse_repeated`
+/// unconditionally -- but it is not O(1) either, and sizing this arm's
+/// worst case from the paragraph above alone would get it wrong.
+///
+/// The *sequence* of keys is identical to what collecting produced, and
+/// for the same reason the resume is sound: `DistinctKeyCursors` emits
+/// first occurrences in document order, and on confirming a real repeat
+/// switches to the exact collapsed list resuming at the count already
+/// yielded -- which lines up, because that list opens with those same
+/// first occurrences. Unlike the `LazySeq` arm below, streaming raises no
+/// atomicity question: producing a key cursor runs no user filter, so
+/// there is no per-element failure that eager collection would have
+/// masked.
+///
+/// **The cursor a collapsed key carries did change**, which is why this is
+/// not purely a cost change. `collapse_repeated` overwrites the surviving
+/// slot with the *last* occurrence's `key_cursor`, so the old path
+/// reported the later position; streaming reports the first occurrence.
+/// Observable through the position builtins and through `anchor`/`style`
+/// in yq mode. The new answer is the one the collecting path has always
+/// given and the one jq's first-occurrence-wins rule points at, so this
+/// settles a disagreement between two spellings rather than creating one
+/// -- pinned by `test_lazy_keys_streaming_reports_first_occurrence_cursor_1599`.
 ///
 /// `sorted` (`keys`): lexicographic order needs every key decoded and
 /// sorted first, unavoidably -- the same cost `materialize_lazy_keys` always
@@ -3084,7 +3119,7 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// existing behaviour of not preserving a cursor for sorted keys (no new
 /// capability, no regression, just demand-aware instead of eager).
 fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
-    fields: V::Fields,
+    fields: &V::Fields,
     sorted: bool,
     collapse: bool,
     rest: &[Expr],
@@ -3093,7 +3128,7 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     if !sorted {
         return drive_pipe_elements_generic::<S, V>(
-            DistinctKeyCursors::new(&fields, collapse)
+            DistinctKeyCursors::new(fields, collapse)
                 .map(|(_, cursor)| Ok(GenericItem::OneCursor(cursor))),
             rest,
             optional,
@@ -3101,7 +3136,7 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         );
     }
 
-    let mut keys = effective_keys(&fields, collapse);
+    let mut keys = effective_keys(fields, collapse);
     keys.sort();
     drive_pipe_elements_generic::<S, V>(
         keys.into_iter()
@@ -3192,7 +3227,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
                 collapse,
             } if is_iterate => {
                 return each_lazy_keys_iterate_sink::<S, V>(
-                    fields, sorted, collapse, rest, optional, sink,
+                    &fields, sorted, collapse, rest, optional, sink,
                 );
             }
             GenericResult::LazyKeys {
