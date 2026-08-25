@@ -3036,9 +3036,19 @@ fn drive_pipe_elements_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    // One cache for the whole drive, so a `rest` pipe that has to be owned
+    // for an `Owned` element is built on the first one and reused by every
+    // element after it (#1598).
+    let mut rest_pipe: Option<Expr> = None;
     for element in elements {
         match element {
-            Ok(item) => match continue_pipe_element_generic::<S, V>(item, rest, optional, sink) {
+            Ok(item) => match continue_pipe_element_generic::<S, V>(
+                item,
+                rest,
+                optional,
+                &mut rest_pipe,
+                sink,
+            ) {
                 Flow::Exhausted => continue,
                 other => return other,
             },
@@ -3956,6 +3966,7 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
     item: GenericItem<V>,
     rest: &[Expr],
     optional: bool,
+    rest_pipe: &mut Option<Expr>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     match item {
@@ -3964,8 +3975,16 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
             eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
         }
         GenericItem::Owned(o) => {
-            let rest_pipe = Expr::Pipe(rest.to_vec());
-            eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
+            // Built once per driver, not once per element (#1598).
+            // `eval_each_owned` needs an `&Expr`, and the only way to
+            // present a `rest` *slice* as one is to own a copy -- which is
+            // a `Vec` allocation plus a recursive `Expr` clone per stage.
+            // Callers hand in the cache so it survives their whole loop;
+            // it stays `None` on the cursor arms above, which never need
+            // it, so a path that yields no `Owned` item still allocates
+            // nothing.
+            let rest_pipe = rest_pipe.get_or_insert_with(|| Expr::Pipe(rest.to_vec()));
+            eval_each_owned::<S>(rest_pipe, &o, optional, &mut |o| {
                 sink(GenericItem::Owned(o))
             })
         }
@@ -4027,9 +4046,18 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     let mut downstream: Option<Flow> = None;
+    // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
+    // this closure also runs once per element of `first`'s output.
+    let mut rest_pipe: Option<Expr> = None;
     let upstream = {
         let mut driver = |item: GenericItem<V>| -> Demand {
-            let flow = continue_pipe_element_generic::<S, V>(item, rest, optional, &mut *sink);
+            let flow = continue_pipe_element_generic::<S, V>(
+                item,
+                rest,
+                optional,
+                &mut rest_pipe,
+                &mut *sink,
+            );
             match flow {
                 Flow::Exhausted => Demand::Continue,
                 other => {
