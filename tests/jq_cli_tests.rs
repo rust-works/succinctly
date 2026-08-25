@@ -10130,6 +10130,66 @@ fn test_range_step_bound_propagates_halt() -> Result<()> {
     Ok(())
 }
 
+/// #1556's rule 3: a bound value that fails `range_num`'s numeric check
+/// aborts the remaining loops but keeps the prefix already produced --
+/// `test_range_bound_non_numeric_value_rejected` covers the single-value
+/// case; this is its comma-fanout sibling, distinct because `each_range`
+/// must deliver the `1` branch's full output through a nested `eval_each`
+/// call *before* the `"x"` branch's failure is even reached, not just
+/// reject a single already-materialized value. Live-verified against jq
+/// 1.7.1: `jq -n 'range((1,"x"))'` prints `0` then raises "Range bounds
+/// must be numeric", exit 5.
+#[test]
+fn test_range_bound_fanout_prefix_then_raises_1556() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range((1,\"x\"))"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("Range bounds must be numeric"), "{stderr}");
+    Ok(())
+}
+
+/// `each_range`'s `from`-closure has its own `range_num` failure arm,
+/// distinct from `to`'s (exercised above) and `step`'s
+/// (`test_range_bound_non_numeric_value_rejected` only ever reaches `to`,
+/// since `range(n)` desugars to `from: Literal(0)`). Covers both the plain
+/// single-value case and the fanout case, where the failure is the *second*
+/// `from` branch and must still abort before `to`/`step` are ever pulled
+/// for it. Live-verified against jq 1.7.1: both exit 5, no stdout.
+#[test]
+fn test_range_from_bound_non_numeric_value_rejected_1556() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range(\"x\"; 5)"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Range bounds must be numeric"), "{stderr}");
+
+    let (stdout, stderr, code) = run_jq_full(&["-n", "range((\"x\",1); 5)"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Range bounds must be numeric"), "{stderr}");
+
+    Ok(())
+}
+
+/// #1556's bonus fix: `path(...)` around a `range` whose `to` bound has a
+/// `halt_error` behind values `path()`'s stop-after-first sink never
+/// demands. Before this fix, `eval_range`'s eager `stream_outputs` fully
+/// materialized the `to` bound as a single `QueryResult::Partial` one
+/// nesting level from `resolve_leaf`'s halt-preserving check, so the halt
+/// fired even though real jq's laziness never reaches it -- `path()` is
+/// already satisfied by the first candidate. With `each_range`, that same
+/// `Partial` is consumed and its `pending` dropped three closures away from
+/// `resolve_leaf`, matching jq. Live-verified against jq 1.7.1: exit 5,
+/// "Invalid path expression with result 1" -- not exit 9.
+#[test]
+fn test_range_bound_path_context_halt_laziness_1556() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "path(range(1; (2,3,halt_error(9)) + 0))"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("Invalid path expression"), "{stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_recurse_cond_propagates_halt_from_f() -> Result<()> {
     // `builtin_recurse_cond`'s `f`-evaluation match, `Err(e) => return
@@ -20720,6 +20780,71 @@ fn test_compare_operand_consuming_input_documents_1459() -> Result<()> {
         "limit over a compare must not pop a document"
     );
 
+    Ok(())
+}
+
+/// `range`'s bound arguments, closed by #1556. `Expr::Range` had no
+/// `eval_each` arm, so a wrapping `first`/`isempty`/`limit(1;...)` could only
+/// drain whatever `eval_range`'s eager `stream_outputs` had already fully
+/// computed -- an `input` in a later comma branch of a bound got popped even
+/// when an earlier branch already satisfied the consumer. Same shape as
+/// `test_compare_operand_consuming_input_documents_1459`, one `Expr` variant
+/// over. Live against jq 1.7.1.
+#[test]
+fn test_range_bound_consuming_input_documents_1556() -> Result<()> {
+    const DOCS: &str = "5\n99\n";
+
+    // Control: every document is processed when nothing consumes the queue.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(DOCS))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "5\n99\n", "control run must see both documents");
+
+    // `first` is satisfied by `range(1, input)`'s first comma branch
+    // (`1` alone gives `range(0;1) = [0]`, non-empty), so `input` in the
+    // second branch is never evaluated and never pops -- the trailing
+    // `, input` reads document 2 cleanly. Before #1556 this raised `break`
+    // at document 2 (already eaten by the bound) and printed only `0`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(range(1, input)), input"], Some(DOCS))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "0\n99\n",
+        "first(range(...)) must not pop a document its bound never needed"
+    );
+
+    // Negative control: without `first`, jq's own laziness does not apply --
+    // every comma branch of the bound is genuinely needed to enumerate all
+    // of `range`'s outputs, so `input` is consumed and both documents feed
+    // the range. Confirms the fix does not over-lazify.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[range(1, input)] | length"], Some(DOCS))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "100\n",
+        "without a stopping consumer, both branches of the bound must still run"
+    );
+
+    Ok(())
+}
+
+/// `isempty` around `range`: the consumer that stops `range` is reached
+/// through another already-lazy arm, not `range`'s immediate caller.
+/// Confirms `each_range`'s `sink_stopped` signal propagates out through
+/// `isempty`'s own stop-after-first sink, not just a bare `first`. `range`'s
+/// first bound branch (`1`) already gives a non-empty `range(0;1) = [0]`, so
+/// `isempty` is `false` without ever evaluating the `stderr`-writing second
+/// branch. Live-verified identical against jq 1.7.1: `false` then
+/// `"after"` on stdout, nothing on stderr.
+#[test]
+fn test_range_bound_sink_stopped_via_intermediate_consumer_1556() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "isempty(range(1, (\"B\" | stderr))), \"after\""],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "false\n\"after\"\n");
+    assert_eq!(
+        stderr, "",
+        "isempty must stop range before its bound's second comma branch runs"
+    );
     Ok(())
 }
 

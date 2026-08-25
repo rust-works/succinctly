@@ -2491,9 +2491,10 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 /// Push every output of `expr` into `sink`, stopping as soon as `sink` says to.
 ///
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
-/// (#987, Stage 3), `Compare` (#1459, Stage 4), and -- #1462, Stage 5 --
-/// `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern`, `FuncDef` and `Limit`.
-/// Everything else falls back to `eval_single` + [`drain_result`]. `Paren`
+/// (#987, Stage 3), `Compare` (#1459, Stage 4), -- #1462, Stage 5 --
+/// `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern`, `FuncDef` and `Limit`,
+/// and -- #1556 -- `Range`. Everything else falls back to `eval_single` +
+/// [`drain_result`]. `Paren`
 /// is not optional cosmetics: `isempty(...)` consumes only its own
 /// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
 /// without this arm the fix would be a coin flip on spelling.
@@ -2673,6 +2674,14 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `each_limit` below forwards every output straight to `sink` and
         // stops on whichever comes first, `n` or `sink` itself.
         Expr::Limit { n, expr } => each_limit::<W, S>(n, expr, value, optional, sink),
+
+        // #1556: `range`'s `from`/`to`/`step` bounds are generator arguments
+        // like any other -- see `each_range`'s own doc comment and
+        // `docs/plan/jq-range-lazy-bounds.md` for why this needs a bespoke
+        // arm rather than reusing `fanout_two_args_lazy`.
+        Expr::Range { from, to, step } => {
+            each_range::<W, S>(from, to.as_deref(), step.as_deref(), value, optional, sink)
+        }
 
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
@@ -3096,6 +3105,152 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // what `limit` reaches -- same policy as `eval_limit`'s `Escaped`
         // arm (`[limit(3; 1,2,error("x"),4)]` raises).
         Flow::Escaped(control) => Flow::Escaped(control),
+    }
+}
+
+/// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
+/// `step` through [`eval_each`] instead of `stream_outputs`, so a wrapping
+/// consumer's [`Demand::Stop`] reaches *inside* the bound expressions
+/// themselves, not just the values `range` finally emits. Nesting order is
+/// unchanged from `eval_range`'s own doc comment: `from` outer, `to`
+/// middle, `step` inner, mirroring jq's own `def range($from; $upto; $by)`.
+///
+/// Two distinct reasons the nest can stop, tracked out-of-band (the driving
+/// closures can only answer `Demand`) -- the same shape
+/// [`fanout_two_args_lazy`]'s `escape` uses, one level deeper:
+///
+/// * `sink_stopped` -- the *wrapping* `sink` returned [`Demand::Stop`] after
+///   receiving a generated value: the consumer has what it wants, so every
+///   remaining bound value at every nesting level is left unevaluated.
+///   Always collapses to `Flow::Stopped { pending: None }`.
+/// * `escape` -- a bound value failed [`range_num`]'s numeric check (rule 3:
+///   `range((1,"x"))` prints `0` then raises), or a nested `eval_each` call
+///   on `to`/`step` itself returned `Flow::Escaped` (rule 4: a `halt`/
+///   `break`/`error` from inside a bound's own generator, deferred until
+///   the prefix already produced is delivered).
+///
+/// Both cases drop any `pending` a nested `to`/`step` call's own
+/// `Flow::Stopped` carries, exactly as [`fanout_two_args_lazy`] already does
+/// at both of *its* nesting levels -- the closest existing precedent for a
+/// multi-level nested-generator combinator in this file, not [`each_limit`]
+/// (which wraps only one level with the ultimate sink passed straight
+/// through, so it has to stay transparent). Live-verified this is what real
+/// jq does even through `path(...)`, where `resolve_leaf` would otherwise be
+/// the one consumer to notice: `path(range(1; (2,3,halt_error(9)) + 0))`
+/// raises "Invalid path expression" in real jq, not halt 9 -- jq never asks
+/// the `to` generator for its second value once `path()`'s first candidate
+/// is enough. See `docs/plan/jq-range-lazy-bounds.md`.
+fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    from: &Expr,
+    to: Option<&Expr>,
+    step: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut escape: Option<Control> = None;
+    let mut sink_stopped = false;
+
+    // One (from, to, step) combination's values, forwarded to the wrapping
+    // `sink`. Reuses `eval_range_values`/`_f64` and `drain_result` verbatim
+    // -- `MAX_RANGE` is unaffected: each combination still eagerly builds
+    // one capped `Vec` exactly as the eager path does (#1556 is scoped to
+    // the bound expressions, not that pre-existing cap).
+    let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
+        let one = match (from_val, to_val, step_val) {
+            (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
+                eval_range_values::<W>(f, t, st)
+            }
+            (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
+        };
+        match drain_result(one, sink) {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                sink_stopped = true;
+                Demand::Stop
+            }
+            // `owned_vec_to_result` only ever yields `None`/`Owned`/
+            // `ManyOwned`, so `drain_result` can only answer `Exhausted` or
+            // `Stopped { pending: None }` here.
+            Flow::Escaped(_) => unreachable!(
+                "eval_range_values(_f64) never produces an Error/Break/Halt/Partial result"
+            ),
+        }
+    };
+
+    let from_flow = eval_each::<W, S>(from, value.clone(), optional, &mut |from_item| {
+        let from_val = match range_num(&item_to_owned(from_item)) {
+            Ok(n) => n,
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
+
+        let Some(to_expr) = to else {
+            // range(n) -- unreachable from any query today; see
+            // `eval_range`'s own doc comment on this branch.
+            return match from_val {
+                RangeNum::Int(t) => emit(RangeNum::Int(0), RangeNum::Int(t), RangeNum::Int(1)),
+                RangeNum::Float(t) => emit(
+                    RangeNum::Float(0.0),
+                    RangeNum::Float(t),
+                    RangeNum::Float(1.0),
+                ),
+            };
+        };
+
+        let to_flow = eval_each::<W, S>(to_expr, value.clone(), optional, &mut |to_item| {
+            let to_val = match range_num(&item_to_owned(to_item)) {
+                Ok(n) => n,
+                Err(e) => {
+                    escape = Some(Control::Error(e));
+                    return Demand::Stop;
+                }
+            };
+
+            match step {
+                None => emit(from_val, to_val, RangeNum::Int(1)),
+                Some(step_expr) => {
+                    let step_flow =
+                        eval_each::<W, S>(step_expr, value.clone(), optional, &mut |step_item| {
+                            let step_val = match range_num(&item_to_owned(step_item)) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    escape = Some(Control::Error(e));
+                                    return Demand::Stop;
+                                }
+                            };
+                            emit(from_val, to_val, step_val)
+                        });
+                    match step_flow {
+                        Flow::Exhausted => Demand::Continue,
+                        Flow::Stopped { .. } => Demand::Stop,
+                        Flow::Escaped(control) => {
+                            escape = Some(control);
+                            Demand::Stop
+                        }
+                    }
+                }
+            }
+        });
+
+        match to_flow {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => Demand::Stop,
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    if sink_stopped {
+        return Flow::Stopped { pending: None };
+    }
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => from_flow,
     }
 }
 
@@ -22625,6 +22780,24 @@ fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
 }
 
 /// Evaluate `range(n)`, `range(a;b)`, or `range(a;b;step)`.
+///
+/// Every bound is a generator argument, and jq nests them leftmost-outermost
+/// -- `range` is a jq-level `def range($from; $upto; $by)` with all three
+/// `$`-bound, unlike the C builtins that nest rightmost-outermost.
+/// Live-verified against jq 1.7.1:
+///
+///   [range((1,2))]             => [0,0,1]
+///   [range((0,1);(2,3))]       => [0,1,0,1,2,1,1,2]
+///   [range(0;6;(2,3))]         => [0,2,4,0,3]
+///   [range((0,1);(2,3);(1,2))] => [0,1,0,0,1,2,0,2,1,1,1,2,1]
+///
+/// Thin wrapper over [`each_range`] (#1556): drives it with a sink that
+/// always answers `Demand::Continue`, appending every value to `out`, then
+/// converts the terminal `Flow` back into a `QueryResult`. Kept as the
+/// entry point for `eval_single`'s `Expr::Range` arm and every other
+/// non-demand-driven caller (`eval_generic.rs`'s bridge included), so the
+/// bound-resolution/value-generation logic has exactly one implementation
+/// rather than two that can drift -- see `docs/plan/jq-range-lazy-bounds.md`.
 fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     from: &Expr,
     to: Option<&Expr>,
@@ -22632,97 +22805,19 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Every bound is a generator argument, and jq nests them leftmost-outermost
-    // -- `range` is a jq-level `def range($from; $upto; $by)` with all three
-    // `$`-bound, unlike the C builtins that nest rightmost-outermost.
-    // Live-verified against jq 1.7.1:
-    //
-    //   [range((1,2))]             => [0,0,1]
-    //   [range((0,1);(2,3))]       => [0,1,0,1,2,1,1,2]
-    //   [range(0;6;(2,3))]         => [0,2,4,0,3]
-    //   [range((0,1);(2,3);(1,2))] => [0,1,0,0,1,2,0,2,1,1,1,2,1]
-    //
-    // Before this every one of those reported "Range bounds must be numeric",
-    // because `range_arg` matched the whole `QueryResult` and sent
-    // `Many`/`ManyOwned` to its catch-all (#1279).
     let mut out: Vec<OwnedValue> = Vec::new();
+    let flow = each_range::<W, S>(from, to, step, value, optional, &mut |item| {
+        out.push(item.into_owned());
+        Demand::Continue
+    });
 
-    // A bound that is not numeric aborts the remaining loops but keeps the
-    // outputs already produced -- `jq -cn 'range((1,"x"))'` prints `0` and
-    // then raises. Same "abort, keep the prefix" rule `fanout_arg` applies.
-    macro_rules! bound {
-        ($v:expr) => {
-            match range_num($v) {
-                Ok(n) => n,
-                Err(e) => return partial(out, Control::Error(e)),
-            }
-        };
-    }
-
-    let (from_vals, from_ctrl) = stream_outputs(eval_single::<W, S>(from, value.clone(), optional));
-    for from_owned in &from_vals {
-        let from_val = bound!(from_owned);
-
-        let Some(to_expr) = to else {
-            // range(n) means range(0; n).
-            //
-            // Unreachable from any query, and was before #1279 too: the parser
-            // desugars the one-argument form itself, emitting
-            // `Range { from: Literal(0), to: Some(n), step: None }`
-            // (`parse_range_expr`), and every other `Expr::Range` construction
-            // in the tree is a rebuild that threads an existing `to` through.
-            // So nothing ever sets `to: None`, and llvm-cov reports 0 hits
-            // here while the line above it has 65. Kept rather than deleted
-            // because narrowing the AST field to a non-`Option` would ripple
-            // through the parser and six rebuild sites for no behavioural
-            // gain -- noted so a reader does not go looking for the test that
-            // would cover it.
-            let one = match from_val {
-                RangeNum::Int(to) => eval_range_values::<W>(0, to, 1),
-                RangeNum::Float(to) => eval_range_values_f64::<W>(0.0, to, 1.0),
-            };
-            if let Some(control) = push_owned_values(one, &mut out) {
-                return partial(out, control);
-            }
-            continue;
-        };
-
-        let (to_vals, to_ctrl) =
-            stream_outputs(eval_single::<W, S>(to_expr, value.clone(), optional));
-        for to_owned in &to_vals {
-            let to_val = bound!(to_owned);
-
-            // The absent-`step` case is one implicit `1`, so it runs the same
-            // innermost loop once rather than needing a branch of its own.
-            let (step_vals, step_ctrl) = match step {
-                Some(step_expr) => {
-                    stream_outputs(eval_single::<W, S>(step_expr, value.clone(), optional))
-                }
-                None => (vec![OwnedValue::Int(1)], None),
-            };
-            for step_owned in &step_vals {
-                let step_val = bound!(step_owned);
-                let one = match (from_val, to_val, step_val) {
-                    (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                        eval_range_values::<W>(f, t, st)
-                    }
-                    (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
-                };
-                if let Some(control) = push_owned_values(one, &mut out) {
-                    return partial(out, control);
-                }
-            }
-            if let Some(control) = step_ctrl {
-                return partial(out, control);
-            }
-        }
-        if let Some(control) = to_ctrl {
-            return partial(out, control);
-        }
-    }
-    match from_ctrl {
-        Some(control) => partial(out, control),
-        None => owned_vec_to_result(out),
+    match flow {
+        Flow::Escaped(control) => partial(out, control),
+        // This sink never answers `Stop`, so `Stopped` cannot actually
+        // occur -- folded with `Exhausted` rather than `unreachable!()`, the
+        // same defensive choice `any_all_gen_cond`/`binary_fanout_core` make
+        // for the identical impossible-`Stopped` shape.
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(out),
     }
 }
 
@@ -34064,6 +34159,41 @@ mod tests {
             (b"null", "limit(2; 1, 2, 3)"),
             (b"null", "limit(5; 1, 2)"),
             (b"null", "limit(3; 1, 2, error(\"x\"), 4)"),
+            // #1556: `Expr::Range` gained a native lazy arm (`each_range`).
+            // This differential is what guards it against drifting from
+            // `eval_range`'s own bound resolution -- `eval_range` is now
+            // itself a thin wrapper over `each_range`, so in practice this
+            // also exercises that the wrapper's `Flow` -> `QueryResult`
+            // conversion agrees with a bare `eval_single` call, but the
+            // pairing is kept so a future refactor that breaks that
+            // relationship still gets caught here.
+            (b"null", "range(3)"),
+            (b"null", "range(1;5)"),
+            (b"null", "range(1;5;2)"),
+            (b"null", "range(5;1;-1)"),
+            (b"null", "[range(0)]"),
+            (b"null", "range(1.5;4.5)"),
+            // Multi-output bounds -- the leftmost-outermost `$`-bound
+            // nesting order `eval_range`'s own doc comment establishes,
+            // live-verified against jq 1.7.1.
+            (b"null", "range((1,2))"),
+            (b"null", "range((0,1);(2,3))"),
+            (b"null", "range(0;6;(2,3))"),
+            (b"null", "range((0,1);(2,3);(1,2))"),
+            // Error/break/halt terminators from within a bound, side-effect
+            // free so the always-`Continue` sink must still agree exactly.
+            (b"null", "range((1,\"x\"))"),
+            (b"null", "range(\"x\")"),
+            (b"null", "range(1; \"x\")"),
+            (b"null", "range(1; 10; \"x\")"),
+            (b"null", "range((1, error(\"x\")); 10)"),
+            (b"null", "label $o | range((1, break $o); 10)"),
+            // Nested inside the other lazy arms, so `each_range` is also
+            // reached indirectly, mirroring the `limit`/`if`/`try` coverage
+            // pattern established above for the other Stage 5 arms.
+            (b"null", "[limit(2; range(1;10))]"),
+            (b"null", "if true then range(1;4) else 9 end"),
+            (b"null", "try range(1; \"x\") catch 9"),
         ];
 
         for (json, src) in cases {
