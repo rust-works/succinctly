@@ -4629,6 +4629,10 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
     let mut out: Vec<OwnedValue> = Vec::new();
+    // A control raised while converting an item the sink was handed, kept
+    // out-of-band because the sink can only answer `Demand` -- same shape as
+    // `binary_fanout_each_generic`'s own `abort`.
+    let mut stray: Option<Control> = None;
     let flow = binary_fanout_each_generic::<V>(
         |operand, operand_sink| {
             eval_each_generic::<S, V>(operand, value.clone(), false, cursor, operand_sink)
@@ -4642,17 +4646,31 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
             )))
         },
         &mut |item: GenericItem<V>| {
-            match item {
-                GenericItem::Owned(v) => out.push(v),
-                // Structurally dead, not just untested: `binary_fanout_each_generic`
-                // has exactly one call to `sink` on its success path
-                // (`sink(GenericItem::Owned(v))` after a successful `combine`)
-                // -- there is no second call site that could hand this
-                // closure anything else, regardless of which `combine` a
-                // future caller passes.
-                _ => unreachable!("combine always produces GenericItem::Owned"),
+            // Total, rather than a `GenericItem::Owned` match with an
+            // `unreachable!()` fallback: `binary_fanout_each_generic` only
+            // ever calls `sink` with an `Owned` today, and for that variant
+            // `generic_item_into_owned` is an identity passthrough -- so
+            // this costs nothing on the only path that runs, and leaves no
+            // arm that could take the process down if a second `sink` call
+            // site is ever added. Same choice `eval.rs`'s
+            // `binary_fanout_core` makes for its own impossible
+            // `Flow::Stopped` ("an answer built from the outputs already
+            // produced is a better failure mode than a panic"), and
+            // deliberately *not* the choice the two `unreachable!()`s nearby
+            // make -- those enumerate a closed variant set, where this would
+            // be asserting an invariant about callers. The `Err` arm has no
+            // caller that can reach it today and so reads as uncovered;
+            // that is the accepted cost of not panicking here.
+            match generic_item_into_owned(item) {
+                Ok(v) => {
+                    out.push(v);
+                    Demand::Continue
+                }
+                Err(control) => {
+                    stray = Some(control);
+                    Demand::Stop
+                }
             }
-            Demand::Continue
         },
     );
 
@@ -4660,7 +4678,7 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         Flow::Exhausted | Flow::Stopped { .. } => None,
         Flow::Escaped(control) => Some(control),
     };
-    finish_fork_generic(out, control, optional)
+    finish_fork_generic(out, control.or(stray), optional)
 }
 
 /// Evaluate `first(inner)`/`last(inner)` (and the `Builtin::FirstStream`/
