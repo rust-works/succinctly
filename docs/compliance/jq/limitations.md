@@ -555,9 +555,25 @@ walk it was already making, so a malformed object emits nothing at all. And **`-
 still echoes the malformed text verbatim**, since reproducing the input byte-for-byte is that
 flag's entire purpose.
 
-Only the *object member* half of this is closed. A bareword in **value** position
-(`[xyz123]` → `[null]`) still degrades silently; it reaches a different swallow point, in the
-infallible `to_owned`/`cursor_to_owned` family. See #1194 and #1247.
+**Which surfaces raise, precisely.** The two that write JSON straight from the cursor do —
+the identity printer and `keys_unsorted` — as do the two `Result`-returning materializers
+behind them. Everything that materializes through the infallible `to_owned` /
+`cursor_to_owned` family still degrades quietly, and on the same document:
+
+```
+$ echo '{123: 1, "b": 2}' | sjq -c .                # error, exit 5
+$ echo '{123: 1, "b": 2}' | sjq -c keys_unsorted    # error, exit 5
+$ echo '{123: 1, "b": 2}' | sjq -c to_entries       # [{"key":"b","value":2}], exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys, length'   # ["b"] then 2, exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c -s .             # [{"b":2}], exit 0
+```
+
+So `length` and `keys` can still disagree about how many members an object has
+(`{invalid: 1}` counts 1 and lists none), which is the failure mode #1385's own postmortem
+names. Closing the rest needs that family to become fallible — the same architectural change
+#1247 is about, tracked there rather than duplicated here. A bareword in **value** position
+(`[xyz123]` → `[null]`) reaches that family too, which is why this issue's second repro is
+not fixed alongside its first.
 
 **A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
 validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects
