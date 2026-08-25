@@ -4933,6 +4933,19 @@ Key optimizations:
 
 **Inlining requirement**: Initial implementation with `#[inline]` caused **3-5% end-to-end regression** due to function call overhead not being eliminated by the compiler. Changing to `#[inline(always)]` on both `find_json_escape` and `find_json_escape_neon` eliminated the regression.
 
+**Where this code lives now** (the section above records O3 as it landed): `find_json_escape`
+moved to [`src/util/simd/escape.rs`](../../src/util/simd/escape.rs) in #125. The scan loop that
+calls it now lives in `stream_json_string` rather than `write_json_string`, which became a thin
+wrapper over it (#965) — so the streaming YAML→JSON path (P9's hot path) picked up this
+optimization too, having run a scalar byte-at-a-time loop until then. Measured effect of that
+alone: block-scalar workloads −4.7% to −8.6%, on both an M4 Pro and a 7950X.
+
+`jq::escape::write_json_body_yq` is the same convention over the same scan and looks like the
+obvious place to share this from, but the two callers want **opposite inlining**: the `#[inline]`
+this path needs costs jq's own `keys_unsorted` callers of that function up to 14% on x86_64
+(`arrays keys_unsorted`, 7950X, measured). They therefore keep separate copies on purpose — see
+#965.
+
 ### Files Modified
 
 - `src/yaml/simd/neon.rs` — Added `find_json_escape_neon()` and `find_json_escape_neon_impl()` with 12 unit tests
