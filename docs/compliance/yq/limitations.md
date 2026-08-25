@@ -595,6 +595,43 @@ Live-verified against yq v4.53.3. Pinned as known gaps (current, not the desired
 state) by `test_yq_auto_output_mixed_format_multi_file_known_gap_1493` and
 `test_yq_auto_output_slurp_mixed_format_known_gap_1493` in `tests/yq_cli_tests.rs`.
 
+### A bad escape in a streamed scalar still degrades silently instead of raising
+
+[#1247](https://github.com/rust-works/succinctly/issues/1247) routed almost every
+decode-failure materialization path through a real `EvalError` — but two streaming output
+writers were left as a deliberately-deferred gap ("Stage 6" in
+[`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)): their only
+error channel is `core::fmt::Result`, which carries no message, so a mid-stream failure
+there can only be silently absorbed or cause a bare, undiagnosed abort. Both still emit a
+substituted `null`/`""` at exit 0 for a value or key with a bad escape, live-verified
+against the same build that fixed every other #1247 site:
+
+```console
+$ printf 'a: 1\nb: "bad \q escape"\n' | succinctly yq -o=json '.'
+{
+  "a": 1,
+  "b": null
+}
+$ printf 'a: 1\nb: "bad \q escape"\n' | yq -o=json '.'
+Error: bad file '-': yaml: while scanning a quoted scalar at line 2, column 4: line 2, column 9: found unknown escape character
+
+$ printf 'double: "quoted \q scalar"\n' | succinctly yq '.'
+double: ""
+$ printf '"a\qb": 1\nb: 2\n' | succinctly yq '.'
+"": 1
+b: 2
+```
+
+The first pair (`-o=json`, `stream_json_value`/the YAML→JSON transcoders) is the case the
+design doc names. The second and third (default YAML→YAML output, no `-o` flag —
+`stream_yaml_string_value`/`write_yaml_field_key`, the single most common `yq`
+invocation) are the same gap on its YAML-target sibling, not previously recorded anywhere.
+Every *materializing* route (a `--arg`-forced DOM, a multi-result filter, `to_entries`,
+`length`) already raises correctly; only these two purely-streamed writers do not. Fixing
+either needs `stream_json_value`/`stream_yaml_value` and their callers to carry a richer
+error than `fmt::Error` — the design doc's own stated reason Stage 6 was split out and
+deferred rather than attempted alongside the rest of #1247's landed stages.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
