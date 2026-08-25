@@ -2586,13 +2586,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             left,
             right,
             optional,
-            |left_val, right_val| match op {
-                ArithOp::Add => arith_add::<S>(left_val, right_val),
-                ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-                ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
-                ArithOp::Div => arith_div::<S>(left_val, right_val),
-                ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-            },
+            |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
         // The one arm here that is a correctness fix rather than an
@@ -3779,6 +3773,37 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// Apply an arithmetic operator to two already-evaluated values.
+///
+/// **The one definition of this dispatch.** Every site that supplies
+/// `binary_fanout_each`'s `combine` for arithmetic used to write the match
+/// out itself: two of them before #1481, three once it added [`eval_each`]'s
+/// lazy arm, and four once `eval_generic` gained its own -- exactly the
+/// "duplicated predicates diverge silently" shape this project has already
+/// been bitten by (#106: three copies of one predicate, one of them
+/// quadratic). The four callers are [`eval_arithmetic`] (bare top-level),
+/// [`eval_each`]'s `Expr::Arithmetic` arm (lazy),
+/// `eval_pipe_with_path_context_internal`'s own arm (path-context), and
+/// `eval_generic`'s `eval_each_generic` arm (the `V: DocumentValue`
+/// evaluator) -- which is also why this is `pub(crate)` rather than private:
+/// the last of those lives in another module.
+///
+/// Structural twin of [`apply_compare_op`], which was extracted for the same
+/// reason and now backs `Expr::Compare`'s own five call sites.
+pub(crate) fn arith_combine<S: EvalSemantics>(
+    op: ArithOp,
+    left: OwnedValue,
+    right: OwnedValue,
+) -> Result<OwnedValue, EvalError> {
+    match op {
+        ArithOp::Add => arith_add::<S>(left, right),
+        ArithOp::Sub => arith_sub::<S>(left, right),
+        ArithOp::Mul(flags) => arith_mul::<S>(left, right, flags),
+        ArithOp::Div => arith_div::<S>(left, right),
+        ArithOp::Mod => arith_mod::<S>(left, right),
+    }
+}
+
 /// Evaluate arithmetic operations.
 fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: ArithOp,
@@ -3787,19 +3812,9 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    eval_binary_fanout::<W, S>(
-        left,
-        right,
-        value,
-        optional,
-        |left_val, right_val| match op {
-            ArithOp::Add => arith_add::<S>(left_val, right_val),
-            ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-            ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, flags),
-            ArithOp::Div => arith_div::<S>(left_val, right_val),
-            ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-        },
-    )
+    eval_binary_fanout::<W, S>(left, right, value, optional, |left_val, right_val| {
+        arith_combine::<S>(op, left_val, right_val)
+    })
 }
 
 /// Add two values (numbers, strings, arrays, objects).
@@ -24122,13 +24137,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 file_origin,
                 current_path,
                 optional,
-                |left_val, right_val| match op {
-                    ArithOp::Add => arith_add::<S>(left_val, right_val),
-                    ArithOp::Sub => arith_sub::<S>(left_val, right_val),
-                    ArithOp::Mul(flags) => arith_mul::<S>(left_val, right_val, *flags),
-                    ArithOp::Div => arith_div::<S>(left_val, right_val),
-                    ArithOp::Mod => arith_mod::<S>(left_val, right_val),
-                },
+                |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             );
             if rest.is_empty() {
                 return arith_result;
