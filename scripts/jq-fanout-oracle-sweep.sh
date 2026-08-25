@@ -14,9 +14,25 @@
 # This is a verification tool, not a CI gate: the pinned regression rows in
 # tests/jq_cli_tests.rs (test_short_circuit_side_effect_shapes_already_match_jq_820's
 # "closed by #1481" section) are what CI actually enforces. Run this manually
-# after touching binary-fanout evaluation order to confirm the divergence
-# count, and keep it around for the next lazy-evaluation issue instead of
-# rebuilding a sweep from scratch again.
+# after touching binary-fanout evaluation order, and keep it around for the
+# next lazy-evaluation issue instead of rebuilding a sweep from scratch again.
+#
+# **Do not blanket-wrap the generated filters in `label $o | ...`.** An
+# earlier draft did, so that a bare `break $o` terminator always had a target.
+# `Expr::Label` has no native `eval_single` arm in `src/jq/eval_generic.rs`
+# (see the `Expr::Array` arm's own comment there), so a `label`-prefixed
+# filter falls to that module's wildcard and is bridged wholesale into
+# `src/jq/eval.rs` -- which silently routed every case away from
+# `eval_generic.rs`, the very copy of the fanout loop #1481 calls out as
+# "what a top-level `==` in the CLI actually reaches". The wrapper is
+# therefore applied to the `break $o` terminator only, and those rows alone
+# cannot speak for `eval_generic.rs`.
+#
+# **Expected result: `0 unexpected`.** Divergences attributable to an already
+# known, separately tracked gap are counted and printed separately (see
+# `classify_divergence` below) so the headline number stays a pass/fail
+# signal rather than something a reader has to re-triage by hand. The script
+# exits non-zero if any *unexpected* divergence appears.
 #
 # Usage:
 #   cargo build --release --features cli
@@ -65,10 +81,7 @@ G_SHAPES=(
   '[1, __X__]'
 )
 
-# 7 terminating side effects. Every generated filter is wrapped in an outer
-# `label $o | (...)` so a bare `break $o` always has a valid target, even
-# though shape 10 above nests its own `label $o` (a deliberate shadowing
-# case, not a bug in the sweep).
+# 7 terminating side effects.
 X_TERMS=(
   '("B"|stderr)'
   '("m"|halt_error(3))'
@@ -85,9 +98,43 @@ X_TERMS=(
 # `input`/`inputs`.
 STDIN_DOCS='1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20'
 
+# Attribute a divergence to an already-tracked gap, or return 1 for "this is
+# new, look at it". Keep every entry tied to an issue number: an unattributed
+# entry here would turn this sweep back into the unreadable count it was.
+classify_divergence() {
+  local filter="$1"
+
+  # #1594: `debug`/`debug(msg)` never write `["DEBUG:",value]` to stderr at
+  # all, so every `debug`-terminated case diverges on stderr regardless of
+  # evaluation order. Unrelated to fanout; drop this branch once #1594 lands.
+  if [[ "$filter" == *debug* ]]; then
+    echo '#1594 (debug writes nothing to stderr)'
+    return 0
+  fi
+
+  # #820's pinned leaks table: `eval_each_generic` has native lazy arms for
+  # `Comma`/`Pipe`/`Paren`/`Compare`/`Arithmetic` only, so a `first(...)`
+  # over an `If`/`Try`/`Label`/`As`/`Limit` — whether that shape is the
+  # argument itself or one of the binary operator's operands — still falls to
+  # the eager `_` fallback and runs a side effect `first` never needed. Pinned
+  # as a known gap in test_short_circuit_side_effect_leaks_820_932_987.
+  if [[ "$filter" == *'first('* ]]; then
+    case "$filter" in
+      *'if true then'*|*'try ('*|*'label $o |'*|*' as $v |'*|*'limit('*)
+        echo '#820 (If/Try/Label/As/Limit have no eval_each_generic arm)'
+        return 0
+        ;;
+    esac
+  fi
+
+  return 1
+}
+
 total=0
 diverged=0
+unexpected=0
 divergence_log=""
+declare -a known_labels=()
 
 run_case() {
   local label="$1" filter="$2"
@@ -101,6 +148,12 @@ run_case() {
 
   if [[ "$jq_out" != "$succ_out" || "$jq_err" != "$succ_err" || "$jq_code" != "$succ_code" ]]; then
     diverged=$((diverged + 1))
+    local known
+    if known="$(classify_divergence "$filter")"; then
+      known_labels+=("$known")
+      return
+    fi
+    unexpected=$((unexpected + 1))
     divergence_log+="[$label] $filter
   jq:          out=$jq_out err=$jq_err exit=$jq_code
   succinctly:  out=$succ_out err=$succ_err exit=$succ_code
@@ -112,18 +165,36 @@ for g in "${G_SHAPES[@]}"; do
   for x in "${X_TERMS[@]}"; do
     operand="${g//__X__/$x}"
 
+    # `break $o` is the one terminator that cannot stand on its own, so those
+    # cases — and only those — get an enclosing label. See the header: a
+    # blanket wrapper would divert the whole sweep away from eval_generic.rs.
+    # Shape 10 nests its own `label $o`, making that combination a deliberate
+    # shadowing case rather than a bug in the sweep.
+    if [[ "$x" == 'break $o' ]]; then
+      open='label $o | '
+    else
+      open=''
+    fi
+
     compare_core="10 == ($operand)"
-    run_case "compare/bare"  "label \$o | [$compare_core]"
-    run_case "compare/first" "label \$o | [first($compare_core)]"
-    run_case "compare/IN"    "label \$o | [IN(10; $operand)]"
+    run_case "compare/bare"  "$open[$compare_core]"
+    run_case "compare/first" "$open[first($compare_core)]"
+    run_case "compare/IN"    "$open[IN(10; $operand)]"
 
     arith_core="10 + ($operand)"
-    run_case "arith/bare"  "label \$o | [$arith_core]"
-    run_case "arith/first" "label \$o | [first($arith_core)]"
+    run_case "arith/bare"  "$open[$arith_core]"
+    run_case "arith/first" "$open[first($arith_core)]"
   done
 done
 
 rm -f /tmp/jq-fanout-sweep.err /tmp/succ-fanout-sweep.err
 
-echo "$divergence_log"
-echo "== $diverged / $total cases diverged from $JQ =="
+printf '%s' "$divergence_log"
+echo "== $total cases vs $JQ: $unexpected unexpected, $((diverged - unexpected)) known =="
+if ((diverged > unexpected)); then
+  printf '%s\n' "${known_labels[@]}" | sort | uniq -c | sed 's/^/   known: /'
+fi
+if ((unexpected > 0)); then
+  echo "FAIL: $unexpected unexpected divergence(s) — see above" >&2
+  exit 1
+fi
