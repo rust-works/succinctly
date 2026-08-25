@@ -1538,6 +1538,17 @@ enum ArgFanout {
     /// rather than emitting a value it then raises over -- live-verified
     /// against the pinned v4.53.3 (`contains(("a", error("boom")))` prints
     /// nothing to stdout, just the error), #1553.
+    ///
+    /// Reached only through [`fanout_arg`] today (`contains` is single-
+    /// argument), which is what makes [`apply_arg_fanout`]'s own arm for
+    /// this variant safe to assume the clearing already ran. **Not** valid
+    /// through [`fanout_two_args`] as-is -- that function's own doc comment
+    /// explains why [`clear_values_when_yq_argument_escaped`] isn't shared
+    /// with it verbatim (clearing a slot's values pre-emptively skips
+    /// `body`, which is where the *other* slot gets validated, #1533/#1534).
+    /// A future two-argument builtin needing this same "fans out, but clears
+    /// on escape" rule needs `fanout_two_args`'s own narrower treatment of
+    /// that function, not a bare reuse of this variant.
     AllClearedOnEscape,
 }
 
@@ -1661,15 +1672,14 @@ fn clear_values_when_yq_argument_escaped(
 fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(), EvalError> {
     match fanout {
         // jq's rule 1: every value is used, and the argument's own control
-        // fires *after* them (#1279).
-        ArgFanout::All => Ok(()),
-
-        // Every value is kept here too -- identical to `All`. The escape
-        // clearing this gate is *for* already happened upstream in
-        // `fanout_arg`, before this function ever runs (same as the two yq
-        // gates below): this arm only has to answer for the non-escape case,
-        // where "every value is kept" is exactly `All`'s own rule (#1553).
-        ArgFanout::AllClearedOnEscape => Ok(()),
+        // fires *after* them (#1279). `AllClearedOnEscape` (#1553) answers
+        // identically here -- provably so, not just today: the escape
+        // clearing it's *for* already happened upstream in `fanout_arg`,
+        // before this function ever runs, so by the time either variant
+        // reaches this arm there is no escape left to distinguish them by.
+        // One arm rather than two separate `Ok(())` bodies, so a future edit
+        // to `All`'s handling can't land on one and silently miss the other.
+        ArgFanout::All | ArgFanout::AllClearedOnEscape => Ok(()),
 
         // `has(("a","b"))` is `true` in real yq, and `setpath((["a"],["b"]); 1)`
         // is a count error. (succinctly's wording for that count error differs
@@ -1740,11 +1750,15 @@ fn apply_arg_fanout(fanout: ArgFanout, args: &mut Vec<OwnedValue>) -> Result<(),
 ///    stealing document 2 while document 1 was still being processed and
 ///    losing document 1's own error entirely.
 ///
-/// Only [`ArgFanout::All`] is driven lazily. Both yq gates stay eager on
-/// purpose: real yq evaluates the whole argument and *reports* an escape
-/// found anywhere in it (see [`apply_arg_fanout`]'s shared escape arm,
-/// #1533/#1534), so pulling lazily there would hide the very control those
-/// gates have to propagate.
+/// Only [`ArgFanout::All`] is driven lazily. Every yq gate stays eager on
+/// purpose, [`ArgFanout::AllClearedOnEscape`] (#1553) included: real yq
+/// evaluates the whole argument and *reports* an escape found anywhere in it
+/// (see [`apply_arg_fanout`]'s shared escape arm, #1533/#1534), so pulling
+/// lazily there would hide the very control those gates have to propagate.
+/// This does cost `contains` the laziness rule 4 above still gives jq mode --
+/// a `body` failure no longer stops the rest of the argument from being
+/// evaluated in yq mode, the same trade-off `has`/`split`/`join`/`setpath`/
+/// `delpaths` already made.
 fn fanout_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
     arg_expr: &Expr,
     value: StandardJson<'a, W>,

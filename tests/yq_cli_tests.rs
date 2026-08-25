@@ -21463,6 +21463,46 @@ fn test_jq_contains_still_emits_the_prefix_before_an_escape_1553() -> Result<()>
     Ok(())
 }
 
+/// #1553: the new eager path pulls the whole argument before ever calling
+/// `body`, so a later value's escape now outranks an earlier value's
+/// `body`-level type error -- rather than `body` failing on the first
+/// mismatched value the way jq mode still does (below), the escape wins.
+/// Live-verified against yq v4.53.3: `.x | contains((1, error("boom")))`
+/// on `abc` is `Error: boom`, not `body`'s own containment-check error.
+/// A "smarter" reimplementation that checked `body` incrementally before
+/// consulting the argument's trailing control would silently flip this back
+/// to the wrong (jq-mode) answer with nothing else here to catch it.
+#[test]
+fn test_yq_contains_gate_a_later_escape_outranks_an_earlier_body_error_1553() -> Result<()> {
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        r#".x | contains((1, error("boom")))"#,
+        "x: \"abc\"\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 1, "err: {err:?}");
+    Ok(())
+}
+
+/// #1553 companion: jq mode is the mirror image here, and must stay that way
+/// -- its lazy path stops pulling the argument the instant `body` fails on
+/// the mismatched `1`, so `error("boom")` is never reached at all. Real jq
+/// 1.7.1 raises its own containment-check error, not `boom`.
+#[test]
+fn test_jq_contains_body_error_still_wins_over_a_later_escape_1553() -> Result<()> {
+    let (out, err, code) =
+        run_jq_stdin_with_stderr(r#"contains((1, error("boom")))"#, r#""abc""#, &["-c"])?;
+    assert_eq!(out, "", "stdout must be empty, got {out:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+    assert!(!err.contains("boom"), "err: {err:?}");
+    assert_eq!(code, 5, "err: {err:?}");
+    Ok(())
+}
+
 /// #1533 (single-argument half): `ArgFanout::RejectMany` used to test
 /// `args.len() > 1` before ever looking at the argument's own trailing
 /// control, so a real `error(...)` inside the generator was masked by
