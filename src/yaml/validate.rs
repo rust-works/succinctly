@@ -1447,8 +1447,8 @@ impl<'a> Validator<'a> {
             b'x' => self.scan_hex_escape(2),
             b'u' => self.scan_hex_escape(4),
             b'U' => self.scan_hex_escape(8),
-            other => Err(self.error(YamlValidationErrorKind::InvalidEscape {
-                sequence: other as char,
+            _other => Err(self.error(YamlValidationErrorKind::InvalidEscape {
+                sequence: crate::text::utf8::decode_char_at(self.input, self.offset),
             })),
         }
     }
@@ -1813,6 +1813,21 @@ mod tests {
             kind(b"---\ndouble: \"quoted \\' scalar\"\n"),
             InvalidEscape { sequence: '\'' }
         )); // HRE5
+    }
+
+    #[test]
+    fn rejects_invalid_escape_decodes_multibyte_char_1422() {
+        // The byte after `\` can be the lead byte of a multi-byte UTF-8
+        // sequence; the reported `sequence` must be the real character, not
+        // a Latin-1 cast of its lead byte (#1422).
+        assert!(matches!(
+            kind("---\na: \"\\日\"\n".as_bytes()),
+            InvalidEscape { sequence: '日' }
+        ));
+        assert!(matches!(
+            kind("---\na: \"\\🎉\"\n".as_bytes()),
+            InvalidEscape { sequence: '🎉' }
+        ));
     }
 
     #[test]

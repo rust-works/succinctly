@@ -227,6 +227,39 @@ fn test_invalid_escape_sequence() -> Result<()> {
     Ok(())
 }
 
+/// The byte an `UnexpectedCharacter`/`InvalidEscape` error reports can be the
+/// lead byte of a multi-byte UTF-8 sequence; the CLI must render the real
+/// decoded character, not a Latin-1-cast mojibake byte (#1422).
+#[test]
+fn test_invalid_escape_sequence_multibyte_char_not_mojibake_1422() -> Result<()> {
+    let (_, stderr, exit_code) = run_validate_stdin("\"\\日\"", &["--no-color"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains('日'),
+        "stderr should contain '日': {stderr}"
+    );
+    assert!(
+        !stderr.contains('æ'),
+        "stderr should not contain mojibake 'æ': {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_unexpected_character_multibyte_char_not_mojibake_1422() -> Result<()> {
+    let (_, stderr, exit_code) = run_validate_stdin("{日: 1}", &["--no-color"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        stderr.contains('日'),
+        "stderr should contain '日': {stderr}"
+    );
+    assert!(
+        !stderr.contains('æ'),
+        "stderr should not contain mojibake 'æ': {stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_invalid_control_character() -> Result<()> {
     // Tab character directly in string (should be escaped as \t)
