@@ -1263,7 +1263,16 @@ impl<'a> Validator<'a> {
         self.skip_spaces_and_tabs();
         match self.peek() {
             None | Some(b'\n' | b'\r' | b'#' | b':') => Ok(()),
-            Some(_) => Err(self.error(YamlValidationErrorKind::UnbalancedFlow { found: ']' })),
+            // The real offending byte, not a hardcoded `']'` -- same bug
+            // class #1636 fixed for `InvalidEscape`, found a second time in
+            // this file during that fix's own review. `decode_char_at`, not
+            // a bare `byte as char` cast, for the same multi-byte-safety
+            // reason `InvalidEscape`'s own `_other` arm above already uses
+            // it (#1422): trailing content after a flow collection can be
+            // any UTF-8 character, not just ASCII.
+            Some(_) => Err(self.error(YamlValidationErrorKind::UnbalancedFlow {
+                found: crate::text::utf8::decode_char_at(self.input, self.offset),
+            })),
         }
     }
 
@@ -1444,30 +1453,38 @@ impl<'a> Validator<'a> {
                 self.skip_spaces();
                 Ok(())
             }
-            b'x' => self.scan_hex_escape('x', 2),
-            b'u' => self.scan_hex_escape('u', 4),
-            b'U' => self.scan_hex_escape('U', 8),
+            b'x' => self.scan_hex_escape(2),
+            b'u' => self.scan_hex_escape(4),
+            b'U' => self.scan_hex_escape(8),
             _other => Err(self.error(YamlValidationErrorKind::InvalidEscape {
                 sequence: crate::text::utf8::decode_char_at(self.input, self.offset),
             })),
         }
     }
 
-    /// Validate `n` hex digits following `\x`/`\u`/`\U`. Positioned on `x`/`u`/`U`,
-    /// which the caller also passes as `kind` -- reported back on a bad digit
-    /// (#1636) rather than a hardcoded `'x'`, since a bad `\u`/`\U` escape must
-    /// name itself, not whichever kind happened to be checked first.
-    fn scan_hex_escape(&mut self, kind: char, n: usize) -> Result<(), YamlValidationError> {
-        self.advance(); // consume x/u/U
+    /// Validate `n` hex digits following `\x`/`\u`/`\U`. Positioned on `x`/`u`/`U`
+    /// (all ASCII, so the `as char` cast below is exact) -- read locally off
+    /// `advance()`'s own return value (the byte it just consumed) rather than
+    /// threaded through as a parameter the three call sites above would just
+    /// be echoing back (they're already positioned there too, and a caller
+    /// literal drifting out of sync with its own match arm is exactly how
+    /// this bug happened the first time). Reported back on a bad digit
+    /// (#1636) instead of the hardcoded `'x'` this used to have, since a bad
+    /// `\u`/`\U` escape must name itself, not whichever kind happened to be
+    /// checked first.
+    fn scan_hex_escape(&mut self, n: usize) -> Result<(), YamlValidationError> {
+        // `escape_kind`, not `kind`: `Self::error` takes its own `kind:
+        // YamlValidationErrorKind` parameter, and this is an unrelated `char`.
+        let escape_kind = self.advance().expect("caller matched on this byte") as char; // consume x/u/U
         for _ in 0..n {
             match self.peek() {
                 Some(c) if c.is_ascii_hexdigit() => {
                     self.advance();
                 }
                 _ => {
-                    return Err(
-                        self.error(YamlValidationErrorKind::InvalidEscape { sequence: kind })
-                    )
+                    return Err(self.error(YamlValidationErrorKind::InvalidEscape {
+                        sequence: escape_kind,
+                    }))
                 }
             }
         }
@@ -1906,7 +1923,7 @@ mod tests {
         )); // CTN5
         assert!(matches!(
             kind(b"---\n[ a, b, c ] ]\n"),
-            UnbalancedFlow { .. }
+            UnbalancedFlow { found: ']' }
         )); // 4H7K
         assert!(matches!(
             kind(b"---\n[ a, b, c,#invalid\n]\n"),
@@ -1917,6 +1934,22 @@ mod tests {
             UnexpectedCharacter { found: '-', .. }
         )); // YJV2
         assert!(matches!(kind(b"[ a, b"), UnclosedFlow { bracket: '[' }));
+    }
+
+    /// #1636 review: `check_after_top_level_flow` hardcoded `found: ']'`
+    /// for *any* disallowed trailing content after *any* top-level flow
+    /// collection closes -- the same "hardcoded literal instead of the
+    /// actual character" bug #1636 fixed for `InvalidEscape`, found a
+    /// second time in this file during that fix's own review. The
+    /// pre-existing `rejects_flow_wellformedness` case (4H7K) never
+    /// caught this because its trailing content coincidentally *was* `]`.
+    #[test]
+    fn rejects_unbalanced_flow_reports_the_real_trailing_byte_1636() {
+        assert!(matches!(kind(b"[a, b] x\n"), UnbalancedFlow { found: 'x' }));
+        // The shared call site fires for `{...}` too, not just `[...]` --
+        // confirmed live to previously report `found: ']'` even though no
+        // `]` appears anywhere in this input.
+        assert!(matches!(kind(b"{a: 1} x\n"), UnbalancedFlow { found: 'x' }));
     }
 
     #[test]
