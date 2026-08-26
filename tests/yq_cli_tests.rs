@@ -12893,6 +12893,33 @@ fn test_eval_all_validate_rejects_invalid_yaml_from_file() -> Result<()> {
     Ok(())
 }
 
+/// #1563 sibling: the plain (non-`--eval-all`) multi-file `--validate` path
+/// streams each file's output as it's processed, so a later file's
+/// validation failure can fire after an earlier file's output is already
+/// buffered -- jq's own identical case (`test_validate_multi_file_second_
+/// invalid_keeps_first_files_output_1558`). Confirms the first file's
+/// output still reaches stdout (an explicit flush now guarantees this
+/// rather than relying on `Drop`'s own best-effort, error-swallowing one).
+#[test]
+fn test_validate_multi_file_second_invalid_keeps_first_files_output_1563() -> Result<()> {
+    let mut good_file = NamedTempFile::new()?;
+    writeln!(good_file, "ok: 1")?;
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: [1, 2")?;
+    let (stdout, stderr, code) = run_yq_files(
+        ".",
+        &[good_file.path(), bad_file.path()],
+        &["-o", "json", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(
+        stdout, "{\n  \"ok\": 1\n}\n",
+        "the first file's valid output survives"
+    );
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// Regression test for the `needs_path_context`/`Compare` runtime-arm fix
 /// (#715): `key` used inside `select(...)`'s condition previously produced
 /// no output at all, independent of `--eval-all`.

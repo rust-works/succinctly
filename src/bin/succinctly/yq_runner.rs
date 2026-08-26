@@ -3464,6 +3464,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if let Some(code) =
                     yaml_validate_guard(&yaml_bytes, fmt, args.validate, Some(file_path))
                 {
+                    // Sibling of jq_runner.rs's identical fix (#1563): a
+                    // later file's validation failure can fire after
+                    // `writer` already buffered real output from earlier
+                    // files in this same `'m2_files` loop. The halt case
+                    // just above (`break 'm2_files`) reaches this
+                    // function's own tail `writer.flush()?` by falling
+                    // through; this early `return` doesn't, and used to
+                    // rely on `writer`'s `Drop` impl instead -- which
+                    // silently swallows a flush error rather than
+                    // propagating it.
+                    writer.flush()?;
                     return Ok(code);
                 }
                 let mut index = YamlIndex::build(&yaml_bytes)
