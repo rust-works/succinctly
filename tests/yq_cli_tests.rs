@@ -8801,6 +8801,40 @@ fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
     Ok(())
 }
 
+/// `-I=0` on the DOM output path (any filter `can_use_m2_streaming` rejects,
+/// e.g. `to_entries`) used to thread an empty indent string into the nested
+/// emitter, collapsing every nesting level onto the same column and losing
+/// the nested value entirely on read-back (#1575). `-P` (which forces the
+/// DOM path too) already rendered this correctly, so its width-2 indent is
+/// the reference here — matching the M2 streaming fast path's own
+/// pre-existing, documented `-I0` choice of width 2.
+#[test]
+fn test_dom_path_indent_zero_preserves_nested_container_1575() -> Result<()> {
+    let yaml = "a:\n  b:\n    c: 1\n";
+    let (out, code) = run_yq_stdin("to_entries", yaml, &["-o=yaml", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- key: a\n  value:\n    b:\n      c: 1\n");
+
+    // Read back the nested value — must not be empty.
+    let (readback, code) = run_yq_stdin(".[0].value", &out, &["-o=yaml", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(readback, "b:\n  c: 1\n");
+    Ok(())
+}
+
+/// `-o=json -I=0` must stay compact — this fix only widens YAML's `-I0`
+/// indent string; JSON's own compact/flow meaning for `-I0` is unaffected
+/// (`OutputConfig::compact` already forces JSON's indent to `""`
+/// independently of `indent_str`).
+#[test]
+fn test_dom_path_indent_zero_json_output_still_compact_1575() -> Result<()> {
+    let yaml = "a:\n  b:\n    c: 1\n";
+    let (out, code) = run_yq_stdin("to_entries", yaml, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"[{"key":"a","value":{"b":{"c":1}}}]"#);
+    Ok(())
+}
+
 // =============================================================================
 // Computed-float scientific notation — #997
 // =============================================================================
