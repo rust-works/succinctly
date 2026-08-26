@@ -8993,6 +8993,73 @@ fn test_computed_whole_float_json_sourced_input_unaffected_by_949() -> Result<()
     Ok(())
 }
 
+/// #1498: `--eval-all` never applied `json_sourced_floats`, unlike every
+/// other JSON-input path -- `.a`'s value came back `1.0` instead of `1`.
+/// Root cause was one level deeper than `OutputConfig` itself: `for_source`
+/// already computed `json_sourced_floats` correctly for `--eval-all`, but
+/// `eval_owned_input`'s reindex round-trip (needed because `.[0].a` isn't
+/// covered by the owned-value fast path) reconstructed an
+/// `OwnedValue::NumberLiteral` from the re-serialized JSON text via the
+/// library's own literal-preserving `to_owned` (#918) -- and the
+/// `NumberLiteral` formatting arm echoed that spelling verbatim, never
+/// consulting `json_sourced` the way the `Float` arm already did. Not
+/// oracle-verified (`--eval-all` is a succinctly-only extension, #715); the
+/// standard (non-`--eval-all`) path on the same input is the reference this
+/// pins internal consistency against.
+#[test]
+fn test_eval_all_applies_json_sourced_floats_1498() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".[0].a",
+        r#"{"a":1.0}"#,
+        &["--input-format", "json", "--eval-all", "-o=json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1");
+    Ok(())
+}
+
+/// #1498 companion: a genuine trailing fraction (not just `.0`) is stripped
+/// too, matching the `Float` arm's own rule exactly -- `2.50` becomes `2.5`,
+/// not `2.50` (literal-preserving) or `2` (over-truncated).
+#[test]
+fn test_eval_all_json_sourced_float_strips_trailing_zero_not_the_fraction_1498() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".[0].a",
+        r#"{"a":2.50}"#,
+        &["--input-format", "json", "--eval-all", "-o=json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "2.5");
+    Ok(())
+}
+
+/// #1498 companion: an int-shaped JSON literal reaching the same code path
+/// is unaffected (no decimal-point ambiguity to strip).
+#[test]
+fn test_eval_all_json_sourced_int_unaffected_1498() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        ".[0].a",
+        r#"{"a":5}"#,
+        &["--input-format", "json", "--eval-all", "-o=json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+    Ok(())
+}
+
+/// #1498 companion: YAML-sourced input reaching the same `--eval-all`
+/// reindex path must keep its literal spelling exactly as before --
+/// `json_sourced_floats` is specifically a JSON-input override
+/// (`InputFormat::Json` only, `OutputConfig::for_source`), so a YAML
+/// `1.50` must not be affected by this fix at all.
+#[test]
+fn test_eval_all_yaml_sourced_float_keeps_literal_spelling_1498() -> Result<()> {
+    let (out, code) = run_yq_stdin(".[0].a", "a: 1.50\n", &["--eval-all", "-o=json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "1.50");
+    Ok(())
+}
+
 /// An untouched literal is unaffected by this fix in any output mode.
 /// Bare `.` (identity) here takes the cursor-based P9/M2 streaming path,
 /// echoing the source text straight from `YamlCursor` without ever
