@@ -1416,6 +1416,46 @@ fn test_duplicate_json_key_field_access_last_wins_1251() -> Result<()> {
     Ok(())
 }
 
+/// #1642 follow-up: `--slurp`/`--eval-all`/`--inplace`'s own JSON reindex
+/// bridge (`parse_input` -> `to_owned_canonicalizing_numbers_at_depth` in
+/// `yq_runner.rs` -- the one path that genuinely parses `--input-format
+/// json` input as JSON rather than as YAML flow syntax, per #1398) was left
+/// on the old `field.key_str()`, silently dropping a decode-failure key
+/// instead of preserving it via `key_display_string` like every other
+/// materializer this fix touched. Before this fix, `.[0] | length` here
+/// reported `1`, one short of the document's real field count, while
+/// `.[0] | keys` silently omitted the bad key's entry entirely.
+#[test]
+fn test_input_format_json_bridge_preserves_decode_failure_key_1642() -> Result<()> {
+    let json = r#"{"a\q":1,"b":2}"#;
+
+    let (output, code) = run_yq_stdin(
+        ".[0] | length",
+        json,
+        &["--input-format", "json", "--slurp"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2", "--slurp length");
+
+    let (output, code) = run_yq_stdin(
+        ".[0] | keys",
+        json,
+        &["--input-format", "json", "--slurp", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a\\q","b"]"#, "--slurp keys");
+
+    let (output, code) = run_yq_stdin(
+        ".[0] | length",
+        json,
+        &["--input-format", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "2", "--eval-all length");
+
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`
