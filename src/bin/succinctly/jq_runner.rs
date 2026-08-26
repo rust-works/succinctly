@@ -25,8 +25,8 @@ use succinctly::json::JsonIndex;
 
 use super::JqCommand;
 use crate::output::{
-    self, escape_json_string, escape_json_string_ascii, exit_codes, ColorScheme, ControlEscape,
-    DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
+    self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
+    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -1254,11 +1254,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             // in this same run, and a genuine (non-malformed-
                             // document) error here shouldn't leave that
                             // relying on `Drop`'s own best-effort,
-                            // error-swallowing flush.
-                            None => {
-                                out.flush()?;
-                                return Err(e);
-                            }
+                            // error-swallowing flush. `flush_then_err`
+                            // (review of #1673) keeps `e` as the reported
+                            // error even if the flush also fails, instead of
+                            // the flush error silently displacing it.
+                            None => return flush_then_err(&mut out, e),
                         }
                     }
                     // result is dropped here, freeing its memory immediately

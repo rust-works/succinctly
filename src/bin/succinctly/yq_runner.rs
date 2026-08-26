@@ -29,8 +29,8 @@ use succinctly::yaml::{
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
-    self, exit_codes, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation,
-    JsonFormatOpts,
+    self, exit_codes, flush_then_err, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle,
+    InputLocation, JsonFormatOpts,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -3472,7 +3472,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         } else {
             'm2_files: for file_path in &input_files {
                 let path = Path::new(file_path);
-                let yaml_bytes = read_file(path)?;
+                // A later file's read failure can fire after `writer`
+                // already buffered real output from earlier files in this
+                // same loop (review of #1673, same class as the
+                // `yaml_validate_guard`/`YamlIndex::build` returns just
+                // below) -- `flush_then_err` keeps this error as the
+                // reported one even if the flush also fails.
+                let yaml_bytes = match read_file(path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return flush_then_err(&mut writer, e),
+                };
                 let fmt = resolve_input_format(args.input_format, Some(path));
                 if let Some(code) =
                     yaml_validate_guard(&yaml_bytes, fmt, args.validate, Some(file_path))
@@ -3490,8 +3499,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     writer.flush()?;
                     return Ok(code);
                 }
-                let mut index = YamlIndex::build(&yaml_bytes)
-                    .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
+                let mut index = match YamlIndex::build(&yaml_bytes) {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let e = anyhow::anyhow!("YAML parse error in {file_path}: {e}");
+                        return flush_then_err(&mut writer, e);
+                    }
+                };
                 if fmt == InputFormat::Json {
                     index.mark_json_sourced();
                 }

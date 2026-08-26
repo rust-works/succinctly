@@ -227,6 +227,25 @@ impl ErrorSink {
     }
 }
 
+/// Flush `writer`'s already-buffered output, then return `err` (#1673).
+///
+/// A multi-file/multi-document run can hit a real error after `writer`
+/// already holds output from earlier documents/files; relying on
+/// `Drop`'s own best-effort flush would silently swallow a write failure
+/// instead of propagating it. If the flush itself also fails, `err` is
+/// not discarded in favor of the flush error -- it's kept as the
+/// returned error's primary message, with the flush failure layered on
+/// as additional context.
+pub fn flush_then_err<W: std::io::Write, T>(
+    writer: &mut W,
+    err: anyhow::Error,
+) -> anyhow::Result<T> {
+    if let Err(flush_err) = writer.flush() {
+        return Err(err.context(format!("(also failed to flush output: {flush_err})")));
+    }
+    Err(err)
+}
+
 /// Print build configuration information (similar to jq --build-configuration)
 pub fn print_build_configuration(tool: &str) {
     println!("succinctly {tool} build configuration:");
