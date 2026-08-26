@@ -30,8 +30,8 @@ use super::eval::{
     apply_compare_op, arith_combine, collapse_vec, eval as full_eval, eval_each_owned,
     format_owned, index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
-    slice_owned_value_read, tonumber_from_str, Control, Demand, EvalError, EvalSemantics, EvalTag,
-    Flow, JqSemantics, QueryResult, YqSemantics,
+    slice_owned_value_read, tonumber_from_str, try_reserve_product, Control, Demand, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -5110,7 +5110,15 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         | GenericResult::LazyIndexRange(_)
         | GenericResult::LazySeq(_)) => {
             let targets = owned_or_err!(owned.collect_owned());
-            let mut out = Vec::with_capacity(keys.len() * targets.len());
+            // #1634: `keys.len() * targets.len()` is a product of two
+            // independent, generator-controlled lengths -- an unguarded
+            // `Vec::with_capacity` here can panic/abort the process on
+            // overflow or a genuine allocation failure. This is the actual
+            // dispatch path for an ordinary `.[$keys]` CLI read (see the
+            // comment on `Expr::IndexExpr`'s own match arm above), so this
+            // site -- not `eval::eval_index_expr`'s sibling -- is what a
+            // real `succinctly jq`/`succinctly yq` invocation hits.
+            let mut out = owned_or_err!(try_reserve_product(&[keys.len(), targets.len()]));
             for k in &keys {
                 for t in &targets {
                     match index_owned_by_key(t, k, optional) {
@@ -5292,7 +5300,26 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // Start outer, end middle, target inner. The result is always owned:
     // slicing constructs a fresh array/string, same invariant as
     // `eval::eval_slice_expr`.
-    let mut out: Vec<OwnedValue> = Vec::with_capacity(starts.len() * ends.len());
+    //
+    // All three factors (#1634 review): the loop below is genuinely S
+    // outer / E middle / T inner, so `starts.len() * ends.len()` alone
+    // under-reserves whenever the target itself has more than one output
+    // -- an unguarded `Vec::with_capacity` product of two or three such
+    // generator-controlled lengths can also panic/abort the process on
+    // overflow or a genuine allocation failure. This is the actual
+    // dispatch path for an ordinary `.[$s:$e]` CLI read (see the comment
+    // on `Expr::SliceExpr`'s own match arm above), so this site -- not
+    // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
+    // jq`/`succinctly yq` invocation hits.
+    let targets_len = match &targets {
+        Targets::Borrowed(ts) => ts.len(),
+        Targets::Owned(ts) => ts.len(),
+    };
+    let mut out: Vec<OwnedValue> = owned_or_err!(try_reserve_product(&[
+        starts.len(),
+        ends.len(),
+        targets_len
+    ]));
     match &targets {
         Targets::Borrowed(ts) => {
             for s in &starts {
@@ -6496,6 +6523,36 @@ mod tests {
             matches!(result, GenericResult::None),
             "expected None, got {result:?}"
         );
+    }
+
+    /// #1634 review: `eval.rs`'s own end-to-end regression test for the
+    /// computed-index capacity guard
+    /// (`test_computed_index_ordinary_cross_product_unaffected_1634`) goes
+    /// through `eval::eval()`, a *different* entry point from the one
+    /// `src/bin/succinctly/{jq,yq}_runner.rs` actually call for an
+    /// ordinary `.[$keys]` read -- `Expr::IndexExpr` is handled natively
+    /// here, in this module's own `eval_index_expr` (see the comment on
+    /// its match arm above), so that other test never touched this
+    /// module's independently-guarded `try_reserve_product` call site at
+    /// all. This test exercises this module's real dispatch path
+    /// directly, targeting the specific arm the guard was added to (an
+    /// *owned* target -- `({"x":1,"y":2})`, a constructed value rather than
+    /// a document navigation, takes `eval_index_expr`'s `owned @ (...)`
+    /// arm rather than the unguarded cursor-based loop below it).
+    #[test]
+    fn test_generic_computed_index_ordinary_cross_product_unaffected_1634() {
+        let json = br"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(&parse(r#"({"x":1,"y":2})[("x","y")]"#).unwrap(), value);
+        match result {
+            GenericResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
