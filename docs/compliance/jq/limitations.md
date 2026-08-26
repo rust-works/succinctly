@@ -668,6 +668,23 @@ still repeats, so `"ab" * 3` and #1230's float-count cases are unaffected.
 This guard is jq-mode-only. See [yq Limitations](../yq/limitations.md) for `succinctly yq`
 mode, which refuses much earlier via its own, separate cap.
 
+Computed-index/-slice expansion (`.[$keys]`, `.[$s:$e]`, both in value position and under
+`path()`) has the identical shape again, at five call sites (#1634): each pre-sizes its
+output with a product of two or three independent, generator-controlled `Vec::len()`s
+(e.g. `keys.len() * targets.len()`), previously handed straight to an infallible
+`Vec::with_capacity`. A large enough cross product — e.g. two independent 100,000-element
+generators feeding the same `.[$keys]` — asks for more elements than the allocator can
+satisfy even though neither input list is individually unreasonable to materialize.
+succinctly now refuses with `Cannot allocate <n> elements for a computed-index expansion`
+(or, for the astronomically rarer case where the product itself overflows even a `u128`
+before a length can be checked, `Cannot allocate elements for a computed-index expansion:
+size overflows u128`) via the same `Vec::try_reserve_exact` technique as the `setpath`/
+string-repeat cases above, applied through a shared `try_reserve_product` helper. Unlike
+`s * n` above, a live check did not turn up an analogous yq-side cap for this shape — this
+guard is symmetric across both modes, converting a host-process crash into a catchable
+error in each, with no cap-specific divergence to record in
+[yq Limitations](../yq/limitations.md).
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

@@ -13555,8 +13555,25 @@ pub(crate) fn index_one_owned(
 /// (matching #1612's own precedent: the reference tool has no oracle
 /// wording to reproduce here, since it just keeps running or gets
 /// OOM-killed by the OS rather than answering promptly).
-fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
-    let total: u128 = factors.iter().map(|&f| f as u128).product();
+pub(crate) fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
+    // `checked_mul`, not a bare `.product()`: with 3+ factors (the
+    // `path()`-position slice sites pass `starts`/`ends`/`target_branches`
+    // together), the running product can itself overflow `u128` before
+    // ever reaching the `usize::try_from` check below meant to catch an
+    // overflow -- `.product()` would silently wrap instead of erroring.
+    // Not reachable with today's callers (each factor is a real
+    // `Vec::len()`; three factors near 2^43 apiece to trigger this would
+    // already have exhausted real memory materializing the inputs), but
+    // the function's own contract shouldn't depend on that.
+    let mut total: u128 = 1;
+    for &f in factors {
+        let Some(next) = total.checked_mul(f as u128) else {
+            return Err(EvalError::new(
+                "Cannot allocate elements for a computed-index expansion: size overflows u128",
+            ));
+        };
+        total = next;
+    }
     let Ok(len) = usize::try_from(total) else {
         return Err(cannot_reserve_cross_product(total));
     };
@@ -13677,6 +13694,15 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // (2) Key outer, target inner.
+    //
+    // A capacity failure here bypasses `pending_halt` -- deliberately: it
+    // is a fresh error arising before any element has even been indexed,
+    // so it takes the exact same priority as an ordinary `index_one`/
+    // `index_one_owned` failure partway through the loop below, which the
+    // comment on that arm documents as already outranking a still-pending
+    // halt (jq's own interleaved key/index evaluation model). `out` is
+    // always empty at this point regardless, so there is no already-
+    // produced prefix a `Partial` could preserve either way.
     match targets {
         Targets::Borrowed(ts) => {
             let mut out: Vec<StandardJson<'a, W>> =
@@ -13810,10 +13836,22 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // owned: slicing constructs a new array/string (see `eval_single`'s
     // `Expr::Slice` arm), so there is nothing to borrow except its rare
     // whole-value fast paths, which `to_owned` below just copies out of.
-    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
-        Ok(out) => out,
-        Err(e) => return QueryResult::Error(e),
+    //
+    // All three factors, not just `starts.len() * ends.len()`: the loop
+    // below is genuinely S outer / T middle / E inner, so the true upper
+    // bound includes the target count too (#1634 review) -- an
+    // under-reservation here wouldn't overflow on its own, but it would
+    // leave the eventual `Vec::push` growth past this capacity unguarded
+    // for exactly the same crash class this function exists to close.
+    let targets_len = match &targets {
+        Targets::Borrowed(ts) => ts.len(),
+        Targets::Owned(ts) => ts.len(),
     };
+    let mut out: Vec<OwnedValue> =
+        match try_reserve_product(&[starts.len(), ends.len(), targets_len]) {
+            Ok(out) => out,
+            Err(e) => return QueryResult::Error(e),
+        };
     match &targets {
         Targets::Borrowed(ts) => {
             for s in &starts {
@@ -19879,6 +19917,13 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     } else {
         &keys[..]
     };
+    // A capacity failure here bypasses `target_escape`/`key_escape` --
+    // deliberately, and for the same reason as `eval_index_expr`'s
+    // identical arm: this fires before the loop below produces anything,
+    // so `out` (the `Err` tuple's own prefix) is always empty regardless,
+    // and a fresh error at this point takes the same priority a mid-loop
+    // `index_one_owned` failure already does (`return Err((out, e.into()))`
+    // below, which likewise doesn't fold in either escape).
     let mut out = match try_reserve_product(&[keys.len(), target_branches.len()]) {
         Ok(out) => out,
         Err(e) => return Err((Vec::new(), e.into())),
@@ -20145,6 +20190,11 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // the `ends.is_empty()` early return: `target` > `end` > `start` --
     // `bounds_escape` already carries the `end` > `start` half.
     let escape = target_escape.or(bounds_escape);
+    // A capacity failure here bypasses `escape` -- same reasoning as
+    // `resolve_index_expr`'s identical arm: `out` is always empty at this
+    // point, and a fresh error at this point takes the same priority a
+    // mid-loop failure already does further down in this function (its own
+    // `return Err((out, ...))` arms likewise don't fold `escape` in).
     let mut out = match try_reserve_product(&[starts.len(), ends.len(), target_branches.len()]) {
         Ok(out) => out,
         Err(e) => return Err((Vec::new(), e.into())),
@@ -35973,12 +36023,33 @@ mod tests {
     /// `usize`-overflow one above.
     #[test]
     fn test_try_reserve_product_refuses_isize_byte_overflow_1634() {
-        // 4e18 raw elements comfortably fits `usize` (~1.8e19), but
-        // `OwnedValue` is well over 2 bytes wide, so the byte size
-        // (`4e18 * size_of::<OwnedValue>()`) is nowhere close to fitting
-        // `isize::MAX` (~9.2e18 bytes).
+        // `usize::MAX / 4`, not a hardcoded 64-bit-only literal (this
+        // crate has existing `target_pointer_width = "64"` gates
+        // elsewhere, e.g. `trees/bp.rs`/`bits/select.rs`, so 32-bit
+        // portability is a live concern) -- times 2 comfortably fits
+        // `usize` as a raw element count on any pointer width, but
+        // `OwnedValue` is well over 2 bytes wide, so the byte size (once
+        // multiplied by `size_of::<OwnedValue>()`) overflows `isize::MAX`
+        // on both 32- and 64-bit targets.
+        let factor = usize::MAX / 4;
+        let result: Result<Vec<OwnedValue>, EvalError> = try_reserve_product(&[factor, 2]);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// #1634 review: the product computation itself must not silently
+    /// wrap when 3+ factors overflow `u128`, before the `usize::try_from`
+    /// check below even runs -- the `path()`-position slice site
+    /// (`resolve_slice_expr`) passes three factors together
+    /// (`starts`/`ends`/`target_branches`), so a naive running
+    /// multiplication with no overflow check of its own could wrap past
+    /// `u128::MAX` back down to a small, wrong value instead of erring.
+    #[test]
+    fn test_try_reserve_product_refuses_u128_overflow_with_three_factors_1634() {
+        // Each factor is ~2^43; three of them multiply to ~2^129, past
+        // `u128::MAX` (2^128).
+        let factor: usize = 1 << 43;
         let result: Result<Vec<OwnedValue>, EvalError> =
-            try_reserve_product(&[2_000_000_000_000_000_000usize, 2]);
+            try_reserve_product(&[factor, factor, factor]);
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
