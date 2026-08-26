@@ -9,7 +9,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, key_display_string, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec,
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
@@ -615,7 +616,16 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            if let Some(key) = field.key_str() {
+            // `key_display_string`, not `field.key_str()`: a key that will
+            // not *decode* (#1247/#1385) is preserved via its raw source
+            // span rather than dropped (#1642) -- this loop used to
+            // silently drop such a field under `--slurp`/`--eval-all`/
+            // `--inplace` (the only callers of `parse_input`, hence of this
+            // function), one short of `length`'s real field count. A key
+            // the format's grammar never allowed at all (#1194) is still
+            // dropped, same as before this fix (this function has no error
+            // channel to raise through).
+            if let Some(key) = key_display_string(&field.key) {
                 map.insert(
                     key.into_owned(),
                     to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1),
