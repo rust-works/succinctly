@@ -13557,20 +13557,41 @@ pub(crate) fn index_one_owned(
 /// zero that brings the real product back down.
 ///
 /// No mode-specific cap: unlike #1612's `MAX_STRING_REPEAT_BYTES` (a
-/// confirmed, deliberate real-yq limit reproduced verbatim), a live check
-/// for an analogous yq-side cap on this cross-product shape didn't turn up
-/// one within this issue's scope. This is purely an internal safety net
-/// converting an uncatchable panic/abort into a catchable `EvalError` in
-/// both modes, per ADR-0018's "would take the host process down"
-/// divergence exception — confirmed live against the pinned jq 1.7.1
-/// binary for this exact cross-product shape (not just analogized from
-/// #1612's own string-repeat case): a genuinely large-but-indexable
-/// `.[$keys]` cross product (`[range(50000) | [1,2]] | .[][(range(50000))]`)
-/// neither errors nor crashes -- jq streams results one at a time rather
-/// than pre-allocating a single buffer the way `Vec::with_capacity` does,
-/// so it just keeps producing output (139M+ lines observed before the
-/// probe was killed at a 15s wall-clock cap, well short of the eventual
-/// 2.5 billion) rather than answering promptly or refusing.
+/// confirmed, deliberate real-yq limit reproduced verbatim). This is purely
+/// an internal safety net converting an uncatchable panic/abort into a
+/// catchable `EvalError` in both modes, per ADR-0018's "would take the host
+/// process down" divergence exception -- for the *reservation* itself, not
+/// necessarily for the write that follows it. `try_reserve_exact` only
+/// catches a Layout that's unrepresentable or an allocation the allocator
+/// refuses outright; under Linux's default memory overcommit, a large but
+/// `isize`-representable reservation can still succeed and only fail later,
+/// page fault by page fault, as the subsequent element-by-element writes
+/// actually touch that memory -- at which point it's the OS's OOM killer
+/// terminating the process, not this guard, the same residual risk #1612's
+/// own `try_reserve_exact` adoption already carries for its real-OOM half
+/// (documented there as accepted under the identical ADR-0018 exception,
+/// not something this guard newly introduces).
+///
+/// jq side, confirmed live against the pinned jq 1.7.1 binary for this
+/// exact cross-product shape (not just analogized from #1612's own
+/// string-repeat case): a genuinely large-but-indexable `.[$keys]` cross
+/// product (`[range(50000) | [1,2]] | .[][(range(50000))]`) neither errors
+/// nor crashes -- jq streams results one at a time rather than
+/// pre-allocating a single buffer the way `Vec::with_capacity` does, so it
+/// just keeps producing output (139M+ lines observed before the probe was
+/// killed at a 15s wall-clock cap, well short of the eventual 2.5 billion)
+/// rather than answering promptly or refusing.
+///
+/// yq side: real yq v4.53.3's lexer rejects `range` outright (confirmed
+/// live, `range(5)` -> `lexer: invalid input text` -- matching the
+/// existing `--jq-extensions`-gated builtin table elsewhere in this file),
+/// so there is no equivalent *generator*-driven way to construct a
+/// comparably large cross product in real yq's own grammar to test this
+/// shape against at all -- not "a cap wasn't found", but "the query shape
+/// needed to trigger this can't be expressed there". A large *document-
+/// sourced* array of literal keys (rather than a generator) could still
+/// reach comparable scale in principle; that variant wasn't pursued
+/// further within this issue's scope.
 pub(crate) fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
     if factors.contains(&0) {
         return Ok(Vec::new());
