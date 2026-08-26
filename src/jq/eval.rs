@@ -13521,6 +13521,58 @@ pub(crate) fn index_one_owned(
     }
 }
 
+/// Reserve capacity for a `Vec<T>` sized as the product of `factors`,
+/// without risking the unconditional panic/abort `Vec::with_capacity`
+/// gives an unrepresentable or unallocatable length (#1634, same
+/// technique #1612/#1017 already established for this bug class:
+/// `arith_mul`'s string-repeat guard, `pad_with_nulls`'s array-grow
+/// guard). Every computed-index cross-product site in this file
+/// (`.[$keys]`/`.[$s:$e]`, both value- and `path()`-position) reduces to
+/// "how many output slots could this generator combination produce, at
+/// most" — a `keys.len() * ts.len()`-style product of generator- or
+/// document-controlled lengths that used to be handed straight to an
+/// infallible `Vec::with_capacity`. `keys`/`ts`/`starts`/`ends`/
+/// `target_branches` are each already-materialized `Vec`s by the time any
+/// of these call sites runs, so unlike #1612's `s.len() * n` (a single
+/// scalar read straight from the document), there is no cheap, portable
+/// way to force `try_reserve_exact`'s own failure path in an end-to-end
+/// test here without exhausting real memory first — this function's own
+/// unit tests instead call it directly with synthetic large factors,
+/// bypassing the (expensive or outright infeasible) generator
+/// materialization a live repro of comparable scale would need.
+///
+/// `factors`' own product is computed in `u128` first so overflow can't
+/// happen a second time in the check meant to catch it (mirrors #1612's
+/// own `s.len() as u128 * n as u128`).
+///
+/// No mode-specific cap: unlike #1612's `MAX_STRING_REPEAT_BYTES` (a
+/// confirmed, deliberate real-yq limit reproduced verbatim), a live check
+/// for an analogous yq-side cap on this cross-product shape didn't turn up
+/// one within this issue's scope. This is purely an internal safety net
+/// converting an uncatchable panic/abort into a catchable `EvalError` in
+/// both modes, per ADR-0018's "would take the host process down"
+/// divergence exception — jq has no cap of its own for this class either
+/// (matching #1612's own precedent: the reference tool has no oracle
+/// wording to reproduce here, since it just keeps running or gets
+/// OOM-killed by the OS rather than answering promptly).
+fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
+    let total: u128 = factors.iter().map(|&f| f as u128).product();
+    let Ok(len) = usize::try_from(total) else {
+        return Err(cannot_reserve_cross_product(total));
+    };
+    let mut out = Vec::new();
+    if out.try_reserve_exact(len).is_err() {
+        return Err(cannot_reserve_cross_product(total));
+    }
+    Ok(out)
+}
+
+fn cannot_reserve_cross_product(total: u128) -> EvalError {
+    EvalError::new(format!(
+        "Cannot allocate {total} elements for a computed-index expansion"
+    ))
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// jq compiles this as `K as $k | E | .[$k]`, and three consequences of that
@@ -13627,7 +13679,11 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (2) Key outer, target inner.
     match targets {
         Targets::Borrowed(ts) => {
-            let mut out: Vec<StandardJson<'a, W>> = Vec::with_capacity(keys.len() * ts.len());
+            let mut out: Vec<StandardJson<'a, W>> =
+                match try_reserve_product(&[keys.len(), ts.len()]) {
+                    Ok(out) => out,
+                    Err(e) => return QueryResult::Error(e),
+                };
             for k in &keys {
                 for t in &ts {
                     match index_one::<W>(t.clone(), k, optional) {
@@ -13655,7 +13711,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         Targets::Owned(ts) => {
-            let mut out: Vec<OwnedValue> = Vec::with_capacity(keys.len() * ts.len());
+            let mut out: Vec<OwnedValue> = match try_reserve_product(&[keys.len(), ts.len()]) {
+                Ok(out) => out,
+                Err(e) => return QueryResult::Error(e),
+            };
             for k in &keys {
                 for t in &ts {
                     match index_one_owned(t, k, optional) {
@@ -13751,7 +13810,10 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // owned: slicing constructs a new array/string (see `eval_single`'s
     // `Expr::Slice` arm), so there is nothing to borrow except its rare
     // whole-value fast paths, which `to_owned` below just copies out of.
-    let mut out: Vec<OwnedValue> = Vec::with_capacity(starts.len() * ends.len());
+    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
+        Ok(out) => out,
+        Err(e) => return QueryResult::Error(e),
+    };
     match &targets {
         Targets::Borrowed(ts) => {
             for s in &starts {
@@ -19817,7 +19879,10 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     } else {
         &keys[..]
     };
-    let mut out = Vec::with_capacity(keys.len() * target_branches.len());
+    let mut out = match try_reserve_product(&[keys.len(), target_branches.len()]) {
+        Ok(out) => out,
+        Err(e) => return Err((Vec::new(), e.into())),
+    };
     for k in keys {
         for PathBranch {
             path: components,
@@ -20080,7 +20145,10 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // the `ends.is_empty()` early return: `target` > `end` > `start` --
     // `bounds_escape` already carries the `end` > `start` half.
     let escape = target_escape.or(bounds_escape);
-    let mut out = Vec::with_capacity(starts.len() * ends.len() * target_branches.len());
+    let mut out = match try_reserve_product(&[starts.len(), ends.len(), target_branches.len()]) {
+        Ok(out) => out,
+        Err(e) => return Err((Vec::new(), e.into())),
+    };
     for (s, s_key) in starts {
         for (e, e_key) in ends {
             // #1326: a genuinely dynamic bound (unlike a literal one, which
@@ -35875,6 +35943,72 @@ mod tests {
         // jq mode's own cases are unaffected by the yq-only cap.
         query!(br#"{"s": "ab", "n": 5242881}"#, ".s * .n",
             QueryResult::Owned(OwnedValue::String(s)) if s.len() == 10_485_762 => {}
+        );
+    }
+
+    /// #1634: unlike #1612's `s.len() * n` (a single scalar read straight
+    /// from the document, cheap to make astronomically large via a huge
+    /// `NumberLiteral`), each of `try_reserve_product`'s factors here is a
+    /// real `Vec::len()` -- there is no way to make one huge without
+    /// actually materializing that many elements first, which for a
+    /// factor large enough to overflow `usize`/`isize` on its own is
+    /// infeasible to do in a test. Calls the guard directly with synthetic
+    /// large factors instead, bypassing the generator materialization a
+    /// live repro of comparable scale would need (see the doc comment on
+    /// `try_reserve_product` itself for why).
+    #[test]
+    fn test_try_reserve_product_refuses_usize_overflow_1634() {
+        // `usize::MAX * 2` (widened to `u128` first) doesn't fit back into
+        // `usize` at all.
+        let result: Result<Vec<OwnedValue>, EvalError> = try_reserve_product(&[usize::MAX, 2]);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// #1634: a product that *does* fit `usize` (as raw element count) but
+    /// whose byte size -- once multiplied by `size_of::<OwnedValue>()`
+    /// inside `Vec::try_reserve_exact` -- exceeds `isize::MAX` must also
+    /// refuse cleanly. This is the boundary `Vec::with_capacity` itself
+    /// panics past even when the raw `usize` conversion above would have
+    /// succeeded, so it needs its own case distinct from the outright
+    /// `usize`-overflow one above.
+    #[test]
+    fn test_try_reserve_product_refuses_isize_byte_overflow_1634() {
+        // 4e18 raw elements comfortably fits `usize` (~1.8e19), but
+        // `OwnedValue` is well over 2 bytes wide, so the byte size
+        // (`4e18 * size_of::<OwnedValue>()`) is nowhere close to fitting
+        // `isize::MAX` (~9.2e18 bytes).
+        let result: Result<Vec<OwnedValue>, EvalError> =
+            try_reserve_product(&[2_000_000_000_000_000_000usize, 2]);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// #1634: the guard must not become a de facto cap on legitimate,
+    /// modest cross products -- an ordinary small product still succeeds
+    /// and reserves the exact requested capacity, matching what
+    /// `Vec::with_capacity` itself would have done before this fix.
+    #[test]
+    fn test_try_reserve_product_succeeds_for_ordinary_sizes_1634() {
+        let out: Vec<OwnedValue> =
+            try_reserve_product(&[10, 20]).expect("a 10*20 product must not refuse");
+        assert!(out.capacity() >= 200, "capacity: {}", out.capacity());
+        assert!(out.is_empty());
+    }
+
+    /// #1634: end-to-end sanity that the guard is actually reachable from a
+    /// real `.[$keys]` query and doesn't change output for a size that
+    /// previously worked (the value-position, `Targets::Borrowed` arm of
+    /// `eval_index_expr` -- the other three wired call sites share the same
+    /// `try_reserve_product` helper and are covered by the direct unit
+    /// tests above and the CLI-level path/slice tests elsewhere in this
+    /// file, e.g. `test_path_...`/`test_slice_...` cases exercising
+    /// `.[$s:$e]` and `path(...)`).
+    #[test]
+    fn test_computed_index_ordinary_cross_product_unaffected_1634() {
+        query!(br#"{"a":1,"b":2}"#, r#".[("a","b")]"#,
+            QueryResult::Many(vs) => {
+                let values: Vec<OwnedValue> = vs.iter().map(to_owned).collect();
+                assert_eq!(values, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
         );
     }
 
