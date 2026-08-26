@@ -126,6 +126,30 @@ fn bad_hex_escape_reports_the_real_escape_kind_1636() -> Result<()> {
     Ok(())
 }
 
+/// #1636 review: `check_after_top_level_flow` hardcoded `found: ']'` for
+/// *any* disallowed trailing content after *any* top-level flow collection
+/// closes -- the same bug class fixed above for `InvalidEscape`, found a
+/// second time in the same file during that fix's own review. Covers both
+/// `[...]` and `{...}` through the real CLI, since both share the one call
+/// site that had the hardcoded literal.
+#[test]
+fn unbalanced_flow_reports_the_real_trailing_byte_1636() -> Result<()> {
+    let (_, stderr, code) = run_validate_stdin("[a, b] x\n", &["--no-color"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("unbalanced flow collection near 'x'"),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) = run_validate_stdin("{a: 1} x\n", &["--no-color"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("unbalanced flow collection near 'x'"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn file_input_reports_filename_and_missing_file() -> Result<()> {
     let mut file = NamedTempFile::new()?;
