@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors};
 use succinctly::jq::eval_generic::{
-    eval_with_cursor, to_owned as generic_to_owned, GenericResult, MAX_NESTING_DEPTH,
+    assert_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, GenericResult,
+    MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
@@ -2713,9 +2714,7 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
             match find_json_values(bytes) {
                 Ok(spans) => spans
                     .into_iter()
-                    .map(|(start, end)| {
-                        crate::output::json_bytes_to_owned_value(&bytes[start..end])
-                    })
+                    .map(|(start, end)| json_bytes_to_owned_value_checked(&bytes[start..end]))
                     // Wrapped rather than flattened, for the same reason as
                     // the sibling site in `parse_json_stream_strict`: the
                     // caller reports a document error in jq's channel at
@@ -3699,6 +3698,90 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
         return Err(MalformedJsonError(EvalError::malformed_json_text(child_cursor.text())).into());
     }
     Ok(Some(start))
+}
+
+/// Recursively validate every object/array in `cursor`'s subtree for a
+/// missing or doubled `,`/`:` (#1643), via [`preceding_gap_ok`] -- the same
+/// check `print_json`'s object/array arms perform, needed again here for a
+/// caller that doesn't go through `print_json` at all.
+///
+/// [`crate::output::json_bytes_to_owned_value`]'s own doc comment says
+/// plainly that it "performs no validation of its own" and expects the
+/// caller to have done so first; [`parse_json_stream`]'s fallback below
+/// (which backs `-S`, `-C`, and `--slurp` -- none of which route through
+/// `print_json`) was calling it directly on unvalidated bytes, so `{"a"
+/// 1}` would silently materialize as `{"a":1}` under those flags even
+/// though the default `sjq -c .` path already rejects it since #1643.
+///
+/// `depth` guards against a stack overflow on adversarially deep input the
+/// same way [`generic_to_owned`]'s own recursion does (`assert_nesting_depth`,
+/// #998) -- this walk runs *before* that one on the same document, so it
+/// needs the identical ceiling rather than risking a raw stack overflow at
+/// some other depth first.
+///
+/// Not a hot path: `parse_json_stream_strict`'s `serde_json` validation
+/// already runs first and only fails (routing here) for a real jq leniency
+/// like a leading-zero number (#1094) or a genuinely malformed document, so
+/// this walk is cold by construction and doesn't need `print_json`'s
+/// `known_text_pos` reuse trick.
+fn validate_json_delimiters<W: AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+    depth: usize,
+) -> core::result::Result<(), EvalError> {
+    assert_nesting_depth(depth);
+    match cursor.value() {
+        StandardJson::Array(elements) => {
+            for (i, child) in elements.cursor_iter().enumerate() {
+                if let Some(start) = child.text_position() {
+                    let expected = if i == 0 { None } else { Some(b',') };
+                    if !preceding_gap_ok(child.text(), start, expected) {
+                        return Err(EvalError::malformed_json_text(child.text()));
+                    }
+                }
+                validate_json_delimiters(&child, depth + 1)?;
+            }
+        }
+        StandardJson::Object(fields) => {
+            let mut remaining = fields;
+            let mut field_index = 0usize;
+            while let Some((field, rest)) = remaining.uncons() {
+                let StandardJson::String(k) = field.key() else {
+                    return Err(EvalError::malformed_json_text(cursor.text()));
+                };
+                let value_cursor = field.value_cursor();
+                if let Some(value_start) = value_cursor.text_position() {
+                    let comma_expected = if field_index == 0 { None } else { Some(b',') };
+                    if !preceding_gap_ok(cursor.text(), k.start(), comma_expected)
+                        || !preceding_gap_ok(cursor.text(), value_start, Some(b':'))
+                    {
+                        return Err(EvalError::malformed_json_text(cursor.text()));
+                    }
+                }
+                validate_json_delimiters(&value_cursor, depth + 1)?;
+                remaining = rest;
+                field_index += 1;
+            }
+            if remaining.ends_unpaired() {
+                return Err(EvalError::malformed_json_text(cursor.text()));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// [`crate::output::json_bytes_to_owned_value`], preceded by the #1643
+/// delimiter check that function's own doc comment says its caller must
+/// supply. Used only by [`parse_json_stream`]'s fallback -- every other
+/// caller of the unchecked version re-serializes an already-validated span
+/// (`--argjson`'s retry re-validates its normalized copy against
+/// `serde_json` before ever reaching it; the primary lazy input path
+/// validates via `print_json` instead).
+fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<OwnedValue, EvalError> {
+    let index = JsonIndex::build(bytes);
+    let cursor = index.root(bytes);
+    validate_json_delimiters(&cursor, 0)?;
+    generic_to_owned(&cursor.value())
 }
 
 /// Print a JqValue as JSON using the provided literal formatter.
