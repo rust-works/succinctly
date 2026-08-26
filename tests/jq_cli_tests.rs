@@ -16496,12 +16496,83 @@ fn test_jq_malformed_object_length_agrees_across_spellings_1194() -> Result<()> 
 /// already-recognized container still degrades to `null` at exit 0. This
 /// fix is about object member *structure*, not number grammar, and the two
 /// have deliberately opposite conventions.
+///
+/// `[xyz123]` used to sit in this same table (a structurally malformed
+/// *value*, not a malformed number, degrading to `[null]`) -- it moved out
+/// once #1641 made the identity printer raise on it instead. See
+/// `test_jq_identity_on_malformed_array_element_errors_1641` below.
 #[test]
 fn test_jq_malformed_nested_number_unaffected_by_1194() -> Result<()> {
-    for (input, expected) in [(r#"{"a": 1.2.3}"#, r#"{"a":null}"#), ("[xyz123]", "[null]")] {
-        let (out, _stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
-        assert_eq!(code, 0, "{input}: out: {out:?}");
-        assert_eq!(out.trim(), expected, "{input}");
+    let (input, expected) = (r#"{"a": 1.2.3}"#, r#"{"a":null}"#);
+    let (out, _stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+    assert_eq!(code, 0, "{input}: out: {out:?}");
+    assert_eq!(out.trim(), expected, "{input}");
+
+    Ok(())
+}
+
+/// #1641: `.[]` over an object walks it via `Expr::Iterate`'s own arm in
+/// `eval_generic.rs`, not `LazySource::Values` as the issue text (and this
+/// codebase's own `docs/compliance/jq/limitations.md`, corrected alongside
+/// this test) both assumed -- that machinery is reached only by `obj |
+/// map(f)`, a distinct construct #1641 deliberately leaves unfixed (see the
+/// doc). `Expr::Iterate`'s object arm already walks every field eagerly via
+/// `effective_fields`, so `effective_fields_checked` folds the #1194 check
+/// into that same walk for free, exactly as `effective_len_checked` already
+/// does for `length`.
+///
+/// The walk is atomic: it builds the whole field list before `.[]` ever
+/// starts emitting, so a malformed member anywhere -- including *after* a
+/// valid field -- raises before any output at all.
+#[test]
+fn test_jq_bare_iterate_over_malformed_object_errors_1641() -> Result<()> {
+    for input in ["{invalid: 1}", "{invalid}", r#"{"a":1, invalid}"#] {
+        let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            out.trim().is_empty(),
+            "{input} should print nothing at all, got: {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input} should name the cause on stderr, got: {stderr:?}"
+        );
+    }
+
+    // Unaffected: a well-formed object still iterates its values normally.
+    let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(out.lines().collect::<Vec<_>>(), ["1", "2"]);
+
+    Ok(())
+}
+
+/// #1641: `print_json`'s `StandardJson::Error` arm (`jq_runner.rs`) now
+/// raises through the same `MalformedJsonError` convention the sibling
+/// object-member check above it already uses, instead of silently printing
+/// `null`. Unlike the bare-`.[]` fix above, this writer streams byte-by-byte
+/// with no rewind, so the accepted trade is a **truncated** prefix on
+/// stdout -- the same trade already shipped for `keys_unsorted`'s
+/// non-string-key case and a nested `{invalid}` -- plus a clean diagnostic
+/// and jq's own exit 5, rather than a silently wrong `null`.
+#[test]
+fn test_jq_identity_on_malformed_array_element_errors_1641() -> Result<()> {
+    for (input, prefix) in [
+        ("[xyz123]", "["),
+        ("[tru]", "["),
+        ("[1,zzz,3]", "[1,"),
+        (r#"{"a": xyz123}"#, r#"{"a":"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert_eq!(
+            out, prefix,
+            "{input} should truncate to exactly its well-formed prefix"
+        );
+        assert!(
+            !stderr.is_empty(),
+            "{input} should carry a diagnostic: {stderr:?}"
+        );
     }
 
     Ok(())
@@ -21999,16 +22070,16 @@ fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
 /// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
 /// at exit 0 where real jq raises `Invalid numeric literal` and exits 5.
 ///
-/// Every materializing route raises now. The lazy output path (`.`, `.[0]`)
-/// still prints `null`: it streams as it walks, so by the time a nested
-/// error is reached the opening bracket is already written, and bailing
-/// there truncates the document. That is tracked as Stage 6 of #1247's
-/// design, not fixed here -- see `docs/plan/decode-failure-routing.md`.
+/// Every materializing route raises now (this test's own `to_entries`).
+/// The lazy output path (`.`, `.[0]`) also raises now, via #1641 --
+/// see `test_jq_identity_on_malformed_array_element_errors_1641` --
+/// though it still streams as it walks, so the accepted trade there is a
+/// truncated prefix on stdout rather than nothing at all.
 ///
-/// `{invalid}` is NOT covered: `JsonFields::uncons` collapses a lone
-/// bareword leaf into "no more fields" at the semi-index layer, so no field
-/// is ever constructed to raise on, and the object simply reads as `{}`.
-/// That is #1194's remaining half and needs its own change.
+/// `{invalid}` (a lone bareword leaf, no sibling to pair as a value) is
+/// covered too, both for `to_entries` here (`malformed_object_member`,
+/// #1194) and for bare `.[]` (`effective_fields_checked`, #1641) -- see
+/// `test_jq_bare_iterate_over_malformed_object_errors_1641`.
 #[test]
 fn test_malformed_value_surfaces_as_error_1194() {
     for doc in ["[xyz123]", "[tru]", "[1,zzz,3]"] {
