@@ -22254,3 +22254,84 @@ fn test_jq_string_repeat_huge_count_compound_assign_does_not_panic_1612() -> Res
     assert_eq!(code, 5, "stderr: {stderr:?}");
     Ok(())
 }
+
+/// #1487: `parent(n)`'s `n` argument used to cast via bit-reinterpreting
+/// `as usize` for an `Int` (a negative value wraps to a huge count, treated
+/// as overshooting past root -- `{}`) but a saturating `as usize` for a
+/// `Float` (negative/NaN saturates to `0`, a silent self-reference no-op).
+/// `-1` and `-1.0` are the same logical argument and must now agree: both
+/// error instead of picking one of the two old, disagreeing behaviors.
+#[test]
+fn test_parent_n_negative_int_errors_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(-1)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("parent(n) requires a non-negative integer argument"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_parent_n_negative_float_errors_same_as_negative_int_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(-1.0)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("parent(n) requires a non-negative integer argument"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_parent_n_nan_errors_instead_of_silent_self_reference_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(nan)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("parent(n) requires a non-negative integer argument"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// A positive-infinity `n` still overshoots past root (`{}`) rather than
+/// erroring -- unlike negative/NaN, "more hops than the document has
+/// depth" is a legitimate, well-defined overshoot per
+/// `resolve_ancestor_path`, not a malformed argument.
+#[test]
+fn test_parent_n_positive_infinite_still_overshoots_to_empty_object_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(infinite)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{}\n");
+    Ok(())
+}
+
+/// `?` still swallows the new error exactly like any other `parent(n)`
+/// error path -- confirms the validation didn't bypass the existing
+/// `optional` handling.
+#[test]
+fn test_parent_n_negative_with_optional_suppresses_error_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(-1)?"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// Sanity check that ordinary non-negative `n` (both `Int` and a whole
+/// `Float`) is unaffected by the new validation.
+#[test]
+fn test_parent_n_non_negative_unaffected_1487() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a.b | parent(1)"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"b\":1}\n");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a.b | parent(1.0)"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"b\":1}\n");
+    Ok(())
+}
