@@ -2021,6 +2021,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    /// Unlike [`key_raw_unescaped`](Self::key_raw_unescaped), this answers
+    /// for an escaped span too -- including one whose escape is invalid --
+    /// since it exists only as a display fallback for a key that fails to
+    /// *decode* (#1642), not for hashing.
+    fn key_raw_source_span(&self) -> Option<&[u8]> {
+        match self {
+            StandardJson::String(s) => {
+                let raw = s.raw_bytes();
+                (raw.len() >= 2).then(|| &raw[1..raw.len() - 1])
+            }
+            _ => None,
+        }
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             StandardJson::Object(fields) => Some(*fields),

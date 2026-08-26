@@ -23,8 +23,9 @@ use indexmap::IndexMap;
 
 use super::document::{
     collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
-    effective_keys, effective_len_checked, key_is_malformed, DistinctKeyCursors, DocumentCursor,
-    DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, effective_len_checked, key_display_string, key_is_malformed,
+    DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields, DocumentValue,
+    IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
@@ -163,21 +164,16 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            // Before `key_str`, not after: YAML's `key_string` stringifies an
-            // undecodable key to `""` (#222's never-drop-a-key rule), so by
-            // the time `key_str` answers `Some`, the failure is already
-            // invisible. Wording matches the sibling `owned_from_standard_json`
-            // conversion #1192 fixed first.
-            if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::decode_failure(format!("{reason} in object key")));
-            }
-            // A key that will not stringify at all is not a decode failure --
-            // it is a key JSON's grammar never allowed (`{123: 1}`), which
-            // the semi-index accepted because `:` and `,` mean the same
-            // nothing to it. Dropping the field silently is #1194: it
-            // vanished from output while `length` went on counting it, the
-            // disagreement #1385's postmortem names as the thing to avoid.
-            let Some(key) = field.key_str() else {
+            // A key that will not *decode* (#1247/#1385) is preserved via
+            // its raw source span rather than raised on (#1642), matching
+            // `length`/`keys_unsorted`/`.`. A key that will not stringify
+            // at all is a different, structural fault -- a key JSON's
+            // grammar never allowed (`{123: 1}`), which the semi-index
+            // accepted because `:` and `,` mean the same nothing to it --
+            // and that still raises: dropping the field silently is #1194,
+            // the disagreement #1385's postmortem names as the thing to
+            // avoid.
+            let Some(key) = key_display_string(&field.key) else {
                 return Err(f.malformed_member_error());
             };
             map.insert(
@@ -271,15 +267,11 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         let mut map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            // Same key ordering as `to_owned_at_depth` above, same reason.
-            if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::decode_failure(format!("{reason} in object key")));
-            }
-            // Same two #1194 checks as `to_owned_at_depth` above, same
-            // reasons -- these two conversions are copies of each other and a
-            // fix that moved only one would leave the cursor and value
-            // domains disagreeing about whether a document is valid.
-            let Some(key) = field.key_str() else {
+            // Same key handling as `to_owned_at_depth` above, same reasons --
+            // these two conversions are copies of each other and a fix that
+            // moved only one would leave the cursor and value domains
+            // disagreeing about whether a document is valid.
+            let Some(key) = key_display_string(&field.key) else {
                 return Err(f.malformed_member_error());
             };
             map.insert(
@@ -686,38 +678,43 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         let mut key_comment_map = IndexMap::new();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            // Same key ordering as `to_owned_at_depth`, same reason (#1247).
-            if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::decode_failure(format!("{reason} in object key")));
-            }
-            if let Some(key) = field.key_str() {
-                let key = key.into_owned();
-                let (v, c) = to_owned_with_comments_at_depth(
-                    &field.value,
-                    Some(&field.value_cursor),
-                    depth + 1,
-                )?;
-                map.insert(key.clone(), v);
-                comment_map.insert(key.clone(), c);
-                // A comment trailing the key's own line, when the value is
-                // deferred to a following line (issue #765) - distinct from
-                // `c`'s own comment above, which belongs to the value.
-                // Recorded alongside whether the deferred value
-                // materialized as nothing at all (a sibling key follows, or
-                // EOF): a folded scalar continuation that merely *reads* as
-                // null (`a: # c\n  null`) is a different, unhandled case
-                // where real yq places the comment after the folded value
-                // instead of right after the key, which `v`/`is_null()`
-                // alone can't tell apart from true absence - both collapse
-                // through the same semantic check `to_owned` uses - so this
-                // also checks the raw text is empty, not just null-ish.
-                if let Some(kc) = field.key_cursor.line_comment_raw() {
-                    let value_absent = field.value.is_null()
-                        && field.value.as_str().map_or(true, |s| s.is_empty());
-                    key_comment_map.insert(key, (kc, value_absent));
-                }
+            // Same key handling as `to_owned_at_depth`, same reasons
+            // (#1247/#1642): preserve a decode-failure key via its raw
+            // source span; still raise on a key the format's grammar never
+            // allowed at all (#1194) -- this arm used to silently drop such
+            // a field instead of raising, the same swallow #1194 names.
+            let Some(key) = key_display_string(&field.key) else {
+                return Err(f.malformed_member_error());
+            };
+            let key = key.into_owned();
+            let (v, c) = to_owned_with_comments_at_depth(
+                &field.value,
+                Some(&field.value_cursor),
+                depth + 1,
+            )?;
+            map.insert(key.clone(), v);
+            comment_map.insert(key.clone(), c);
+            // A comment trailing the key's own line, when the value is
+            // deferred to a following line (issue #765) - distinct from
+            // `c`'s own comment above, which belongs to the value.
+            // Recorded alongside whether the deferred value
+            // materialized as nothing at all (a sibling key follows, or
+            // EOF): a folded scalar continuation that merely *reads* as
+            // null (`a: # c\n  null`) is a different, unhandled case
+            // where real yq places the comment after the folded value
+            // instead of right after the key, which `v`/`is_null()`
+            // alone can't tell apart from true absence - both collapse
+            // through the same semantic check `to_owned` uses - so this
+            // also checks the raw text is empty, not just null-ish.
+            if let Some(kc) = field.key_cursor.line_comment_raw() {
+                let value_absent =
+                    field.value.is_null() && field.value.as_str().map_or(true, |s| s.is_empty());
+                key_comment_map.insert(key, (kc, value_absent));
             }
             f = rest;
+        }
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
         }
         Ok((
             OwnedValue::Object(map),
@@ -6909,24 +6906,21 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // A loop for the same reason as the array arm above.
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for field in effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
-                    // Key decode checked before `key_str`, as everywhere else
-                    // (#1247) -- YAML stringifies an undecodable key to `""`.
-                    if let Some(reason) = field.key.string_decode_error() {
-                        return GenericResult::Error(EvalError::decode_failure(format!(
-                            "{reason} in object key"
-                        )));
-                    }
-                    // `continue` here was #1194's third drop site: an entry
-                    // vanished from the array while `length` still counted
-                    // the member it came from.
+                    // A key that will not *decode* is preserved via its raw
+                    // source span rather than raised on (#1247/#1642),
+                    // matching `length`/`keys_unsorted`/`.`. `continue` here
+                    // was #1194's third drop site: an entry vanished from
+                    // the array while `length` still counted the member it
+                    // came from.
                     //
-                    // Unreachable as it stands -- `malformed_object_member`
-                    // above has already proved every key stringifies -- but
-                    // `key_str` is an `Option` and something has to be
-                    // written here. Report the same cause rather than invent
-                    // a second one, so that if the pre-check is ever moved
-                    // this arm is still right rather than merely quiet.
-                    let Some(key) = field.key_str() else {
+                    // The `else` is unreachable as it stands --
+                    // `malformed_object_member` above has already proved
+                    // every key stringifies -- but `key_display_string` is
+                    // an `Option` and something has to be written here.
+                    // Report the same cause rather than invent a second one,
+                    // so that if the pre-check is ever moved this arm is
+                    // still right rather than merely quiet.
+                    let Some(key) = key_display_string(&field.key) else {
                         return GenericResult::Error(fields.malformed_member_error());
                     };
                     let mut entry = IndexMap::new();
@@ -7323,20 +7317,25 @@ mod tests {
         );
     }
 
-    /// #1247: the same for an undecodable *key*, which used to drop the
-    /// whole field instead of degrading its value.
+    /// #1247 used to raise on an undecodable *key* here (closing the
+    /// original fault: it used to drop the whole field instead of
+    /// degrading its value). #1642 preserves it instead, via its raw
+    /// source span (lossily decoded), matching `length`/`keys_unsorted`/
+    /// `.`.
     #[test]
-    fn test_to_owned_errors_on_object_key_decode_failure_1247() {
+    fn test_to_owned_preserves_object_key_decode_failure_1642() {
         use crate::json::JsonIndex;
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let err = to_owned(&value).expect_err("an undecodable key must not materialize");
-        assert!(
-            err.message.contains("in object key"),
-            "message: {}",
-            err.message
+        let owned = to_owned(&value).expect("an undecodable key is preserved, not raised on");
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([(
+                "\u{FFFD}\u{FFFD}".to_string(),
+                OwnedValue::from_number_literal("1")
+            )]))
         );
     }
 
@@ -13559,18 +13558,33 @@ mod tests {
     // cursor-carrying variant instead, so `One`/`Many` only ever arise when
     // the ambient cursor is `None` to begin with.
 
-    /// `to_owned_with_comments` mirrors `to_owned`'s decode-failure checks
-    /// (#1247) -- this covers the object-key check specifically, since #1247
-    /// added it to this function too, not just `to_owned_at_depth`.
+    /// `to_owned_with_comments` mirrors `to_owned`'s key handling -- this
+    /// covers the object-key case specifically, since #1247 added its check
+    /// to this function too, not just `to_owned_at_depth`, and #1642
+    /// changed both from raising to preserving in the same way.
     #[test]
-    fn test_to_owned_with_comments_errors_on_object_key_decode_failure_1247() {
+    fn test_to_owned_with_comments_preserves_object_key_decode_failure_1642() {
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let err = to_owned_with_comments(&value, Some(&cursor))
-            .expect_err("an undecodable key must not materialize");
-        assert!(err.message.contains("in object key"), "{err:?}");
+        let (owned, comments) = to_owned_with_comments(&value, Some(&cursor))
+            .expect("an undecodable key is preserved, not raised on");
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([(
+                "\u{FFFD}\u{FFFD}".to_string(),
+                OwnedValue::from_number_literal("1")
+            )]))
+        );
+        let CommentTree::Object(_, comment_map, key_comment_map) = comments else {
+            panic!("expected CommentTree::Object: {comments:?}");
+        };
+        assert!(
+            comment_map.contains_key("\u{FFFD}\u{FFFD}"),
+            "{comment_map:?}"
+        );
+        assert!(key_comment_map.is_empty(), "{key_comment_map:?}");
     }
 
     /// The value-side sibling of the test above: a field whose *value* (not
@@ -13772,9 +13786,11 @@ mod tests {
     /// falls back to `materialize_lazy_keys`, which decodes every key --
     /// `keys` (not `keys_unsorted`, which stays lazy) over a document with an
     /// undecodable key reaches this on both output formats. CLI-reachable:
-    /// `sjq keys`/`syq keys` over such a document.
+    /// `sjq keys`/`syq keys` over such a document. #1247 raised here;
+    /// #1642 preserves the key via its raw source span instead, matching
+    /// every other `keys`/`length`/`.` route.
     #[test]
-    fn test_stream_sorted_lazy_keys_arm_reports_decode_failure_1247() {
+    fn test_stream_sorted_lazy_keys_arm_preserves_decode_failure_1642() {
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
 
         let index = JsonIndex::build(json);
@@ -13789,15 +13805,15 @@ mod tests {
         let stats = result
             .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
             .unwrap();
-        assert_eq!(out, "");
-        assert!(stats.error.is_some());
+        assert!(stats.error.is_none(), "{:?}", stats.error);
+        assert_eq!(out, "[\"\u{FFFD}\u{FFFD}\"]");
 
         let mut out = String::new();
         let stats = result
             .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
             .unwrap();
-        assert_eq!(out, "");
-        assert!(stats.error.is_some());
+        assert!(stats.error.is_none(), "{:?}", stats.error);
+        assert_eq!(out, "- \u{FFFD}\u{FFFD}");
     }
 
     /// `stream_json`'s `LazySeq` arm falls back to materializing each
@@ -13942,26 +13958,35 @@ mod tests {
     /// too, so with `keys` (sorted) it falls through the same as any other
     /// non-`length` stage. CLI-reachable: `sjq 'keys | .[0]'`.
     #[test]
-    fn test_fold_lazy_keys_stage_catchall_decode_failure_1247() {
+    fn test_fold_lazy_keys_stage_catchall_preserves_decode_failure_1642() {
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let result = eval_with_cursor(&crate::jq::parse("keys | .[0]").unwrap(), cursor);
-        assert!(result.is_error(), "{result:?}");
+        match result {
+            GenericResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "\u{FFFD}\u{FFFD}"),
+            other => panic!("expected Owned(String(..)): {other:?}"),
+        }
     }
 
     /// `each_lazy_keys_iterate_sink`'s sorted branch (#1599) decodes and
     /// sorts every key via `effective_keys` before iterating -- reached by
     /// `keys | .[]` (the demand-driven `Expr::Iterate` fan-out over a lazy
-    /// keys result) over a document with an undecodable key.
+    /// keys result) over a document with an undecodable key. #1247 raised
+    /// here; #1642 preserves the key instead.
     /// CLI-reachable: `sjq 'keys | .[]'`.
     #[test]
-    fn test_each_lazy_keys_iterate_sink_sorted_decode_failure_1247() {
+    fn test_each_lazy_keys_iterate_sink_sorted_preserves_decode_failure_1642() {
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let result = eval_with_cursor(&crate::jq::parse("keys | .[]").unwrap(), cursor);
-        assert!(result.is_error(), "{result:?}");
+        match result {
+            GenericResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())]);
+            }
+            other => panic!("expected ManyOwned([..]): {other:?}"),
+        }
     }
 
     /// `eval_index_expr`'s "key outer, target inner" loop takes its
