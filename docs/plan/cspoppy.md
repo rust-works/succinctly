@@ -448,6 +448,111 @@ favourably (as #595's theory would predict) or something else stays an open
 question. Revisit if ARM instruction-counting tooling becomes available on
 the sanctioned bench hosts, or if the effect ever flips to a regression.
 
+### 5d. Issue #1587 follow-up (2026-08-26): the anomaly is a codegen-units artifact, not an unavoidable recompile cost
+
+Re-checked #595's "expected, no action" call using #1587's finding: this crate
+has no `[profile.release]`, so it builds at Rust's default `codegen-units =
+16`, and an unrelated code change can reshuffle binary layout on every
+rebuild. §5b's cachegrind numbers were captured under that default profile;
+this re-runs the identical `becd1b8d`/`09158571` comparison on `terminus`
+using the same `scripts/perf-ab.py --tool cachegrind` harness (now carrying
+#1587's `--before-profile`/`--after-profile` recording), same box, same
+session, same 5 reps × 50 iterations — with only the codegen-units setting
+changed between the two runs below.
+
+**`terminus`, default profile (`codegen-units=16`, rebuilt today):**
+
+| shape              | Ir Δ  | I1mr Δ  | ILmr Δ |
+|--------------------|-------|---------|--------|
+| 10x10lines         | -0.1% | +27.2%  | -0.4%  |
+| 50x50lines         | -0.0% | +22.4%  | -0.4%  |
+| 100x100lines       | -0.0% | +17.4%  | -0.4%  |
+| 10x1000lines       | -0.0% | +23.3%  | -0.4%  |
+| long_10x100lines   | -0.0% | +27.6%  | -0.4%  |
+| long_50x100lines   | -0.0% | +14.1%  | -0.5%  |
+| long_100x100lines  | -0.0% | +11.8%  | -0.5%  |
+
+Median I1mr Δ **+22.45%**, essentially reproducing §5b's original
++11.8%..+27.7% almost exactly — same box, same commits, five months later,
+so the artifact is not a one-off.
+
+**Same box, same commits, same session — `codegen-units=1` on both sides:**
+
+| shape              | Ir Δ  | I1mr Δ  | ILmr Δ |
+|--------------------|-------|---------|--------|
+| 10x10lines         | -0.1% | -14.9%  | -0.0%  |
+| 50x50lines         | -0.0% | -19.1%  | -0.1%  |
+| 100x100lines       | -0.0% | -10.7%  | -0.2%  |
+| 10x1000lines       | -0.0% | -7.8%   | -0.1%  |
+| long_10x100lines   | -0.0% | -8.7%   | -0.1%  |
+| long_50x100lines   | -0.0% | -10.0%  | -0.1%  |
+| long_100x100lines  | -0.0% | +1.3%   | -0.2%  |
+
+Median I1mr Δ **-10.02%** — not just reduced but reversed in sign, on the
+same seven shapes that read +11.8%..+27.6% one env var earlier. `Ir` stayed
+flat in both runs, and the checksum identity gate passed 7/7 both times —
+nothing about the underlying `YamlIndex::build` work changed between binaries
+either time; only the compiler's layout choice did.
+
+**`johns-mac-mini` (M4 Pro, ARM), `--tool wallclock`, 9 interleaved reps ×
+200 iterations** — checked too, to complete the cross-arch record rather
+than assume "already neutral" needed no re-run:
+
+**Default profile (`codegen-units=16`, rebuilt today):**
+
+| shape              | min ms Δ | median ms Δ |
+|--------------------|----------|-------------|
+| 10x10lines         | -0.9%    | -1.2%       |
+| 50x50lines         | -0.5%    | +0.3%       |
+| 100x100lines       | +0.6%    | +0.5%       |
+| 10x1000lines       | +0.2%    | +0.2%       |
+| long_10x100lines   | -9.3%    | -7.5%       |
+| long_50x100lines   | -9.7%    | -8.6%       |
+| long_100x100lines  | -9.7%    | -9.4%       |
+
+Matches §5b/§5c's established pattern exactly: short shapes neutral, `long_*`
+shapes read as a ~7-10% "improvement" — the one #649 investigated and left
+with "mechanism unconfirmed, no ARM instruction-counting tool available."
+
+**Same box, same commits, same session — `codegen-units=1` on both sides:**
+
+| shape              | min ms Δ | median ms Δ |
+|--------------------|----------|-------------|
+| 10x10lines         | +1.4%    | -1.3%       |
+| 50x50lines         | +0.5%    | -0.0%       |
+| 100x100lines       | +0.1%    | +0.1%       |
+| 10x1000lines       | -0.2%    | -0.0%       |
+| long_10x100lines   | -2.6%    | -0.8%       |
+| long_50x100lines   | -2.6%    | -1.8%       |
+| long_100x100lines  | -0.4%    | -2.1%       |
+
+Short shapes stay inside §5b's own established control band (-1.0%..+0.4%)
+either way — consistent with the original "neutral" call, which was correct
+on those four shapes and is why they weren't the ones under suspicion. The
+`long_*` "improvement" #649 could not explain shrinks from ~7-10% to
+~0-2.6% under the identical pin that erased #595's x86 regression. A small
+residual remains at 9 reps and isn't chased further here — an order of
+magnitude smaller than the original effect, and #649's own framing
+("improvement, not a regression, no user-facing harm, revisit if it ever
+flips to a regression") already covers a residual this size.
+
+**Conclusion: #595's diagnosis stands ("layout, not logic") but its framing
+needs correcting, and the same fix substantially explains #649 too.** §5b's
+cachegrind evidence that this was a code-layout/cache artifact rather than
+real extra work was right — but "binary code-layout artifact from the
+recompile," closed as expected and unavoidable, was not quite right either.
+The layout shift is not an intrinsic property of recompiling; it is a direct
+consequence of this crate's unpinned `codegen-units=16` default (#1587).
+Pinning `codegen-units=1` on both sides — now documented as [A/B
+Benchmarking Method § 9](../guides/benchmarking.md#a-b-benchmarking-method)
+— removes #595's x86 regression entirely in a same-session, same-box,
+same-commit re-run (even reversing its sign), and collapses most of #649's
+unexplained ARM `long_*` "improvement" down to noise-adjacent levels in the
+same re-run. Filed under #1587 rather than reopening either #595 or #649,
+since no action is needed against CS-Poppy's logic in any case; recorded
+here so a future reader doesn't take either issue's original framing as the
+final word on *why* the numbers moved.
+
 ---
 
 ## 6. Future developments
