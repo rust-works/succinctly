@@ -22,9 +22,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, collapsed_fields_if, effective_fields, effective_keys, effective_len_checked,
-    key_is_malformed, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec,
+    collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
+    effective_keys, effective_len_checked, key_is_malformed, DistinctKeyCursors, DocumentCursor,
+    DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, collapse_vec, eval as full_eval, eval_each_owned,
@@ -3764,14 +3764,28 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // yq is inconsistent here and does collapse under `.[]`
                 // traversal alone (confirmed live against yq v4.53.3), so
                 // this always passes `true` rather than the mode flag.
-                let cursors: Vec<_> = effective_fields(&fields, true)
-                    .into_iter()
-                    .map(|field| field.value_cursor)
-                    .collect();
-                if cursors.is_empty() {
-                    GenericResult::None
-                } else {
-                    GenericResult::ManyCursor(cursors)
+                //
+                // `_checked`: an object member the semi-index accepted but
+                // JSON does not (a bareword key, an unpaired trailing child,
+                // #1194) used to reach here silently, because
+                // `effective_fields`'s walk discards the exhausted tail that
+                // is the only place `ends_unpaired` can still answer (#1641).
+                // The check is free here -- it rides the same walk this arm
+                // already ran unconditionally, same as `effective_len_checked`
+                // does for `length`.
+                match effective_fields_checked(&fields, true) {
+                    Ok(effective) => {
+                        let cursors: Vec<_> = effective
+                            .into_iter()
+                            .map(|field| field.value_cursor)
+                            .collect();
+                        if cursors.is_empty() {
+                            GenericResult::None
+                        } else {
+                            GenericResult::ManyCursor(cursors)
+                        }
+                    }
+                    Err(err) => GenericResult::Error(err),
                 }
             } else if let Some(reason) = value.string_decode_error() {
                 GenericResult::Error(EvalError::decode_failure(reason))

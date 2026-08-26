@@ -1094,6 +1094,41 @@ pub fn effective_fields<F: DocumentFields>(
     }
 }
 
+/// [`effective_fields`], refusing an object whose members the format's
+/// grammar never allowed (#1194).
+///
+/// The value-cursor-carrying counterpart of [`effective_len_checked`], for a
+/// caller that needs the fields themselves (`.[]`'s bare object arm) rather
+/// than just a count. The check and the field list come out of the same
+/// walk this function was already making, for the reason
+/// `effective_len_checked`'s own doc comment gives: a caller-side pre-check
+/// (`malformed_object_member`) would double the cost of a walk this function
+/// already runs. `to_entries` is the one caller for which that redundant
+/// walk is negligible (it materializes every value regardless), which is
+/// why it keeps using the pre-check instead.
+#[allow(clippy::type_complexity)] // STYLE-0004: mirrors effective_fields's own Vec<DocumentField<..>>, plus a Result for the #1194 check; a named alias would add indirection for one extra wrapper.
+pub fn effective_fields_checked<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<DocumentField<F::Value, F::Cursor>>, EvalError> {
+    let mut out = Vec::new();
+    let mut walk = fields.clone();
+    while let Some((field, rest)) = walk.uncons() {
+        if key_is_malformed(&field.key) {
+            return Err(walk.malformed_member_error());
+        }
+        out.push(field);
+        walk = rest;
+    }
+    if walk.ends_unpaired() {
+        return Err(walk.malformed_member_error());
+    }
+    if collapse && keys_repeat(&out) {
+        out = collapse_repeated(out);
+    }
+    Ok(out)
+}
+
 /// The collapsed field list, or `None` when no key repeats.
 ///
 /// Lets a caller keep whatever zero-allocation fast path it already has for
