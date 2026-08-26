@@ -3908,24 +3908,42 @@ where
                         // same reason (its own comment explains why: a
                         // malformed document must not leave a partial `{`
                         // -- or here, `[` -- already on `out` when the
-                        // error surfaces). Caches each element's own
-                        // `text_position()` along the way, since it's
-                        // needed for the check anyway, so the write loop
-                        // below doesn't make `print_json`'s recursion
-                        // re-derive the same rank/select lookup a second
-                        // time -- a version that didn't cache measured
-                        // 19-30% slower on `sjq -c .` (#1643, see the PR).
-                        let mut positions = Vec::new();
+                        // error surfaces).
+                        //
+                        // Walked exactly once: a first cut called
+                        // `elements.cursor_iter()` a second time for the
+                        // write loop, re-navigating the same BP siblings
+                        // it had just walked for the check -- the same
+                        // shape of re-walk the object arm's own comment
+                        // below measured at 8-9% of `sjq '.'` over a 10 MB
+                        // document, and here it cost 12-15% of instruction
+                        // count on a large flat array (#1643 perf-guard
+                        // failure, arrays_identity). Recording each
+                        // element's BP position -- not a whole
+                        // `JsonCursor`, for the same reason `PreparedField`
+                        // hoists `text`/`index` into `Frame` rather than
+                        // storing them per element -- plus its
+                        // already-resolved `text_position()` lets the
+                        // write loop reconstruct the cursor via
+                        // `Frame::cursor` instead of re-deriving it.
+                        let frame = Frame {
+                            text: c.text(),
+                            index: c.index(),
+                        };
+                        let mut prepared: Vec<(usize, usize)> = Vec::new();
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
-                            positions.push(check_preceding_delimiter(&child_cursor, i)?);
+                            let pos = check_preceding_delimiter(&child_cursor, i)?;
+                            prepared.push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
                         }
                         if compact {
                             out.write_all(b"[")?;
-                            for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            for (i, &(bp, value_start)) in prepared.iter().enumerate() {
                                 if i > 0 {
                                     out.write_all(b",")?;
                                 }
-                                let child_value = JqValue::Cursor(child_cursor);
+                                let child_value = JqValue::Cursor(frame.cursor(bp));
+                                let known_text_pos =
+                                    (value_start != usize::MAX).then_some(value_start);
                                 print_json(
                                     out,
                                     &child_value,
@@ -3933,20 +3951,22 @@ where
                                     config,
                                     level + 1,
                                     scratch,
-                                    positions[i],
+                                    known_text_pos,
                                 )?;
                             }
                             out.write_all(b"]")?;
                         } else {
                             out.write_all(b"[")?;
                             out.write_all(separator.as_bytes())?;
-                            for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                            for (i, &(bp, value_start)) in prepared.iter().enumerate() {
                                 if i > 0 {
                                     out.write_all(b",")?;
                                     out.write_all(separator.as_bytes())?;
                                 }
                                 out.write_all(next_indent.as_bytes())?;
-                                let child_value = JqValue::Cursor(child_cursor);
+                                let child_value = JqValue::Cursor(frame.cursor(bp));
+                                let known_text_pos =
+                                    (value_start != usize::MAX).then_some(value_start);
                                 print_json(
                                     out,
                                     &child_value,
@@ -3954,7 +3974,7 @@ where
                                     config,
                                     level + 1,
                                     scratch,
-                                    positions[i],
+                                    known_text_pos,
                                 )?;
                             }
                             out.write_all(separator.as_bytes())?;
