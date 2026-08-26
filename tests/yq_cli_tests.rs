@@ -22532,6 +22532,111 @@ fn test_lazy_keys_streaming_preserves_yaml_duplicates_1599() -> Result<()> {
     Ok(())
 }
 
+/// #1607: `limit`/`nth` over `keys | .[]` used to disagree with the
+/// collecting path (`[keys | .[]]`) on the same duplicate-key document —
+/// `[limit(3; keys|.[])]` capped at 2 keys regardless of how large `n` was
+/// (`limit(9; ...)` gave the identical, wrong answer), and `nth(2; ...)`
+/// produced nothing at all. Root cause: `Expr::Limit`/`Builtin::NthStream`
+/// had no native arm in the generic evaluator, so both fell to the `_`
+/// fallback that materializes the whole input into an `OwnedValue` before
+/// `expr` ever runs — and `OwnedValue::Object` is `IndexMap`-backed and
+/// cannot represent a duplicate mapping key, unlike `keys|.[]` alone (via
+/// `GenericResult::LazyKeys`/`DistinctKeyCursors`), which already preserved
+/// them correctly. Mirrors #607's identical fix for `first`/`last`.
+#[test]
+fn test_limit_and_nth_over_lazy_keys_preserve_yaml_duplicates_1607() -> Result<()> {
+    let dup = "b: 1\na: 2\nb: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+
+    // The reference: the collecting path already preserves every duplicate.
+    let (out, code) = run_yq_stdin("[keys | .[]]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","a","b"]"#);
+
+    // `limit` must agree with it at every `n`, including past the document's
+    // own key count (`n` capping the *output*, not silently capping at the
+    // first duplicate regardless of `n`).
+    for (n, want) in [
+        (1, r#"["b"]"#),
+        (2, r#"["b","a"]"#),
+        (3, r#"["b","a","b"]"#),
+        (9, r#"["b","a","b"]"#),
+    ] {
+        let (out, code) = run_yq_stdin(&format!("[limit({n}; keys|.[])]"), dup, &args)?;
+        assert_eq!(code, 0, "limit({n}; ...)");
+        assert_eq!(out.trim(), want, "limit({n}; ...)");
+    }
+
+    // `nth` must reach the second occurrence of the duplicated key too, not
+    // just the first.
+    for (n, want) in [(0, r#""b""#), (1, r#""a""#), (2, r#""b""#)] {
+        let (out, code) = run_yq_stdin(&format!("nth({n}; keys|.[])"), dup, &args)?;
+        assert_eq!(code, 0, "nth({n}; ...)");
+        assert_eq!(out.trim(), want, "nth({n}; ...)");
+    }
+    // Past the last key: no output, not an error.
+    let (out, code) = run_yq_stdin("nth(3; keys|.[])", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "");
+
+    Ok(())
+}
+
+/// #1607 follow-up: control-flow edge cases the native `limit`/`nth` arms
+/// must still get right once duplicate keys stopped being the reason to
+/// take the `_` fallback -- these don't depend on any duplicate key at all,
+/// just on the sink/`Flow` reconciliation `eval_limit_generic`/
+/// `eval_nth_generic` reimplement from `eval.rs`'s `each_take_n`/
+/// `each_take_nth`.
+#[test]
+fn test_limit_and_nth_control_flow_1607() -> Result<()> {
+    // `n == 0` is the empty result, not an error.
+    let (out, code) = run_yq_stdin(
+        "[limit(0; keys|.[])]",
+        "a: 1\nb: 2\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+
+    // A negative `n` is unlimited for `limit` (#983) -- every output passes
+    // through unchanged, including both occurrences of a duplicate key.
+    let (out, code) = run_yq_stdin(
+        "[limit(-1; keys|.[])]",
+        "b: 1\na: 2\nb: 3\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","a","b"]"#);
+
+    // A negative `n` is instead an error for `nth`, not unlimited --
+    // `eval_nth_generic` must reproduce `builtin_nth_stream`'s classification
+    // (and its exact message), not `eval_nth_expr`'s different one.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        "nth(-1; keys|.[])",
+        "a: 1\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("nth doesn't support negative indices"),
+        "stderr: {stderr}"
+    );
+
+    // A generator `n` (`limit((1,2); f)`, re-running `f` once per `n` value,
+    // #1279) is deliberately left on the deferred fallback -- confirm it
+    // still gets the right, jq-parity answer through that path.
+    let (out, code) = run_yq_stdin(
+        "[limit((1,2); (10,20,30))]",
+        "null\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[10,10,20]");
+
+    Ok(())
+}
+
 /// #1247: a mapping key that fails to decode must not hide the *valid*
 /// fields after it. `YamlFields::find`/`find_cursor` used to `?` out of the
 /// whole search on the first undecodable key, so `.b` answered `null` here

@@ -27,11 +27,12 @@ use super::document::{
     DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, arith_combine, collapse_vec, eval as full_eval, eval_each_owned,
-    format_owned, index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
-    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
-    slice_owned_value_read, tonumber_from_str, try_reserve_product, Control, Demand, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, QueryResult, YqSemantics,
+    apply_compare_op, arith_combine, classify_limit_n, collapse_vec, eval as full_eval,
+    eval_each_owned, format_owned, index_one_owned as index_owned_by_key, literal_to_owned,
+    needs_path_context, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
+    slice_object_as_yq_children, slice_owned_value_read, tonumber_from_str, try_reserve_product,
+    Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult,
+    YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType};
 use super::slice::{slice_str, SliceBounds};
@@ -3931,6 +3932,60 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
         }
 
+        // Same reasoning as `FirstExpr`/`LastExpr` above (#607), a second
+        // instance of it (#1607): the `_` fallback below materializes the
+        // whole input via `to_owned()` before `expr` ever runs, so
+        // `limit(n; keys|.[])` on a document with a duplicate mapping key
+        // lost every duplicate — `OwnedValue::Object` is `IndexMap`-backed
+        // and cannot represent them, even though `keys|.[]` alone (via
+        // `LazyKeys`/`DistinctKeyCursors`) already preserves them correctly.
+        // `eval_limit_generic` only takes over the common case (`n_expr`
+        // evaluates to one plain value); see its own doc comment for why a
+        // generator `n` is left on the pre-existing path below.
+        Expr::Limit { n, expr } => {
+            match eval_limit_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
+                Some(result) => result,
+                None => {
+                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                    eval_on_owned::<S, _>(
+                        &Expr::Limit {
+                            n: n.clone(),
+                            expr: expr.clone(),
+                        },
+                        owned,
+                        optional,
+                    )
+                }
+            }
+        }
+
+        // A CLI `nth(n; expr)` always parses to `Builtin::NthStream` (see
+        // that arm in `eval_builtin`, where the real fix lives) --
+        // `Expr::NthExpr` itself is never freshly constructed by the parser,
+        // only passed through unchanged by AST rewrites like
+        // `substitute_var` (see `eval.rs`'s `eval_nth_expr_n_argument_
+        // propagates_halt` for the same note on its `eval.rs` counterpart).
+        // Handled here anyway, at the same cost as the arm above, so a
+        // rewrite-preserved `NthExpr` gets the identical duplicate-key fix
+        // rather than silently falling back to the lossy path depending on
+        // which of the two spellings it happens to carry.
+        Expr::NthExpr { n, expr } => {
+            match eval_nth_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
+                Some(result) => result,
+                None => {
+                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                    eval_on_owned::<S, _>(
+                        &Expr::NthExpr {
+                            n: n.clone(),
+                            expr: expr.clone(),
+                        },
+                        owned,
+                        optional,
+                    )
+                }
+            }
+        }
+
         // #1062: was a hand-rolled arm-for-arm copy of the same six
         // `Literal` variants (one of three targeting `OwnedValue` -- see
         // `literal_to_owned`'s own doc comment for the other two); delegates
@@ -4933,6 +4988,182 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Partial(_, Control::Error(e)) => GenericResult::Error(e),
         GenericResult::Partial(_, Control::Break(label)) => GenericResult::Break(label),
         GenericResult::Partial(_, Control::Halt(code)) => GenericResult::Halt(code),
+    }
+}
+
+/// Native `Expr::Limit` arm for the generic evaluator (#1607) — the same
+/// fix `eval_first_or_last_generic` already applies to `first`/`last`
+/// (#607), a second instance of the same root cause: `eval_single`'s `_`
+/// fallback materializes the whole input into an `OwnedValue` before `expr`
+/// ever runs, and `OwnedValue::Object` is `IndexMap`-backed and cannot
+/// represent a duplicate mapping key. `limit(n; keys|.[])` on a document
+/// with one silently dropped every duplicate that `keys|.[]` alone (via
+/// `GenericResult::LazyKeys`/`DistinctKeyCursors`) already preserves
+/// correctly, regardless of `S::COLLAPSE_DUPLICATE_KEYS`.
+///
+/// Returns `None` to defer to the caller's own fallback rather than
+/// handling every shape `eval.rs`'s `eval_limit`/`fanout_arg` do: only the
+/// common case — `n_expr` evaluates to exactly one plain value — is taken
+/// natively here, via [`eval_each_generic`]'s own demand-driven `Pipe`/
+/// `Iterate`/`LazyKeys` machinery (what keeps `expr`'s duplicate keys
+/// alive). `n_expr` as a *generator* (`limit((1,2); f)`, re-running `expr`
+/// once per `n` value, #1279) is jq's own rarer laziness contract, which
+/// `eval.rs`'s `fanout_arg` already implements correctly for every
+/// document `eval.rs` can represent losslessly — reproducing that richness
+/// here isn't needed to fix this issue's actual bug. The cost of deferring
+/// is `n_expr` being evaluated a second time by the caller's fallback, in
+/// the rare case it isn't a plain single value; a side-effecting `n_expr`
+/// (`limit(debug; f)`) would observe that, but this shape is not known to
+/// occur in practice and is out of this fix's scope.
+fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let n_value = match eval_single::<S, V>(n_expr, value.clone(), optional, cursor) {
+        GenericResult::One(v) => to_owned(&v).ok()?,
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
+        GenericResult::Owned(v) => v,
+        _ => return None,
+    };
+    let n = match classify_limit_n(n_value) {
+        Ok(LimitN::Unlimited) => {
+            return Some(eval_single::<S, V>(expr, value, optional, cursor));
+        }
+        Ok(LimitN::Take(n)) => n,
+        Err(e) => return Some(GenericResult::Error(e)),
+    };
+    if n == 0 {
+        return Some(GenericResult::None);
+    }
+
+    // Pull at most `n`, then stop the generator -- mirrors `eval.rs`'s own
+    // `each_take_n`, adapted to `eval_each_generic`'s `GenericItem` sink so
+    // a `LazyKeys` item stays cursor-backed (and duplicate-preserving)
+    // until `generic_item_into_owned` decodes it here.
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let mut stray: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        match generic_item_into_owned(item) {
+            Ok(v) => {
+                out.push(v);
+                if out.len() >= n {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            }
+            Err(control) => {
+                stray = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+    let satisfied = out.len() >= n;
+    // Mirrors `limit_with_n`'s own reconciliation: once `n` outputs arrived,
+    // jq's own `foreach ... break $out` fires, so a trailing control --
+    // `eval_each_generic` escaping natively, or a lazy item that failed to
+    // materialize here (`stray`, which has no `eval.rs` counterpart since
+    // `Item` there is never itself lazy) -- is dropped; short of `n`, it
+    // surfaces instead (`[limit(3; 1,2,error("x"),4)]` raises).
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => stray,
+        Flow::Escaped(control) => Some(control),
+    };
+    Some(match control {
+        Some(control) if !satisfied => partial_generic(out, control),
+        _ => owned_vec_to_generic_result(out),
+    })
+}
+
+/// Native `Builtin::NthStream`/`Expr::NthExpr` arm for the generic evaluator
+/// (#1607) — [`eval_limit_generic`]'s twin, same root cause, same deferral
+/// contract (see its doc comment). jq defines `nth($n; f)` as `last(limit($n
+/// + 1; f))`, so this pulls only as far as index `n` then stops, mirroring
+/// `eval.rs`'s own `each_take_nth`.
+///
+/// `n`'s classification (accept `Int`/`Float`/`NumberLiteral`, negative ->
+/// "nth doesn't support negative indices", anything else -> a type error)
+/// matches `builtin_nth_stream` exactly, not `eval_nth_expr`'s narrower
+/// integer-only rule — `Builtin::NthStream` is the arm real `nth(n; expr)`
+/// calls actually reach (see this function's call sites), so its
+/// classification is the one this native path must reproduce bug-for-bug.
+fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let n_value = match eval_single::<S, V>(n_expr, value.clone(), optional, cursor) {
+        GenericResult::One(v) => to_owned(&v).ok()?,
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
+        GenericResult::Owned(v) => v,
+        _ => return None,
+    };
+    let n = match n_value {
+        ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
+            let f = owned.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                return Some(GenericResult::Error(EvalError::new(
+                    "nth doesn't support negative indices",
+                )));
+            }
+            owned.as_i64().map_or(f as usize, |i| i as usize)
+        }
+        ref other => {
+            return Some(GenericResult::Error(EvalError::type_error(
+                "number",
+                other.type_name(),
+            )));
+        }
+    };
+
+    let mut seen = 0usize;
+    let mut wanted: Option<OwnedValue> = None;
+    let mut decode_err: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        if seen == n {
+            match generic_item_into_owned(item) {
+                Ok(v) => wanted = Some(v),
+                Err(control) => decode_err = Some(control),
+            }
+            seen += 1;
+            Demand::Stop
+        } else {
+            seen += 1;
+            Demand::Continue
+        }
+    });
+    // Mirrors `each_take_nth` + its caller's own priority exactly: a
+    // captured item at index `n` always wins, even over a trailing escape
+    // from beyond that point; a decode failure *at* index `n` surfaces as
+    // that error (no `eval.rs` counterpart, since `Item` there is never
+    // itself lazy); short of reaching index `n` at all, whatever ended the
+    // pull (exhaustion, or an escape before index `n`) decides.
+    Some(if let Some(v) = wanted {
+        GenericResult::Owned(v)
+    } else if let Some(control) = decode_err {
+        control_to_generic_result(control)
+    } else {
+        match flow {
+            Flow::Stopped { .. } | Flow::Exhausted => GenericResult::None,
+            Flow::Escaped(control) => control_to_generic_result(control),
+        }
+    })
+}
+
+/// Convert a bare [`Control`] into the [`GenericResult`] shape that
+/// terminates a stream with no successful output at all -- the
+/// zero-outputs-collected counterpart to [`partial_generic`], which handles
+/// the same three variants alongside a non-empty prefix.
+fn control_to_generic_result<V: DocumentValue>(control: Control) -> GenericResult<V> {
+    match control {
+        Control::Error(e) => GenericResult::Error(e),
+        Control::Break(label) => GenericResult::Break(label),
+        Control::Halt(code) => GenericResult::Halt(code),
     }
 }
 
@@ -6176,6 +6407,29 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
         Builtin::LastStream(inner) => {
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, true)
+        }
+
+        // `nth(n; expr)` (arity 2) parses straight to this `Builtin`
+        // spelling, not `Expr::NthExpr` -- unlike `first`/`last`/`limit`,
+        // whose parser rules build the dedicated `Expr` variant directly
+        // (confirmed in `parser.rs`: `nth`'s two-arg form returns
+        // `Builtin::NthStream`, no `Expr::NthExpr` construction site exists
+        // there at all). So this is the arm real `nth(n; expr)` calls
+        // actually reach, not `eval_single`'s `Expr::NthExpr` arm -- same
+        // #607/#1607 duplicate-key reasoning applies here, reusing
+        // `eval_nth_generic` rather than duplicating its logic.
+        Builtin::NthStream(n, expr) => {
+            match eval_nth_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
+                Some(result) => result,
+                None => {
+                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                    eval_on_owned::<S, _>(
+                        &Expr::Builtin(Builtin::NthStream(n.clone(), expr.clone())),
+                        owned,
+                        optional,
+                    )
+                }
+            }
         }
 
         Builtin::Reverse => {

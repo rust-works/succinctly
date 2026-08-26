@@ -3114,7 +3114,7 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// categorically instead of relying on a differential test to catch the
 /// next divergence.
 #[derive(Debug)]
-enum LimitN {
+pub(crate) enum LimitN {
     /// Unlimited passthrough: run the caller's own `expr`/`resolve_node`
     /// unbounded.
     Unlimited,
@@ -3122,7 +3122,7 @@ enum LimitN {
     Take(usize),
 }
 
-fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError> {
+pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError> {
     match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
             Ok(LimitN::Take(i as usize))
