@@ -4863,8 +4863,13 @@ fn test_debug_msg_argument_halt_propagates() -> Result<()> {
     // halt_error's introduction made `debug(msg)` the one builtin argument
     // position where a halt had zero effect -- no stderr write, no exit
     // code. Verified against jq 1.7.1: `jq -n 'debug(halt_error(3))'` exits
-    // 3 (the pre-existing no-print policy for `msg`'s *text* is unchanged;
-    // only its control effects must reach the process).
+    // 3 -- and, since #1594, `msg`'s own text no longer stays silent either
+    // (the library-context no-print policy this comment used to describe is
+    // gone entirely): a `halt_error` fires before `msg`'s value is ever
+    // produced, so no `["DEBUG:", ...]` line reaches stderr for *this*
+    // repro specifically, but that's `halt_error`'s own short-circuit, not a
+    // debug-line suppression -- see `test_debug_writes_the_debug_line_1594`
+    // for the case that does print.
     let (stdout, stderr, code) = run_jq_full(&["-n", "debug(halt_error(3)), \"after\""], None)?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
@@ -4887,6 +4892,48 @@ fn test_debug_msg_argument_error_propagates() -> Result<()> {
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
     assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1594: `debug`/`debug(msg)` were explicit, commented no-ops -- `.` passed
+/// through unchanged, nothing ever reached stderr. Real jq writes
+/// `["DEBUG:", value]` as compact JSON with a trailing newline. Verified
+/// byte-for-byte (via separate stdout/stderr file redirection, not this
+/// helper's own combined capture) against jq 1.7.1: `jq -cn '1 | debug'`
+/// writes `["DEBUG:",1]\n` to stderr and `1\n` to stdout.
+#[test]
+fn test_debug_writes_the_debug_line_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "1 | debug"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+/// #1594 companion: `debug(msg)` prints `msg`'s own evaluated value into the
+/// `["DEBUG:", ...]` line, not `.` -- but still passes `.` (not `msg`) through
+/// to stdout unchanged. Verified against jq 1.7.1: `jq -cn '1 | debug("hi")'`
+/// writes `["DEBUG:","hi"]\n` to stderr, `1\n` to stdout.
+#[test]
+fn test_debug_msg_writes_msgs_own_value_not_input_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", r#"1 | debug("hi")"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "[\"DEBUG:\",\"hi\"]\n");
+    assert_eq!(stdout, "1\n");
+    Ok(())
+}
+
+/// #1594 companion: real jq's own definition is `(msg|debug|empty), .`, so a
+/// multi-output `msg` writes one `["DEBUG:", ...]` line per output, in order
+/// -- not one line for the whole stream. Verified against jq 1.7.1:
+/// `jq -cn '1 | debug(("a","b"))'` writes two separate newline-terminated
+/// lines.
+#[test]
+fn test_debug_msg_multi_output_writes_one_line_per_output_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", r#"1 | debug(("a","b"))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "[\"DEBUG:\",\"a\"]\n[\"DEBUG:\",\"b\"]\n");
+    assert_eq!(stdout, "1\n");
     Ok(())
 }
 

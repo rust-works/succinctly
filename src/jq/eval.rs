@@ -5532,7 +5532,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::IsFinite => builtin_isfinite::<W>(value, optional),
 
         // Phase 10: Debug
-        Builtin::Debug => builtin_debug::<W>(value, optional),
+        Builtin::Debug => builtin_debug::<W, S>(value, optional),
         Builtin::DebugMsg(msg) => builtin_debug_msg::<W, S>(msg, value, optional),
 
         // Process control (#791)
@@ -31407,37 +31407,55 @@ fn builtin_isfinite<W: Clone + AsRef<[u64]>>(
 
 // Debug functions
 
-/// Builtin: debug - output value to stderr, pass through unchanged
-fn builtin_debug<W: Clone + AsRef<[u64]>>(
+/// Writes one `["DEBUG:", value]` line to stderr, matching jq 1.7.1
+/// byte-for-byte: compact JSON, a trailing newline -- unlike `stderr`'s own
+/// builtin just below, which has none (`jq -cn '1 | debug'` writes
+/// `["DEBUG:",1]\n` to stderr). Reuses `owned_value_to_json`, the same
+/// formatter `builtin_stderr` uses, so non-finite floats etc. render
+/// identically across both rather than re-deriving the jq/yq JSON-shape fork
+/// a second time.
+fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
+    write_stderr("[\"DEBUG:\",");
+    write_stderr(&owned_value_to_json::<S>(value));
+    write_stderr("]\n");
+}
+
+/// Builtin: debug - print `["DEBUG:", .]` to stderr, pass `.` through
+/// unchanged.
+fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // In a library context we don't actually print to stderr
-    // We just pass through the value unchanged
-    QueryResult::Owned(to_owned(&value))
+    let owned = to_owned(&value);
+    write_debug_line::<S>(&owned);
+    QueryResult::Owned(owned)
 }
 
-/// Builtin: debug(msg) - output message and value to stderr
+/// Builtin: debug(msg) - print `["DEBUG:", <msg output>]` to stderr once per
+/// output of `msg` (real jq's own definition is `(msg|debug|empty), .`, so a
+/// multi-output `msg` writes one line per output -- confirmed live:
+/// `debug(("a","b"))` writes two lines), then pass `.` (not `msg`'s value)
+/// through unchanged.
 fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     msg: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    // In a library context we don't actually print to stderr, matching
-    // `builtin_debug`'s own no-op policy — but `msg` still has to be
-    // evaluated for its control effects, even though its value is discarded:
-    // a halt reached while producing it (`debug(halt_error(3))`) must halt
-    // the process exactly as it would anywhere else `msg` could sit (#791),
-    // and a plain error must propagate too — real jq defines `debug(msg)` as
-    // `(msg|debug|empty), .` with no `try`/`?`, so an error raised while
-    // producing `msg` aborts the whole expression (verified live:
-    // `debug(error("boom"))` errors out in real jq rather than passing `.`
-    // through). This does not change the pre-existing no-print policy, only
-    // stops a halt/error from vanishing because the argument was never
-    // evaluated at all.
+    // `msg` still has to be evaluated for its control effects even before
+    // considering what to print: a halt reached while producing it
+    // (`debug(halt_error(3))`) must halt the process exactly as it would
+    // anywhere else `msg` could sit (#791), and a plain error must propagate
+    // too — real jq defines `debug(msg)` as `(msg|debug|empty), .` with no
+    // `try`/`?`, so an error raised while producing `msg` aborts the whole
+    // expression (verified live: `debug(error("boom"))` errors out in real
+    // jq rather than passing `.` through).
     let owned = to_owned(&value);
-    if let Err(escape) = eval_owned_multi::<S>(msg, &owned) {
-        return QueryResult::from(escape);
+    let msg_outputs = match eval_owned_multi::<S>(msg, &owned) {
+        Ok(outputs) => outputs,
+        Err(escape) => return QueryResult::from(escape),
+    };
+    for msg_value in &msg_outputs {
+        write_debug_line::<S>(msg_value);
     }
     QueryResult::Owned(owned)
 }

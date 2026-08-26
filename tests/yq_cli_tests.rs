@@ -1177,6 +1177,25 @@ fn test_yq_range_multi_output_bound_fanout_and_laziness_1556() -> Result<()> {
     Ok(())
 }
 
+/// #1594: `debug` reaches this same shared `<S: EvalSemantics>` builtin in
+/// yq mode too (gated behind `--jq-extensions`, real yq has no `debug` at
+/// all). Not oracle-verified -- no real-yq equivalent -- but pins that the
+/// fix (writing a `["DEBUG:", value]` line via the mode-aware
+/// `owned_value_to_json`) reaches yq mode identically to jq mode rather than
+/// only being wired up on the jq-mode call site.
+#[test]
+fn test_yq_debug_writes_the_debug_line_1594() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | debug",
+        "a: 1\n",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "out: {output:?} stderr: {stderr:?}");
+    assert_eq!(output, "1\n");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n");
+    Ok(())
+}
+
 /// Updated for #1398: `paths` on `--input-format json` input must now agree
 /// with YAML input (both preserve every duplicate-key occurrence, matching
 /// `to_entries`'s own format-independent behavior) rather than applying
