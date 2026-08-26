@@ -9060,6 +9060,33 @@ fn test_eval_all_yaml_sourced_float_keeps_literal_spelling_1498() -> Result<()> 
     Ok(())
 }
 
+/// #1498 review follow-up: the fix's own `json_sourced_float_display`
+/// (plain `f64::to_string()`) would render an infinite value as `inf`/
+/// `-inf` -- not valid JSON -- unless guarded the same way the sibling
+/// `Float` arm already guards it (`is_infinite()` before ever consulting
+/// `json_sourced`). No live path reconstructs an infinite `NumberLiteral`
+/// from JSON *document* input (the reindex bridge's own unparseable
+/// sentinel gets intercepted back to a plain `Float` on reparse), but a
+/// query-*text* literal like `1e400` reaches the exact same code path via
+/// the parser directly -- `json_sourced` is a document-level flag that
+/// doesn't distinguish where the number came from. Guarded defensively,
+/// matching the `Float` arm's own `"null"` answer for yq-mode Infinity
+/// (#1087's own scope note: real yq's Go `encoding/json` refuses to
+/// marshal Infinity at all, so `"null"` is this codebase's own established,
+/// deliberate choice here, not a fresh one this fix invents).
+#[test]
+fn test_eval_all_json_sourced_infinite_literal_does_not_emit_invalid_json_1498() -> Result<()> {
+    // `--` before the filter: `-1e400` on its own would otherwise be parsed
+    // as an (unrecognised) flag, not the filter argument.
+    for expr in ["1e400", "-1e400"] {
+        let (out, code) =
+            run_yq_stdin(expr, "null\n", &["--input-format", "json", "-o=json", "--"])?;
+        assert_eq!(code, 0, "expr {expr}: out: {out:?}");
+        assert_eq!(out.trim(), "null", "expr {expr}: out: {out:?}");
+    }
+    Ok(())
+}
+
 /// An untouched literal is unaffected by this fix in any output mode.
 /// Bare `.` (identity) here takes the cursor-based P9/M2 streaming path,
 /// echoing the source text straight from `YamlCursor` without ever
