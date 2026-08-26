@@ -23927,6 +23927,42 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// Classify `parent(n)`'s count argument into a validated ancestor-hop
+/// count (#1487). The previous inline casts (`i as usize` for `Int`, `f as
+/// usize` for `Float`) disagreed with each other on the same logical
+/// argument: a negative `Int` bit-wraps to a huge `usize` (treated as
+/// overshooting past root), while a negative or NaN `Float` saturates to
+/// `0` (treated as a no-op self-reference) -- `parent(-1)` and
+/// `parent(-1.0)` produced different results for what a caller would
+/// reasonably expect to be the same argument. There is no "unlimited"
+/// counterpart here the way `classify_limit_n` has for `limit(n; f)` --
+/// `n` must name a concrete, non-negative hop count, so every negative,
+/// non-finite, or non-numeric input is a hard error instead. Reuses
+/// `numeric_key_to_index`'s existing truncate-and-reject-NaN convention
+/// (already relied on for real `.[key]` indexing elsewhere in this file)
+/// rather than a third hand-rolled numeric conversion.
+fn classify_parent_n(n_value: &OwnedValue) -> Result<usize, EvalError> {
+    match numeric_key_to_index(n_value) {
+        Some(i) if i >= 0 => Ok(i as usize),
+        Some(_) => Err(EvalError::new(
+            "parent(n) requires a non-negative integer argument",
+        )),
+        // A `Float`/`NumberLiteral(Float)` returns `None` from
+        // `numeric_key_to_index` only when it's NaN; any other type
+        // (string, bool, array, object, null) also lands here.
+        None if matches!(
+            n_value,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        ) =>
+        {
+            Err(EvalError::new(
+                "parent(n) requires a non-negative integer argument",
+            ))
+        }
+        None => Err(EvalError::type_error("number", n_value.type_name())),
+    }
+}
+
 /// Resolve the value `n` levels up from `current_path` -- `parent` is this
 /// with `n = 1`, `parent(n)` with whatever `n` evaluates to. Returns both
 /// the ancestor's own path (for `rest`'s continuation, via
@@ -24284,16 +24320,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // `key`'s own value).
         let n = match eval_owned_expr_opt::<S>(n_expr, value, optional) {
             Ok(None) => return QueryResult::None,
-            Ok(Some(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _))) => {
-                i as usize
-            }
-            Ok(Some(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _))) => {
-                f as usize
-            }
-            Ok(Some(_)) if optional => return QueryResult::None,
-            Ok(Some(_)) => return QueryResult::Error(EvalError::type_error("number", "other")),
-            // `?` swallows only a genuine error; a halt always escapes
-            // (#791).
+            Ok(Some(ref v)) => match classify_parent_n(v) {
+                Ok(n) => n,
+                // `?` swallows only a genuine error; a halt always escapes
+                // (#791).
+                Err(_) if optional => return QueryResult::None,
+                Err(e) => return QueryResult::Error(e),
+            },
             Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
             Err(escape) => return escape.into(),
         };
