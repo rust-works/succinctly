@@ -13526,24 +13526,35 @@ pub(crate) fn index_one_owned(
 /// gives an unrepresentable or unallocatable length (#1634, same
 /// technique #1612/#1017 already established for this bug class:
 /// `arith_mul`'s string-repeat guard, `pad_with_nulls`'s array-grow
-/// guard). Every computed-index cross-product site in this file
-/// (`.[$keys]`/`.[$s:$e]`, both value- and `path()`-position) reduces to
-/// "how many output slots could this generator combination produce, at
-/// most" — a `keys.len() * ts.len()`-style product of generator- or
-/// document-controlled lengths that used to be handed straight to an
-/// infallible `Vec::with_capacity`. `keys`/`ts`/`starts`/`ends`/
-/// `target_branches` are each already-materialized `Vec`s by the time any
-/// of these call sites runs, so unlike #1612's `s.len() * n` (a single
-/// scalar read straight from the document), there is no cheap, portable
-/// way to force `try_reserve_exact`'s own failure path in an end-to-end
-/// test here without exhausting real memory first — this function's own
-/// unit tests instead call it directly with synthetic large factors,
-/// bypassing the (expensive or outright infeasible) generator
-/// materialization a live repro of comparable scale would need.
+/// guard). Every computed-index cross-product site in this file and in
+/// `eval_generic.rs` (`.[$keys]`/`.[$s:$e]`, value- and `path()`-position,
+/// native and generic-cursor evaluators alike — 7 call sites total)
+/// reduces to "how many output slots could this generator combination
+/// produce, at most" — a `keys.len() * ts.len()`-style product of
+/// generator- or document-controlled lengths that used to be handed
+/// straight to an infallible `Vec::with_capacity`. `keys`/`ts`/`starts`/
+/// `ends`/`target_branches` are each already-materialized `Vec`s by the
+/// time any of these call sites runs, so unlike #1612's `s.len() * n` (a
+/// single scalar read straight from the document), there is no cheap,
+/// portable way to force `try_reserve_exact`'s own failure path in an
+/// end-to-end test here without exhausting real memory first — this
+/// function's own unit tests instead call it directly with synthetic
+/// large factors, bypassing the (expensive or outright infeasible)
+/// generator materialization a live repro of comparable scale would need.
 ///
-/// `factors`' own product is computed in `u128` first so overflow can't
-/// happen a second time in the check meant to catch it (mirrors #1612's
-/// own `s.len() as u128 * n as u128`).
+/// Every factor is checked in plain `usize` via a `checked_mul` chain,
+/// with an upfront short-circuit for a zero factor. Widening to `u128`
+/// first (an earlier version of this function did) is unnecessary: given
+/// the zero short-circuit, every remaining factor is `>= 1`, so a
+/// left-to-right running product can only grow, meaning the *first* point
+/// (if any) where `checked_mul` overflows `usize` is exactly the point
+/// where the true mathematical product has already exceeded `usize::MAX`
+/// — there is no case a `u128` detour catches that direct `usize`
+/// arithmetic misses, and `usize` is what `try_reserve_exact` needs
+/// anyway. The zero short-circuit isn't just an optimization: without it,
+/// factors like `[usize::MAX, 2, 0]` (true product `0`, must succeed)
+/// would spuriously refuse at the second factor before ever reaching the
+/// zero that brings the real product back down.
 ///
 /// No mode-specific cap: unlike #1612's `MAX_STRING_REPEAT_BYTES` (a
 /// confirmed, deliberate real-yq limit reproduced verbatim), a live check
@@ -13551,42 +13562,41 @@ pub(crate) fn index_one_owned(
 /// one within this issue's scope. This is purely an internal safety net
 /// converting an uncatchable panic/abort into a catchable `EvalError` in
 /// both modes, per ADR-0018's "would take the host process down"
-/// divergence exception — jq has no cap of its own for this class either
-/// (matching #1612's own precedent: the reference tool has no oracle
-/// wording to reproduce here, since it just keeps running or gets
-/// OOM-killed by the OS rather than answering promptly).
+/// divergence exception — confirmed live against the pinned jq 1.7.1
+/// binary for this exact cross-product shape (not just analogized from
+/// #1612's own string-repeat case): a genuinely large-but-indexable
+/// `.[$keys]` cross product (`[range(50000) | [1,2]] | .[][(range(50000))]`)
+/// neither errors nor crashes -- jq streams results one at a time rather
+/// than pre-allocating a single buffer the way `Vec::with_capacity` does,
+/// so it just keeps producing output (139M+ lines observed before the
+/// probe was killed at a 15s wall-clock cap, well short of the eventual
+/// 2.5 billion) rather than answering promptly or refusing.
 pub(crate) fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
-    // `checked_mul`, not a bare `.product()`: with 3+ factors (the
-    // `path()`-position slice sites pass `starts`/`ends`/`target_branches`
-    // together), the running product can itself overflow `u128` before
-    // ever reaching the `usize::try_from` check below meant to catch an
-    // overflow -- `.product()` would silently wrap instead of erroring.
-    // Not reachable with today's callers (each factor is a real
-    // `Vec::len()`; three factors near 2^43 apiece to trigger this would
-    // already have exhausted real memory materializing the inputs), but
-    // the function's own contract shouldn't depend on that.
-    let mut total: u128 = 1;
-    for &f in factors {
-        let Some(next) = total.checked_mul(f as u128) else {
-            return Err(EvalError::new(
-                "Cannot allocate elements for a computed-index expansion: size overflows u128",
-            ));
-        };
-        total = next;
+    if factors.contains(&0) {
+        return Ok(Vec::new());
     }
-    let Ok(len) = usize::try_from(total) else {
-        return Err(cannot_reserve_cross_product(total));
-    };
+    let mut len: usize = 1;
+    for &f in factors {
+        let Some(next) = len.checked_mul(f) else {
+            return Err(cannot_reserve_cross_product(factors));
+        };
+        len = next;
+    }
     let mut out = Vec::new();
     if out.try_reserve_exact(len).is_err() {
-        return Err(cannot_reserve_cross_product(total));
+        return Err(cannot_reserve_cross_product(factors));
     }
     Ok(out)
 }
 
-fn cannot_reserve_cross_product(total: u128) -> EvalError {
+fn cannot_reserve_cross_product(factors: &[usize]) -> EvalError {
+    let product = factors
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(" * ");
     EvalError::new(format!(
-        "Cannot allocate {total} elements for a computed-index expansion"
+        "Cannot allocate {product} elements for a computed-index expansion"
     ))
 }
 
@@ -13695,14 +13705,21 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // (2) Key outer, target inner.
     //
-    // A capacity failure here bypasses `pending_halt` -- deliberately: it
-    // is a fresh error arising before any element has even been indexed,
-    // so it takes the exact same priority as an ordinary `index_one`/
-    // `index_one_owned` failure partway through the loop below, which the
-    // comment on that arm documents as already outranking a still-pending
-    // halt (jq's own interleaved key/index evaluation model). `out` is
-    // always empty at this point regardless, so there is no already-
-    // produced prefix a `Partial` could preserve either way.
+    // A capacity failure here bypasses both `pending_halt` and `optional` --
+    // deliberately, on both counts. It is a fresh error arising before any
+    // element has even been indexed, so it takes the exact same priority as
+    // an ordinary `index_one`/`index_one_owned` failure partway through the
+    // loop below, which the comment on that arm documents as already
+    // outranking a still-pending halt (jq's own interleaved key/index
+    // evaluation model); `out` is always empty at this point regardless, so
+    // there is no already-produced prefix a `Partial` could preserve either
+    // way. And this function's own doc comment is explicit that `optional`
+    // "reaches `index_one` and nothing else" -- concretely, not even key or
+    // target evaluation are covered (`.[error("boom")]?` still raises,
+    // `"str" | .a[length]?` still fails) -- so a capacity check that runs
+    // before `index_one`/`index_one_owned` is ever called is, by that same
+    // explicit contract, outside `?`'s reach too, exactly like key/target
+    // evaluation already is.
     match targets {
         Targets::Borrowed(ts) => {
             let mut out: Vec<StandardJson<'a, W>> =
@@ -13817,6 +13834,14 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Borrowed(Vec<StandardJson<'a, W>>),
         Owned(Vec<OwnedValue>),
     }
+    impl<W> Targets<'_, W> {
+        fn len(&self) -> usize {
+            match self {
+                Self::Borrowed(ts) => ts.len(),
+                Self::Owned(ts) => ts.len(),
+            }
+        }
+    }
     let targets = match targets {
         QueryResult::One(v) => Targets::Borrowed(vec![v]),
         QueryResult::Many(vs) => Targets::Borrowed(vs),
@@ -13843,12 +13868,8 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // under-reservation here wouldn't overflow on its own, but it would
     // leave the eventual `Vec::push` growth past this capacity unguarded
     // for exactly the same crash class this function exists to close.
-    let targets_len = match &targets {
-        Targets::Borrowed(ts) => ts.len(),
-        Targets::Owned(ts) => ts.len(),
-    };
     let mut out: Vec<OwnedValue> =
-        match try_reserve_product(&[starts.len(), ends.len(), targets_len]) {
+        match try_reserve_product(&[starts.len(), ends.len(), targets.len()]) {
             Ok(out) => out,
             Err(e) => return QueryResult::Error(e),
         };
@@ -19924,6 +19945,18 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // and a fresh error at this point takes the same priority a mid-loop
     // `index_one_owned` failure already does (`return Err((out, e.into()))`
     // below, which likewise doesn't fold in either escape).
+    //
+    // `optional` is *not* extended to a capacity failure either: this
+    // function's own doc comment scopes the `?`/non-`?` difference to
+    // exactly one thing -- "what happens when the resolved key cannot be
+    // applied to the container it reached" (i.e. `key_to_path_component`/
+    // `index_one_owned`'s own per-pair failure below) -- and says
+    // "everything else is shared" between the two spellings. A capacity
+    // failure is not that one named exception, so it stays shared: the
+    // same hard error either way, matching key/target evaluation failures
+    // (also outside the named exception) and `eval_index_expr`'s identical
+    // arm, whose own doc comment is even more explicit that `optional`
+    // "reaches `index_one` and nothing else".
     let mut out = match try_reserve_product(&[keys.len(), target_branches.len()]) {
         Ok(out) => out,
         Err(e) => return Err((Vec::new(), e.into())),
@@ -20195,6 +20228,17 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // point, and a fresh error at this point takes the same priority a
     // mid-loop failure already does further down in this function (its own
     // `return Err((out, ...))` arms likewise don't fold `escape` in).
+    //
+    // Unlike `resolve_index_expr`, `optional` is *not* extended to a
+    // capacity failure here: this function's own doc comment deliberately
+    // narrows `?` to "only the final application of the resolved bounds to
+    // the target", explicitly excluding bound resolution and any check
+    // that isn't that final per-element application -- the same narrower
+    // convention `eval_slice_expr` (value position) already follows, unlike
+    // `eval_index_expr`'s broader "covers the indexing" scope. A capacity
+    // check is neither S/T's evaluation nor the final application; treating
+    // it as covered here would be extending `?` past what this function's
+    // own documented contract already draws the line at.
     let mut out = match try_reserve_product(&[starts.len(), ends.len(), target_branches.len()]) {
         Ok(out) => out,
         Err(e) => return Err((Vec::new(), e.into())),
@@ -36036,21 +36080,19 @@ mod tests {
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
-    /// #1634 review: the product computation itself must not silently
-    /// wrap when 3+ factors overflow `u128`, before the `usize::try_from`
-    /// check below even runs -- the `path()`-position slice site
-    /// (`resolve_slice_expr`) passes three factors together
-    /// (`starts`/`ends`/`target_branches`), so a naive running
-    /// multiplication with no overflow check of its own could wrap past
-    /// `u128::MAX` back down to a small, wrong value instead of erring.
+    /// #1634 review: a zero factor must short-circuit to success *before*
+    /// the `checked_mul` chain runs, not just fall out of it naturally --
+    /// `[usize::MAX, 2, 0]`'s true mathematical product is `0` (trivially
+    /// satisfiable), but without an upfront zero check, the chain would
+    /// overflow at the second factor (`usize::MAX * 2`) and spuriously
+    /// refuse before ever reaching the zero that brings the real product
+    /// back down. Also exercises 3 factors, the `path()`-position slice
+    /// sites' own arity.
     #[test]
-    fn test_try_reserve_product_refuses_u128_overflow_with_three_factors_1634() {
-        // Each factor is ~2^43; three of them multiply to ~2^129, past
-        // `u128::MAX` (2^128).
-        let factor: usize = 1 << 43;
-        let result: Result<Vec<OwnedValue>, EvalError> =
-            try_reserve_product(&[factor, factor, factor]);
-        assert!(result.is_err(), "expected Err, got {result:?}");
+    fn test_try_reserve_product_zero_factor_short_circuits_even_after_an_overflowing_pair_1634() {
+        let out: Vec<OwnedValue> = try_reserve_product(&[usize::MAX, 2, 0])
+            .expect("a true product of 0 must succeed regardless of factor order");
+        assert!(out.is_empty());
     }
 
     /// #1634: the guard must not become a de facto cap on legitimate,
@@ -36068,10 +36110,14 @@ mod tests {
     /// #1634: end-to-end sanity that the guard is actually reachable from a
     /// real `.[$keys]` query and doesn't change output for a size that
     /// previously worked (the value-position, `Targets::Borrowed` arm of
-    /// `eval_index_expr` -- the other three wired call sites share the same
-    /// `try_reserve_product` helper and are covered by the direct unit
-    /// tests above and the CLI-level path/slice tests elsewhere in this
-    /// file, e.g. `test_path_...`/`test_slice_...` cases exercising
+    /// `eval.rs`'s own `eval_index_expr` -- the other 4 call sites in this
+    /// file (`eval_index_expr`'s `Targets::Owned` arm, `eval_slice_expr`,
+    /// `resolve_index_expr`, `resolve_slice_expr`) plus the 2 in
+    /// `eval_generic.rs` (the actual CLI dispatch path -- see
+    /// `test_generic_computed_index_ordinary_cross_product_unaffected_1634`)
+    /// share the same `try_reserve_product` helper and are covered by the
+    /// direct unit tests above and the CLI-level path/slice tests elsewhere
+    /// in this file, e.g. `test_path_...`/`test_slice_...` cases exercising
     /// `.[$s:$e]` and `path(...)`).
     #[test]
     fn test_computed_index_ordinary_cross_product_unaffected_1634() {

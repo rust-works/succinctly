@@ -5269,6 +5269,14 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         Borrowed(Vec<V>),
         Owned(Vec<OwnedValue>),
     }
+    impl<V> Targets<V> {
+        fn len(&self) -> usize {
+            match self {
+                Self::Borrowed(ts) => ts.len(),
+                Self::Owned(ts) => ts.len(),
+            }
+        }
+    }
     let targets = match eval_single::<S, V>(target, value, false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
@@ -5311,14 +5319,10 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // on `Expr::SliceExpr`'s own match arm above), so this site -- not
     // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
     // jq`/`succinctly yq` invocation hits.
-    let targets_len = match &targets {
-        Targets::Borrowed(ts) => ts.len(),
-        Targets::Owned(ts) => ts.len(),
-    };
     let mut out: Vec<OwnedValue> = owned_or_err!(try_reserve_product(&[
         starts.len(),
         ends.len(),
-        targets_len
+        targets.len()
     ]));
     match &targets {
         Targets::Borrowed(ts) => {

@@ -669,20 +669,30 @@ This guard is jq-mode-only. See [yq Limitations](../yq/limitations.md) for `succ
 mode, which refuses much earlier via its own, separate cap.
 
 Computed-index/-slice expansion (`.[$keys]`, `.[$s:$e]`, both in value position and under
-`path()`) has the identical shape again, at five call sites (#1634): each pre-sizes its
-output with a product of two or three independent, generator-controlled `Vec::len()`s
-(e.g. `keys.len() * targets.len()`), previously handed straight to an infallible
-`Vec::with_capacity`. A large enough cross product — e.g. two independent 100,000-element
-generators feeding the same `.[$keys]` — asks for more elements than the allocator can
-satisfy even though neither input list is individually unreasonable to materialize.
-succinctly now refuses with `Cannot allocate <n> elements for a computed-index expansion`
-(or, for the astronomically rarer case where the product itself overflows even a `u128`
-before a length can be checked, `Cannot allocate elements for a computed-index expansion:
-size overflows u128`) via the same `Vec::try_reserve_exact` technique as the `setpath`/
-string-repeat cases above, applied through a shared `try_reserve_product` helper. Unlike
-`s * n` above, a live check did not turn up an analogous yq-side cap for this shape — this
-guard is symmetric across both modes, converting a host-process crash into a catchable
-error in each, with no cap-specific divergence to record in
+`path()`) has the identical shape again, at seven call sites (#1634): five in
+[src/jq/eval.rs](../../../src/jq/eval.rs) (`eval_index_expr` ×2 arms, `eval_slice_expr`,
+`resolve_index_expr`, `resolve_slice_expr`) plus two more in
+[src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)'s own independent
+`eval_index_expr`/`eval_slice_expr` — the latter two are what a real `succinctly jq`/
+`succinctly yq` CLI invocation actually dispatches an ordinary `.[$keys]`/`.[$s:$e]` read
+through (the `eval.rs` siblings are reached only via the direct library API, or via
+`eval_generic.rs`'s own fallback for expressions it doesn't handle natively). Each site
+pre-sizes its output with a product of two or three independent, generator-controlled
+`Vec::len()`s (e.g. `keys.len() * targets.len()`), previously handed straight to an
+infallible `Vec::with_capacity`. A large enough cross product — e.g. two independent
+100,000-element generators feeding the same `.[$keys]` — asks for more elements than the
+allocator can satisfy even though neither input list is individually unreasonable to
+materialize. succinctly now refuses with `Cannot allocate <factors joined by " * "> elements
+for a computed-index expansion` via the same `Vec::try_reserve_exact` technique as the
+`setpath`/string-repeat cases above, applied through a shared `try_reserve_product` helper.
+Confirmed live against the pinned jq 1.7.1 binary for this exact shape (not just analogized
+from the string-repeat case above): a genuinely large-but-indexable cross product
+(`[range(50000) | [1,2]] | .[][(range(50000))]`) neither errors nor crashes — jq streams
+results one at a time instead of pre-allocating a single buffer, so it just keeps producing
+output rather than answering promptly or refusing. Unlike `s * n` above, a live check did
+not turn up an analogous yq-side cap for this shape either — this guard is symmetric across
+both modes, converting a host-process crash into a catchable error in each, with no
+cap-specific divergence to record in
 [yq Limitations](../yq/limitations.md).
 
 ## Regex flags `l` and `n`
