@@ -498,14 +498,9 @@ fn apply_front_matter(
     Ok((fm.yaml.to_vec(), InputFormat::Yaml, body))
 }
 
-/// The result of [`gather_input_sources`]: either the gathered sources, or
-/// an exit code from a failed `--validate` check that the caller must
-/// return immediately, mirroring [`yaml_validate_guard`]'s "bail with this
-/// code" contract at each of this function's now-single call site.
-enum GatheredSources {
-    Sources(Vec<(Vec<u8>, InputFormat, Option<Vec<u8>>)>),
-    ExitCode(i32),
-}
+/// One gathered input source: its bytes, resolved format, and (only under
+/// `--front-matter=process`) the untouched body carried alongside it.
+type GatheredSource = (Vec<u8>, InputFormat, Option<Vec<u8>>);
 
 /// Reads each input source -- stdin if `input_files` is empty, else each
 /// file in listed order -- applying `--front-matter` (a no-op unless the
@@ -515,12 +510,22 @@ enum GatheredSources {
 /// this identical stdin-or-per-file gather step; each `--front-matter`
 /// body is `None` unless `front_matter` is `Some(Process)`, same contract
 /// as `apply_front_matter`.
+///
+/// Stops at the first source that fails `--validate` (matching jq's own
+/// stop-at-first-failure semantics, #1558) and returns the exit code for
+/// it alongside every earlier source that DID pass. The caller decides
+/// what to do with that valid prefix: `--slurp`/`--eval-all` discard it
+/// (both combine every source into one value, so a partial set can't
+/// stand in for "every file combined"), while the per-file-independent
+/// paths (the default path, `--split-exp`) process and emit it before
+/// reporting the failure -- matching the M2-streaming path's own
+/// already-established "earlier valid output survives" behavior (#1564).
 fn gather_input_sources(
     input_files: &[String],
     input_format: InputFormat,
     front_matter: Option<FrontMatterMode>,
     validate: bool,
-) -> Result<GatheredSources> {
+) -> Result<(Vec<GatheredSource>, Option<i32>)> {
     let mut sources = Vec::new();
     if input_files.is_empty() {
         let raw_bytes = read_stdin()?;
@@ -528,7 +533,7 @@ fn gather_input_sources(
         let (input_bytes, format, body) =
             apply_front_matter(raw_bytes, resolved_format, front_matter, "<stdin>")?;
         if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, None) {
-            return Ok(GatheredSources::ExitCode(code));
+            return Ok((sources, Some(code)));
         }
         sources.push((input_bytes, format, body));
     } else {
@@ -540,12 +545,12 @@ fn gather_input_sources(
                 apply_front_matter(raw_bytes, resolved_format, front_matter, file_path)?;
             if let Some(code) = yaml_validate_guard(&input_bytes, format, validate, Some(file_path))
             {
-                return Ok(GatheredSources::ExitCode(code));
+                return Ok((sources, Some(code)));
             }
             sources.push((input_bytes, format, body));
         }
     }
-    Ok(GatheredSources::Sources(sources))
+    Ok((sources, None))
 }
 
 /// Materializes a `DocumentValue` into an `OwnedValue` the same way
@@ -3108,6 +3113,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // output and all-falsy output alike as "no matches found".
     let mut any_truthy = false;
 
+    // #1564: set by the default path / --split-exp when
+    // `gather_input_sources` finds a later file that fails `--validate` --
+    // rather than bailing immediately (losing the earlier files' already-
+    // valid output, the bug this exists to fix), those two branches still
+    // process/emit whatever passed and defer reporting the failure's exit
+    // code until the shared tail below, after that output is written.
+    let mut deferred_validate_exit_code: Option<i32> = None;
+
     // Uncaught evaluation errors. Evaluation continues past one, so the failure
     // is remembered here and turned into yq's exit 1 below (#355).
     let mut sink = ErrorSink::default();
@@ -3572,15 +3585,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // `evaluate_input`, so `file_index` resolves against that side table.
         // `--front-matter` is rejected in combination above, so every
         // gathered body is `None` here.
-        let input_sources = match gather_input_sources(
+        let (input_sources, validate_exit_code) = gather_input_sources(
             &input_files,
             args.input_format,
             args.front_matter,
             args.validate,
-        )? {
-            GatheredSources::Sources(s) => s,
-            GatheredSources::ExitCode(code) => return Ok(code),
-        };
+        )?;
+        if let Some(code) = validate_exit_code {
+            // #1564: --eval-all combines every source into one evaluation
+            // (see below), so a partial set missing the file that failed
+            // (and everything after it) can't stand in for "every file
+            // combined" -- bail before evaluating anything, unlike the
+            // per-file-independent paths this issue actually fixes.
+            return Ok(code);
+        }
 
         // #1493 review: this branch was missed by the original fix --
         // every other output-producing branch resolves `Auto` per-source,
@@ -3690,15 +3708,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         } else {
             // `--front-matter` is rejected in combination above, so every
             // gathered body is `None` here.
-            let input_sources = match gather_input_sources(
+            let (input_sources, validate_exit_code) = gather_input_sources(
                 &input_files,
                 args.input_format,
                 args.front_matter,
                 args.validate,
-            )? {
-                GatheredSources::Sources(s) => s,
-                GatheredSources::ExitCode(code) => return Ok(code),
-            };
+            )?;
+            // #1564: unlike --eval-all/--slurp, each file's split output is
+            // already written independently of the others (the loop below)
+            // -- process whatever passed and report the failure once done,
+            // instead of losing every earlier file's already-valid output.
+            deferred_validate_exit_code = validate_exit_code;
 
             let mut global_doc_index: usize = 0;
             'files: for (bytes, format, _) in &input_sources {
@@ -3836,15 +3856,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // mode is rejected above since a slurped array can't reattach a body
         // per input file) is applied before validation, since the raw
         // file bytes (e.g. Markdown) aren't valid standalone YAML.
-        let input_sources = match gather_input_sources(
+        let (input_sources, validate_exit_code) = gather_input_sources(
             &input_files,
             args.input_format,
             args.front_matter,
             args.validate,
-        )? {
-            GatheredSources::Sources(s) => s,
-            GatheredSources::ExitCode(code) => return Ok(code),
-        };
+        )?;
+        if let Some(code) = validate_exit_code {
+            // #1564: --slurp combines every source into one array (see
+            // below), so a partial set can't stand in for "the slurped
+            // array of every file" -- bail before evaluating anything,
+            // unlike the per-file-independent paths this issue fixes.
+            return Ok(code);
+        }
 
         if can_slurp_fast_path {
             // M2 streaming fast path (#478): stream each source's document
@@ -4281,15 +4305,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // Markdown) aren't valid standalone YAML; `process` mode's body is
         // carried alongside each source for reattachment in the output loop
         // below.
-        let input_sources = match gather_input_sources(
+        let (input_sources, validate_exit_code) = gather_input_sources(
             &input_files,
             args.input_format,
             args.front_matter,
             args.validate,
-        )? {
-            GatheredSources::Sources(s) => s,
-            GatheredSources::ExitCode(code) => return Ok(code),
-        };
+        )?;
+        // #1564: each file's results are collected/emitted independently
+        // of the others (the two loops below) -- process whatever passed
+        // and report the failure once done, instead of losing every
+        // earlier file's already-valid output the way this path used to.
+        deferred_validate_exit_code = validate_exit_code;
 
         // Process all inputs first to collect results, then determine multi-doc status
         // This avoids double-parsing YAML for document counting
@@ -4427,6 +4453,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // stops evaluating further input as soon as it's requested, but still
     // finishes writing whatever output it already had buffered/collected.
     if let Some(code) = sink.halted() {
+        return Ok(code);
+    }
+
+    // #1564: a `--validate` failure on a later file, discovered up front
+    // during gathering, outranks the normal success/hit/falsy
+    // determination below -- but every earlier file that DID pass
+    // validation was still processed/emitted above (see
+    // `deferred_validate_exit_code`'s own comment). A halt during that
+    // processing still wins, same precedence the M2-streaming path
+    // already gives it (checked immediately above).
+    if let Some(code) = deferred_validate_exit_code {
         return Ok(code);
     }
 

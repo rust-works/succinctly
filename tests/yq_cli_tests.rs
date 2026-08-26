@@ -12893,6 +12893,110 @@ fn test_eval_all_validate_rejects_invalid_yaml_from_file() -> Result<()> {
     Ok(())
 }
 
+/// #1564: the default (DOM) path used to discard *every* file's output on
+/// a later file's `--validate` failure -- unlike the M2-streaming path
+/// (jq's own sibling: `test_validate_multi_file_second_invalid_keeps_
+/// first_files_output_1558`), which already preserved an earlier valid
+/// file's output. `[.]` forces the DOM path (never M2-streaming-eligible).
+#[test]
+fn test_dom_path_validate_multi_file_second_invalid_keeps_first_files_output_1564() -> Result<()> {
+    let mut good_file = NamedTempFile::new()?;
+    writeln!(good_file, "ok: 1")?;
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: [1, 2")?;
+    let (stdout, stderr, code) = run_yq_files(
+        "[.]",
+        &[good_file.path(), bad_file.path()],
+        &["-o", "json", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(
+        stdout, "[\n  {\n    \"ok\": 1\n  }\n]\n",
+        "the first file's valid output survives"
+    );
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #1564 sibling: `--split-exp` also processes/emits each file
+/// independently (one split file per file), so it gets the same fix --
+/// the first file's split output must be written before the second
+/// file's validation failure is reported.
+#[test]
+fn test_split_exp_validate_multi_file_second_invalid_keeps_first_files_output_1564() -> Result<()> {
+    let dir = TempDir::new()?;
+    let mut good_file = NamedTempFile::new()?;
+    writeln!(good_file, "ok: 1")?;
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: [1, 2")?;
+    let pattern = format!(
+        "\"{}/out_\" + ($index|tostring) + \".yml\"",
+        dir.path().display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--split-exp", &pattern, "--validate"])
+        .arg(".")
+        .arg(good_file.path())
+        .arg(bad_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    let content = std::fs::read_to_string(dir.path().join("out_0.yml"))?;
+    assert_eq!(content, "ok: 1\n", "the first file's split output survives");
+    assert!(
+        !dir.path().join("out_1.yml").exists(),
+        "the second (invalid) file must not produce a split output"
+    );
+    Ok(())
+}
+
+/// #1564: `--slurp` combines every file into one array, so -- unlike the
+/// default path and `--split-exp` above -- it must keep discarding
+/// everything on any file's `--validate` failure; a partial array can't
+/// stand in for "every file slurped together".
+#[test]
+fn test_slurp_validate_multi_file_second_invalid_still_discards_everything_1564() -> Result<()> {
+    let mut good_file = NamedTempFile::new()?;
+    writeln!(good_file, "ok: 1")?;
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: [1, 2")?;
+    let (stdout, stderr, code) = run_yq_files(
+        ".",
+        &[good_file.path(), bad_file.path()],
+        &["--slurp", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "", "a partial slurped array must never be emitted");
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #1564 sibling to the `--slurp` case above: `--eval-all` also combines
+/// every file into one evaluation, so it keeps the same all-or-nothing
+/// behavior on a later file's `--validate` failure.
+#[test]
+fn test_eval_all_validate_multi_file_second_invalid_still_discards_everything_1564() -> Result<()> {
+    let mut good_file = NamedTempFile::new()?;
+    writeln!(good_file, "ok: 1")?;
+    let mut bad_file = NamedTempFile::new()?;
+    writeln!(bad_file, "a: [1, 2")?;
+    let (stdout, stderr, code) = run_yq_files(
+        ".",
+        &[good_file.path(), bad_file.path()],
+        &["--eval-all", "--validate"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "a partial combined evaluation must never be emitted"
+    );
+    assert!(stderr.contains("validation error"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// Regression test for the `needs_path_context`/`Compare` runtime-arm fix
 /// (#715): `key` used inside `select(...)`'s condition previously produced
 /// no output at all, independent of `--eval-all`.
