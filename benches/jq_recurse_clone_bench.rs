@@ -51,6 +51,29 @@
 //! value that was sitting there), so that clone cost is pure waste — exactly
 //! the waste #668 describes.
 //!
+//! **#1651 update.** #701 made `push_recursive_branches`'s *path* half O(1)
+//! per node (an `Rc<PathPrefix>` cons-list replacing a `Vec<Expr>` clone),
+//! but this benchmark's growth exponent stayed k≈1.94 regardless — because
+//! `del(..)`'s own consumer, not `push_recursive_branches`, still flattened
+//! that O(1)-to-construct chain back down to an owned `Vec<Expr>`
+//! (`resolve_dynamic_indexes`'s `assemble`) and then *again* to
+//! `Vec<DeleteStep>` (`builtin_del`'s `flatten_delete_path`) — once per
+//! resolved branch, unconditionally, even though this fixture's own guard
+//! above proves the result is always `null` and neither flattened form is
+//! ever inspected. `resolve_dynamic_indexes` now takes a
+//! `short_circuit_del_root` flag, set only by `del()`'s own call: when any
+//! resolved branch is the document root (true for `..`/bare
+//! `recurse`/`recurse(f)`/`recurse(f;cond)` unconditionally, since each
+//! emits self before recursing into children), it returns
+//! `[Expr::Identity]` immediately, skipping both flattens. This benchmark
+//! now exercises only `push_recursive_branches`'s own O(d) branch
+//! construction (still real work — every node's path is still resolved) —
+//! its growth exponent should read ~k≈1 post-fix. A **filtered** recurse
+//! whose match set excludes the root (`del(.. | select(cond))` where `cond`
+//! rejects `.`) is *not* covered by this flag and still pays both O(d²)
+//! flattens in full — deliberately out of scope here; see the #1651
+//! follow-up issue for that shape.
+//!
 //! This file makes **no timing assertion** — it is a Criterion benchmark for
 //! manual before/after comparison, not a CI gate. Run it interleaved
 //! before/after #668's fix lands, per the A/B method in

@@ -14951,7 +14951,7 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // fail in practice; falling back to `NotChecked` on the (unreachable)
     // `Err` arm just means the caller re-derives from scratch, same as
     // before this function existed.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
         Ok(paths) => paths,
         Err(_) => return YqAssignNoopCheck::NotChecked,
     };
@@ -15040,7 +15040,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
             let pristine = to_owned(&input);
-            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
                 Ok(paths) => paths,
                 // `?` swallows only a genuine error; a halt always escapes,
                 // so `(.[(halt_error(3))] = 1)?` still halts instead of
@@ -15160,7 +15160,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
@@ -20847,11 +20847,42 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// repro is 22.0s -> 0.38s at 400,000. The four items above remain the
 /// reason this flag is `false`; they are not a prerequisite for `del`'s
 /// scaling.
+///
+/// `short_circuit_del_root` (#1651): when `true`, and any resolved branch's
+/// path is empty (`PathBranch::path.depth() == 0` — the document root
+/// itself was one of the resolved paths), returns `[Expr::Identity]`
+/// immediately, without calling `assemble()`. This is `del()`'s own
+/// exhausted-path rule (`delete_expr_paths_at`'s `paths.iter().any(|path|
+/// path.len() == start)` check, and `delete_at_path`'s `Expr::Identity`
+/// arm both already collapse the whole value to `null` once any branch is
+/// the root) applied *before* paying `assemble`'s `PathPrefix::to_vec()` —
+/// O(depth) per branch — for every other, now-irrelevant branch. `..`/bare
+/// `recurse`/`recurse(f)`/`recurse(f;cond)` all emit the root branch
+/// unconditionally (`push_recursive_branches` pushes the current node
+/// before recursing into children, and `recurse`'s own definition emits
+/// `.` regardless of what `f` does), so this turns `del(..)` from O(d²)
+/// (one O(depth) flatten per one of `d+1` branches) into O(d) (one O(1)
+/// `.depth()` check per branch) on a depth-`d` document — the residual
+/// term #701/#1631 left unfixed. Left `false` for `path()`/`=`/`|=`: they
+/// need every resolved branch regardless of whether one is the root
+/// (`path(.., .)` still reports every path; `(.., .) = 9` still writes
+/// every one), so a root branch carries no shortcut meaning for them.
+///
+/// Deliberately narrow: a filtered descent whose match set does *not*
+/// include the root (`del(.. | select(cond))` where `cond` rejects `.`)
+/// never finds a `depth() == 0` branch here and pays the full flatten
+/// regardless — that shape is tracked separately, not fixed by this flag.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     defer_trailing_iterate: bool,
+    short_circuit_del_root: bool,
 ) -> Result<Vec<Expr>, (Vec<Expr>, EvalEscape)> {
+    debug_assert!(
+        !(short_circuit_del_root && defer_trailing_iterate),
+        "short_circuit_del_root is only meaningful for del()'s own call \
+         shape, which always passes defer_trailing_iterate=false"
+    );
     if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
     }
@@ -20998,7 +21029,12 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         return match resolve_node::<S>(expr, input, true, false)
             .and_then(|branches| reject_untracked_at_terminal(branches, false))
         {
-            Ok(branches) => Ok(assemble(branches)),
+            Ok(branches) => {
+                if short_circuit_del_root && branches.iter().any(|b| b.path.depth() == 0) {
+                    return Ok(vec![Expr::Identity]);
+                }
+                Ok(assemble(branches))
+            }
             Err((prefix, e)) => Err((assemble(prefix), e)),
         };
     }
@@ -25777,7 +25813,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // a later one errors (confirmed live) — so that prefix is walked below
     // exactly like a successful resolution, and only the *error* is deferred
     // to the end.
-    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned, true) {
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned, true, false) {
         Ok(exprs) => (exprs, None),
         Err((exprs, e)) => (exprs, Some(e)),
     };
@@ -27579,7 +27615,14 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // but is always the sole entry, so it takes the `paths.len() <= 1`
     // branch below rather than `delete_expr_paths_at`'s comma-grouped one
     // (#1382).
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
+    //
+    // `short_circuit_del_root=true` (#1651): if any resolved branch is the
+    // document root, this returns `[Expr::Identity]` here without paying
+    // `assemble`'s O(depth)-per-branch flatten for every other branch —
+    // `delete_expr_paths_at`/`delete_at_path` would collapse the whole
+    // document to `null` once they got there anyway, on exactly this
+    // condition (see `resolve_dynamic_indexes`'s doc comment).
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false, true) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
