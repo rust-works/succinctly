@@ -551,29 +551,20 @@ is the opt-in form for callers who want it (exit 3, its own separately-pinned co
 `to_entries`, `keys`, `length` (in all three of its spellings, including `keys | length`),
 `--slurp`, `--sort-keys`, `--ascii-output`, and any filter shape that costs the value its cursor
 (a comma, an `if`) — because #1247 made the `to_owned`/`cursor_to_owned` family fallible and
-this check rides along with it. Three routes remain, for two different reasons: two of them
-stream, so they have no error channel to raise into; the third never walks the whole object, so
-it is not in a position to find the malformed member at all.
+this check rides along with it. Bare `.[]` and the identity printer raise now too (#1641, below).
+One route remains, and it never walks the whole object, so it is not in a position to find the
+malformed member at all:
 
 ```
-$ echo '{invalid}'        | sjq -c '.[]'                 # no output, exit 0
-$ echo '[xyz123]'         | sjq -c .                     # [null],    exit 0
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[]'     # 123 then "b", exit 0
 ```
 
-`.[]` walks the field list through `LazySource::Values`, whose `uncons` reports an unpaired
-child as plain exhaustion and returns `Option`, not `Result`. `[xyz123]`'s identity path reaches
-`print_json`'s `StandardJson::Error` arm, which #1247's own design doc deferred for the same
-reason: by the time a nested error is discovered the opening bracket has been written, so bailing
-there yields a truncated document where every materializing route gives a clean diagnostic.
-Both are that document's Stage 6.
-
-The third is `keys_unsorted`'s **positional** fast paths — `[]`, `[0]`, `[n]`, `first`, `last`.
+This is `keys_unsorted`'s **positional** fast paths — `[]`, `[0]`, `[n]`, `first`, `last`.
 `#1514` and `#1599` deliberately took the whole-object probe *off* these arms: `first` and `[0]`
 answer from one `uncons_key` because collapsing keeps every key at its first position, so the
 answer holds whatever the rest of the object turns out to be. Restoring a #1194 check means
 restoring exactly the walk those two issues removed, which is why it is tracked separately
-(#1629) rather than folded in here. `keys_unsorted | length` is *not* in this set — it reaches
+(#1629) rather than fixed here. `keys_unsorted | length` is *not* in this set — it reaches
 `effective_len`, which walks, and so carries the check for free.
 
 Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
@@ -581,15 +572,56 @@ and finds a non-string key once its `[` is already out, so a **truncated** array
 stdout beside the exit 5. Pre-checking would mean a second walk over every key on a path
 `scripts/perf-guard.py` measures.
 
-The identity printer has no such limit for an object malformed at the *top* level — its check
-rides inside a walk it was already making, so nothing is emitted at all. A malformed object
-*nested* inside a well-formed one is found only once its parent's opening bytes are written, so
-that case truncates like `keys_unsorted` does:
+A malformed object *nested* inside a well-formed one is found only once its parent's opening
+bytes are written, so that case truncates the same way:
 
 ```
 $ echo '{invalid}'        | sjq -c .   # (nothing),  exit 5
 $ echo '{"a": {invalid}}' | sjq -c .   # `{"a":`,    exit 5
 ```
+
+**Bare `.[]` and the identity printer now raise too (#1641).** Both were previously misdiagnosed
+(here and in the issue that fixed them) as blocked on "no error channel to raise into" — tracing
+the actual code disproved that for both.
+
+Bare `.[]`'s object arm is `Expr::Iterate` in `eval_generic.rs`, not `LazySource::Values` (that
+machinery is reached only by `obj | map(f)`, a distinct construct — see below). `Expr::Iterate`
+already walks every field eagerly via `effective_fields`, so there was no laziness to preserve;
+`effective_fields`'s underlying `all_fields()` walk just never exposed whether it ended on an
+unpaired child. `effective_fields_checked` folds the check into that same walk, the way
+`effective_len_checked` already does for `length`:
+
+```
+$ echo '{invalid: 1}' | sjq -c '.[]'   # exit 5 now (was: 1,          exit 0)
+$ echo '{invalid}'    | sjq -c '.[]'   # exit 5 now (was: no output, exit 0)
+```
+
+The walk is atomic — it builds the whole field list before `.[]` starts emitting — so a malformed
+member anywhere in the object, including *after* a valid field, raises before any output at all:
+`{"a":1, invalid} | .[]` prints nothing, not `1`.
+
+`print_json`'s `StandardJson::Error` arm (`jq_runner.rs`) — reached by the identity path on a
+structurally malformed *value* (`[xyz123]`, `[tru]`) rather than a malformed *member* — now raises
+through the same `MalformedJsonError` convention the object-member check above uses. This one
+**does** truncate, the same accepted trade `keys_unsorted` and a nested `{invalid}` already make
+above: the writer streams child cursors as it walks, so an earlier sibling and the opening bracket
+are already out by the time a later error is found:
+
+```
+$ echo '[xyz123]'  | sjq -c .   # `[`,   exit 5 now (was: [null],       exit 0)
+$ echo '[1,zzz,3]' | sjq -c .   # `[1,`, exit 5 now (was: [1,null,3], exit 0)
+```
+
+This exact fix was tried once before and reverted: the earlier attempt predated
+`MalformedJsonError`, so bailing surfaced as a generic exit 1 instead of jq's own exit 5 — worse
+than the silent `null` it replaced. Reusing the now-established convention keeps the exit code and
+diagnostic clean; the truncation itself was already the accepted trade, not a new one.
+
+**Not fixed: `obj | map(f)` has the identical latent gap.** `{invalid: 1} | map(.)` goes through
+`LazySource::Values` in `eval_generic.rs`, whose `uncons` still cannot tell "no more fields" from
+"the last field never got a value" apart — the same ambiguity `effective_fields_checked` closes for
+bare `.[]`. Left open by #1641, mirroring the `#1629` precedent above rather than silently
+expanding that PR's scope.
 
 `--preserve-input` is not an exception to any of this: it changes how values are *rendered*
 (number literals and escape sequences kept as written), not whether the document is accepted,

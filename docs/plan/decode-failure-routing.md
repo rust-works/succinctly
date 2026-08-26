@@ -463,12 +463,31 @@ all of 17–20 under this stage's "✅ landed."** Re-reading both directly:
   for the two siblings that are recorded; this third one belongs in the same bucket once
   Stage 6 is scoped.
 
-One site was reverted after being written. `print_json`'s `StandardJson::Error` arm
-(`jq_runner.rs`) walks child cursors lazily and streams as it goes, so by the time a
-nested error is reached it has already written the opening `[`. Bailing there produced a
-truncated document plus a generic exit 1, where every materializing route gives a clean
-diagnostic and exit 5 — worse on every axis than the silent `null` it replaced. Left as
-`null` with the reasoning in place, and folded into Stage 6, which is the same problem.
+One site was reverted after being written, and later fixed for real by
+[#1641](https://github.com/rust-works/succinctly/issues/1641). `print_json`'s
+`StandardJson::Error` arm (`jq_runner.rs`) walks child cursors lazily and streams as it
+goes, so by the time a nested error is reached it has already written the opening `[`.
+The first attempt to raise there produced a truncated document plus a *generic* exit 1 —
+worse on every axis than the silent `null` it replaced — and was reverted, with the
+reasoning folded into Stage 6 below on the theory that this site needed the same new
+error channel the YAML streaming siblings do.
+
+**That theory was wrong.** `print_json` already returns `anyhow::Result<()>`, and by the
+time #1641 revisited this site, the sibling object-member check a few lines above it
+(Stage 3/#1194) had already established `MalformedJsonError` — a thin `anyhow`-downcastable
+wrapper around `EvalError` that lets `run_jq` tell a diagnosable data error from a real I/O
+failure and choose exit 5 over exit 1. The channel this arm was "missing" already existed
+in the same function; the original revert predated that convention, not a genuine
+architectural gap. Reusing it needed no new error type, only the one-line change from
+`out.write_all(b"null")?` to raising through it. The truncation trade itself was never in
+question — it is the same one `keys_unsorted` and a nested `{invalid}` already accepted;
+see
+[jq Limitations](../compliance/jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input).
+
+Site 20 (`json/light.rs:2098`, the JSON→YAML streaming output path) is a genuinely
+different case from this one, not covered by #1641: it is built on `core::fmt::Write`,
+which really does carry no richer error type, so it remains folded into Stage 6 below
+alongside its YAML→JSON and YAML→YAML siblings.
 
 Evaluation still continues past the bad value, so the good documents either side of it in
 a multi-value stream are still processed (`ErrorSink`, #355). Real jq aborts the whole run
@@ -646,6 +665,11 @@ what Stage 6 is left with is bad escapes only.
   `to_owned_at_depth`'s doc comment exists.
 - [#1194](https://github.com/rust-works/succinctly/issues/1194) — half in scope (see
   Correction 3).
+- [#1641](https://github.com/rust-works/succinctly/issues/1641) — bare `.[]` and
+  `print_json`'s `StandardJson::Error` arm, the two routes left after #1194/#1608/#1628
+  closed the materializing side. Corrected this document's own claim that the `print_json`
+  site needed Stage 6's new error channel — see the "One site was reverted" discussion
+  above.
 - [#1242](https://github.com/rust-works/succinctly/issues/1242) — the YAML invalid-UTF-8
   repro; Stage 5.
 - [#1191](https://github.com/rust-works/succinctly/issues/1191) (closed) — the stated
@@ -664,8 +688,15 @@ what Stage 6 is left with is bad escapes only.
 Not yet filed. Once this document is reviewed:
 
 1. One implementation issue per stage above, linking back here.
-2. **`JsonFields::uncons` cannot represent a malformed field** — #1194's headline repro
-   (`{invalid} → {}`), see Correction 3.
+2. ~~**`JsonFields::uncons` cannot represent a malformed field** — #1194's headline repro
+   (`{invalid} → {}`), see Correction 3.~~ Filed and fixed for the two routes that
+   materialize nothing today as
+   [#1641](https://github.com/rust-works/succinctly/issues/1641), by working around the
+   ambiguity at each caller (`effective_fields_checked`, `MalformedJsonError`) rather than
+   changing `uncons`'s own contract. One instance remains open: `obj | map(f)`
+   (`LazySource::Values` in `eval_generic.rs`) has the identical gap and was deliberately
+   left unfixed there — see
+   [jq Limitations](../compliance/jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input).
 3. ~~**Decide catchability of decode errors** — Open Risk 1, if it is not settled during
    Stage 3's review.~~ Filed as [#1620](https://github.com/rust-works/succinctly/issues/1620),
    resolved there -- see Open Risk 1 above.
