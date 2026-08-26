@@ -241,7 +241,15 @@ pub fn flush_then_err<W: std::io::Write, T>(
     err: anyhow::Error,
 ) -> anyhow::Result<T> {
     if let Err(flush_err) = writer.flush() {
-        return Err(err.context(format!("(also failed to flush output: {flush_err})")));
+        // Deliberately not `err.context(...)`: anyhow's `.context(C)` makes
+        // `C` the new top-level `Display` message and demotes the receiver
+        // to the cause chain (visible only via `{:?}`) -- the opposite of
+        // what's documented above. Folding the flush error into a single
+        // message keeps `err`'s own text as the primary, readable-under-
+        // `{}` content (review of #1673).
+        return Err(anyhow::anyhow!(
+            "{err} (also failed to flush output: {flush_err})"
+        ));
     }
     Err(err)
 }
