@@ -375,9 +375,16 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 /// when `--validate` is set, additionally runs the opt-in strict validator
 /// (`succinctly::yaml::validate`) before indexing and, on the first
 /// violation, prints a rustc-style diagnostic. Either failure returns the
-/// exit code to bail with. Mirrors `sjq --validate`
-/// (`jq_runner::validate_json_input`) for the `--validate` half; JSON input
-/// (`-p json`) is left to jq-side validation for both halves (#1616).
+/// exit code to bail with. The `--validate` half mirrors `sjq --validate`
+/// (`jq_runner::validate_json_input`), an opt-in strict check for its own
+/// primary format the same way this one is for YAML.
+///
+/// This function returns `None` unconditionally for `InputFormat::Json`
+/// (`-p json`) -- **neither half runs for JSON input**, not "runs
+/// elsewhere": `validate_json_input` above is `sjq`'s own flag, reached only
+/// from the `jq` subcommand, and is never called from this file. `-p json`
+/// therefore gets no encoding or grammar check of any kind today, a known
+/// silent-data-loss gap tracked as #1616.
 fn yaml_validate_guard(
     input: &[u8],
     format: InputFormat,
