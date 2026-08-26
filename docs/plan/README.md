@@ -28,7 +28,6 @@ These plans are kept for:
 | [jq-generator-argument-fanout.md](jq-generator-argument-fanout.md)   | Implemented | `src/jq/eval.rs`                  | One builtin result per generator-argument output  |
 | [jq-range-lazy-bounds.md](jq-range-lazy-bounds.md)                   | Implemented | `src/jq/eval.rs`                  | Lazy `range()` bound-argument resolution          |
 | [decode-failure-routing.md](decode-failure-routing.md)               | Proposed    | `src/jq/`, `src/yaml/`            | Decode-failure error routing                      |
-| [jq-range-lazy-bounds.md](jq-range-lazy-bounds.md)                   | Implemented | `src/jq/eval.rs`                  | Lazy `range()` bound resolution                   |
 
 ## Archived Plans
 
