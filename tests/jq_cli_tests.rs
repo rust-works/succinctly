@@ -4937,6 +4937,62 @@ fn test_debug_msg_multi_output_writes_one_line_per_output_1594() -> Result<()> {
     Ok(())
 }
 
+/// #1594 review follow-up: real jq's per-item pipe semantics mean an escape
+/// on a *later* output of `msg` does not retroactively un-print an earlier
+/// output's debug line -- the first output was already consumed by the time
+/// the second one escapes. An eager "collect every output into one Vec, then
+/// print" implementation (this fix's own first revision) gets this wrong:
+/// it discards the whole Vec the moment `msg` later errors, silently losing
+/// the already-produced line. Live-verified against jq 1.7.1:
+/// `jq -cn '1 | debug(("a", error("boom")))'` writes `["DEBUG:","a"]` to
+/// stderr *before* the error, not instead of it.
+#[test]
+fn test_debug_msg_keeps_the_prefix_when_a_later_output_errors_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", r#"1 | debug(("a", error("boom")))"#], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("[\"DEBUG:\",\"a\"]\n"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1594 review follow-up, `break` sibling of the test above: a `break`
+/// reached after `msg` has already produced output(s) must not un-print
+/// them either. Live-verified against jq 1.7.1:
+/// `jq -cn 'label $out | debug(("a","b", break $out))'` writes both DEBUG
+/// lines, then breaks (no error, no further stdout).
+#[test]
+fn test_debug_msg_keeps_the_prefix_when_a_later_output_breaks_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", r#"label $out | debug(("a","b", break $out))"#],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "[\"DEBUG:\",\"a\"]\n[\"DEBUG:\",\"b\"]\n");
+    Ok(())
+}
+
+/// #1594 review follow-up: `msg`'s outputs must be produced and printed in
+/// true generator order, interleaved with any side effect nested inside a
+/// later output -- not "evaluate the whole of `msg` first (side effects
+/// included), print afterward". Live-verified against jq 1.7.1 (bytes
+/// confirmed via separate stdout/stderr file redirection, `od -c`):
+/// `jq -cn 'debug((1, (2|stderr|empty)))'` writes `["DEBUG:",1]` then raw
+/// `2` to stderr, in that order -- debug's own line for the first output
+/// prints before the second output's nested `stderr` call ever runs.
+#[test]
+fn test_debug_msg_interleaves_with_a_nested_side_effect_in_generator_order_1594() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "debug((1, (2|stderr|empty)))"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "[\"DEBUG:\",1]\n2");
+    assert_eq!(stdout, "null\n");
+    Ok(())
+}
+
 #[test]
 fn test_paths_filter_halt_on_scalar_root() -> Result<()> {
     // `builtin_paths_filter` only evaluated `filter` against nodes reached
@@ -19318,13 +19374,17 @@ fn test_tonumber_rejects_internal_overflow_sentinels_1090() {
 // interleaves the two misleadingly, since stdout is buffered when piped but
 // stderr is not (same convention as the `halt`/`stderr` block above).
 //
-// `stderr` and `halt_error` are the only two builtins whose Rust
-// implementation performs I/O *at evaluation time* (`write_stderr`, via
-// `builtin_stderr`/`builtin_halt_error` in `src/jq/eval.rs`); `debug` and
-// `debug(msg)` are deliberate library-context no-ops, and `error(...)` carries
-// its payload in the result. So `stderr` is the only usable probe for "was
-// this sub-expression evaluated at all?" -- which is why #820's own original
-// `first(1, debug)` repro was a false negative.
+// `stderr`, `halt_error`, and (since #1594) `debug`/`debug(msg)` are the
+// builtins whose Rust implementation performs I/O *at evaluation time*
+// (`write_stderr`, via `builtin_stderr`/`builtin_halt_error`/`builtin_debug`/
+// `builtin_debug_msg` in `src/jq/eval.rs`); `error(...)` carries its payload
+// in the result instead. `stderr` remains this file's probe of choice below
+// -- unlike `debug`, its output is unwrapped raw text (`"B"` rather than
+// `["DEBUG:","B"]`), which keeps the tables' expected-stderr strings
+// shorter -- but `debug`/`debug(msg)` are equally usable "was this
+// sub-expression evaluated at all?" probes now. Before #1594 they were
+// deliberate library-context no-ops, which is why #820's own original
+// `first(1, debug)` repro was a false negative at the time.
 //
 // `input`/`inputs` are a second, *destructive* probe: they pop from the same
 // process-global queue the CLI's own per-document driver loop drains, so an

@@ -31414,10 +31414,19 @@ fn builtin_isfinite<W: Clone + AsRef<[u64]>>(
 /// formatter `builtin_stderr` uses, so non-finite floats etc. render
 /// identically across both rather than re-deriving the jq/yq JSON-shape fork
 /// a second time.
+///
+/// Builds the whole line before writing it, in one `write_stderr` call --
+/// matching `builtin_halt_error`'s own single-write convention just below,
+/// rather than the three separate writes an earlier revision used. Also
+/// makes this atomic against a mid-formatting panic (e.g.
+/// `assert_value_tree_depth`'s nesting-depth guard): a panic during
+/// `owned_value_to_json` now leaves stderr untouched rather than a
+/// truncated `["DEBUG:",` fragment with no closing bracket.
 fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
-    write_stderr("[\"DEBUG:\",");
-    write_stderr(&owned_value_to_json::<S>(value));
-    write_stderr("]\n");
+    write_stderr(&format!(
+        "[\"DEBUG:\",{}]\n",
+        owned_value_to_json::<S>(value)
+    ));
 }
 
 /// Builtin: debug - print `["DEBUG:", .]` to stderr, pass `.` through
@@ -31432,41 +31441,69 @@ fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: debug(msg) - print `["DEBUG:", <msg output>]` to stderr once per
-/// output of `msg` (real jq's own definition is `(msg|debug|empty), .`, so a
-/// multi-output `msg` writes one line per output -- confirmed live:
-/// `debug(("a","b"))` writes two lines), then pass `.` (not `msg`'s value)
-/// through unchanged.
+/// output of `msg`, *as each output is produced* -- real jq's own definition
+/// is `(msg|debug|empty), .`, a per-item pipe, not "collect every output,
+/// then print". This matters in two live-verified ways an eager collect
+/// (`eval_owned_multi`, an earlier revision's approach) gets wrong:
+///
+/// 1. **Ordering.** A side effect nested inside a later output of `msg` must
+///    not fire before an earlier output's own debug line prints:
+///    `debug((1, (2|stderr|empty)))` writes `["DEBUG:",1]` then raw `2` in
+///    real jq, in that order, because jq only asks `msg` for its second
+///    output after the first has already been consumed (here, printed).
+///    Collecting `msg`'s outputs into a `Vec` first evaluates the whole
+///    expression -- side effects included -- before any debug line is
+///    written, reversing the order.
+/// 2. **Partial output on a later escape.** `debug(("a", error("boom")))`
+///    still writes `["DEBUG:","a"]` to stderr in real jq before the error
+///    propagates -- the first output was already consumed (printed) by the
+///    time the second one escapes. An eager collector that gathers every
+///    output into `Ok(Vec<_>)` and only prints on success discards that
+///    already-produced value the moment `msg` later errors/breaks/halts,
+///    silently losing it. Same loss for `break`/`halt_error` reached after
+///    at least one output.
+///
+/// [`eval_each_owned`] is the codebase's existing demand-driven sink (#820,
+/// `docs/plan/jq-lazy-generator-consumers.md`) built for exactly this
+/// "consumer must see each output as it happens, not after the fact" shape
+/// (its own module doc cites `stderr`, two functions below, as the
+/// canonical example) -- calling `write_debug_line` directly from the sink,
+/// always answering `Demand::Continue`, prints each line in true generator
+/// order and naturally preserves whatever already printed before a later
+/// escape, with no separate "keep the prefix" bookkeeping needed.
 fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     msg: &Expr,
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    // `msg` still has to be evaluated for its control effects even before
-    // considering what to print: a halt reached while producing it
-    // (`debug(halt_error(3))`) must halt the process exactly as it would
-    // anywhere else `msg` could sit (#791), and a plain error must propagate
-    // too — real jq defines `debug(msg)` as `(msg|debug|empty), .` with no
-    // `try`/`?`, so an error raised while producing `msg` aborts the whole
-    // expression (verified live: `debug(error("boom"))` errors out in real
-    // jq rather than passing `.` through).
     let owned = to_owned(&value);
-    let msg_outputs = match eval_owned_multi::<S>(msg, &owned) {
-        Ok(outputs) => outputs,
-        Err(escape) => return QueryResult::from(escape),
-    };
-    for msg_value in &msg_outputs {
-        write_debug_line::<S>(msg_value);
+    let flow = eval_each_owned::<S>(msg, &owned, false, &mut |msg_value| {
+        write_debug_line::<S>(&msg_value);
+        Demand::Continue
+    });
+    // This sink never answers `Stop`, so `Flow::Stopped` cannot actually
+    // occur -- folded into "no trailing control" anyway rather than
+    // `unreachable!()`, the same "a defensible answer beats a panic"
+    // precedent `resolve_leaf`'s own always-`Continue` `eval_each_owned` use
+    // takes for the identical shape (citing `any_all_gen_cond` as its
+    // precedent in turn). A `Halt` is never downgraded: `QueryResult::from`
+    // (via `EvalEscape::from(Control)`) carries it straight through,
+    // matching #791's "halt is an unconditional process-termination signal"
+    // rule -- unchanged from the pre-existing halt-propagation behavior
+    // this replaces.
+    if let Flow::Escaped(control) = flow {
+        return QueryResult::from(EvalEscape::from(control));
     }
     QueryResult::Owned(owned)
 }
 
 // Process control functions (#791)
 //
-// Unlike `debug`/`debug(msg)` above, these genuinely write to stderr rather
-// than staying a library-context no-op: `stderr`'s write has to fire *during*
-// generator iteration (e.g. `(1,2,3) | stderr` needs three separate
-// interleaved writes as each value streams through), which can't be deferred
-// to a CLI-layer batch print the way `ErrorSink`'s diagnostics are. Gated the
+// `stderr`'s write has to fire *during* generator iteration (e.g.
+// `(1,2,3) | stderr` needs three separate interleaved writes as each value
+// streams through), which can't be deferred to a CLI-layer batch print the
+// way `ErrorSink`'s diagnostics are -- the same requirement `debug`/
+// `debug(msg)` above now meet too, via `eval_each_owned`. Gated the
 // same way `$ENV`/`env` gate their (read-only) OS interaction below.
 
 /// Write raw bytes to stderr. No-op under `no_std` (mirrors `eval_env`'s
