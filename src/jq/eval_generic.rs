@@ -5099,17 +5099,21 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
             Demand::Continue
         }
     });
-    let satisfied = out.len() >= n;
     Some(match flow {
-        // Short of `n`: there is no lazy `GenericResult` shape that carries
-        // both a prefix and a pending control, so decode the captured
-        // prefix eagerly and surface the trailing control alongside it --
-        // matches `limit_with_n`'s identical rule
-        // (`[limit(3; 1,2,error("x"),4)]` raises).  A decode failure while
+        // The sink returns `Demand::Stop` the instant `out.len() >= n`, and
+        // every `eval_each_generic` arm stops pulling as soon as `Demand`
+        // says to -- so an escape can only fire *before* that point, never
+        // after: `flow` alone already tells us whether `n` was reached,
+        // with no need to separately track/re-check `out.len()` against
+        // `n`. Short of `n`, there is no lazy `GenericResult` shape that
+        // carries both a prefix and a pending control, so decode the
+        // captured prefix eagerly and surface the trailing control
+        // alongside it -- matches `limit_with_n`'s identical rule
+        // (`[limit(3; 1,2,error("x"),4)]` raises). A decode failure while
         // draining that prefix is itself reported in place of the
         // generator's own control, the same priority a mid-pull `stray`
         // took before this batch conversion existed.
-        Flow::Escaped(control) if !satisfied => {
+        Flow::Escaped(control) => {
             let mut owned = Vec::with_capacity(out.len());
             let mut decode_err = None;
             for item in out {
@@ -5129,7 +5133,7 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
         // any trailing control, so both resolve the same way.
         _ => match items_to_generic_result(out) {
             Ok(result) => result,
-            Err(control) => partial_generic(Vec::new(), control),
+            Err((prefix, control)) => partial_generic(prefix, control),
         },
     })
 }
@@ -5175,25 +5179,47 @@ fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
 
     let mut seen = 0usize;
     let mut wanted: Option<GenericItem<V>> = None;
+    let mut skipped_err: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         if seen == n {
             wanted = Some(item);
             seen += 1;
-            Demand::Stop
-        } else {
-            seen += 1;
-            Demand::Continue
+            return Demand::Stop;
         }
+        seen += 1;
+        // jq defines `nth($n; f)` as `last(limit($n + 1; f))`: every output
+        // of `f` up to index `n` is genuinely produced, not just the one
+        // ultimately kept -- a *skipped* item's own lazy computation (a
+        // buffered `map`/`select` chain, `GenericItem::LazySeq`, #724/#725)
+        // must still run for its side effects/errors even though its value
+        // is discarded here. `each_take_nth` in `eval.rs` gets this for
+        // free (its `Item`s are never themselves lazy, only ever borrowed
+        // or already-owned); this sink has to force it explicitly, or
+        // `nth(2; .[] | map(10/.))` over `[[1],[0],[2]]` would silently
+        // skip the division-by-zero `map` never ran on `[0]` and answer
+        // from `[2]` instead of erroring. The item *at* index `n` is
+        // deliberately exempted from this force -- see below.
+        if let Err(control) = generic_item_into_owned(item) {
+            skipped_err = Some(control);
+            return Demand::Stop;
+        }
+        Demand::Continue
     });
     // Mirrors `each_take_nth` + its caller's own priority exactly: a
     // captured item at index `n` always wins, even over a trailing escape
-    // from beyond that point; short of reaching index `n` at all, whatever
-    // ended the pull (exhaustion, or an escape before index `n`) decides.
-    // Kept cursor-backed ([`generic_item_to_result`], #607's own conversion)
-    // rather than forced through `OwnedValue`, so a duplicate key *inside*
-    // the captured item survives too, not just across the walk to reach it.
+    // from beyond that point (and, by construction, over `skipped_err` too
+    // -- once `wanted` is set the sink returns `Demand::Stop` immediately,
+    // so no later item, and no `skipped_err`, can still be pending);
+    // short of reaching index `n` at all, whatever ended the pull
+    // (exhaustion, a skipped item's own forced failure, or the generator's
+    // own escape before index `n`) decides. The *wanted* item alone is
+    // kept cursor-backed ([`generic_item_to_result`], #607's own
+    // conversion) rather than forced through `OwnedValue`, so a duplicate
+    // key *inside* it survives too, not just across the walk to reach it.
     Some(if let Some(item) = wanted {
         generic_item_to_result(item)
+    } else if let Some(control) = skipped_err {
+        partial_generic(Vec::new(), control)
     } else {
         match flow {
             Flow::Stopped { .. } | Flow::Exhausted => GenericResult::None,
@@ -5209,19 +5235,54 @@ fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
 /// over eagerly decoding into `ManyOwned`. Used by
 /// [`eval_limit_generic`]'s own success path so `limit` extends #607's
 /// duplicate-key fidelity to what it *captures*, not only to how it walks.
+///
+/// `OneCursorValue` gets its own arm rather than folding into the
+/// cursor-only one below: its value is always an already-decoded key
+/// string, the exact thing `each_lazy_keys_iterate_sink`'s `!sorted` arm
+/// (its one construction site, #1514/#1609) exists to avoid re-decoding.
+/// Collapsing straight to `ManyCursor` would throw that decode away, only
+/// for `cursor_vec_to_generic_result`'s eventual `to_owned_cursor` to redo
+/// it later -- fine once for `first`/`last` (`generic_item_to_result`'s own
+/// doc comment already accepts that single cost), but `limit(n; keys|.[])`
+/// pays it once *per captured key*, silently reintroducing O5's own
+/// double-decode on the exact shape it was measured against. Since a key
+/// string has no nested containers of its own, converting it directly with
+/// `to_owned` carries no duplicate-key risk to reintroduce.
+///
+/// On a mid-batch decode failure, the error comes back paired with
+/// whatever prefix already decoded cleanly, not bare -- `limit(5; f)` must
+/// still stream the outputs `f` produced before a later one failed
+/// (`[400/0.4]`, err) rather than losing them, matching real jq's
+/// streaming-before-error contract (#400/#494) and `limit_with_n`'s own
+/// identical rule. A plain `Result<_, Control>` here would have silently
+/// discarded that prefix at the `?` the moment any item failed.
 fn items_to_generic_result<V: DocumentValue>(
     items: Vec<GenericItem<V>>,
-) -> Result<GenericResult<V>, Control> {
-    if items.iter().all(|item| {
-        matches!(
-            item,
-            GenericItem::OneCursor(_) | GenericItem::OneCursorValue(_, _)
-        )
-    }) {
+) -> Result<GenericResult<V>, (Vec<OwnedValue>, Control)> {
+    if items
+        .iter()
+        .all(|item| matches!(item, GenericItem::OneCursorValue(_, _)))
+    {
+        let mut owned = Vec::with_capacity(items.len());
+        for item in items {
+            let GenericItem::OneCursorValue(_, v) = item else {
+                unreachable!("checked by the all() above")
+            };
+            match to_owned(&v) {
+                Ok(o) => owned.push(o),
+                Err(e) => return Err((owned, Control::Error(e))),
+            }
+        }
+        return Ok(owned_vec_to_generic_result(owned));
+    }
+    if items
+        .iter()
+        .all(|item| matches!(item, GenericItem::OneCursor(_)))
+    {
         let cursors: Vec<V::Cursor> = items
             .into_iter()
             .map(|item| match item {
-                GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => c,
+                GenericItem::OneCursor(c) => c,
                 _ => unreachable!("checked by the all() above"),
             })
             .collect();
@@ -5229,7 +5290,10 @@ fn items_to_generic_result<V: DocumentValue>(
     }
     let mut owned = Vec::with_capacity(items.len());
     for item in items {
-        owned.push(generic_item_into_owned(item)?);
+        match generic_item_into_owned(item) {
+            Ok(v) => owned.push(v),
+            Err(control) => return Err((owned, control)),
+        }
     }
     Ok(owned_vec_to_generic_result(owned))
 }

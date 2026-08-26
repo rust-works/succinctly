@@ -18629,6 +18629,43 @@ fn test_jq_cursor_metadata_carve_out_keeps_limit_and_nth_inputs_lazy_1607() -> R
     Ok(())
 }
 
+/// #1607 review follow-up: `limit`'s native fast path must still stream
+/// every output it already produced before a *later* one fails, matching
+/// real jq's streaming-before-error contract (#400/#494) and `eval.rs`'s
+/// own `limit_with_n` (`[limit(3; 1,2,error("x"),4)]` raises, but only
+/// after printing `1` and `2`). The native path's batch-to-`GenericResult`
+/// conversion used to discard the whole prefix on a mid-batch decode
+/// failure instead of surfacing it alongside the error.
+#[test]
+fn test_jq_limit_streams_prefix_before_a_later_output_fails_1607() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "limit(5; .[] | map(10/.))"], Some("[[1],[0]]\n"))
+            .expect("limit streaming-before-error repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[10]\n");
+    assert!(stderr.contains("divided"), "stderr: {stderr}");
+    Ok(())
+}
+
+/// #1607 review follow-up: jq defines `nth($n; f)` as `last(limit($n + 1;
+/// f))` -- every output of `f` up to index `n` must genuinely run, not
+/// just the one `nth` ultimately keeps, so an error while producing a
+/// *skipped* output still surfaces. The native fast path's sink used to
+/// discard a skipped item without forcing its own lazy computation (a
+/// buffered `map`/`select` chain) to run at all, silently skipping past
+/// what should have been a division-by-zero error and answering from a
+/// later index instead.
+#[test]
+fn test_jq_nth_still_evaluates_a_skipped_output_that_would_error_1607() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "nth(2; .[] | map(10/.))"], Some("[[1],[0],[2]]\n"))
+            .expect("nth skipped-output repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("divided"), "stderr: {stderr}");
+    Ok(())
+}
+
 /// The carve-out keys off the `line`/`at_offset`/... *builtins*, so a field
 /// or key that merely spells one of their names must not trip it -- that
 /// would quietly switch a filter back to the eager path and undo #1504's own
