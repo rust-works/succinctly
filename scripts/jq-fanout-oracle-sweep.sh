@@ -125,22 +125,6 @@ classify_divergence() {
     return 0
   fi
 
-  # #1596 (dup: #1604): `eval_each_generic` has native lazy arms for
-  # `Comma`/`Pipe`/`Paren` (#1461) and `Compare`/`Arithmetic` (#1481) only,
-  # so a `first(...)` over an `If`/`Try`/`Label`/`As`/`Limit` — whether that
-  # shape is the argument itself or one of the binary operator's operands —
-  # still falls to the eager `_` fallback and runs a side effect `first`
-  # never needed. Pinned as a known gap in
-  # test_short_circuit_side_effect_leaks_820_932_987; #1596 tracks the fix.
-  if [[ "$filter" == *'first('* ]]; then
-    case "$filter" in
-      *'if true then'*|*'try ('*|*'label $o |'*|*' as $v |'*|*'limit('*)
-        echo '#1596 (If/Try/Label/As/Limit have no eval_each_generic arm)'
-        return 0
-        ;;
-    esac
-  fi
-
   return 1
 }
 

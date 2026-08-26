@@ -27,14 +27,15 @@ use super::document::{
     DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, arith_combine, classify_limit_n, classify_nth_n, collapse_vec,
-    eval as full_eval, eval_each_owned, format_owned, index_one_owned as index_owned_by_key,
+    apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
+    collect_pattern_var_names, eval as full_eval, eval_each_owned, expand_func_calls,
+    extract_pattern_bindings, format_owned, index_one_owned as index_owned_by_key,
     literal_to_owned, needs_path_context, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, tonumber_from_str,
-    try_reserve_product, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, QueryResult, YqSemantics,
+    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
+    substitute_vars, tonumber_from_str, try_reserve_product, Control, Demand, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
-use super::expr::{Builtin, CompareOp, Expr, FormatType};
+use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
@@ -4438,6 +4439,86 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
+
+        // #1596: `cond` stays eager (branch *selection* was already lazy --
+        // only the taken branch's own body wasn't), mirroring `eval.rs`'s
+        // `each_if`/`Expr::If` pair exactly -- see [`each_if_generic`].
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => each_if_generic::<S, V>(
+            cond,
+            then_branch,
+            else_branch,
+            value,
+            optional,
+            cursor,
+            sink,
+        ),
+
+        // Same `.[EXPR]?`/`.[S:E]?` carve-out as `eval_single`'s identical
+        // arm above (#693) -- `?` here guards only the final index/slice
+        // step, not the key/bounds sub-expression, so route straight through
+        // rather than via [`each_try_generic`], which would catch the
+        // key/bounds error too.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            eval_each_generic::<S, V>(inner, value, true, cursor, sink)
+        }
+        // `E?` is sugar for `try E` (no catch handler) -- same ambient-
+        // `optional` forwarding as `eval_single`'s own arm (#693).
+        Expr::Optional(inner) => {
+            each_try_generic::<S, V>(inner, None, value, optional, cursor, sink)
+        }
+        Expr::Try { expr, catch } => {
+            each_try_generic::<S, V>(expr, catch.as_deref(), value, optional, cursor, sink)
+        }
+
+        Expr::Label { name, body } => {
+            each_label_generic::<S, V>(name, body, value, optional, cursor, sink)
+        }
+
+        // The parser builds `Expr::As` for the bare-`$var` spelling and
+        // reserves `Expr::AsPattern` for anything destructured -- both need
+        // an arm, same as `eval.rs`'s own pair (see that pair's doc comments
+        // for the live-verified parse confirmation).
+        Expr::As { expr, var, body } => {
+            each_as_generic::<S, V>(expr, var, body, value, optional, cursor, sink)
+        }
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => each_as_pattern_generic::<S, V>(expr, patterns, body, value, optional, cursor, sink),
+
+        // `def name(params): body; then` is pure AST substitution -- no
+        // producer logic of its own to make demand-aware -- so routing the
+        // expanded tree back through `eval_each_generic` instead of
+        // `eval_single` is the whole fix, mirroring `eval.rs`'s identical
+        // arm.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } => {
+            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
+            eval_each_generic::<S, V>(&expanded_then, value, optional, cursor, sink)
+        }
+
+        // Demand-forwarding twin of `eval_limit_generic` (#1607): that
+        // function still (correctly) answers a bare top-level `limit(n;
+        // expr)` by collecting up to `n` items as one batch, but a wrapping
+        // consumer with a *smaller* demand -- `first(limit(2; expr))` -- needs
+        // that demand to reach inside `expr` itself, not just cap the batch
+        // `eval_limit_generic` hands back once full. Mirrors `eval.rs`'s own
+        // `each_limit`/`Expr::Limit` pair (#1462).
+        Expr::Limit { n, expr } => {
+            each_limit_generic::<S, V>(n, expr, value, optional, cursor, sink)
+        }
+
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }
 }
@@ -4538,6 +4619,400 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
                 sink,
             )
         }
+    }
+}
+
+/// Lazy twin of `eval::each_if` (#1596): `cond` is evaluated eagerly --
+/// branch *selection* was already lazy (a fanout over `cond`'s own outputs
+/// picks the taken branch per bit) -- but each taken branch's own body is
+/// now pushed through [`eval_each_generic`] rather than materialized via
+/// `eval_single`, so a generator inside it honours the wrapping consumer's
+/// demand (`first(if true then (1,("B"|stderr)) else 9 end)` no longer
+/// evaluates the `stderr` candidate). Mirrors `eval.rs`'s `each_if`
+/// bit-by-bit walk over every one of `cond`'s outputs (multi-output `cond`,
+/// e.g. `if (true,false) then "a" else "b" end`, #378) minus the
+/// borrowed/owned accumulator -- `sink` *is* the accumulator here, same as
+/// `eval_each_generic`'s own `Comma` arm.
+fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let cond_result = eval_single::<S, V>(cond, value.clone(), optional, cursor);
+    let mut bits: Vec<bool> = Vec::new();
+    let cond_control = push_generic_truthiness(cond_result, &mut bits);
+
+    for bit in bits {
+        let branch = if bit { then_branch } else { else_branch };
+        match eval_each_generic::<S, V>(branch, value.clone(), optional, cursor, sink) {
+            Flow::Exhausted => {}
+            stopped_or_escaped => return stopped_or_escaped,
+        }
+    }
+
+    match cond_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Lazy twin of `eval::each_try` (#1596): pushes `expr`'s own outputs
+/// straight to `sink`, then -- only on a bare `Flow::Escaped`, whose own
+/// contract guarantees every output produced before it was already
+/// delivered -- runs the catch handler (if any) and forwards its outputs
+/// too. `catch` runs bound to the raised payload for `Error`, or `null` for
+/// `Break` (#562, matching `eval::each_try`'s own note that real jq binds
+/// its own internal break marker there instead, not worth replicating).
+///
+/// A decode failure (#1247) must never be caught here, same #1620 exclusion
+/// as `eval_single`'s own `Expr::Optional` arm above. `Halt` is never
+/// caught, matching `Control`'s own pass-through guarantee.
+///
+/// If `sink` itself is satisfied before `expr` would have errored,
+/// `eval_each_generic` returns `Flow::Stopped` rather than `Escaped`, and
+/// this function propagates it verbatim without ever running `catch` --
+/// matching jq exactly: `first(try (1, error("x")) catch "c")` is `1`, and
+/// jq never even reaches `error`, let alone `catch`.
+fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    catch: Option<&Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match eval_each_generic::<S, V>(expr, value, optional, cursor, sink) {
+        Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+            Flow::Escaped(Control::Error(e))
+        }
+        Flow::Escaped(Control::Error(e)) => match catch {
+            Some(catch_expr) => {
+                eval_each_owned::<S>(catch_expr, &e.payload(), optional, &mut |o| {
+                    sink(GenericItem::Owned(o))
+                })
+            }
+            None => Flow::Exhausted,
+        },
+        Flow::Escaped(Control::Break(_)) => match catch {
+            Some(catch_expr) => {
+                eval_each_owned::<S>(catch_expr, &OwnedValue::Null, optional, &mut |o| {
+                    sink(GenericItem::Owned(o))
+                })
+            }
+            None => Flow::Exhausted,
+        },
+        // Halt is never caught (`Control`'s own guarantee); other terminal
+        // shapes (`Exhausted`, `Stopped`) pass straight through.
+        other => other,
+    }
+}
+
+/// Lazy twin of `eval::each_label` (#1596): pushes `body`'s outputs straight
+/// to `sink`, then -- only on a bare `Flow::Escaped(Control::Break(name))`
+/// matching this label, whose contract guarantees every prior output was
+/// already delivered -- swallows it. Every other outcome -- a non-matching
+/// break, a bare or trailing `Error`/`Halt`, `Exhausted`, or a satisfied
+/// `Stopped` -- propagates unchanged.
+fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
+    name: &str,
+    body: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match eval_each_generic::<S, V>(body, value, optional, cursor, sink) {
+        Flow::Escaped(Control::Break(label)) if label == name => Flow::Exhausted,
+        other => other,
+    }
+}
+
+/// Lazy twin of `eval::each_as` (#1596): the bind expression (`expr`) is
+/// evaluated eagerly, exactly as `eval::each_as` already does -- this fix is
+/// scoped to what runs *per bound value*, not to the binding itself. Each
+/// bound value's `body` is then pushed through [`eval_each_generic`] rather
+/// than materialized, so `isempty((1,2) as $x | ($x, ("B"|stderr)))`-shaped
+/// binds no longer evaluate the `stderr` branch. The parser reserves this
+/// bare-`$var` node for `Expr::As`; [`each_as_pattern_generic`] below is its
+/// destructuring sibling (`Expr::AsPattern`, `?//`-chains included).
+///
+/// [`push_generic_owned_values`] plays the role `eval::materialize_bound_values`
+/// plays for `eval::each_as` -- an empty `out` with `None` control is "no
+/// bound values at all" (mirrors `QueryResult::None`'s `Err(Flow::Exhausted)`
+/// there); an empty `out` with `Some(control)` is a bare
+/// error/break/halt before any bind (mirrors that function's
+/// `Error`/`Break`/`Halt` arms); a non-empty `out` with `Some(control)` is a
+/// `Partial` bind whose produced prefix is still bound and run through the
+/// body (#400, #494), exactly as `eval::materialize_bound_values`'s own
+/// `Partial` arm documents.
+fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    var: &str,
+    body: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
+    let mut bound_values: Vec<OwnedValue> = Vec::new();
+    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
+    if bound_values.is_empty() {
+        return match bound_control {
+            Some(control) => Flow::Escaped(control),
+            None => Flow::Exhausted,
+        };
+    }
+
+    for bound_val in bound_values {
+        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+        match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+
+    match bound_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Lazy twin of `eval::each_as_pattern` (#1596): the bind expression
+/// (`expr`) is evaluated eagerly, exactly as `eval::each_as_pattern` already
+/// does -- same reasoning as [`each_as_generic`] above, its non-destructuring
+/// sibling. Each bound value's `body` (after `?//`-alternative substitution)
+/// is then pushed through [`eval_each_generic`] rather than materialized.
+fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    patterns: &[Pattern],
+    body: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
+    let mut bound_values: Vec<OwnedValue> = Vec::new();
+    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
+    if bound_values.is_empty() {
+        return match bound_control {
+            Some(control) => Flow::Escaped(control),
+            None => Flow::Exhausted,
+        };
+    }
+
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
+
+    for bound_val in bound_values {
+        match each_pattern_alternatives_generic::<S, V>(
+            patterns,
+            &all_var_names,
+            body,
+            &bound_val,
+            &value,
+            optional,
+            cursor,
+            sink,
+        ) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+
+    match bound_control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
+/// Sink-based twin of `eval::each_pattern_alternatives` (#1596): same
+/// `?//`-alternative fallthrough rule (a pattern-match failure, a body
+/// error, or a body break tries the next alternative unless this is the
+/// last one; halt never falls through), but each alternative's own
+/// successful outputs are pushed to `sink` as they're produced instead of
+/// collected.
+///
+/// If `sink` itself is satisfied partway through an alternative,
+/// `eval_each_generic` returns `Flow::Stopped` rather than `Escaped`, which
+/// this function propagates immediately rather than falling through to the
+/// next alternative -- once the consumer has what it wants, no further
+/// alternative is ever tried, matching [`each_try_generic`]'s identical
+/// reasoning.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `eval::each_pattern_alternatives`'s
+                                     // own 7-argument shape plus this module's `cursor` --
+                                     // every param is threaded straight through to the
+                                     // recursive `eval_each_generic` call, a struct would just
+                                     // rename the same fields.
+fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    body: &Expr,
+    bound_val: &OwnedValue,
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let last_idx = patterns.len() - 1;
+    // #1366: a genuine `?//`-chain (2+ patterns) inverts real jq's
+    // duplicate-binding dedup rule relative to a bare pattern -- see
+    // `extract_pattern_bindings`'s own doc comment.
+    let invert_dedup = patterns.len() > 1;
+
+    for (i, pattern) in patterns.iter().enumerate() {
+        let is_last = i == last_idx;
+
+        let bindings = match extract_pattern_bindings(pattern, bound_val, invert_dedup) {
+            Ok(b) => b,
+            Err(e) => {
+                if is_last {
+                    return Flow::Escaped(Control::Error(e));
+                }
+                continue;
+            }
+        };
+
+        let null_value = OwnedValue::Null;
+        let substituted_body = substitute_vars(
+            body,
+            as_var_refs(&bindings).chain(
+                all_var_names
+                    .iter()
+                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                    .map(|name| (name.as_str(), &null_value)),
+            ),
+        );
+
+        match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
+            Flow::Exhausted => return Flow::Exhausted,
+            Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1457: `Break` falls through like `Error`, not immediately
+            // like `Halt` -- same live-verified correction
+            // `eval::each_pattern_alternatives` itself documents.
+            Flow::Escaped(Control::Error(e)) => {
+                if is_last {
+                    return Flow::Escaped(Control::Error(e));
+                }
+                continue;
+            }
+            Flow::Escaped(Control::Break(label)) => {
+                if is_last {
+                    return Flow::Escaped(Control::Break(label));
+                }
+                continue;
+            }
+            Flow::Escaped(Control::Halt(code)) => return Flow::Escaped(Control::Halt(code)),
+        }
+    }
+
+    unreachable!(
+        "patterns is always non-empty by construction (the parser never \
+         builds an empty AsPattern), and every loop iteration above \
+         returns on its `is_last` pass"
+    )
+}
+
+/// Demand-forwarding twin of [`eval_limit_generic`] (#1596, mirroring
+/// `eval::each_limit`, #1462): forwards every output of `expr` straight to
+/// `sink`, stopping the generator as soon as *either* `n` outputs have been
+/// forwarded or `sink` itself says to stop -- whichever comes first.
+/// [`eval_limit_generic`]'s own batch-collect (#1607) still answers a bare
+/// `limit(n; expr)` correctly, but a wrapping consumer satisfied sooner
+/// (`first(limit(2; (1,("B"|stderr))))`) had no way to say so until this arm
+/// existed, because `eval_limit_generic` always collects up to `n` items as
+/// one batch before `eval_each_generic`'s `_` fallback ever got a chance to
+/// forward a smaller demand.
+///
+/// A generator `n` (anything beyond the common single-value shapes) bridges
+/// to the full evaluator and drains its answer -- the same "give up on the
+/// fast path, hand the whole node to `eval.rs`" policy as
+/// `eval_limit_generic`'s own `None` return, except this function has no
+/// caller to hand a `None` back to, so it performs the bridge/drain itself.
+fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let n_result = eval_single::<S, V>(n_expr, value.clone(), optional, cursor);
+    let n_value = match n_result {
+        GenericResult::One(v) => match to_owned(&v) {
+            Ok(o) => o,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        },
+        GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
+            Ok(o) => o,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        },
+        GenericResult::Owned(v) => v,
+        GenericResult::None => return Flow::Exhausted,
+        GenericResult::Error(e) => return Flow::Escaped(Control::Error(e)),
+        GenericResult::Break(label) => return Flow::Escaped(Control::Break(label)),
+        GenericResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
+        _ => {
+            let owned = match to_owned_with_cursor(&value, cursor) {
+                Ok(o) => o,
+                Err(e) => return Flow::Escaped(Control::Error(e)),
+            };
+            let result = eval_on_owned::<S, V>(
+                &Expr::Limit {
+                    n: Box::new(n_expr.clone()),
+                    expr: Box::new(expr.clone()),
+                },
+                owned,
+                optional,
+            );
+            return drain_result_generic(result, sink);
+        }
+    };
+
+    let n = match classify_limit_n(n_value) {
+        Ok(LimitN::Unlimited) => {
+            return eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+        }
+        Ok(LimitN::Take(n)) => n,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+
+    if n == 0 {
+        return Flow::Exhausted;
+    }
+
+    let mut count = 0usize;
+    let mut outer_stopped = false;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        count += 1;
+        if sink(item) == Demand::Stop {
+            outer_stopped = true;
+            Demand::Stop
+        } else if count >= n {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+
+    // The wrapping consumer, not our own `n` cap, is why the generator
+    // stopped -- propagate its verdict (and whatever `pending` came with it)
+    // verbatim, exactly as every other lazy arm does.
+    if outer_stopped {
+        return flow;
+    }
+    match flow {
+        Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
+        Flow::Escaped(control) => Flow::Escaped(control),
     }
 }
 
