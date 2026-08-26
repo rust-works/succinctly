@@ -1114,7 +1114,9 @@ pub struct YqCommand {
     #[arg(long)]
     pub tab: bool,
 
-    /// Sets indent level for output (default 2). Use 0 for compact output.
+    /// Sets indent level for output (default 2). 0 means compact/flow for
+    /// JSON output, but for YAML (whose block style can't go flow-compact
+    /// the same way) means "use a small default width" instead (#1575).
     #[arg(short = 'I', long, value_name = "N", default_value = "2", value_parser = clap::value_parser!(u8).range(0..=7))]
     pub indent: u8,
 
