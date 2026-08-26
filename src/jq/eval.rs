@@ -23928,39 +23928,72 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Classify `parent(n)`'s count argument into a validated ancestor-hop
-/// count (#1487). The previous inline casts (`i as usize` for `Int`, `f as
-/// usize` for `Float`) disagreed with each other on the same logical
-/// argument: a negative `Int` bit-wraps to a huge `usize` (treated as
-/// overshooting past root), while a negative or NaN `Float` saturates to
-/// `0` (treated as a no-op self-reference) -- `parent(-1)` and
-/// `parent(-1.0)` produced different results for what a caller would
-/// reasonably expect to be the same argument. There is no "unlimited"
-/// counterpart here the way `classify_limit_n` has for `limit(n; f)` --
-/// `n` must name a concrete, non-negative hop count, so every negative,
-/// non-finite, or non-numeric input is a hard error instead. Reuses
+/// count (#1487), at the given `depth` (`current_path.len()` at the call
+/// site -- needed for yq mode's wraparound rule below). The previous inline
+/// casts (`i as usize` for `Int`, `f as usize` for `Float`) disagreed with
+/// each other on the same logical argument: a negative `Int` bit-wraps to a
+/// huge `usize` (treated as overshooting past root), while a negative or
+/// NaN `Float` saturates to `0` (treated as a no-op self-reference) --
+/// `parent(-1)` and `parent(-1.0)` produced different results for what a
+/// caller would reasonably expect to be the same argument. Reuses
 /// `numeric_key_to_index`'s existing truncate-and-reject-NaN convention
 /// (already relied on for real `.[key]` indexing elsewhere in this file)
 /// rather than a third hand-rolled numeric conversion.
-fn classify_parent_n(n_value: &OwnedValue) -> Result<usize, EvalError> {
-    match numeric_key_to_index(n_value) {
-        Some(i) if i >= 0 => Ok(i as usize),
-        Some(_) => Err(EvalError::new(
-            "parent(n) requires a non-negative integer argument",
-        )),
-        // A `Float`/`NumberLiteral(Float)` returns `None` from
-        // `numeric_key_to_index` only when it's NaN; any other type
-        // (string, bool, array, object, null) also lands here.
-        None if matches!(
-            n_value,
-            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
-        ) =>
-        {
-            Err(EvalError::new(
-                "parent(n) requires a non-negative integer argument",
-            ))
-        }
-        None => Err(EvalError::type_error("number", n_value.type_name())),
+///
+/// **Yq mode, negative integer `n`**: real yq (mikefarah/yq v4.53.3,
+/// live-verified) accepts this and treats it as Python-style reverse
+/// indexing into the list `[self, parent(1), .., parent(depth)=root]` (a
+/// real, working feature -- not something to error on): `parent(-k)` for
+/// `1 <= k <= depth + 1` equals `parent(depth + 1 - k)`, and any `k` beyond
+/// that clamps to `parent(0)` (self) rather than erroring further or
+/// wrapping past it again. Real yq's own grammar only accepts a bare
+/// integer literal for `n` (a float, or any computed expression, is a
+/// parse-time error there, confirmed live) -- succinctly's `parent(n_expr)`
+/// already accepts a full expression as an extension beyond that grammar,
+/// so this rule is naturally generalized here to any *integer*-valued `n`
+/// (literal or computed), matching the meaning real yq assigns whenever it
+/// can parse the argument at all. There is no oracle at all for a
+/// non-integer (`Float`/NaN) `n` in yq mode -- real yq can't even parse
+/// that shape -- so it falls through to the same hard error as jq mode.
+///
+/// **Jq mode**: jq has no `parent`/`parent(n)` builtin, so there is no
+/// oracle to match for any of this. `n` is validated as a plain
+/// non-negative integer; every negative, non-finite, or non-numeric input
+/// is a hard error instead of picking one of the two disagreeing legacy
+/// behaviors.
+fn classify_parent_n<S: EvalSemantics>(
+    n_value: &OwnedValue,
+    depth: usize,
+) -> Result<usize, EvalError> {
+    const NOT_NON_NEGATIVE_INT: &str = "parent(n) requires a non-negative integer argument";
+
+    let Some(raw) = n_value.as_f64() else {
+        return Err(EvalError::type_error("number", n_value.type_name()));
+    };
+    if raw.is_nan() {
+        return Err(EvalError::new(NOT_NON_NEGATIVE_INT));
     }
+    if raw >= 0.0 {
+        // Sign already checked on the *untruncated* value above -- unlike
+        // checking `numeric_key_to_index`'s truncated result for
+        // negativity, this doesn't miss a fractional value in `(-1, 0)`
+        // (e.g. `-0.5`, which truncates toward zero to `0` and would
+        // otherwise slip through as a silent, valid self-reference -- the
+        // exact "negative Float saturates to a no-op" bug this function
+        // exists to eliminate).
+        let i = numeric_key_to_index(n_value).expect("checked non-NaN above");
+        return Ok(i as usize);
+    }
+    // `raw < 0.0`. Yq mode's wraparound rule (see doc comment above) only
+    // has meaning for a genuine negative *integer* -- a fractional negative
+    // (e.g. `-0.5`) has no whole hop count to wrap to, and no oracle at all
+    // (real yq's grammar can't express it either way), so it falls through
+    // to the same hard error as jq mode.
+    if S::TAG == EvalTag::Yq && raw.fract() == 0.0 {
+        let i = raw as i64;
+        return Ok((depth as i64 + 1 + i).max(0) as usize);
+    }
+    Err(EvalError::new(NOT_NON_NEGATIVE_INT))
 }
 
 /// Resolve the value `n` levels up from `current_path` -- `parent` is this
@@ -24320,7 +24353,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // `key`'s own value).
         let n = match eval_owned_expr_opt::<S>(n_expr, value, optional) {
             Ok(None) => return QueryResult::None,
-            Ok(Some(ref v)) => match classify_parent_n(v) {
+            Ok(Some(ref v)) => match classify_parent_n::<S>(v, current_path.len()) {
                 Ok(n) => n,
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791).
