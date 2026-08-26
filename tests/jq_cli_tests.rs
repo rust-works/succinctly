@@ -20215,6 +20215,73 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // ---- closed by #1596 (duplicate: #1604) ----
+        // `first(f)`/`last(f)` are the only consumers routed through
+        // `eval_generic.rs`'s own native `eval_each_generic` (via
+        // `each_take_first_generic`) rather than bouncing to `eval.rs`'s
+        // already-lazy `eval_each` -- every other short-circuiting consumer
+        // (`isempty`, `limit`, `nth`, `path`, `any`, `all`, `IN`, ...) already
+        // got this exact arm set for free from the "closed by #820 Stage 5"
+        // section above. `eval_each_generic` gained the matching native
+        // `If`/`Try`/`Optional`/`Label`/`As`/`AsPattern`/`FuncDef` arms and a
+        // demand-forwarding `Limit` arm, closing the asymmetry: a bare
+        // `first(...)` wrapped around any of these seven shapes now stops on
+        // whichever output satisfies it instead of running every sibling
+        // branch to completion first, matching jq (1.7.1, confirmed live)
+        // exactly -- no stderr in any of the seven.
+        (
+            &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"first(try (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // `E?` sugar for `try E` (`Expr::Optional`), not `Expr::Try` itself.
+        (&["-cn", r#"first((1, ("B"|stderr))?)"#], None, "1\n", "", 0),
+        (
+            &["-cn", r#"first(label $out | (1, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // Doubly eager before the fix: both `$x` bindings' body ran to
+        // completion, so this row alone leaked `BB` rather than every other
+        // row's single `B` -- pins that both bindings now stop after their
+        // own body's first output.
+        (
+            &["-cn", r#"first((1,2) as $x | ($x, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"first(limit(2; (1, ("B"|stderr))))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // `Expr::FuncDef`: the top-level `def f: (1,("B"|stderr)); first(f)`
+        // spelling already matched jq before this arm existed (`first`'s own
+        // `eval_first_expr` reaches the expansion via `eval_single`, itself
+        // already lazy) -- the gap was a `FuncDef` nested *inside* `first`'s
+        // own argument, as here.
+        (
+            &["-cn", r#"first(def f: (1, ("B"|stderr)); f)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -20267,78 +20334,6 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // `Expr::If`/`Try`/`Label`/`As`/`Limit` have no native
-        // `eval_each_generic` arm (#1461 scoped it to `Comma`/`Pipe`/`Paren`;
-        // #1481 added `Compare`/`Arithmetic`), so when one of these is
-        // `first`'s argument's top-level shape, evaluation falls through to
-        // eager `eval_single` and a sibling branch's side effect fires even
-        // though `first` never needed it. Out of scope by design -- fixing
-        // `fold_pipe_stages`'s `LazyKeys`/`LazyIndexRange`/`LazySeq` gap
-        // (#1565) does not touch this; these five shapes are pinned as an
-        // explicit, documented known gap rather than fixed. jq: no stderr.
-        //
-        // Tracked for fixing as #1596 (duplicate: #1604), the sibling of
-        // #1592, which #1481 closed for `Compare`/`Arithmetic`.
-        //
-        // The same five shapes leak identically one level down, as an
-        // *operand* of a binary operator (`first(10 == (if true then (1,
-        // ("B"|stderr)) else 9 end))`, and the `+` spelling of it): the
-        // operand strategy `binary_fanout_each_generic` is handed is
-        // `eval_each_generic` itself, so it inherits exactly this arm set.
-        // `scripts/jq-fanout-oracle-sweep.sh` attributes those 20 cases to
-        // this entry rather than reporting them as unexplained -- pinning
-        // every one of them here would be 20 more rows saying what these
-        // five already say.
-        (
-            &["-cn", r#"first(if true then (1, ("B"|stderr)) else 9 end)"#],
-            None,
-            "1\n",
-            "B",
-            0,
-        ),
-        // `try EXPR` with nothing erroring is just `EXPR`'s own laziness --
-        // still eager here, same root cause as the `If` row above.
-        (
-            &["-cn", r#"first(try (1, ("B"|stderr)))"#],
-            None,
-            "1\n",
-            "B",
-            0,
-        ),
-        // `label $out | EXPR` with no `break` reached is just `EXPR`'s own
-        // laziness -- same root cause as the `If` row above.
-        (
-            &["-cn", r#"first(label $out | (1, ("B"|stderr)))"#],
-            None,
-            "1\n",
-            "B",
-            0,
-        ),
-        // `EXPR as $x | BODY` should stop after `BODY`'s first output for
-        // the first `$x` binding, never touching the second `(1,2)`
-        // binding at all -- same root cause as the `If` row above, but
-        // doubly eager here since both bindings' `BODY` runs to completion,
-        // hence `BB` rather than the other rows' single `B`. jq: no stderr
-        // at all (captured from jq 1.7.1), same as every other row here --
-        // it stops at `$x`'s own first output, before `("B"|stderr)` is
-        // ever reached under either binding.
-        (
-            &["-cn", r#"first((1,2) as $x | ($x, ("B"|stderr)))"#],
-            None,
-            "1\n",
-            "BB",
-            0,
-        ),
-        // `limit(2; f)` should stop pulling from `f` after `first` takes
-        // `limit`'s own first output, never evaluating `f`'s second output
-        // -- same root cause as the `If` row above.
-        (
-            &["-cn", r#"first(limit(2; (1, ("B"|stderr))))"#],
-            None,
-            "1\n",
-            "B",
-            0,
-        ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry -------
         // (code review, #1462): `resolve_leaf` is the one consumer that
         // reads `Flow::Stopped`'s `pending`, and this pair pins the

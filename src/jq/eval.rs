@@ -21094,7 +21094,9 @@ where
 /// `EvalContext`). Named so this one-line, logic-free projection has a
 /// single place to read rather than 4 identical copies of it (#1368 code
 /// review).
-fn as_var_refs(bindings: &[(String, OwnedValue)]) -> impl Iterator<Item = (&str, &OwnedValue)> {
+pub(crate) fn as_var_refs(
+    bindings: &[(String, OwnedValue)],
+) -> impl Iterator<Item = (&str, &OwnedValue)> {
     bindings.iter().map(|(n, v)| (n.as_str(), v))
 }
 
@@ -21189,7 +21191,12 @@ fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue)
 /// duplicating this `if` verbatim was flagged in #844's own review as
 /// exactly the kind of two-call-site asymmetry the issue was filed to fix
 /// in the first place.
-fn substitute_bound_var(bind_expr: &Expr, body: &Expr, var_name: &str, bound: &OwnedValue) -> Expr {
+pub(crate) fn substitute_bound_var(
+    bind_expr: &Expr,
+    body: &Expr,
+    var_name: &str,
+    bound: &OwnedValue,
+) -> Expr {
     if is_identity_passthrough(bind_expr) {
         substitute_var_tracked(body, var_name, bound)
     } else {
@@ -32967,7 +32974,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Collect every variable name a pattern would bind, recursively.
-fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
+pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
     match pattern {
         Pattern::Var(name) => names.push(name.clone()),
         Pattern::Object(entries) => {
@@ -33007,7 +33014,7 @@ fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<String>) {
 /// inverted for the *inner* array sub-pattern too, not just the outermost
 /// container -- so `invert` threads through every recursive call
 /// unchanged, it is not computed once and only applied at the top.
-fn extract_pattern_bindings(
+pub(crate) fn extract_pattern_bindings(
     pattern: &Pattern,
     value: &OwnedValue,
     invert: bool,
@@ -33400,7 +33407,7 @@ fn expansion_error(msg: String) -> Expr {
 }
 
 /// Expand function calls to a defined function by inlining the body.
-fn expand_func_calls(
+pub(crate) fn expand_func_calls(
     expr: &Expr,
     func_name: &str,
     params: &[String],

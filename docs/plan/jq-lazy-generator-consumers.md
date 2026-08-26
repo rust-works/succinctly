@@ -2,7 +2,7 @@
 
 [Home](../../) > [Docs](../) > [Plan](./) > Lazy generator consumers
 
-**Status: Stages 1, 2, 2b, 3, 4, 5 and the #1481 follow-up implemented.** This document is the
+**Status: Stages 1, 2, 2b, 3, 4, 5 and the #1481/#1596 follow-ups implemented.** This document is the
 deliverable for [#820](https://github.com/rust-works/succinctly/issues/820), which its
 own tier review (2026-08-20) classified Tier 3 — "evaluator-architecture change, design
 doc first, in the shape of #1282". It also scopes the two issues that name #820 as their
@@ -24,6 +24,7 @@ by Stage 3: `each_paths_filter` + `resolve_leaf`'s stop-after-first sink). See
 | (c)   | Mirror the sink into `eval_generic` for `Pipe`      | ✅ merged — #1451, #1461    |
 | —     | Interleave top-level `input`/`inputs` (#1309's residue) | ✅ merged — #1504        |
 | —     | Interleave the eager binary-fanout loops            | ✅ merged — closes #1481    |
+| —     | Mirror Stage 5's arm set into `eval_generic.rs`     | ✅ merged — closes #1596    |
 
 **What actually shipped, against what this document predicted.** #820's silent data loss —
 a discarded branch consuming `input`/`inputs` documents the CLI's driver loop then never
@@ -53,19 +54,22 @@ stderr order (`(input) + (input, input)` over `"a" "b" "c" "d"` was `["ca","db"]
 jq's `["ba","dc"]`). See [issue #1481](https://github.com/rust-works/succinctly/issues/1481)
 for the full repro set and `scripts/jq-fanout-oracle-sweep.sh` for the verification sweep.
 
-**What is still divergent, and where it is pinned.** Five shapes remain, all in
-`test_short_circuit_side_effect_leaks_820_932_987`: `first(...)` over an `Expr::If`, `Try`,
-`Label`, `As` or `Limit`. Those five are the arm set `eval_each_generic` still lacks — it
-has native arms for `Comma`/`Pipe`/`Paren` (option (c)/#1461) and `Compare`/`Arithmetic`
-(#1481) only, so anything else falls to its eager `_` fallback. The same five leak
-identically one level down, as an *operand* of a binary operator
+**The remaining seven shapes, closed by #1596.** `first(...)`/`last(...)` over an `Expr::If`,
+`Try`, `Optional`, `Label`, `As`, `AsPattern` or `FuncDef` — plus the demand-forwarding-only
+`Expr::Limit` arm — used to fall to `eval_each_generic`'s eager `_` fallback, which had native
+arms for `Comma`/`Pipe`/`Paren` (option (c)/#1461) and `Compare`/`Arithmetic` (#1481) only.
+The same seven leaked identically one level down, as an *operand* of a binary operator
 (`first(10 == (if true then (1, ("B"|stderr)) else 9 end))`), because the operand strategy
-`binary_fanout_each_generic` is handed is `eval_each_generic` itself; the sweep script
-attributes those cases to this same entry rather than pinning 20 more rows that say what the
-five already say. Closing them means mirroring Stage 5's `eval.rs` arm set into
-`eval_generic.rs` — the natural next increment of option (c), not a new mechanism, and
-already filed as [#1596](https://github.com/rust-works/succinctly/issues/1596) (duplicate:
-[#1604](https://github.com/rust-works/succinctly/issues/1604)). Its `Compare` sibling,
+`binary_fanout_each_generic` is handed is `eval_each_generic` itself. **Closed as of #1596**
+(duplicate: [#1604](https://github.com/rust-works/succinctly/issues/1604)) by mirroring
+Stage 5's `eval.rs` arm set into `eval_generic.rs` — the natural next increment of option (c),
+not a new mechanism: `each_if_generic`, `each_try_generic` (shared by `Expr::Try` and
+`Expr::Optional`), `each_label_generic`, `each_as_generic`, `each_as_pattern_generic` (plus
+its own `each_pattern_alternatives_generic` twin), and a demand-forwarding `each_limit_generic`
+for `Expr::Limit`; `Expr::FuncDef` again needed no new function, only routing the
+`expand_func_calls`-expanded tree back through `eval_each_generic` instead of `eval_single`.
+`scripts/jq-fanout-oracle-sweep.sh` went from 20 known-gap cases attributed to this entry to
+0 (490/490 matching the oracle). Its `Compare` sibling,
 [#1592](https://github.com/rust-works/succinctly/issues/1592), is what #1481 closed here —
 together with the `Arithmetic` half #1592 did not name.
 
@@ -647,6 +651,11 @@ time there, or `first`/`last` no longer shadowing `eval.rs` for these shapes spe
 worth folding into **#1462**'s own scope rather than rediscovering as a surprise gap once
 that issue's `eval.rs` half ships.
 
+This caveat's own prediction is what happened: #1462 shipped `eval.rs`'s half only (Stage 5,
+item 7 below), and the CLI-specific residual it named here was filed and closed separately as
+**#1596** (item 9 below) — the "identical widening applied a second time" this paragraph
+called for, in `eval_generic.rs` rather than `eval.rs`.
+
 **Honest scoping of #932.** `builtin_upper_in` synthesizes
 `gen = Expr::Compare { Eq, src, s }` for the `IN(src; s)` form and hands it to
 `any_all_gen_cond`. `binary_fanout_core` evaluates the **right** operand to
@@ -691,11 +700,11 @@ Columns are `stdout | exit | stderr`. Input is `null` (`-cn`) unless noted.
 | `[isempty(.id == (1, input)), .id]` over 4 docs                    | `ids 1-4\|0\|` | `ids 1,3\|0\|`   | Stage 4   |
 | `[all((1,2) == (10, ("B"\|stderr)); .)]`                           | `[false]\|0\|` | `[false]\|0\|B`  | Stage 4   |
 | `isempty(limit(3; 1, ("B"\|stderr)))`                              | `false\|0\|`   | `false\|0\|B`    | Stage 5   |
-| `first(if true then (1,("B"\|stderr)) else 9 end)`                 | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
-| `first(try (1,("B"\|stderr)) catch 9)`                             | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
-| `first(label $o \| (1,("B"\|stderr)))`                             | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
-| `first(1 as $x \| (1,("B"\|stderr)))`                              | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
-| `def f: (1,("B"\|stderr)); first(f)`                               | `1\|0\|`       | `1\|0\|B`        | Stage 5   |
+| `first(if true then (1,("B"\|stderr)) else 9 end)`                 | `1\|0\|`       | `1\|0\|B`        | #1596     |
+| `first(try (1,("B"\|stderr)) catch 9)`                             | `1\|0\|`       | `1\|0\|B`        | #1596     |
+| `first(label $o \| (1,("B"\|stderr)))`                             | `1\|0\|`       | `1\|0\|B`        | #1596     |
+| `first(1 as $x \| (1,("B"\|stderr)))`                              | `1\|0\|`       | `1\|0\|B`        | #1596     |
+| `def f: (1,("B"\|stderr)); first(f)`                               | `1\|0\|`       | `1\|0\|B`        | #1596     |
 
 Plus the data-loss shapes in [Problem](#this-is-no-longer-a-cosmetic-leak--it-causes-silent-data-loss),
 closed by Stage 2 (`isempty`) and Stage 2b (`first`).
@@ -1269,3 +1278,30 @@ the reasoning behind each placement:
    by extending the existing `first`/`last` bridge-to-`eval.rs` pattern to the top-level
    entry points rather than by #1461's full mirror — see "#1504 — the other 'two more
    owners'..." above. #1461 itself remains open.
+9. **#1596** (duplicate: #1604) — the next increment of option (c): mirror Stage 5's widened
+   `eval.rs` arm set (`If`/`Try`/`Optional`/`Label`/`As`/`AsPattern`/`FuncDef`/`Limit`) into
+   `eval_generic.rs`, closing the asymmetry Stage 5's own finding (ii) named — `first(...)`/
+   `last(...)` are the only consumers with a native `eval_generic.rs` fast path, so they were
+   also the only ones Stage 5's new arms never reached. **Implemented** as `each_if_generic`,
+   `each_try_generic` (shared by `Expr::Try` and `Expr::Optional`, same as `eval.rs`'s
+   `each_try`), `each_label_generic`, `each_as_generic`, `each_as_pattern_generic` (with its
+   own `each_pattern_alternatives_generic` twin of `eval.rs`'s `each_pattern_alternatives`),
+   and a demand-forwarding `each_limit_generic` — `eval_limit_generic` (#1607) already answers
+   a bare top-level `limit(n; expr)` correctly but collects its `n`-item batch before a
+   *wrapping* consumer's own smaller demand can shrink it, the exact `each_limit` gap Stage 5
+   closed in `eval.rs` one layer up. `Expr::FuncDef` again needed no new function, only routing
+   `expand_func_calls`'s expansion back through `eval_each_generic` instead of `eval_single`.
+   `substitute_bound_var`, `collect_pattern_var_names`, `expand_func_calls`,
+   `extract_pattern_bindings` and `as_var_refs` were promoted from module-private to
+   `pub(crate)` in `eval.rs` so `eval_generic.rs` could reuse them rather than re-derive
+   identical logic a second time.
+
+   Every new arm inherits input-queue safety from its call site rather than needing its own
+   guard: `eval_first_or_last_generic`'s existing `uses_input_builtins(inner)` check already
+   walks the *whole* argument tree before ever dispatching into `eval_each_generic`, and
+   `eval_limit_generic`/`eval_nth_generic`'s own `limit_or_nth_uses_live_input_queue` guard
+   (#1607) does the same for a bare `limit`/`nth` call — both predicates recurse into every
+   `Expr` variant already, this stage's new ones included, so no new gap opened. Verified with
+   `scripts/jq-fanout-oracle-sweep.sh`, which went from 20 known-gap cases attributed to this
+   issue to 0 divergences (490/490 matching pinned jq 1.7.1); its now-dead `classify_divergence`
+   branch for this issue was removed.
