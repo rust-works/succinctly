@@ -689,10 +689,18 @@ Confirmed live against the pinned jq 1.7.1 binary for this exact shape (not just
 from the string-repeat case above): a genuinely large-but-indexable cross product
 (`[range(50000) | [1,2]] | .[][(range(50000))]`) neither errors nor crashes — jq streams
 results one at a time instead of pre-allocating a single buffer, so it just keeps producing
-output rather than answering promptly or refusing. Unlike `s * n` above, a live check did
-not turn up an analogous yq-side cap for this shape either — this guard is symmetric across
-both modes, converting a host-process crash into a catchable error in each, with no
-cap-specific divergence to record in
+output rather than answering promptly or refusing.
+
+Unlike `s * n` above, this is symmetric across both modes rather than a yq-specific
+divergence to record — but not because a live check for a yq-side cap came back empty.
+Real yq v4.53.3's lexer rejects `range` outright (confirmed live, `range(5)` →
+`lexer: invalid input text` — matching the `--jq-extensions`-gated builtin table above), so
+there is no *generator*-driven way to construct a comparably large cross product in real
+yq's own grammar at all: the query shape needed to test this doesn't exist there, as
+opposed to existing and having been tested clean. A large *document-sourced* array of
+literal keys could in principle still reach comparable scale in yq; that variant wasn't
+pursued within this issue's scope. Either way, the guard converts a host-process crash into
+a catchable error uniformly in both modes, with no cap-specific divergence to record in
 [yq Limitations](../yq/limitations.md).
 
 ## Regex flags `l` and `n`
