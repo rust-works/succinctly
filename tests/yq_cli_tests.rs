@@ -20788,10 +20788,13 @@ fn test_yq_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()
 /// #1476: `parent(n)` must agree with bare `parent` exactly at the root
 /// boundary (`n == current_path.len()`) in yq mode too, since both route
 /// through the same `eval_pipe_with_path_context_internal` shared by jq
-/// and yq mode. `parent`/`parent(n)` are succinctly-only extensions with
-/// no real yq equivalent, so this is an internal-consistency check, not a
-/// yq-parity one: `.a | parent` and `.a | parent(1)` must still agree with
-/// each other, and both give the root.
+/// and yq mode. Both `parent` and `parent(n)` *are* real yq builtins
+/// (confirmed live against yq v4.53.3 -- `parent` is one level up, exactly
+/// as here; #1487's own investigation corrected an earlier assumption in
+/// this comment that there was no real yq equivalent at all), so this is
+/// also implicitly a yq-parity check for the boundary case: `.a | parent`
+/// and `.a | parent(1)` must still agree with each other, and both give
+/// the root.
 #[test]
 fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result<()> {
     let (chained, code) = run_yq_stdin(".a | parent", "a: 1\n", &["-o", "json"])?;
@@ -20800,6 +20803,53 @@ fn test_yq_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result
     assert_eq!(code, 0, "output: {n_form:?}");
     assert_eq!(n_form, chained, "parent(1) must agree with parent");
     assert!(n_form.contains(r#""a": 1"#), "output: {n_form:?}");
+    Ok(())
+}
+
+/// #1487: real yq (v4.53.3, live-verified) accepts a negative integer
+/// literal for `parent(n)` and treats it as Python-style reverse indexing
+/// into `[self, parent(1), .., parent(depth)=root]` -- NOT an error, unlike
+/// jq mode (which has no `parent(n)` oracle at all and hard-errors on any
+/// negative `n`). On the 3-level document below (`.a.b.c`, depth 3):
+/// `parent(-1)` == `parent(3)` (root), `parent(-2)` == `parent(2)`,
+/// `parent(-3)` == `parent(1)`, and `parent(-4)`/beyond clamp to
+/// `parent(0)` (self) instead of erroring or wrapping further. Every one of
+/// these exact input/output pairs was captured directly from the pinned
+/// `yq` binary, not derived from a description of its behavior.
+#[test]
+fn test_yq_parent_n_negative_wraps_like_real_yq_1487() -> Result<()> {
+    let doc = "a:\n  b:\n    c: 1\n";
+    let cases: &[(&str, &str)] = &[
+        ("-1", "a:\n  b:\n    c: 1\n"),
+        ("-2", "b:\n  c: 1\n"),
+        ("-3", "c: 1\n"),
+        ("-4", "1\n"),
+        ("-5", "1\n"),
+    ];
+    for (n, expected) in cases {
+        let filter = format!(".a.b.c | parent({n})");
+        let (out, stderr, code) = run_yq_stdin_with_stderr(&filter, doc, &[])?;
+        assert_eq!(code, 0, "n={n}: stderr={stderr}");
+        assert_eq!(out, *expected, "n={n}: stderr={stderr}");
+    }
+    Ok(())
+}
+
+/// #1487: a negative *fractional* `n` (e.g. `-0.5`) has no real yq oracle
+/// at all -- real yq's own `parent(n)` grammar only accepts a bare integer
+/// literal (a float argument is a parse-time error there, live-verified),
+/// so it falls through to the same hard error as jq mode rather than
+/// attempting to wrap a non-whole hop count.
+#[test]
+fn test_yq_parent_n_negative_fractional_has_no_oracle_and_errors_1487() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a.b.c | parent(-0.5)", "a:\n  b:\n    c: 1\n", &[])?;
+    assert_eq!(out, "", "stderr={stderr}");
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("parent(n) requires a non-negative integer argument"),
+        "stderr={stderr}"
+    );
     Ok(())
 }
 

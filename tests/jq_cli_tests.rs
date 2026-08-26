@@ -22335,3 +22335,43 @@ fn test_parent_n_non_negative_unaffected_1487() -> Result<()> {
     assert_eq!(stdout, "{\"b\":1}\n");
     Ok(())
 }
+
+/// #1487: `n` in the open interval `(-1, 0)` (e.g. `-0.5`) truncates toward
+/// zero to `0` -- checking negativity on the *truncated* value instead of
+/// the raw one would silently accept this as a valid `n=0` self-reference,
+/// reproducing the exact "negative Float saturates to a no-op" bug this fix
+/// exists to eliminate.
+#[test]
+fn test_parent_n_fractional_negative_in_open_unit_interval_errors_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(-0.5)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("parent(n) requires a non-negative integer argument"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1487: the non-numeric-argument error now reports the real type name
+/// (`n_value.type_name()`) instead of the old hardcoded placeholder
+/// `"other"`.
+#[test]
+fn test_parent_n_non_numeric_argument_reports_real_type_name_1487() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(\"x\")"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("expected number, got string"),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(null)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("expected number, got null"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
