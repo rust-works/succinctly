@@ -2682,6 +2682,76 @@ fn test_undecodable_keys_are_not_duplicates_1385() -> Result<()> {
     Ok(())
 }
 
+/// #1642: `length`, `keys`, `keys_unsorted`, `to_entries` and `has` must all
+/// agree on whether a document with an undecodable object key is usable --
+/// before this fix, `keys`/`to_entries`/`has` raised (exit 5) on exactly the
+/// same document `.`/`length`/bare `keys_unsorted` accepted (exit 0), so a
+/// script's behaviour depended on which builtin it happened to call. This
+/// extends `test_undecodable_keys_are_not_duplicates_1385`'s guarantee (a
+/// key that will not decode is never a duplicate) to the two builtins that
+/// used to raise before ever reaching it.
+///
+/// `keys`/`to_entries` report the bad key re-escaped from a real
+/// materialized `String` (`a\q`'s single source backslash doubles to
+/// `\\`), where bare `keys_unsorted` echoes the exact source bytes verbatim
+/// -- an inherent, harmless difference between a genuinely-lazy raw-byte
+/// echo and a value that has actually been materialized, not a new
+/// inconsistency.
+#[test]
+fn test_undecodable_key_builtins_agree_1642() -> Result<()> {
+    let doc = r#"{"a\q":1,"b":2}"#;
+
+    let (out, _, code) = run_jq_full(&["-c", "length"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    let (out, _, code) = run_jq_full(&["-c", "keys_unsorted"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["a\q","b"]"#);
+
+    let (out, _, code) = run_jq_full(&["-c", "keys"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"a\\\\q\",\"b\"]");
+
+    let (out, _, code) = run_jq_full(&["-c", "to_entries"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "[{\"key\":\"a\\\\q\",\"value\":1},{\"key\":\"b\",\"value\":2}]"
+    );
+
+    let (out, _, code) = run_jq_full(&["-c", r#"has("b")"#], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "true");
+
+    // Two decode-failure keys, byte-identical source: #1385 already pins
+    // that they never collapse under `.`/`length`/`[.[]]`; extend that to
+    // `keys`/`to_entries`, which used to raise before ever getting the
+    // chance to (dis)agree.
+    let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
+
+    let (out, _, code) = run_jq_full(&["-c", "length"], Some(dup_doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    let (out, _, code) = run_jq_full(&["-c", "keys_unsorted"], Some(dup_doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["\ud800","\ud800"]"#);
+
+    let (out, _, code) = run_jq_full(&["-c", "keys"], Some(dup_doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"\\\\ud800\",\"\\\\ud800\"]");
+
+    let (out, _, code) = run_jq_full(&["-c", "to_entries"], Some(dup_doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "[{\"key\":\"\\\\ud800\",\"value\":1},{\"key\":\"\\\\ud800\",\"value\":2}]"
+    );
+
+    Ok(())
+}
+
 /// #1514: `keys_unsorted | map(f)` and `keys_unsorted | .[]` no longer probe
 /// the whole object before the first key comes out — they dedup as they walk
 /// and switch to the exact collapsed list only once a hash repeats. That
@@ -22268,40 +22338,41 @@ fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
     assert_eq!(stdout.trim(), r#"["\ud800","b"]"#, "stderr: {stderr}");
 }
 
-/// #1247 follow-up: `keys_unsorted` piped into anything else -- even just a
-/// second comma-generator result, as here -- can no longer stay on the
+/// #1642: `keys_unsorted` piped into anything else -- even just a second
+/// comma-generator result, as here -- can no longer stay on the
 /// genuinely-lazy raw-byte path `test_undecodable_object_key_does_not_hide_later_fields_1247`
 /// pins above; it has to materialize through the same escape-hatch fallback
 /// (`materialize_lazy_keys`/`effective_keys`, #140) that `keys` (sorted) and
-/// `{x: keys_unsorted}` (object construction) already went through. That
-/// fallback decodes every key via `key_str()`, so it inherits #1247's core
-/// rule: an undecodable key raises instead of silently vanishing. Before
-/// this test's fix, the fallback silently dropped the bad key instead
-/// (`keys_unsorted, length` printed `["b"]` then `2`, exit 0) -- the same
-/// swallow this whole issue exists to close, just reachable from a third
-/// angle the original #1247 sweep missed.
+/// `{x: keys_unsorted}` (object construction) already go through.
+///
+/// Before this fix, that fallback raised on an undecodable key
+/// (`keys_unsorted, length` exited 5) where the bare, genuinely-lazy fast
+/// path answered fine -- the same document giving a different answer
+/// depending on which pipeline shape reached it, exactly the inconsistency
+/// #1642 exists to close. It now agrees with the bare path: the key
+/// survives via its raw source span rather than being dropped *or* raised
+/// on. `keys` (sorted) always needed a full decode to sort by, so it goes
+/// through the identical fallback and now agrees too -- properly
+/// re-escaped this time, since it is a real materialized `String`, not a
+/// byte-verbatim echo (a literal `\` in the source doubles to `\\`, unlike
+/// bare `keys_unsorted`'s raw echo).
 #[test]
-fn test_undecodable_key_in_materialized_keys_unsorted_surfaces_as_error_1247() {
+fn test_undecodable_key_in_materialized_keys_unsorted_agrees_with_bare_1642() {
     let input = r#"{"\ud800": 1, "b": 2}"#;
 
     let (stdout, stderr, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
         .unwrap_or_else(|e| panic!("`keys_unsorted, length` failed to run: {e}"));
-    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(
-        stderr.contains("invalid unicode escape sequence in object key"),
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "[\"\\\\ud800\",\"b\"]\n2",
         "stderr: {stderr}"
     );
 
-    // Same fallback, reached via sorting instead of a second comma result:
-    // `keys` (sorted) always needed a full decode to sort by, even before
-    // this fix, and already raised.
     let (stdout, stderr, code) = run_jq_full(&["-c", "keys"], Some(input))
         .unwrap_or_else(|e| panic!("`keys` failed to run: {e}"));
-    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(
-        stderr.contains("invalid unicode escape sequence in object key"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "[\"\\\\ud800\",\"b\"]", "stderr: {stderr}");
 }
 
 /// #1247 core: a string scalar the semi-index accepted but that cannot be
@@ -22341,19 +22412,24 @@ fn test_decode_failure_surfaces_as_error_1247() {
     }
 }
 
-/// #1247: an undecodable *key* raises too, and does not silently shrink the
-/// object. `to_entries` used to return one entry fewer than the document had
-/// -- `effective_fields`' dedup walk dropped any field whose key wouldn't
-/// decode, before anything could notice.
+/// #1642 (was #1247): an undecodable *key* does not silently shrink the
+/// object -- `to_entries` used to return one entry fewer than the document
+/// had, because `effective_fields`' dedup walk dropped any field whose key
+/// wouldn't decode, before anything could notice. #1247 closed that by
+/// raising instead; #1642 closes it the other way, by preserving the key
+/// via its raw source span, matching `length`/`keys_unsorted`/`.`/`keys`
+/// (which #1247 had left disagreeing with each other -- see
+/// `test_undecodable_key_in_materialized_keys_unsorted_agrees_with_bare_1642`).
+/// Either way, no entry goes missing.
 #[test]
-fn test_decode_failure_in_key_surfaces_as_error_1247() {
+fn test_decode_failure_in_key_preserved_in_to_entries_1642() {
     let doc = r#"{"\ud800": 1, "b": 2}"#;
     let (stdout, stderr, code) = run_jq_full(&["-c", "to_entries"], Some(doc))
         .unwrap_or_else(|e| panic!("failed to run: {e}"));
-    assert_ne!(code, 0, "stdout: {stdout}");
-    assert!(
-        stderr.contains("in object key"),
-        "stderr should name the key as the site: {stderr}"
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "[{\"key\":\"\\\\ud800\",\"value\":1},{\"key\":\"b\",\"value\":2}]"
     );
 }
 
