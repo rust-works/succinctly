@@ -18605,6 +18605,30 @@ fn test_jq_cursor_metadata_carve_out_keeps_first_inputs_lazy_1504() -> Result<()
     Ok(())
 }
 
+/// #1607's own native `Expr::Limit`/`Builtin::NthStream` arms in
+/// `eval_generic.rs` are reachable from the same carved-out path as
+/// `first(inputs), line` above, and needed the identical #1309 guard --
+/// without it, `limit`/`nth` over `inputs` mixed with a cursor-metadata
+/// builtin silently drained the whole remaining queue via `eval.rs`'s
+/// eager `builtin_inputs` instead of stopping at `n`/index `n` (a
+/// regression this PR's own new native arms would otherwise have
+/// introduced, not a pre-existing gap: pre-#1607, `Expr::Limit`/
+/// `Builtin::NthStream` always fell straight to `eval.rs`'s fully-lazy
+/// `each_take_n`/`each_take_nth`, which never had this problem).
+#[test]
+fn test_jq_cursor_metadata_carve_out_keeps_limit_and_nth_inputs_lazy_1607() -> Result<()> {
+    for (filter, expected) in [
+        ("[nth(1; inputs), line, [inputs]]", "[2,1,[3,4]]\n"),
+        ("[limit(2; inputs), line, [inputs]]", "[1,2,1,[3,4]]\n"),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-cn", filter], Some("1\n2\n3\n4\n")).expect("limit/nth carve-out runs");
+        assert_eq!(code, 0, "{filter}: stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// The carve-out keys off the `line`/`at_offset`/... *builtins*, so a field
 /// or key that merely spells one of their names must not trip it -- that
 /// would quietly switch a filter back to the eager path and undo #1504's own

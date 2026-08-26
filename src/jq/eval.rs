@@ -3143,6 +3143,29 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError>
     }
 }
 
+/// `nth(n; expr)`'s own `n` classification, shared by [`builtin_nth_stream`]
+/// and `eval_generic.rs`'s `eval_nth_generic` (#1607) so the two spellings
+/// (`Builtin::NthStream`, the arm real `nth(n; expr)` calls reach, and the
+/// generic evaluator's native fast path over the same shape) can't drift
+/// apart the way a hand-copied classification already has once before
+/// (#1313, the reason [`classify_limit_n`] above exists at all).
+///
+/// A document-sourced number arrives here as an `OwnedValue`; preferring
+/// `as_i64()` over `as_f64()` matters because an integer past `f64`'s
+/// 53-bit mantissa would otherwise be rounded on its way to `usize`.
+pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
+    match n_owned {
+        ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
+            let f = owned.as_f64().unwrap_or(0.0);
+            if f < 0.0 {
+                return Err(EvalError::new("nth doesn't support negative indices"));
+            }
+            Ok(owned.as_i64().map_or(f as usize, |i| i as usize))
+        }
+        ref other => Err(EvalError::type_error("number", other.type_name())),
+    }
+}
+
 /// Demand-forwarding twin of [`eval_limit`] (#1462, Stage 5): forwards every
 /// output of `expr` straight to `sink`, stopping the generator as soon as
 /// *either* `n` outputs have been forwarded or `sink` itself says to stop --
@@ -30911,28 +30934,9 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_owned| {
-            // A document-sourced number arrives here as an `OwnedValue`; it used
-            // to arrive as a borrowed `QueryResult::One` and take an arm of its
-            // own, which preferred `as_i64()` and only fell back to `as_f64()`.
-            // That preference is kept: an integer past f64's 53-bit mantissa
-            // would otherwise be rounded on its way to `usize`. The sibling
-            // owned arm this replaces used `as_f64()` alone, so consolidating on
-            // the *borrowed* arm's rule is the lossless direction.
-            let n = match n_owned {
-                ref owned @ (OwnedValue::Int(_)
-                | OwnedValue::Float(_)
-                | OwnedValue::NumberLiteral(..)) => {
-                    let f = owned.as_f64().unwrap_or(0.0);
-                    if f < 0.0 {
-                        return QueryResult::Error(EvalError::new(
-                            "nth doesn't support negative indices",
-                        ));
-                    }
-                    owned.as_i64().map_or(f as usize, |i| i as usize)
-                }
-                ref other => {
-                    return QueryResult::Error(EvalError::type_error("number", other.type_name()))
-                }
+            let n = match classify_nth_n(n_owned) {
+                Ok(n) => n,
+                Err(e) => return QueryResult::Error(e),
             };
 
             // Same sink as `eval_nth_expr`, differing only in always materializing

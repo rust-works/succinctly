@@ -2887,6 +2887,25 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
             can_use_m2_streaming(inner)
         }
+
+        // Same reasoning as `FirstExpr`/`LastExpr` above, now that #1607
+        // gave `Expr::Limit`/`Builtin::NthStream` (the arm real
+        // `nth(n; expr)` calls reach) their own native, cursor-threading
+        // arms in `eval_generic.rs`: `limit(3; .[])`/`nth(0; .[])` stream a
+        // `GenericResult` cursor exactly like plain navigation when `expr`
+        // itself does, so route them through `eval_with_cursor_using`
+        // here too rather than `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path -- otherwise #1607's own fix is discarded
+        // one layer up: a correctly cursor-preserving `GenericResult`
+        // still gets flattened into an `IndexMap`-backed `OwnedValue` the
+        // moment `evaluate_yaml_cursor` materializes it for output,
+        // silently re-losing a duplicate key *inside* the captured item
+        // (not the `limit`/`nth` walk itself, which #1607 already fixed
+        // regardless of this gate). `n` is never recursed into: it's
+        // always evaluated as a single control value, never streamed.
+        Expr::Limit { n: _, expr } => can_use_m2_streaming(expr),
+        Expr::NthExpr { n: _, expr } => can_use_m2_streaming(expr),
+        Expr::Builtin(Builtin::NthStream(_, expr)) => can_use_m2_streaming(expr),
         Expr::IndexExpr { .. } => true,
 
         // `select(...)` never changes position - a truthy output is always

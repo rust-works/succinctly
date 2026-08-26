@@ -22637,6 +22637,39 @@ fn test_limit_and_nth_control_flow_1607() -> Result<()> {
     Ok(())
 }
 
+/// #1607 review follow-up: `limit`/`nth` must preserve a duplicate key
+/// *inside the captured value itself*, not only across their own iteration
+/// walk (the original repro's scope, `keys|.[]`, only ever captures plain
+/// strings, which have nothing internal to lose). `limit(1; .[])`/
+/// `nth(0; .[])` on a sequence whose picked element is itself a
+/// duplicate-keyed mapping used to collapse that duplicate, unlike
+/// `first(.[])` on the identical input (#607) -- both routes need
+/// `can_use_m2_streaming` to recurse into `expr` the same way
+/// `FirstExpr`/`LastExpr`/`Map` already do, or a correctly cursor-preserving
+/// `GenericResult` from `eval_generic.rs` still gets flattened into an
+/// `IndexMap`-backed `OwnedValue` one layer up, in `evaluate_yaml_cursor`'s
+/// DOM path.
+#[test]
+fn test_limit_and_nth_preserve_duplicate_keys_inside_captured_item_1607() -> Result<()> {
+    let dup = "- b: 1\n  a: 2\n  b: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    let want = r#"{"b":1,"a":2,"b":3}"#;
+
+    let (out, code) = run_yq_stdin("first(.[])", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), want, "first(.[]) (reference, #607)");
+
+    let (out, code) = run_yq_stdin("limit(1; .[])", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), want, "limit(1; .[])");
+
+    let (out, code) = run_yq_stdin("nth(0; .[])", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), want, "nth(0; .[])");
+
+    Ok(())
+}
+
 /// #1247: a mapping key that fails to decode must not hide the *valid*
 /// fields after it. `YamlFields::find`/`find_cursor` used to `?` out of the
 /// whole search on the first undecodable key, so `.b` answered `null` here
