@@ -3421,6 +3421,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
                 config,
                 0,
                 &mut Vec::new(),
+                &mut Vec::new(),
                 None,
             )?;
         } else {
@@ -3430,6 +3431,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
                 &PreserveFormatter,
                 config,
                 0,
+                &mut Vec::new(),
                 &mut Vec::new(),
                 None,
             )?;
@@ -3805,6 +3807,11 @@ fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<Owned
 /// `Result` and already threads a `level` parameter (previously used only
 /// for indentation, reused here as the depth counter), so there's no reason
 /// to give up the clean failure mode the way `to_owned` had to.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `array_scratch` (#1643) joins `scratch`
+                                     // (#1385) as a second recursion-threaded buffer with its own distinct element type -- each
+                                     // exists solely to give one specific container arm (object, array) a shared allocation instead
+                                     // of a fresh `Vec` per container, so bundling them into one struct would hide that they're
+                                     // independent, not a related group the way `DirectEvalOptions`'s bools are.
 fn print_json<'a, F, Out, Wrd>(
     out: &mut Out,
     value: &JqValue<'a, Wrd>,
@@ -3812,6 +3819,17 @@ fn print_json<'a, F, Out, Wrd>(
     config: &OutputConfig,
     level: usize,
     scratch: &mut Vec<PreparedField<'a>>,
+    // #1643: shared stack for the array arm's own single-walk validation,
+    // same `base`/`truncate` discipline as `scratch` above and for the same
+    // reason -- a fresh `Vec` per array measured as a real cost here, not
+    // just for objects: the `arrays` perf-guard shape (#1523) is a top-level
+    // array of ~100K 5-element arrays, so a fresh heap allocation per *inner*
+    // array (100K of them) was still enough on its own to push
+    // `arrays_identity` over the 5% threshold even after the double-walk fix
+    // removed the dominant cost. Holds `(bp_pos, value_start)` pairs -- see
+    // `PreparedField::value_start`'s doc comment for why `usize::MAX` is the
+    // sentinel rather than `Option<usize>`.
+    array_scratch: &mut Vec<(usize, usize)>,
     // #1643: when `value` is a `JqValue::Cursor` and the caller has
     // *already* called `text_position()` on it (to check the delimiter
     // preceding it against a sibling), it's passed through here so the
@@ -3926,19 +3944,29 @@ where
                         // already-resolved `text_position()` lets the
                         // write loop reconstruct the cursor via
                         // `Frame::cursor` instead of re-deriving it.
+                        //
+                        // `array_scratch` is the shared buffer threaded
+                        // through the whole recursion (see its own doc
+                        // comment on `print_json`'s signature): this
+                        // array's elements occupy `base..`, a nested array
+                        // appends past that and truncates back on the way
+                        // out, same stack discipline `scratch` already uses
+                        // for object fields.
                         let frame = Frame {
                             text: c.text(),
                             index: c.index(),
                         };
-                        let mut prepared: Vec<(usize, usize)> = Vec::new();
+                        let base = array_scratch.len();
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
                             let pos = check_preceding_delimiter(&child_cursor, i)?;
-                            prepared.push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
+                            array_scratch
+                                .push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
                         }
                         if compact {
                             out.write_all(b"[")?;
-                            for (i, &(bp, value_start)) in prepared.iter().enumerate() {
-                                if i > 0 {
+                            for i in base..array_scratch.len() {
+                                let (bp, value_start) = array_scratch[i];
+                                if i > base {
                                     out.write_all(b",")?;
                                 }
                                 let child_value = JqValue::Cursor(frame.cursor(bp));
@@ -3951,6 +3979,7 @@ where
                                     config,
                                     level + 1,
                                     scratch,
+                                    array_scratch,
                                     known_text_pos,
                                 )?;
                             }
@@ -3958,8 +3987,9 @@ where
                         } else {
                             out.write_all(b"[")?;
                             out.write_all(separator.as_bytes())?;
-                            for (i, &(bp, value_start)) in prepared.iter().enumerate() {
-                                if i > 0 {
+                            for i in base..array_scratch.len() {
+                                let (bp, value_start) = array_scratch[i];
+                                if i > base {
                                     out.write_all(b",")?;
                                     out.write_all(separator.as_bytes())?;
                                 }
@@ -3974,6 +4004,7 @@ where
                                     config,
                                     level + 1,
                                     scratch,
+                                    array_scratch,
                                     known_text_pos,
                                 )?;
                             }
@@ -3981,6 +4012,7 @@ where
                             out.write_all(current_indent.as_bytes())?;
                             out.write_all(b"]")?;
                         }
+                        array_scratch.truncate(base);
                     }
                 }
                 StandardJson::Object(fields) => {
@@ -4141,6 +4173,7 @@ where
                                 config,
                                 level + 1,
                                 scratch,
+                                array_scratch,
                                 known_text_pos,
                             )?;
                         }
@@ -4190,7 +4223,16 @@ where
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
+                    print_json(
+                        out,
+                        v,
+                        formatter,
+                        config,
+                        level + 1,
+                        scratch,
+                        array_scratch,
+                        None,
+                    )?;
                 }
                 out.write_all(b"]")?;
             } else {
@@ -4202,7 +4244,16 @@ where
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
+                    print_json(
+                        out,
+                        v,
+                        formatter,
+                        config,
+                        level + 1,
+                        scratch,
+                        array_scratch,
+                        None,
+                    )?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
@@ -4226,7 +4277,16 @@ where
                     };
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
-                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
+                    print_json(
+                        out,
+                        v,
+                        formatter,
+                        config,
+                        level + 1,
+                        scratch,
+                        array_scratch,
+                        None,
+                    )?;
                 }
                 out.write_all(b"}")?;
             } else {
@@ -4247,7 +4307,16 @@ where
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
                     out.write_all(space_after_colon.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
+                    print_json(
+                        out,
+                        v,
+                        formatter,
+                        config,
+                        level + 1,
+                        scratch,
+                        array_scratch,
+                        None,
+                    )?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
