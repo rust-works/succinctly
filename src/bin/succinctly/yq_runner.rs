@@ -2903,9 +2903,9 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // (not the `limit`/`nth` walk itself, which #1607 already fixed
         // regardless of this gate). `n` is never recursed into: it's
         // always evaluated as a single control value, never streamed.
-        Expr::Limit { n: _, expr } => can_use_m2_streaming(expr),
-        Expr::NthExpr { n: _, expr } => can_use_m2_streaming(expr),
-        Expr::Builtin(Builtin::NthStream(_, expr)) => can_use_m2_streaming(expr),
+        Expr::Limit { n: _, expr }
+        | Expr::NthExpr { n: _, expr }
+        | Expr::Builtin(Builtin::NthStream(_, expr)) => can_use_m2_streaming(expr),
         Expr::IndexExpr { .. } => true,
 
         // `select(...)` never changes position - a truthy output is always
