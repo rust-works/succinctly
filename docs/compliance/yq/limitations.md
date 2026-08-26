@@ -252,9 +252,15 @@ what a construct loses, the question to ask is which output route it takes, not 
 implements** — a construct on the DOM route loses everything the DOM cannot carry, all at
 once.
 
-The `-I0` nesting bug that surfaced along the way is *wider* than `map` and is not fixed:
-`to_entries -I=0` still emits a nested container at its parent's indent, while `-P -I=0` is
-correct for both. #757 only closed the route `map` took into it.
+The `-I0` nesting bug that surfaced along the way was *wider* than `map`: any filter
+`can_use_m2_streaming` rejects (`to_entries`, `with_entries`, `walk`, `--arg`-bearing
+queries, ...) reached the DOM emitter with an empty per-level indent string at `-I0`,
+corrupting nested containers on read-back regardless of which construct routed it there.
+#757 only closed the route `map` took into it; the underlying DOM-emitter bug itself was
+fixed generally, for every construct that reaches the DOM path, by
+[#1575](https://github.com/rust-works/succinctly/issues/1575) — `OutputConfig::compute_indent_str`
+now clamps `-I0`'s YAML indent width to 2 (the same convention the M2 streaming path already
+used for its own `-I0`) instead of collapsing to an empty string.
 
 ### `input`, `inputs`, `input_line_number` are rejected, but at runtime rather than parse time
 

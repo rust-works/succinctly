@@ -199,16 +199,20 @@ impl OutputConfig {
         }
     }
 
-    /// `-I1` clamps to 2 for YAML output (#1486): real yq's YAML output at
-    /// `-I1` is byte-identical to its own `-I2` output at every level,
-    /// mirroring the fast-path streamer's identical clamp on
-    /// `yaml_indent_spaces` below. JSON has no such quirk (verified live:
-    /// `-I1 -o=json` genuinely indents 1 space per level in real yq) --
-    /// `indent_str` is shared by both formats' DOM emitters (see its use in
-    /// the JSON branch of `output_value`), so the clamp only applies when
-    /// `output_value` will actually take the YAML branch, i.e.
-    /// `effective_output_format == Yaml` exactly -- matching that
-    /// dispatch's own condition, not its complement.
+    /// `-I0`/`-I1` both clamp to width 2 for YAML output (#1486, #1575):
+    /// real yq's YAML output at `-I1` is byte-identical to its own `-I2`
+    /// output at every level, mirroring the fast-path streamer's identical
+    /// clamp on `yaml_indent_spaces` below; `-I0` reuses the same clamp
+    /// rather than modeling real yq's own irregular `-I0`-behaves-like-`-I4`
+    /// quirk (see `compute_indent_str`'s own comment on the clamp). JSON has
+    /// no such quirk (verified live: `-I1 -o=json` genuinely indents 1
+    /// space per level in real yq, and `-I0 -o=json` means compact/flow,
+    /// handled separately by `OutputConfig::compact`) -- `indent_str` is
+    /// shared by both formats' DOM emitters (see its use in the JSON branch
+    /// of `output_value`), so the clamp only applies when `output_value`
+    /// will actually take the YAML branch, i.e. `effective_output_format ==
+    /// Yaml` exactly -- matching that dispatch's own condition, not its
+    /// complement.
     ///
     /// Takes the caller's *effective* format rather than reading
     /// `args.output_format` directly: `Self::from_args` passes
@@ -220,30 +224,23 @@ impl OutputConfig {
     /// unconditionally, since `-o=auto` always rendered JSON regardless of
     /// input format anyway.
     fn compute_indent_str(args: &YqCommand, effective_output_format: OutputFormat) -> String {
-        if args.indent == 0 {
-            // YAML's significant whitespace means an empty indent string
-            // collapses every nesting level onto the same column, corrupting
-            // the document on read-back (#1575: a nested nested container
-            // under `-I=0` silently disappears). Real yq's own `-I0` behaves
-            // like a nonzero width with its own irregular per-level quirk
-            // this DOM emitter doesn't otherwise model; mirror the M2
-            // streaming fast path's own pre-existing, documented `-I0`
-            // choice of width 2 (`yaml_indent_spaces` below) instead of
-            // chasing that exact quirk. JSON is unaffected: `-I0` there
-            // means compact/flow, and `OutputConfig::compact` already
-            // forces JSON's own indent to `""` independently of this
-            // string.
-            return match (effective_output_format, args.tab) {
-                (OutputFormat::Yaml, true) => "\t".to_string(),
-                (OutputFormat::Yaml, false) => "  ".to_string(),
-                (_, _) => String::new(),
-            };
-        }
         if args.tab {
             return "\t".to_string();
         }
         let width = args.indent as usize;
         let width = if effective_output_format == OutputFormat::Yaml {
+            // This clamp used to run only for a nonzero `args.indent`; an
+            // early return above it short-circuited `-I0` straight to an
+            // empty string instead. YAML's significant whitespace then read
+            // a nested container's fields back as siblings of their parent
+            // key, silently losing the whole value on read-back (#1575).
+            // `0.max(2)` already lands on the same width-2 convention the M2
+            // streaming fast path uses for its own `-I0`
+            // (`yaml_indent_spaces` below), so letting `-I0` reach this
+            // clamp like every other width is the whole fix. JSON is
+            // unaffected either way: `-I0` there means compact/flow, and
+            // `OutputConfig::compact` already forces JSON's own indent to
+            // `""` independently of this string.
             width.max(2)
         } else {
             width

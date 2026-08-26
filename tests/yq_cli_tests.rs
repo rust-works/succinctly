@@ -8804,10 +8804,9 @@ fn test_navigation_queries_keep_whole_float_decimal_point_yaml() -> Result<()> {
 /// `-I=0` on the DOM output path (any filter `can_use_m2_streaming` rejects,
 /// e.g. `to_entries`) used to thread an empty indent string into the nested
 /// emitter, collapsing every nesting level onto the same column and losing
-/// the nested value entirely on read-back (#1575). `-P` (which forces the
-/// DOM path too) already rendered this correctly, so its width-2 indent is
-/// the reference here — matching the M2 streaming fast path's own
-/// pre-existing, documented `-I0` choice of width 2.
+/// the nested value entirely on read-back (#1575). Expected output matches
+/// the M2 streaming fast path's own pre-existing, documented `-I0` choice of
+/// width 2 (`yaml_indent_spaces` in `yq_runner.rs`), which this fix mirrors.
 #[test]
 fn test_dom_path_indent_zero_preserves_nested_container_1575() -> Result<()> {
     let yaml = "a:\n  b:\n    c: 1\n";
@@ -8832,6 +8831,34 @@ fn test_dom_path_indent_zero_json_output_still_compact_1575() -> Result<()> {
     let (out, code) = run_yq_stdin("to_entries", yaml, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"[{"key":"a","value":{"b":{"c":1}}}]"#);
+    Ok(())
+}
+
+/// `--tab` output cannot be read back by succinctly's own YAML parser at
+/// *any* indent width or nesting shape — pure, unmixed tab indentation
+/// alone already fails with "tab character used for indentation" on
+/// unmodified `main`, unrelated to `-I0` or this fix (tracked separately as
+/// #1684). This fix's `compute_indent_str` change makes `--tab -I=0`
+/// combined with a compact block-sequence item newly mix 2 literal spaces
+/// (the sequence item's own fixed `- `-width offset, #785/#1362) with
+/// tab-based per-level indent on the same line — pinning that exact,
+/// still-broken output here so a future change to either side doesn't
+/// silently shift it without updating #1684's own investigation.
+#[test]
+fn test_dom_path_indent_zero_tab_is_pinned_not_fixed_1575() -> Result<()> {
+    let yaml = "a:\n  b:\n    c: 1\n";
+    let (out, code) = run_yq_stdin("to_entries", yaml, &["-o=yaml", "-I=0", "--tab"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- key: a\n  value:\n  \tb:\n  \t\tc: 1\n");
+
+    // Read-back still fails — see #1684, not attempted here.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".[0].value", &out, &["-o=yaml", "-I=0", "--tab"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("tab character used for indentation"),
+        "stderr: {stderr}"
+    );
     Ok(())
 }
 
