@@ -1161,6 +1161,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // Validate JSON if --validate flag is set
             if args.validate {
                 if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
+                    // Every other early return in this function flushes
+                    // explicitly before returning (#1563) -- this one used
+                    // to rely on `out`'s own `Drop` impl to flush any
+                    // already-buffered output from files processed before
+                    // this one, which works today but silently swallows a
+                    // flush error (e.g. a closed stdout) instead of
+                    // propagating it, unlike every sibling return path.
+                    out.flush()?;
                     return Ok(exit_code);
                 }
             }
