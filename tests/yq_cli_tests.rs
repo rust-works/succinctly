@@ -21666,6 +21666,124 @@ fn test_jq_contains_body_error_still_wins_over_a_later_escape_1553() -> Result<(
     Ok(())
 }
 
+/// #1649: real yq (v4.53.3, live-verified) only raises a containment-check
+/// error on a top-level kind mismatch when *at least one* operand is
+/// container-shaped (array/object) -- a mismatch between two scalars
+/// answers `false` instead. `succinctly yq` used to raise unconditionally
+/// on any mismatch, matching jq's own (correct-for-jq) rule instead.
+#[test]
+fn test_yq_contains_scalar_vs_scalar_kind_mismatch_answers_false_1649() -> Result<()> {
+    let (out, code) = run_yq_stdin(".x | contains(5)", "x: \"abc\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(".x | contains(true)", "x: 5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin(".x | contains(\"a\")", "x: null\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    // `true`/`false` are distinct `jq_kind`s (#358) but both scalar --
+    // still `false`, not the containment-check error.
+    let (out, code) = run_yq_stdin(".x | contains(false)", "x: true\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "false");
+    Ok(())
+}
+
+/// #1649: the exact opposite boundary from the test above -- any mismatch
+/// where at least one side is a container (array/object) still errors in
+/// yq mode, live-verified against v4.53.3 for every combination below
+/// (array-vs-object, array-vs-scalar, object-vs-scalar, scalar-vs-array).
+/// A naive "both operands must be containers to error" reading of the
+/// issue's suggested fix direction would get this wrong -- a single
+/// container operand is already enough.
+#[test]
+fn test_yq_contains_any_container_operand_kind_mismatch_still_errors_1649() -> Result<()> {
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | contains({})", "x: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | contains(\"a\")", "x: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | contains(\"a\")", "x:\n  a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | contains([1])", "x: null\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+    Ok(())
+}
+
+/// #1649: `inside` is documented in this codebase as `contains`'s inverse
+/// and shares the same kind-mismatch rule, gated the same way even though
+/// real yq has no `inside` at all (lexer-rejected) to verify it against --
+/// this is an internal-consistency check with `contains`, not yq parity.
+#[test]
+fn test_yq_inside_shares_contains_kind_mismatch_rule_1649() -> Result<()> {
+    let (out, code) = run_yq_stdin(".x | inside(\"abc\")", "x: 5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "false");
+
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | inside(\"abc\")", "x: [1]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+    Ok(())
+}
+
+/// #1649: `?` still swallows the containment-check error exactly as
+/// before for the cases that still raise it (container operand involved) --
+/// confirms the new false-vs-error boundary didn't disturb `optional`
+/// handling.
+#[test]
+fn test_yq_contains_optional_still_suppresses_the_remaining_error_cases_1649() -> Result<()> {
+    let (out, code) = run_yq_stdin(".x | contains(\"a\")?", "x: [1]\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {out:?}");
+    assert_eq!(out.trim(), "");
+    Ok(())
+}
+
+/// #1649: jq mode must stay exactly as it was -- any top-level kind
+/// mismatch errors unconditionally, container or not, matching jq 1.7.1's
+/// own `f_contains`. Confirms the new yq-only carve-out is properly
+/// `EvalSemantics`-gated rather than leaking into jq mode.
+#[test]
+fn test_jq_contains_scalar_vs_scalar_kind_mismatch_still_errors_1649() -> Result<()> {
+    let (out, err, code) = run_jq_stdin_with_stderr("contains(5)", r#""abc""#, &["-c"])?;
+    assert_eq!(out, "", "err: {err:?}");
+    assert_eq!(code, 5, "err: {err:?}");
+    assert!(
+        err.contains("cannot have their containment checked"),
+        "err: {err:?}"
+    );
+    Ok(())
+}
+
 /// #1533 (single-argument half): `ArgFanout::RejectMany` used to test
 /// `args.len() > 1` before ever looking at the argument's own trailing
 /// control, so a real `error(...)` inside the generator was masked by
