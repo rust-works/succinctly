@@ -20263,6 +20263,16 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // `Expr::AsPattern` (destructuring), `Expr::As`'s sibling above --
+        // needs its own arm/test since the parser builds a distinct node for
+        // each spelling (see `each_as_pattern_generic`'s own doc comment).
+        (
+            &["-cn", r#"first([1,2] as [$a,$b] | ($a, ("B"|stderr)))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
         (
             &["-cn", r#"first(limit(2; (1, ("B"|stderr))))"#],
             None,
@@ -20293,6 +20303,37 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             args.join(" ")
         );
     }
+    Ok(())
+}
+
+/// Code review (#1596): `each_limit_generic` (the native `Expr::Limit` arm
+/// `first`/`last` route through) must evaluate a generator `n` argument at
+/// most once, same as its non-`first`-wrapped siblings -- not this test's own
+/// "matches jq" claim, since real jq never evaluates the second `n` binding
+/// here at all (`first`'s own single-output need is already satisfied by the
+/// first), a *separate*, pre-existing gap in `eval.rs`'s own generator-`n`
+/// handling shared by every consumer (confirmed live:
+/// `isempty(limit((1,("N"|debug)); 42))` leaks the identical single
+/// `["DEBUG:","N"]` on `main`, unrelated to and unmoved by this issue).
+///
+/// What IS this issue's own regression risk: before the guards
+/// `each_limit_generic` gained in review, it evaluated `n_expr` via
+/// `eval_single` to classify it, then -- for exactly this generator shape --
+/// discarded that evaluation and re-ran the whole `Expr::Limit` node from
+/// scratch via the full-evaluator bridge, so `debug` fired *twice* under
+/// `first(...)` where every other route (bare `limit(...)`, `isempty(...)`)
+/// fires it once. This test pins the fixed count (one), not jq parity.
+#[test]
+fn test_first_over_limit_generator_n_evaluates_once_not_twice_1596() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-cn", r#"first(limit((1,("N"|debug)); 42))"#], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "42\n");
+    assert_eq!(
+        stderr.trim_end_matches('\n'),
+        r#"["DEBUG:","N"]"#,
+        "n_expr's own side effect must fire exactly once, not twice"
+    );
     Ok(())
 }
 
