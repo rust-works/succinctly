@@ -1444,17 +1444,20 @@ impl<'a> Validator<'a> {
                 self.skip_spaces();
                 Ok(())
             }
-            b'x' => self.scan_hex_escape(2),
-            b'u' => self.scan_hex_escape(4),
-            b'U' => self.scan_hex_escape(8),
+            b'x' => self.scan_hex_escape('x', 2),
+            b'u' => self.scan_hex_escape('u', 4),
+            b'U' => self.scan_hex_escape('U', 8),
             _other => Err(self.error(YamlValidationErrorKind::InvalidEscape {
                 sequence: crate::text::utf8::decode_char_at(self.input, self.offset),
             })),
         }
     }
 
-    /// Validate `n` hex digits following `\x`/`\u`/`\U`. Positioned on `x`/`u`/`U`.
-    fn scan_hex_escape(&mut self, n: usize) -> Result<(), YamlValidationError> {
+    /// Validate `n` hex digits following `\x`/`\u`/`\U`. Positioned on `x`/`u`/`U`,
+    /// which the caller also passes as `kind` -- reported back on a bad digit
+    /// (#1636) rather than a hardcoded `'x'`, since a bad `\u`/`\U` escape must
+    /// name itself, not whichever kind happened to be checked first.
+    fn scan_hex_escape(&mut self, kind: char, n: usize) -> Result<(), YamlValidationError> {
         self.advance(); // consume x/u/U
         for _ in 0..n {
             match self.peek() {
@@ -1462,7 +1465,9 @@ impl<'a> Validator<'a> {
                     self.advance();
                 }
                 _ => {
-                    return Err(self.error(YamlValidationErrorKind::InvalidEscape { sequence: 'x' }))
+                    return Err(
+                        self.error(YamlValidationErrorKind::InvalidEscape { sequence: kind })
+                    )
                 }
             }
         }
@@ -1834,6 +1839,27 @@ mod tests {
     fn accepts_valid_escapes() {
         assert!(validate(b"a: \"tab\\tnl\\n hex \\x41 \\u0041 \\U00000041\"\n").is_ok());
         assert!(validate(b"a: \"q \\\" s \\/ b \\\\ nbsp \\_ next \\N\"\n").is_ok());
+    }
+
+    /// #1636: `scan_hex_escape` used to hardcode `sequence: 'x'` regardless
+    /// of which escape kind (`\x`/`\u`/`\U`) called it, so a bad `\u`/`\U`
+    /// escape was misreported as `\x`. Only `\x` itself happened to report
+    /// correctly, by coincidence -- covering all three kinds here so a
+    /// regression in any one of them fails a named assertion.
+    #[test]
+    fn rejects_bad_hex_digit_reports_the_real_escape_kind_1636() {
+        assert!(matches!(
+            kind(b"---\na: \"\\xZZ\"\n"),
+            InvalidEscape { sequence: 'x' }
+        ));
+        assert!(matches!(
+            kind(b"---\na: \"\\uZZZZ\"\n"),
+            InvalidEscape { sequence: 'u' }
+        ));
+        assert!(matches!(
+            kind(b"---\na: \"\\UZZZZZZZZ\"\n"),
+            InvalidEscape { sequence: 'U' }
+        ));
     }
 
     #[test]
