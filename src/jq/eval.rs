@@ -23970,27 +23970,34 @@ fn classify_parent_n<S: EvalSemantics>(
     let Some(raw) = n_value.as_f64() else {
         return Err(EvalError::type_error("number", n_value.type_name()));
     };
-    if raw.is_nan() {
-        return Err(EvalError::new(NOT_NON_NEGATIVE_INT));
-    }
     if raw >= 0.0 {
-        // Sign already checked on the *untruncated* value above -- unlike
-        // checking `numeric_key_to_index`'s truncated result for
-        // negativity, this doesn't miss a fractional value in `(-1, 0)`
-        // (e.g. `-0.5`, which truncates toward zero to `0` and would
-        // otherwise slip through as a silent, valid self-reference -- the
-        // exact "negative Float saturates to a no-op" bug this function
-        // exists to eliminate).
-        let i = numeric_key_to_index(n_value).expect("checked non-NaN above");
+        // Sign checked on the *untruncated* value above -- unlike checking
+        // `numeric_key_to_index`'s truncated result for negativity, this
+        // doesn't miss a fractional value in `(-1, 0)` (e.g. `-0.5`, which
+        // truncates toward zero to `0` and would otherwise slip through as
+        // a silent, valid self-reference -- the exact "negative Float
+        // saturates to a no-op" bug this function exists to eliminate).
+        // NaN satisfies neither this comparison nor the branch below, so it
+        // falls through to the final hard error without a separate check.
+        let i = numeric_key_to_index(n_value).expect("checked non-NaN above (raw >= 0.0)");
         return Ok(i as usize);
     }
     // `raw < 0.0`. Yq mode's wraparound rule (see doc comment above) only
     // has meaning for a genuine negative *integer* -- a fractional negative
     // (e.g. `-0.5`) has no whole hop count to wrap to, and no oracle at all
     // (real yq's grammar can't express it either way), so it falls through
-    // to the same hard error as jq mode.
-    if S::TAG == EvalTag::Yq && raw.fract() == 0.0 {
-        let i = raw as i64;
+    // to the same hard error as jq mode. `raw.is_infinite()` is checked
+    // alongside `raw.fract() == 0.0` because `f64::fract` itself returns
+    // NaN for an infinite input (`inf - inf`), which would otherwise
+    // inconsistently hard-error on `-infinite` while every other
+    // sufficiently-negative finite value (e.g. `-1e300`) clamps to self.
+    if S::TAG == EvalTag::Yq && (raw.fract() == 0.0 || raw.is_infinite()) {
+        // Reuses `numeric_key_to_index`'s exact `i64` conversion rather
+        // than `raw as i64` -- `raw` is only an `f64` approximation of the
+        // original value (lossy for an `Int`/`NumberLiteral(Int)` beyond
+        // 2^53), and the branch above already gets this right by deferring
+        // to the same helper.
+        let i = numeric_key_to_index(n_value).expect("checked non-NaN above (raw < 0.0)");
         return Ok((depth as i64 + 1 + i).max(0) as usize);
     }
     Err(EvalError::new(NOT_NON_NEGATIVE_INT))
