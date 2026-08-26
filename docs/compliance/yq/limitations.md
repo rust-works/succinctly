@@ -729,6 +729,24 @@ on a bad key while the default streamed identity output already preserved it as 
 same one-document-many-answers problem #1642's JSON-side fix closes, on the mapping-key
 axis instead of the object-key one.
 
+**One exception, on the materializing routes only.** Every decode-failure key's display
+fallback is the fixed constant `""`, so a mapping with *two* decode-failure keys collides
+the instant a materializing route (`--arg`, `-P`, `.,.`) builds an `IndexMap<String, _>`
+keyed by that string -- the two are never actually the same key (#1385's "never a
+duplicate" rule again), but a plain string-keyed map cannot hold both entries under `""`.
+Rather than resurrect the silent-overwrite bug this whole effort exists to close,
+`DisplayKeyGuard` ([src/jq/document.rs](../../../src/jq/document.rs)) makes that specific
+collision raise instead:
+
+```console
+$ printf '"a\qb": 1\n"c\qd": 2\n' | succinctly yq --arg z y '.'
+Error: object key "" is ambiguous: an undecodable key's display form collides with
+another key of the same name and cannot be represented
+```
+
+An *ordinary* repeated key (no decode failure on either side) is unaffected and still
+collapses to its last value, matching yq's normal duplicate-key handling.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
