@@ -1009,6 +1009,49 @@ Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../
 [`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
 (the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
 
+## `limit`'s own `n` argument is not demand-aware when it is itself a generator
+
+Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention
+as any other filter argument, so a *generator* `n` (`limit((1,2); f)`, #1279's own canonical
+example) re-runs the whole `limit` body once per bound value of `$n` — but only as many
+times as the wrapping consumer actually needs:
+
+```
+$ succinctly jq -cn 'first(limit((1,2); (1, ("B"|stderr))))'      # jq: 1, no stderr
+1
+$ succinctly jq -cn '[limit((1,2); (1, ("B"|stderr)))]'           # jq: [1,1,"B"], stderr B (both agree)
+[1,1,"B"]
+B
+```
+
+The second row is not a typo: an *unbounded* consumer genuinely needs both of `$n`'s
+bindings (`$n=1` keeps `expr`'s first output alone; `$n=2` keeps its first two, so
+`("B"|stderr)`'s own value ends up in the array too), so exploring `expr`'s second output
+there is correct in both tools. The first row is where they diverge — jq's own `first`
+stops after `$n=1`'s single output and never even considers the `$n=2` binding, so
+`stderr` stays empty; `succinctly jq` still writes `B`.
+
+**Root cause: no demand-aware entry point exists yet for a generator `n`.** `limit`'s fast,
+demand-forwarding paths (`eval::each_limit`, `eval_generic.rs`'s `eval_limit_generic`/
+`each_limit_generic`, #1607/#1596) all defer to `eval.rs`'s plain, fully-materializing
+`eval()`/`full_eval` the moment `n` is anything beyond a single plain value — the same
+"give up on the fast path, hand the whole node to the collecting evaluator" policy `map(f)`
+above used to have before #724/#725 gave it a genuinely lazy sequence type. `limit`'s own
+generator-`n` case has no equivalent lazy machinery to defer to: `eval()` collects every
+output across every `$n` binding into one `QueryResult` before any wrapping consumer's
+`Demand` is ever consulted, so a `first`/`nth` sitting outside a generator-`n` `limit` gets
+the answer only after paying (and leaking any side effect from) work it never asked for.
+
+Deliberately not fixed here: it needs `eval.rs` itself to gain a demand-aware path for a
+generator `n`, not another consumer-side guard — the same order of work #724/#725 needed
+for `map(f)`, not a small patch. `n_expr` as a generator is jq's own rarer laziness
+contract to begin with (most real `limit`/`nth` calls pass a scalar), so the common case is
+unaffected; only a bare, side-effecting, multi-output `n` under a truncating consumer sees
+this. Tracked in
+[`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md)
+(item 9) as a residual, not silently reintroduced — `each_limit_generic`'s own doc comment
+carries the same note at the call site.
+
 ## Deliberate divergences (ADR-0018 rule 4)
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy

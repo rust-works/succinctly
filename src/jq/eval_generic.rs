@@ -4971,6 +4971,26 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
 /// 42))` wrote `"N"` to `debug` twice instead of once before this guard
 /// existed) -- exactly the class of leak #1596 exists to close, reintroduced
 /// one arm over.
+///
+/// **A generator `n_expr` is a documented residual even once guarded.**
+/// `eval_on_owned`'s own `full_eval` call has no demand to forward -- it
+/// answers with a fully materialized `QueryResult`, collecting every output
+/// across every `n_expr` binding `limit`'s own backtracking arg-passing
+/// contract explores, *before* `drain_result_generic` ever gets a chance to
+/// apply a wrapping `first`/`nth`'s smaller demand to what comes back.
+/// Live-verified against pinned jq 1.7.1: `first(limit((1,2); (1,
+/// ("B"|stderr))))` -- the exact bare-top-level-`Comma` shape this guard
+/// exists to make safe from double-evaluation -- still writes `B` to
+/// stderr here, where jq never explores the `$n=2` binding at all once
+/// `first` is satisfied by `$n=1`'s own single output. A non-`first`/`last`
+/// consumer wanting *every* output (`[limit((1,2); (1, ("B"|stderr)))]`)
+/// correctly writes `B` in both tools -- that shape needs `$n=2`'s
+/// exploration regardless, so the two rows aren't actually inconsistent,
+/// just differently demanding. Closing this needs `eval.rs` to expose a
+/// demand-aware entry point for a generator-`n_expr` `limit` (`each_limit`
+/// only reaches its own generator-`n` case through the same
+/// fully-materializing route today), which is a larger change than this
+/// arm's own scope -- tracked as a residual, not silently reintroduced.
 fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     n_expr: &Expr,
     expr: &Expr,

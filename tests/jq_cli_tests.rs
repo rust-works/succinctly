@@ -20466,6 +20466,13 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
 /// scratch via the full-evaluator bridge, so `debug` fired *twice* under
 /// `first(...)` where every other route (bare `limit(...)`, `isempty(...)`)
 /// fires it once. This test pins the fixed count (one), not jq parity.
+///
+/// A broader, separate residual (`expr`'s own side effects, not just
+/// `n_expr`'s, still leak past the bridge for a generator `n` under
+/// `first`/`nth`) is documented in
+/// [`docs/compliance/jq/limitations.md`](../docs/compliance/jq/limitations.md)
+/// rather than pinned here, since `expr = 42` above carries no side effect
+/// of its own -- this test's scope is `n_expr`'s count, not that residual.
 #[test]
 fn test_first_over_limit_generator_n_evaluates_once_not_twice_1596() -> Result<()> {
     let (stdout, stderr, code) =
