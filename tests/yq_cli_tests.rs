@@ -23429,16 +23429,23 @@ fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> 
 /// Two routes, deliberately different at this stage of #1247's design (see
 /// `docs/plan/decode-failure-routing.md`):
 ///
-/// * the **materializing** routes raise a real error and exit non-zero;
+/// * the **materializing** routes raise a real error and exit non-zero --
+///   except for a bad *key* (`"a\qb": 1`), which #1642 changed to preserve
+///   instead (via its raw source span, matching YAML's existing
+///   never-drop-a-key convention for a key with no scalar form), so it
+///   stays in this list only for the bad *value* case;
 /// * the **streaming** routes still degrade to `null`/`""` -- but the
 ///   document they emit is now parseable, which is what this test's first
 ///   half pins. Making streaming loud too needs an error channel through
 ///   `stream_json_value`'s `core::fmt::Result`, which is its own stage.
 #[test]
 fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
-    for (input, expected) in [
-        ("b: \"x\\qy\"\n", r#"{"b":null}"#),
-        ("\"a\\qb\": 1\n", r#"{"":1}"#),
+    // `materialized`: `None` if materializing must still raise (a bad
+    // *value*); `Some(json)` if it must now succeed with `json` per result
+    // (a bad *key*, #1642).
+    for (input, streamed, materialized) in [
+        ("b: \"x\\qy\"\n", r#"{"b":null}"#, None),
+        ("\"a\\qb\": 1\n", r#"{"":1}"#, Some(r#"{"":1}"#)),
     ] {
         // Streaming: still degrades, but the emitted JSON is valid. `-P`
         // takes this route too -- it forces pretty-printing, not the DOM.
@@ -23448,22 +23455,35 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
         ] {
             let (output, exit_code) = run_yq_stdin(".", input, extra)?;
             assert_eq!(exit_code, 0, "args {extra:?}, output: {output:?}");
-            assert_eq!(output.trim(), expected, "args {extra:?}");
+            assert_eq!(output.trim(), streamed, "args {extra:?}");
         }
 
         // Materializing: `--arg` forces the DOM path, and a multi-result
-        // filter loses its cursor to `GenericResult::Many`. Both raise.
+        // filter loses its cursor to `GenericResult::Many`.
         for extra in [
             &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
             &["-o", "json", "-I", "0"][..],
         ] {
             let filter = if extra.len() > 4 { "." } else { ".,." };
             let (output, stderr, exit_code) = run_yq_split(filter, input, extra)?;
-            assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
-            assert!(
-                stderr.contains("invalid escape sequence"),
-                "args {extra:?}, stderr: {stderr}"
-            );
+            match materialized {
+                None => {
+                    assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+                    assert!(
+                        stderr.contains("invalid escape sequence"),
+                        "args {extra:?}, stderr: {stderr}"
+                    );
+                }
+                Some(expected) => {
+                    assert_eq!(exit_code, 0, "args {extra:?}, stderr: {stderr}");
+                    let expected = if filter == ".,." {
+                        format!("{expected}\n{expected}")
+                    } else {
+                        expected.to_string()
+                    };
+                    assert_eq!(output.trim(), expected, "args {extra:?}");
+                }
+            }
         }
     }
     Ok(())
