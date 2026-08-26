@@ -1161,13 +1161,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // Validate JSON if --validate flag is set
             if args.validate {
                 if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
-                    // Every other early return in this function flushes
-                    // explicitly before returning (#1563) -- this one used
-                    // to rely on `out`'s own `Drop` impl to flush any
-                    // already-buffered output from files processed before
-                    // this one, which works today but silently swallows a
-                    // flush error (e.g. a closed stdout) instead of
-                    // propagating it, unlike every sibling return path.
+                    // Every other return from this loop that can run after
+                    // `out` has already buffered real output flushes
+                    // explicitly first (#1563; review: not a blanket claim
+                    // about the whole function -- the separate materializing
+                    // branch below has its own early returns that provably
+                    // run before anything is ever written to `out`, so
+                    // nothing to flush there). This one used to rely on
+                    // `out`'s own `Drop` impl to flush any already-buffered
+                    // output from files processed before this one, which
+                    // works today but silently swallows a flush error (e.g.
+                    // a closed stdout) instead of propagating it, unlike
+                    // every sibling return path in this loop.
                     out.flush()?;
                     return Ok(exit_code);
                 }
@@ -1243,7 +1248,17 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                                 sink.report(DiagStyle::Jq, err, &at);
                                 break;
                             }
-                            None => return Err(e),
+                            // Same reasoning as the `--validate` early
+                            // return above (#1563): `out` can already hold
+                            // buffered output from earlier documents/files
+                            // in this same run, and a genuine (non-malformed-
+                            // document) error here shouldn't leave that
+                            // relying on `Drop`'s own best-effort,
+                            // error-swallowing flush.
+                            None => {
+                                out.flush()?;
+                                return Err(e);
+                            }
                         }
                     }
                     // result is dropped here, freeing its memory immediately
