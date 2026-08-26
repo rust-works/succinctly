@@ -3822,21 +3822,21 @@ where
                         scratch.truncate(base);
                     }
                 }
-                // A structurally malformed value the semi-index accepted as
-                // a span but could not classify (`[xyz123]`, `[tru]`), still
-                // printed as `null` -- so this lazy output path disagrees
-                // with every materializing one, which now raises (#1194).
-                //
-                // Deliberately NOT raised here, and this was tried: `print_json`
-                // walks child cursors lazily and streams as it goes, so by the
-                // time a nested error is reached it has already written the
-                // opening `[`. Bailing produced a truncated document plus a
-                // generic exit 1, where the materializing routes give a clean
-                // diagnostic and exit 5 -- worse on every axis than the silent
-                // `null`. Needs the same error channel as the YAML streaming
-                // path; tracked together as Stage 6 in
-                // `docs/plan/decode-failure-routing.md`.
-                StandardJson::Error(_) => out.write_all(b"null")?,
+                // A structurally malformed value the semi-index accepted as a
+                // span but could not classify (`[xyz123]`, `[tru]`). An
+                // earlier attempt to raise here predated `MalformedJsonError`
+                // (added for the object-member check just above): without
+                // it, bailing produced a truncated document at a *generic*
+                // exit 1 -- worse on every axis than the silent `null` it
+                // replaced, so it was reverted back to `null` (#1194). That
+                // convention exists now, so reuse it: same truncated-prefix
+                // trade the object arm above and the `keys_unsorted` writer
+                // already make (`docs/compliance/jq/limitations.md`), but a
+                // clean diagnostic and jq's own exit 5 instead of a silent
+                // wrong answer (#1641).
+                StandardJson::Error(_) => {
+                    return Err(MalformedJsonError(EvalError::malformed_json_text(c.text())).into());
+                }
             }
         }
         JqValue::String(s) => {
