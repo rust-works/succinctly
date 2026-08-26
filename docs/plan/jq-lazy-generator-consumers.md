@@ -1296,12 +1296,34 @@ the reasoning behind each placement:
    `pub(crate)` in `eval.rs` so `eval_generic.rs` could reuse them rather than re-derive
    identical logic a second time.
 
-   Every new arm inherits input-queue safety from its call site rather than needing its own
-   guard: `eval_first_or_last_generic`'s existing `uses_input_builtins(inner)` check already
-   walks the *whole* argument tree before ever dispatching into `eval_each_generic`, and
-   `eval_limit_generic`/`eval_nth_generic`'s own `limit_or_nth_uses_live_input_queue` guard
-   (#1607) does the same for a bare `limit`/`nth` call — both predicates recurse into every
-   `Expr` variant already, this stage's new ones included, so no new gap opened. Verified with
-   `scripts/jq-fanout-oracle-sweep.sh`, which went from 20 known-gap cases attributed to this
-   issue to 0 divergences (490/490 matching pinned jq 1.7.1); its now-dead `classify_divergence`
-   branch for this issue was removed.
+   Six of the seven new arms (`If`/`Try`/`Optional`/`Label`/`As`/`AsPattern`/`FuncDef`) inherit
+   input-queue safety from their call site rather than needing their own guard:
+   `eval_first_or_last_generic`'s existing `uses_input_builtins(inner)` check already walks the
+   *whole* argument tree before ever dispatching into `eval_each_generic`, which recurses into
+   every `Expr` variant already, these new ones included, so no new gap opened there.
+
+   **`each_limit_generic` needed its own guard, caught by code review.** Unlike the six arms
+   above, it doesn't merely dispatch into a sink -- it first calls `eval_single` on `n_expr` to
+   classify it, and, for any shape beyond the common single value (a generator `n`, e.g. a bare
+   `Comma`), falls back to bridging the *whole* `Expr::Limit` node to the full evaluator via
+   `eval_on_owned`. Reviewed live: without a guard, that bridge re-evaluates `n_expr` a *second*
+   time from scratch, so `first(limit((1,("N"|debug)); 42))` wrote `["DEBUG:","N"]` to stderr
+   twice instead of once -- the same double-evaluation `eval_limit_generic`'s own
+   `limit_or_nth_uses_live_input_queue`/bare-`Comma` pre-checks (#1607) already exist to prevent
+   for the bare-`limit(...)` case, reintroduced one arm over because `each_limit_generic`
+   evaluated `n_expr` unconditionally before ever consulting them. Fixed by porting the
+   identical two pre-checks into `each_limit_generic`, deferring to the bridge *before* touching
+   `n_expr` at all rather than after — pinned in
+   `test_first_over_limit_generator_n_evaluates_once_not_twice_1596`, which asserts the fixed
+   count (one) rather than jq parity: real jq never evaluates the second `n` binding for this
+   shape at all, since `first`'s own single-output need is already satisfied by the first, a
+   *separate*, pre-existing gap in `eval.rs`'s own generator-`n` handling shared by every
+   consumer (confirmed live: `isempty(limit((1,("N"|debug)); 42))` leaks the identical single
+   `["DEBUG:","N"]` on unmodified `main`, unrelated to and unmoved by this issue).
+
+   Verified with `scripts/jq-fanout-oracle-sweep.sh`, which went from 20 known-gap cases
+   attributed to this issue to 0 divergences (490/490 matching pinned jq 1.7.1); its now-dead
+   `classify_divergence` branch for this issue was removed. The sweep's own `G_SHAPES`/`X_TERMS`
+   never puts a generator in `limit`'s `n` argument specifically (only in `expr`), so it could
+   not have caught the `each_limit_generic` double-evaluation on its own -- the dedicated CLI
+   test above is what actually pins that fix.

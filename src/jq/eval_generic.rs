@@ -4344,11 +4344,12 @@ fn drain_result_generic<V: DocumentValue>(
 /// instead of `eval_single`'s own eager, always-materialize-everything
 /// dispatch for the same three variants.
 ///
-/// Scoped to `Comma`/`Pipe`/`Paren`/`Compare`/`Arithmetic` -- mirroring
-/// `eval.rs`'s still wider arm set (`If`/`Try`/`Label`/`As`/`Limit`/...)
-/// remains out of scope here; those shapes still fall to the `_` fallback
-/// below, and the five of them are pinned as an explicit known gap in
-/// `test_short_circuit_side_effect_leaks_820_932_987`.
+/// Scoped to `Comma`/`Pipe`/`Paren`/`Compare`/`Arithmetic`/`If`/`Try`/
+/// `Optional`/`Label`/`As`/`AsPattern`/`FuncDef`/`Limit` -- every other
+/// `Expr` shape still falls to the eager `_` fallback below. `Range`'s own
+/// `from`/`to`/`step` bounds are a known, out-of-scope residual: `first(
+/// range(1, ("B"|stderr); 5))` still leaks (live-verified against jq 1.7.1),
+/// tracked separately rather than folded into this arm set.
 ///
 /// `Compare` and `Arithmetic` both gained native arms for #1481, mirroring
 /// `eval.rs`'s own pair (#1459/Stage 4 for `Compare`, #1481 for
@@ -4368,6 +4369,17 @@ fn drain_result_generic<V: DocumentValue>(
 /// `first(10 == (1, ("B"|stderr)))` no longer did (both oracle-verified
 /// against pinned jq 1.7.1; pinned together in
 /// `test_short_circuit_side_effect_shapes_already_match_jq_820`).
+///
+/// `If`/`Try`/`Optional`/`Label`/`As`/`AsPattern`/`FuncDef`/`Limit` gained
+/// native arms for #1596, mirroring `eval.rs`'s own Stage 5 arm set
+/// (`docs/plan/jq-lazy-generator-consumers.md`) -- see [`each_if_generic`],
+/// [`each_try_generic`], [`each_label_generic`], [`each_as_generic`],
+/// [`each_as_pattern_generic`] and [`each_limit_generic`]. `first`/`last` are
+/// the only consumers routed through this file's own native fast path rather
+/// than bouncing to `eval.rs`'s already-lazy `eval_each`, so they were the
+/// only ones Stage 5 (`eval.rs`'s own widening) never reached; the seven
+/// shapes are pinned in `test_short_circuit_side_effect_shapes_already_match_jq_820`,
+/// not the leaks table.
 fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -4508,13 +4520,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             eval_each_generic::<S, V>(&expanded_then, value, optional, cursor, sink)
         }
 
-        // Demand-forwarding twin of `eval_limit_generic` (#1607): that
-        // function still (correctly) answers a bare top-level `limit(n;
-        // expr)` by collecting up to `n` items as one batch, but a wrapping
-        // consumer with a *smaller* demand -- `first(limit(2; expr))` -- needs
-        // that demand to reach inside `expr` itself, not just cap the batch
-        // `eval_limit_generic` hands back once full. Mirrors `eval.rs`'s own
-        // `each_limit`/`Expr::Limit` pair (#1462).
+        // See `each_limit_generic`'s own doc comment.
         Expr::Limit { n, expr } => {
             each_limit_generic::<S, V>(n, expr, value, optional, cursor, sink)
         }
@@ -4731,6 +4737,38 @@ fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Generic-evaluator twin of `eval::materialize_bound_values` (#1596):
+/// unpacks a bind expression's own [`GenericResult`] into the values
+/// [`each_as_generic`]/[`each_as_pattern_generic`] loop the shared
+/// `body`/pattern-match logic over, plus the control the bind itself trails
+/// (#400, #494: a `Partial` bind still has its produced prefix bound and run
+/// through the body). `Err(flow)` carries the caller's own early return for a
+/// bind that produced no values at all, or that raised without producing
+/// any -- mirroring that function's `Err(Flow::Exhausted)`/bare-error arms.
+///
+/// [`push_generic_owned_values`] plays the role `eval::materialize_bound_values`'s
+/// own `QueryResult` match plays there: it already folds every `GenericResult`
+/// shape (including the three lazy variants, via `materialize_lazy`) into
+/// `(Vec<OwnedValue>, Option<Control>)`, so this wrapper only needs the
+/// empty-vs-non-empty split `eval.rs`'s version encodes as separate arms.
+/// Shared by both [`each_as_generic`] and [`each_as_pattern_generic`] (code
+/// review, #1596) rather than each inlining its own copy of this split --
+/// the same duplication `eval::materialize_bound_values`'s own doc comment
+/// says it was extracted to eliminate between `eval::each_as`/`eval::each_as_pattern`.
+fn materialize_bound_values_generic<V: DocumentValue>(
+    bound_result: GenericResult<V>,
+) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
+    let mut bound_values: Vec<OwnedValue> = Vec::new();
+    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
+    if bound_values.is_empty() {
+        return Err(match bound_control {
+            Some(control) => Flow::Escaped(control),
+            None => Flow::Exhausted,
+        });
+    }
+    Ok((bound_values, bound_control))
+}
+
 /// Lazy twin of `eval::each_as` (#1596): the bind expression (`expr`) is
 /// evaluated eagerly, exactly as `eval::each_as` already does -- this fix is
 /// scoped to what runs *per bound value*, not to the binding itself. Each
@@ -4739,16 +4777,6 @@ fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
 /// binds no longer evaluate the `stderr` branch. The parser reserves this
 /// bare-`$var` node for `Expr::As`; [`each_as_pattern_generic`] below is its
 /// destructuring sibling (`Expr::AsPattern`, `?//`-chains included).
-///
-/// [`push_generic_owned_values`] plays the role `eval::materialize_bound_values`
-/// plays for `eval::each_as` -- an empty `out` with `None` control is "no
-/// bound values at all" (mirrors `QueryResult::None`'s `Err(Flow::Exhausted)`
-/// there); an empty `out` with `Some(control)` is a bare
-/// error/break/halt before any bind (mirrors that function's
-/// `Error`/`Break`/`Halt` arms); a non-empty `out` with `Some(control)` is a
-/// `Partial` bind whose produced prefix is still bound and run through the
-/// body (#400, #494), exactly as `eval::materialize_bound_values`'s own
-/// `Partial` arm documents.
 fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     var: &str,
@@ -4759,14 +4787,10 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let mut bound_values: Vec<OwnedValue> = Vec::new();
-    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
-    if bound_values.is_empty() {
-        return match bound_control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        };
-    }
+    let (bound_values, bound_control) = match materialize_bound_values_generic(bound_result) {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
 
     for bound_val in bound_values {
         let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
@@ -4797,14 +4821,10 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let mut bound_values: Vec<OwnedValue> = Vec::new();
-    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
-    if bound_values.is_empty() {
-        return match bound_control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        };
-    }
+    let (bound_values, bound_control) = match materialize_bound_values_generic(bound_result) {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
 
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
@@ -4938,6 +4958,19 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
 /// fast path, hand the whole node to `eval.rs`" policy as
 /// `eval_limit_generic`'s own `None` return, except this function has no
 /// caller to hand a `None` back to, so it performs the bridge/drain itself.
+///
+/// Guarded exactly like [`eval_limit_generic`], and for the identical two
+/// reasons (see that function's own doc comment): [`limit_or_nth_uses_live_input_queue`]
+/// defers to the bridge *before* touching a live `input`/`inputs` queue, and
+/// a bare top-level `Comma` `n_expr` is detected statically and deferred
+/// without ever evaluating it here first -- so the bridge's own single
+/// `eval_on_owned` call is the only evaluation of `n_expr`, not a second one
+/// stacked on top of a `eval_single` call this function already made. Without
+/// these two checks, `n_expr` would double-evaluate here whenever it fell
+/// through to the bridge below (confirmed live: `first(limit((1,("N"|debug));
+/// 42))` wrote `"N"` to `debug` twice instead of once before this guard
+/// existed) -- exactly the class of leak #1596 exists to close, reintroduced
+/// one arm over.
 fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     n_expr: &Expr,
     expr: &Expr,
@@ -4946,6 +4979,29 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    let mut bridge_to_full_evaluator = |value: V, cursor: Option<V::Cursor>| -> Flow {
+        let owned = match to_owned_with_cursor(&value, cursor) {
+            Ok(o) => o,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        let result = eval_on_owned::<S, V>(
+            &Expr::Limit {
+                n: Box::new(n_expr.clone()),
+                expr: Box::new(expr.clone()),
+            },
+            owned,
+            optional,
+        );
+        drain_result_generic(result, sink)
+    };
+
+    if limit_or_nth_uses_live_input_queue(n_expr, expr) {
+        return bridge_to_full_evaluator(value, cursor);
+    }
+    if matches!(unwrap_paren(n_expr), Expr::Comma(_)) {
+        return bridge_to_full_evaluator(value, cursor);
+    }
+
     let n_result = eval_single::<S, V>(n_expr, value.clone(), optional, cursor);
     let n_value = match n_result {
         GenericResult::One(v) => match to_owned(&v) {
@@ -4961,21 +5017,12 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Error(e) => return Flow::Escaped(Control::Error(e)),
         GenericResult::Break(label) => return Flow::Escaped(Control::Break(label)),
         GenericResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
-        _ => {
-            let owned = match to_owned_with_cursor(&value, cursor) {
-                Ok(o) => o,
-                Err(e) => return Flow::Escaped(Control::Error(e)),
-            };
-            let result = eval_on_owned::<S, V>(
-                &Expr::Limit {
-                    n: Box::new(n_expr.clone()),
-                    expr: Box::new(expr.clone()),
-                },
-                owned,
-                optional,
-            );
-            return drain_result_generic(result, sink);
-        }
+        // A generator `n_expr` broader than a bare top-level `Comma` (e.g. a
+        // `Pipe` whose middle stage is the comma) still costs a second
+        // `n_expr` evaluation here, same documented residual gap as
+        // `eval_limit_generic`'s own identical fallback -- narrowing it
+        // further isn't needed to fix #1596's own leak.
+        _ => return bridge_to_full_evaluator(value, cursor),
     };
 
     let n = match classify_limit_n(n_value) {
