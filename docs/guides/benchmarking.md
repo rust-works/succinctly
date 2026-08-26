@@ -905,6 +905,49 @@ because `.` had barely moved at that commit; a second bisect on `.` was needed t
 signal proves one thing. Before believing a bisect result, ask which paths the suspected change
 touches and whether the signal is sensitive to each of them.
 
+### 9. Pin the build profile before comparing two binaries
+
+`Cargo.toml` has no `[profile.release]`, so `cargo build --release` uses Rust's default
+`codegen-units = 16`, no LTO — the crate is split into 16 independently-optimized chunks, and
+changing code in one module can shift how LLVM lays out *unrelated* modules in the binary. That
+has nothing to do with the diff under test: `succinctly jq type`, a query that touches no keys,
+measured **+12% on an M4 Pro and +27% on a 7950X** between two binaries whose diff cannot reach
+that code path (#1587). It doesn't bisect to the same commit on both machines either — the
+signature of a placement artifact, not a real regression, which always gives the same answer on
+both.
+
+`--control` does not catch this. It times `--before` against a copy of itself, so the two
+binaries always share one codegen placement by construction; it bounds machine noise, not
+placement drift between two genuinely *different* builds.
+
+Rebuilding both sides with `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` removes it —
+`docs/plan/jq-duplicate-key-collapse.md` collapsed that same +12%/+27% pair to +0.2% this way,
+mid-investigation, before the practice was written down here. Set the env var for both
+`--before` and `--after` builds, then tell `scripts/ab-cli.py`/`scripts/perf-ab.py` what you did
+via `--before-profile`/`--after-profile` (free text, e.g. `codegen-units=1`) — the scripts
+cannot read a binary's codegen-units back out, so they only warn when the two builds' profiles
+are unrecorded or don't match:
+
+```bash
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release --features cli   # both checkouts
+
+scripts/ab-cli.py --before ./succ-base --after ./succ-head \
+    --before-profile codegen-units=1 --after-profile codegen-units=1 \
+    --corpus ~/wrk/bench-scratch/mycorpus
+```
+
+The crate's actual `[profile.release]` is deliberately left at Rust's default: pinning
+`codegen-units = 1` there measured **1.98x-3.0x slower clean release builds** with no benefit to
+the interactive edit-compile-test loop, which uses debug builds, not release — so this is a
+benchmarking-time convention, not a shipped build setting.
+
+Also worth knowing: #595's x86-only 12-28% `block_scalars` anomaly was closed as "expected, no
+action — binary code-layout artifact from the recompile," using cachegrind to show flat
+instruction counts (`Ir`) but rising L1-icache misses (`I1mr`). That diagnosis predates this
+rule and never pinned codegen-units — see #1587 for the re-check. It does not, however, put
+`scripts/perf-guard.py`'s CI gate in question: that gate reads cachegrind `Ir`, which stayed
+flat in the same investigation — only `I1mr`, which perf-guard doesn't gate on, moved.
+
 ### Building both halves on a remote box
 
 A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:
@@ -1080,14 +1123,17 @@ test bench_name ... bench:  1,234 ns/iter (+/- 56)
 - **Date**: When benchmark was run (e.g., "2026-01-17")
 - **Platform**: CPU model and OS version
 - **Tool versions**: For comparison benchmarks (jq-1.6, yq v4.48.1)
-- **Build flags**: Any special RUSTFLAGS or features
+- **Build flags**: Any special RUSTFLAGS or features, and — for an A/B comparing two binaries —
+  whether `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` was pinned on both sides (see [A/B
+  Benchmarking Method § 9](#a-b-benchmarking-method), #1587). Unstated means default
+  `codegen-units=16`, which can add its own ±10-27% independent of the change being measured.
 
 **Example**:
 ```markdown
 **Date**: 2026-01-17
 **Platform**: AMD Ryzen 9 7950X (Zen 4, x86_64)
 **OS**: Linux 6.6.87.2-microsoft-standard-WSL2
-**Build**: `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+**Build**: `RUSTFLAGS="-C target-cpu=native" cargo build --release` (codegen-units=1, both sides)
 ```
 
 ### Formatting Tables
