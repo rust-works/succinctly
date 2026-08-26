@@ -937,9 +937,15 @@ scripts/ab-cli.py --before ./succ-base --after ./succ-head \
 ```
 
 The crate's actual `[profile.release]` is deliberately left at Rust's default: pinning
-`codegen-units = 1` there measured **1.98x-3.0x slower clean release builds** with no benefit to
-the interactive edit-compile-test loop, which uses debug builds, not release — so this is a
-benchmarking-time convention, not a shipped build setting.
+`codegen-units = 1` there costs real compile time, with no benefit to the interactive
+edit-compile-test loop, which uses debug builds, not release — so this is a benchmarking-time
+convention, not a shipped build setting. Three interleaved clean `cargo build --release --features
+cli` reps (18-core Apple M5 Max, `Johns-M5-Pro-Max` — a development machine running concurrent
+work, not one of the idle bench boxes named elsewhere in this guide, so treat this as directional)
+measured **1.4x-1.9x slower** (median 1.8x; 28.9s/24.1s/31.2s at `codegen-units=16` vs
+51.4s/46.9s/42.3s paired at `codegen-units=1`). The multiplier scales with available parallelism —
+losing per-crate codegen concurrency costs more on a wider machine — so don't expect a fixed ratio
+across hardware.
 
 Also worth knowing: #595's x86-only 12-28% `block_scalars` anomaly was closed as "expected, no
 action — binary code-layout artifact from the recompile," using cachegrind to show flat

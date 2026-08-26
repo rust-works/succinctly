@@ -526,12 +526,13 @@ with "mechanism unconfirmed, no ARM instruction-counting tool available."
 | long_50x100lines   | -2.6%    | -1.8%       |
 | long_100x100lines  | -0.4%    | -2.1%       |
 
-Short shapes stay inside §5b's own established control band (-1.0%..+0.4%)
-either way — consistent with the original "neutral" call, which was correct
-on those four shapes and is why they weren't the ones under suspicion. The
-`long_*` "improvement" #649 could not explain shrinks from ~7-10% to
-~0-2.6% under the identical pin that erased #595's x86 regression. A small
-residual remains at 9 reps and isn't chased further here — an order of
+Short shapes stay noise-level small either way (-1.3%..+1.4% across both
+runs, close to but slightly wider than §5b's own established -1.0%..+0.4%
+control band) — consistent with the original "neutral" call, which was
+correct on those four shapes and is why they weren't the ones under
+suspicion. The `long_*` "improvement" #649 could not explain shrinks from
+~7-10% to ~0-2.6% under the identical pin that erased #595's x86 regression.
+A small residual remains at 9 reps and isn't chased further here — an order of
 magnitude smaller than the original effect, and #649's own framing
 ("improvement, not a regression, no user-facing harm, revisit if it ever
 flips to a regression") already covers a residual this size.
