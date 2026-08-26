@@ -65,6 +65,12 @@ def parse_args(argv=None):
     )
     p.add_argument("--before", required=True, help="baseline harness binary")
     p.add_argument("--after", help="binary under test (omit with --control)")
+    p.add_argument("--before-profile",
+                   help="build profile --before was built with, e.g. 'codegen-units=1' "
+                        "(recorded only, not verified — rule 9)")
+    p.add_argument("--after-profile",
+                   help="build profile --after was built with; a mismatch against "
+                        "--before-profile is warned about (rule 9)")
     p.add_argument("--tool", choices=["cachegrind", "perf", "wallclock"], default="cachegrind")
     p.add_argument("--valgrind-bin", default="valgrind",
                    help="path to valgrind (e.g. a rootless ~/local/bin/valgrind build)")
@@ -82,6 +88,30 @@ def parse_args(argv=None):
     p.add_argument("--force", action="store_true",
                    help="run even if the machine looks busy")
     return p.parse_args(argv)
+
+
+def profile_status(args):
+    """Rule 9: codegen-units/LTO placement differences between two binaries can add
+    noise unrelated to any code change (issue #1587), and a binary can't be
+    introspected after the fact to check — this only reports what the caller asserts."""
+    if args.control:
+        return None  # a copy of --before always shares its own layout
+    before, after = args.before_profile, args.after_profile
+    if before and after:
+        if before == after:
+            return f"profile: {before} (matched)"
+        return (f"WARNING: binaries were built with different profiles "
+                f"(before={before!r}, after={after!r}) — a measured delta may include a "
+                f"codegen-placement artifact, not just the code change. See "
+                f"docs/guides/benchmarking.md § A/B Benchmarking Method, rule 9.")
+    if before or after:
+        return (f"WARNING: build profile given for only one binary "
+                f"(before={before!r}, after={after!r}) — pass both or neither. See "
+                f"docs/guides/benchmarking.md § A/B Benchmarking Method, rule 9.")
+    return ("WARNING: build profile not specified for either binary — codegen-units/LTO "
+            "differences between --before and --after can add noise unrelated to any code "
+            "change (issue #1587). Pass --before-profile/--after-profile once confirmed. See "
+            "docs/guides/benchmarking.md § A/B Benchmarking Method, rule 9.")
 
 
 def machine_warnings():
@@ -252,6 +282,9 @@ def main(argv=None):
 
     print(f"before={args.before}")
     print(f"after ={args.after}" + ("  (copy of --before: noise floor)" if args.control else ""))
+    status = profile_status(args)
+    if status:
+        print(status)
     print(f"tool={args.tool} shapes={args.shapes} iterations={args.iterations} reps={args.reps}")
     print()
 
