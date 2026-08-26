@@ -12,7 +12,7 @@ use succinctly::jq::escape::{
 use succinctly::jq::eval_generic::to_owned as generic_to_owned;
 use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, EvalError,
-    JqSemantics, OwnedValue, StreamError,
+    JqSemantics, NumberRepr, OwnedValue, StreamError,
 };
 use succinctly::json::JsonIndex;
 use succinctly::yaml::format_float_with_fraction;
@@ -443,9 +443,27 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             }
         }
-        OwnedValue::NumberLiteral(_, literal) => {
+        OwnedValue::NumberLiteral(repr, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
                 "null".to_string() // JSON doesn't support NaN
+            } else if opts.control_escape == ControlEscape::Yq && opts.json_sourced {
+                // #1498: a `NumberLiteral` can still reach here for
+                // JSON-sourced input despite `to_owned_canonicalizing_numbers`
+                // stripping it at parse time -- `--eval-all`'s
+                // `eval_owned_input` reindex round-trip (serialize the
+                // already-stripped `OwnedValue` back to JSON text, then
+                // re-parse it through the library's own literal-preserving
+                // `to_owned`, #918) reconstructs one. Whichever route
+                // produced it, the same #978/#1398 rule applies: a
+                // JSON-sourced *float* never keeps a decimal point. Matches
+                // the `Float` arm's own `json_sourced` branch above exactly
+                // -- int-shaped literals have no such spelling ambiguity, so
+                // they fall through to the verbatim-echo branch below
+                // unchanged.
+                match repr {
+                    NumberRepr::Float(f) => f.to_string(),
+                    NumberRepr::Int(_) => literal.to_string(),
+                }
             } else if opts.control_escape == ControlEscape::Yq {
                 // yq mode: echo the source spelling verbatim (#1008) --
                 // matches the Float arm's own yq/jq split above, and real
