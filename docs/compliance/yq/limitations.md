@@ -255,12 +255,27 @@ once.
 The `-I0` nesting bug that surfaced along the way was *wider* than `map`: any filter
 `can_use_m2_streaming` rejects (`to_entries`, `with_entries`, `walk`, `--arg`-bearing
 queries, ...) reached the DOM emitter with an empty per-level indent string at `-I0`,
-corrupting nested containers on read-back regardless of which construct routed it there.
-#757 only closed the route `map` took into it; the underlying DOM-emitter bug itself was
-fixed generally, for every construct that reaches the DOM path, by
+corrupting nested containers on read-back regardless of which construct routed it there —
+the earlier claim that `-P -I=0` was already correct for this case was itself false
+(verified live against the pre-#1575 binary: `-P` doesn't force the DOM path for an
+M2-streamable filter, since `can_yaml_fast_path`'s gate is already satisfied by `-I0`'s own
+`compact` flag regardless of `-P`), not merely superseded by the fix below. #757 only
+closed the route `map` took into it; the underlying DOM-emitter bug itself was fixed
+generally, for every construct that reaches the DOM path, by
 [#1575](https://github.com/rust-works/succinctly/issues/1575) — `OutputConfig::compute_indent_str`
 now clamps `-I0`'s YAML indent width to 2 (the same convention the M2 streaming path already
 used for its own `-I0`) instead of collapsing to an empty string.
+
+**Residual divergence, deliberately not chased by #1575**: real yq's own `-I0` is not width
+2 — it's empirically identical to its own `-I4` output (verified live against v4.53.3),
+plus an irregular per-level quirk beyond even that (a compact block-sequence item's inlined
+mapping doesn't increment its own indent depth for the purpose of computing its fields'
+children, so the jump from the mapping's own line to its first nested level is narrower
+than every jump after it). Neither succinctly output route models this — both settle for a
+uniform width-2 step, matching each other but not the oracle. Widening to width 4 alone
+would still not close the gap (the irregular per-level part is unmodeled by both routes at
+every non-default `-I` width, not just `-I0`), so this remains open rather than folded into
+#1575's fix.
 
 ### `input`, `inputs`, `input_line_number` are rejected, but at runtime rather than parse time
 
