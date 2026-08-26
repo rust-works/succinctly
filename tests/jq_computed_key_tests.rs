@@ -1814,6 +1814,72 @@ fn test_del_with_comma_mixing_identity_and_other_paths() {
     check(r#"{"a":1,"b":2}"#, "del(., .)", Outcome::values(&["null"]));
 }
 
+/// #1651: `..`/bare `recurse`/`recurse(f)`/`recurse(f;cond)` all emit the
+/// document root as one of their resolved branches unconditionally — `del`
+/// of any of them collapses the whole document to `null`, the same rule
+/// [`test_del_with_comma_mixing_identity_and_other_paths`] pins for a
+/// hand-written comma. Before this fix, reaching that same `null` still
+/// cost an O(depth) flatten (`resolve_dynamic_indexes`'s `assemble`, then
+/// `builtin_del`'s own `flatten_delete_path`) *per resolved branch* — `d+1`
+/// of them on a depth-`d` document — even though the result was always
+/// `null` and neither flatten's output was ever inspected. Every value here
+/// was captured from real jq 1.7.1.
+#[test]
+fn test_del_recurse_family_root_branch_short_circuits_1651() {
+    check(r#"{"a":{"b":1}}"#, "del(..)", Outcome::values(&["null"]));
+    check(
+        r#"{"a":{"b":1}}"#,
+        "del(recurse)",
+        Outcome::values(&["null"]),
+    );
+    check(
+        r#"{"a":{"b":1}}"#,
+        "del(recurse(.[]?))",
+        Outcome::values(&["null"]),
+    );
+    check(
+        r#"{"a":{"b":1}}"#,
+        "del(recurse(.[]?; true))",
+        Outcome::values(&["null"]),
+    );
+    // A filtered recurse whose match set *does* include the root still
+    // collapses, exactly like the unconditional forms above — the
+    // short-circuit only depends on whether a `depth() == 0` branch is
+    // present, not on how it got there.
+    check(
+        r#"{"a":{"b":1}}"#,
+        r"del(.. | select(true))",
+        Outcome::values(&["null"]),
+    );
+}
+
+/// #1651: the root-branch short-circuit is `del()`-only. `path()`, `=` and
+/// `|=` must keep resolving *every* branch even when one of them is the
+/// document root — collapsing early for them would silently drop every
+/// other resolved path. Values captured from real jq 1.7.1.
+#[test]
+fn test_del_root_short_circuit_does_not_leak_into_path_or_writers_1651() {
+    check(
+        r#"{"a":1}"#,
+        r"[path(., .a)]",
+        Outcome::values(&[r#"[[],["a"]]"#]),
+    );
+    check(
+        r#"{"a":1}"#,
+        r"[path(recurse)]",
+        Outcome::values(&[r#"[[],["a"]]"#]),
+    );
+    // Root's own update is a no-op (it's an object, not a number), but `.a`
+    // and `.b` still get updated — if the short-circuit wrongly fired here,
+    // `.a`/`.b` would be silently skipped and the result would equal the
+    // unmodified input.
+    check(
+        r#"{"a":1,"b":2}"#,
+        r#"(., .a, .b) |= (if type == "number" then . + 10 else . end)"#,
+        Outcome::values(&[r#"{"a":11,"b":12}"#]),
+    );
+}
+
 /// #527: two comma siblings continuing through the same *missing* field
 /// (`.a.b.c` and `.a.b.d`, both through `.a.b`) put `delete_expr_object_paths`
 /// in front of a field name the object doesn't have, and it raised

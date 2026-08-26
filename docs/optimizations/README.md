@@ -23,6 +23,7 @@ This directory documents optimization techniques used in the succinctly library,
 | **String search**    | [jq-string-search.md](jq-string-search.md)               | memmem vs std Two-Way for jq substring builtins                       |
 | **jq allocation**    | [jq-format-allocation.md](jq-format-allocation.md)       | `@csv`/`@tsv`/`@dsv`/`@sh` byte-scan rewrite — investigated, rejected |
 | **Select scan**      | [select-scan.md](select-scan.md)                         | #40 scan-length measurement, IB cursor O(n²) fix                      |
+| **`del()` root short-circuit** | [del-root-shortcircuit.md](del-root-shortcircuit.md) | #1651 double-flatten O(d²) fix, k≈1.96→1.14                    |
 | **Targets**          | [targets.md](targets.md)                                 | CPU target configurations, architecture flags                         |
 | **SIMD Strategy**    | [simd-strategy.md](simd-strategy.md)                     | Per-module SIMD usage, platform support, lessons                      |
 
@@ -53,6 +54,7 @@ This directory documents optimization techniques used in the succinctly library,
 | O1 Sequential Cursor           | **3-13%** (query)  | Compact encoding | [end-positions.md](end-positions.md)                     |
 | O2 Gap-Skip rank1              | **2-6%** (query)   | Compact encoding | [end-positions.md](end-positions.md)                     |
 | jq Lazy String Slicing         | **8.5%** (vs regression), **2%** (vs baseline) | Control flow | src/jq/eval.rs |
+| `del()` Root Short-Circuit     | **20-49x** (grows with depth) | Control flow | [del-root-shortcircuit.md](del-root-shortcircuit.md) |
 
 ### Notable Failures (Instructive)
 
