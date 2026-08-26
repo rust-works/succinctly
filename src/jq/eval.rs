@@ -7292,8 +7292,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `ArgFanout::contains_gate`'s doc comment.
         ArgFanout::contains_gate::<S>(),
         |b| {
-            if jq_kind(&input) != jq_kind(&b) && containment_kind_mismatch_is_error::<S>(&input, &b)
-            {
+            if containment_kind_mismatch_should_error::<S>(&input, &b) {
                 return if optional {
                     QueryResult::None
                 } else {
@@ -7305,9 +7304,12 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
-/// Whether a top-level kind mismatch between `contains`/`inside`'s two
-/// operands should raise [`EvalError::containment_check`], or -- in yq
-/// mode only -- fall through to a plain `false` (#1649).
+/// Whether `contains`/`inside`'s two top-level operands `a`/`b` should
+/// raise [`EvalError::containment_check`] instead of proceeding to the
+/// real containment check (#1649). Self-contained: absorbs the kind
+/// comparison itself, not just the yq-only carve-out, so a caller has one
+/// predicate to call rather than an inline `jq_kind(..) != jq_kind(..)`
+/// duplicated (mirror-image argument order) at each of the two call sites.
 ///
 /// jq has no carve-out here: `f_contains` errors on any kind mismatch,
 /// unconditionally, which is what `S::TAG != EvalTag::Yq` preserves.
@@ -7323,8 +7325,12 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// null-vs-string were all confirmed live to return `false`, not error.
 /// This is the *opposite* of a "both must be containers to error" guess --
 /// a single container operand is already enough to error.
-fn containment_kind_mismatch_is_error<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
-    S::TAG != EvalTag::Yq || is_owned_container(a) || is_owned_container(b)
+fn containment_kind_mismatch_should_error<S: EvalSemantics>(
+    a: &OwnedValue,
+    b: &OwnedValue,
+) -> bool {
+    jq_kind(a) != jq_kind(b)
+        && (S::TAG != EvalTag::Yq || is_owned_container(a) || is_owned_container(b))
 }
 
 /// Check if `a` contains `b` (recursive containment check)
@@ -7380,12 +7386,15 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         b_expr,
         value.clone(),
         optional,
-        // Real yq has no `inside` (lexer-rejected); see `builtin_ltrimstr`.
+        // `inside` is a jq-only builtin real yq's lexer would reject if it
+        // were properly gated -- it currently isn't (#1650: ~13 jq-only
+        // builtins, `inside` named explicitly, are silently reachable in
+        // yq mode without `--jq-extensions`), so this stays reachable
+        // ungated today; see `builtin_ltrimstr` for the sibling case.
         ArgFanout::All,
         |b| {
             // inside is the inverse of contains: b contains input
-            if jq_kind(&b) != jq_kind(&input) && containment_kind_mismatch_is_error::<S>(&b, &input)
-            {
+            if containment_kind_mismatch_should_error::<S>(&b, &input) {
                 return if optional {
                     QueryResult::None
                 } else {
@@ -13831,9 +13840,11 @@ pub(crate) fn owned_bound_to_i64(
 }
 
 /// Whether `target` is a genuine container -- `Array` or `Object`. The one
-/// exclusion both `is_yq_slice_empty_container_scalar` and
-/// `is_yq_field_index_noop_scalar` below share; factored out so a future
-/// `OwnedValue` variant only needs a decision made in one place, not two
+/// exclusion `is_yq_slice_empty_container_scalar` and
+/// `is_yq_field_index_noop_scalar` below share, and also the container test
+/// `containment_kind_mismatch_should_error` (#1649) uses for `contains`/
+/// `inside`'s yq-mode kind-mismatch rule; factored out so a future
+/// `OwnedValue` variant only needs a decision made in one place, not three
 /// near-identical `matches!` lists left to drift (the "duplicated
 /// predicates diverge silently" lesson from #106).
 fn is_owned_container(target: &OwnedValue) -> bool {
