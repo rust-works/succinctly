@@ -23,7 +23,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::document::{DistinctKeyCursors, DocumentFields, DocumentValue, IndentSpec};
+use super::document::{key_display_string, DistinctKeyCursors, DocumentFields, IndentSpec};
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
@@ -549,11 +549,11 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     out.write_char('[')?;
     let mut i = 0usize;
     for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
-        // `key_string()` is expected to always return `Some` (see
-        // `DocumentField::key_str`'s doc comment); a key with no
-        // stringifiable spelling is silently skipped, matching
-        // `DocumentFields::keys()`'s default walk.
-        if let Some(key) = key.key_string() {
+        // A key that will not *decode* is preserved via its raw source
+        // span rather than silently skipped (#1642), matching
+        // `DocumentFields::keys()`. A key with no stringifiable spelling at
+        // all (#1194) has no name to report and is still skipped here.
+        if let Some(key) = key_display_string(&key) {
             if i > 0 {
                 out.write_char(',')?;
             }
@@ -877,7 +877,9 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         // Flow style
         out.write_char('[')?;
         for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
-            if let Some(key) = key.key_string() {
+            // Preserved via its raw source span rather than skipped on a
+            // decode failure (#1642), matching `stream_lazy_keys_json`.
+            if let Some(key) = key_display_string(&key) {
                 if i > 0 {
                     out.write_str(", ")?;
                 }
@@ -889,7 +891,7 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
     } else {
         // Block style
         for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
-            if let Some(key) = key.key_string() {
+            if let Some(key) = key_display_string(&key) {
                 if i > 0 {
                     out.write_char('\n')?;
                 }

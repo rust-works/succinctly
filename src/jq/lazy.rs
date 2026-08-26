@@ -27,7 +27,7 @@ use std::borrow::Cow;
 
 use crate::json::light::{JsonCursor, StandardJson};
 
-use super::document::{effective_len, DistinctKeyCursors};
+use super::document::{effective_len, key_display_string, DistinctKeyCursors};
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
 use super::expr::Literal;
@@ -684,12 +684,11 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
 ) -> Result<OwnedValue, EvalError> {
     let mut keys = Vec::new();
     for (key, _) in DistinctKeyCursors::new(fields, collapse) {
-        if let StandardJson::String(k) = key {
-            // An undecodable key used to vanish from `keys` entirely, so the
-            // array silently came back short (#1247).
-            let s = k
-                .as_str()
-                .map_err(|e| EvalError::new(format!("{e} in object key")))?;
+        // A key that will not *decode* is preserved via its raw source span
+        // rather than raised on (#1247/#1642), matching
+        // `length`/`keys_unsorted`/`.`. A non-string key (#1194) still has
+        // no name to report and is skipped here, same as before this fix.
+        if let Some(s) = key_display_string(&key) {
             keys.push(OwnedValue::String(s.into_owned()));
         }
     }
@@ -753,12 +752,10 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 // A key that isn't a `String` token at all is *structurally*
                 // malformed and still drops the field silently -- #1194's
                 // territory, unchanged here. A key that is a string but
-                // won't decode used to drop the field just as quietly; that
-                // half raises now (#1247).
-                if let StandardJson::String(key_str) = field.key() {
-                    let cow = key_str
-                        .as_str()
-                        .map_err(|e| EvalError::new(format!("{e} in object key")))?;
+                // won't decode is preserved via its raw source span rather
+                // than raised on (#1247/#1642), matching
+                // `length`/`keys_unsorted`/`.`.
+                if let Some(cow) = key_display_string(&field.key()) {
                     let value_cursor = field.value_cursor();
                     map.insert(
                         cow.into_owned(),
@@ -975,23 +972,28 @@ mod tests {
         assert!(val.into_owned().is_err());
     }
 
-    /// #1247: an undecodable *key* used to drop its whole field silently,
-    /// so the object simply came back smaller.
+    /// #1247 used to raise here; #1642 preserves instead, matching
+    /// `length`/`keys_unsorted`/`.` -- an undecodable *key* must never drop
+    /// its whole field silently (#1247's original fix), but nor should it
+    /// make the object unusable when every other route already tolerates
+    /// it.
     #[test]
-    fn test_materialize_errors_on_object_key_decode_failure_1247() {
+    fn test_materialize_preserves_object_key_decode_failure_1642() {
         use crate::json::JsonIndex;
 
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let val = JqValue::from_cursor(cursor);
-        let err = val
+        let owned = val
             .materialize()
-            .expect_err("an undecodable key must not materialize");
-        assert!(
-            err.message.contains("in object key"),
-            "message: {}",
-            err.message
+            .expect("an undecodable key is preserved, not raised on (#1642)");
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([(
+                "\u{FFFD}\u{FFFD}".to_string(),
+                OwnedValue::from_number_literal("1")
+            )]))
         );
     }
 
@@ -1421,14 +1423,17 @@ mod tests {
         );
     }
 
-    /// #684/#1247: `lazy_keys_array_to_owned` is `LazyKeysArray`'s own
+    /// #684/#1247/#1642: `lazy_keys_array_to_owned` is `LazyKeysArray`'s own
     /// materializer -- the escape hatch `materialize`/`into_owned` reach for
     /// `sort_keys`/color output/etc. Exercise it directly, both outcomes: a
     /// clean object hits the `Ok(OwnedValue::Array(keys))` return, and an
-    /// object with an undecodable key hits the `Err` raised out of the
-    /// `DistinctKeyCursors` walk instead of the field silently vanishing.
+    /// object with an undecodable key hits the *same* `Ok` return -- the
+    /// key preserved via its raw source span (lossily decoded, since this
+    /// key is raw invalid UTF-8 rather than a bad escape) instead of either
+    /// raising (#1247's answer) or the field silently vanishing (the fault
+    /// #1247 fixed).
     #[test]
-    fn test_lazy_keys_array_to_owned_ok_and_err_1247() {
+    fn test_lazy_keys_array_to_owned_ok_and_preserves_decode_failure_1642() {
         use crate::json::JsonIndex;
 
         let json: &[u8] = br#"{"b":1,"a":2}"#;
@@ -1453,20 +1458,21 @@ mod tests {
             StandardJson::Object(fields) => fields,
             other => panic!("expected object, got {other:?}"),
         };
-        let err = lazy_keys_array_to_owned(&fields, true)
-            .expect_err("an undecodable key must not materialize");
-        assert!(err.message.contains("in object key"), "{}", err.message);
+        assert_eq!(
+            lazy_keys_array_to_owned(&fields, true).expect("preserved, not raised (#1642)"),
+            OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+        );
     }
 
-    /// #1247: the same `LazyKeysArray` arms as above, reached this time
-    /// through `materialize`/`into_owned`'s recursive `Array`/`Object` cases
-    /// at depth > 0 -- e.g. `[keys_unsorted]`/`{x: keys_unsorted}` forced to
-    /// materialize by `--sort-keys`/`-C` at the CLI boundary
+    /// #1247/#1642: the same `LazyKeysArray` arms as above, reached this
+    /// time through `materialize`/`into_owned`'s recursive `Array`/`Object`
+    /// cases at depth > 0 -- e.g. `[keys_unsorted]`/`{x: keys_unsorted}`
+    /// forced to materialize by `--sort-keys`/`-C` at the CLI boundary
     /// (`write_output_jq_value`'s "complex output" branch in
     /// `jq_runner.rs`), rather than `lazy_keys_array_to_owned` being called
     /// on a bare top-level `keys_unsorted` result.
     #[test]
-    fn test_lazy_keys_array_nested_materialize_and_into_owned_1247() {
+    fn test_lazy_keys_array_nested_materialize_and_into_owned_1642() {
         use crate::json::JsonIndex;
 
         let json: &[u8] = b"{\"\xff\xfe\": 1}";
@@ -1482,17 +1488,27 @@ mod tests {
         };
 
         let nested_in_array = JqValue::Array(vec![lazy_keys.clone()]);
-        let err = nested_in_array
-            .materialize()
-            .expect_err("a nested undecodable key must not materialize");
-        assert!(err.message.contains("in object key"), "{}", err.message);
+        assert_eq!(
+            nested_in_array
+                .materialize()
+                .expect("a nested undecodable key is preserved, not raised on (#1642)"),
+            OwnedValue::Array(vec![OwnedValue::Array(vec![OwnedValue::String(
+                "\u{FFFD}\u{FFFD}".to_string()
+            )])])
+        );
 
         let nested_in_object: JqValue<'_, Vec<u64>> =
             JqValue::Object(IndexMap::from([("x".to_string(), lazy_keys)]));
-        let err = nested_in_object
+        let owned = nested_in_object
             .into_owned()
-            .expect_err("a nested undecodable key must not materialize");
-        assert!(err.message.contains("in object key"), "{}", err.message);
+            .expect("a nested undecodable key is preserved, not raised on (#1642)");
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([(
+                "x".to_string(),
+                OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
+            )]))
+        );
     }
 
     /// #1194: sibling of `jq_runner.rs`'s `standard_json_to_jq_value` and its

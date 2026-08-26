@@ -5,13 +5,11 @@
 //! intermediate conversion.
 
 #[cfg(not(test))]
-use alloc::format;
-#[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::{borrow::Cow, string::String, vec::Vec};
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 #[cfg(test)]
 use std::borrow::Cow;
 
@@ -436,6 +434,21 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// This key's raw source-text span (quotes stripped), regardless of
+    /// whether the bytes inside it actually decode.
+    ///
+    /// Unlike [`key_raw_unescaped`](Self::key_raw_unescaped), which bails
+    /// out to `None` on any escape at all, this answers for an escaped-but-
+    /// undecodable span too -- it exists solely as a display fallback for
+    /// `key_display_string` (#1642), never for identity or hashing.
+    /// Defaults to `None`; JSON overrides it, YAML does not (a decode
+    /// failure there falls back to `""`, matching its existing
+    /// [`key_string`](Self::key_string) convention for any key with no
+    /// scalar form).
+    fn key_raw_source_span(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Try to get as object fields.
     fn as_object(&self) -> Option<Self::Fields>;
 
@@ -617,17 +630,13 @@ pub trait DocumentFields: Sized + Clone {
         let mut keys = Vec::new();
         let mut fields = self.clone();
         while let Some((field, rest)) = fields.uncons() {
-            // Before `key_str`, not after -- same ordering rule as every
-            // other key-materializing site (#1247): an undecodable key must
-            // raise here, not silently vanish once `key_str` stringifies it.
-            if let Some(reason) = field.key.string_decode_error() {
-                return Err(EvalError::decode_failure(format!("{reason} in object key")));
-            }
-            // A key that will not stringify at all never allowed by the
-            // format's grammar in the first place -- structurally malformed,
-            // not a decode failure (#1194). It used to be skipped, so `keys`
-            // reported one name fewer than `length` counted members.
-            let Some(key) = field.key_str() else {
+            // A key that will not *decode* (#1247/#1385) is preserved via
+            // its raw source span rather than raised on (#1642) -- `keys`
+            // must agree with `length`/`keys_unsorted`/`.` on whether such
+            // a key is present. A key that will not stringify at *all* is a
+            // different, structural fault the format's grammar never
+            // allowed (#1194) and still raises.
+            let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
             keys.push(key.into_owned());
@@ -749,6 +758,29 @@ fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, 
 /// predicate on a branch it never takes.
 pub(crate) fn key_is_malformed<V: DocumentValue>(key: &V) -> bool {
     key.string_decode_error().is_none() && key.key_string().is_none()
+}
+
+/// The string to show for a key, substituting a best-effort fallback when
+/// the key is malformed only because its bytes won't *decode* (#1642) --
+/// never for a key the format's grammar rejects outright (#1194), which
+/// `key_is_malformed` still catches and which still must raise.
+///
+/// `None` here means the caller should raise -- exactly the #1194 case.
+/// The substituted fallback is a **display-only** value: it must never
+/// feed back into an identity or hashing decision (`key_hash_of`,
+/// `key_string()` itself, `collapse_repeated`/`DistinctKeyCursors`'s
+/// dedup), because two different decode-failure keys can produce the same
+/// fallback spelling and must still never be treated as duplicates of one
+/// another (#1385).
+pub(crate) fn key_display_string<V: DocumentValue>(key: &V) -> Option<Cow<'_, str>> {
+    if key.string_decode_error().is_some() {
+        Some(match key.key_raw_source_span() {
+            Some(raw) => String::from_utf8_lossy(raw).into_owned().into(),
+            None => Cow::Borrowed(""),
+        })
+    } else {
+        key.key_string()
+    }
 }
 
 /// An open-addressed set of key hashes: "have I seen this one?" answered
@@ -1448,30 +1480,31 @@ fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
 /// An object's field names under the mode's duplicate-key rule, in
 /// document order (first position of each key).
 ///
-/// Probes with [`KeyHashes`] first and returns the walked keys untouched
-/// when nothing repeats, which is the overwhelmingly common case (#1514).
-/// Only a document that actually carries a repeat pays for the
-/// `IndexSet`, whose `insert` keeps the first occurrence's position and
-/// discards later equal ones -- the whole rule, since a key array carries
-/// no values for "last value wins" to choose between.
+/// Walks [`DistinctKeyCursors`] rather than hashing `fields.keys()`'s own
+/// output: collapsing on the *materialized strings* would be unsafe once a
+/// decode-failure key can produce a non-`None` `key_display_string`
+/// fallback (#1642) -- two different such keys can share a fallback
+/// spelling and must still never collapse into one (#1385).
+/// `DistinctKeyCursors` already gets this right, by deciding collapse from
+/// `key_hash_of`/[`key_string`](DocumentValue::key_string) -- both `None`,
+/// hence "never a duplicate", for exactly a decode-failure key -- *before*
+/// any display fallback is ever applied.
 pub fn effective_keys<F: DocumentFields>(
     fields: &F,
     collapse: bool,
 ) -> Result<Vec<String>, EvalError> {
-    let keys = fields.keys()?;
-    if !collapse {
-        return Ok(keys);
+    let mut keys = Vec::new();
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (key, _cursor) in cursors.by_ref() {
+        let Some(key) = key_display_string(&key) else {
+            return Err(fields.malformed_member_error());
+        };
+        keys.push(key.into_owned());
     }
-    let mut hashes: Vec<u64> = keys.iter().map(|key| key_hash(key.as_bytes())).collect();
-    hashes.sort_unstable();
-    if !hashes_repeat(&hashes) {
-        return Ok(keys);
+    if cursors.ended_unpaired() {
+        return Err(fields.malformed_member_error());
     }
-    let mut seen: IndexSet<String> = IndexSet::with_capacity(keys.len());
-    for key in keys {
-        seen.insert(key);
-    }
-    Ok(seen.into_iter().collect())
+    Ok(keys)
 }
 
 /// A single field from an object.
@@ -1756,5 +1789,86 @@ mod checked_len_tests {
         let fields = cursor.value().as_object().expect("an object");
 
         assert_eq!(effective_len_checked(&fields, false).ok(), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod key_display_string_tests {
+    use super::{effective_keys, key_display_string, key_is_malformed, DocumentValue};
+    use crate::json::JsonIndex;
+
+    /// A normal key stringifies exactly as `key_string()` already would --
+    /// the fallback must never engage when there is nothing to fall back
+    /// from.
+    #[test]
+    fn normal_key_is_unaffected_1642() {
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let (field, _) = fields.uncons().expect("one field");
+        assert_eq!(key_display_string(&field.key()).as_deref(), Some("a"));
+    }
+
+    /// A key whose bytes won't *decode* (#1247) gets its raw source span
+    /// instead of raising -- the whole point of #1642.
+    #[test]
+    fn decode_failure_key_falls_back_to_raw_span_1642() {
+        let json: &[u8] = br#"{"a\q":1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let (field, _) = fields.uncons().expect("one field");
+        assert_eq!(key_display_string(&field.key()).as_deref(), Some("a\\q"));
+    }
+
+    /// A key the format's grammar never allowed at all (#1194) is a
+    /// different, structural fault -- still `None`, still the caller's cue
+    /// to raise.
+    #[test]
+    fn structurally_malformed_key_still_reports_none_1642() {
+        let json: &[u8] = br"{123: 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let (field, _) = fields.uncons().expect("one field");
+        assert!(key_display_string(&field.key()).is_none());
+        assert!(key_is_malformed(&field.key()));
+    }
+
+    /// Two different decode-failure keys with byte-identical source spans
+    /// must never collapse into one under jq mode's collapse rule (#1385) --
+    /// `effective_keys` has to decide collapse from `key_hash_of`/
+    /// `key_string`, which stay `None`-safe for a decode failure, *before*
+    /// `key_display_string`'s fallback is ever applied for display.
+    #[test]
+    fn effective_keys_never_collapses_colliding_decode_failures_1642() {
+        let json: &[u8] = br#"{"\ud800":1,"\ud800":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+
+        let keys = effective_keys(&fields, true).expect("no genuine #1194 fault");
+        assert_eq!(keys, vec!["\\ud800".to_string(), "\\ud800".to_string()]);
+    }
+
+    /// A real duplicate still collapses under jq mode exactly as before --
+    /// `effective_keys`'s rewrite around `DistinctKeyCursors` must not
+    /// regress the ordinary case it replaces.
+    #[test]
+    fn effective_keys_still_collapses_a_real_duplicate_1642() {
+        let json: &[u8] = br#"{"a":1,"a":2,"b":3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+
+        assert_eq!(
+            effective_keys(&fields, true).expect("well formed"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(
+            effective_keys(&fields, false).expect("well formed"),
+            vec!["a".to_string(), "a".to_string(), "b".to_string()]
+        );
     }
 }
