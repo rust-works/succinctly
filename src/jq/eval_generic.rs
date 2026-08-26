@@ -13602,6 +13602,43 @@ mod tests {
         assert!(err.message.contains("invalid UTF-8"), "{err:?}");
     }
 
+    /// #1194: `to_owned_with_comments` mirrors `to_owned`/`to_owned_cursor`'s
+    /// non-string-key check (`test_both_owned_conversions_raise_on_non_string_key_1194`)
+    /// -- this is the third conversion reaching the same `key_display_string`
+    /// `else` arm, for a key the format's grammar never allowed at all, as
+    /// opposed to #1642's decode-failure preservation covered above.
+    #[test]
+    fn test_to_owned_with_comments_raises_on_non_string_key_1194() {
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = to_owned_with_comments(&value, Some(&cursor))
+            .expect_err("a bare numeric key is not JSON");
+        assert!(
+            err.message.contains("expected string key"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1194: an object whose children don't pair (`{invalid}`) raises from
+    /// `to_owned_with_comments` too -- this function's own `ends_unpaired`
+    /// check, added alongside the #1642 preserve-not-raise change and until
+    /// now untested. `to_owned`/`to_owned_cursor` already had this guard; see
+    /// `test_owned_from_standard_json_raises_on_unpaired_field_1194` for the
+    /// value-domain sibling using the same repro.
+    #[test]
+    fn test_to_owned_with_comments_raises_on_unpaired_field_1194() {
+        let json: &[u8] = b"{invalid}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = to_owned_with_comments(&value, Some(&cursor))
+            .expect_err("an unpaired member is not JSON");
+        assert!(err.message.contains("Invalid JSON text"), "{err:?}");
+    }
+
     /// `to_owned_key_shape`'s array/object branches (#626/#670/#903) are a
     /// shape-only fast path for a computed index/slice-bound candidate --
     /// reached from `eval_index_expr`'s `keys` match when the key expression

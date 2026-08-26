@@ -2031,6 +2031,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 let raw = s.raw_bytes();
                 (raw.len() >= 2).then(|| &raw[1..raw.len() - 1])
             }
+            // Unreachable as it stands -- `key_display_string`'s only
+            // caller (`document.rs`) reaches this method solely behind
+            // `string_decode_error().is_some()`, which for this type is
+            // itself only `Some` on the `String` arm above -- but the
+            // trait's return type is an `Option` and something has to be
+            // written here. `None` matches the trait default.
             _ => None,
         }
     }
