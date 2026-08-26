@@ -16598,6 +16598,92 @@ fn test_jq_wellformed_objects_unaffected_by_1194() -> Result<()> {
     Ok(())
 }
 
+/// #1643: a missing or doubled `,`/`:` between two real object members or
+/// array elements now raises, matching real jq's parse error, instead of
+/// the semi-index silently inventing the missing delimiter (or dropping
+/// the extra one) on the way back out. `#1194`'s own checks can't see any
+/// of these -- every one leaves an even, well-typed BP child count.
+#[test]
+fn test_jq_missing_or_doubled_delimiter_raises_1643() -> Result<()> {
+    for input in [
+        r#"{"a" 1}"#,        // missing `:` between key and value
+        r#"{"a":1 "b":2}"#,  // missing `,` between members
+        r#"{"a":1,,"b":2}"#, // doubled `,` between members
+        "[1 2]",             // missing `,` between elements
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1643: the same class of check applies through a field lookup, not just
+/// the bare identity filter -- whatever value ends up printed is checked,
+/// wherever it's found in the tree.
+#[test]
+fn test_jq_missing_delimiter_raises_through_field_lookup_1643() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a":{"b" 1}}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1643: well-formed documents -- including ones whose *string content*
+/// contains a literal `,`/`:`, and nested containers -- are unaffected.
+/// The check inspects only the whitespace/delimiter gap between children,
+/// never a child's own bytes.
+#[test]
+fn test_jq_wellformed_documents_unaffected_by_1643() -> Result<()> {
+    for (input, expected) in [
+        (r#"{"a":1}"#, r#"{"a":1}"#),
+        (r#"{"a":1,"b":2}"#, r#"{"a":1,"b":2}"#),
+        ("[1,2,3]", "[1,2,3]"),
+        ("{}", "{}"),
+        ("[]", "[]"),
+        (r#"{"a":{"b":1}}"#, r#"{"a":{"b":1}}"#),
+        ("[1,[2,3],{\"x\":4}]", "[1,[2,3],{\"x\":4}]"),
+        (r#"{"a":"1,2:3"}"#, r#"{"a":"1,2:3"}"#),
+        (r#"{ "a" : 1 , "b" : 2 }"#, r#"{"a":1,"b":2}"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
+/// #1643: known, documented gap -- a trailing/leading comma next to a
+/// bracket (rather than between two real children) is not yet caught.
+/// Catching it needs the *closing* bracket's text position, which has no
+/// cheap lookup today (IB only marks opening positions); see
+/// `preceding_gap_ok`'s doc comment in `jq_runner.rs` for why. Pinned here
+/// so a future fix for this class updates this test rather than being
+/// silently covered by a coincidence.
+#[test]
+fn test_jq_trailing_leading_comma_still_a_known_gap_1643() -> Result<()> {
+    for (input, expected) in [
+        (r#"{"a":1,}"#, r#"{"a":1}"#),
+        ("[1,2,]", "[1,2]"),
+        ("{,}", "{}"),
+        ("[,]", "[]"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

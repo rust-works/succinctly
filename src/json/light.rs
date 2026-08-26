@@ -643,7 +643,18 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         let Some(text_pos) = self.text_position() else {
             return StandardJson::Error("invalid cursor position");
         };
+        self.value_at(text_pos)
+    }
 
+    /// Same as [`value`](Self::value), for a caller that has already
+    /// resolved this cursor's `text_position()` for some other reason (a
+    /// delimiter gap check against a sibling, #1643) and doesn't want to
+    /// pay for the same rank/select lookup a second time.
+    ///
+    /// `text_pos` must be this cursor's own `text_position()` -- passing
+    /// any other offset produces nonsense, silently, since there is
+    /// nothing here to check it against.
+    pub fn value_at(&self, text_pos: usize) -> StandardJson<'a, W> {
         if text_pos >= self.text.len() {
             return StandardJson::Error("text position out of bounds");
         }
@@ -1359,6 +1370,17 @@ pub struct JsonString<'a> {
 }
 
 impl<'a> JsonString<'a> {
+    /// The byte offset of the opening quote in the document text.
+    ///
+    /// Lets a caller that already resolved this string via
+    /// [`JsonCursor::value`] reuse that position (e.g. for a delimiter gap
+    /// check, #1643) instead of paying for another `text_position()` --
+    /// itself a rank/select lookup, not free -- to re-derive it.
+    #[inline]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
     /// Get the raw bytes including quotes.
     pub fn raw_bytes(&self) -> &'a [u8] {
         let end = self.find_end();

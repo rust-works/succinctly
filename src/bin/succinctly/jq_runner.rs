@@ -580,6 +580,16 @@ struct PreparedField<'a> {
     key_bp: usize,
     /// BP position of the value cursor.
     value_bp: usize,
+    /// The value cursor's own `text_position()`, if the #1643 delimiter
+    /// check already resolved one -- `usize::MAX` otherwise (a sentinel
+    /// rather than `Option<usize>` for the same reason this struct hoists
+    /// `text`/`index` into `Frame` above: an `Option<usize>` doubles this
+    /// field's size to 16 bytes on a type with no spare bit pattern to
+    /// exploit, which the same 1M-field-object memory math this struct's
+    /// own doc comment cites would double again. The write loop passes it
+    /// to `print_json` as `known_text_pos` so that recursive call doesn't
+    /// redo the same rank/select lookup the check already paid for.
+    value_start: usize,
     /// The key's raw source span, quotes included.
     raw: &'a [u8],
     /// Whether that span contains a backslash escape.
@@ -3405,9 +3415,25 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // For preserve mode (!jq_compat), use the preserve formatter (keeps original number format)
     if !config.sort_keys && !config.color_output {
         if config.jq_compat {
-            print_json(out, value, &JqCompatFormatter, config, 0, &mut Vec::new())?;
+            print_json(
+                out,
+                value,
+                &JqCompatFormatter,
+                config,
+                0,
+                &mut Vec::new(),
+                None,
+            )?;
         } else {
-            print_json(out, value, &PreserveFormatter, config, 0, &mut Vec::new())?;
+            print_json(
+                out,
+                value,
+                &PreserveFormatter,
+                config,
+                0,
+                &mut Vec::new(),
+                None,
+            )?;
         }
     } else {
         // For complex output (pretty-print, sort_keys, colors), materialize
@@ -3587,6 +3613,94 @@ impl LiteralFormatter for PreserveFormatter {
 // Generic JSON Printer
 // =============================================================================
 
+/// Whether the byte span immediately before `child_start` is exactly the
+/// delimiter JSON's grammar requires there -- neither missing nor doubled
+/// (#1643).
+///
+/// The semi-index has no signal for this at all: `json::standard::is_delim`
+/// maps `,` and `:` to the same invisible bit as whitespace, so `{"a" 1}`,
+/// `{"a":1 "b":2}`, `{"a":1,,"b":2}` and `[1 2]` all index exactly as if
+/// they were well-formed -- `#1194`'s `ends_unpaired`/`key_is_malformed`
+/// checks can't see any of them either, since every one leaves an even,
+/// well-typed BP child count, the only anomaly those checks test for.
+///
+/// Scans *backward* from `child_start` (a cheap, O(1)-via-rank/select
+/// position every direct child already has) rather than forward from the
+/// previous sibling's own end: finding a sibling's end is O(that
+/// sibling's own subtree) whenever it's a container -- `JsonCursor::
+/// text_range`'s own comment explains why: IB only marks *opening*
+/// positions, so there is no cheap text-position lookup for a closing
+/// bracket. Scanning forward from there at every recursion level would
+/// make a deeply nested document's check cost quadratic in nesting depth.
+/// Walking backward instead touches only the whitespace/delimiter run in
+/// the gap itself, stopping the instant it reaches non-whitespace content
+/// it doesn't need to identify -- bounded by the gap, not by anything
+/// before it.
+///
+/// Deliberately narrower than re-running the strict validator over the
+/// same bytes would be: this only inspects gap bytes between already-
+/// recognized children, never a child's own content, so it can't regress
+/// this crate's own established leniencies beyond strict RFC 8259 --
+/// leading zeros (#1149), a leading-dot number (#1171), a malformed
+/// nested number like `1.2.3` (#1194/#966) -- none of which live in a gap.
+///
+/// Only catches a missing or doubled delimiter between two real children.
+/// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
+/// container (`{,}`) needs the *closing* bracket's text position, which is
+/// exactly the expensive lookup this function exists to avoid -- tracked
+/// as a follow-up rather than folded in here.
+fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -> bool {
+    let mut i = child_start;
+    let mut found = None;
+    while i > 0 {
+        match text[i - 1] {
+            b @ (b',' | b':') => {
+                if found.is_some() {
+                    return false; // doubled delimiter
+                }
+                found = Some(b);
+                i -= 1;
+            }
+            b if b.is_ascii_whitespace() => i -= 1,
+            _ => break, // reached the previous sibling's own content
+        }
+    }
+    found == expected
+}
+
+/// Array-element wrapper around [`preceding_gap_ok`]: element `index` (0-
+/// based) must be preceded by `,`, except the first, which must be
+/// preceded by nothing (#1643).
+///
+/// Called from the array arm's own validation pass, before any of `[`'s
+/// contents are written -- same discipline as the object arm just below,
+/// and for the same reason (its own comment there explains it): a
+/// malformed array must not leave a partial `[` on `out` when the error
+/// surfaces.
+///
+/// Returns the element's own `text_position()` on success, so the caller
+/// can cache it and hand it to `print_json` as `known_text_pos` once the
+/// write loop reaches that same element, instead of that recursive call
+/// re-deriving the same rank/select lookup a second time -- a version
+/// that didn't cache this measured 19-30% slower on `sjq -c .` (#1643,
+/// see the PR): a document with many short elements pays for this lookup
+/// once per element regardless, so paying for it *twice* per element,
+/// once here and again moments later, was the entire regression, not the
+/// gap check itself.
+fn check_preceding_delimiter<W: AsRef<[u64]>>(
+    child_cursor: &JsonCursor<'_, W>,
+    index: usize,
+) -> Result<Option<usize>> {
+    let Some(start) = child_cursor.text_position() else {
+        return Ok(None);
+    };
+    let expected = if index == 0 { None } else { Some(b',') };
+    if !preceding_gap_ok(child_cursor.text(), start, expected) {
+        return Err(MalformedJsonError(EvalError::malformed_json_text(child_cursor.text())).into());
+    }
+    Ok(Some(start))
+}
+
 /// Print a JqValue as JSON using the provided literal formatter.
 ///
 /// This is the unified printer that handles JSON structure (arrays, objects,
@@ -3615,6 +3729,15 @@ fn print_json<'a, F, Out, Wrd>(
     config: &OutputConfig,
     level: usize,
     scratch: &mut Vec<PreparedField<'a>>,
+    // #1643: when `value` is a `JqValue::Cursor` and the caller has
+    // *already* called `text_position()` on it (to check the delimiter
+    // preceding it against a sibling), it's passed through here so the
+    // `Cursor` arm below can call `value_at` instead of `value` --
+    // `text_position()` is a rank/select lookup, not free, and every
+    // array/object element already pays for it once at the call site.
+    // `None` for a value with no such caller-side lookup (the top-level
+    // call, or any non-`Cursor` variant, which ignores this either way).
+    known_text_pos: Option<usize>,
 ) -> Result<()>
 where
     F: LiteralFormatter,
@@ -3654,7 +3777,14 @@ where
         }
         JqValue::Cursor(c) => {
             use succinctly::json::light::StandardJson;
-            match c.value() {
+            // #1643: reuse the caller's `text_position()` lookup when it
+            // handed one in, instead of `value()` redoing it -- see
+            // `known_text_pos`'s own doc comment above.
+            let resolved = match known_text_pos.or_else(|| c.text_position()) {
+                Some(text_pos) => c.value_at(text_pos),
+                None => StandardJson::Error("invalid cursor position"),
+            };
+            match resolved {
                 StandardJson::Null => out.write_all(b"null")?,
                 StandardJson::Bool(true) => out.write_all(b"true")?,
                 StandardJson::Bool(false) => out.write_all(b"false")?,
@@ -3688,31 +3818,66 @@ where
                 StandardJson::Array(elements) => {
                     if elements.is_empty() {
                         out.write_all(b"[]")?;
-                    } else if compact {
-                        out.write_all(b"[")?;
-                        for (i, child_cursor) in elements.cursor_iter().enumerate() {
-                            if i > 0 {
-                                out.write_all(b",")?;
-                            }
-                            let child_value = JqValue::Cursor(child_cursor);
-                            print_json(out, &child_value, formatter, config, level + 1, scratch)?;
-                        }
-                        out.write_all(b"]")?;
                     } else {
-                        out.write_all(b"[")?;
-                        out.write_all(separator.as_bytes())?;
+                        // #1643: validate every element's preceding
+                        // delimiter *before* writing anything, same
+                        // discipline as the object arm below and for the
+                        // same reason (its own comment explains why: a
+                        // malformed document must not leave a partial `{`
+                        // -- or here, `[` -- already on `out` when the
+                        // error surfaces). Caches each element's own
+                        // `text_position()` along the way, since it's
+                        // needed for the check anyway, so the write loop
+                        // below doesn't make `print_json`'s recursion
+                        // re-derive the same rank/select lookup a second
+                        // time -- a version that didn't cache measured
+                        // 19-30% slower on `sjq -c .` (#1643, see the PR).
+                        let mut positions = Vec::new();
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
-                            if i > 0 {
-                                out.write_all(b",")?;
-                                out.write_all(separator.as_bytes())?;
-                            }
-                            out.write_all(next_indent.as_bytes())?;
-                            let child_value = JqValue::Cursor(child_cursor);
-                            print_json(out, &child_value, formatter, config, level + 1, scratch)?;
+                            positions.push(check_preceding_delimiter(&child_cursor, i)?);
                         }
-                        out.write_all(separator.as_bytes())?;
-                        out.write_all(current_indent.as_bytes())?;
-                        out.write_all(b"]")?;
+                        if compact {
+                            out.write_all(b"[")?;
+                            for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                }
+                                let child_value = JqValue::Cursor(child_cursor);
+                                print_json(
+                                    out,
+                                    &child_value,
+                                    formatter,
+                                    config,
+                                    level + 1,
+                                    scratch,
+                                    positions[i],
+                                )?;
+                            }
+                            out.write_all(b"]")?;
+                        } else {
+                            out.write_all(b"[")?;
+                            out.write_all(separator.as_bytes())?;
+                            for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                                if i > 0 {
+                                    out.write_all(b",")?;
+                                    out.write_all(separator.as_bytes())?;
+                                }
+                                out.write_all(next_indent.as_bytes())?;
+                                let child_value = JqValue::Cursor(child_cursor);
+                                print_json(
+                                    out,
+                                    &child_value,
+                                    formatter,
+                                    config,
+                                    level + 1,
+                                    scratch,
+                                    positions[i],
+                                )?;
+                            }
+                            out.write_all(separator.as_bytes())?;
+                            out.write_all(current_indent.as_bytes())?;
+                            out.write_all(b"]")?;
+                        }
                     }
                 }
                 StandardJson::Object(fields) => {
@@ -3764,6 +3929,7 @@ where
                         // of `sjq '.'` over 10 MB. This is the same single
                         // walk, just keeping its own tail.
                         let mut remaining = fields;
+                        let mut field_index = 0usize;
                         while let Some((field, rest)) = remaining.uncons() {
                             // The `_` arm is *not* unreachable, whatever this
                             // comment used to claim: nothing enforces the JSON
@@ -3785,14 +3951,40 @@ where
                                 ))
                                 .into());
                             };
+                            // #1643: this key must be preceded by a `,` (or
+                            // nothing, if it's the object's first field), and
+                            // its value must be preceded by a `:` -- neither
+                            // is enforced anywhere else on this path. See
+                            // `preceding_gap_ok` for why a missing/doubled
+                            // trailing comma is what this catches, not a
+                            // trailing one. `k.start()` reuses the position
+                            // `field.key()` just resolved above rather than
+                            // asking `field.key_cursor()` to re-derive it.
+                            let key_start = k.start();
+                            let value_start = field.value_cursor().text_position();
+                            if let Some(value_start) = value_start {
+                                let comma_expected =
+                                    if field_index == 0 { None } else { Some(b',') };
+                                if !preceding_gap_ok(frame.text, key_start, comma_expected)
+                                    || !preceding_gap_ok(frame.text, value_start, Some(b':'))
+                                {
+                                    scratch.truncate(base);
+                                    return Err(MalformedJsonError(
+                                        EvalError::malformed_json_text(frame.text),
+                                    )
+                                    .into());
+                                }
+                            }
                             let (raw, escaped) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
                                 value_bp: field.value_cursor().bp_position(),
+                                value_start: value_start.unwrap_or(usize::MAX),
                                 raw,
                                 escaped,
                             });
                             remaining = rest;
+                            field_index += 1;
                         }
                         // An odd number of BP children means the text was
                         // never `key: value` -- `{invalid}`, `{"a"}`, or the
@@ -3833,7 +4025,21 @@ where
                             out.write_all(next_indent.as_bytes())?;
                             write_object_key(out, &frame, &field, config, space_after_colon)?;
                             let child_value = JqValue::Cursor(frame.cursor(field.value_bp));
-                            print_json(out, &child_value, formatter, config, level + 1, scratch)?;
+                            // #1643: `value_start` was already resolved by
+                            // the check above (or is the sentinel, if that
+                            // check's own lookup came back `None`) -- see
+                            // `PreparedField::value_start`'s doc comment.
+                            let known_text_pos =
+                                (field.value_start != usize::MAX).then_some(field.value_start);
+                            print_json(
+                                out,
+                                &child_value,
+                                formatter,
+                                config,
+                                level + 1,
+                                scratch,
+                                known_text_pos,
+                            )?;
                         }
                         out.write_all(separator.as_bytes())?;
                         out.write_all(current_indent.as_bytes())?;
@@ -3881,7 +4087,7 @@ where
                     if i > 0 {
                         out.write_all(b",")?;
                     }
-                    print_json(out, v, formatter, config, level + 1, scratch)?;
+                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
                 }
                 out.write_all(b"]")?;
             } else {
@@ -3893,7 +4099,7 @@ where
                         out.write_all(separator.as_bytes())?;
                     }
                     out.write_all(next_indent.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1, scratch)?;
+                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
@@ -3917,7 +4123,7 @@ where
                     };
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
-                    print_json(out, v, formatter, config, level + 1, scratch)?;
+                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
                 }
                 out.write_all(b"}")?;
             } else {
@@ -3938,7 +4144,7 @@ where
                     out.write_all(escaped.as_bytes())?;
                     out.write_all(b"\":")?;
                     out.write_all(space_after_colon.as_bytes())?;
-                    print_json(out, v, formatter, config, level + 1, scratch)?;
+                    print_json(out, v, formatter, config, level + 1, scratch, None)?;
                 }
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
