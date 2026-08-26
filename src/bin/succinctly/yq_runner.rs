@@ -221,7 +221,23 @@ impl OutputConfig {
     /// input format anyway.
     fn compute_indent_str(args: &YqCommand, effective_output_format: OutputFormat) -> String {
         if args.indent == 0 {
-            return String::new();
+            // YAML's significant whitespace means an empty indent string
+            // collapses every nesting level onto the same column, corrupting
+            // the document on read-back (#1575: a nested nested container
+            // under `-I=0` silently disappears). Real yq's own `-I0` behaves
+            // like a nonzero width with its own irregular per-level quirk
+            // this DOM emitter doesn't otherwise model; mirror the M2
+            // streaming fast path's own pre-existing, documented `-I0`
+            // choice of width 2 (`yaml_indent_spaces` below) instead of
+            // chasing that exact quirk. JSON is unaffected: `-I0` there
+            // means compact/flow, and `OutputConfig::compact` already
+            // forces JSON's own indent to `""` independently of this
+            // string.
+            return match (effective_output_format, args.tab) {
+                (OutputFormat::Yaml, true) => "\t".to_string(),
+                (OutputFormat::Yaml, false) => "  ".to_string(),
+                (_, _) => String::new(),
+            };
         }
         if args.tab {
             return "\t".to_string();
