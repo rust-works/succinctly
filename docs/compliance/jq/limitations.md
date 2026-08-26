@@ -642,6 +642,39 @@ $ echo '{"a\q":1,"b":2,"b":3}' | sjq -c .        # {"a\q":1,"b":3}
 has two members. Dropping it instead — which is what the first cut of #1385 did — deleted
 the field from output while `length` went on counting it.
 
+`to_entries` and `has` agree too (#1642). PR #1391 (the #1247 fix) made `keys`/`to_entries`
+*raise* on exactly this key instead of preserving it, without noticing that now contradicted
+#1385's own rule above — so the same document gave four different answers depending on
+which builtin was asked. `has` raised for an unrelated reason: it had no native handling and
+fell back to fully materializing the object first, which failed on the unrelated bad key
+before `has` ever got to check the one it was actually asked about. All five now agree,
+pinned together in one test (`test_undecodable_key_builtins_agree_1642`) rather than
+trusting each builtin's own prose to stay in sync:
+
+```
+$ echo '{"a\q":1,"b":2}' | sjq -c 'length, keys, keys_unsorted, to_entries, has("b")'
+2
+["a\\q","b"]
+["a\\q","b"]
+[{"key":"a\\q","value":1},{"key":"b","value":2}]
+true
+```
+
+A comma is enough to cost `keys_unsorted` its genuinely-lazy raw-byte path (#140's
+`materialize_lazy_keys`/`effective_keys` escape hatch), so every result above is a real
+materialized string — `a\q`'s one source backslash doubles to `\\`, which is why `keys`
+and this `keys_unsorted` agree byte-for-byte. **Bare** `keys_unsorted` (the sole top-level
+filter) stays lazy and echoes the exact source bytes verbatim instead:
+
+```
+$ echo '{"a\q":1,"b":2}' | sjq -c 'keys_unsorted'
+["a\q","b"]
+```
+
+Both spellings agree the key is present and the count is 2 — the literal escaping
+differing between a raw-byte echo and a materialized value is an inherent property of the
+two representations, not a new inconsistency #1642 introduces.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the

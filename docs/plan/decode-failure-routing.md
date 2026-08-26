@@ -436,7 +436,15 @@ Implementation notes, all discovered while doing it:
 - **Not everything that looks like a degrade is one.** `length` on an object answers from
   `fields.len()` without decoding, and `keys_unsorted` streams each key's raw byte span
   verbatim. Neither loses data — both are the same raw-passthrough class as `jq '.'` —
-  so both were left alone, and the tests say why.
+  so both were left alone, and the tests say why. **This stage's own key guards did not
+  yet draw that line consistently**: `keys`/`to_entries` (and `has`, indirectly, via this
+  stage's `to_owned`/`cursor_to_owned` family) raised on a decode-failure key instead of
+  joining `length`/`keys_unsorted`/`.` in the raw-passthrough class — contradicting #1385's
+  own "never a duplicate" rule one section up, on the same document. Closed by
+  [#1642](https://github.com/rust-works/succinctly/issues/1642), which moved the
+  substitution point into `DocumentValue::key_raw_source_span`/`document::key_display_string`
+  so every key guard in this stage (and `effective_keys`'s own dedup step) shares one
+  definition instead of each re-deriving the #1194-vs-decode-failure distinction.
 
 **Stage 4 — the `StandardJson::Error` arms (sites 17–18). ✅ landed.** Fixes
 `[xyz123] → [null]`, i.e. #1194's in-scope half. Small once Stage 3 exists: the arms
@@ -678,6 +686,9 @@ what Stage 6 is left with is bad escapes only.
   is the deliverable for.
 - [#1620](https://github.com/rust-works/succinctly/issues/1620) (resolved) — Open Risk 1,
   decode-failure catchability, filed and settled per this document's own follow-up list.
+- [#1642](https://github.com/rust-works/succinctly/issues/1642) (resolved) — Stage 3's key
+  guards raised inconsistently with `length`/`keys_unsorted`/`.`, contradicting #1385;
+  fixed by moving every key guard onto one shared substitution point.
 - [#1192](https://github.com/rust-works/succinctly/issues/1192) (closed) — fixed two
   sibling copies and established the `EvalError` wording convention reused here.
 - [#1098](https://github.com/rust-works/succinctly/issues/1098) (closed) — the original
