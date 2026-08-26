@@ -21627,14 +21627,19 @@ fn test_jq_contains_still_emits_the_prefix_before_an_escape_1553() -> Result<()>
 }
 
 /// #1553: the new eager path pulls the whole argument before ever calling
-/// `body`, so a later value's escape now outranks an earlier value's
-/// `body`-level type error -- rather than `body` failing on the first
-/// mismatched value the way jq mode still does (below), the escape wins.
-/// Live-verified against yq v4.53.3: `.x | contains((1, error("boom")))`
-/// on `abc` is `Error: boom`, not `body`'s own containment-check error.
-/// A "smarter" reimplementation that checked `body` incrementally before
-/// consulting the argument's trailing control would silently flip this back
-/// to the wrong (jq-mode) answer with nothing else here to catch it.
+/// `body`, so a later value's escape wins over whatever an earlier value's
+/// own `body` call would have answered -- unconditionally, not just when
+/// that earlier answer happens to be an error. (At the time this test was
+/// written, `1` vs `"abc"` was itself a `body`-level containment-check
+/// error in yq mode too; #1649 later made a scalar-vs-scalar kind mismatch
+/// answer `false` there instead, so the premise below is now `body` never
+/// running at all rather than `body` erroring -- the escape wins either
+/// way, which is what this test actually asserts.) Live-verified against
+/// yq v4.53.3: `.x | contains((1, error("boom")))` on `abc` is
+/// `Error: boom`, not `body`'s own answer for `1`. A "smarter"
+/// reimplementation that checked `body` incrementally before consulting the
+/// argument's trailing control would silently flip this back to running
+/// `body` on `1` first, with nothing else here to catch it.
 #[test]
 fn test_yq_contains_gate_a_later_escape_outranks_an_earlier_body_error_1553() -> Result<()> {
     let (out, err, code) = run_yq_stdin_with_stderr(
@@ -21696,42 +21701,58 @@ fn test_yq_contains_scalar_vs_scalar_kind_mismatch_answers_false_1649() -> Resul
 /// #1649: the exact opposite boundary from the test above -- any mismatch
 /// where at least one side is a container (array/object) still errors in
 /// yq mode, live-verified against v4.53.3 for every combination below
-/// (array-vs-object, array-vs-scalar, object-vs-scalar, scalar-vs-array).
-/// A naive "both operands must be containers to error" reading of the
-/// issue's suggested fix direction would get this wrong -- a single
-/// container operand is already enough.
+/// (array-vs-object, its reverse object-vs-array, array-vs-scalar,
+/// object-vs-scalar, scalar-vs-array). A naive "both operands must be
+/// containers to error" reading of the issue's suggested fix direction
+/// would get this wrong -- a single container operand is already enough.
+///
+/// Asserts the full error text (not just a `.contains(..)` substring) so
+/// a future change to `builtin_contains`'s/`builtin_inside`'s
+/// `EvalError::containment_check(a, b)` argument order -- easy to get
+/// backwards given the two functions are near-mirror-images of each
+/// other -- would be caught here rather than passing silently.
 #[test]
 fn test_yq_contains_any_container_operand_kind_mismatch_still_errors_1649() -> Result<()> {
     let (_, err, code) =
         run_yq_stdin_with_stderr(".x | contains({})", "x: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 1, "err: {err:?}");
-    assert!(
-        err.contains("cannot have their containment checked"),
-        "err: {err:?}"
+    assert_eq!(
+        err.trim(),
+        "Error: array ([1,2]) and object ({}) cannot have their containment checked"
+    );
+
+    // Reverse of the case above -- confirms the gate is symmetric in `a`/`b`
+    // and not just tested in one operand order.
+    let (_, err, code) =
+        run_yq_stdin_with_stderr(".x | contains([1])", "x:\n  a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "err: {err:?}");
+    assert_eq!(
+        err.trim(),
+        r#"Error: object ({"a":1}) and array ([1]) cannot have their containment checked"#
     );
 
     let (_, err, code) =
         run_yq_stdin_with_stderr(".x | contains(\"a\")", "x: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 1, "err: {err:?}");
-    assert!(
-        err.contains("cannot have their containment checked"),
-        "err: {err:?}"
+    assert_eq!(
+        err.trim(),
+        r#"Error: array ([1,2]) and string ("a") cannot have their containment checked"#
     );
 
     let (_, err, code) =
         run_yq_stdin_with_stderr(".x | contains(\"a\")", "x:\n  a: 1\n", &["-o", "json"])?;
     assert_eq!(code, 1, "err: {err:?}");
-    assert!(
-        err.contains("cannot have their containment checked"),
-        "err: {err:?}"
+    assert_eq!(
+        err.trim(),
+        r#"Error: object ({"a":1}) and string ("a") cannot have their containment checked"#
     );
 
     let (_, err, code) =
         run_yq_stdin_with_stderr(".x | contains([1])", "x: null\n", &["-o", "json"])?;
     assert_eq!(code, 1, "err: {err:?}");
-    assert!(
-        err.contains("cannot have their containment checked"),
-        "err: {err:?}"
+    assert_eq!(
+        err.trim(),
+        "Error: null (null) and array ([1]) cannot have their containment checked"
     );
     Ok(())
 }
@@ -21740,6 +21761,10 @@ fn test_yq_contains_any_container_operand_kind_mismatch_still_errors_1649() -> R
 /// and shares the same kind-mismatch rule, gated the same way even though
 /// real yq has no `inside` at all (lexer-rejected) to verify it against --
 /// this is an internal-consistency check with `contains`, not yq parity.
+/// (`inside` itself is currently reachable in yq mode without
+/// `--jq-extensions`, a separate, pre-existing gap tracked by #1650 -- not
+/// this test's concern, which is only whether the kind-mismatch rule
+/// matches `contains`'s own once `inside` is reached at all.)
 #[test]
 fn test_yq_inside_shares_contains_kind_mismatch_rule_1649() -> Result<()> {
     let (out, code) = run_yq_stdin(".x | inside(\"abc\")", "x: 5\n", &["-o", "json"])?;
@@ -21749,9 +21774,9 @@ fn test_yq_inside_shares_contains_kind_mismatch_rule_1649() -> Result<()> {
     let (_, err, code) =
         run_yq_stdin_with_stderr(".x | inside(\"abc\")", "x: [1]\n", &["-o", "json"])?;
     assert_eq!(code, 1, "err: {err:?}");
-    assert!(
-        err.contains("cannot have their containment checked"),
-        "err: {err:?}"
+    assert_eq!(
+        err.trim(),
+        r#"Error: string ("abc") and array ([1]) cannot have their containment checked"#
     );
     Ok(())
 }
