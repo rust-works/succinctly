@@ -748,10 +748,25 @@ design doc names. The second and third (default YAML→YAML output, no `-o` flag
 `stream_yaml_string_value`/`write_yaml_field_key`, the single most common `yq`
 invocation) are the same gap on its YAML-target sibling, not previously recorded anywhere.
 Every *materializing* route (a `--arg`-forced DOM, a multi-result filter, `to_entries`,
-`length`) already raises correctly; only these two purely-streamed writers do not. Fixing
-either needs `stream_json_value`/`stream_yaml_value` and their callers to carry a richer
-error than `fmt::Error` — the design doc's own stated reason Stage 6 was split out and
-deferred rather than attempted alongside the rest of #1247's landed stages.
+`length`) already raises correctly for a bad *value* like the one above; only these two
+purely-streamed writers do not. Fixing either needs `stream_json_value`/`stream_yaml_value`
+and their callers to carry a richer error than `fmt::Error` — the design doc's own stated
+reason Stage 6 was split out and deferred rather than attempted alongside the rest of
+#1247's landed stages.
+
+A bad *key* is a different story, on both routes, since [#1642](https://github.com/rust-works/succinctly/issues/1642):
+`to_entries`/`keys`/`length` all preserve it (as `""`, `YamlValue::key_string`'s existing
+convention for a mapping key with no scalar form -- issue #222) rather than raising, on
+*every* route, streamed or materialized alike -- matching the third example above
+(`"a\qb": 1` → `"": 1`) and jq mode's own analogous fix for a JSON key (see the "A key
+that will not decode is never a duplicate" note under [jq Limitations § Duplicate object
+keys collapse, except under `--preserve-input`](../jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input)).
+`has`/`in` agree too, for the same reason as jq mode: neither has native handling and both
+fall back to materializing the whole mapping first, which no longer fails on an unrelated
+bad key. This was a live inconsistency prior to #1642 -- `to_entries`/`keys` used to raise
+on a bad key while the default streamed identity output already preserved it as `""`, the
+same one-document-many-answers problem #1642's JSON-side fix closes, on the mapping-key
+axis instead of the object-key one.
 
 ### Other categories
 
