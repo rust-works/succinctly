@@ -2752,6 +2752,32 @@ fn test_undecodable_key_builtins_agree_1642() -> Result<()> {
     Ok(())
 }
 
+/// #1642 follow-up: `paths`/`leaf_paths` were left on the old
+/// `field.key_str()` (`None` for a decode-failure key, same as for a
+/// #1194 key the grammar never allowed), so they silently dropped a
+/// decode-failure key's path while `keys`/`length`/`to_entries` -- routed
+/// through the shared `key_display_string` -- correctly reported it. Same
+/// "one document, many answers" failure `test_undecodable_key_builtins_agree_1642`
+/// pins for the other five builtins, just on this pair.
+#[test]
+fn test_paths_and_leaf_paths_agree_with_keys_on_decode_failure_1642() -> Result<()> {
+    let doc = r#"{"a\q":1,"b":2}"#;
+
+    let (out, _, code) = run_jq_full(&["-c", "keys"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"a\\\\q\",\"b\"]");
+
+    let (out, _, code) = run_jq_full(&["-c", "paths"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"a\\\\q\"]\n[\"b\"]");
+
+    let (out, _, code) = run_jq_full(&["-c", "leaf_paths"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"a\\\\q\"]\n[\"b\"]");
+
+    Ok(())
+}
+
 /// #1642 follow-up: `to_owned`/`materialize` (`-S`, `-s`, a multi-result
 /// filter like `.,.`) build an `IndexMap<String, _>` keyed by
 /// `key_display_string`'s fallback. Two *different* decode-failure keys can

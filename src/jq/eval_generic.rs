@@ -6454,7 +6454,15 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             return;
         }
         for field in fields {
-            let Some(key) = field.key_str() else {
+            // `key_display_string`, not `field.key_str()`: a key that will
+            // not *decode* (#1247/#1385) is preserved via its raw source
+            // span rather than skipped (#1642), matching
+            // `length`/`keys`/`keys_unsorted`/`.` -- this loop used to
+            // silently drop such a field's path, disagreeing with `keys`
+            // over the same document. A key the format's grammar never
+            // allowed at all (#1194) is still skipped, same as before this
+            // fix (this function has no error channel to raise through).
+            let Some(key) = key_display_string(&field.key) else {
                 continue;
             };
             current_path.push(OwnedValue::String(key.into_owned()));

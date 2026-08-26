@@ -675,6 +675,12 @@ Both spellings agree the key is present and the count is 2 — the literal escap
 differing between a raw-byte echo and a materialized value is an inherent property of the
 two representations, not a new inconsistency #1642 introduces.
 
+`paths` and `leaf_paths` agree with the same five now too: both were left on the
+pre-#1642 `field.key_str()` (`None` for a decode-failure key, indistinguishable from
+#1194's genuinely absent one) when the rest of this file's builtins were rewired onto the
+shared `key_display_string` fallback, so a bad key's path silently vanished from `paths`'s
+output while `keys` went on reporting it.
+
 **One exception, on the materializing routes only** (`to_owned`/`materialize` — `-S`,
 `-s`, a multi-result filter like `.,.`). Two *different* decode-failure keys can share the
 same display fallback (byte-identical raw escapes, or two distinct bad `\u` escapes that
