@@ -369,11 +369,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read file: {}", path.display()))
 }
 
-/// When `--validate` is set and the resolved input format is YAML, run the
-/// opt-in strict validator (`succinctly::yaml::validate`) before indexing and,
-/// on the first violation, print a rustc-style diagnostic and return the exit
-/// code to bail with. Mirrors `sjq --validate` (`jq_runner::validate_json_input`);
-/// JSON input is left to jq-side validation.
+/// For a YAML/Auto-format input, always rejects a non-UTF-8 byte stream
+/// outright (#1242) -- this half is unconditional, not gated on
+/// `--validate`, matching real yq's own refusal of a stray byte. Then, only
+/// when `--validate` is set, additionally runs the opt-in strict validator
+/// (`succinctly::yaml::validate`) before indexing and, on the first
+/// violation, prints a rustc-style diagnostic. Either failure returns the
+/// exit code to bail with. Mirrors `sjq --validate`
+/// (`jq_runner::validate_json_input`) for the `--validate` half; JSON input
+/// (`-p json`) is left to jq-side validation for both halves (#1616).
 fn yaml_validate_guard(
     input: &[u8],
     format: InputFormat,
@@ -399,7 +403,7 @@ fn yaml_validate_guard(
     // error.
     if let Err(err) = succinctly::text::utf8::validate_utf8(input) {
         eprintln!("Error: YAML parse error: {err}");
-        return Some(exit_codes::FALSE_OR_NULL);
+        return Some(exit_codes::YQ_FAILURE);
     }
     if !validate {
         return None;
