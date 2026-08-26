@@ -23489,6 +23489,54 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
     Ok(())
 }
 
+/// #1642 follow-up: two *different* decode-failure keys share the same
+/// display fallback (YAML's is always `""` -- #222) once a materializing
+/// route (`--arg`, `-P`) inserts that fallback into a plain
+/// `IndexMap<String, _>`. #1385 forbids treating two decode-failure keys as
+/// the same key, and the map cannot hold two entries under one string, so
+/// this must raise rather than silently keep only the last value -- the
+/// silent-data-loss regression `DisplayKeyGuard`
+/// (`src/jq/document.rs`) closes.
+#[test]
+fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
+    let input = "\"a\\qb\": 1\n\"c\\qd\": 2\n";
+    for extra in [&["--arg", "z", "y"][..], &["-P"][..]] {
+        let (output, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, extra)?;
+        assert_eq!(
+            exit_code, 1,
+            "args {extra:?} should raise rather than silently drop a value, output: {output:?}"
+        );
+        assert!(
+            stderr.contains("ambiguous"),
+            "args {extra:?}, stderr: {stderr}"
+        );
+    }
+
+    // A single decode-failure key still preserves fine -- no false positive
+    // from the new guard.
+    let single = "\"a\\qb\": 1\n\"c\": 2\n";
+    let (output, stderr, exit_code) = run_yq_stdin_with_stderr(".", single, &["--arg", "z", "y"])?;
+    assert_eq!(
+        exit_code, 0,
+        "single bad key should still succeed, stderr: {stderr}"
+    );
+    assert_eq!(output.trim(), "'': 1\nc: 2");
+
+    // An ordinary repeated key -- no decode failure on either side -- still
+    // collapses to the last value, matching yq's normal duplicate handling;
+    // the guard must not turn a genuine duplicate into a raise.
+    let ordinary_dup = "a: 1\na: 2\n";
+    let (output, stderr, exit_code) =
+        run_yq_stdin_with_stderr(".", ordinary_dup, &["--arg", "z", "y"])?;
+    assert_eq!(
+        exit_code, 0,
+        "ordinary duplicate key should not raise, stderr: {stderr}"
+    );
+    assert_eq!(output.trim(), "a: 2");
+
+    Ok(())
+}
+
 /// #1620: a decode failure must never be suppressed by `?`, matching how
 /// `try`/`catch` already never catches one -- real yq's equivalent is a
 /// parse-time rejection no program could ever catch either. `\q` is not a

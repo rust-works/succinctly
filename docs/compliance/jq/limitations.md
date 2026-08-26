@@ -675,6 +675,24 @@ Both spellings agree the key is present and the count is 2 — the literal escap
 differing between a raw-byte echo and a materialized value is an inherent property of the
 two representations, not a new inconsistency #1642 introduces.
 
+**One exception, on the materializing routes only** (`to_owned`/`materialize` — `-S`,
+`-s`, a multi-result filter like `.,.`). Two *different* decode-failure keys can share the
+same display fallback (byte-identical raw escapes, or two distinct bad `\u` escapes that
+both lossy-decode to the same replacement text) — never the same key under #1385's rule
+above, but a plain `IndexMap<String, _>` cannot hold two entries under one string. Silently
+keeping only the last value would be *quieter* data loss than #1247's original raise, not a
+fix, so `DisplayKeyGuard` ([src/jq/document.rs](../../../src/jq/document.rs)) makes this
+specific collision raise instead:
+
+```
+$ echo '{"\ud800":1,"\ud800":2}' | sjq -Sc .
+jq: error (at <stdin>:0): object key "\ud800" is ambiguous: an undecodable key's display
+form collides with another key of the same name and cannot be represented
+```
+
+An *ordinary* repeated key (no decode failure on either side) is unaffected and still
+collapses to its last value, matching jq's normal duplicate-key handling.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the

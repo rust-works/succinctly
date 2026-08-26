@@ -761,26 +761,101 @@ pub(crate) fn key_is_malformed<V: DocumentValue>(key: &V) -> bool {
 }
 
 /// The string to show for a key, substituting a best-effort fallback when
-/// the key is malformed only because its bytes won't *decode* (#1642) --
-/// never for a key the format's grammar rejects outright (#1194), which
-/// `key_is_malformed` still catches and which still must raise.
+/// the key is malformed only because its bytes won't *decode* (#1642).
 ///
-/// `None` here means the caller should raise -- exactly the #1194 case.
+/// Never for a key the format's grammar rejects outright (#1194), which
+/// `key_is_malformed` still catches and which still must raise. `None`
+/// here means the caller should raise -- exactly the #1194 case.
 /// The substituted fallback is a **display-only** value: it must never
 /// feed back into an identity or hashing decision (`key_hash_of`,
 /// `key_string()` itself, `collapse_repeated`/`DistinctKeyCursors`'s
 /// dedup), because two different decode-failure keys can produce the same
 /// fallback spelling and must still never be treated as duplicates of one
-/// another (#1385).
-pub(crate) fn key_display_string<V: DocumentValue>(key: &V) -> Option<Cow<'_, str>> {
+/// another (#1385). A caller that keys a *map* by this string (rather than
+/// just displaying it) needs to know when that risk applies -- see
+/// `key_display_string_kind` and `DisplayKeyGuard`.
+///
+/// `pub`, not `pub(crate)`: `succinctly-cli`'s `yq_runner.rs` (a separate
+/// binary crate) needs the same key-display logic for its own
+/// `--input-format json` materializer, and must not re-derive it.
+pub fn key_display_string<V: DocumentValue>(key: &V) -> Option<Cow<'_, str>> {
+    key_display_string_kind(key).map(|(key, _is_fallback)| key)
+}
+
+/// [`key_display_string`], plus whether the string is the decode-failure
+/// **fallback** spelling (`true`) rather than a genuine decode (`false`).
+///
+/// Must check `string_decode_error()` *first*, not `key_string()`: YAML's
+/// `key_string()` override never returns `None` at all (#222 -- a complex
+/// or undecodable key stringifies to `""` rather than being dropped), so
+/// checking it first would make every YAML decode-failure key silently
+/// report `is_fallback = false`, indistinguishable from a genuine key
+/// spelled `""`. JSON's two checks happen to be redundant with each other
+/// (`string_decode_error()` and `key_string()` both resolve via the same
+/// `as_str()`), but the order has to serve both formats' actual contracts,
+/// not just the cheaper one.
+pub(crate) fn key_display_string_kind<V: DocumentValue>(key: &V) -> Option<(Cow<'_, str>, bool)> {
     if key.string_decode_error().is_some() {
-        Some(match key.key_raw_source_span() {
-            Some(raw) => String::from_utf8_lossy(raw).into_owned().into(),
-            None => Cow::Borrowed(""),
-        })
-    } else {
-        key.key_string()
+        let fallback = key
+            .key_raw_source_span()
+            .map_or(Cow::Borrowed(""), String::from_utf8_lossy);
+        return Some((fallback, true));
     }
+    key.key_string().map(|key| (key, false))
+}
+
+/// Guards a display-keyed `IndexMap` (`to_owned`/`materialize`, #1642)
+/// against silently merging two keys that [`key_display_string_kind`]'s own
+/// contract forbids treating as the same key: a decode-failure key's
+/// fallback spelling colliding with another decode-failure key's, or with
+/// an unrelated key that happens to decode to the identical text. An
+/// `IndexMap<String, _>` has no way to hold two entries under one string,
+/// so letting that insert happen the ordinary way silently drops the
+/// earlier value -- quieter data loss than #1247's original raise, which
+/// this fix relaxed but must not replace with a worse failure mode.
+///
+/// An *ordinary* repeated key -- neither side a decode-failure fallback --
+/// still overwrites without complaint here, matching jq's normal
+/// last-key-wins duplicate handling; only a fallback spelling on either
+/// side of the collision is refused.
+#[derive(Default)]
+pub(crate) struct DisplayKeyGuard {
+    fallback_keys: Vec<String>,
+}
+
+impl DisplayKeyGuard {
+    /// Checks `key` (with the `is_fallback` flag from
+    /// [`key_display_string_kind`]) against every key already present in
+    /// `map` and every fallback key this guard has already approved.
+    /// Returns `true` when it is safe to insert (a fresh key, or an
+    /// ordinary repeat); `false` when inserting would silently collapse two
+    /// keys that must stay distinct, in which case the caller should raise
+    /// instead.
+    pub(crate) fn check<T>(
+        &mut self,
+        map: &IndexMap<String, T>,
+        key: &str,
+        is_fallback: bool,
+    ) -> bool {
+        let collides = map.contains_key(key)
+            && (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key));
+        if !collides && is_fallback {
+            self.fallback_keys.push(String::from(key));
+        }
+        !collides
+    }
+}
+
+/// The error for two keys that collide only because a decode-failure key's
+/// display fallback (#1642) matches another key's spelling. #1385 forbids
+/// treating them as the same key, but a display-keyed map has no way to
+/// hold both, so this is what `to_owned`/`materialize` raise instead of
+/// silently dropping one of them -- see [`DisplayKeyGuard`].
+pub(crate) fn colliding_display_key_error(key: &str) -> EvalError {
+    EvalError::decode_failure(alloc::format!(
+        "object key \"{key}\" is ambiguous: an undecodable key's display form \
+         collides with another key of the same name and cannot be represented"
+    ))
 }
 
 /// An open-addressed set of key hashes: "have I seen this one?" answered

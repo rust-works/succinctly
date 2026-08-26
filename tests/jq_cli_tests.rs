@@ -2752,6 +2752,57 @@ fn test_undecodable_key_builtins_agree_1642() -> Result<()> {
     Ok(())
 }
 
+/// #1642 follow-up: `to_owned`/`materialize` (`-S`, `-s`, a multi-result
+/// filter like `.,.`) build an `IndexMap<String, _>` keyed by
+/// `key_display_string`'s fallback. Two *different* decode-failure keys can
+/// share that fallback spelling (byte-identical raw escapes, or two
+/// separate bad `\u` escapes that both lossy-decode to U+FFFD), and #1385
+/// forbids treating them as the same key -- but the map cannot hold two
+/// entries under one string. Before this fix that silently kept only the
+/// last value (worse than #1247's original raise, which turned into
+/// quieter data loss instead of louder consistency); now it raises. See
+/// `DisplayKeyGuard` in `src/jq/document.rs`.
+#[test]
+fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
+    let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
+
+    for args in [
+        &["-Sc", "."][..],
+        &["-c", "-s", "."][..],
+        &["-c", ".,."][..],
+    ] {
+        let (out, err, code) = run_jq_full(args, Some(dup_doc))?;
+        assert_ne!(
+            code, 0,
+            "args {args:?} should raise rather than silently drop a value, out: {out:?}"
+        );
+        assert!(err.contains("ambiguous"), "args {args:?}, stderr: {err}");
+    }
+
+    // A single decode-failure key still preserves fine under the same
+    // routes -- no false positive from the new guard.
+    let single_doc = r#"{"\ud800":1,"b":2}"#;
+    let (out, err, code) = run_jq_full(&["-Sc", "."], Some(single_doc))?;
+    assert_eq!(
+        code, 0,
+        "single bad key should still succeed, stderr: {err}"
+    );
+    assert_eq!(out.trim(), "{\"\\\\ud800\":1,\"b\":2}");
+
+    // An ordinary repeated key -- no decode failure on either side -- still
+    // collapses to the last value (jq's normal duplicate-key handling); the
+    // guard must not turn a genuine duplicate into a raise.
+    let ordinary_dup = r#"{"a":1,"a":2}"#;
+    let (out, err, code) = run_jq_full(&["-Sc", "."], Some(ordinary_dup))?;
+    assert_eq!(
+        code, 0,
+        "ordinary duplicate key should not raise, stderr: {err}"
+    );
+    assert_eq!(out.trim(), "{\"a\":2}");
+
+    Ok(())
+}
+
 /// #1514: `keys_unsorted | map(f)` and `keys_unsorted | .[]` no longer probe
 /// the whole object before the first key comes out — they dedup as they walk
 /// and switch to the exact collapsed list only once a hash repeats. That
