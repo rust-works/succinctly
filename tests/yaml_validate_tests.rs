@@ -97,6 +97,35 @@ fn error_output_has_rustc_style_caret() -> Result<()> {
     Ok(())
 }
 
+/// #1636: a bad hex digit after `\u`/`\U` used to be misreported as `\x`
+/// (a hardcoded literal, not derived from which escape kind actually
+/// failed) -- only `\x` itself happened to report correctly, by
+/// coincidence. Covers all three kinds through the real CLI.
+#[test]
+fn bad_hex_escape_reports_the_real_escape_kind_1636() -> Result<()> {
+    let (_, stderr, code) = run_validate_stdin("a: \"\\xZZ\"\n", &["--no-color"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("invalid escape sequence '\\x'"),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) = run_validate_stdin("a: \"\\uZZZZ\"\n", &["--no-color"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("invalid escape sequence '\\u'"),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) = run_validate_stdin("a: \"\\UZZZZZZZZ\"\n", &["--no-color"])?;
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("invalid escape sequence '\\U'"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn file_input_reports_filename_and_missing_file() -> Result<()> {
     let mut file = NamedTempFile::new()?;
