@@ -16684,6 +16684,63 @@ fn test_jq_trailing_leading_comma_still_a_known_gap_1643() -> Result<()> {
     Ok(())
 }
 
+/// #1643 follow-up: `-S`/`-C`/`--slurp` bypass `print_json` entirely --
+/// they materialize via `parse_json_stream`'s fallback (which backs the
+/// "original" input path `-S`/`-C`/`--slurp` force), reaching
+/// `json_bytes_to_owned_value_checked` instead. Before this was fixed, a
+/// missing delimiter silently survived on this path even though the
+/// default `sjq -c .` path already rejected it since #1643 -- confirmed
+/// live: real jq errors (exit 5) on every one of these regardless of flag.
+#[test]
+fn test_jq_missing_delimiter_raises_under_sort_keys_color_and_slurp_1643() -> Result<()> {
+    for args in [
+        vec!["-S", "."],
+        vec!["-C", "-c", "."],
+        vec!["-c", "--slurp", "."],
+    ] {
+        let (out, stderr, code) = run_jq_full(&args, Some(r#"{"a" 1}"#))?;
+        assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{args:?}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{args:?}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1643 follow-up: a malformed value elsewhere in a multi-value stream
+/// (not just the first) is still caught under `-S`, since
+/// `parse_json_stream`'s fallback validates every span it materializes,
+/// not just the one `serde_json` first stumbled on.
+#[test]
+fn test_jq_missing_delimiter_raises_under_sort_keys_mid_stream_1643() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-S", "."], Some("{\"x\":1}\n{\"a\" 1}"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1643 follow-up: `parse_json_stream`'s fallback exists specifically to
+/// preserve jq's own leading-zero leniency (#1094) once `serde_json`
+/// rejects it -- the new delimiter check added for the previous two tests
+/// must not regress that leniency for `-S`/`--slurp`.
+#[test]
+fn test_jq_leading_zero_leniency_unaffected_under_sort_keys_and_slurp_1643() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-S", "-c", "."], Some(r#"{"a":007}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(out.trim(), r#"{"a":7}"#);
+
+    let (out, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(r#"{"a":007}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(out.trim(), r#"[{"a":7}]"#);
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching
