@@ -7292,7 +7292,8 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `ArgFanout::contains_gate`'s doc comment.
         ArgFanout::contains_gate::<S>(),
         |b| {
-            if jq_kind(&input) != jq_kind(&b) {
+            if jq_kind(&input) != jq_kind(&b) && containment_kind_mismatch_is_error::<S>(&input, &b)
+            {
                 return if optional {
                     QueryResult::None
                 } else {
@@ -7302,6 +7303,28 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)))
         },
     )
+}
+
+/// Whether a top-level kind mismatch between `contains`/`inside`'s two
+/// operands should raise [`EvalError::containment_check`], or -- in yq
+/// mode only -- fall through to a plain `false` (#1649).
+///
+/// jq has no carve-out here: `f_contains` errors on any kind mismatch,
+/// unconditionally, which is what `S::TAG != EvalTag::Yq` preserves.
+///
+/// Real yq (v4.53.3, live-verified across every kind pairing below, not
+/// just the issue's own string-vs-number repro) only errors when *at
+/// least one* operand is container-shaped (`Array`/`Object`) --
+/// array-vs-object, array-vs-string, object-vs-string, and null-vs-array
+/// all error there. A kind mismatch between two *scalars* (covering every
+/// non-container `OwnedValue`, including a `Bool(true)`/`Bool(false)`
+/// pairing, which `jq_kind` itself still treats as a "mismatch" per #358)
+/// answers `false` instead: string-vs-number, number-vs-bool, and
+/// null-vs-string were all confirmed live to return `false`, not error.
+/// This is the *opposite* of a "both must be containers to error" guess --
+/// a single container operand is already enough to error.
+fn containment_kind_mismatch_is_error<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue) -> bool {
+    S::TAG != EvalTag::Yq || is_owned_container(a) || is_owned_container(b)
 }
 
 /// Check if `a` contains `b` (recursive containment check)
@@ -7361,7 +7384,8 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ArgFanout::All,
         |b| {
             // inside is the inverse of contains: b contains input
-            if jq_kind(&b) != jq_kind(&input) {
+            if jq_kind(&b) != jq_kind(&input) && containment_kind_mismatch_is_error::<S>(&b, &input)
+            {
                 return if optional {
                     QueryResult::None
                 } else {

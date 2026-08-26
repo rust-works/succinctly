@@ -438,6 +438,19 @@ which was true only before #1534.
   but routes through the same eager, escape-clearing `fanout_arg` machinery `FirstOnly`/
   `RejectMany` already use. Confirmed by
   `test_yq_contains_gate_emits_nothing_when_the_argument_escapes_1553` and its siblings.
+- **`contains`/`inside` on a top-level kind mismatch** ([#1649](https://github.com/rust-works/succinctly/issues/1649),
+  now closed). `f_contains`'s `jq_kind(a) != jq_kind(b)` screen raises
+  `EvalError::containment_check` unconditionally in jq mode — correct there — but real yq
+  (v4.53.3, live-verified across every kind pairing, not just the string-vs-number case the
+  issue was filed for) only errors when **at least one** operand is container-shaped
+  (array/object); a mismatch between two scalars (including a `true`/`false` pairing, which
+  `jq_kind` itself still treats as a "mismatch" per #358) answers `false` instead. This is the
+  *opposite* of "both operands must be containers to error" — a single container operand
+  (array-vs-string, object-vs-string, null-vs-array) is already enough. `contains`/`inside`
+  are now gated per `S::TAG` via the shared `containment_kind_mismatch_is_error` (`inside`
+  follows the same rule for internal consistency with `contains`, even though real yq has no
+  `inside` at all to verify it against — see the fan-out table above). Confirmed by
+  `test_yq_contains_scalar_vs_scalar_kind_mismatch_answers_false_1649` and its siblings.
 
 ### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
 
