@@ -363,6 +363,19 @@ fn escape_json_body(s: &str, opts: &JsonFormatOpts) -> String {
     }
 }
 
+/// A JSON-sourced float's yq-mode display: a plain, bare `f64::to_string()`
+/// with no forced decimal point and no scientific-notation threshold --
+/// real yq's own JSON-input convention (#978/#1398), distinct from
+/// `format_float_yq`'s own (non-JSON-sourced) threshold/fraction rules.
+/// Named and shared rather than a hand-copied `f.to_string()` at each call
+/// site, matching `jq_bare_float_display`'s own precedent for the
+/// identical class of problem (CLAUDE.md's #106 lesson) -- `format_json_impl`'s
+/// `Float` arm and its `NumberLiteral` arm (#1498, the same rule reached
+/// through a reconstructed literal) both need this exact formatter.
+fn json_sourced_float_display(f: f64) -> String {
+    f.to_string()
+}
+
 /// Format a value as JSON text (compact or pretty, per `opts`).
 pub fn format_json(value: &OwnedValue, opts: &JsonFormatOpts) -> String {
     format_json_impl(value, opts, 0)
@@ -419,13 +432,8 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 }
             } else if opts.control_escape == ControlEscape::Yq && opts.json_sourced {
                 // A JSON-sourced float never keeps a decimal point, in any
-                // output mode (#978, #1398) -- real yq's JSON-input
-                // convention is a plain re-serialize through bare `f64`
-                // `Display`, with no scientific-notation threshold at all
-                // (matching `format_float_yq`'s own doc comment on this
-                // exact exclusion, and the M2 streaming writers' identical
-                // `json_sourced_canonical_float` rule in `src/yaml/light.rs`).
-                f.to_string()
+                // output mode (#978, #1398) -- see `json_sourced_float_display`.
+                json_sourced_float_display(*f)
             } else if opts.control_escape == ControlEscape::Yq {
                 // yq mode: scientific notation past yq's magnitude threshold
                 // (#997), decimal-with-fraction otherwise, regardless of
@@ -446,30 +454,48 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
         OwnedValue::NumberLiteral(repr, literal) => {
             if value.as_f64().is_some_and(f64::is_nan) {
                 "null".to_string() // JSON doesn't support NaN
-            } else if opts.control_escape == ControlEscape::Yq && opts.json_sourced {
-                // #1498: a `NumberLiteral` can still reach here for
-                // JSON-sourced input despite `to_owned_canonicalizing_numbers`
-                // stripping it at parse time -- `--eval-all`'s
-                // `eval_owned_input` reindex round-trip (serialize the
-                // already-stripped `OwnedValue` back to JSON text, then
-                // re-parse it through the library's own literal-preserving
-                // `to_owned`, #918) reconstructs one. Whichever route
-                // produced it, the same #978/#1398 rule applies: a
-                // JSON-sourced *float* never keeps a decimal point. Matches
-                // the `Float` arm's own `json_sourced` branch above exactly
-                // -- int-shaped literals have no such spelling ambiguity, so
-                // they fall through to the verbatim-echo branch below
-                // unchanged.
-                match repr {
-                    NumberRepr::Float(f) => f.to_string(),
-                    NumberRepr::Int(_) => literal.to_string(),
-                }
             } else if opts.control_escape == ControlEscape::Yq {
-                // yq mode: echo the source spelling verbatim (#1008) --
-                // matches the Float arm's own yq/jq split above, and real
-                // yq's documented byte-for-byte literal preservation,
-                // regardless of finiteness (confirmed live: a genuine
-                // document `1e999` literal echoes verbatim in real yq too).
+                match repr {
+                    // #1498 review: `json_sourced_float_display` (plain
+                    // `f64::to_string()`) renders an infinite `f` as
+                    // `inf`/`-inf`, not valid JSON -- the `Float` arm above
+                    // avoids this by special-casing `is_infinite()` before
+                    // its own `json_sourced` branch ever runs. No live path
+                    // reconstructs an *infinite* `NumberLiteral` for
+                    // JSON-sourced document input today (`to_json_for_reindex`'s
+                    // unparseable sentinel gets intercepted back to a plain
+                    // `Float` on reparse, never boxed into a `NumberLiteral`
+                    // -- see that function's own doc comment) -- but a
+                    // query-*text* literal like `1e400` reaches this same
+                    // arm via the parser directly, independent of the
+                    // reindex bridge, and `json_sourced` is a document-level
+                    // flag that doesn't distinguish the two origins. Guarded
+                    // here defensively, matching the `Float` arm's own
+                    // `"null"` answer, rather than relying on that
+                    // cross-file invariant to keep holding.
+                    NumberRepr::Float(f) if opts.json_sourced && f.is_infinite() => {
+                        "null".to_string()
+                    }
+                    // #1498: a `NumberLiteral` can still reach here for
+                    // JSON-sourced input despite `to_owned_canonicalizing_numbers`
+                    // stripping it at parse time -- `--eval-all`'s
+                    // `eval_owned_input` reindex round-trip (serialize the
+                    // already-stripped `OwnedValue` back to JSON text, then
+                    // re-parse it through the library's own literal-preserving
+                    // `to_owned`, #918) reconstructs one. Same rule as the
+                    // `Float` arm above either way: a JSON-sourced *finite*
+                    // float never keeps a decimal point.
+                    NumberRepr::Float(f) if opts.json_sourced => json_sourced_float_display(*f),
+                    // Int literals have no such spelling ambiguity, and a
+                    // non-`json_sourced` float has no rule to apply here at
+                    // all -- both echo the source spelling verbatim (#1008),
+                    // matching real yq's documented byte-for-byte literal
+                    // preservation regardless of finiteness (confirmed live:
+                    // a genuine document `1e999` literal echoes verbatim in
+                    // real yq too).
+                    _ => literal.to_string(),
+                }
+            } else {
                 // jq mode keeps `format_number_jq_compat`'s reformatting
                 // unchanged, which itself already reformats a non-finite
                 // literal's mantissa correctly (#1083/#1087) rather than
@@ -479,8 +505,6 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 // YAML), but it has other pre-existing divergences from
                 // real jq, unrelated and left alone here, e.g. `0.1e1` ->
                 // `1E+0` here vs real jq's `1`.
-                literal.to_string()
-            } else {
                 format_number_jq_compat(literal.as_bytes())
             }
         }
