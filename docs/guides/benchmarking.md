@@ -161,14 +161,19 @@ GitHub Actions runs `rank_select` benchmarks on every PR/push for smoke testing:
 
 **Perf Regression Guard** (issue #1523): a separate CI job measures `succinctly
 jq`/`yq` instruction counts via `valgrind --tool=cachegrind` (`scripts/perf-guard.py`)
-for a fixed query/shape matrix, and fails if any drifts more than 5% from the
-checked-in baseline (`tests/data/perf-guard-baseline.json`). Deterministic
-instruction counts, not wall-clock time, are what make a tight threshold viable on a
-shared, noisy CI runner — this exists because #1385's 2-3x regression shipped through
-`rank_select`-only smoke testing unnoticed. Runs on x86_64 and ARM64-Linux only
-(valgrind has no Apple Silicon support); currently a non-required check while it
-builds a track record. To deliberately update the baseline after a real, understood
-cost change:
+for a fixed query/shape matrix, and fails if any drifts more than 5% from a baseline.
+Deterministic instruction counts, not wall-clock time, are what make a tight threshold
+viable on a shared, noisy CI runner — this exists because #1385's 2-3x regression
+shipped through `rank_select`-only smoke testing unnoticed. Runs on x86_64 and
+ARM64-Linux only (valgrind has no Apple Silicon support); currently a non-required
+check while it builds a track record.
+
+On `pull_request` runs, the baseline is a binary built fresh from the PR's own
+`git merge-base` in the same CI run (`--baseline-binary`), not the committed file —
+see #1582 below for why. On other runs (a direct push to `main`) there is no PR to
+build a merge-base from, so it falls back to the checked-in
+`tests/data/perf-guard-baseline.json`. To deliberately update that file after a real,
+understood cost change:
 
 ```bash
 cargo build --release --features cli
@@ -176,6 +181,20 @@ scripts/perf-guard.py --binary target/release/succinctly --arch x86_64 --update-
 ```
 
 (run once per arch you can reach; state the reason in the commit message).
+
+**Why the file isn't the primary comparison (#1582).** At this project's merge
+cadence, the checked-in baseline drifts on its own: rebuilding at the baseline's own
+source commit vs. `main` three days / 147 commits later (55 touching
+`eval.rs`/`json`/`yaml`) showed **+1.0% to +3.2% drift on every one of the six
+queries**, with zero PR involved — ordinary accumulated small changes eating most of
+the 5% budget before any single PR is measured. The obvious first guess — that this is
+the same `codegen-units=16` cross-module placement artifact #1587 found and fixed by
+pinning `codegen-units=1` (see rule 9 below) — does not hold here: rebuilding both
+sides of that same three-day comparison at `codegen-units=1` left the drift the same
+size or larger, not collapsed the way #1587's wall-clock/icache case did. So the fix is
+structural, not a build flag: compare each PR against a binary built from its own
+merge-base in the same run, which cancels staleness (of any cause) instead of trying to
+keep a single checked-in file fresh against a fast-moving `main`.
 
 ---
 
@@ -950,9 +969,18 @@ across hardware.
 Also worth knowing: #595's x86-only 12-28% `block_scalars` anomaly was closed as "expected, no
 action — binary code-layout artifact from the recompile," using cachegrind to show flat
 instruction counts (`Ir`) but rising L1-icache misses (`I1mr`). That diagnosis predates this
-rule and never pinned codegen-units — see #1587 for the re-check. It does not, however, put
-`scripts/perf-guard.py`'s CI gate in question: that gate reads cachegrind `Ir`, which stayed
-flat in the same investigation — only `I1mr`, which perf-guard doesn't gate on, moved.
+rule and never pinned codegen-units — see #1587 for the re-check.
+
+**Update (#1582): `Ir` is not immune to this after all.** The paragraph above once
+concluded that `scripts/perf-guard.py`'s CI gate was safe by construction, since it reads
+`Ir` and #595's `Ir` stayed flat while only `I1mr` moved. #1582 found a case where `Ir`
+itself drifts — 1-3% across every one of perf-guard's six queries between two `main`
+commits three days apart, no single PR responsible — and confirmed with a paired
+`codegen-units=1` rebuild that it is *not* the `codegen-units=16` mechanism this section
+describes (that rebuild left the drift the same size or larger, not collapsed). What
+actually protects the gate now is structural: `pull_request` runs compare against a binary
+built from the PR's own merge-base in the same run, not a file that can go stale — see the
+Perf Regression Guard section above.
 
 ### Building both halves on a remote box
 
