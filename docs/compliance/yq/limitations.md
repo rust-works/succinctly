@@ -732,8 +732,8 @@ node's `!!map`/`!!seq` tag and quoting style in YAML output (`{"a":1,"b":2} | yq
 output is unaffected, since neither appears in JSON
 ([#1416](https://github.com/rust-works/succinctly/issues/1416)). Also see
 [yq Query Language Reference § Known Limitations](../../reference/yq-language.md#known-limitations)
-for the feature-level gaps (`*`/`+` are not cartesian generators; position builtins after DOM
-conversion).
+for the feature-level gaps (position builtins after DOM conversion; `file_index`/`key`/
+`document_index` inside object literals or `any`/`all`).
 
 ## Where the two modes deliberately differ from each other
 
