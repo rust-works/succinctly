@@ -21615,6 +21615,26 @@ fn test_yq_combinations_n_empty_argument_produces_empty_array_1408() -> Result<(
     Ok(())
 }
 
+/// #1669: the crash-guard fix is shared code (`src/jq/eval.rs`'s
+/// `builtin_combinations_n`/`cartesian_product`, dispatched identically
+/// regardless of mode) rather than something yq's own evaluator path
+/// reimplements, but that's exactly the kind of thing a future mode-
+/// specific dispatch change could silently break for one mode and not the
+/// other -- confirmed directly through yq mode rather than assumed from
+/// the jq-mode tests alone.
+#[test]
+fn test_yq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        "combinations(288230376151711744)",
+        "[1]\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
+    assert_eq!(output, "");
+    assert!(stderr.contains("Cannot allocate"), "stderr: {stderr}");
+    assert_ne!(code, 0, "stderr={stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_yq_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()> {
     let (output, stderr, code) =

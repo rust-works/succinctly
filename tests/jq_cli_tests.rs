@@ -22552,10 +22552,10 @@ fn test_jq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
 }
 
 /// #1669: `combinations(n)`'s *second* allocation risk -- once its own
-/// `n`-sized guard above passes (a small `n` is cheap on its own), the
-/// `cartesian_product(&arrays)` call that follows can still overflow on
-/// `base_array.len()^n`, a completely different quantity `try_reserve_product(&[n])`
-/// never sees. `n=10` is trivial by itself; `1000^10` is not.
+/// `n`-sized `indices` guard passes (a small `n` is cheap on its own), the
+/// actual output size `base_array.len().pow(n)` can still overflow, a
+/// completely different quantity the `n`-alone guard never sees. `n=10` is
+/// trivial by itself; `1000^10` is not.
 #[test]
 fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -22572,14 +22572,102 @@ fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Resul
     Ok(())
 }
 
+/// #1669: `checked_combinations_len`'s `base <= 1` short-circuit (a
+/// single-element base array raised to any power is always exactly one
+/// combination) is only reachable when `n` itself passes the earlier
+/// `indices` guard -- a small base paired with a merely large (not
+/// astronomically huge) `n` exercises it directly instead of failing
+/// earlier. The one combination produced is `n` copies of the sole
+/// element, joined into one array.
+#[test]
+fn test_jq_combinations_n_single_element_base_any_n_is_one_combination() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[combinations(5)] | length"], Some("[1]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1");
+    Ok(())
+}
+
+/// #1669: `checked_combinations_len` can return `Some(total)` (no overflow
+/// in the exponentiation itself -- `2^63` fits in a 64-bit `usize`) while
+/// the *subsequent* `results.try_reserve_exact(total)` still fails, since
+/// `total` elements at `size_of::<OwnedValue>()` bytes each overflows the
+/// allocator's own `isize::MAX`-byte ceiling well before `total` itself
+/// overflows `usize`. Deterministic and fast: the allocator's capacity
+/// check rejects this on arithmetic grounds alone, without attempting any
+/// real allocation.
+#[test]
+fn test_jq_combinations_n_reserve_exact_failure_after_pow_succeeds_does_not_abort_1669(
+) -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-c", "[1,2] | combinations(63) | length"], None)?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Cannot allocate 2^63"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1669 review: an earlier version of this fix guarded `n` alone (cheap:
+/// `n * size_of::<Vec<OwnedValue>>()`) before cloning `n` copies of
+/// `base_array` one at a time via ordinary, infallible `Vec::clone()` --
+/// so a *moderate* `n` combined with a *large* `base_array` passed that
+/// guard and then reached the allocator directly during the clone loop
+/// itself, the same abort class the guard was meant to prevent, just moved
+/// to a different axis. The fix now indexes `base_array` directly instead
+/// of cloning it `n` times, so `n=1,000,000` (a trivial `indices` guard on
+/// its own) combined with a 100,000-element `base_array` must still be
+/// refused up front, without ever touching the per-element cost that used
+/// to slip through here.
+#[test]
+fn test_jq_combinations_n_moderate_n_large_base_array_does_not_abort_1669() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            "[range(100000)] | combinations(1000000) | length",
+        ],
+        None,
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("Cannot allocate"), "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1669 review: `cartesian_product`'s only other coverage exercises the
+/// overflow-refusal path below (`try_reserve_product` failing before the
+/// loop body ever runs at all) -- this repo had no permanent test at any
+/// point covering bare `combinations`' actual multi-output success path
+/// (the mixed-radix increment's non-carrying branch specifically, hit
+/// whenever a combination isn't the last one for its innermost array),
+/// predating this PR's own change to the function's return type. Matches
+/// real jq's own documented example output for this exact input.
+#[test]
+fn test_jq_combinations_bare_multi_output_matches_real_jq() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[combinations]"], Some("[[1,2],[3,4]]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "[[1,3],[1,4],[2,3],[2,4]]");
+    Ok(())
+}
+
 /// #1669: `cartesian_product` (backing bare `combinations` on an array of
-/// arrays, and reached a second time by `combinations(n)` after its own
-/// `n`-sized guard above) grew its `results` via ordinary `Vec` push-growth
-/// with no upfront size check -- slower to trigger than the `n`-guard above
-/// since growth is incremental, but the identical missed guard. Five
-/// 100000-element arrays make the product overflow `usize` by the fourth
-/// factor, so this must fail fast rather than attempt to enumerate any of
-/// the 10^25 combinations.
+/// arrays -- `combinations(n)` above no longer calls it at all, computing
+/// its Cartesian *power* directly instead) grew its `results` via ordinary
+/// `Vec` push-growth with no upfront size check -- slower to trigger than
+/// an eagerly-sized allocation since growth is incremental, but the
+/// identical missed guard. Five 100000-element arrays make the product
+/// overflow `usize` by the fourth factor, so this must fail fast rather
+/// than attempt to enumerate any of the 10^25 combinations.
 #[test]
 fn test_jq_combinations_cartesian_product_length_overflow_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(

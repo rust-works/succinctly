@@ -703,6 +703,28 @@ pursued within this issue's scope. Either way, the guard converts a host-process
 a catchable error uniformly in both modes, with no cap-specific divergence to record in
 [yq Limitations](../yq/limitations.md).
 
+`combinations`/`combinations(n)` (#1669) have the identical shape a third time, at two
+independent sites: `builtin_combinations_n`'s own `n`-sized bookkeeping (an `n`-element
+`indices` array, guarded on `n` alone) and the actual combinatorial output size
+(`base_array.len().pow(n)` for `combinations(n)`, or the product of every input array's
+length for bare `combinations` on an array of arrays) — two genuinely different quantities,
+since a small `n` can still combine with a large base array to overflow only the second.
+Confirmed live before this fix: `[1] | combinations(288230376151711744)` aborted the
+process (SIGABRT), not a catchable error. succinctly now refuses with `Cannot allocate
+<base>^<n> elements for combinations` (the `combinations(n)` case) or the same `Cannot
+allocate <factors joined by " * "> elements for a computed-index expansion` message
+`try_reserve_product` already uses elsewhere (the bare `combinations` case), via the same
+`Vec::try_reserve_exact` technique as the cases above. Confirmed live against the pinned jq
+1.7.1 binary that jq itself does not error or crash on a comparably large query: both
+`combinations`/`combinations(n)` are true generators there, so `first(combinations(...))`
+returns immediately without ever materializing the full combinatorial explosion — the
+divergence is specifically that succinctly eagerly builds the whole result set rather than
+streaming it lazily, the same shape (not just the same *conclusion*) as the `.[$keys]`
+cross-product case above. Every combination count that fits in memory is still produced in
+full, so ordinary uses of both builtins are unaffected. This guard is symmetric across jq
+and yq mode (yq reaches it only behind `--jq-extensions`, per #1650), with no additional
+yq-specific cap to record in [yq Limitations](../yq/limitations.md).
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

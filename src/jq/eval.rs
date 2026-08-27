@@ -13647,6 +13647,27 @@ fn cannot_reserve_cross_product(factors: &[usize]) -> EvalError {
     ))
 }
 
+/// `base^n`, refusing rather than overflowing `usize` -- the actual output
+/// size `combinations(n)` must build, a different (and independently
+/// overflow-prone) quantity from `n` alone: a moderate `n` can still
+/// combine with a large `base` to overflow here even once `n` itself is
+/// known to be a safe count (#1669). `u32::try_from(n)` failing means `n`
+/// doesn't even fit a `u32` exponent, which -- for any `base >= 2` -- is
+/// already an astronomically certain overflow, so that's treated the same
+/// as `checked_pow` itself returning `None`.
+fn checked_combinations_len(base: usize, n: usize) -> Option<usize> {
+    if base <= 1 {
+        return Some(base); // 0^n stays 0 (unreached: caller requires a non-empty base), 1^n is always 1
+    }
+    base.checked_pow(u32::try_from(n).ok()?)
+}
+
+fn cannot_allocate_combinations(base: usize, n: usize) -> EvalError {
+    EvalError::new(format!(
+        "Cannot allocate {base}^{n} elements for combinations"
+    ))
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// jq compiles this as `K as $k | E | .[$k]`, and three consequences of that
@@ -30584,23 +30605,58 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    // Create n copies of the base array and compute Cartesian product. `n`
-    // alone drives this Vec's size (each clone is pushed one at a time
-    // rather than collected via a TrustedLen `map`, which is what let a
-    // huge `n` reach the allocator directly here before -- confirmed live,
-    // `[1] | combinations(288230376151711744)` aborted the process; #1669),
-    // so it needs its own guard independent of `cartesian_product`'s own.
-    let mut arrays: Vec<Vec<OwnedValue>> = match try_reserve_product(&[n]) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-    for _ in 0..n {
-        arrays.push(base_array.clone());
+    // Compute the n-fold Cartesian power of base_array directly against a
+    // shared reference, rather than the tempting `(0..n).map(|_|
+    // base_array.clone()).collect()` -- that route needs two independent
+    // guards of its own (n alone drove a huge outer Vec::<Vec<_>> straight
+    // to the allocator before this fix, confirmed live: `[1] |
+    // combinations(288230376151711744)` aborted the process; and even a
+    // guarded n could still pair with a large base_array to exhaust memory
+    // one real clone at a time, since neither guard bounds *that* product)
+    // where indexing into one shared `base_array` needs neither.
+    //
+    // Two independent quantities still need guarding here: `n` itself
+    // (`indices` below is n elements long) and `base_array.len().pow(n)`
+    // (the actual output size) -- a moderate n combined with a large
+    // base_array can overflow the second while trivially passing the
+    // first, so checking only one would still leave the other's crash
+    // reachable (#1669 review).
+    let mut indices: Vec<usize> = Vec::new();
+    if indices.try_reserve_exact(n).is_err() {
+        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     }
-    let results = match cartesian_product(&arrays) {
-        Ok(results) => results,
-        Err(e) => return QueryResult::Error(e),
+    indices.resize(n, 0);
+
+    let Some(total) = checked_combinations_len(base_array.len(), n) else {
+        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     };
+    let mut results = Vec::new();
+    if results.try_reserve_exact(total).is_err() {
+        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
+    }
+
+    loop {
+        let combination: Vec<OwnedValue> =
+            indices.iter().map(|&idx| base_array[idx].clone()).collect();
+        results.push(OwnedValue::Array(combination));
+
+        // Increment indices (like counting in mixed radix), same as
+        // cartesian_product's own loop below.
+        let mut carry = true;
+        for idx in indices.iter_mut().rev() {
+            if carry {
+                *idx += 1;
+                if *idx >= base_array.len() {
+                    *idx = 0;
+                } else {
+                    carry = false;
+                }
+            }
+        }
+        if carry {
+            break;
+        }
+    }
     QueryResult::ManyOwned(results)
 }
 
