@@ -533,8 +533,11 @@ otherwise already correct, and it can be reverted independently if the perf gate
   writing invalid UTF-8 to stdout, and the non-lazy path refused the file outright with
   `Failed to read file` when the read had in fact succeeded.
   **Not byte-identical even now, for this document-decode path specifically**: #1617's
-  own review found a separate, narrower jq quirk -- when an `InvalidContinuationByte`
-  error's rescanned byte lands at a string's *last* byte, real jq silently drops it
+  own review found a separate, narrower jq quirk -- jq's actual rule for
+  `InvalidContinuationByte` is `len - pos < seq_len` (not enough total bytes remain from
+  the lead byte's own position to satisfy the declared sequence length, whether the
+  buffer genuinely ends or an intervening byte is simply invalid); when that holds, jq
+  silently drops the *entire* remaining tail rather than keeping and rescanning it
   (`\xe1\x41` at a string's end -> `"�"` in jq, `"�A"` here, matching
   `String::from_utf8_lossy`'s own answer). Filed and later fixed *in the algorithm
   itself* as [#1717](https://github.com/rust-works/succinctly/issues/1717) -- likely an
@@ -542,9 +545,11 @@ otherwise already correct, and it can be reverted independently if the perf gate
   bug-for-bug per ADR-0018 rule 4. The fix reaches `@base64d`/`@urid` (#1719, whose own
   `input` is already scoped to one decoded string) but not this whole-document decode
   path: `utf8_lossy_document` substitutes the entire file's bytes in one pass before
-  JSON structure is parsed, so "last byte of `input`" essentially never coincides with
-  "last byte of one JSON string" the way it does for a base64/percent-decoded buffer --
-  the example above is still accurate post-#1717.
+  JSON structure is parsed, so jq's own per-string trigger point essentially never
+  coincides with "end of the whole buffer" the way it does for a base64/percent-decoded
+  buffer -- the example above is still accurate post-#1717, even though jq's own trigger
+  is not rare (it fires on any string ending in the right byte shape, however much more
+  content follows in the rest of the file).
 - Scope was document input only until #1719 also routed `@base64d`/`@urid`'s jq-mode
   output through this same `substitute_invalid_utf8_jq_style` call (for the
   overlong/surrogate/out-of-range case). At the time, this inherited the #1717 quirk
@@ -552,9 +557,14 @@ otherwise already correct, and it can be reverted independently if the perf gate
   identical wrong answer for #1717's specific shape before #1719 (byte-identical output
   pre/post, confirmed live). #1717's later fix changed that: `@base64d`/`@urid` now match
   jq exactly for this quirk too, since the function's own `input` is naturally scoped to
-  one decoded string already. `--raw-input` shares the jq path too (jq substitutes there
-  as well, at whole-file granularity like `utf8_lossy_document` -- unfixed, same
-  granularity mismatch); DSV input, `--arg`/`--argjson` and `--rawfile` remain untouched.
+  one decoded string already. `--raw-input` shares the jq path too, but real jq's own
+  `-R` (non-slurp) trigger is scoped *per line*, not per whole file (live-verified:
+  `printf 'a\xe1\x41\n' | jq -R '.'` drops the byte on a single-line file with an
+  ordinary trailing newline) -- `get_inputs` substitutes the whole raw buffer before
+  splitting into lines, so this is unfixed for a different, more tractable reason than
+  `utf8_lossy_document`'s genuine per-JSON-string granularity gap, tracked separately as
+  [#1742](https://github.com/rust-works/succinctly/issues/1742); DSV input,
+  `--arg`/`--argjson` and `--rawfile` remain untouched.
 - **`--validate` is excluded, and getting that wrong was a live regression** caught in
   review. The substitution originally ran at read time, before `validate_json_input`, so
   the strict validator was handed an already-repaired document: `sjq --validate` exited 0

@@ -205,18 +205,29 @@ and — since #1719 — for `@base64d`/`@urid`'s own invalid-UTF-8 output too, c
 structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+FFFD where
 `String::from_utf8_lossy`'s WHATWG rule gives one per byte.
 
-jq has a second, separate quirk here (#1717): when an `InvalidContinuationByte`'s
-rescanned byte lands at the buffer's *last* byte, and at least two continuation bytes are
-still missing (`shortfall = (sequence length - 1) - good continuation bytes >= 2`), real
-jq silently **drops** that byte instead of rescanning it as its own character. Fixed
-in `substitute_invalid_utf8_jq_style` itself, live-verified across every 2-/3-/4-byte
-lead shape that can reach shortfall 2+ (a 2-byte lead's only failure mode is shortfall 1,
-which jq always keeps — `\xc2\x41` -> `"\u{FFFD}A"`, matching WHATWG):
+jq has a second, separate quirk here (#1717): for `InvalidContinuationByte`, jq's actual
+rule is simply `len - pos < seq_len` — if `seq_len` bytes aren't all physically present
+from the lead byte's own position onward, jq collapses the *entire* remaining tail into
+one U+FFFD, **regardless of why** they're short (the buffer genuinely ends, or one of the
+bytes that *is* present fails the continuation check partway through). Only once
+`seq_len` bytes are actually present does jq validate each continuation byte and fall
+back to WHATWG-style rescan-at-the-bad-byte. An earlier version of this fix instead
+conditioned the drop on "the offending byte is `input`'s own last byte", which
+undercounts: `[0xF0, b'A', b'B']` (a 4-byte lead, one invalid continuation, *one* byte of
+headroom before end-of-input — so the offending byte is *not* `input`'s last byte) still
+collapses in real jq. Live-verified across every 2-/3-/4-byte lead shape and headroom
+amount up to 3 bytes (a 2-byte lead's headroom-0 case is its only failure mode at all —
+`\xc2\x41` -> `"\u{FFFD}A"`, kept, since `len - pos == seq_len` there), plus a 750-case
+differential sweep against varied lead/continuation/trailing combinations, all matching:
 
 ```bash
 $ printf '"4UE="' | jq -c '@base64d | explode'          # base64 "4UE=" decodes to [0xE1, 0x41]
 [65533]
 $ printf '"4UE="' | sjq -c '@base64d | explode'
+[65533]
+$ printf '"8EFC"' | jq -c '@base64d | explode'          # decodes to [0xF0, 0x41, 0x42] -- the
+[65533]                                                 # previously-missed, one-byte-headroom shape
+$ printf '"8EFC"' | sjq -c '@base64d | explode'
 [65533]
 ```
 
@@ -224,10 +235,14 @@ $ printf '"4UE="' | sjq -c '@base64d | explode'
 bytes** — `@base64d`/`@urid`, via `owned_string_from_decoded_bytes`
 ([src/jq/eval.rs](../../../src/jq/eval.rs)). It does *not* reach whole-document/whole-file
 callers (`jq_runner.rs`'s `utf8_lossy_document`/`get_inputs`), because those substitute
-an entire file's bytes in one pass before JSON structure is even parsed — real jq's
-per-string, closing-quote-relative notion of "last byte" has no equivalent there, so
-"last byte of `input`" almost never coincides with "last byte of one JSON string's
-content" the way it naturally does for a base64/percent-decoded buffer:
+an entire file's bytes in one pass before JSON structure is even parsed. Real jq's own
+trigger is scoped to *each JSON string's own closing quote* (document mode) or *each
+line* (`--raw-input`, confirmed live: `printf 'a\xe1\x41\n' | jq -R '.'` drops the byte
+even though the file's own trailing newline follows) — neither of which is "the whole
+buffer's own end" in a realistic multi-field document or multi-line file. jq's own
+trigger condition is not rare (it fires on *any* string/line ending in the right byte
+shape, however much more content follows elsewhere in the file); only succinctly's
+whole-buffer reproduction of it essentially never activates:
 
 ```bash
 $ printf '{"a":"\xe1\x41"}' | jq -c '.a'              # jq drops the 'A'
@@ -237,12 +252,14 @@ $ printf '{"a":"\xe1\x41"}' | sjq -c '.a'              # unfixed: still whole-do
 ```
 
 Reproducing this quirk for `.a`-style document access would need per-JSON-string
-substitution timing (or per-line, for `--raw-input`), not a whole-buffer pass before
-parsing — a bigger architectural change than this issue's own "Low severity, narrow
-trigger" framing anticipated, and not attempted here. Likely an off-by-one in jq's own
-end-of-buffer lookahead rather than a designed rule either way; per ADR-0018 rule 4 the
-correct resolution, where reached, is bug-for-bug replication rather than "fixing" the
-substitution into the more sensible WHATWG-consistent shape. See
+substitution timing — a bigger architectural change than this issue's own "Low severity,
+narrow trigger" framing anticipated, and not attempted here. `--raw-input`'s own gap is
+narrower and more tractable (a caller-side reorder: split into lines before
+substituting, instead of after — the algorithm itself needs no further change), tracked
+separately as [#1742](https://github.com/rust-works/succinctly/issues/1742). Likely an
+off-by-one in jq's own end-of-buffer lookahead rather than a designed rule either way;
+per ADR-0018 rule 4 the correct resolution, where reached, is bug-for-bug replication
+rather than "fixing" the substitution into the more sensible WHATWG-consistent shape. See
 [docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
 substitution-mechanism history and [#1717](https://github.com/rust-works/succinctly/issues/1717)
 for the document/raw-input granularity gap this leaves open.
