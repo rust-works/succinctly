@@ -215,11 +215,9 @@ Not an [extension](#extensions) for the `-j` spelling — real yq's arg parser d
 reference also accepts"), and none of [ADR-0018](../../adrs/adr-0018.md) rule 4's carve-outs
 apply either (the output is readable, nothing is corrupted or discarded, and no process
 dies). Taken alone, the long form `--join-output` *would* pass rule 5's token test — real yq
-has no such flag at all — but it is not documented as a separate extension here: `-j` and
-`--join-output` are two spellings of the one clap argument, sharing one implementation and
-one behaviour, so a user reaching this feature through the novel long spelling still holds a
-flag whose short alias collides with existing yq surface. The pair is recorded as a single
-open divergence rather than split into "one extension, one bug" by spelling. It's a plain,
+has no such flag at all — but `-j` and `--join-output` are two spellings of the one clap
+argument, sharing one implementation and behaviour, so the pair is recorded as a single open
+divergence here rather than split into "one extension, one bug" by spelling. It's a plain,
 unaddressed name collision: `succinctly yq`'s `-j`/`--join-output` implements jq-style "no
 separator, concatenate raw" output (apparently ported from `JqCommand`'s own legitimate
 `-j`, which does match real jq's `-j`). Real yq's own `-j` means something else entirely — a
@@ -241,8 +239,9 @@ way gets something unrelated instead. Long-standing (predates #1701, ported alon
 `JqCommand`'s own `-j`), found and recorded by
 [#1710](https://github.com/rust-works/succinctly/issues/1710) — a documentation-only fix
 (see [docs/guides/cli.md](../../guides/cli.md) for the matching caveat on the flag's own
-listing); remapping `-j` to real yq's actual `--tojson` meaning, which #1710 also raised, is
-a bigger, more disruptive change not attempted there. "`-0`/`--nul-output` multi-document
+listing). Remapping `-j` to real yq's actual `--tojson` meaning, which #1710 also raised, is
+a bigger, more disruptive change not attempted there — tracked separately as
+[#1731](https://github.com/rust-works/succinctly/issues/1731). "`-0`/`--nul-output` multi-document
 separator" above discusses this same flag from a different angle — why `-0`/`-j` output
 getting a newline-guarded `---` is a *permitted* rule-4(a) divergence, independent of the
 name-collision question here.
