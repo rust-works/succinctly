@@ -23680,11 +23680,12 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
     Ok(())
 }
 
-/// #1620: a decode failure must never be suppressed by `?`, matching how
-/// `try`/`catch` already never catches one -- real yq's equivalent is a
-/// parse-time rejection no program could ever catch either. `\q` is not a
-/// YAML escape, so the scalar is structurally valid but undecodable, same
-/// repro as `test_decode_failure_does_not_corrupt_json_output_1247` above.
+/// #1620: a decode failure must never be suppressed by `?` -- real yq's
+/// equivalent is a parse-time rejection no program could ever catch, since
+/// real yq has no `try`/`catch` construct at all to catch it with. `\q` is
+/// not a YAML escape, so the scalar is structurally valid but undecodable,
+/// same repro as `test_decode_failure_does_not_corrupt_json_output_1247`
+/// above.
 ///
 /// `.a?` (no downstream builtin) is deliberately not included: bare field
 /// access never decodes the string at all, so there is no decode failure for
