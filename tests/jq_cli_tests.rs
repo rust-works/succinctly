@@ -4044,23 +4044,28 @@ fn test_seq_malformed_record_with_rs_byte_does_not_warn_1525() -> Result<()> {
 }
 
 /// #1525: an RS-less file combined with an RS-containing one triggers no
-/// warning at all -- real jq treats the whole `--seq` input as one
-/// continuous stream, and the RS-containing file satisfies the "every
-/// record starts with an RS byte" requirement for the stream as a whole.
+/// warning at all when the RS-less file is *empty* -- real jq treats the
+/// whole `--seq` input as one continuous stream, and the RS-containing
+/// file satisfies the "every record starts with an RS byte" requirement
+/// for the stream as a whole. (A *non-empty* RS-less file paired with an
+/// RS-containing one still warns on real jq, with one of the other
+/// message templates #1723 tracks -- not this one; not exercised here.)
+///
+/// Spawns via `spawn_jq_full` (not a bare `Command::new(...).output()`)
+/// for its `ENOENT`-retry protection: other tests in this file rebuild
+/// the shared binary path concurrently (see `MAX_SPAWN_RETRIES`'s own
+/// doc comment, #550).
 #[test]
 fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<()> {
     let mut valid_file = NamedTempFile::new()?;
     writeln!(valid_file, "\u{1e}1")?;
-    let mut empty_file = NamedTempFile::new()?;
-    write!(empty_file, "")?;
+    let empty_file = NamedTempFile::new()?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(["--seq", "-c", "."])
-        .arg(valid_file.path())
-        .arg(empty_file.path())
-        .stdin(Stdio::null())
-        .output()?;
+    let valid_path = valid_file.path().to_str().unwrap();
+    let empty_path = empty_file.path().to_str().unwrap();
+    let mut cmd = spawn_jq_full(&["--seq", "-c", ".", valid_path, empty_path])?;
+    drop(cmd.stdin.take());
+    let output = cmd.wait_with_output()?;
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stderr)?, "");
@@ -4071,7 +4076,8 @@ fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<
 
 /// #1525: two RS-less files report a line/column computed from their
 /// *concatenation*, not either file's own content alone -- oracle-verified
-/// against the pinned jq 1.7.1 binary.
+/// against the pinned jq 1.7.1 binary. Spawns via `spawn_jq_full` for its
+/// `ENOENT`-retry protection, same reason as the test above.
 #[test]
 fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
     let mut file_a = NamedTempFile::new()?;
@@ -4079,18 +4085,101 @@ fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
     let mut file_b = NamedTempFile::new()?;
     write!(file_b, "cd")?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(["--seq", "-c", "."])
-        .arg(file_a.path())
-        .arg(file_b.path())
-        .stdin(Stdio::null())
-        .output()?;
+    let path_a = file_a.path().to_str().unwrap();
+    let path_b = file_b.path().to_str().unwrap();
+    let mut cmd = spawn_jq_full(&["--seq", "-c", ".", path_a, path_b])?;
+    drop(cmd.stdin.take());
+    let output = cmd.wait_with_output()?;
 
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stderr)?.trim(),
         "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 4"
+    );
+    Ok(())
+}
+
+/// #1525: the reported column counts *raw* bytes, before invalid UTF-8 is
+/// lossily substituted (#1617) -- each substituted byte becomes a 3-byte
+/// U+FFFD, which would overcount the column by 2 per substitution if the
+/// count ran on the substituted string instead. Oracle-verified.
+#[test]
+fn test_seq_no_rs_warning_column_counts_raw_bytes_not_substituted_1525() -> Result<()> {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"ab");
+    input.push(0xFF); // invalid UTF-8 lead byte -> substituted to 3-byte U+FFFD
+    input.extend_from_slice(b"cd");
+
+    let mut cmd = spawn_jq_full(&["--seq", "-c", "."])?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(&input)?;
+    }
+    let output = cmd.wait_with_output()?;
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr)?.trim(),
+        "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 5"
+    );
+    Ok(())
+}
+
+/// #1525: `--seq --input-dsv` combined must never fire the RS-byte
+/// warning -- DSV is a succinctly-only extension with no RFC 7464 records
+/// at all. The non-slurp streaming DSV path bypasses `get_inputs`
+/// entirely and was never at risk; `-s` routes through `get_inputs`
+/// instead, which is what the fix's `args.input_dsv.is_none()` guard
+/// covers.
+#[test]
+fn test_seq_dsv_combo_does_not_warn_1525() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "--input-dsv", ",", "-s", "-c", "."],
+        Some("a,b\n1,2\n"),
+    )
+    .unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    // `--seq` RS-prefixes output too (RFC 7464), same as real jq.
+    assert_eq!(stdout.trim(), "\u{1e}[[\"a\",\"b\"],[\"1\",\"2\"]]");
+    Ok(())
+}
+
+/// #1525: `-n --seq` combined with a filter that forces a real read
+/// (`inputs`) must not print the "ignoring parse error" warning -- real
+/// jq treats this same no-RS-byte condition as a *fatal* error there
+/// (exit 5), not a warning, and succinctly doesn't implement that fatal
+/// path yet (a separate, larger gap than this issue's own scope).
+/// Printing the warning's exact wording in this mode would misrepresent
+/// succinctly's still-unfixed non-fatal behavior as though it matched jq.
+#[test]
+fn test_seq_null_input_with_inputs_does_not_warn_1525() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "--seq", "-c", "[inputs]"], Some("1 2")).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    // `--seq` RS-prefixes output too (RFC 7464), same as real jq.
+    assert_eq!(stdout.trim(), "\u{1e}[]");
+    Ok(())
+}
+
+/// #1525: a leading UTF-8 BOM on the very first source is stripped before
+/// line/column counting, matching real jq. Oracle-verified.
+#[test]
+fn test_seq_no_rs_warning_strips_leading_bom_1525() -> Result<()> {
+    let mut input = Vec::new();
+    input.extend_from_slice(b"\xEF\xBB\xBF");
+    input.extend_from_slice(b"1 2");
+
+    let mut cmd = spawn_jq_full(&["--seq", "-c", "."])?;
+    if let Some(mut stdin) = cmd.stdin.take() {
+        stdin.write_all(&input)?;
+    }
+    let output = cmd.wait_with_output()?;
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr)?.trim(),
+        "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3"
     );
     Ok(())
 }

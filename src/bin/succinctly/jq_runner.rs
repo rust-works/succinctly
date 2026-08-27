@@ -1669,6 +1669,88 @@ fn get_inputs(
     // -- `-R`, `--seq` and DSV never do, and must not start now.
     let json_input_mode = args.input_dsv.is_none() && !args.raw_input && !args.seq;
 
+    // #1525: real jq warns on stderr when it drops a malformed --seq
+    // record; succinctly silently ignored malformed records entirely
+    // (RFC 7464's own recommended failure mode, #1243, still correct for
+    // *output*) with no diagnostic. This covers exactly one of jq's
+    // several message shapes: content with no RS byte anywhere at all.
+    // RFC 7464 requires every record to start with one, so jq's --seq
+    // reader never resyncs onto unprefixed content -- it reports the
+    // abandonment unconditionally the instant EOF arrives, regardless of
+    // what the content actually is, even fully valid JSON (oracle-
+    // verified: `printf 'null' | jq --seq '.'` still warns). A malformed
+    // record that *does* start with an RS byte gets one of several other
+    // jq message templates ("Unfinished string at EOF", "Unfinished JSON
+    // term at EOF", "Invalid numeric literal ... (need RS to resync)")
+    // depending on exactly how it's malformed -- and an RS-containing
+    // source combined with a *non-empty* RS-less one still warns with one
+    // of those other templates too, not silence (only the all-empty
+    // sub-case of that combination is handled below, oracle-verified: a
+    // non-empty RS-less file paired with an RS-containing one still gets
+    // one of the un-implemented templates). Matching any of that needs
+    // deeper investigation into jq's own incremental-parser error states
+    // and is intentionally out of scope here; tracked separately (#1723).
+    //
+    // Checked once across every source's *raw* bytes, before UTF-8
+    // substitution (#1617) can inflate the count real jq's own column
+    // arithmetic counts against -- an invalid byte becomes a 3-byte
+    // U+FFFD there, which would overcount the column by 2 for every
+    // substituted byte. `!args.raw_input` and `args.input_dsv.is_none()`
+    // both matter: `-R` takes over raw-text handling entirely (matching
+    // `slurp_eof_line` below's identical priority), and DSV content read
+    // via `-s`/`-n 'inputs'` (the only way DSV input reaches this
+    // function -- non-slurp DSV has its own streaming path that bypasses
+    // `get_inputs` entirely) never contains RFC 7464 records at all, so
+    // neither combination should ever trigger this. `!args.null_input`
+    // also matters: under `-n` combined with a filter that forces a real
+    // read (`force_read_under_null_input`, the only way this function is
+    // even reached with `args.null_input` true), real jq treats this same
+    // condition as a *fatal* error (exit 5), not a warning -- printing the
+    // softer "ignoring parse error" wording there would misrepresent
+    // succinctly's still-unfixed non-fatal behavior as though it now
+    // matched jq; left silent instead until that's fixed properly.
+    //
+    // Real jq treats the whole `--seq` input -- single file, multiple
+    // files, `-s` or not -- as one continuous byte stream for this check:
+    // an RS-less short file combined with an RS-containing one triggers no
+    // warning at all when the RS-less file is empty (a non-empty one still
+    // warns, per above), and two RS-less files together report a
+    // line/column computed from their *concatenation*, not either file's
+    // own content alone (oracle-verified). A leading UTF-8 BOM on the very
+    // first source is stripped before counting, matching real jq
+    // (oracle-verified: `printf '\xef\xbb\xbf1 2' | jq --seq '.'` reports
+    // column 3, not 6).
+    if args.seq
+        && !args.raw_input
+        && args.input_dsv.is_none()
+        && !args.null_input
+        && !raw_bytes.iter().any(|(_, raw)| raw.contains(&0x1E))
+    {
+        const BOM: &[u8] = b"\xEF\xBB\xBF";
+        let mut line = 1usize;
+        let mut column = 0usize;
+        let mut first_source = true;
+        for (_, raw) in &raw_bytes {
+            let bytes = if first_source && raw.starts_with(BOM) {
+                &raw[BOM.len()..]
+            } else {
+                raw.as_slice()
+            };
+            first_source = false;
+            for &b in bytes {
+                if b == b'\n' {
+                    line += 1;
+                    column = 0;
+                } else {
+                    column += 1;
+                }
+            }
+        }
+        eprintln!(
+            "jq: ignoring parse error: Unfinished abandoned text at EOF at line {line}, column {column}"
+        );
+    }
+
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
     let mut raw_inputs: Vec<(Option<usize>, String)> = Vec::with_capacity(raw_bytes.len());
@@ -1701,44 +1783,6 @@ fn get_inputs(
             }
         };
         raw_inputs.push((file_idx, raw));
-    }
-
-    // #1525: real jq warns on stderr when it drops a malformed --seq
-    // record; succinctly silently ignored malformed records entirely
-    // (RFC 7464's own recommended failure mode, #1243, still correct for
-    // *output*) with no diagnostic. This covers exactly one of jq's
-    // several message shapes: content with no RS byte anywhere at all.
-    // RFC 7464 requires every record to start with one, so jq's --seq
-    // reader never resyncs onto unprefixed content -- it reports the
-    // abandonment unconditionally the instant EOF arrives, regardless of
-    // what the content actually is, even fully valid JSON (oracle-
-    // verified: `printf 'null' | jq --seq '.'` still warns). A malformed
-    // record that *does* start with an RS byte gets one of several other
-    // jq message templates ("Unfinished string at EOF", "Unfinished JSON
-    // term at EOF", "Invalid numeric literal ... (need RS to resync)")
-    // depending on exactly how it's malformed -- matching those needs
-    // deeper investigation into jq's own incremental-parser error states
-    // and is intentionally out of scope here; tracked separately (#1723).
-    //
-    // Checked once across every source concatenated, not per file: `-R`
-    // takes over entirely from `--seq` for raw-text mode (`!args.raw_input`
-    // matches the same priority `slurp_eof_line` below already gives it),
-    // and real jq treats the whole `--seq` input -- single file, multiple
-    // files, `-s` or not -- as one continuous byte stream for this check.
-    // Oracle-verified: an RS-less short file combined with an RS-containing
-    // one triggers no warning at all, and two RS-less files together report
-    // a line/column computed from their *concatenation*, not either file's
-    // own content alone.
-    if args.seq && !args.raw_input && !raw_inputs.iter().any(|(_, raw)| raw.contains('\u{1E}')) {
-        let mut combined = String::new();
-        for (_, raw) in &raw_inputs {
-            combined.push_str(raw);
-        }
-        let line = 1 + combined.matches('\n').count();
-        let column = combined.rsplit('\n').next().unwrap_or("").len();
-        eprintln!(
-            "jq: ignoring parse error: Unfinished abandoned text at EOF at line {line}, column {column}"
-        );
     }
 
     let mut locations = InputLocations::new(
