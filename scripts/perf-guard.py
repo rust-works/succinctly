@@ -30,6 +30,13 @@ one set of counts per arch, not one shared set):
         prevent). `--arch` must match one of ci.yml's `perf-guard` matrix
         names (currently `x86_64`, `ARM64-Linux`) for the CI job to find it.
 
+`--check` also accepts `--baseline-binary PATH` in place of the default
+`--baseline FILE`: instead of comparing against the checked-in JSON, it
+measures a second binary (also generated fresh, same as `--binary`) and
+compares against that (issue #1582). ci.yml's `perf-guard` job uses this on
+`pull_request` runs, building `--baseline-binary` from the PR's own
+`git merge-base` -- see "Why a baseline binary, not just the file" below.
+
 The query/shape matrix is #1523's own "minimum viable set": #1514's two
 regressions were complementary and each was invisible to the other's own
 signal (one showed only in a `wide`-shaped `keys_unsorted` query, the other
@@ -58,6 +65,18 @@ oversights -- worth revisiting once this guard has a track record:
   or `src/bits/popcount.rs`'s explicit intrinsics is invisible here, the same
   split `bench`'s own default/simd/portable-popcount 3-way matrix exists to
   separate for `rank_select`.
+- The committed `--baseline` file is a *fallback* used only for non-PR runs
+  (a direct push to `main`) and carries a real staleness risk: at this
+  project's merge cadence, `Ir` drifts 1-3% across every query within days
+  from ordinary accumulated changes alone (measured directly: baseline
+  source commit vs. `main` 3 days/147 commits later, 55 of them touching
+  `eval.rs`/`json`/`yaml`). This is *not* a `codegen-units=16` artifact --
+  pinning `codegen-units=1` on both sides of that same comparison left the
+  drift the same size or larger, so #1587's fix for a similar-looking
+  wall-clock/icache issue does not apply here. It is why `--baseline-binary`
+  exists: a same-run comparison against the PR's own merge-base cancels
+  staleness from any cause, instead of trying to keep a checked-in file
+  fresh against a fast-moving `main`.
 
 Standard library only; no third-party dependencies.
 """
@@ -127,8 +146,15 @@ def parse_args(argv=None):
         epilog=EPILOG,
     )
     p.add_argument("--binary", required=True, help="path to the succinctly binary (release build)")
-    p.add_argument("--baseline", default="tests/data/perf-guard-baseline.json",
+    baseline_source = p.add_mutually_exclusive_group()
+    baseline_source.add_argument("--baseline", default="tests/data/perf-guard-baseline.json",
                     help="path to the checked-in baseline file")
+    baseline_source.add_argument("--baseline-binary", default=None,
+                    help="path to a second built binary (e.g. the PR's git merge-base) to "
+                         "measure and compare against instead of --baseline -- cancels drift "
+                         "from any cause shared by both binaries (staleness, codegen shift, "
+                         "toolchain version), since both are built the same way in the same "
+                         "run. Only valid with --check (issue #1582).")
     p.add_argument("--arch", required=True,
                     help="baseline key for this run, e.g. x86_64/ARM64-Linux -- instruction "
                          "counts are architecture-specific (different ISA, different codegen), "
@@ -206,11 +232,13 @@ def measure_query(valgrind_bin, binary, mode, filter_expr, fixture_path, reps):
     return round(statistics.median(counts))
 
 
-def measure_all(binary, valgrind_bin, reps):
+def measure_all(binary, valgrind_bin, reps, label="binary"):
     """Generate each distinct (pattern, size) fixture exactly once -- several
     `QUERIES` rows share one, and regenerating an identical file per row
     would be pure waste -- then measure every query against its fixture.
-    Returns {query_id: median instruction count}."""
+    Returns {query_id: median instruction count}. `label` only affects the
+    printed header, distinguishing this run's output in CI logs when
+    `measure_all` is called twice (current binary, then --baseline-binary)."""
     with tempfile.TemporaryDirectory() as tmp:
         fixture_paths = {}
         for _, pattern, size, _, _ in QUERIES:
@@ -226,6 +254,7 @@ def measure_all(binary, valgrind_bin, reps):
                 fixture_paths[shape] = path
 
         measured = {}
+        print(f"Measuring {label} ({binary}):")
         print(f"{'query':<26} {'instructions':>16}")
         print("-" * 44)
         for query_id, pattern, size, mode, filter_expr in QUERIES:
@@ -270,15 +299,28 @@ def main(argv=None):
     if not os.access(args.binary, os.X_OK):
         sys.exit(f"binary is not executable: {args.binary} (lost its execute bit in transit?)")
 
+    if args.baseline_binary and args.update_baseline:
+        sys.exit("--baseline-binary is only valid with --check -- there's nothing to update "
+                 "a checked-in baseline *from* a transient second binary.")
+    if args.baseline_binary:
+        if not os.path.exists(args.baseline_binary):
+            sys.exit(f"baseline binary not found: {args.baseline_binary}")
+        if not os.access(args.baseline_binary, os.X_OK):
+            sys.exit(f"baseline binary is not executable: {args.baseline_binary} (lost its "
+                     f"execute bit in transit?)")
+
     # Fail fast on a missing/incomplete baseline before running any of the
     # (expensive, cachegrind-instrumented) measurements below. Instruction
     # counts are architecture-specific (different ISA, different codegen),
     # so the baseline file is keyed by `--arch` -- x86_64's counts are not a
-    # valid baseline for ARM64-Linux's run or vice versa.
-    baseline_file = load_baseline_file(args.baseline)
+    # valid baseline for ARM64-Linux's run or vice versa. None of this
+    # applies when `--baseline-binary` is given: `measure_all` below always
+    # returns exactly `known_ids`, so there's no file to be stale/incomplete.
+    baseline_file = {}
     baseline = {}
     known_ids = {q[0] for q in QUERIES}
-    if args.check:
+    if args.check and not args.baseline_binary:
+        baseline_file = load_baseline_file(args.baseline)
         baseline = baseline_file.get(args.arch, {})
         missing = known_ids - set(baseline)
         if missing:
@@ -287,13 +329,22 @@ def main(argv=None):
                 f"-- run with --update-baseline first (and commit the result)."
             )
 
-    measured = measure_all(args.binary, args.valgrind_bin, args.reps)
+    measured = measure_all(args.binary, args.valgrind_bin, args.reps, label="current binary")
 
     if args.update_baseline:
         baseline_file[args.arch] = measured
         save_baseline_file(args.baseline, baseline_file)
         print(f"Wrote {len(measured)} entries for arch {args.arch!r} to {args.baseline}")
         return 0
+
+    if args.baseline_binary:
+        # A same-run comparison against the PR's own merge-base: whatever
+        # staleness the checked-in file would carry (real accumulated drift,
+        # codegen shift, toolchain version) is shared by both binaries here
+        # and cancels out, leaving only what this binary's diff changed
+        # (issue #1582).
+        baseline = measure_all(args.baseline_binary, args.valgrind_bin, args.reps,
+                                label="baseline binary")
 
     stale = set(baseline) - known_ids
     if stale:
