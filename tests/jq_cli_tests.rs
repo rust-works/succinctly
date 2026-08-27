@@ -16998,20 +16998,72 @@ fn test_jq_wellformed_documents_unaffected_by_1643() -> Result<()> {
     Ok(())
 }
 
-/// #1643: known, documented gap -- a trailing/leading comma next to a
-/// bracket (rather than between two real children) is not yet caught.
-/// Catching it needs the *closing* bracket's text position, which has no
-/// cheap lookup today (IB only marks opening positions); see
-/// `preceding_gap_ok`'s doc comment in `jq_runner.rs` for why. Pinned here
-/// so a future fix for this class updates this test rather than being
-/// silently covered by a coincidence.
+/// #1676: #1643's own deferred trailing/leading-comma gap is now caught --
+/// a `,`/`:` next to a bracket (rather than between two real children),
+/// whether after the last real child (`{"a":1,}`, `[1,2,]`) or inside an
+/// apparently-empty container (`{,}`, `[,]`). Was previously silently
+/// accepted (exit 0, comma dropped); see `trailing_gap_ok`'s doc comment in
+/// `jq_runner.rs` for the scoped fix. Verified against `/usr/bin/jq` 1.7.1,
+/// which rejects every one of these at exit 5.
 #[test]
-fn test_jq_trailing_leading_comma_still_a_known_gap_1643() -> Result<()> {
+fn test_jq_trailing_leading_comma_now_rejected_1676() -> Result<()> {
+    for input in [
+        r#"{"a":1,}"#,
+        "[1,2,]",
+        "{,}",
+        "[,]",
+        r#"{"a":1, "b":2,}"#,
+        "{  ,  }",
+        "[  ,  ]",
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    // Same check, but the trailing comma is on a *nested* array, one level
+    // inside an otherwise well-formed root object/array. Not held to the
+    // no-partial-output guarantee above: that guarantee is specific to the
+    // *root* value's own container arm validating before writing its own
+    // opening bracket (`test_jq_malformed_object_leaves_no_partial_output_
+    // 1194`) -- a nested child's own malformation is only discovered when
+    // the recursive `print_json` call reaches it, by which point the
+    // well-formed root prefix (`{"a":`) is already on stdout. Pre-existing
+    // for every other malformed-nested-child case too (verified against
+    // e.g. `{"a":[1 2]}`'s own missing-comma error), not something this fix
+    // introduces.
+    for input in [r#"{"a":[1,2,]}"#, "[[1,2,]]"] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1676's own remaining, deliberately deferred gap: a trailing comma right
+/// before a container's closing bracket is only caught when the last real
+/// child is a scalar or the container is empty -- catching it when the last
+/// child is *itself* a container would need that child's own closing
+/// bracket's text position, the same O(subtree) lookup `preceding_gap_ok`'s
+/// doc comment already explains is too expensive to pay unconditionally.
+/// Pinned here, same discipline as #1643's own now-fixed gap test above, so
+/// a future fix for *this* narrower residual updates this test rather than
+/// silently landing uncovered. Real jq rejects both (confirmed live against
+/// `/usr/bin/jq` 1.7.1): `{"a":[1,2],}` and `[[1,2],]` are both parse
+/// errors there.
+#[test]
+fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() -> Result<()> {
     for (input, expected) in [
-        (r#"{"a":1,}"#, r#"{"a":1}"#),
-        ("[1,2,]", "[1,2]"),
-        ("{,}", "{}"),
-        ("[,]", "[]"),
+        (r#"{"a":[1,2],}"#, r#"{"a":[1,2]}"#),
+        ("[[1,2],]", "[[1,2]]"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
@@ -17042,6 +17094,44 @@ fn test_jq_missing_delimiter_raises_under_sort_keys_color_and_slurp_1643() -> Re
             stderr.contains("Invalid JSON text"),
             "{args:?}: stderr: {stderr:?}"
         );
+    }
+
+    Ok(())
+}
+
+/// #1676, same shape as the missing-delimiter test above: on the
+/// `-S`/`-C`/`--slurp` fallback path, `serde_json`'s own strict pass
+/// already rejects a trailing/leading comma outright (`parse_json_stream`
+/// only ever reaches `json_bytes_to_owned_value_checked` after that strict
+/// pass has *failed*) -- so unlike the default path, this one was never
+/// silently accepting these inputs. What was missing is `validate_json_
+/// delimiters`'s own trailing/empty-gap check, which the lenient re-scan
+/// this path falls back to (`find_json_values`) needs independently: that
+/// scanner finds `{"a":1,}` as one balanced span regardless of the comma,
+/// and before this fix nothing downstream re-validated it. Confirmed by
+/// building pre-fix and observing exit 0 here.
+#[test]
+fn test_jq_trailing_comma_raises_under_sort_keys_color_and_slurp_1676() -> Result<()> {
+    for args in [
+        vec!["-S", "."],
+        vec!["-C", "-c", "."],
+        vec!["-c", "--slurp", "."],
+    ] {
+        for input in [r#"{"a":1,}"#, "[1,2,]", "{,}", "[,]"] {
+            let (out, stderr, code) = run_jq_full(&args, Some(input))?;
+            assert_eq!(
+                code, 5,
+                "{args:?} {input}: out: {out:?}, stderr: {stderr:?}"
+            );
+            assert!(
+                out.trim().is_empty(),
+                "{args:?} {input}: unexpected output {out:?}"
+            );
+            assert!(
+                stderr.contains("Invalid JSON text"),
+                "{args:?} {input}: stderr: {stderr:?}"
+            );
+        }
     }
 
     Ok(())

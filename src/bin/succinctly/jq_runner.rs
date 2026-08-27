@@ -3764,6 +3764,59 @@ fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -> bo
     found == expected
 }
 
+/// Forward-scan mirror of [`preceding_gap_ok`], used to catch the trailing
+/// half of #1643's own deferred gap (#1676): a `,`/`:` sitting between a
+/// container's last real child and its closing bracket (`{"a":1,}`,
+/// `[1,2,]`), or inside an apparently-empty container (`{,}`, `[,]`).
+///
+/// Scans *forward* from `start` -- a position every caller here obtains
+/// cheaply (a scalar child's own `text_range().1`, or `open_pos + 1` for a
+/// genuinely empty container) -- exactly as bounded as `preceding_gap_ok`'s
+/// backward scan: it stops the instant it reaches real content, so its cost
+/// is the size of the gap itself, never the container's remaining text.
+///
+/// Returns the position of the first non-whitespace, non-delimiter byte on
+/// success (so the caller can confirm it's the expected closing bracket),
+/// or `None` if the gap holds a doubled delimiter or one that doesn't match
+/// `expected`.
+fn following_gap_ok(text: &[u8], start: usize, expected: Option<u8>) -> Option<usize> {
+    let mut i = start;
+    let mut found = None;
+    while i < text.len() {
+        match text[i] {
+            b @ (b',' | b':') => {
+                if found.is_some() {
+                    return None; // doubled delimiter
+                }
+                found = Some(b);
+                i += 1;
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => break, // reached real content -- a value, or the closing bracket
+        }
+    }
+    (found == expected).then_some(i)
+}
+
+/// Whether a container closes cleanly once its last real child's own text
+/// has ended at `gap_start` (or `gap_start` is `open_pos + 1`, for a
+/// genuinely empty container): no trailing `,`/`:` before the matching
+/// closing bracket (#1676).
+///
+/// Deliberately narrower than a complete fix: `gap_start` must already be
+/// known cheaply. Callers only have that when the last child is a scalar
+/// (its `text_range()` is a bounded, self-delimiting scan, not the
+/// O(subtree) walk `JsonCursor::text_range`'s own comment describes for a
+/// container) or when the container is empty. When the last child is
+/// itself a container, finding *its* closing bracket costs exactly what
+/// this function's sibling `preceding_gap_ok` was written to avoid, so
+/// callers skip this check in that case rather than pay for it -- the same
+/// "tracked as a follow-up, not folded in here" trade #1643 already made,
+/// narrowed by one more case rather than eliminated.
+fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
+    matches!(following_gap_ok(text, gap_start, None), Some(pos) if text.get(pos) == Some(&close_char))
+}
+
 /// Array-element wrapper around [`preceding_gap_ok`]: element `index` (0-
 /// based) must be preceded by `,`, except the first, which must be
 /// preceded by nothing (#1643).
@@ -3828,7 +3881,11 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
     assert_nesting_depth(depth);
     match cursor.value() {
         StandardJson::Array(elements) => {
+            let mut saw_any = false;
+            let mut last_is_container = false;
+            let mut last_gap_end = None;
             for (i, child) in elements.cursor_iter().enumerate() {
+                saw_any = true;
                 if let Some(start) = child.text_position() {
                     let expected = if i == 0 { None } else { Some(b',') };
                     if !preceding_gap_ok(child.text(), start, expected) {
@@ -3836,11 +3893,41 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                     }
                 }
                 validate_json_delimiters(&child, depth + 1)?;
+                match child.value() {
+                    StandardJson::Array(_) | StandardJson::Object(_) => {
+                        last_is_container = true;
+                        last_gap_end = None;
+                    }
+                    _ => {
+                        last_is_container = false;
+                        last_gap_end = child.text_range().map(|(_, end)| end);
+                    }
+                }
+            }
+            // #1676: trailing `,` (`[1,2,]`) or a stray `,` in an
+            // apparently-empty array (`[,]`) -- see `trailing_gap_ok`'s
+            // own doc comment for why this is skipped when the last
+            // element is itself a container.
+            if !last_is_container {
+                if let Some(open_pos) = cursor.text_position() {
+                    let gap_start = if saw_any {
+                        last_gap_end
+                    } else {
+                        Some(open_pos + 1)
+                    };
+                    if let Some(gap_start) = gap_start {
+                        if !trailing_gap_ok(cursor.text(), gap_start, b']') {
+                            return Err(EvalError::malformed_json_text(cursor.text()));
+                        }
+                    }
+                }
             }
         }
         StandardJson::Object(fields) => {
             let mut remaining = fields;
             let mut field_index = 0usize;
+            let mut last_is_container = false;
+            let mut last_gap_end = None;
             while let Some((field, rest)) = remaining.uncons() {
                 let StandardJson::String(k) = field.key() else {
                     return Err(EvalError::malformed_json_text(cursor.text()));
@@ -3855,11 +3942,37 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                     }
                 }
                 validate_json_delimiters(&value_cursor, depth + 1)?;
+                match value_cursor.value() {
+                    StandardJson::Array(_) | StandardJson::Object(_) => {
+                        last_is_container = true;
+                        last_gap_end = None;
+                    }
+                    _ => {
+                        last_is_container = false;
+                        last_gap_end = value_cursor.text_range().map(|(_, end)| end);
+                    }
+                }
                 remaining = rest;
                 field_index += 1;
             }
             if remaining.ends_unpaired() {
                 return Err(EvalError::malformed_json_text(cursor.text()));
+            }
+            // #1676: same trailing/empty-gap check as the array arm above,
+            // applied to the last field's *value*.
+            if !last_is_container {
+                if let Some(open_pos) = cursor.text_position() {
+                    let gap_start = if field_index > 0 {
+                        last_gap_end
+                    } else {
+                        Some(open_pos + 1)
+                    };
+                    if let Some(gap_start) = gap_start {
+                        if !trailing_gap_ok(cursor.text(), gap_start, b'}') {
+                            return Err(EvalError::malformed_json_text(cursor.text()));
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -3975,8 +4088,12 @@ where
             use succinctly::json::light::StandardJson;
             // #1643: reuse the caller's `text_position()` lookup when it
             // handed one in, instead of `value()` redoing it -- see
-            // `known_text_pos`'s own doc comment above.
-            let resolved = match known_text_pos.or_else(|| c.text_position()) {
+            // `known_text_pos`'s own doc comment above. Kept as its own
+            // binding (rather than only inside the `Some` arm below) so the
+            // container arms further down can reuse it for #1676's
+            // trailing/empty-gap check without a second rank/select call.
+            let container_pos = known_text_pos.or_else(|| c.text_position());
+            let resolved = match container_pos {
                 Some(text_pos) => c.value_at(text_pos),
                 None => StandardJson::Error("invalid cursor position"),
             };
@@ -4013,6 +4130,17 @@ where
                 }
                 StandardJson::Array(elements) => {
                     if elements.is_empty() {
+                        // #1676: a stray `,`/`:` inside an apparently-empty
+                        // array (`[,]`) -- cheap since there's no subtree
+                        // to scan, just the gap between `[` and `]`.
+                        if let Some(open_pos) = container_pos {
+                            if !trailing_gap_ok(c.text(), open_pos + 1, b']') {
+                                return Err(MalformedJsonError(EvalError::malformed_json_text(
+                                    c.text(),
+                                ))
+                                .into());
+                            }
+                        }
                         out.write_all(b"[]")?;
                     } else {
                         // #1643: validate every element's preceding
@@ -4052,10 +4180,37 @@ where
                             index: c.index(),
                         };
                         let base = array_scratch.len();
+                        // #1676: tracks the last element's own end position
+                        // (cheap for a scalar; skipped for a container --
+                        // see `trailing_gap_ok`'s own doc comment) so a
+                        // trailing `,` before `]` (`[1,2,]`) can be caught
+                        // below, before anything is written.
+                        let mut last_is_container = false;
+                        let mut last_gap_end = None;
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
                             let pos = check_preceding_delimiter(&child_cursor, i)?;
                             array_scratch
                                 .push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
+                            match child_cursor.value() {
+                                StandardJson::Array(_) | StandardJson::Object(_) => {
+                                    last_is_container = true;
+                                    last_gap_end = None;
+                                }
+                                _ => {
+                                    last_is_container = false;
+                                    last_gap_end = child_cursor.text_range().map(|(_, end)| end);
+                                }
+                            }
+                        }
+                        if !last_is_container {
+                            if let Some(gap_start) = last_gap_end {
+                                if !trailing_gap_ok(c.text(), gap_start, b']') {
+                                    return Err(MalformedJsonError(
+                                        EvalError::malformed_json_text(c.text()),
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                         if compact {
                             out.write_all(b"[")?;
@@ -4112,6 +4267,17 @@ where
                 }
                 StandardJson::Object(fields) => {
                     if fields.is_empty() {
+                        // #1676: a stray `,`/`:` inside an apparently-empty
+                        // object (`{,}`) -- same reasoning as the array
+                        // arm's own empty-case check above.
+                        if let Some(open_pos) = container_pos {
+                            if !trailing_gap_ok(c.text(), open_pos + 1, b'}') {
+                                return Err(MalformedJsonError(EvalError::malformed_json_text(
+                                    c.text(),
+                                ))
+                                .into());
+                            }
+                        }
                         out.write_all(b"{}")?;
                     } else {
                         // #1385: jq collapses a repeated key to its first
@@ -4160,6 +4326,10 @@ where
                         // walk, just keeping its own tail.
                         let mut remaining = fields;
                         let mut field_index = 0usize;
+                        // #1676: mirrors the array arm's own tracking, for
+                        // the last field's *value* rather than an element.
+                        let mut last_is_container = false;
+                        let mut last_gap_end = None;
                         while let Some((field, rest)) = remaining.uncons() {
                             // The `_` arm is *not* unreachable, whatever this
                             // comment used to claim: nothing enforces the JSON
@@ -4205,6 +4375,19 @@ where
                                     .into());
                                 }
                             }
+                            // #1676: same last-child tracking as the array
+                            // arm, applied to this field's value.
+                            match field.value_cursor().value() {
+                                StandardJson::Array(_) | StandardJson::Object(_) => {
+                                    last_is_container = true;
+                                    last_gap_end = None;
+                                }
+                                _ => {
+                                    last_is_container = false;
+                                    last_gap_end =
+                                        field.value_cursor().text_range().map(|(_, end)| end);
+                                }
+                            }
                             let (raw, escaped) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
@@ -4233,6 +4416,17 @@ where
                                 frame.text,
                             ))
                             .into());
+                        }
+                        if !last_is_container {
+                            if let Some(gap_start) = last_gap_end {
+                                if !trailing_gap_ok(frame.text, gap_start, b'}') {
+                                    scratch.truncate(base);
+                                    return Err(MalformedJsonError(
+                                        EvalError::malformed_json_text(frame.text),
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                         let collapsed = if config.jq_compat {
                             collapse_duplicate_fields(&scratch[base..], &frame)
