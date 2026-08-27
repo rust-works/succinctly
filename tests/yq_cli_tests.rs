@@ -20382,12 +20382,13 @@ fn test_jq_base64d_invalid_trailing_byte_uses_invalid_data_message_1146() -> Res
 ///
 /// "null" decodes to `[0x9E, 0xE9, 0x65]`: a stray continuation byte (one
 /// U+FFFD on its own), then a 3-byte lead (0xE9) whose sole continuation
-/// candidate (0x65, `'e'`) is both invalid *and* the buffer's last byte --
-/// exactly #1717's shortfall-2-at-end shape. `base64_decode_lossy`
-/// (WHATWG) does not model that drop and so no longer matches this
-/// call's own asserted value below; the literal replaces it, matching
-/// jq 1.7.1 exactly (`printf '"null"' | jq -j '@base64d'` ->
-/// two U+FFFD, no trailing `e`, confirmed live).
+/// candidate (0x65, `'e'`) is both invalid and the buffer's last byte --
+/// `len - pos == 2 < seq_len == 3`, exactly #1717's drop-the-whole-tail
+/// shape. `base64_decode_lossy` (WHATWG) does not model that drop and so
+/// no longer matches this call's own asserted value below; the literal
+/// replaces it, matching jq 1.7.1 exactly
+/// (`printf '"null"' | jq -j '@base64d'` -> two U+FFFD, no trailing `e`,
+/// confirmed live).
 #[test]
 fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"null\"", &[])?;
@@ -20398,22 +20399,45 @@ fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
 
 /// #1717, reached via `@base64d`. Base64 "4UE=" decodes to raw bytes
 /// `[0xE1, 0x41]`: a 3-byte lead followed by an invalid continuation byte
-/// ('A') at the string's last byte -- shortfall 2, at end. Real jq 1.7.1
-/// drops that trailing byte entirely
+/// ('A'), with no bytes at all remaining after it -- `len - pos == 2 <
+/// seq_len == 3`. Real jq 1.7.1 drops that trailing byte entirely
 /// (`echo '"4UE="' | jq -c '@base64d|explode'` -> `[65533]`), and
 /// `succinctly` now matches exactly, via `owned_string_from_decoded_bytes`
 /// (`src/jq/eval.rs`) calling the fixed `substitute_invalid_utf8_jq_style`
 /// (`src/text/utf8/mod.rs`). Document/raw-input decode
 /// (`jq_runner.rs`'s `utf8_lossy_document`/`get_inputs`) does *not* gain
-/// this fix -- it substitutes a whole file/document buffer at once, so
-/// "last byte of input" almost never coincides with "last byte of one
-/// JSON string's own content" the way it naturally does here, where
-/// `input` already *is* one decoded string's bytes. See
-/// docs/compliance/jq/limitations.md § "An open gap in jq's own UTF-8
-/// replacement-character substitution" for the granularity distinction.
+/// this fix -- it substitutes a whole file/document buffer at once,
+/// before real jq's own per-string (document mode) or per-line
+/// (`--raw-input`) trigger point ever applies, so "last byte of input"
+/// almost never coincides with jq's own trigger the way it naturally
+/// does here, where `input` already *is* one decoded string's bytes
+/// (jq's own trigger is not rare -- it fires on any string/line ending
+/// in the right byte shape, however much more content follows; only
+/// succinctly's whole-buffer reproduction of it is). See #1742 for the
+/// separate, more tractable raw-input caller-ordering gap, and
+/// docs/compliance/jq/limitations.md's "fixed at function granularity,
+/// open at document granularity" section for the full detail.
 #[test]
 fn test_jq_base64d_drops_trailing_byte_quirk_fixed_1717() -> Result<()> {
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"4UE=\"", &["-c"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[65533]");
+    Ok(())
+}
+
+/// #1717's actual rule is `len - pos < seq_len` (not enough total bytes
+/// present for the declared sequence length), not "the offending byte is
+/// `input`'s own last byte" -- an earlier, narrower version of the fix
+/// used the latter and missed this exact shape. Base64 "8EFC" decodes to
+/// `[0xF0, 0x41, 0x42]`: a 4-byte lead, an invalid continuation ('A'),
+/// and *one* trailing byte ('B') -- so the invalid byte itself is not
+/// `input`'s last byte, yet real jq still collapses the whole tail
+/// (`printf '"8EFC"' | jq -c '@base64d | explode'` -> `[65533]`, dropping
+/// both 'A' and 'B'). Found by code review via a 1200-case differential
+/// sweep against jq 1.7.1; independently re-verified live before fixing.
+#[test]
+fn test_jq_base64d_drops_whole_tail_when_one_byte_short_of_seq_len_1717() -> Result<()> {
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"8EFC\"", &["-c"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[65533]");
     Ok(())

@@ -213,10 +213,17 @@ pub trait EvalSemantics: Copy + Default {
     /// -- one already-isolated string's bytes, which is exactly what
     /// `@base64d`/`@urid` decode to. `jq_runner.rs`'s document/raw-input
     /// callers do *not* gain that particular match: they substitute a
-    /// whole file/document buffer in one pass, so "last byte of input"
-    /// essentially never coincides with "last byte of one JSON string" the
-    /// way it does here -- see docs/compliance/jq/limitations.md's "An
-    /// open gap in jq's own UTF-8 replacement-character substitution".
+    /// whole file/document buffer in one pass, before real jq's own
+    /// per-string (document mode) or per-line (`--raw-input`, live-
+    /// verified) scoping ever applies -- "last byte of the whole buffer"
+    /// essentially never coincides with jq's own trigger point in a
+    /// realistic multi-field document or multi-line file, even though
+    /// jq's own trigger itself is not rare at all (it fires on *any*
+    /// string/line ending in the right byte shape, however much more
+    /// content follows). See docs/compliance/jq/limitations.md's "jq's
+    /// own UTF-8 replacement-character substitution: fixed at function
+    /// granularity, open at document granularity" and #1742 for the
+    /// separate, more tractable raw-input caller-ordering gap.
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool;
 }
 
@@ -9233,10 +9240,10 @@ fn format_base64d<S: EvalSemantics>(
     //
     // In jq mode this now round-trips the oracle exactly, including the
     // #1717 end-of-buffer drop quirk (`"null"`'s decoded bytes happen to
-    // hit that exact shape) -- see
-    // docs/compliance/jq/limitations.md's "An open gap in jq's own UTF-8
-    // replacement-character substitution" for the one place that quirk is
-    // still open (document/raw-input decode, a different granularity).
+    // hit that exact shape) -- see docs/compliance/jq/limitations.md's
+    // "fixed at function granularity, open at document granularity"
+    // section for the one place that quirk is still open (document/
+    // raw-input decode, a different granularity).
     Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 
