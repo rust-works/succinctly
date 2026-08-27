@@ -1121,6 +1121,26 @@ of jq's own incremental-parser failure classification to know which of its inter
 segment would have failed in, not just whether it parses — deliberately deferred, tracked in
 [#1723](https://github.com/rust-works/succinctly/issues/1723).
 
+A second, narrower gap `succinctly jq --seq` also deliberately stays silent on: `-n`
+combined with a filter that forces a real read (`input`/`inputs`) turns the identical
+no-RS-byte condition into a **fatal** error on real jq (exit 5), not a warning:
+
+```
+$ printf '1 2' | jq -n --seq -c '[inputs]'
+jq: error (at <stdin>:0): Unfinished abandoned text at EOF at line 1, column 3
+$ printf '1 2' | succinctly jq -n --seq -c '[inputs]'
+[]
+```
+
+`succinctly jq` has never implemented this fatal-vs-warning distinction (predates #1525, not
+a regression); #1525 specifically avoids printing the warning's exact wording in this one
+mode (`!args.null_input` in `seq_no_rs_byte_warning`'s call site,
+[src/bin/succinctly/jq_runner.rs](../../../src/bin/succinctly/jq_runner.rs)), since doing so
+would make the still-wrong exit code/output look like it now matched jq's message. Fixing the
+underlying exit-code divergence properly needs `get_inputs` to be able to raise a real,
+fatal `EvalError` from this specific condition rather than only ever warning or returning
+values — not attempted here.
+
 ## Deliberate divergences (ADR-0018 rule 4)
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
