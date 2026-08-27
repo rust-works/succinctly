@@ -540,7 +540,15 @@ otherwise already correct, and it can be reverted independently if the perf gate
   off-by-one in jq's own end-of-buffer lookahead rather than a designed rule, per ADR-0018
   rule 4 the correct resolution if picked up is bug-for-bug replication, not "fixing" it.
 - Scope is document input only. `--raw-input` shares the jq path (jq substitutes there
-  too); DSV input, `--arg`/`--argjson` and `--rawfile` are untouched.
+  too); DSV input, `--arg`/`--argjson` and `--rawfile` are untouched. #1719 later routed
+  `@base64d`/`@urid`'s jq-mode output through this same `substitute_invalid_utf8_jq_style`
+  call for the overlong/surrogate/out-of-range case those builtins previously got wrong
+  too -- and, as an unavoidable side effect of sharing the one function, they also inherit
+  #1717's still-open quirk above. This isn't new exposure: both builtins already gave the
+  same wrong (WHATWG) answer for #1717's specific shape before #1719, since
+  `String::from_utf8_lossy` and `substitute_invalid_utf8_jq_style` agree on that one case
+  (confirmed live, byte-identical output pre/post #1719 for `"4UE=" | @base64d`) -- #1719
+  changes zero bytes of output for #1717's shape, only for the shape it actually targets.
 - **`--validate` is excluded, and getting that wrong was a live regression** caught in
   review. The substitution originally ran at read time, before `validate_json_input`, so
   the strict validator was handed an already-repaired document: `sjq --validate` exited 0

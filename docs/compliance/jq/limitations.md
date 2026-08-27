@@ -197,6 +197,35 @@ This case is deliberately **absent from the probe corpus**: the captured table i
 file read with `include_str!`, so jq's byte-exact output here is not representable. It is
 recorded in prose instead rather than dropped silently.
 
+## An open gap in jq's own UTF-8 replacement-character substitution
+
+`substitute_invalid_utf8_jq_style` ([src/text/utf8/mod.rs](../../src/text/utf8/mod.rs),
+#1617) matches jq 1.7.1's maximal-subpart substitution rule for document/raw-input decode,
+and — since #1719 — for `@base64d`/`@urid`'s own invalid-UTF-8 output too, collapsing a
+structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+FFFD where
+`String::from_utf8_lossy`'s WHATWG rule gives one per byte.
+
+One case remains unmatched everywhere this function is used: when an
+`InvalidContinuationByte`'s rescanned byte lands at a string's *last* byte, real jq
+silently **drops** that byte; succinctly (matching WHATWG) keeps it.
+
+```bash
+$ printf '{"a":"\xe1\x41"}' | jq -c '.a'              # jq drops the 'A'
+"�"
+$ printf '{"a":"\xe1\x41"}' | sjq -c '.a'
+"�A"
+```
+
+This is not new to #1719 — the same wrong answer for this shape existed under the plain
+WHATWG fallback `@base64d`/`@urid` used before it (byte-identical output, confirmed live,
+both pre- and post-#1719). Filed as
+[#1717](https://github.com/rust-works/succinctly/issues/1717), likely an off-by-one in
+jq's own end-of-buffer lookahead rather than a designed rule; per ADR-0018 rule 4 the
+correct resolution, if picked up, is bug-for-bug replication rather than "fixing" the
+substitution into the more sensible WHATWG-consistent shape. See
+[docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
+substitution-mechanism history.
+
 ## Conversion diagnostics beyond a single token
 
 jq implements `tonumber` and `fromjson` by handing the string to its JSON parser, so a
