@@ -3158,16 +3158,22 @@ fn test_join_output_identity_1701() -> Result<()> {
 }
 
 /// Same fix, multiple results (evaluated, `.[]`) -- real join-output
-/// concatenates every result with no separator at all.
+/// concatenates every result with no separator at all. Deliberately uses
+/// the default YAML output format, not `-o json`: `-o json` would also
+/// exercise the M2 fast path's separate, pre-existing `raw_output`
+/// gap (`stream_json` never strips JSON string quoting the way the DOM
+/// path's `output_value` does -- #1715, found by a gap-sweep review of
+/// this PR but predating it), which would make this test either fail or
+/// silently pin `"hello""world"` (still quoted) as "correct" instead of
+/// jq's own `-j` semantics (`helloworld`, confirmed against the pinned
+/// oracle). YAML output has no such gap: plain scalars are unquoted by
+/// default regardless of the M2/DOM path taken, so this test exercises
+/// only the separator-suppression fix it's actually named for.
 #[test]
 fn test_join_output_multiple_results_1701() -> Result<()> {
-    let (output, code) = run_yq_stdin(
-        ".[]",
-        "[\"hello\", \"world\"]\n",
-        &["-o", "json", "--join-output"],
-    )?;
+    let (output, code) = run_yq_stdin(".[]", "[\"hello\", \"world\"]\n", &["--join-output"])?;
     assert_eq!(code, 0);
-    assert_eq!(output, "\"hello\"\"world\"");
+    assert_eq!(output, "helloworld");
     Ok(())
 }
 

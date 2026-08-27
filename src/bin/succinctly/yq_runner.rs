@@ -1857,8 +1857,7 @@ fn emit_yaml_doc_separator<W: std::io::Write>(
     terminator: Terminator,
 ) -> std::io::Result<()> {
     if *streamed && will_output && !no_doc {
-        write_doc_marker_newline_guard(writer, terminator)?;
-        writeln!(writer, "---")?;
+        write_doc_separator_marker(writer, terminator)?;
     }
     *streamed |= will_output;
     Ok(())
@@ -1884,6 +1883,24 @@ fn write_doc_marker_newline_guard<W: std::io::Write>(
     Ok(())
 }
 
+/// `write_doc_marker_newline_guard` immediately followed by the `---`
+/// separator itself -- the pairing every ordinary (non-front-matter-fence)
+/// `---` write in this file needs. Folded into one call after review found
+/// the two-line pair repeated verbatim at every such site: each repeat was
+/// itself a chance for a future writer to add a 6th and forget the guard,
+/// which is exactly how #1701 needed four separate review rounds to find
+/// every site that had. The two front-matter fence sites don't use this --
+/// they follow the guard with `extend_from_slice`/`write_all` of `---` plus
+/// a caller-supplied line ending and body bytes, not a bare `---`+`\n`, so
+/// they call `write_doc_marker_newline_guard` directly instead.
+fn write_doc_separator_marker<W: std::io::Write>(
+    writer: &mut W,
+    terminator: Terminator,
+) -> std::io::Result<()> {
+    write_doc_marker_newline_guard(writer, terminator)?;
+    writeln!(writer, "---")
+}
+
 /// State for tracking split_doc output separators.
 struct SplitDocState {
     has_split_doc: bool,
@@ -1907,8 +1924,7 @@ impl SplitDocState {
     fn write_separator<W: Write>(&mut self, writer: &mut W, config: &OutputConfig) -> Result<()> {
         if self.has_split_doc && config.output_format == OutputFormat::Yaml && !config.no_doc {
             if !self.is_first_output {
-                write_doc_marker_newline_guard(writer, Terminator::from_config(config))?;
-                writeln!(writer, "---")?;
+                write_doc_separator_marker(writer, Terminator::from_config(config))?;
             }
             self.is_first_output = false;
         }
@@ -3904,11 +3920,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // (#1701 code review): the previous result's own
                 // `write_terminator` call (inside `output_value` below)
                 // might have written `\0`/nothing rather than `\n`.
-                write_doc_marker_newline_guard(
-                    &mut writer,
-                    Terminator::from_config(&output_config),
-                )?;
-                writeln!(writer, "---")?;
+                write_doc_separator_marker(&mut writer, Terminator::from_config(&output_config))?;
             }
             any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(&mut writer, result, &CommentTree::empty(), &output_config)?;
@@ -4498,11 +4510,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             // `emit_yaml_doc_separator` -- the previous
                             // document's own terminator might not have been
                             // `\n`.
-                            write_doc_marker_newline_guard(
+                            write_doc_separator_marker(
                                 &mut buf_writer,
                                 Terminator::from_config(&output_config),
                             )?;
-                            writeln!(buf_writer, "---")?;
                         }
                         doc_had_output = true;
                         any_doc_output_this_file = true;
@@ -4733,11 +4744,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // #1701 code review: same fix as
                     // `emit_yaml_doc_separator` -- the previous document's
                     // own terminator might not have been `\n`.
-                    write_doc_marker_newline_guard(
+                    write_doc_separator_marker(
                         &mut writer,
                         Terminator::from_config(&file_output_config),
                     )?;
-                    writeln!(writer, "---")?;
                 }
                 if file_output_config.output_format == OutputFormat::Yaml {
                     any_yaml_doc_output = true;
