@@ -12,7 +12,7 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::signal_death_error;
+use cargo_run_exit::{classify_cargo_run_exit, exit_code_or_signal_death, MAX_CARGO_RETRIES};
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -37,11 +37,9 @@ fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, Strin
     }
 
     let output = cmd.wait_with_output()?;
+    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(exit_code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, exit_code))
 }
 
@@ -55,11 +53,9 @@ fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, St
         .stderr(Stdio::piped())
         .output()?;
 
+    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(exit_code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, exit_code))
 }
 
@@ -371,6 +367,43 @@ fn test_file_not_found() -> Result<()> {
 // Multiple files tests
 // ============================================================================
 
+/// Runs `json validate` over multiple files via `cargo run` (needed so this
+/// test still builds from source rather than requiring a pre-built binary),
+/// retrying on the same transient conditions `run_jq_file`
+/// (`tests/jq_cli_tests.rs`) does: exit 101 from concurrent `cargo build`
+/// lock contention, or a signal death under that same load (#1691 code
+/// review -- these two tests originally had no retry loop at all, unlike
+/// every other `cargo run`-spawning helper in this codebase).
+fn run_json_validate_via_cargo(files: &[&std::path::Path]) -> Result<i32> {
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let output = Command::new("cargo")
+            .args([
+                "run",
+                "--features",
+                "cli",
+                "--bin",
+                "succinctly",
+                "--",
+                "json",
+                "validate",
+            ])
+            .args(files)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) =
+            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
+        else {
+            std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+            continue;
+        };
+        return Ok(exit_code);
+    }
+    unreachable!()
+}
+
 #[test]
 fn test_multiple_files_all_valid() -> Result<()> {
     let mut file1 = NamedTempFile::new()?;
@@ -381,27 +414,7 @@ fn test_multiple_files_all_valid() -> Result<()> {
     writeln!(file2, r#"{{"b": 2}}"#)?;
     file2.flush()?;
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "json",
-            "validate",
-        ])
-        .arg(file1.path())
-        .arg(file2.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    let Some(code) = output.status.code() else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(signal_death_error(output.status, &stderr));
-    };
+    let code = run_json_validate_via_cargo(&[file1.path(), file2.path()])?;
     assert_eq!(code, 0);
     Ok(())
 }
@@ -416,27 +429,7 @@ fn test_multiple_files_one_invalid() -> Result<()> {
     writeln!(file2, r#"{{"b": }}"#)?; // invalid
     file2.flush()?;
 
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--features",
-            "cli",
-            "--bin",
-            "succinctly",
-            "--",
-            "json",
-            "validate",
-        ])
-        .arg(file1.path())
-        .arg(file2.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    let Some(code) = output.status.code() else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(signal_death_error(output.status, &stderr));
-    };
+    let code = run_json_validate_via_cargo(&[file1.path(), file2.path()])?;
     assert_eq!(code, 1);
     Ok(())
 }

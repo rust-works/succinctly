@@ -16,7 +16,7 @@ use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::signal_death_error;
+use cargo_run_exit::exit_code_or_signal_death;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_succinctly")
@@ -27,11 +27,9 @@ fn run(args: &[&str]) -> Result<(String, String, i32)> {
         .args(args)
         .output()
         .expect("spawn succinctly");
+    let code = exit_code_or_signal_death(out.status, &out.stderr)?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    let Some(code) = out.status.code() else {
-        return Err(signal_death_error(out.status, &stderr));
-    };
     Ok((stdout, stderr, code))
 }
 
