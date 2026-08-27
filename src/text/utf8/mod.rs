@@ -201,17 +201,24 @@ fn code_point_bounds_violation(cp: u32, len: usize) -> Option<CodePointBoundsVio
 /// `0xE0`-`0xEF`, `0xF0`-`0xF4`) has at least one continuation-byte choice
 /// that decodes in range.
 ///
-/// Exists so this fact -- used by [`substitute_invalid_utf8_jq_style`] to
-/// decide whether a bounds violation collapses to one U+FFFD or is treated
-/// as an ordinary invalid lead byte -- is derived from the same bounds
-/// `code_point_bounds_violation` already encodes, rather than duplicated as
-/// an independent byte-range literal that could silently drift from it (see
-/// `code_point_bounds_violation`'s own doc comment and #1423 for a case
-/// where exactly that happened between two different functions).
+/// A genuine, standalone classification of `lead_byte` alone -- no
+/// precondition on having already seen (or counted) any continuation
+/// bytes. [`substitute_invalid_utf8_jq_style`] relies on that: jq treats
+/// `0xC0`/`0xC1`/`0xF5`-`0xF7` as a one-byte error unconditionally, even
+/// when there isn't enough remaining input to know what the continuation
+/// bytes *would* have been (`\xf5\x80` at end-of-input is 2 separate
+/// one-byte errors in jq, not one 2-of-4-bytes-present truncated
+/// sequence) -- so this must be checked, and answer correctly, before any
+/// continuation-byte counting or truncation check runs, not only after a
+/// bounds violation is otherwise confirmed. Exists as one named function,
+/// rather than an independent byte-range literal at each call site, so it
+/// can't silently drift from `code_point_bounds_violation`'s own bounds
+/// (see that function's doc comment and #1423 for a case where exactly
+/// that happened between two different functions).
 #[inline]
 fn is_never_valid_lead_byte(lead_byte: u8, seq_len: usize) -> bool {
     match seq_len {
-        2 => code_point_bounds_violation(0, 2).is_some(), // C0/C1's own minimum cp
+        2 => matches!(lead_byte, 0xC0 | 0xC1),
         4 => lead_byte >= 0xF5,
         _ => false, // seq_len == 3 (0xE0-0xEF): always a valid lead
     }
@@ -759,66 +766,7 @@ pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
             continue;
         }
 
-        let seq_len = sequence_length(byte);
-
-        // `Some(resume_at)`: this byte starts (or is) an invalid maximal
-        // subpart running from `pos` to (not including) `resume_at`.
-        // `None`: `byte` leads a fully valid `seq_len`-byte sequence,
-        // already confirmed below -- stays part of the current run.
-        let bad = if seq_len == 0 {
-            // A stray continuation byte (0x80-0xBF) or a lead RFC 3629
-            // never lists as valid at any length (0xF8-0xFF): one byte,
-            // no sequence in progress.
-            Some(pos + 1)
-        } else if pos + seq_len > len {
-            // Truncated -- only reachable at the very end of `input`, so
-            // the whole remaining tail is one maximal subpart.
-            Some(len)
-        } else {
-            let mut good_continuations = 0;
-            while good_continuations < seq_len - 1
-                && is_continuation_byte(input[pos + 1 + good_continuations])
-            {
-                good_continuations += 1;
-            }
-            if good_continuations < seq_len - 1 {
-                // A continuation byte was missing/invalid: the subpart is
-                // the lead plus whatever continuations were already good;
-                // the offending byte itself is rescanned next iteration,
-                // not skipped (WHATWG restarts scanning there).
-                Some(pos + 1 + good_continuations)
-            } else {
-                // Every continuation byte present and well-formed --
-                // decode and check the value, mirroring
-                // `validate_utf8_scalar`'s identical per-length arithmetic.
-                let cp = match seq_len {
-                    2 => ((byte as u32 & 0x1F) << 6) | (input[pos + 1] as u32 & 0x3F),
-                    3 => {
-                        ((byte as u32 & 0x0F) << 12)
-                            | ((input[pos + 1] as u32 & 0x3F) << 6)
-                            | (input[pos + 2] as u32 & 0x3F)
-                    }
-                    4 => {
-                        ((byte as u32 & 0x07) << 18)
-                            | ((input[pos + 1] as u32 & 0x3F) << 12)
-                            | ((input[pos + 2] as u32 & 0x3F) << 6)
-                            | (input[pos + 3] as u32 & 0x3F)
-                    }
-                    _ => unreachable!(),
-                };
-                if code_point_bounds_violation(cp, seq_len).is_none() {
-                    None
-                } else {
-                    Some(if is_never_valid_lead_byte(byte, seq_len) {
-                        pos + 1
-                    } else {
-                        pos + seq_len
-                    })
-                }
-            }
-        };
-
-        match bad {
+        match invalid_subpart_end(input, pos, len) {
             Some(resume_at) => {
                 out.push_str(
                     core::str::from_utf8(&input[run_start..pos]).expect("already validated"),
@@ -827,12 +775,98 @@ pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
                 pos = resume_at;
                 run_start = pos;
             }
-            None => pos += seq_len,
+            // A fully valid `sequence_length(byte)`-byte sequence,
+            // confirmed by `invalid_subpart_end` -- stays part of the
+            // current run.
+            None => pos += sequence_length(byte),
         }
     }
 
     out.push_str(core::str::from_utf8(&input[run_start..pos]).expect("already validated"));
     out
+}
+
+/// The end of the invalid maximal subpart starting at `input[pos]` (which
+/// is not ASCII -- callers skip that case via [`skip_ascii`] before
+/// reaching here), or `None` if `input[pos]` instead leads a fully valid
+/// [`sequence_length`]-byte sequence. Each of the four `Some` cases below
+/// is a distinct, mutually exclusive reason a byte can't be part of one --
+/// see [`substitute_invalid_utf8_jq_style`]'s own doc comment for which
+/// jq/WHATWG rule each one implements.
+#[inline]
+fn invalid_subpart_end(input: &[u8], pos: usize, len: usize) -> Option<usize> {
+    let byte = input[pos];
+    let seq_len = sequence_length(byte);
+
+    if seq_len == 0 {
+        // A stray continuation byte (0x80-0xBF) or a lead RFC 3629 never
+        // lists as valid at any length (0xF8-0xFF): one byte, no sequence
+        // in progress.
+        return Some(pos + 1);
+    }
+
+    if is_never_valid_lead_byte(byte, seq_len) {
+        // 0xC0/0xC1 or 0xF5-0xF7: can never decode in range regardless of
+        // what follows, so -- like any other bad lead -- this is a single
+        // byte, checked before even counting continuation bytes or
+        // comparing against remaining length. Must run before the
+        // truncation check below: review found live against jq that
+        // `\xf5\x80` at end-of-input is 2 one-byte errors, not one
+        // "2-of-4-bytes-present" truncated subpart -- jq never tries to
+        // accumulate continuations for a lead that could never succeed.
+        return Some(pos + 1);
+    }
+
+    // How many continuation bytes this sequence needs vs. how many bytes
+    // are even left in `input` -- bounding the scan below on whichever is
+    // smaller is what makes "ran out of bytes" and "hit a bad byte before
+    // running out" distinguishable, instead of a length check alone
+    // (`pos + seq_len > len`) mistaking the *former* for the latter and
+    // swallowing a following valid byte that was never part of this
+    // sequence at all (e.g. `[0xE1, b'A']`: too short for a 3-byte
+    // sequence, but `b'A'` right there is not a continuation byte either
+    // -- the fix, not a truncation).
+    let available = (len - pos - 1).min(seq_len - 1);
+    let mut good_continuations = 0;
+    while good_continuations < available
+        && is_continuation_byte(input[pos + 1 + good_continuations])
+    {
+        good_continuations += 1;
+    }
+    if good_continuations < seq_len - 1 {
+        if pos + 1 + good_continuations == len {
+            // Ran out of *bytes*, not because one was invalid -- every
+            // byte that *was* available was a valid continuation, there
+            // just weren't enough of them. Only reachable at the very
+            // end of `input`, so the whole remaining tail is one
+            // maximal subpart.
+            return Some(len);
+        }
+        // Ran out because the next byte specifically isn't a valid
+        // continuation byte, with more input still available: the
+        // subpart is the lead plus whatever continuations were already
+        // good; the offending byte itself is rescanned next iteration,
+        // not skipped (WHATWG restarts scanning there).
+        return Some(pos + 1 + good_continuations);
+    }
+
+    // Every continuation byte already confirmed present and well-formed
+    // above -- the only way `decode_code_point` can still return `None`
+    // here is a bounds violation on a structurally valid lead
+    // (`0xE0`-`0xEF`/`0xF0`-`0xF4`; a never-valid lead already returned
+    // above), which collapses the whole sequence into one U+FFFD.
+    // Sharing the decode (rather than re-deriving the same per-length
+    // bit-packing arithmetic inline) keeps it in exactly two places in
+    // the file (`validate_utf8_scalar`'s own unrolled arms, which need
+    // their per-byte error offsets and so can't easily call out to
+    // this), not three -- see `code_point_bounds_violation`'s own doc
+    // comment and #1423 for a case where a third independent copy of
+    // this exact arithmetic drifted silently.
+    if decode_code_point(&input[pos..]).is_some() {
+        None
+    } else {
+        Some(pos + seq_len)
+    }
 }
 
 #[cfg(test)]
@@ -2830,6 +2864,69 @@ mod validate_utf8_differential_tests {
 #[cfg(test)]
 mod substitute_invalid_utf8_jq_style_tests {
     use super::*;
+
+    /// Regression test for a critical bug review found: the truncation
+    /// check (`pos + seq_len > len`) fired on remaining *byte count*
+    /// alone, before ever checking whether the bytes that *are* present
+    /// validate as continuation bytes. When a genuinely-invalid
+    /// continuation byte happened to fall near the end of `input` --
+    /// short of `seq_len` total remaining bytes, but not because input
+    /// ran out -- the old code misclassified it as truncation and
+    /// swallowed the *whole* remaining tail into one U+FFFD, silently
+    /// dropping valid trailing bytes it should have kept and rescanned
+    /// (e.g. `[0xE1, b'A']` gave `"\u{FFFD}"`, discarding `'A'`, instead
+    /// of `"\u{FFFD}A"`).
+    #[test]
+    fn invalid_continuation_near_eof_does_not_swallow_a_trailing_valid_byte() {
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, b'A']), "\u{FFFD}A");
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xF0, b'A']), "\u{FFFD}A");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x90, b'A']),
+            "\u{FFFD}A"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[b'X', 0xE1, b'A']),
+            "X\u{FFFD}A"
+        );
+        // Genuine truncation (every available byte IS a valid
+        // continuation, there just aren't enough of them) must still
+        // collapse to one U+FFFD, not regress to per-byte.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, 0x80]), "\u{FFFD}");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80]),
+            "\u{FFFD}"
+        );
+    }
+
+    /// Regression test for a second bug review found on top of the first:
+    /// a never-valid lead byte (`0xC0`/`0xC1`/`0xF5`-`0xF7`) with fewer
+    /// than `seq_len` bytes remaining was *also* misrouted into the
+    /// truncation branch, collapsing the whole tail into one U+FFFD --
+    /// but jq treats these leads as a one-byte error unconditionally, per
+    /// byte, regardless of how much input remains (it never attempts to
+    /// accumulate continuations for a lead that could never succeed).
+    /// Live-verified against the pinned jq 1.7.1 binary: `\xf5\x80` at
+    /// end-of-input is 2 separate U+FFFD, not 1.
+    #[test]
+    fn never_valid_lead_stays_per_byte_even_when_truncated() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF5, 0x80]),
+            "\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF5, 0x80, 0x80]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF6, 0x80, 0x80]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF5, 0xF6, 0xF7]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xC0]), "\u{FFFD}");
+    }
 
     #[test]
     fn valid_input_is_unchanged() {
