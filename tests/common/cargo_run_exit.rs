@@ -13,6 +13,18 @@
 
 use anyhow::Result;
 
+/// Maximum retries for a `cargo run` command that fails with exit code 101,
+/// or whose child is killed by a signal (`ExitStatus::code()` returns `None`
+/// only in that case, on Unix). Both are treated as transient: `101` often
+/// means cargo lock contention between concurrently running tests, and a
+/// signal death under the same heavy concurrent load (an OOM kill, another
+/// session's `pkill`, or fallout from that same lock contention) is just as
+/// likely to be environmental as a real bug in the code under test (#1516).
+/// Shared here, not redeclared per file (#1546 code review): a retry budget
+/// tuned in one file and not the others would recreate the exact drift this
+/// module exists to prevent, just for a constant instead of a function.
+pub const MAX_CARGO_RETRIES: u32 = 3;
+
 /// Builds the "child was killed by signal N" error for a signal-terminated
 /// process (`ExitStatus::code()` returns `None` only in that case, on Unix),
 /// naming the signal and the captured stderr. Historically every call site

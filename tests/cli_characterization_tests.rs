@@ -26,12 +26,7 @@ use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::classify_cargo_run_exit;
-
-/// Maximum retries for `cargo run` commands that fail with exit code 101.
-/// Handles flaky failures from cargo lock contention when tests run in parallel
-/// (same rationale as the other CLI integration tests).
-const MAX_CARGO_RETRIES: u32 = 3;
+use cargo_run_exit::{classify_cargo_run_exit, MAX_CARGO_RETRIES};
 
 /// Run `succinctly <args>` with `stdin` piped in, returning captured stdout.
 ///

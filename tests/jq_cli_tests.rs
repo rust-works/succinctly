@@ -12,16 +12,7 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, signal_death_error};
-
-/// Maximum retries for cargo run commands that fail with exit code 101, or
-/// whose child is killed by a signal (`ExitStatus::code()` returns `None`
-/// only in that case, on Unix). Both are treated as transient: `101` often
-/// means cargo lock contention between concurrently running tests, and a
-/// signal death under the same heavy concurrent load (an OOM kill, another
-/// session's `pkill`, or fallout from that same lock contention) is just as
-/// likely to be environmental as a real bug in the code under test (#1516).
-const MAX_CARGO_RETRIES: u32 = 3;
+use cargo_run_exit::{classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES};
 
 /// Maximum retries for spawning the pre-built binary directly.
 ///
