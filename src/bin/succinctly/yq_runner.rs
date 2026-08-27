@@ -3224,11 +3224,33 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // implement ASCII escaping, so `compact ||` previously let
     // `--ascii-output` through unescaped whenever `-I=0`/compact mode was
     // also requested -- the DOM path (`output_value`) is the only place
-    // that escapes correctly, and it's reached only when this whole
-    // condition is false.
+    // that escapes correctly, and it's reached only when this is false.
+    //
+    // Falling back to DOM for `--ascii-output` reopens the duplicate-key
+    // collapse `can_stream_pretty_or_colored`'s own comment above warns
+    // about (#442/#748/#809) -- but only for this one flag, and only in a
+    // way that already shipped: pretty mode's `can_stream_pretty_or_colored
+    // && !ascii_output` had exactly this same DOM fallback (and therefore
+    // the same duplicate-key loss) for `--ascii-output` before #1693 ever
+    // touched this function. This shared local makes compact mode
+    // consistent with that pre-existing behavior instead of leaving the two
+    // output styles to diverge on the same input. #1700 tracks the real fix
+    // (ASCII-escaping support in the M2 streamers themselves, which would
+    // let `--ascii-output` keep both correct escaping and duplicate-key
+    // safety at once) -- not attempted here per #1693's own "Low, cosmetic"
+    // scoping and the same #965 inlining-cost reasoning this file's
+    // `stream_json_string` doc comment records for why that isn't a
+    // drop-in change.
+    //
+    // Extracted into one local (rather than repeating the expression at
+    // `can_json_fast_path`, `can_inplace_json_fast_path`, and
+    // `can_slurp_fast_path`'s JSON arm) per /code-review on #1693's own PR:
+    // `can_slurp_fast_path` originally diverged from this exact predicate
+    // because #1577 copied it by hand instead of sharing it.
+    let can_stream_json_output_style =
+        !args.ascii_output && (output_config.compact || can_stream_pretty_or_colored);
     let can_json_fast_path = is_m2_streamable
-        && !args.ascii_output
-        && (output_config.compact || can_stream_pretty_or_colored)
+        && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -3265,10 +3287,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // writes), so `-C` reaching the fast path still never writes ANSI to
     // disk, but no longer forces a fallback to the duplicate-key-collapsing
     // DOM path either.
-    // Same `!args.ascii_output` fix as `can_json_fast_path` above (#1693).
+    // Shares `can_json_fast_path`'s `can_stream_json_output_style` above.
     let can_inplace_json_fast_path = is_m2_streamable
-        && !args.ascii_output
-        && (output_config.compact || can_stream_pretty_or_colored)
+        && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -3295,17 +3316,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // one never OR's in `output_config.compact` for YAML -- preserved as-is
     // from before #1577.
     //
-    // The JSON arm's `!args.ascii_output && (compact || pretty-or-colored)`
-    // shape now matches `can_json_fast_path`/`can_inplace_json_fast_path`
-    // above exactly (#1693 fixed all three the same way: none of the M2 JSON
-    // streamers implement ASCII escaping, so `!args.ascii_output` has to gate
-    // the whole disjunction, not just the pretty-or-colored half, or compact
-    // mode lets `--ascii-output` through unescaped).
+    // The JSON arm shares `can_json_fast_path`'s `can_stream_json_output_style`
+    // above (#1693 fixed all three JSON gates the same way: none of the M2
+    // JSON streamers implement ASCII escaping, so `!args.ascii_output` has to
+    // gate the whole disjunction, not just the pretty-or-colored half, or
+    // compact mode lets `--ascii-output` through unescaped).
     let can_slurp_fast_path = is_identity
         && match output_config.output_format {
-            OutputFormat::Json => {
-                !args.ascii_output && (output_config.compact || can_stream_pretty_or_colored)
-            }
+            OutputFormat::Json => can_stream_json_output_style,
             OutputFormat::Yaml => can_stream_pretty_or_colored,
             _ => false,
         }
