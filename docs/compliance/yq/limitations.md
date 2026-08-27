@@ -105,6 +105,45 @@ kind drops its `&anchor`, where real yq keeps it),
 equal-value rule), [#1352](https://github.com/rust-works/succinctly/issues/1352) and
 [#1353](https://github.com/rust-works/succinctly/issues/1353).
 
+### `-0`/`--nul-output` multi-document separator — rule 4(a)
+
+Real yq's own `-0` output on multi-document input is not readable by real yq itself: the
+configured terminator (`\0` here) lands directly before the next document's `---`, with no
+newline between them, and real yq's own parser then rejects that byte sequence outright:
+
+```bash
+$ printf 'a: 1\n---\nb: 2\n' | yq -0 '.' | od -c
+0000000    a   :       1  \0   -   -   -  \n   b   :       2  \0
+$ printf 'a: 1\n---\nb: 2\n' | yq -0 '.' > /tmp/x.bin && yq '.' /tmp/x.bin
+Error: bad file '/tmp/x.bin': yaml: offset 4: control characters are not allowed
+```
+
+succinctly inserts a newline before every `---` document/front-matter separator whenever the
+previous write's own terminator (`Terminator`,
+[src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)) wasn't already
+one — `write_doc_marker_newline_guard`, from
+[#1701](https://github.com/rust-works/succinctly/issues/1701):
+
+```bash
+$ printf 'a: 1\n---\nb: 2\n' | succinctly yq -0 '.' | od -c
+0000000    a   :       1  \0  \n   -   -   -  \n   b   :       2  \0
+```
+
+This is rule 4(a), not a new carve-out — same shape as anchor soundness above: real yq emits
+`---`-boundary output real yq cannot itself re-read, so inserting the missing newline is
+permitted rather than bug-for-bug reproduced. `--join-output` has no real-yq counterpart at
+all (it is a succinctly-only spelling of jq-style "no separator" semantics colliding with a
+name real yq uses for something else entirely — see
+[#1710](https://github.com/rust-works/succinctly/issues/1710)), so for that flag there was
+never a reference behaviour to diverge from in the first place; the same guard is applied to
+it purely for internal consistency, not for fidelity.
+
+Scope note: this entry covers only the `---`-boundary corruption. The reparsed value shown
+above still differs from the original once the embedded `\0` itself is considered — succinctly
+performs no embedded-NUL content validation on `-0` output, unlike real yq's own refusal to
+read it back at all. That is a separate, already-filed gap
+([#1709](https://github.com/rust-works/succinctly/issues/1709)), not fixed by this entry.
+
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
 Real yq's `*+d` applies the deep-merge *and* the append, doubling the right operand.
