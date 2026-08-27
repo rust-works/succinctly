@@ -20,6 +20,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::classify_cargo_run_exit;
+
 const MAX_CARGO_RETRIES: u32 = 3;
 
 /// A real-but-deep nesting depth: deeper than typical documents (~30-50 levels),
@@ -42,13 +46,13 @@ fn run(args: &[&str], stdin: &str) -> Result<(String, i32)> {
         }
 
         let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry.
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) =
+            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
+        else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
         let stdout = String::from_utf8(output.stdout)?;
         return Ok((stdout, exit_code));

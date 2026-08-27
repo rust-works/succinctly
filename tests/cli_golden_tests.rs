@@ -7,6 +7,10 @@ use anyhow::Result;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::{classify_cargo_run_exit, signal_death_error};
+
 /// Maximum retries for cargo run commands that fail with exit code 101.
 /// This handles flaky failures from cargo lock contention when tests run in parallel.
 const MAX_CARGO_RETRIES: u32 = 3;
@@ -19,16 +23,15 @@ fn run_cli(args: &[&str]) -> Result<String> {
             .args(args)
             .output()?;
 
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) =
+            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
+        else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if exit_code != 0 {
             anyhow::bail!("Command failed: {stderr}");
         }
 
@@ -360,9 +363,13 @@ fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
         .stderr(Stdio::piped())
         .output()?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // #1546: `.code().unwrap_or(-1)` would coerce a signal-killed child to a
+    // fake exit code -1 rather than reporting the death.
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((stdout, stderr, exit_code))
 }
 
