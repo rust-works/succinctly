@@ -253,7 +253,8 @@ $ printf '{"a":"\xe1\x41"}' | sjq -c '.a'              # unfixed: still whole-do
 
 Reproducing this quirk for `.a`-style document access would need per-JSON-string
 substitution timing — a bigger architectural change than this issue's own "Low severity,
-narrow trigger" framing anticipated, and not attempted here. `--raw-input`'s own gap is
+narrow trigger" framing anticipated, and not attempted here; tracked separately as
+[#1743](https://github.com/rust-works/succinctly/issues/1743). `--raw-input`'s own gap is
 narrower and more tractable (a caller-side reorder: split into lines before
 substituting, instead of after — the algorithm itself needs no further change), tracked
 separately as [#1742](https://github.com/rust-works/succinctly/issues/1742). Likely an

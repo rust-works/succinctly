@@ -757,8 +757,8 @@ pub fn format_byte(byte: u8) -> String {
 /// the right byte shape, however much more content follows in the rest
 /// of the file). See `docs/compliance/jq/limitations.md`'s "fixed at
 /// function granularity, open at document granularity" section for the
-/// live-verified detail, and #1742 for the separate, more tractable
-/// raw-input caller-ordering gap this leaves open.
+/// live-verified detail, #1743 for the document-mode gap, and #1742 for
+/// the separate, more tractable raw-input caller-ordering gap.
 ///
 /// A single left-to-right scan, not a loop over [`validate_utf8`]: that
 /// function's AVX2 path has no early exit (it scans every 32-byte block of
@@ -2922,16 +2922,16 @@ mod substitute_invalid_utf8_jq_style_tests {
     /// failure mode, because the old truncation-misclassification bug did
     /// not require end-of-input at all, and would have collapsed these
     /// same vectors even with trailing content following (see
-    /// `any_trailing_byte_after_the_rescanned_byte_restores_normal_keep_behavior`,
-    /// which pins exactly that: trailing content is kept, not swallowed,
-    /// once enough bytes are present for the full sequence).
+    /// `keeps_and_rescans_once_seq_len_bytes_are_present`, which pins
+    /// exactly that: trailing content is kept, not swallowed, once enough
+    /// bytes are present for the full sequence).
     #[test]
-    fn invalid_continuation_near_eof_does_not_swallow_a_trailing_valid_byte() {
+    fn invalid_continuation_boundary_detection_matches_jq_near_eof() {
         // #1717: whenever fewer than `seq_len` bytes remain from the lead
         // onward, jq (and now this function) collapses the whole tail
         // rather than keeping and rescanning whatever's left -- see the
-        // dedicated `drops_the_rescanned_byte_at_end_of_input_*` test
-        // above for the isolated case-by-case breakdown.
+        // dedicated `drops_the_whole_tail_when_fewer_than_seq_len_bytes_remain_from_the_lead`
+        // test below for the isolated case-by-case breakdown.
         assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, b'A']), "\u{FFFD}");
         assert_eq!(substitute_invalid_utf8_jq_style(&[0xF0, b'A']), "\u{FFFD}");
         assert_eq!(
@@ -3141,18 +3141,16 @@ mod substitute_invalid_utf8_jq_style_tests {
     /// end-of-input -- so the offending byte is *not* the last byte) still
     /// collapses in real jq, live-verified, and is the case that earlier
     /// version got wrong. The shortfall=2-via-3-byte-lead case
-    /// (`[0xE1, b'A']`) and shortfall=3-via-4-byte-lead, zero-headroom case
-    /// (`[0xF0, b'A']`) are already pinned by
-    /// `invalid_continuation_near_eof_does_not_swallow_a_trailing_valid_byte`
-    /// above; this adds the remaining shapes that test doesn't cover,
-    /// including the previously-missed one.
+    /// (`[0xE1, b'A']`), shortfall=3-via-4-byte-lead zero-headroom case
+    /// (`[0xF0, b'A']`), and 4-byte-lead-good=1-zero-headroom case
+    /// (`[0xF0, 0x80, b'A']`, indistinguishable from `[0xF0, 0x90, b'A']`
+    /// there since `is_continuation_byte` treats the whole 0x80-0xBF range
+    /// alike) are already pinned by
+    /// `invalid_continuation_boundary_detection_matches_jq_near_eof` above;
+    /// this adds the one shape that test doesn't cover -- the previously-
+    /// missed, one-byte-of-headroom case.
     #[test]
     fn drops_the_whole_tail_when_fewer_than_seq_len_bytes_remain_from_the_lead() {
-        // 4-byte lead, good=1, zero headroom (len - pos == 3 < seq_len == 4).
-        assert_eq!(
-            substitute_invalid_utf8_jq_style(&[0xF0, 0x80, b'A']),
-            "\u{FFFD}"
-        );
         // 4-byte lead, good=0, *one byte of headroom* (len - pos == 3 <
         // seq_len == 4) -- the shape the narrower pre-fix condition missed.
         assert_eq!(
