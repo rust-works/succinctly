@@ -3121,6 +3121,58 @@ fn test_join_output_multiple_results_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1701 code review: `emit_yaml_doc_separator` used to assume the previous
+/// document's own output always ended in `\n`, so `--join-output` on
+/// multi-document YAML input glued `---` directly onto the prior document's
+/// last byte -- confirmed live to silently *corrupt* the document on
+/// reparse (`a: 1\n---\nb: 2\n` -> `a: 1---\nb: 2` -> reparses as the single
+/// document `{"a": "1---", "b": 2}` instead of two documents). Pins the fix:
+/// `---` must always start on its own line regardless of which terminator
+/// produced the document before it.
+#[test]
+fn test_join_output_multidoc_does_not_corrupt_documents_1701() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+
+    let (output, code) = run_yq_stdin(".", input, &["--join-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\n---\nb: 2");
+
+    // Round-trip: reparsing must still yield two distinct documents, not
+    // one document with "---" corrupted into a scalar's own text.
+    let (reparsed, code) = run_yq_stdin(".", &output, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(reparsed, "{\"a\":1}\n{\"b\":2}\n");
+
+    Ok(())
+}
+
+/// Same fix, `-0`/`--nul-output` (#1701 code review). Unlike `--join-output`
+/// above, `-0`'s own glued-`---` case was confirmed byte-identical to real
+/// yq's own multi-doc `-0` output -- but real yq can't reparse that output
+/// either, so this fix's extra newline is a permitted divergence under
+/// ADR-0018's carve-out for reference output the tool can't read back, not
+/// a fidelity violation.
+#[test]
+fn test_nul_output_multidoc_separator_stays_on_its_own_line_1701() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+    let (output, code) = run_yq_stdin(".", input, &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\0\n---\nb: 2\0");
+    Ok(())
+}
+
+/// #1701 code review: the `--slurp` fast path (a sibling of `stream_cursor!`,
+/// gated by `can_slurp_fast_path` rather than going through that macro) was
+/// left out of the original fix and still hardcoded a bare newline.
+#[test]
+fn test_slurp_nul_output_1701() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+    let (output, code) = run_yq_stdin(".", input, &["--slurp", "-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "- a: 1\n- b: 2\0");
+    Ok(())
+}
+
 #[test]
 fn test_split_doc_json_output() -> Result<()> {
     // JSON output should not get --- separators
