@@ -9,11 +9,7 @@ use std::time::Duration;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, signal_death_error};
-
-/// Maximum retries for cargo run commands that fail with exit code 101.
-/// This handles flaky failures from cargo lock contention when tests run in parallel.
-const MAX_CARGO_RETRIES: u32 = 3;
+use cargo_run_exit::{classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES};
 
 /// Helper to run a CLI command and capture its output
 fn run_cli(args: &[&str]) -> Result<String> {

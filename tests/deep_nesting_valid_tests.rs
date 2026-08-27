@@ -22,9 +22,7 @@ use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::classify_cargo_run_exit;
-
-const MAX_CARGO_RETRIES: u32 = 3;
+use cargo_run_exit::{classify_cargo_run_exit, MAX_CARGO_RETRIES};
 
 /// A real-but-deep nesting depth: deeper than typical documents (~30-50 levels),
 /// yet comfortably under the ~128-level DoS cap proposed in #151/#152.
