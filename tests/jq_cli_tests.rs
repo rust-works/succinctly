@@ -22551,11 +22551,10 @@ fn test_jq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
     Ok(())
 }
 
-/// #1669: `combinations(n)`'s *second* allocation risk -- once its own
-/// `n`-sized `indices` guard passes (a small `n` is cheap on its own), the
-/// actual output size `base_array.len().pow(n)` can still overflow, a
-/// completely different quantity the `n`-alone guard never sees. `n=10` is
-/// trivial by itself; `1000^10` is not.
+/// #1669: `combinations(n)`'s *second* allocation risk -- the actual output
+/// size `base_array.len().pow(n)` can overflow independently of `n` alone
+/// being perfectly reasonable (`n=10` is trivial by itself; `1000^10` is
+/// not), a completely different quantity from the row-width guard on `n`.
 #[test]
 fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -22574,8 +22573,8 @@ fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Resul
 
 /// #1669: `checked_combinations_len`'s `base <= 1` short-circuit (a
 /// single-element base array raised to any power is always exactly one
-/// combination) is only reachable when `n` itself passes the earlier
-/// `indices` guard -- a small base paired with a merely large (not
+/// combination) is only reachable when `n` itself passes the row-width
+/// guard that follows -- a small base paired with a merely large (not
 /// astronomically huge) `n` exercises it directly instead of failing
 /// earlier. The one combination produced is `n` copies of the sole
 /// element, joined into one array.
@@ -22584,6 +22583,34 @@ fn test_jq_combinations_n_single_element_base_any_n_is_one_combination() -> Resu
     let (stdout, stderr, code) = run_jq_full(&["-c", "[combinations(5)] | length"], Some("[1]"))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim(), "1");
+    Ok(())
+}
+
+/// #1669 review: `checked_combinations_len`'s `base <= 1` short-circuit
+/// makes the output *count* permanently `1` regardless of `n`, so the
+/// `results` guard alone never bounds `n` when `base_array` has a single
+/// element -- the row-width guard (`Vec::<OwnedValue>::new().try_reserve_exact(n)`)
+/// is what actually catches this. `indices` itself needs no separate guard:
+/// it's a `Vec<usize>`, a smaller type at the same length `n`, so this
+/// probe (against the larger `OwnedValue`) already subsumes it. The
+/// distinct error message (naming `n` alone, not `base^n`) confirms which
+/// guard actually fired.
+#[test]
+fn test_jq_combinations_n_row_width_guard_independent_of_output_count_1669() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "[1] | combinations(9000000000000) | length"],
+        None,
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Cannot allocate 9000000000000 elements for combinations"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stderr: {stderr:?}");
     Ok(())
 }
 

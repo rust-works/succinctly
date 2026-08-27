@@ -13668,6 +13668,17 @@ fn cannot_allocate_combinations(base: usize, n: usize) -> EvalError {
     ))
 }
 
+/// Distinct from [`cannot_allocate_combinations`]: that message blames the
+/// computed output size `base^n`, which is misleading when the failure is
+/// actually about `n` itself (either directly too large to represent as a
+/// count, or -- since every combination row is `n` elements of `OwnedValue`,
+/// independent of how many rows there are -- too large for even a single
+/// row, regardless of what `base^n` computes to; `base <= 1` makes that
+/// exponent permanently `1` while `n` remains unbounded, #1669 review).
+fn cannot_allocate_combinations_count(n: usize) -> EvalError {
+    EvalError::new(format!("Cannot allocate {n} elements for combinations"))
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// jq compiles this as `K as $k | E | .[$k]`, and three consequences of that
@@ -30615,25 +30626,34 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // one real clone at a time, since neither guard bounds *that* product)
     // where indexing into one shared `base_array` needs neither.
     //
-    // Two independent quantities still need guarding here: `n` itself
-    // (`indices` below is n elements long) and `base_array.len().pow(n)`
-    // (the actual output size) -- a moderate n combined with a large
-    // base_array can overflow the second while trivially passing the
-    // first, so checking only one would still leave the other's crash
-    // reachable (#1669 review).
-    let mut indices: Vec<usize> = Vec::new();
-    if indices.try_reserve_exact(n).is_err() {
-        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
-    }
-    indices.resize(n, 0);
-
+    // Two independent quantities need guarding here, cheapest first so a
+    // request that fails a cheap check never pays for a more expensive one
+    // first (#1669 review -- an earlier version of this fix committed
+    // `indices`' real memory via `resize` before ever running the O(log n),
+    // no-allocation-at-all check below that could reject the whole call):
+    //
+    // 1. base_array.len().pow(n), the actual output row *count* -- pure
+    //    arithmetic, no allocation.
+    // 2. n itself as a row *width*: every combination is n elements of
+    //    OwnedValue, rebuilt fresh each iteration, independent of how many
+    //    rows there are -- `checked_combinations_len`'s own `base <= 1`
+    //    short-circuit makes the row count permanently 1 regardless of n,
+    //    so that guard alone never bounds this. `OwnedValue` is a larger
+    //    type than `indices`' own `usize`, so a `Vec<OwnedValue>`-sized
+    //    probe for this exact `n` subsumes `indices`' own allocation (a
+    //    smaller request for the same length) rather than needing a
+    //    second, separate guard for it.
     let Some(total) = checked_combinations_len(base_array.len(), n) else {
         return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     };
+    if Vec::<OwnedValue>::new().try_reserve_exact(n).is_err() {
+        return QueryResult::Error(cannot_allocate_combinations_count(n));
+    }
     let mut results = Vec::new();
     if results.try_reserve_exact(total).is_err() {
         return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     }
+    let mut indices: Vec<usize> = vec![0; n];
 
     loop {
         let combination: Vec<OwnedValue> =
@@ -30671,6 +30691,21 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
         return Ok(vec![OwnedValue::Array(Vec::new())]);
+    }
+
+    // Guard the row width (arrays.len()) against the heaviest type that
+    // recurs at that length -- OwnedValue, not usize -- before building
+    // anything: `lens`/`indices` below are also arrays.len() elements
+    // long, but of the smaller `usize`, so this subsumes their own
+    // allocation cost. Independent of `results`' own length-*product*
+    // guard just below: many length-1 factor arrays keep that product tiny
+    // while the row width (arrays.len() itself) stays unbounded (#1669
+    // review).
+    if Vec::<OwnedValue>::new()
+        .try_reserve_exact(arrays.len())
+        .is_err()
+    {
+        return Err(cannot_allocate_combinations_count(arrays.len()));
     }
 
     let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();

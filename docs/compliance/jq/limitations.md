@@ -703,27 +703,40 @@ pursued within this issue's scope. Either way, the guard converts a host-process
 a catchable error uniformly in both modes, with no cap-specific divergence to record in
 [yq Limitations](../yq/limitations.md).
 
-`combinations`/`combinations(n)` (#1669) have the identical shape a third time, at two
-independent sites: `builtin_combinations_n`'s own `n`-sized bookkeeping (an `n`-element
-`indices` array, guarded on `n` alone) and the actual combinatorial output size
-(`base_array.len().pow(n)` for `combinations(n)`, or the product of every input array's
-length for bare `combinations` on an array of arrays) — two genuinely different quantities,
-since a small `n` can still combine with a large base array to overflow only the second.
+`combinations`/`combinations(n)` (#1669) have the identical shape a third time, at three
+independent sites: `builtin_combinations_n`'s own `n`-sized bookkeeping (both the `indices`
+array and, independently, each combination row it builds — `checked_combinations_len`'s
+`base <= 1` short-circuit makes the output *count* permanently `1` regardless of `n`, so
+that alone never bounds the row width), `cartesian_product`'s own row width
+(`arrays.len()`, unbounded by its length-*product* guard whenever many factor arrays are
+length 1), and the actual combinatorial output count (`base_array.len().pow(n)` for
+`combinations(n)`, or the product of every input array's length for bare `combinations`).
 Confirmed live before this fix: `[1] | combinations(288230376151711744)` aborted the
-process (SIGABRT), not a catchable error. succinctly now refuses with `Cannot allocate
-<base>^<n> elements for combinations` (the `combinations(n)` case) or the same `Cannot
-allocate <factors joined by " * "> elements for a computed-index expansion` message
-`try_reserve_product` already uses elsewhere (the bare `combinations` case), via the same
-`Vec::try_reserve_exact` technique as the cases above. Confirmed live against the pinned jq
-1.7.1 binary that jq itself does not error or crash on a comparably large query: both
-`combinations`/`combinations(n)` are true generators there, so `first(combinations(...))`
-returns immediately without ever materializing the full combinatorial explosion — the
-divergence is specifically that succinctly eagerly builds the whole result set rather than
-streaming it lazily, the same shape (not just the same *conclusion*) as the `.[$keys]`
-cross-product case above. Every combination count that fits in memory is still produced in
-full, so ordinary uses of both builtins are unaffected. This guard is symmetric across jq
-and yq mode (yq reaches it only behind `--jq-extensions`, per #1650), with no additional
-yq-specific cap to record in [yq Limitations](../yq/limitations.md).
+process (SIGABRT), not a catchable error. succinctly now refuses with a `Cannot allocate
+...` message via the same `Vec::try_reserve_exact` technique as the cases above, whichever
+site first detects the excess.
+
+The two arities diverge from real jq differently. Bare `combinations` matches the
+`.[$keys]` cross-product case above exactly: confirmed live against the pinned jq 1.7.1
+binary, `[range(100000)] as $a | first([$a,$a,$a,$a,$a] | combinations)` returns instantly
+rather than erroring or hanging — jq streams results one at a time instead of
+pre-allocating, so succinctly's eager refusal is a real behavioural divergence for this
+arity, not just a difference in wording. `combinations(n)` does not get the same lazy
+treatment in jq's own standard-library definition (`def combinations(n): . as $dot |
+[range(n)] | map($dot) | combinations;`): `[range(n)]` eagerly materializes an
+`n`-element array *before* the lazy recursive `combinations` is ever reached, so jq itself
+pays the same eager cost succinctly does — confirmed live, `[1] | first(combinations(
+288230376151711744))` does not return within 6 seconds against the pinned jq 1.7.1 binary
+either, rather than the instant response the bare-`combinations` case gets. succinctly's
+guard makes this fail fast with a catchable error instead of hanging (and eventually
+exhausting memory) the way jq's own definition does — an improvement in kind, not just a
+faster failure, but still the "would take the host process down" exception ADR-0018
+carves out, since jq's own hang is exactly the failure mode being prevented, just reached
+by resource exhaustion rather than a clean abort. Every combination count that fits in
+memory is still produced in full for both arities, so ordinary uses of both builtins are
+unaffected. This guard is symmetric across jq and yq mode (yq reaches it only behind
+`--jq-extensions`, per #1650), with no additional yq-specific cap to record in
+[yq Limitations](../yq/limitations.md).
 
 ## Regex flags `l` and `n`
 
