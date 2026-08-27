@@ -366,18 +366,27 @@ match, `succinctly yq` rejects them too by default (a parse error naming
 `--jq-extensions`); passing the flag opts back into the jq-compatible
 surface (#1512):
 
-| Builtin                                           | Description                               |
-|---------------------------------------------------|-------------------------------------------|
-| `paths`, `paths(f)`, `leaf_paths`                 | Paths to every node / every leaf node     |
-| `getpath(path)`                                   | Value at a path array                     |
-| `tostream`, `fromstream(f)`, `truncate_stream(f)` | Streaming event representation            |
-| `IN(s)`, `IN(src; s)`                             | Membership test                           |
-| `ltrimstr(s)`                                     | Strip a leading string prefix             |
-| `limit(n; f)`                                     | First `n` outputs of `f`                  |
-| `isempty(f)`                                      | True if `f` produces no output            |
-| `debug`, `debug(msg)`                             | Print to stderr, pass value through       |
-| `infinite`, `isnan`                               | IEEE 754 infinity literal / NaN test      |
-| `gsub(re; s)`, `scan(re)`, `splits(re)`           | Not real yq builtins at any arity (#1436) |
+| Builtin                                              | Description                                   |
+|------------------------------------------------------|-----------------------------------------------|
+| `paths`, `paths(f)`, `leaf_paths`                    | Paths to every node / every leaf node         |
+| `getpath(path)`                                      | Value at a path array                         |
+| `tostream`, `fromstream(f)`, `truncate_stream(f)`    | Streaming event representation                |
+| `IN(s)`, `IN(src; s)`                                | Membership test                               |
+| `ltrimstr(s)`                                        | Strip a leading string prefix                 |
+| `limit(n; f)`                                        | First `n` outputs of `f`                      |
+| `isempty(f)`                                         | True if `f` produces no output                |
+| `debug`, `debug(msg)`                                | Print to stderr, pass value through           |
+| `infinite`, `isnan`                                  | IEEE 754 infinity literal / NaN test          |
+| `gsub(re; s)`, `scan(re)`, `splits(re)`              | Not real yq builtins at any arity (#1436)     |
+| `inside(s)`                                          | Membership test, `contains`'s inverse         |
+| `startswith(s)`, `endswith(s)`                       | String prefix / suffix test                   |
+| `rtrimstr(s)`                                        | Strip a trailing string suffix                |
+| `index(s)`, `rindex(s)`, `indices(s)`                | First / last / all match positions            |
+| `range(n)`, `range(from; to)`, `range(from; to; by)` | Numeric generator                             |
+| `nth(n)`, `nth(n; f)`                                | The `n`th value / output of `f`               |
+| `combinations`, `combinations(n)`                    | Cartesian product of an array of arrays       |
+| `pow(base; exp)`                                     | Exponentiation                                |
+| `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
 
 ```bash
 echo '{}' | succinctly yq 'paths'

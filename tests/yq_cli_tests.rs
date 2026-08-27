@@ -1321,14 +1321,36 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
     Ok(())
 }
 
-/// #1512: `succinctly yq` rejects jq-only builtins real yq's lexer lacks by
-/// default -- a parse error mentioning `--jq-extensions`, not the CLI
-/// silently accepting broader syntax than the reference it's meant to
+/// #1512/#1650: `succinctly yq` rejects jq-only builtins real yq's lexer
+/// lacks by default -- a parse error mentioning `--jq-extensions`, not the
+/// CLI silently accepting broader syntax than the reference it's meant to
 /// match. Covers both `try_parse_builtin`'s ordinary gate (`paths`,
-/// `getpath`) and `limit`'s special-cased one in `parse_primary`.
+/// `getpath`) and `limit`'s special-cased one in `parse_primary`, plus the
+/// 14 names #1650 added to close the gap `docs/compliance/yq/limitations.md`'s
+/// own fan-out table had been documenting as ungated all along (`inside`,
+/// `startswith`, `endswith`, `rtrimstr`, `index`, `rindex`, `indices`,
+/// `range`, `nth`, `combinations`, `pow`, `strftime`, `strptime`, `bsearch`).
 #[test]
 fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
-    for filter in ["paths", "getpath([])", "limit(1; .)"] {
+    for filter in [
+        "paths",
+        "getpath([])",
+        "limit(1; .)",
+        "inside(\"a\")",
+        "startswith(\"a\")",
+        "endswith(\"a\")",
+        "rtrimstr(\"a\")",
+        "index(\"a\")",
+        "rindex(\"a\")",
+        "indices(\"a\")",
+        "range(1)",
+        "nth(1; .)",
+        "combinations",
+        "pow(2;3)",
+        "strftime(\"%Y\")",
+        "strptime(\"%Y\")",
+        "bsearch(1)",
+    ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
         assert!(
@@ -1339,12 +1361,36 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     Ok(())
 }
 
-/// #1512: the CLI flag actually reaches the parser -- `--jq-extensions`
-/// makes the same three filters succeed end to end through the real
-/// `succinctly yq` binary, not just through the parser's own unit tests.
+/// #1512/#1650: the CLI flag actually reaches the parser -- `--jq-extensions`
+/// makes the same filters succeed end to end through the real `succinctly
+/// yq` binary, not just through the parser's own unit tests.
 #[test]
 fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
-    for filter in ["paths", "getpath([])", "limit(1; .)"] {
+    // The #1650 additions are self-contained (their own literal input via
+    // `X | f`) rather than operating on the shared `.` document below --
+    // several need a specific type (`inside`/`startswith`/... need a
+    // string, `bsearch` a sorted array) that `.` (the object `{a: 1}`)
+    // doesn't satisfy, and the point here is confirming each builtin runs
+    // to completion once gated open, not exercising every input shape.
+    for filter in [
+        "paths",
+        "getpath([])",
+        "limit(1; .)",
+        "\"abc\" | inside(\"a\")",
+        "\"abc\" | startswith(\"a\")",
+        "\"abc\" | endswith(\"c\")",
+        "\"abc\" | rtrimstr(\"c\")",
+        "\"abc\" | index(\"b\")",
+        "\"abc\" | rindex(\"b\")",
+        "\"abc\" | indices(\"b\")",
+        "range(1)",
+        "nth(1; .)",
+        "[[1],[2]] | combinations",
+        "pow(2;3)",
+        "0 | strftime(\"%Y\")",
+        "\"2020\" | strptime(\"%Y\")",
+        "[1,2,3] | bsearch(2)",
+    ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
         assert_eq!(
@@ -2771,7 +2817,11 @@ fn test_raw_input_split() -> Result<()> {
 #[test]
 fn test_raw_input_select() -> Result<()> {
     let input = "apple\nbanana\navocado\ncherry";
-    let (output, exit_code) = run_yq_stdin("select(startswith(\"a\"))", input, &["-R"])?;
+    let (output, exit_code) = run_yq_stdin(
+        "select(startswith(\"a\"))",
+        input,
+        &["-R", "--jq-extensions"],
+    )?;
     assert_eq!(exit_code, 0);
     assert_eq!(output, "apple\navocado\n");
     Ok(())
@@ -12552,7 +12602,7 @@ fn test_split_exp_with_null_input() -> Result<()> {
     );
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .arg("yq")
-        .args(["-n", "--split-exp", &pattern])
+        .args(["-n", "--split-exp", &pattern, "--jq-extensions"])
         .arg("range(3)")
         .stdin(Stdio::null())
         .output()?;
@@ -13760,8 +13810,11 @@ fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_yaml() -> Res
         "\"{}/f\" + ($index|tostring) + \".yml\"",
         dir.path().display()
     );
-    let (stdout, stderr, code) =
-        run_yq_split("range(3), halt", "x: 1\n", &["--split-exp", &pattern])?;
+    let (stdout, stderr, code) = run_yq_split(
+        "range(3), halt",
+        "x: 1\n",
+        &["--split-exp", &pattern, "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "");
 
@@ -13784,7 +13837,7 @@ fn test_split_exp_writes_every_result_in_a_multi_value_halt_prefix_json() -> Res
     let (stdout, stderr, code) = run_yq_split(
         "range(3), halt",
         "5",
-        &["--split-exp", &pattern, "-p", "json"],
+        &["--split-exp", &pattern, "-p", "json", "--jq-extensions"],
     )?;
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "");
@@ -21229,8 +21282,11 @@ fn test_yq_string_interpolation_path_context_optional_threaded_through_rest_1403
 /// has real CI signal here rather than only in `jq_cli_tests.rs`.
 #[test]
 fn test_yq_nth_stream_empty_n_argument_produces_no_output_1408() -> Result<()> {
-    let (output, stderr, code) =
-        run_yq_stdin_with_stderr("nth(empty; .a,.b)", "a: 1\nb: 2\n", &["-o", "json"])?;
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        "nth(empty; .a,.b)",
+        "a: 1\nb: 2\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(output, "");
     assert_eq!(stderr, "");
@@ -21239,8 +21295,11 @@ fn test_yq_nth_stream_empty_n_argument_produces_no_output_1408() -> Result<()> {
 
 #[test]
 fn test_yq_combinations_n_empty_argument_produces_empty_array_1408() -> Result<()> {
-    let (output, stderr, code) =
-        run_yq_stdin_with_stderr("combinations(empty)", "[1, 2]\n", &["-o", "json"])?;
+    let (output, stderr, code) = run_yq_stdin_with_stderr(
+        "combinations(empty)",
+        "[1, 2]\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(output.trim(), "[]");
     assert_eq!(stderr, "");
@@ -22233,18 +22292,24 @@ fn test_yq_contains_any_container_operand_kind_mismatch_still_errors_1649() -> R
 /// and shares the same kind-mismatch rule, gated the same way even though
 /// real yq has no `inside` at all (lexer-rejected) to verify it against --
 /// this is an internal-consistency check with `contains`, not yq parity.
-/// (`inside` itself is currently reachable in yq mode without
-/// `--jq-extensions`, a separate, pre-existing gap tracked by #1650 -- not
-/// this test's concern, which is only whether the kind-mismatch rule
-/// matches `contains`'s own once `inside` is reached at all.)
+/// (`inside` needs `--jq-extensions` to be reachable in yq mode at all,
+/// per #1650 -- this test's concern is only whether the kind-mismatch rule
+/// matches `contains`'s own once `inside` is reached.)
 #[test]
 fn test_yq_inside_shares_contains_kind_mismatch_rule_1649() -> Result<()> {
-    let (out, code) = run_yq_stdin(".x | inside(\"abc\")", "x: 5\n", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        ".x | inside(\"abc\")",
+        "x: 5\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "output: {out:?}");
     assert_eq!(out.trim(), "false");
 
-    let (_, err, code) =
-        run_yq_stdin_with_stderr(".x | inside(\"abc\")", "x: [1]\n", &["-o", "json"])?;
+    let (_, err, code) = run_yq_stdin_with_stderr(
+        ".x | inside(\"abc\")",
+        "x: [1]\n",
+        &["-o", "json", "--jq-extensions"],
+    )?;
     assert_eq!(code, 1, "err: {err:?}");
     assert_eq!(
         err.trim(),

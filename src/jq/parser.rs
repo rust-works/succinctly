@@ -1387,6 +1387,7 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("repeat") {
                     self.parse_repeat_expr()
                 } else if self.matches_keyword("range") {
+                    self.reject_unless_jq_extensions("range")?;
                     self.parse_range_expr()
                 } else if self.matches_keyword("first") {
                     self.parse_first_expr()
@@ -2538,6 +2539,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Ltrimstr(Box::new(s))));
         }
         if self.matches_keyword("rtrimstr") {
+            self.reject_unless_jq_extensions("rtrimstr")?;
             self.consume_keyword("rtrimstr");
             self.skip_ws();
             self.expect('(')?;
@@ -2548,6 +2550,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Rtrimstr(Box::new(s))));
         }
         if self.matches_keyword("startswith") {
+            self.reject_unless_jq_extensions("startswith")?;
             self.consume_keyword("startswith");
             self.skip_ws();
             self.expect('(')?;
@@ -2558,6 +2561,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Startswith(Box::new(s))));
         }
         if self.matches_keyword("endswith") {
+            self.reject_unless_jq_extensions("endswith")?;
             self.consume_keyword("endswith");
             self.skip_ws();
             self.expect('(')?;
@@ -2756,6 +2760,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Contains(Box::new(b))));
         }
         if self.matches_keyword("inside") {
+            self.reject_unless_jq_extensions("inside")?;
             self.consume_keyword("inside");
             self.skip_ws();
             self.expect('(')?;
@@ -2895,6 +2900,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Test(Box::new(re))));
         }
         if self.matches_keyword("indices") {
+            self.reject_unless_jq_extensions("indices")?;
             self.consume_keyword("indices");
             self.skip_ws();
             self.expect('(')?;
@@ -2906,6 +2912,7 @@ impl<'a> Parser<'a> {
         }
         // Check index before rindex since rindex contains "index"
         if self.matches_keyword("rindex") {
+            self.reject_unless_jq_extensions("rindex")?;
             self.consume_keyword("rindex");
             self.skip_ws();
             self.expect('(')?;
@@ -2916,6 +2923,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Rindex(Box::new(s))));
         }
         if self.matches_keyword("index") {
+            self.reject_unless_jq_extensions("index")?;
             self.consume_keyword("index");
             self.skip_ws();
             self.expect('(')?;
@@ -3186,6 +3194,7 @@ impl<'a> Parser<'a> {
         }
         // pow(base; exp)
         if self.matches_keyword("pow") {
+            self.reject_unless_jq_extensions("pow")?;
             self.consume_keyword("pow");
             self.skip_ws();
             self.expect('(')?;
@@ -3362,6 +3371,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Transpose));
         }
         if self.matches_keyword("bsearch") {
+            self.reject_unless_jq_extensions("bsearch")?;
             self.consume_keyword("bsearch");
             self.skip_ws();
             self.expect('(')?;
@@ -3601,6 +3611,7 @@ impl<'a> Parser<'a> {
         // nth(n; expr) or nth(n) - output only the nth value (0-indexed)
         // nth(n) without second arg is already handled by Phase 5 Builtin::Nth
         if self.matches_keyword("nth") {
+            self.reject_unless_jq_extensions("nth")?;
             self.consume_keyword("nth");
             self.skip_ws();
             self.expect('(')?;
@@ -3660,6 +3671,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Mktime));
         }
         if self.matches_keyword("strftime") {
+            self.reject_unless_jq_extensions("strftime")?;
             self.consume_keyword("strftime");
             self.skip_ws();
             self.expect('(')?;
@@ -3670,6 +3682,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Strftime(Box::new(fmt))));
         }
         if self.matches_keyword("strptime") {
+            self.reject_unless_jq_extensions("strptime")?;
             self.consume_keyword("strptime");
             self.skip_ws();
             self.expect('(')?;
@@ -3718,6 +3731,7 @@ impl<'a> Parser<'a> {
 
         // Phase 17: Combinations
         if self.matches_keyword("combinations") {
+            self.reject_unless_jq_extensions("combinations")?;
             self.consume_keyword("combinations");
             self.skip_ws();
             if self.peek() == Some('(') {
