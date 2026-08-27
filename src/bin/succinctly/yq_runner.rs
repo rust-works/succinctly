@@ -1857,12 +1857,30 @@ fn emit_yaml_doc_separator<W: std::io::Write>(
     terminator: Terminator,
 ) -> std::io::Result<()> {
     if *streamed && will_output && !no_doc {
-        if !matches!(terminator, Terminator::Newline) {
-            writer.write_all(b"\n")?;
-        }
+        write_doc_marker_newline_guard(writer, terminator)?;
         writeln!(writer, "---")?;
     }
     *streamed |= will_output;
+    Ok(())
+}
+
+/// Writes a `\n` iff `terminator` isn't already one -- the shared guard
+/// behind every `---`/front-matter-fence write in this file (#1701 code
+/// review): each one used to assume the byte immediately before it was
+/// already a newline (true for the default terminator, false for
+/// `-0`/`--join-output`), gluing the marker directly onto the previous
+/// document's own last byte and corrupting it on reparse. Called
+/// immediately before every such write, never after -- so it composes with
+/// whichever exact trailing form (`writeln!(..., "---")`, a bare
+/// `write_all(b"---")` followed by the caller's own line-ending logic, etc.)
+/// that call site already used.
+fn write_doc_marker_newline_guard<W: std::io::Write>(
+    writer: &mut W,
+    terminator: Terminator,
+) -> std::io::Result<()> {
+    if !matches!(terminator, Terminator::Newline) {
+        writer.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -1881,9 +1899,15 @@ impl SplitDocState {
     }
 
     /// Write a separator if needed for split_doc mode. Returns Ok(()) always.
+    ///
+    /// Same `---`-must-start-on-its-own-line fix as `emit_yaml_doc_separator`
+    /// (#1701 code review): the previous document's own terminator might
+    /// have been `\0`/nothing rather than `\n`, and gluing `---` directly
+    /// onto that document's last byte corrupts it on reparse the same way.
     fn write_separator<W: Write>(&mut self, writer: &mut W, config: &OutputConfig) -> Result<()> {
         if self.has_split_doc && config.output_format == OutputFormat::Yaml && !config.no_doc {
             if !self.is_first_output {
+                write_doc_marker_newline_guard(writer, Terminator::from_config(config))?;
                 writeln!(writer, "---")?;
             }
             self.is_first_output = false;
@@ -1916,10 +1940,14 @@ enum Terminator {
 }
 
 impl Terminator {
-    fn from_config(nul_output: bool, join_output: bool) -> Self {
-        if nul_output {
+    /// Takes `&OutputConfig` (not two positional bools) so no call site can
+    /// silently transpose `nul_output`/`join_output` -- the exact risk
+    /// `stream_cursor!`'s own `$output_config:expr` consolidation (#1701
+    /// code review) was about, one level up from here.
+    fn from_config(config: &OutputConfig) -> Self {
+        if config.nul_output {
             Self::Nul
-        } else if !join_output {
+        } else if !config.join_output {
             Self::Newline
         } else {
             Self::None
@@ -1951,7 +1979,7 @@ impl Terminator {
 
 /// Write the appropriate line terminator based on output config.
 fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<()> {
-    Terminator::from_config(config.nul_output, config.join_output).write_io(writer)?;
+    Terminator::from_config(config).write_io(writer)?;
     Ok(())
 }
 
@@ -3481,8 +3509,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // overridden per call site).
     macro_rules! stream_cursor {
         ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr, $output_config:expr) => {{
-            let terminator =
-                Terminator::from_config($output_config.nul_output, $output_config.join_output);
+            let terminator = Terminator::from_config(&$output_config);
             if $is_yaml {
                 // M2 YAML path: YAML output streaming
                 if is_identity {
@@ -3635,11 +3662,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     |out| root.stream_json_document(out, json_indent, sort_keys),
                                 )?;
                             }
-                            Terminator::from_config(
-                                output_config.nul_output,
-                                output_config.join_output,
-                            )
-                            .write_io(&mut writer)?;
+                            write_terminator(&mut writer, &output_config)?;
                             // `root` is the virtual document sequence; falsiness
                             // lives on the actual document value (#178).
                             if args.exit_status {
@@ -3766,11 +3789,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         },
                                     )?;
                                 }
-                                Terminator::from_config(
-                                    output_config.nul_output,
-                                    output_config.join_output,
-                                )
-                                .write_io(&mut writer)?;
+                                write_terminator(&mut writer, &output_config)?;
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
@@ -3880,6 +3899,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // `---` BETWEEN results (not before the first) -- deliberately
                 // different from --slurp's no-separator convention, since
                 // eval-all is explicitly a multi-document-stream feature (#715).
+                // Same `---`-must-start-on-its-own-line fix as
+                // `emit_yaml_doc_separator`/`SplitDocState::write_separator`
+                // (#1701 code review): the previous result's own
+                // `write_terminator` call (inside `output_value` below)
+                // might have written `\0`/nothing rather than `\n`.
+                write_doc_marker_newline_guard(
+                    &mut writer,
+                    Terminator::from_config(&output_config),
+                )?;
                 writeln!(writer, "---")?;
             }
             any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
@@ -4197,8 +4225,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // --join-output` still emitted a bare newline here before this
             // fix, unlike the `stream_cursor!`-based fast paths this same
             // issue's title names.
-            Terminator::from_config(output_config.nul_output, output_config.join_output)
-                .write_io(&mut writer)?;
+            write_terminator(&mut writer, &output_config)?;
         } else {
             // #1493: resolve `Auto` against the uniform format of every
             // source, if they all agree (confirmed live: an all-JSON slurp
@@ -4368,11 +4395,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         )
                                         .map_err(|_| anyhow::anyhow!("Write error"))?;
                                     }
-                                    Terminator::from_config(
-                                        output_config.nul_output,
-                                        output_config.join_output,
-                                    )
-                                    .write_io(&mut buf_writer)?;
+                                    write_terminator(&mut buf_writer, &output_config)?;
                                     if args.exit_status {
                                         any_truthy |=
                                             root.first_child().is_some_and(|c| !c.is_falsy());
@@ -4471,6 +4494,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             && front_matter_body.is_none()
                             && any_doc_output_this_file
                         {
+                            // #1701 code review: same fix as
+                            // `emit_yaml_doc_separator` -- the previous
+                            // document's own terminator might not have been
+                            // `\n`.
+                            write_doc_marker_newline_guard(
+                                &mut buf_writer,
+                                Terminator::from_config(&output_config),
+                            )?;
                             writeln!(buf_writer, "---")?;
                         }
                         doc_had_output = true;
@@ -4676,6 +4707,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     && front_matter_body.is_none()
                     && any_yaml_doc_output
                 {
+                    // #1701 code review: same fix as
+                    // `emit_yaml_doc_separator` -- the previous document's
+                    // own terminator might not have been `\n`.
+                    write_doc_marker_newline_guard(
+                        &mut writer,
+                        Terminator::from_config(&file_output_config),
+                    )?;
                     writeln!(writer, "---")?;
                 }
                 if file_output_config.output_format == OutputFormat::Yaml {
