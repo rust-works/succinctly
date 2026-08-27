@@ -610,7 +610,7 @@ what Stage 6 is left with is bad escapes only.
    documents. Making it reject them is the point of Stage 5, but it is a user-visible
    behaviour change to call out in the changelog, not just a bug fix.
 5. **Stage 5's pass is charged to every input, including the ones it cannot help.** This
-   is the exact trap the O5 `HAS_CR` work documented (see CLAUDE.md): measure against the
+   is the exact trap the O6 `HAS_CR` work documented (see CLAUDE.md): measure against the
    workload where succinctly is *already fastest*, not the one where it is slowest. The
    +8%-on-the-cheapest-query figure above is the ceiling to defend; anything worse means
    the pass is in the wrong place.
