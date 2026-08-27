@@ -24,6 +24,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::classify_cargo_run_exit;
+
 /// Maximum retries for `cargo run` commands that fail with exit code 101.
 /// Handles flaky failures from cargo lock contention when tests run in parallel
 /// (same rationale as the other CLI integration tests).
@@ -49,16 +53,15 @@ fn run(args: &[&str], stdin: &str) -> Result<String> {
         }
 
         let output = cmd.wait_with_output()?;
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        // Exit code 101 often indicates cargo lock contention; retry.
-        if exit_code == 101 && attempt + 1 < MAX_CARGO_RETRIES {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(exit_code) =
+            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
+        else {
             std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
             continue;
-        }
+        };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if exit_code != 0 {
             anyhow::bail!("`succinctly {}` failed: {stderr}", args.join(" "));
         }
 
