@@ -50,7 +50,12 @@ impl std::error::Error for FrontMatterError {}
 
 /// A leading UTF-8 BOM, if present, sits before the `---` fence rather than
 /// inside it -- common in Markdown files saved by Windows editors.
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+///
+/// `pub(crate)` rather than private: `jq_runner.rs`'s own `--seq` "no RS
+/// byte anywhere" diagnostic (#1525) strips the same 3 bytes before its
+/// own line/column count, matching real jq's identical BOM-stripping
+/// there.
+pub(crate) const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Split `input` into its YAML front matter and trailing body.
 ///
