@@ -1508,6 +1508,32 @@ fn test_ascii_output_still_escapes_in_compact_inplace_mode_1693() -> Result<()> 
     Ok(())
 }
 
+/// #1693 code review: routing `--ascii-output` to the DOM path (the fix
+/// above) reopens `can_stream_pretty_or_colored`'s duplicate-key collapse
+/// (#442/#748/#809) for compact mode specifically -- but pretty mode already
+/// had this exact tradeoff before #1693 touched this function (its own
+/// `can_stream_pretty_or_colored && !ascii_output` gate already forced DOM
+/// for `--ascii-output`, collapse included), so this pins compact mode as
+/// now *consistent* with that pre-existing behavior, not a new regression
+/// introduced from a clean baseline. See the `can_stream_json_output_style`
+/// comment in `yq_runner.rs` and #1700 for the real fix (ASCII-escaping
+/// support in the M2 streamers themselves, which would keep both correct
+/// escaping and duplicate-key safety at once).
+#[test]
+fn test_ascii_output_compact_and_pretty_agree_on_duplicate_key_collapse_1693() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0", "--ascii-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "{\"a\":2}\n");
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &["-o", "json", "--ascii-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "{\n  \"a\": 2\n}\n");
+
+    Ok(())
+}
+
 /// #1577: like [`test_duplicate_mapping_key_survives_slurp_multiple_sources`],
 /// but for JSON output -- duplicate keys within one source must survive
 /// `--slurp -o=json` combining documents from multiple files, not just a
