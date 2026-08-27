@@ -507,7 +507,20 @@ otherwise already correct, and it can be reverted independently if the perf gate
 - **`yaml validate`** grew the check too, reusing the `InvalidUtf8` variant that had been
   declared but never constructed — the scanner reads bytes and never decodes them, so
   nothing could ever have produced it.
-- **jq** substitutes U+FFFD and exits 0, byte-identical to jq 1.7.1 on the probes above.
+- **jq** substitutes U+FFFD and exits 0, byte-identical to jq 1.7.1 on the probes above --
+  but "the probes above" turned out not to cover every `Utf8ErrorKind`, and the
+  substitution *algorithm* itself was wrong for three of them. This landed using
+  `String::from_utf8_lossy`, which follows WHATWG's maximal-subpart rule: one U+FFFD per
+  byte once a sequence is known bad. jq 1.7.1 instead collapses a whole *structurally
+  valid* 3- or 4-byte sequence (a lead byte RFC 3629 lists as legitimate, i.e.
+  `0xE0`-`0xEF` or `0xF0`-`0xF4`) into a single U+FFFD when its *decoded value* is
+  overlong, a surrogate, or out of range -- `\xe0\x80\x80` gave three U+FFFD here against
+  jq's one. Fixed by #1617 (`substitute_invalid_utf8_jq_style`,
+  [src/text/utf8/mod.rs](../../src/text/utf8/mod.rs)), which special-cases exactly those
+  three `Utf8ErrorKind`s on a structurally-valid lead and falls back to the
+  already-agreeing WHATWG rule everywhere else (`0xC0`/`0xC1`/`0xF5`-`0xF7`, which RFC
+  3629 excludes from the valid-lead-byte set at any length, included -- jq treats those
+  like any other never-valid lead, unchanged).
   This also fixed two bugs in the opposite direction: the lazy path echoed the raw bytes,
   writing invalid UTF-8 to stdout, and the non-lazy path refused the file outright with
   `Failed to read file` when the read had in fact succeeded.

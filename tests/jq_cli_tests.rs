@@ -22342,6 +22342,105 @@ fn test_invalid_utf8_document_substitutes_replacement_char_1247() -> Result<()> 
     Ok(())
 }
 
+/// #1617: an overlong, surrogate, or out-of-range code point decoded from a
+/// *structurally valid* 3- or 4-byte lead byte must collapse to one U+FFFD
+/// for the whole sequence, matching jq 1.7.1 -- not one U+FFFD per byte,
+/// which is `String::from_utf8_lossy`'s WHATWG rule and #1247's own
+/// original substitution used unconditionally. Every byte sequence and
+/// expected output here was live-verified against the pinned jq 1.7.1
+/// binary; see the issue for the full table.
+#[test]
+fn test_utf8_wide_sequence_collapses_to_one_fffd_1617() -> Result<()> {
+    for (bytes, expected, label) in [
+        (&b"\xe0\x80\x80"[..], "\u{fffd}", "3-byte overlong"),
+        (&b"\xf0\x8f\xbf\xbf"[..], "\u{fffd}", "4-byte overlong"),
+        (&b"\xed\xa0\x80"[..], "\u{fffd}", "surrogate (low)"),
+        (&b"\xed\xbf\xbf"[..], "\u{fffd}", "surrogate (high)"),
+        (
+            &b"\xed\xa0\x80\xed\xb0\x80"[..],
+            "\u{fffd}\u{fffd}",
+            "surrogate pair (CESU-8): 2 fffd, not 6",
+        ),
+        (&b"\xf4\x90\x80\x80"[..], "\u{fffd}", "out of range"),
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(b"{\"a\":\"")?;
+        file.write_all(bytes)?;
+        file.write_all(b"\"}")?;
+        file.flush()?;
+        let path = file.path().to_str().unwrap();
+
+        let (stdout, stderr, code) = run_jq_full(&["-c", ".a", path], None)
+            .unwrap_or_else(|e| panic!("{label}: failed to run: {e}"));
+        assert_eq!(code, 0, "{label}: stderr: {stderr}");
+        assert_eq!(stdout.trim(), format!("\"{expected}\""), "{label}");
+    }
+    Ok(())
+}
+
+/// #1617: `0xC0`/`0xC1` (2-byte overlong) and `0xF5`-`0xF7` (out of range at
+/// every possible continuation) are excluded from the collapse above --
+/// RFC 3629 lists neither as a valid lead byte at any length, so jq treats
+/// them like any other never-valid lead: one U+FFFD per byte, unchanged
+/// from before #1617. `0xF5`-`0xF7` specifically is the case a naive
+/// "any OutOfRangeCodepoint on a 0xF0-0xF7 lead" rule would have wrongly
+/// collapsed, since our own validator's `code_point_bounds_violation`
+/// reports the identical `OutOfRangeCodepoint` kind for both.
+#[test]
+fn test_utf8_never_valid_lead_stays_one_fffd_per_byte_1617() -> Result<()> {
+    for (bytes, expected, label) in [
+        (&b"\xc0\xaf"[..], "\u{fffd}\u{fffd}", "2-byte overlong (C0)"),
+        (
+            &b"\xf5\x80\x80\x80"[..],
+            "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            "out of range, never-valid lead (F5)",
+        ),
+        (
+            &b"\xf6\x80\x80\x80"[..],
+            "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            "out of range, never-valid lead (F6)",
+        ),
+        (
+            &b"\xf7\x80\x80\x80"[..],
+            "\u{fffd}\u{fffd}\u{fffd}\u{fffd}",
+            "out of range, never-valid lead (F7)",
+        ),
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(b"{\"a\":\"")?;
+        file.write_all(bytes)?;
+        file.write_all(b"\"}")?;
+        file.flush()?;
+        let path = file.path().to_str().unwrap();
+
+        let (stdout, stderr, code) = run_jq_full(&["-c", ".a", path], None)
+            .unwrap_or_else(|e| panic!("{label}: failed to run: {e}"));
+        assert_eq!(code, 0, "{label}: stderr: {stderr}");
+        assert_eq!(stdout.trim(), format!("\"{expected}\""), "{label}");
+    }
+    Ok(())
+}
+
+/// #1617 on the `-R`/raw-input decode path (`get_inputs`'s own copy of the
+/// substitution, separate from `utf8_lossy_document`'s document-mode copy)
+/// -- both call the same shared `substitute_invalid_utf8_jq_style`, but
+/// each has its own call site, so each needs its own regression coverage.
+#[test]
+fn test_utf8_wide_sequence_collapses_raw_input_1617() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a")?;
+    file.write_all(b"\xe0\x80\x80")?;
+    file.write_all(b"b\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"a\u{fffd}b\"");
+    Ok(())
+}
+
 /// #1247 guard: the substitution pass must leave valid multi-byte content
 /// byte-for-byte alone -- it runs on every document, so a false positive
 /// would corrupt ordinary files.

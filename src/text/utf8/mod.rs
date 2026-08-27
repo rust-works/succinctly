@@ -672,6 +672,128 @@ pub fn format_byte(byte: u8) -> String {
     }
 }
 
+/// Lossily decode `input` as UTF-8, substituting invalid sequences with
+/// U+FFFD using jq 1.7.1's own maximal-subpart rule rather than
+/// `String::from_utf8_lossy`'s WHATWG rule (#1617).
+///
+/// The two rules agree on four of `Utf8ErrorKind`'s six cases -- an
+/// invalid lead byte, an invalid continuation byte, a truncated sequence,
+/// and a 2-byte overlong encoding (`0xC0`/`0xC1`, which WHATWG treats as
+/// an immediately-invalid lead rather than a would-be sequence) -- so
+/// this only special-cases the remaining two: an overlong, surrogate, or
+/// out-of-range code point decoded from a *structurally valid* 3- or
+/// 4-byte lead. There, jq consumes the whole sequence as one unit (one
+/// U+FFFD); WHATWG's maximal subpart restarts after just the lead byte
+/// (one U+FFFD per byte) since the sequence's *decoded value*, not its
+/// shape, is what's wrong. Live-verified against the pinned jq 1.7.1
+/// binary for all six kinds, including the untested-by-#1617's-own-issue
+/// invalid-continuation-byte case (confirmed to already agree).
+///
+/// # Examples
+///
+/// ```
+/// use succinctly::text::utf8::substitute_invalid_utf8_jq_style;
+///
+/// // Overlong 3-byte sequence: one U+FFFD for the whole sequence, not one per byte.
+/// assert_eq!(substitute_invalid_utf8_jq_style(&[0xE0, 0x80, 0x80]), "\u{FFFD}");
+///
+/// // Already-agreeing case (invalid lead byte): unchanged from WHATWG's rule.
+/// assert_eq!(substitute_invalid_utf8_jq_style(&[0xFF, 0xFE]), "\u{FFFD}\u{FFFD}");
+/// ```
+pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
+    // Appends `input[a..b]`, a span this function has already established
+    // is well-formed UTF-8 via a prior `validate_utf8` call -- re-checked
+    // here rather than taken on faith via `from_utf8_unchecked`, since
+    // this path only runs on already-malformed input (never the hot,
+    // valid-document path `unsafe_code = "deny"`'s per-file carve-outs
+    // are reserved for).
+    fn push_validated(out: &mut String, input: &[u8], a: usize, b: usize) {
+        out.push_str(core::str::from_utf8(&input[a..b]).expect("already validated"));
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut pos = 0;
+    while pos < input.len() {
+        match validate_utf8(&input[pos..]) {
+            Ok(()) => {
+                push_validated(&mut out, input, pos, input.len());
+                break;
+            }
+            Err(e) => {
+                let abs_offset = pos + e.offset;
+                let lead = input[abs_offset];
+                // RFC 3629 lists 0xE0-0xEF and 0xF0-0xF4 as valid lead
+                // bytes (just with a narrowed continuation range to avoid
+                // overlong/surrogate/out-of-range); jq collapses a bad
+                // *value* from one of those into one U+FFFD. 0xC0/0xC1 and
+                // 0xF5-0xF7 are never valid at any length regardless of
+                // continuation bytes -- jq (like WHATWG) treats those as
+                // an immediately-invalid lead instead, one U+FFFD per
+                // byte, same as any other `InvalidLeadByte` (falls to the
+                // final `else` arm below, not this one). Live-verified
+                // `F5 80 80 80`/`F6 80 80 80`/`F7 80 80 80` all give 4x
+                // U+FFFD against the pinned oracle, not the 1x this arm
+                // would otherwise produce for an in-range 4-byte lead.
+                // 0xE0-0xEF (3-byte) and 0xF0-0xF4 (4-byte) are contiguous,
+                // so one range covers both; `seq_len` below still keys off
+                // `lead <= 0xEF` to pick 3 vs. 4.
+                let is_wide_bounds_violation = matches!(
+                    e.kind,
+                    Utf8ErrorKind::OverlongEncoding
+                        | Utf8ErrorKind::SurrogateCodepoint
+                        | Utf8ErrorKind::OutOfRangeCodepoint
+                ) && matches!(lead, 0xE0..=0xF4);
+
+                if is_wide_bounds_violation {
+                    // `abs_offset` is this sequence's own lead byte (see
+                    // `validate_utf8_scalar`'s `err_at(input, pos, ...)`
+                    // calls for these three kinds), so everything before
+                    // it is already-confirmed-valid.
+                    push_validated(&mut out, input, pos, abs_offset);
+                    out.push('\u{FFFD}');
+                    let seq_len = if lead <= 0xEF { 3 } else { 4 };
+                    pos = abs_offset + seq_len;
+                } else if matches!(e.kind, Utf8ErrorKind::TruncatedSequence) {
+                    // Only ever reported when `pos + seq_len > input.len()`
+                    // -- i.e. only at the very end of `input` -- so the
+                    // whole truncated tail is one maximal subpart and
+                    // this is always the loop's last iteration.
+                    push_validated(&mut out, input, pos, abs_offset);
+                    out.push('\u{FFFD}');
+                    pos = input.len();
+                } else if matches!(e.kind, Utf8ErrorKind::InvalidContinuationByte) {
+                    // Unlike the other kinds, `abs_offset` here is the
+                    // *offending* byte, not this sequence's lead -- walk
+                    // back over the continuation bytes already confirmed
+                    // valid for this specific sequence to find its start,
+                    // then rescan the offending byte itself (WHATWG
+                    // restarts scanning there, it isn't skipped).
+                    let mut seq_start = abs_offset - 1;
+                    while seq_start > pos && is_continuation_byte(input[seq_start]) {
+                        seq_start -= 1;
+                    }
+                    push_validated(&mut out, input, pos, seq_start);
+                    out.push('\u{FFFD}');
+                    pos = abs_offset;
+                } else {
+                    // Either a real `InvalidLeadByte` (a stray
+                    // continuation byte, or a never-valid lead in
+                    // 0xF8-0xFF), or one of `OverlongEncoding` /
+                    // `OutOfRangeCodepoint` on a never-valid-at-any-length
+                    // lead byte (0xC0/0xC1/0xF5-0xF7, excluded from
+                    // `is_wide_bounds_violation` above) -- both are a
+                    // single byte with no sequence in progress, so
+                    // WHATWG's maximal subpart is that one byte alone.
+                    push_validated(&mut out, input, pos, abs_offset);
+                    out.push('\u{FFFD}');
+                    pos = abs_offset + 1;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2656,6 +2778,214 @@ mod validate_utf8_differential_tests {
                 expected,
                 "broadword differed from scalar on {bytes:02x?}"
             );
+        }
+    }
+}
+
+/// Regression tests for #1617: `substitute_invalid_utf8_jq_style` must match
+/// jq 1.7.1's own maximal-subpart rule, not `String::from_utf8_lossy`'s
+/// WHATWG rule. Every expected value below was live-verified against the
+/// pinned `/usr/bin/jq` 1.7.1 binary (see the issue for the full table).
+#[cfg(test)]
+mod substitute_invalid_utf8_jq_style_tests {
+    use super::*;
+
+    #[test]
+    fn valid_input_is_unchanged() {
+        assert_eq!(substitute_invalid_utf8_jq_style(b"hello"), "hello");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style("日本語".as_bytes()),
+            "日本語"
+        );
+        assert_eq!(substitute_invalid_utf8_jq_style(b""), "");
+    }
+
+    #[test]
+    fn invalid_lead_byte_is_one_fffd_per_byte() {
+        // Already agreed with jq before #1617; must stay unchanged.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xFF]), "\u{FFFD}");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xFF, 0xFE]),
+            "\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0x80]), "\u{FFFD}");
+    }
+
+    #[test]
+    fn truncated_sequences_collapse_to_one_fffd() {
+        // Already agreed with jq before #1617; must stay unchanged.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xC2]), "\u{FFFD}");
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, 0x80]), "\u{FFFD}");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80]),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn two_byte_overlong_c0_c1_is_one_fffd_per_byte() {
+        // 0xC0/0xC1 can never produce a valid (non-overlong) 2-byte
+        // sequence at any continuation value -- jq treats the lead byte
+        // itself as immediately invalid, same as any other never-valid
+        // lead, not as "collapse the whole sequence" (unlike 3-/4-byte
+        // overlong on an otherwise-valid lead). Already agreed with jq
+        // before #1617; must stay unchanged.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xC0, 0xAF]),
+            "\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn three_byte_overlong_collapses_to_one_fffd() {
+        // The #1617 fix: jq collapses the whole structurally-valid 3-byte
+        // sequence into one U+FFFD; WHATWG/`from_utf8_lossy` would give 3.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xE0, 0x80, 0x80]),
+            "\u{FFFD}"
+        );
+        // Second byte below the narrowed A0 threshold, still a
+        // structurally valid lead -- same collapse.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xE0, 0x9F, 0xBF]),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn four_byte_overlong_collapses_to_one_fffd() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x8F, 0xBF, 0xBF]),
+            "\u{FFFD}"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x80, 0x80, 0x80]),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn surrogate_codepoints_collapse_to_one_fffd() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xED, 0xA0, 0x80]),
+            "\u{FFFD}"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xED, 0xBF, 0xBF]),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn surrogate_pair_cesu8_gives_two_fffd_not_six() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]),
+            "\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_on_valid_lead_collapses_to_one_fffd() {
+        // F4 90 80 80 decodes to U+110000, one past U+10FFFF -- F4 itself
+        // is a structurally valid 4-byte lead (F0-F4 per RFC 3629).
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF4, 0x90, 0x80, 0x80]),
+            "\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_on_never_valid_lead_is_one_fffd_per_byte() {
+        // F5-F7 can NEVER decode to <= U+10FFFF regardless of
+        // continuation bytes (minimum for F5 is already 0x140000) -- RFC
+        // 3629 excludes them from the valid-lead-byte set entirely, so
+        // jq treats them like C0/C1: one U+FFFD per byte, not a
+        // whole-sequence collapse. This is the one case #1617's own issue
+        // didn't test and would have been wrongly collapsed by a naive
+        // "any OutOfRangeCodepoint on 0xF0-0xF7" rule.
+        for lead in [0xF5u8, 0xF6, 0xF7] {
+            let input = [lead, 0x80, 0x80, 0x80];
+            assert_eq!(
+                substitute_invalid_utf8_jq_style(&input),
+                "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}",
+                "lead byte {lead:#04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_lead_f8_ff_is_one_fffd_per_byte() {
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF8, 0x80, 0x80, 0x80, 0x80]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+    }
+
+    #[test]
+    fn invalid_continuation_byte_rescans_the_offending_byte() {
+        // Already agreed with jq before #1617; must stay unchanged. The
+        // offending byte is rescanned (not skipped), so it reappears as
+        // its own literal character when it's plain ASCII.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xE1, 0x41, b'b', b'c']),
+            "\u{FFFD}Abc"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xE1, 0x80, 0x41, b'b', b'c']),
+            "\u{FFFD}Abc"
+        );
+    }
+
+    #[test]
+    fn valid_prefix_and_suffix_around_a_bad_sequence_are_preserved() {
+        let mut input = b"before ".to_vec();
+        input.extend_from_slice(&[0xE0, 0x80, 0x80]);
+        input.extend_from_slice(b" after");
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&input),
+            "before \u{FFFD} after"
+        );
+    }
+
+    #[test]
+    fn multiple_bad_sequences_each_get_their_own_substitution() {
+        let mut input = vec![0xE0, 0x80, 0x80];
+        input.push(b'-');
+        input.extend_from_slice(&[0xED, 0xA0, 0x80]);
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&input),
+            "\u{FFFD}-\u{FFFD}"
+        );
+    }
+
+    /// `substitute_invalid_utf8_jq_style` must always produce valid UTF-8
+    /// (a `String`, not just "doesn't panic") on arbitrary bytes, never
+    /// panicking on the internal `.expect("already validated")` calls.
+    #[test]
+    fn never_panics_on_random_bytes() {
+        // Tiny deterministic xorshift64 RNG, same shape as
+        // `validate_utf8_differential_tests`'s own (not shared across
+        // modules -- that one is private to it).
+        struct Rng(u64);
+        impl Rng {
+            fn next_u32(&mut self) -> u32 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                (x >> 32) as u32
+            }
+            fn below(&mut self, n: u32) -> u32 {
+                self.next_u32() % n
+            }
+        }
+
+        let mut rng = Rng(0x1617_1617_1617_1617);
+        for _ in 0..5_000 {
+            let len = rng.below(64) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (rng.next_u32() & 0xFF) as u8).collect();
+            let _ = substitute_invalid_utf8_jq_style(&bytes);
         }
     }
 }
