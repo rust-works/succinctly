@@ -23184,6 +23184,70 @@ fn test_jq_combinations_n_moderate_n_large_base_array_does_not_abort_1669() -> R
     Ok(())
 }
 
+/// #1720: a multi-output `n` expression sums each output's arity into a
+/// running `usize` total *before* any of #1669's allocation guards above
+/// ever run -- that sum itself can overflow with as few as two large
+/// outputs, independent of every guard above (all of which assume an
+/// already-summed, already-valid `n`). Confirmed live before this fix:
+/// `[1] | combinations((9223372036854775807, 9223372036854775807, 3))`
+/// aborted a debug build (`attempt to add with overflow`) and silently
+/// wrapped to a wrong answer (rather than erroring) in release. Real jq
+/// hangs on this exact shape instead of erroring (confirmed live against
+/// the pinned jq 1.7.1 binary, ADR-0018), so this is the same "would take
+/// the host process down" exception `docs/compliance/jq/limitations.md`
+/// already documents for #1669, not a new divergence.
+#[test]
+fn test_jq_combinations_n_arity_sum_overflow_does_not_abort_1720() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "combinations((9223372036854775807, 9223372036854775807, 3))",
+        ],
+        Some("[1]"),
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("arity overflowed"), "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1720 review: a trailing `?` at the call site catches the new overflow
+/// error the same way it already catches #1669's sibling allocation-guard
+/// errors (`EvalError::new`, not specially marked uncatchable) -- suppressed
+/// to no output rather than propagating, consistent behavior across every
+/// guard this function raises.
+#[test]
+fn test_jq_combinations_n_arity_sum_overflow_caught_by_optional_1720() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "combinations((9223372036854775807, 9223372036854775807, 3))?",
+        ],
+        Some("[1]"),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1720 review: this fix must not disturb ordinary multi-output `n` --
+/// arities that sum without overflowing still take the documented sum-of-
+/// arities path (`[1,2] | [combinations((1,2))] | length` == `combinations(3)`
+/// == 8, per `builtin_combinations_n`'s own doc comment), not per-output
+/// fan-out (which would give 2^1 + 2^2 == 6 instead).
+#[test]
+fn test_jq_combinations_n_multi_output_arity_sums_not_fans_out() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[combinations((1,2))] | length"], Some("[1,2]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "8");
+    Ok(())
+}
+
 /// #1669 review: `cartesian_product`'s only other coverage exercises the
 /// overflow-refusal path below (`try_reserve_product` failing before the
 /// loop body ever runs at all) -- this repo had no permanent test at any

@@ -13751,6 +13751,14 @@ fn cannot_allocate_combinations_count(n: usize) -> EvalError {
     EvalError::new(format!("Cannot allocate {n} elements for combinations"))
 }
 
+/// Distinct from both of the above: those blame a *valid* `n` that is too
+/// large to allocate for; this fires earlier, while summing `n`'s own
+/// per-output arities together, before there is a valid `n` to blame at all
+/// (#1720).
+fn combinations_arity_overflow() -> EvalError {
+    EvalError::new("combinations(n): n's arity overflowed while summing multiple outputs")
+}
+
 /// Evaluate `E[K]` — indexing by a computed key.
 ///
 /// jq compiles this as `K as $k | E | .[$k]`, and three consequences of that
@@ -30712,13 +30720,29 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // two outputs, so `combinations(1.5)` is `combinations(2)`.
     let mut n = 0usize;
     for n_value in &n_values {
-        n += match range_num(n_value) {
+        let arity = match range_num(n_value) {
             Ok(RangeNum::Int(i)) => i.max(0) as usize,
             Ok(RangeNum::Float(f)) if f > 0.0 => f.ceil() as usize,
             Ok(RangeNum::Float(_)) => 0,
             Err(_) if optional => return QueryResult::None,
             Err(e) => return QueryResult::Error(e),
         };
+        // #1720: two or more large per-output arities can overflow this
+        // running sum before `n` itself is even fully computed -- a
+        // different failure point from the allocation guards below, which
+        // all assume an already-valid `n`. `EvalError::new` (not gated by
+        // the local `optional` flag, same as the allocation guards below):
+        // confirmed live that a trailing `?` at the call site still catches
+        // it, matching those guards' own catchable behavior -- `optional`
+        // only short-circuits `range_num`'s own type-check errors above,
+        // not a capacity failure like this one. Real jq hangs indefinitely
+        // on this exact shape rather than erroring (confirmed live,
+        // ADR-0018) -- raising here instead is the documented "would take
+        // the host process down" exception.
+        let Some(next) = n.checked_add(arity) else {
+            return QueryResult::Error(combinations_arity_overflow());
+        };
+        n = next;
     }
 
     // Input must be an array
