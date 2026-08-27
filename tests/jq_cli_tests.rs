@@ -22806,6 +22806,35 @@ fn test_utf8_never_valid_lead_stays_one_fffd_per_byte_1617() -> Result<()> {
     Ok(())
 }
 
+/// #1717's fix reaches `@base64d`/`@urid` (#1719, see `yq_cli_tests.rs`'s
+/// own `test_jq_base64d_drops_*_1717` tests) but *not* this whole-document
+/// decode path (`utf8_lossy_document`) -- real jq's own trigger is scoped
+/// to each JSON string's own closing quote, but `utf8_lossy_document`
+/// substitutes the entire file's bytes in one pass before JSON structure
+/// is even parsed, so "last byte of the whole file" essentially never
+/// coincides with jq's actual trigger point. Pins the CURRENT (still
+/// divergent from jq) behavior as a deliberate regression guard, not a
+/// target to match -- see docs/compliance/jq/limitations.md's "fixed at
+/// function granularity, open at document granularity" section and #1743,
+/// which tracks closing this specific gap.
+#[test]
+fn test_invalid_utf8_document_drop_quirk_still_diverges_from_jq_1717() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"a\":\"\xe1\x41\"}")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    // Real jq 1.7.1 drops the 'A' entirely (confirmed live): `"\u{fffd}"`.
+    // succinctly keeps it -- `utf8_lossy_document` substitutes the whole
+    // file, and 'A' is not that whole file's own last byte (the closing
+    // `"}"` still follows it), so #1717's fix never activates here.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a", path], None).unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"\u{fffd}A\"");
+    Ok(())
+}
+
 /// #1617 on the `-R`/raw-input decode path (`get_inputs`'s own copy of the
 /// substitution, separate from `utf8_lossy_document`'s document-mode copy)
 /// -- both call the same shared `substitute_invalid_utf8_jq_style`, but

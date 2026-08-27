@@ -549,7 +549,9 @@ otherwise already correct, and it can be reverted independently if the perf gate
   coincides with "end of the whole buffer" the way it does for a base64/percent-decoded
   buffer -- the example above is still accurate post-#1717, even though jq's own trigger
   is not rare (it fires on any string ending in the right byte shape, however much more
-  content follows in the rest of the file).
+  content follows in the rest of the file). Closing this gap would need per-JSON-string
+  substitution timing, tracked separately as
+  [#1743](https://github.com/rust-works/succinctly/issues/1743).
 - Scope was document input only until #1719 also routed `@base64d`/`@urid`'s jq-mode
   output through this same `substitute_invalid_utf8_jq_style` call (for the
   overlong/surrogate/out-of-range case). At the time, this inherited the #1717 quirk
