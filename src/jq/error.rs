@@ -1014,9 +1014,10 @@ impl EvalError {
     /// *where* the error was caught (a bare postfix `?` on the primitive
     /// that raised it vs. anything else), both of these mean the same thing
     /// at every call site that checks them: never suppressed by `?`, never
-    /// handed to a `catch` handler. A future always-uncatchable error class
-    /// only needs to be added here, not hand-copied into every `?`/`try`
-    /// dispatch that currently ANDs the two checks together.
+    /// handed to a `catch` handler. Only `resolve_node`'s `Expr::Try` arm
+    /// ANDs the two checks together today, but a future always-uncatchable
+    /// error class only needs to be added here, not hand-copied into
+    /// whichever `?`/`try` dispatch sites grow the same check next.
     pub fn is_uncatchable(&self) -> bool {
         self.is_invalid_path_expression() || self.is_decode_failure()
     }

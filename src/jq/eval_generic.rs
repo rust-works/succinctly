@@ -380,10 +380,12 @@ fn to_owned_for_diagnostic<V: DocumentValue>(value: &V, cursor: Option<V::Cursor
 
 /// The shared "is this a decode failure, an optional no-op, or a genuine
 /// type error" three-way check every native-arm dispatcher (`Iterate`,
-/// `Map`, `Length`, `Keys`, `KeysUnsorted`, `ToNumber`) needs once its own
-/// type-specific branches are exhausted -- decode-failure must be checked
-/// *before* `optional` (#1620), not after, so `.a?` on an undecodable
-/// string still raises rather than silently swallowing it.
+/// `Map`, `Length`, `Keys`, `KeysUnsorted`, `ToEntries`, `ToNumber`) needs
+/// once its own type-specific branches are exhausted -- decode-failure must
+/// be checked *before* `optional` (#1620), not after, so `.a?` on an
+/// undecodable string still raises rather than silently swallowing it.
+/// `ToEntries` passes `optional: false` unconditionally rather than
+/// threading it through -- see that call site's own comment for why.
 ///
 /// `fallback` is only called for the genuine type-error case, so it can
 /// build a builtin-specific `EvalError` (`cannot_iterate_with`,
