@@ -3096,6 +3096,81 @@ fn test_multidoc_input_with_no_doc_flag_inplace_evaluated_1699() -> Result<()> {
     Ok(())
 }
 
+/// #1701: `-0`/`--nul-output` was silently ignored whenever the M2 fast path
+/// was taken -- `stream_cursor!` hardcoded a bare newline terminator
+/// unconditionally, same root cause and fix shape as #1699's `--no-doc` gap
+/// in the same macro. Confirmed live to still terminate with `\n` on
+/// unmodified `main`.
+#[test]
+fn test_nul_output_identity_1701() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\0");
+
+    // Baseline: without -0, still newline-terminated.
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\n");
+
+    Ok(())
+}
+
+/// Same fix, evaluated (not identity) path.
+#[test]
+fn test_nul_output_evaluated_1701() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\0");
+    Ok(())
+}
+
+/// Same fix, `--inplace` (#1701).
+#[test]
+fn test_nul_output_inplace_1701() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-0")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read(input_file.path())?;
+    assert_eq!(rewritten, b"a: 1\0");
+
+    Ok(())
+}
+
+/// #1701: `--join-output` has the identical gap -- it should suppress the
+/// trailing terminator entirely, but the M2 fast path always wrote a bare
+/// newline regardless. Confirmed live on unmodified `main`.
+#[test]
+fn test_join_output_identity_1701() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &["--join-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1");
+    Ok(())
+}
+
+/// Same fix, multiple results (evaluated, `.[]`) -- real join-output
+/// concatenates every result with no separator at all.
+#[test]
+fn test_join_output_multiple_results_1701() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".[]",
+        "[\"hello\", \"world\"]\n",
+        &["-o", "json", "--join-output"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\"hello\"\"world\"");
+    Ok(())
+}
+
 #[test]
 fn test_split_doc_json_output() -> Result<()> {
     // JSON output should not get --- separators

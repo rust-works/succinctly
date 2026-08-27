@@ -4,7 +4,6 @@
 //! YAML semi-indexing and jq expression evaluator.
 
 use anyhow::{Context, Result};
-use core::fmt::Write as FmtWrite;
 use indexmap::IndexMap;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
@@ -1872,13 +1871,61 @@ impl SplitDocState {
     }
 }
 
+/// Which terminator (if any) follows a written value, per `-0`/`--nul-output`
+/// and `-j`/`--join-output`. Matches real yq's precedence: NUL wins over
+/// join (`-0 -j` still separates on NUL, not nothing), and a bare newline is
+/// the default when neither is set.
+///
+/// Split out from [`write_terminator`] (#1701) so the same three-way choice
+/// can also drive the M2 fast path's own terminator writes -- previously
+/// `stream_cursor!` hardcoded a bare newline unconditionally, ignoring both
+/// flags whenever the fast path was taken (confirmed live on unmodified
+/// `main`, same root cause and fix shape as #1699's `--no-doc` gap in the
+/// same macro).
+#[derive(Clone, Copy)]
+enum Terminator {
+    Nul,
+    Newline,
+    None,
+}
+
+impl Terminator {
+    fn from_config(nul_output: bool, join_output: bool) -> Self {
+        if nul_output {
+            Self::Nul
+        } else if !join_output {
+            Self::Newline
+        } else {
+            Self::None
+        }
+    }
+
+    /// Write this terminator to an `io::Write` sink (the M2 path's own
+    /// `$writer`, and every DOM-path caller of `write_terminator`).
+    fn write_io<W: Write>(self, writer: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::Nul => writer.write_all(&[0]),
+            Self::Newline => writeln!(writer),
+            Self::None => Ok(()),
+        }
+    }
+
+    /// Write this terminator to a `core::fmt::Write` sink -- the M2 path's
+    /// per-result callbacks passed into `stream_yaml`/`stream_json`, which
+    /// write into a buffered `fmt::Write` target rather than `$writer`
+    /// itself.
+    fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
+        match self {
+            Self::Nul => writer.write_char('\0'),
+            Self::Newline => writer.write_char('\n'),
+            Self::None => Ok(()),
+        }
+    }
+}
+
 /// Write the appropriate line terminator based on output config.
 fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<()> {
-    if config.nul_output {
-        writer.write_all(&[0])?;
-    } else if !config.join_output {
-        writeln!(writer)?;
-    }
+    Terminator::from_config(config.nul_output, config.join_output).write_io(writer)?;
     Ok(())
 }
 
@@ -3389,14 +3436,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // scope at definition time, not at each expansion site. `$fragment:expr`
     // parameters don't have that problem — they always evaluate in the
     // caller's own scope — hence passing color as `$use_color:expr`.
-    // `no_doc` is threaded the same way (#1699 code review), even though
-    // nothing currently shadows `.no_doc` to a different value the way
-    // `--inplace` does for `.use_color` (every `OutputConfig::for_source`
-    // copies `no_doc` through unchanged) -- a bare reference would only be
-    // safe by that coincidence, and would silently read the wrong value the
-    // day something *does* start varying `no_doc` per source/file.
+    // `no_doc`/`nul_output`/`join_output` are threaded the same way (#1699,
+    // #1701 code review), even though nothing currently shadows any of them
+    // to a different value the way `--inplace` does for `.use_color` (every
+    // `OutputConfig::for_source` copies all three through unchanged) -- a
+    // bare reference would only be safe by that coincidence, and would
+    // silently read the wrong value the day something *does* start varying
+    // one of them per source/file.
     macro_rules! stream_cursor {
-        ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr, $no_doc:expr) => {{
+        ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr, $no_doc:expr, $nul_output:expr, $join_output:expr) => {{
+            let terminator = Terminator::from_config($nul_output, $join_output);
             if $is_yaml {
                 // M2 YAML path: YAML output streaming
                 if is_identity {
@@ -3409,7 +3458,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                         $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
                     })?;
-                    writeln!($writer)?;
+                    terminator.write_io($writer)?;
                     // Streaming skips evaluation, so inspect the document
                     // value directly to keep `-e` falsy tracking (#178).
                     if args.exit_status {
@@ -3431,7 +3480,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $no_doc,
                     )?;
                     let stats = stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
-                        result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
+                        result.stream_yaml(out, yaml_indent, sort_keys, |w| terminator.write_fmt(w))
                     })?;
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
@@ -3446,7 +3495,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |s| output::colorize_json(s, &ColorScheme::default()),
                         |out| $cursor.stream_json(out, json_indent, sort_keys),
                     )?;
-                    writeln!($writer)?;
+                    terminator.write_io($writer)?;
                     // Streaming skips evaluation, so inspect the document
                     // value directly to keep `-e` falsy tracking (#178).
                     if args.exit_status {
@@ -3460,7 +3509,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $use_color,
                         |s| output::colorize_json(s, &ColorScheme::default()),
                         |out| {
-                            result.stream_json(out, json_indent, sort_keys, |w| w.write_str("\n"))
+                            result.stream_json(out, json_indent, sort_keys, |w| {
+                                terminator.write_fmt(w)
+                            })
                         },
                     )?;
                     any_truthy |= stats.any_truthy;
@@ -3506,7 +3557,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 can_yaml_fast_path,
                                 &mut yaml_doc_streamed,
                                 output_config.use_color,
-                                output_config.no_doc
+                                output_config.no_doc,
+                                output_config.nul_output,
+                                output_config.join_output
                             );
                             // See the matching check in the per-file loop below.
                             if sink.halted().is_some() {
@@ -3555,7 +3608,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     can_yaml_fast_path,
                                     &mut yaml_doc_streamed,
                                     output_config.use_color,
-                                    output_config.no_doc
+                                    output_config.no_doc,
+                                    output_config.nul_output,
+                                    output_config.join_output
                                 );
                             }
                         }
@@ -3618,7 +3673,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     can_yaml_fast_path,
                                     &mut yaml_doc_streamed,
                                     output_config.use_color,
-                                    output_config.no_doc
+                                    output_config.no_doc,
+                                    output_config.nul_output,
+                                    output_config.join_output
                                 );
                                 // Halt outranks every remaining document and
                                 // file (#791): without this, a `halt` nested
@@ -3682,7 +3739,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         can_yaml_fast_path,
                                         &mut yaml_doc_streamed,
                                         output_config.use_color,
-                                        output_config.no_doc
+                                        output_config.no_doc,
+                                        output_config.nul_output,
+                                        output_config.join_output
                                     );
                                     // See the matching check in the `Sequence` arm above.
                                     if sink.halted().is_some() {
@@ -4214,7 +4273,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         can_inplace_yaml_fast_path,
                                         &mut yaml_doc_streamed,
                                         false,
-                                        output_config.no_doc
+                                        output_config.no_doc,
+                                        output_config.nul_output,
+                                        output_config.join_output
                                     );
                                     // halt/halt_error (#791): matches the DOM
                                     // `--inplace` branch below — stop
@@ -4269,7 +4330,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         can_inplace_yaml_fast_path,
                                         &mut yaml_doc_streamed,
                                         false,
-                                        output_config.no_doc
+                                        output_config.no_doc,
+                                        output_config.nul_output,
+                                        output_config.join_output
                                     );
                                 }
                             }
