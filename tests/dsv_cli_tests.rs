@@ -15,7 +15,7 @@ use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::signal_death_error;
+use cargo_run_exit::exit_code_or_signal_death;
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -34,11 +34,9 @@ fn run_generate(size: &str, extra_args: &[&str]) -> Result<(String, String, i32)
         .stderr(Stdio::piped())
         .output()?;
 
+    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let Some(exit_code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, exit_code))
 }
 

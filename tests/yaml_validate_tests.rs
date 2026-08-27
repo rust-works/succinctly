@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::signal_death_error;
+use cargo_run_exit::exit_code_or_signal_death;
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -33,11 +33,9 @@ fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, Strin
         stdin.write_all(input.as_bytes())?;
     }
     let output = cmd.wait_with_output()?;
+    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, code))
 }
 
@@ -49,11 +47,9 @@ fn run_validate_file(path: &str, extra_args: &[&str]) -> Result<(String, String,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
+    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, code))
 }
 
@@ -243,11 +239,9 @@ fn run_yq_validate_stdin(input: &str, filter: &str) -> Result<(String, String, i
         stdin.write_all(input.as_bytes())?;
     }
     let output = cmd.wait_with_output()?;
+    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, code))
 }
 
@@ -286,11 +280,9 @@ fn yq_without_validate_accepts_the_same_invalid_yaml() -> Result<()> {
             stdin.write_all(b"a: b: c: d\n")?;
         }
         let output = cmd.wait_with_output()?;
+        let code = exit_code_or_signal_death(output.status, &output.stderr)?;
         let stdout = String::from_utf8(output.stdout)?;
         let stderr = String::from_utf8(output.stderr)?;
-        let Some(code) = output.status.code() else {
-            return Err(signal_death_error(output.status, &stderr));
-        };
         (stdout, stderr, code)
     };
     assert_eq!(code, 0);
