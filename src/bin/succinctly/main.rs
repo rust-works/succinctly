@@ -2276,6 +2276,8 @@ mod corpus_stats;
 mod dsv_bench;
 mod dsv_generators;
 mod env_config;
+#[cfg(feature = "bench-runner")]
+mod exit_status;
 mod front_matter;
 mod generators;
 mod jq_bench;

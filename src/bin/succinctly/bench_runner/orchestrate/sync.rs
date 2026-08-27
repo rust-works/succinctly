@@ -150,7 +150,9 @@ pub(crate) fn sync_node(
     let remote_binary = format!("{remote_dir}/succinctly");
     remote.upload(node, &local_binary, &remote_binary, connect_timeout)?;
 
-    let verify = remote.exec(node, &version_cmd, connect_timeout)?;
+    let verify = remote
+        .exec(node, &version_cmd, connect_timeout)
+        .with_context(|| format!("post-upload version check failed on node '{}'", node.name))?;
     if !verify.success() {
         anyhow::bail!(
             "post-upload version check failed on node '{}': {}",
