@@ -524,6 +524,13 @@ otherwise already correct, and it can be reverted independently if the perf gate
   This also fixed two bugs in the opposite direction: the lazy path echoed the raw bytes,
   writing invalid UTF-8 to stdout, and the non-lazy path refused the file outright with
   `Failed to read file` when the read had in fact succeeded.
+  **Not byte-identical even now**: #1617's own review found a separate, narrower jq quirk
+  it does not attempt to match -- when an `InvalidContinuationByte` error's rescanned byte
+  lands at a string's *last* byte, real jq silently drops it (`\xe1\x41` at a string's end
+  -> `"�"` in jq, `"�A"` here, matching `String::from_utf8_lossy`'s own answer).
+  Filed as [#1717](https://github.com/rust-works/succinctly/issues/1717); likely an
+  off-by-one in jq's own end-of-buffer lookahead rather than a designed rule, per ADR-0018
+  rule 4 the correct resolution if picked up is bug-for-bug replication, not "fixing" it.
 - Scope is document input only. `--raw-input` shares the jq path (jq substitutes there
   too); DSV input, `--arg`/`--argjson` and `--rawfile` are untouched.
 - **`--validate` is excluded, and getting that wrong was a live regression** caught in
