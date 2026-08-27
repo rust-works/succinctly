@@ -786,6 +786,26 @@ no filter the reference also accepts — an extension is not a divergence.
 **Wholly new syntax, unconditional** — `at_offset`/`at_position`, `@dsv`. Neither jq nor yq
 has anything resembling these; there is no reference token to gate them against.
 
+**A flag name real yq also uses, for something unrelated** — `-j`/`--join-output`. In yq
+mode this implements jq-style "no separator, concatenate raw" output (apparently ported from
+`JqCommand`'s own legitimate `-j`, which does match real jq's `-j`). Real yq's own `-j` means
+something else entirely: a deprecated alias for `--tojson` (forces `-o=json`, prints a
+deprecation warning to stderr); the long form `--join-output` does not exist in real yq at
+all (`Error: unknown flag: --join-output`), confirmed live against the pinned v4.53.3 binary:
+
+```bash
+$ yq -j '.'            <<< 'a: 1'   # Flag --tojson has been deprecated, please use -o=json instead
+                                     # {"a": 1}
+$ yq --join-output '.' <<< 'a: 1'   # Error: unknown flag: --join-output
+```
+
+This is the one extension in this file where the *name itself* collides with real yq surface
+rather than being wholly novel — a user who knows real yq's `-j` and reasonably expects
+`succinctly yq -j` to behave the same way gets something unrelated instead. Long-standing
+(predates #1701, ported alongside `JqCommand`'s own `-j`), found and recorded by
+[#1710](https://github.com/rust-works/succinctly/issues/1710). See
+[docs/guides/cli.md](../../guides/cli.md) for the same caveat on the flag's own listing.
+
 **jq-styled syntax real yq's lexer rejects, gated behind `--jq-extensions`, off by default
 ([#1512](https://github.com/rust-works/succinctly/issues/1512))** — `paths`, `getpath`,
 `leaf_paths`, `tostream`/`fromstream`/`truncate_stream`, `IN`, `ltrimstr`, `limit`,
