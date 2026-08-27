@@ -3223,6 +3223,61 @@ fn test_slurp_nul_output_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1701 code review round 2: the corruption bug found in
+/// `emit_yaml_doc_separator` also existed, independently, in every DOM-path
+/// document-separator writer -- `SplitDocState::write_separator`, the
+/// `--eval-all` branch's own inline check, and the "standard" (non-M2,
+/// non-slurp) multi-file loop's inline check. `.a + 0` is not M2-eligible
+/// (arithmetic forces the DOM path), so this exercises the standard loop's
+/// fix specifically.
+#[test]
+fn test_join_output_multidoc_dom_path_does_not_corrupt_1701() -> Result<()> {
+    let input = "a: 1\n---\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".a + 0", input, &["--join-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n---\n2");
+
+    Ok(())
+}
+
+/// Same fix, `--eval-all` (#1701 code review round 2).
+#[test]
+fn test_join_output_eval_all_does_not_corrupt_1701() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+    let (output, code) = run_yq_stdin(".", input, &["--eval-all", "--join-output"])?;
+    assert_eq!(code, 0);
+    // --eval-all combines every document into one evaluation, so `.`
+    // yields a single array result here -- no `---` boundary is involved,
+    // this just confirms the branch still round-trips cleanly.
+    assert_eq!(output, "- a: 1\n- b: 2");
+    Ok(())
+}
+
+/// Same fix, `--inplace` on the DOM path (#1701 code review round 2).
+#[test]
+fn test_join_output_inplace_dom_path_does_not_corrupt_1701() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+    writeln!(input_file, "---")?;
+    writeln!(input_file, "a: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("--join-output")
+        .arg(".a + 0")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "1\n---\n2");
+
+    Ok(())
+}
+
 #[test]
 fn test_split_doc_json_output() -> Result<()> {
     // JSON output should not get --- separators
