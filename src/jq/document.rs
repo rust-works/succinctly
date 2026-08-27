@@ -1869,7 +1869,9 @@ mod checked_len_tests {
 
 #[cfg(test)]
 mod key_display_string_tests {
-    use super::{effective_keys, key_display_string, key_is_malformed, DocumentValue};
+    use super::{
+        effective_keys, key_display_string, key_is_malformed, DocumentFields, DocumentValue,
+    };
     use crate::json::JsonIndex;
 
     /// A normal key stringifies exactly as `key_string()` already would --
@@ -1945,5 +1947,38 @@ mod key_display_string_tests {
             effective_keys(&fields, false).expect("well formed"),
             vec!["a".to_string(), "a".to_string(), "b".to_string()]
         );
+    }
+
+    /// `DocumentFields::keys()`'s per-field raise for a key the format's
+    /// grammar never allowed at all (#1194) -- distinct from a
+    /// decode-failure key, which `key_display_string` now folds into a
+    /// fallback spelling instead (#1642) and which this method no longer
+    /// raises on either. This trait method itself has had no production
+    /// caller since `effective_keys`'s own #1385 rewrite moved off it (see
+    /// that function's doc comment above), but it stays `pub` API surface
+    /// and must keep raising correctly for a caller outside this crate.
+    #[test]
+    fn document_fields_keys_raises_on_malformed_key_1194() {
+        let json: &[u8] = br"{123: 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let err = fields.keys().expect_err("a bare numeric key is not JSON");
+        assert!(err.message.contains("Invalid JSON text"), "{err:?}");
+    }
+
+    /// The post-walk sibling of the test above: `{invalid}`'s lone child
+    /// never pairs into a field at all, so nothing reaches the per-field
+    /// check -- only `ends_unpaired()` after the loop catches it, same
+    /// two-fault split as `test_jq_malformed_object_keys_raises_on_both_faults_1194`
+    /// in `tests/jq_cli_tests.rs` exercises through the CLI.
+    #[test]
+    fn document_fields_keys_raises_on_unpaired_trailing_field_1194() {
+        let json: &[u8] = br"{invalid}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let err = fields.keys().expect_err("an unpaired member is not JSON");
+        assert!(err.message.contains("Invalid JSON text"), "{err:?}");
     }
 }
