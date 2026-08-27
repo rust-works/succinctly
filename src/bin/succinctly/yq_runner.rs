@@ -1831,8 +1831,8 @@ fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> Commen
 /// `no_doc` suppresses the separator itself while still updating `streamed`
 /// (#1699) -- mirroring `SplitDocState::write_separator`'s existing
 /// `!config.no_doc` check, which this fast path had no equivalent of before:
-/// the DOM path (the eval-all loop above) already respects `--no-doc`, but
-/// this macro-shared M2 path wrote `---` unconditionally.
+/// the DOM path (the eval-all loop further below) already respects
+/// `--no-doc`, but this macro-shared M2 path wrote `---` unconditionally.
 fn emit_yaml_doc_separator<W: std::io::Write>(
     writer: &mut W,
     streamed: &mut bool,
@@ -3389,8 +3389,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // scope at definition time, not at each expansion site. `$fragment:expr`
     // parameters don't have that problem — they always evaluate in the
     // caller's own scope — hence passing color as `$use_color:expr`.
+    // `no_doc` is threaded the same way (#1699 code review), even though
+    // nothing currently shadows `.no_doc` to a different value the way
+    // `--inplace` does for `.use_color` (every `OutputConfig::for_source`
+    // copies `no_doc` through unchanged) -- a bare reference would only be
+    // safe by that coincidence, and would silently read the wrong value the
+    // day something *does* start varying `no_doc` per source/file.
     macro_rules! stream_cursor {
-        ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr) => {{
+        ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr, $no_doc:expr) => {{
             if $is_yaml {
                 // M2 YAML path: YAML output streaming
                 if is_identity {
@@ -3399,7 +3405,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // `$cursor` here is the whole document being
                     // redisplayed as itself - its own trailing comment,
                     // if any, must be kept (#710).
-                    emit_yaml_doc_separator($writer, $doc_streamed, true, output_config.no_doc)?;
+                    emit_yaml_doc_separator($writer, $doc_streamed, true, $no_doc)?;
                     stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                         $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
                     })?;
@@ -3422,7 +3428,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $writer,
                         $doc_streamed,
                         result.produces_output(),
-                        output_config.no_doc,
+                        $no_doc,
                     )?;
                     let stats = stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                         result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
@@ -3499,7 +3505,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 &mut writer,
                                 can_yaml_fast_path,
                                 &mut yaml_doc_streamed,
-                                output_config.use_color
+                                output_config.use_color,
+                                output_config.no_doc
                             );
                             // See the matching check in the per-file loop below.
                             if sink.halted().is_some() {
@@ -3547,7 +3554,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut writer,
                                     can_yaml_fast_path,
                                     &mut yaml_doc_streamed,
-                                    output_config.use_color
+                                    output_config.use_color,
+                                    output_config.no_doc
                                 );
                             }
                         }
@@ -3609,7 +3617,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     &mut writer,
                                     can_yaml_fast_path,
                                     &mut yaml_doc_streamed,
-                                    output_config.use_color
+                                    output_config.use_color,
+                                    output_config.no_doc
                                 );
                                 // Halt outranks every remaining document and
                                 // file (#791): without this, a `halt` nested
@@ -3672,7 +3681,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut writer,
                                         can_yaml_fast_path,
                                         &mut yaml_doc_streamed,
-                                        output_config.use_color
+                                        output_config.use_color,
+                                        output_config.no_doc
                                     );
                                     // See the matching check in the `Sequence` arm above.
                                     if sink.halted().is_some() {
@@ -4203,7 +4213,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut buf_writer,
                                         can_inplace_yaml_fast_path,
                                         &mut yaml_doc_streamed,
-                                        false
+                                        false,
+                                        output_config.no_doc
                                     );
                                     // halt/halt_error (#791): matches the DOM
                                     // `--inplace` branch below — stop
@@ -4257,7 +4268,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         &mut buf_writer,
                                         can_inplace_yaml_fast_path,
                                         &mut yaml_doc_streamed,
-                                        false
+                                        false,
+                                        output_config.no_doc
                                     );
                                 }
                             }

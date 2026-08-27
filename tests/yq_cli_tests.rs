@@ -2979,19 +2979,25 @@ fn test_multidoc_input_with_no_doc_flag_1699() -> Result<()> {
 }
 
 /// Same fix, evaluated (not identity) path -- `emit_yaml_doc_separator`'s
-/// second call site (#1699).
+/// second call site (#1699). `. as $x | $x` was tried first here but turned
+/// out not to reach the M2 path at all (`Expr::As` has no arm in
+/// `can_use_m2_streaming`, so it silently runs the DOM path instead, which
+/// already respected `--no-doc` before this fix -- caught by /code-review:
+/// the test passed identically pre- and post-fix). `.a` is a genuinely
+/// M2-eligible `Expr::Field`, confirmed live by its duplicate-key-preserving
+/// behavior (the DOM/`IndexMap` path collapses duplicates; M2 doesn't).
 #[test]
 fn test_multidoc_input_with_no_doc_flag_evaluated_1699() -> Result<()> {
     let input = "a: 1\n---\nb: 2\n";
 
-    let (output, code) = run_yq_stdin(". as $x | $x", input, &["--no-doc"])?;
+    let (output, code) = run_yq_stdin(".a", input, &["--no-doc"])?;
     assert_eq!(code, 0);
-    assert_eq!(output, "a: 1\nb: 2\n");
+    assert_eq!(output, "1\nnull\n");
 
     Ok(())
 }
 
-/// Same fix, `--inplace` (#1699).
+/// Same fix, `--inplace`'s identity call site (#1699).
 #[test]
 fn test_multidoc_input_with_no_doc_flag_inplace_1699() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
@@ -3011,6 +3017,31 @@ fn test_multidoc_input_with_no_doc_flag_inplace_1699() -> Result<()> {
     assert!(output.status.success());
     let rewritten = std::fs::read_to_string(input_file.path())?;
     assert_eq!(rewritten, "a: 1\nb: 2\n");
+
+    Ok(())
+}
+
+/// Same fix, `--inplace`'s evaluated call site (#1699) -- the sixth and
+/// last of `stream_cursor!`'s `emit_yaml_doc_separator` invocations.
+#[test]
+fn test_multidoc_input_with_no_doc_flag_inplace_evaluated_1699() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+    writeln!(input_file, "---")?;
+    writeln!(input_file, "b: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("--no-doc")
+        .arg(".a")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "1\nnull\n");
 
     Ok(())
 }
