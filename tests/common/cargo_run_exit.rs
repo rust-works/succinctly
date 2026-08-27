@@ -8,10 +8,21 @@
 //! code) in `jq_cli_tests.rs` alone; its own `/code-review` found the
 //! identical pattern hand-rolled in three more files (#1546). Sharing one
 //! copy here, rather than four independently drifting ones, is the fix.
+//!
+//! `signal_death_error`/`exit_code_or_signal_death`'s actual logic now lives
+//! in `src/bin/succinctly/exit_status.rs` (#1696 found the same
+//! `.code().unwrap_or(-1)` pattern hand-rolled a fifth time, in production
+//! orchestration code) -- included below via the same `#[path]` mechanism
+//! this file is itself included with, rather than re-hand-copied, so the
+//! two call sites can't drift apart again. This module's own wrappers keep
+//! every existing call site here on its established `&str` signature.
 
 #![allow(dead_code)] // Each consumer uses a different subset.
 
 use anyhow::Result;
+
+#[path = "../../src/bin/succinctly/exit_status.rs"]
+mod exit_status;
 
 /// Maximum retries for a `cargo run` command that fails with exit code 101,
 /// or whose child is killed by a signal (`ExitStatus::code()` returns `None`
@@ -26,26 +37,15 @@ use anyhow::Result;
 pub const MAX_CARGO_RETRIES: u32 = 3;
 
 /// Builds the "child was killed by signal N" error for a signal-terminated
-/// process (`ExitStatus::code()` returns `None` only in that case, on Unix),
-/// naming the signal and the captured stderr. Historically every call site
-/// below silently coerced this to `-1` via `.code().unwrap_or(-1)`, which
-/// renders as an inscrutable `left: -1, right: 0` with no indication a child
-/// was ever killed -- exactly what cost a wrong root-cause call in the #1459
-/// review (#1516).
+/// process, naming the signal and the captured stderr. Historically every
+/// call site below silently coerced this to `-1` via `.code().unwrap_or(-1)`,
+/// which renders as an inscrutable `left: -1, right: 0` with no indication a
+/// child was ever killed -- exactly what cost a wrong root-cause call in the
+/// #1459 review (#1516). Thin `&str` wrapper around
+/// `exit_status::signal_death_error` (see that module for the mechanism) so
+/// this file's existing callers don't all need to switch to raw bytes.
 pub fn signal_death_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
-    // `ExitStatus::code()` returns `None` only when the child was
-    // terminated by a signal (Unix) -- there is no other cause.
-    #[cfg(unix)]
-    let signal = {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    };
-    #[cfg(not(unix))]
-    let signal: Option<i32> = None;
-    anyhow::anyhow!(
-        "child was killed by signal {}; stderr:\n{stderr}",
-        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
-    )
+    exit_status::signal_death_error(status, stderr.as_bytes())
 }
 
 /// Extracts a real exit code from `status`, or builds [`signal_death_error`]
@@ -61,18 +61,13 @@ pub fn signal_death_error(status: std::process::ExitStatus, stderr: &str) -> any
 ///
 /// Also collapses the ~29 hand-written `let Some(code) = status.code() else
 /// { ... }` copies #1691's own fix introduced across 7 files into one
-/// definition, per that same review round.
+/// definition, per that same review round. Delegates to
+/// `exit_status::exit_code_or_signal_death`.
 pub fn exit_code_or_signal_death(
     status: std::process::ExitStatus,
     raw_stderr: &[u8],
 ) -> Result<i32> {
-    match status.code() {
-        Some(code) => Ok(code),
-        None => Err(signal_death_error(
-            status,
-            &String::from_utf8_lossy(raw_stderr),
-        )),
-    }
+    exit_status::exit_code_or_signal_death(status, raw_stderr)
 }
 
 /// Classifies a `cargo run` child's exit for a retry loop, so each call site

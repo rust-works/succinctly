@@ -9,6 +9,7 @@
 //! any network access.
 
 use super::config::NodeConfig;
+use crate::exit_status::exit_code_or_signal_death;
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Read;
@@ -208,14 +209,19 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ExecOutput> {
     let mut stdout_pipe = child.stdout.take().context("child had no stdout pipe")?;
     let mut stderr_pipe = child.stderr.take().context("child had no stderr pipe")?;
 
+    // Raw bytes, decoded only after the exit-code/signal check below: a
+    // signal-killed child can leave a truncated multi-byte UTF-8 sequence
+    // at the end of a buffer it was writing when killed, and a strict
+    // `read_to_string` discards *all* already-read output (not just the
+    // trailing partial sequence) the moment that happens (#1696 review).
     let stdout_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stdout_pipe.read_to_string(&mut buf);
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
         buf
     });
     let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf);
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
         buf
     });
 
@@ -232,40 +238,21 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ExecOutput> {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
 
-    let exit_code = status
-        .code()
-        .ok_or_else(|| signal_death_error(status, &stderr))?;
+    // Checked against the raw bytes, before either is decoded, so a
+    // signal-killed child (OOM kill, network drop, another process's
+    // `pkill`) is diagnosed by name instead of coerced into a fake `-1`
+    // exit code (#1696) — and so that check can never itself fail to
+    // decode (`String::from_utf8_lossy` below cannot fail).
+    let exit_code = exit_code_or_signal_death(status, &stderr_bytes)?;
 
     Ok(ExecOutput {
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         exit_code,
     })
-}
-
-/// Builds the "child was killed by signal N" error for a signal-terminated
-/// process (`ExitStatus::code()` returns `None` only in that case, on Unix).
-/// Mirrors `tests/common/cargo_run_exit.rs`'s `signal_death_error` (#1691) —
-/// duplicated rather than shared because production code can't depend on a
-/// `tests/` module. Without this, a signal-killed remote `ssh`/`rsync` child
-/// (OOM kill, network drop, another process's `pkill`) silently coerced to a
-/// fake exit code `-1`, reporting as a generic non-zero-exit failure with no
-/// indication a signal was ever involved (#1696).
-fn signal_death_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
-    #[cfg(unix)]
-    let signal = {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    };
-    #[cfg(not(unix))]
-    let signal: Option<i32> = None;
-    anyhow::anyhow!(
-        "child was killed by signal {}; stderr:\n{stderr}",
-        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
-    )
 }
 
 /// Recursively copy the *contents* of `src` into `dst` (creating `dst` if
@@ -372,6 +359,32 @@ mod tests {
         assert!(
             err.to_string().contains("signal 9"),
             "expected error to name signal 9, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn localhost_exec_signal_death_preserves_truncated_utf8_stderr() {
+        // Writes the first two bytes of a three-byte UTF-8 sequence (U+20AC)
+        // to stderr, then kills itself with SIGKILL before ever completing
+        // it -- exactly the truncated-multi-byte-sequence scenario that
+        // made a strict `read_to_string` silently discard *all* captured
+        // output, not just the trailing partial bytes (#1696 review). Only
+        // a raw-bytes capture, decoded lossily after the exit-code check,
+        // survives this: the invalid tail becomes a replacement character
+        // instead of erasing the whole buffer.
+        let err = SystemSsh
+            .exec(
+                &node("localhost"),
+                "printf '\\xe2\\x82' >&2; kill -9 $$",
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("signal 9"), "expected signal 9, got: {msg}");
+        assert!(
+            msg.contains('\u{FFFD}'),
+            "expected the truncated stderr bytes to survive as a replacement character, got: {msg}"
         );
     }
 
