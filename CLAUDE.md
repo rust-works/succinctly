@@ -791,14 +791,6 @@ For detailed documentation on optimization techniques used in this project, see 
   - **16-byte threshold + `#[inline(always)]`**: Both required to prevent regression (threshold alone still caused 3-5% regression)
   - Best for: YAML with long string values (logs, templates, embedded content)
   - See [docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-](docs/parsing/yaml.md#o3-simd-escape-scanning-for-json-output--accepted-) for full analysis
-- ✅ O5 (`HAS_CR` Const-Generic Specialization): **recovers most of the #324 CRLF-correctness cost**, issue #340
-  - `build_semi_index` SIMD-scans once for `\r`, then parses with `Parser::<false>` (LF-only) or `Parser::<true>` (#324 parser verbatim)
-  - Interleaved `yaml_bench` vs `c5dab403`, excl. block scalars: **M4 Pro +4.0% → +0.7%**, **7950X +11.0% → +4.7%**; x86 block scalars 31-34% *faster* than pre-#324
-  - End-to-end `dev bench yq` (32 configs) recovers fully: **7950X +5.0% → +0.8%**, **M4 Pro +2.3% → −0.2%** median; CRLF documents +1.1%/+0.5% (unchanged); binary +52 KB (+0.9%)
-  - **The gate is one-directional**: `true` is always correct, and the whole-input precheck proves no `\r` arm is reachable under `false`. An un-gated site is a missed optimization, never a bug — so gating can be applied incrementally and measured
-  - **Cost the estimate missed**: long quoted scalars regress +7-12%. The parser bulk-skips them at ~15 GB/s, so a second pass over the input is large next to the parse. Reusing the position-finding `define_escape_scanner!` first made it **+42%**; an existence-only scan (OR the chunk compares, reduce once) was needed
-  - Key insight: a precheck that enables a fast path is charged to *every* input, including the ones it cannot help — measure it against the workload where the parser is already fastest, not the one it is slowest
-  - See [docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization](docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization) for full analysis
 - ✅ O4 (seq_items Bitvector Elimination): **−12.5% build peak memory, 2-6% faster builds**, issues #75/#104/#106
   - Removed the stored `seq_items` bitvector; seq-item wrappers are derived from text (`-` + whitespace/EOI)
   - Branchless `matches!` derivation at both detection sites recovers the 7-15% query regression #106 found in the naive form
@@ -813,7 +805,15 @@ For detailed documentation on optimization techniques used in this project, see 
   - `size_of::<GenericItem<V>>()` measured unchanged (176/192 bytes) — the new variant fit inside the enum's existing footprint, no boxing needed
   - Key insight: a doc comment naming a redundancy (#1514) can be verified by reading the call graph, not just profiled; format-dependent magnitude (YAML full decode vs JSON single-byte dispatch) doesn't mean the underlying inefficiency isn't present in the cheaper format too
   - See [docs/parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-](docs/parsing/yaml.md#o5-lazy-keys-cursorvalue-reuse--accepted-) for full analysis
-- ✅ O5 (CS-Poppy Combined Sampling for BP Select): **4× smaller YAML select index**, mixed select1 speed by platform, issue #64
+- ✅ O6 (`HAS_CR` Const-Generic Specialization): **recovers most of the #324 CRLF-correctness cost**, issue #340
+  - `build_semi_index` SIMD-scans once for `\r`, then parses with `Parser::<false>` (LF-only) or `Parser::<true>` (#324 parser verbatim)
+  - Interleaved `yaml_bench` vs `c5dab403`, excl. block scalars: **M4 Pro +4.0% → +0.7%**, **7950X +11.0% → +4.7%**; x86 block scalars 31-34% *faster* than pre-#324
+  - End-to-end `dev bench yq` (32 configs) recovers fully: **7950X +5.0% → +0.8%**, **M4 Pro +2.3% → −0.2%** median; CRLF documents +1.1%/+0.5% (unchanged); binary +52 KB (+0.9%)
+  - **The gate is one-directional**: `true` is always correct, and the whole-input precheck proves no `\r` arm is reachable under `false`. An un-gated site is a missed optimization, never a bug — so gating can be applied incrementally and measured
+  - **Cost the estimate missed**: long quoted scalars regress +7-12%. The parser bulk-skips them at ~15 GB/s, so a second pass over the input is large next to the parse. Reusing the position-finding `define_escape_scanner!` first made it **+42%**; an existence-only scan (OR the chunk compares, reduce once) was needed
+  - Key insight: a precheck that enables a fast path is charged to *every* input, including the ones it cannot help — measure it against the workload where the parser is already fastest, not the one it is slowest
+  - See [docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization](docs/parsing/yaml.md#buying-it-back-the-has_cr-specialization) for full analysis
+- ✅ O7 (CS-Poppy Combined Sampling for BP Select): **4× smaller YAML select index**, mixed select1 speed by platform, issue #64
   - Replaced `WithSelect`'s sampled `(word, cumulative)` pairs with `WithCsPoppy`: `u32` entry points into BP's own rank directory (`rank_l1`/`rank_l2`) instead of a parallel structure
   - Step A (narrow `SelectIndex<u32>` for BP, `len <= u32::MAX` bits) + Step B (`WithCsPoppy`) together take the BP select index from 25% to 6.25% of the bitmap — a 4x reduction, measured via real `select_heap_size()`, not derived
   - **select1 speed is platform-dependent**: neutral-to-faster on Zen 4 (7950X), 5-15% slower on Apple M4 Pro — both measured via full (non-`--quick`) `bp_select_micro` runs on pinned hardware. Accepted despite the ARM regression because `BalancedParens::select1` on YAML's BP is reached only once per `at_offset`/`at_position`/`yq-locate` call, never the `.foo.bar` navigation hot path
