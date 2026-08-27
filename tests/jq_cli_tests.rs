@@ -2829,6 +2829,33 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
     Ok(())
 }
 
+/// #1642 follow-up: `-e`/`--exit-status` forces `JqValue::materialize()` on
+/// every result before `jq_runner.rs`'s own guarded `print_json` path ever
+/// runs (see `cursor_to_owned`'s doc comment in `src/jq/lazy.rs`) -- a
+/// second, independent materializer from the `-S`/`-s`/`.,.`  routes the
+/// test above covers, with its own `DisplayKeyGuard` call site that a fix
+/// touching only the other three left unexercised. Without `-e`, the same
+/// document streams both colliding keys through untouched (#1385: a
+/// decode-failure key is never a duplicate, so nothing raises); `-e` alone
+/// is what forces the raise.
+#[test]
+fn test_exit_status_materialize_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
+    let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
+
+    let (out, code) = run_jq_stdin(".", dup_doc, &["-c"])?;
+    assert_eq!(code, 0, "no -e: both keys should stream through untouched");
+    assert_eq!(out.trim(), r#"{"\ud800":1,"\ud800":2}"#);
+
+    let (out, err, code) = run_jq_full(&["-e", "-c", "."], Some(dup_doc))?;
+    assert_ne!(
+        code, 0,
+        "-e should raise rather than silently drop a value, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    Ok(())
+}
+
 /// #1514: `keys_unsorted | map(f)` and `keys_unsorted | .[]` no longer probe
 /// the whole object before the first key comes out — they dedup as they walk
 /// and switch to the exact collapsed list only once a hash repeats. That
