@@ -9,6 +9,10 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
 /// runs, since this file is itself gated on `cli`, and bakes the resulting
@@ -29,11 +33,12 @@ fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, Strin
         stdin.write_all(input.as_bytes())?;
     }
     let output = cmd.wait_with_output()?;
-    Ok((
-        String::from_utf8(output.stdout)?,
-        String::from_utf8(output.stderr)?,
-        output.status.code().unwrap_or(-1),
-    ))
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let Some(code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    Ok((stdout, stderr, code))
 }
 
 fn run_validate_file(path: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
@@ -44,11 +49,12 @@ fn run_validate_file(path: &str, extra_args: &[&str]) -> Result<(String, String,
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
-    Ok((
-        String::from_utf8(output.stdout)?,
-        String::from_utf8(output.stderr)?,
-        output.status.code().unwrap_or(-1),
-    ))
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let Some(code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    Ok((stdout, stderr, code))
 }
 
 #[test]
@@ -237,11 +243,12 @@ fn run_yq_validate_stdin(input: &str, filter: &str) -> Result<(String, String, i
         stdin.write_all(input.as_bytes())?;
     }
     let output = cmd.wait_with_output()?;
-    Ok((
-        String::from_utf8(output.stdout)?,
-        String::from_utf8(output.stderr)?,
-        output.status.code().unwrap_or(-1),
-    ))
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    let Some(code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    Ok((stdout, stderr, code))
 }
 
 #[test]
@@ -279,11 +286,12 @@ fn yq_without_validate_accepts_the_same_invalid_yaml() -> Result<()> {
             stdin.write_all(b"a: b: c: d\n")?;
         }
         let output = cmd.wait_with_output()?;
-        (
-            String::from_utf8(output.stdout)?,
-            String::from_utf8(output.stderr)?,
-            output.status.code().unwrap_or(-1),
-        )
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        let Some(code) = output.status.code() else {
+            return Err(signal_death_error(output.status, &stderr));
+        };
+        (stdout, stderr, code)
     };
     assert_eq!(code, 0);
     Ok(())

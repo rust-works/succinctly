@@ -13,20 +13,27 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use anyhow::Result;
+
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_succinctly")
 }
 
-fn run(args: &[&str]) -> (String, String, i32) {
+fn run(args: &[&str]) -> Result<(String, String, i32)> {
     let out = Command::new(bin())
         .args(args)
         .output()
         .expect("spawn succinctly");
-    (
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        out.status.code().unwrap_or(-1),
-    )
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let Some(code) = out.status.code() else {
+        return Err(signal_death_error(out.status, &stderr));
+    };
+    Ok((stdout, stderr, code))
 }
 
 fn write_config(dir: &Path, yaml: &str) -> String {
@@ -43,32 +50,34 @@ fn local_only_yaml(results_dir: &Path) -> String {
 }
 
 #[test]
-fn orchestrate_rejects_missing_config() {
+fn orchestrate_rejects_missing_config() -> Result<()> {
     let (_, stderr, code) = run(&[
         "bench",
         "orchestrate",
         "--config",
         "/nonexistent/nodes.yaml",
         "--all",
-    ]);
+    ])?;
 
     assert_ne!(code, 0);
     assert!(stderr.contains("Failed to read config file"), "{stderr}");
+    Ok(())
 }
 
 #[test]
-fn orchestrate_rejects_invalid_yaml() {
+fn orchestrate_rejects_invalid_yaml() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(dir.path(), "not: [valid, yaml");
 
-    let (_, stderr, code) = run(&["bench", "orchestrate", "--config", &config, "--all"]);
+    let (_, stderr, code) = run(&["bench", "orchestrate", "--config", &config, "--all"])?;
 
     assert_ne!(code, 0);
     assert!(stderr.contains("Failed to parse YAML config"), "{stderr}");
+    Ok(())
 }
 
 #[test]
-fn orchestrate_rejects_unknown_node_selection() {
+fn orchestrate_rejects_unknown_node_selection() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let results_dir = dir.path().join("results");
     let config = write_config(dir.path(), &local_only_yaml(&results_dir));
@@ -81,14 +90,15 @@ fn orchestrate_rejects_unknown_node_selection() {
         "--node",
         "nonexistent",
         "--all",
-    ]);
+    ])?;
 
     assert_ne!(code, 0);
     assert!(stderr.contains("No nodes selected"), "{stderr}");
+    Ok(())
 }
 
 #[test]
-fn orchestrate_dry_run_prints_plan_without_side_effects() {
+fn orchestrate_dry_run_prints_plan_without_side_effects() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let results_dir = dir.path().join("results");
     let config = write_config(dir.path(), &local_only_yaml(&results_dir));
@@ -100,7 +110,7 @@ fn orchestrate_dry_run_prints_plan_without_side_effects() {
         &config,
         "--dry-run",
         "corpus_stats",
-    ]);
+    ])?;
 
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Dry run"), "{stdout}");
@@ -109,6 +119,7 @@ fn orchestrate_dry_run_prints_plan_without_side_effects() {
         !results_dir.exists(),
         "dry-run must not create the results dir"
     );
+    Ok(())
 }
 
 /// Runs the real `SystemSsh` localhost path end-to-end: connectivity check,
@@ -118,12 +129,12 @@ fn orchestrate_dry_run_prints_plan_without_side_effects() {
 /// be built already; either way the orchestration plumbing must complete
 /// with exit 0 and produce its result files.
 #[test]
-fn orchestrate_local_only_node_runs_end_to_end() {
+fn orchestrate_local_only_node_runs_end_to_end() -> Result<()> {
     let dir = tempfile::tempdir().unwrap();
     let results_dir = dir.path().join("results");
     let config = write_config(dir.path(), &local_only_yaml(&results_dir));
 
-    let (_, stderr, code) = run(&["bench", "orchestrate", "--config", &config, "corpus_stats"]);
+    let (_, stderr, code) = run(&["bench", "orchestrate", "--config", &config, "corpus_stats"])?;
 
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stderr.contains("Orchestration run complete"), "{stderr}");
@@ -138,4 +149,5 @@ fn orchestrate_local_only_node_runs_end_to_end() {
     assert!(run_dir.join("metadata.json").exists());
     assert!(run_dir.join("results.jsonl").exists());
     assert!(run_dir.join("local/node_info.json").exists());
+    Ok(())
 }
