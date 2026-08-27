@@ -856,6 +856,25 @@ fn invalid_subpart_end(input: &[u8], pos: usize, len: usize) -> Option<usize> {
         // subpart is the lead plus whatever continuations were already
         // good; the offending byte itself is rescanned next iteration,
         // not skipped (WHATWG restarts scanning there).
+        //
+        // #1717: real jq instead *drops* that rescanned byte -- silently,
+        // with no U+FFFD of its own -- when both (a) it is the very last
+        // byte of `input` and (b) at least two continuation bytes are
+        // still missing (`shortfall`). Live-verified across every lead
+        // length that can produce a shortfall of 2+ (2-byte leads only
+        // ever reach shortfall 1, so never trigger this): shortfall 1
+        // always keeps the byte regardless of lead length (`\xe1\x80\x41`
+        // -> `"\u{FFFD}A"`, `\xf0\x90\x80\x41` -> `"\u{FFFD}A"`);
+        // shortfall 2+ drops it only at end-of-input (`\xe1\x41` ->
+        // `"\u{FFFD}"`, `\xf0\x41`/`\xf0\x80\x41` -> `"\u{FFFD}"`) and
+        // keeps it the moment any byte follows (`\xe1\x41\x42` ->
+        // `"\u{FFFD}AB"`, `\xf0\x41\x42\x43` -> `"\u{FFFD}ABC"`). Likely an
+        // off-by-one in jq's own end-of-buffer lookahead, not a designed
+        // rule -- reproduced bug-for-bug per ADR-0018 rule 4.
+        let shortfall = (seq_len - 1) - good_continuations;
+        if shortfall >= 2 && pos + 1 + good_continuations == len - 1 {
+            return Some(len);
+        }
         return Some(pos + 1 + good_continuations);
     }
 
@@ -2881,25 +2900,41 @@ mod substitute_invalid_utf8_jq_style_tests {
     /// continuation byte happened to fall near the end of `input` --
     /// short of `seq_len` total remaining bytes, but not because input
     /// ran out -- the old code misclassified it as truncation and
-    /// swallowed the *whole* remaining tail into one U+FFFD, silently
-    /// dropping valid trailing bytes it should have kept and rescanned
-    /// (e.g. `[0xE1, b'A']` gave `"\u{FFFD}"`, discarding `'A'`, instead
-    /// of `"\u{FFFD}A"`).
+    /// swallowed the *whole* remaining tail into one U+FFFD by the wrong
+    /// mechanism (a truncation collapse, not a rescanned-byte decision).
+    ///
+    /// The four assertions below all happen to land in #1717's own
+    /// drop-the-rescanned-byte territory (shortfall >= 2, byte is at the
+    /// absolute end of `input`) -- confirmed live against jq 1.7.1 --
+    /// so their *answer* now agrees with a one-U+FFFD collapse too. That
+    /// is not a coincidence this test stops distinguishing: it still
+    /// exercises the original bug's actual failure mode, because the old
+    /// truncation-misclassification bug did not require end-of-input at
+    /// all, and would have collapsed these same vectors even with
+    /// trailing content following (see
+    /// `any_trailing_byte_after_the_rescanned_byte_restores_normal_keep_behavior`,
+    /// which pins exactly that: trailing content is kept, not swallowed).
     #[test]
     fn invalid_continuation_near_eof_does_not_swallow_a_trailing_valid_byte() {
-        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, b'A']), "\u{FFFD}A");
-        assert_eq!(substitute_invalid_utf8_jq_style(&[0xF0, b'A']), "\u{FFFD}A");
+        // #1717: at the absolute end of input with shortfall >= 2, jq (and
+        // now this function) drops the rescanned byte rather than keeping
+        // it -- see the dedicated `drops_the_rescanned_byte_at_end_of_input_*`
+        // test above for the isolated case-by-case breakdown.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, b'A']), "\u{FFFD}");
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xF0, b'A']), "\u{FFFD}");
         assert_eq!(
             substitute_invalid_utf8_jq_style(&[0xF0, 0x90, b'A']),
-            "\u{FFFD}A"
+            "\u{FFFD}"
         );
         assert_eq!(
             substitute_invalid_utf8_jq_style(&[b'X', 0xE1, b'A']),
-            "X\u{FFFD}A"
+            "X\u{FFFD}"
         );
         // Genuine truncation (every available byte IS a valid
         // continuation, there just aren't enough of them) must still
-        // collapse to one U+FFFD, not regress to per-byte.
+        // collapse to one U+FFFD, not regress to per-byte. Unaffected by
+        // #1717 -- a completely different branch (`invalid_subpart_end`'s
+        // "ran out of bytes" case, not "hit an invalid byte").
         assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, 0x80]), "\u{FFFD}");
         assert_eq!(
             substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80]),
@@ -3081,6 +3116,73 @@ mod substitute_invalid_utf8_jq_style_tests {
             substitute_invalid_utf8_jq_style(&[0xE1, 0x80, 0x41, b'b', b'c']),
             "\u{FFFD}Abc"
         );
+    }
+
+    /// #1717: at the very end of `input` (nothing follows the rescanned
+    /// byte at all), real jq silently drops it instead of rescanning it --
+    /// but only when at least 2 continuation bytes are still missing
+    /// (`shortfall = (seq_len - 1) - good_continuations >= 2`). Live-
+    /// verified across every lead length that can reach shortfall 2+: a
+    /// 2-byte lead never can (its only failure mode is shortfall 1), so
+    /// this quirk is 3-/4-byte-lead-only.
+    #[test]
+    fn drops_the_rescanned_byte_at_end_of_input_when_shortfall_is_two_or_more() {
+        // 3-byte lead, good=0 (shortfall=2): dropped.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, b'A']), "\u{FFFD}");
+        // 4-byte lead, good=0 (shortfall=3): dropped.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xF0, b'A']), "\u{FFFD}");
+        // 4-byte lead, good=1 (shortfall=2): dropped.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x80, b'A']),
+            "\u{FFFD}"
+        );
+        // The dropped byte need not be plain ASCII -- it's consumed
+        // wholesale, not re-decoded, so it gets no U+FFFD of its own either.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, 0xFF]), "\u{FFFD}");
+    }
+
+    #[test]
+    fn keeps_the_rescanned_byte_at_end_of_input_when_shortfall_is_exactly_one() {
+        // 2-byte lead, good=0 (shortfall=1, the only case a 2-byte lead
+        // can reach): kept.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xC2, b'A']), "\u{FFFD}A");
+        // 3-byte lead, good=1 (shortfall=1): kept.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xE1, 0x80, b'A']),
+            "\u{FFFD}A"
+        );
+        // 4-byte lead, good=2 (shortfall=1): kept.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80, b'A']),
+            "\u{FFFD}A"
+        );
+    }
+
+    #[test]
+    fn any_trailing_byte_after_the_rescanned_byte_restores_normal_keep_behavior() {
+        // Same shortfall-2+ shapes as the drop test above, but with one
+        // more byte after the rescanned position -- no longer "at the end
+        // of input", so the byte is kept and rescanned normally, exactly
+        // as `invalid_continuation_byte_rescans_the_offending_byte` above
+        // already covers for the shortfall=2 (3-byte-lead) case. This adds
+        // the shortfall=3/shortfall=2-via-4-byte-lead siblings.
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, b'A', b'B', b'C']),
+            "\u{FFFD}ABC"
+        );
+        assert_eq!(
+            substitute_invalid_utf8_jq_style(&[0xF0, 0x80, b'A', b'B']),
+            "\u{FFFD}AB"
+        );
+    }
+
+    #[test]
+    fn never_valid_lead_byte_at_end_is_unaffected_by_the_drop_quirk() {
+        // #1717 is specific to InvalidContinuationByte on a structurally-
+        // valid lead; is_never_valid_lead_byte (0xC0/0xC1/0xF5-0xF7) is
+        // handled earlier in invalid_subpart_end and never reaches the
+        // shortfall check at all, so this stays exactly as before.
+        assert_eq!(substitute_invalid_utf8_jq_style(&[0xC0, b'A']), "\u{FFFD}A");
     }
 
     #[test]
