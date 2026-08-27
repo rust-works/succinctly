@@ -3219,8 +3219,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // falling back to the DOM/IndexMap path that would collapse duplicate
     // mapping keys (#442, #748, #809).
     let can_stream_pretty_or_colored = !args.pretty_print;
+    // `!args.ascii_output` gates the whole disjunction, not just the
+    // pretty-or-colored half (#1693): none of the M2 JSON streamers
+    // implement ASCII escaping, so `compact ||` previously let
+    // `--ascii-output` through unescaped whenever `-I=0`/compact mode was
+    // also requested -- the DOM path (`output_value`) is the only place
+    // that escapes correctly, and it's reached only when this whole
+    // condition is false.
     let can_json_fast_path = is_m2_streamable
-        && (output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output))
+        && !args.ascii_output
+        && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -3257,8 +3265,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // writes), so `-C` reaching the fast path still never writes ANSI to
     // disk, but no longer forces a fallback to the duplicate-key-collapsing
     // DOM path either.
+    // Same `!args.ascii_output` fix as `can_json_fast_path` above (#1693).
     let can_inplace_json_fast_path = is_m2_streamable
-        && (output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output))
+        && !args.ascii_output
+        && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
         && !args.raw_input
@@ -3285,18 +3295,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // one never OR's in `output_config.compact` for YAML -- preserved as-is
     // from before #1577.
     //
-    // The JSON arm deliberately does NOT copy `can_json_fast_path`'s
-    // `compact || (pretty-or-colored && !ascii_output)` shape verbatim: that
-    // condition already lets `--ascii-output` through unescaped in compact
-    // mode today (#1693, a live, pre-existing bug -- none of the M2 JSON
-    // streamers implement ASCII escaping at all, contrary to what that
-    // condition's shape implies). Copying it here would have been a new
-    // regression, not an inherited gap: before this arm existed, `--slurp
-    // -o=json` had no fast path in *any* combination, so `--ascii-output`
-    // always reached the DOM path's correct escaping. `!args.ascii_output`
-    // is therefore required unconditionally, keeping that combination on
-    // the DOM path exactly as it was pre-#1577, until #1693 gives the M2
-    // streamers real ASCII-escaping support to extend this to.
+    // The JSON arm's `!args.ascii_output && (compact || pretty-or-colored)`
+    // shape now matches `can_json_fast_path`/`can_inplace_json_fast_path`
+    // above exactly (#1693 fixed all three the same way: none of the M2 JSON
+    // streamers implement ASCII escaping, so `!args.ascii_output` has to gate
+    // the whole disjunction, not just the pretty-or-colored half, or compact
+    // mode lets `--ascii-output` through unescaped).
     let can_slurp_fast_path = is_identity
         && match output_config.output_format {
             OutputFormat::Json => {

@@ -1467,6 +1467,47 @@ fn test_slurp_json_ascii_output_still_escapes_in_compact_mode_1577() -> Result<(
     Ok(())
 }
 
+/// #1693: `can_json_fast_path`'s `compact || (pretty-or-colored &&
+/// !ascii_output)` shape let `--ascii-output` through unescaped whenever
+/// compact mode (`-I0`) was also requested -- none of the M2 JSON streamers
+/// implement ASCII escaping, only the DOM path's `output_value` does. Fixed
+/// by making `!args.ascii_output` gate the whole disjunction.
+#[test]
+fn test_ascii_output_still_escapes_in_compact_mode_1693() -> Result<()> {
+    let yaml = "a: \"h\u{e9}llo\"\n";
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0", "--ascii-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "{\"a\":\"h\\u00e9llo\"}\n");
+
+    Ok(())
+}
+
+/// Same bug, same fix, for `can_inplace_json_fast_path` (#1693).
+#[test]
+fn test_ascii_output_still_escapes_in_compact_inplace_mode_1693() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: \"h\u{e9}llo\"")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-o")
+        .arg("json")
+        .arg("-I0")
+        .arg("--ascii-output")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "{\"a\":\"h\\u00e9llo\"}\n");
+
+    Ok(())
+}
+
 /// #1577: like [`test_duplicate_mapping_key_survives_slurp_multiple_sources`],
 /// but for JSON output -- duplicate keys within one source must survive
 /// `--slurp -o=json` combining documents from multiple files, not just a
