@@ -316,11 +316,19 @@ def main(argv=None):
     # valid baseline for ARM64-Linux's run or vice versa. None of this
     # applies when `--baseline-binary` is given: `measure_all` below always
     # returns exactly `known_ids`, so there's no file to be stale/incomplete.
+    #
+    # Loaded whenever `--baseline-binary` isn't in play -- including
+    # `--update-baseline` -- because `--update-baseline` merges `measured`
+    # into whatever this dict already holds and then writes the whole thing
+    # back out. Gating the load on `args.check` left `--update-baseline`
+    # starting from `{}` and overwriting the file with only the arch just
+    # measured, silently deleting every other arch's entries (#1582).
     baseline_file = {}
     baseline = {}
     known_ids = {q[0] for q in QUERIES}
-    if args.check and not args.baseline_binary:
+    if not args.baseline_binary:
         baseline_file = load_baseline_file(args.baseline)
+    if args.check and not args.baseline_binary:
         baseline = baseline_file.get(args.arch, {})
         missing = known_ids - set(baseline)
         if missing:
