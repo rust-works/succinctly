@@ -412,7 +412,7 @@ succinctly yq '.users[]' input.yaml
 - `-o, --output-format <FORMAT>`: Output format: `yaml` (default), `json`, `auto`
 - `-I, --indent <N>`: Indent level (0 for compact output, default: 2)
 - `-r, --unwrapScalar`: Output raw strings without quotes (default for YAML)
-- `-j, --join-output`: Like -r but no newline after each output. **A succinctly extension, not real yq's own `-j`** — real yq's `-j` is a deprecated alias for `--tojson` (forces JSON output, unrelated to line-joining), and `--join-output` doesn't exist in real yq at all (confirmed against the pinned v4.53.3 binary; see [yq Limitations § Extensions](../compliance/yq/limitations.md#extensions)). Unaffected in jq mode below, where `-j`/`--join-output` does match real jq
+- `-j, --join-output`: Like -r but no newline after each output. **`-j` collides with real yq's own `-j`** — real yq's `-j` is a deprecated alias for `--tojson` (forces JSON output, unrelated to line-joining), and `--join-output` doesn't exist in real yq at all (confirmed against the pinned v4.53.3 binary; see [yq Limitations § Open divergences](../compliance/yq/limitations.md#open-divergences-bugs-not-decisions)). Unaffected in jq mode below, where `-j`/`--join-output` does match real jq
 - `-0, --nul-output`: Use NUL char to separate values instead of newline
 - `-S, --sort-keys`: Sort keys of each object on output
 - `-C, --colors`: Force colorized output
