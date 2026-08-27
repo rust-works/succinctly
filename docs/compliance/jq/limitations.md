@@ -864,6 +864,19 @@ unaffected. This guard is symmetric across jq and yq mode (yq reaches it only be
 `--jq-extensions`, per #1650), with no additional yq-specific cap to record in
 [yq Limitations](../yq/limitations.md).
 
+`combinations(n)` has a fourth, independent overflow site (#1720), found reviewing #1669's
+own fix: a multi-output `n` expression (e.g. `combinations((a, b, c))`) sums each output's
+arity into a running `usize` total *before* any of the guards above ever run, and that sum
+itself can overflow with as few as two large outputs — `[1] |
+combinations((9223372036854775807, 9223372036854775807, 3))` aborted a debug build
+(`attempt to add with overflow`) and silently wrapped to a wrong answer in release, neither
+of which the allocation guards above touch, since they all assume an already-summed,
+already-valid `n`. Real jq hangs on this exact shape rather than erroring (confirmed live,
+`timeout 10 jq -c 'combinations((9223372036854775807, 9223372036854775807, 3))' <<< '[1]'`
+against the pinned jq 1.7.1 binary), so refusing with a catchable error is the same
+"would take the host process down" exception as the rest of this entry, not a new kind of
+divergence.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)
