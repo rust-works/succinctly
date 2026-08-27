@@ -1938,9 +1938,10 @@ impl SplitDocState {
 /// (`--raw-output0 -j`, order-independent either way), not yq: the pinned
 /// yq oracle (Homebrew v4.53.3) has no `--join-output` flag at all (it
 /// errors "unknown flag"), and its own `-j` is an unrelated, deprecated
-/// alias for `--tojson`. yq-mode's `-j`/`--join-output` is a succinctly
-/// extension borrowing jq's flag meaning, not a real-yq behavior to match.
-/// A bare newline is the default when neither flag is set.
+/// alias for `--tojson`. yq-mode's `-j`/`--join-output` borrows jq's flag
+/// meaning and collides with real yq's own `-j` — a documented open
+/// divergence (docs/compliance/yq/limitations.md), not a real-yq behavior
+/// to match. A bare newline is the default when neither flag is set.
 ///
 /// Split out from [`write_terminator`] (#1701) so the same three-way choice
 /// can also drive the M2 fast path's own terminator writes -- previously
