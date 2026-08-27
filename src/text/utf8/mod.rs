@@ -191,6 +191,32 @@ fn code_point_bounds_violation(cp: u32, len: usize) -> Option<CodePointBoundsVio
     }
 }
 
+/// Whether `lead_byte` (a `2`/`3`/`4`-byte lead per [`sequence_length`]) can
+/// *never* pass [`code_point_bounds_violation`], regardless of which
+/// continuation bytes follow it -- i.e. RFC 3629 doesn't list it as a valid
+/// lead byte at any length. `0xC0`/`0xC1` always decode to `cp < 0x80`
+/// (their maximum, with continuation `0xBF`, is `0x7F`); `0xF5`-`0xF7`
+/// always decode to `cp > 0x10FFFF` (their minimum, with continuation
+/// `0x80`, is `0x140000`). Every other 2/3/4-byte lead (`0xC2`-`0xDF`,
+/// `0xE0`-`0xEF`, `0xF0`-`0xF4`) has at least one continuation-byte choice
+/// that decodes in range.
+///
+/// Exists so this fact -- used by [`substitute_invalid_utf8_jq_style`] to
+/// decide whether a bounds violation collapses to one U+FFFD or is treated
+/// as an ordinary invalid lead byte -- is derived from the same bounds
+/// `code_point_bounds_violation` already encodes, rather than duplicated as
+/// an independent byte-range literal that could silently drift from it (see
+/// `code_point_bounds_violation`'s own doc comment and #1423 for a case
+/// where exactly that happened between two different functions).
+#[inline]
+fn is_never_valid_lead_byte(lead_byte: u8, seq_len: usize) -> bool {
+    match seq_len {
+        2 => code_point_bounds_violation(0, 2).is_some(), // C0/C1's own minimum cp
+        4 => lead_byte >= 0xF5,
+        _ => false, // seq_len == 3 (0xE0-0xEF): always a valid lead
+    }
+}
+
 /// Validate UTF-8 using a portable scalar algorithm with a broadword (SWAR)
 /// ASCII fast path.
 ///
@@ -676,18 +702,35 @@ pub fn format_byte(byte: u8) -> String {
 /// U+FFFD using jq 1.7.1's own maximal-subpart rule rather than
 /// `String::from_utf8_lossy`'s WHATWG rule (#1617).
 ///
-/// The two rules agree on four of `Utf8ErrorKind`'s six cases -- an
-/// invalid lead byte, an invalid continuation byte, a truncated sequence,
-/// and a 2-byte overlong encoding (`0xC0`/`0xC1`, which WHATWG treats as
-/// an immediately-invalid lead rather than a would-be sequence) -- so
-/// this only special-cases the remaining two: an overlong, surrogate, or
-/// out-of-range code point decoded from a *structurally valid* 3- or
-/// 4-byte lead. There, jq consumes the whole sequence as one unit (one
-/// U+FFFD); WHATWG's maximal subpart restarts after just the lead byte
-/// (one U+FFFD per byte) since the sequence's *decoded value*, not its
-/// shape, is what's wrong. Live-verified against the pinned jq 1.7.1
-/// binary for all six kinds, including the untested-by-#1617's-own-issue
-/// invalid-continuation-byte case (confirmed to already agree).
+/// The two rules agree on every `Utf8ErrorKind` except a bounds violation
+/// (overlong/surrogate/out-of-range) on a *structurally valid* 3- or
+/// 4-byte lead byte -- one that RFC 3629 lists as legitimate (`0xE0`-`0xEF`,
+/// `0xF0`-`0xF4`), just with a narrowed continuation-byte range. There, jq
+/// consumes the whole sequence as one unit (one U+FFFD); WHATWG's maximal
+/// subpart restarts after just the lead byte (one U+FFFD per byte), since
+/// the sequence's *decoded value*, not its shape, is what's wrong. A bounds
+/// violation on a lead RFC 3629 never lists as valid at any length
+/// (`0xC0`/`0xC1`, `0xF5`-`0xF7`) is not included in that collapse -- those
+/// can never decode in range regardless of continuation bytes, so jq (like
+/// WHATWG) treats the lead byte alone as immediately invalid, same as any
+/// other bad lead. Live-verified against the pinned jq 1.7.1 binary for
+/// every kind, including the case #1617's own issue didn't test
+/// (`0xF5`-`0xF7`, which reports the identical `Utf8ErrorKind` as the
+/// collapsing `0xF0`-`0xF4` case and would be wrongly collapsed by a rule
+/// keyed on the error kind alone).
+///
+/// A single left-to-right scan, not a loop over [`validate_utf8`]: that
+/// function's AVX2 path has no early exit (it scans every 32-byte block of
+/// its input before checking for an error at all, since its job is a
+/// whole-buffer accept/reject decision, not locating the first error
+/// cheaply), so calling it repeatedly on a shrinking suffix to find one
+/// error at a time is O(n) *per call*, and a dense run of single-byte
+/// errors (e.g. a binary file with no real UTF-8 in it) drove that into
+/// O(n^2) overall in an earlier version of this function -- found by
+/// review before it shipped. This mirrors [`validate_utf8_scalar`]'s own
+/// dispatch instead (lead-byte-driven, ASCII-skipped via the same
+/// broadword `skip_ascii` helper), continuing past an error rather than
+/// returning on the first one.
 ///
 /// # Examples
 ///
@@ -701,96 +744,94 @@ pub fn format_byte(byte: u8) -> String {
 /// assert_eq!(substitute_invalid_utf8_jq_style(&[0xFF, 0xFE]), "\u{FFFD}\u{FFFD}");
 /// ```
 pub fn substitute_invalid_utf8_jq_style(input: &[u8]) -> String {
-    // Appends `input[a..b]`, a span this function has already established
-    // is well-formed UTF-8 via a prior `validate_utf8` call -- re-checked
-    // here rather than taken on faith via `from_utf8_unchecked`, since
-    // this path only runs on already-malformed input (never the hot,
-    // valid-document path `unsafe_code = "deny"`'s per-file carve-outs
-    // are reserved for).
-    fn push_validated(out: &mut String, input: &[u8], a: usize, b: usize) {
-        out.push_str(core::str::from_utf8(&input[a..b]).expect("already validated"));
-    }
-
-    let mut out = String::with_capacity(input.len());
+    let len = input.len();
+    let mut out = String::with_capacity(len);
     let mut pos = 0;
-    while pos < input.len() {
-        match validate_utf8(&input[pos..]) {
-            Ok(()) => {
-                push_validated(&mut out, input, pos, input.len());
-                break;
-            }
-            Err(e) => {
-                let abs_offset = pos + e.offset;
-                let lead = input[abs_offset];
-                // RFC 3629 lists 0xE0-0xEF and 0xF0-0xF4 as valid lead
-                // bytes (just with a narrowed continuation range to avoid
-                // overlong/surrogate/out-of-range); jq collapses a bad
-                // *value* from one of those into one U+FFFD. 0xC0/0xC1 and
-                // 0xF5-0xF7 are never valid at any length regardless of
-                // continuation bytes -- jq (like WHATWG) treats those as
-                // an immediately-invalid lead instead, one U+FFFD per
-                // byte, same as any other `InvalidLeadByte` (falls to the
-                // final `else` arm below, not this one). Live-verified
-                // `F5 80 80 80`/`F6 80 80 80`/`F7 80 80 80` all give 4x
-                // U+FFFD against the pinned oracle, not the 1x this arm
-                // would otherwise produce for an in-range 4-byte lead.
-                // 0xE0-0xEF (3-byte) and 0xF0-0xF4 (4-byte) are contiguous,
-                // so one range covers both; `seq_len` below still keys off
-                // `lead <= 0xEF` to pick 3 vs. 4.
-                let is_wide_bounds_violation = matches!(
-                    e.kind,
-                    Utf8ErrorKind::OverlongEncoding
-                        | Utf8ErrorKind::SurrogateCodepoint
-                        | Utf8ErrorKind::OutOfRangeCodepoint
-                ) && matches!(lead, 0xE0..=0xF4);
+    // `input[run_start..pos]` is confirmed valid UTF-8 not yet flushed to
+    // `out`.
+    let mut run_start = 0;
 
-                if is_wide_bounds_violation {
-                    // `abs_offset` is this sequence's own lead byte (see
-                    // `validate_utf8_scalar`'s `err_at(input, pos, ...)`
-                    // calls for these three kinds), so everything before
-                    // it is already-confirmed-valid.
-                    push_validated(&mut out, input, pos, abs_offset);
-                    out.push('\u{FFFD}');
-                    let seq_len = if lead <= 0xEF { 3 } else { 4 };
-                    pos = abs_offset + seq_len;
-                } else if matches!(e.kind, Utf8ErrorKind::TruncatedSequence) {
-                    // Only ever reported when `pos + seq_len > input.len()`
-                    // -- i.e. only at the very end of `input` -- so the
-                    // whole truncated tail is one maximal subpart and
-                    // this is always the loop's last iteration.
-                    push_validated(&mut out, input, pos, abs_offset);
-                    out.push('\u{FFFD}');
-                    pos = input.len();
-                } else if matches!(e.kind, Utf8ErrorKind::InvalidContinuationByte) {
-                    // Unlike the other kinds, `abs_offset` here is the
-                    // *offending* byte, not this sequence's lead -- walk
-                    // back over the continuation bytes already confirmed
-                    // valid for this specific sequence to find its start,
-                    // then rescan the offending byte itself (WHATWG
-                    // restarts scanning there, it isn't skipped).
-                    let mut seq_start = abs_offset - 1;
-                    while seq_start > pos && is_continuation_byte(input[seq_start]) {
-                        seq_start -= 1;
+    while pos < len {
+        let byte = input[pos];
+
+        if byte < 0x80 {
+            pos = skip_ascii(input, pos + 1);
+            continue;
+        }
+
+        let seq_len = sequence_length(byte);
+
+        // `Some(resume_at)`: this byte starts (or is) an invalid maximal
+        // subpart running from `pos` to (not including) `resume_at`.
+        // `None`: `byte` leads a fully valid `seq_len`-byte sequence,
+        // already confirmed below -- stays part of the current run.
+        let bad = if seq_len == 0 {
+            // A stray continuation byte (0x80-0xBF) or a lead RFC 3629
+            // never lists as valid at any length (0xF8-0xFF): one byte,
+            // no sequence in progress.
+            Some(pos + 1)
+        } else if pos + seq_len > len {
+            // Truncated -- only reachable at the very end of `input`, so
+            // the whole remaining tail is one maximal subpart.
+            Some(len)
+        } else {
+            let mut good_continuations = 0;
+            while good_continuations < seq_len - 1
+                && is_continuation_byte(input[pos + 1 + good_continuations])
+            {
+                good_continuations += 1;
+            }
+            if good_continuations < seq_len - 1 {
+                // A continuation byte was missing/invalid: the subpart is
+                // the lead plus whatever continuations were already good;
+                // the offending byte itself is rescanned next iteration,
+                // not skipped (WHATWG restarts scanning there).
+                Some(pos + 1 + good_continuations)
+            } else {
+                // Every continuation byte present and well-formed --
+                // decode and check the value, mirroring
+                // `validate_utf8_scalar`'s identical per-length arithmetic.
+                let cp = match seq_len {
+                    2 => ((byte as u32 & 0x1F) << 6) | (input[pos + 1] as u32 & 0x3F),
+                    3 => {
+                        ((byte as u32 & 0x0F) << 12)
+                            | ((input[pos + 1] as u32 & 0x3F) << 6)
+                            | (input[pos + 2] as u32 & 0x3F)
                     }
-                    push_validated(&mut out, input, pos, seq_start);
-                    out.push('\u{FFFD}');
-                    pos = abs_offset;
+                    4 => {
+                        ((byte as u32 & 0x07) << 18)
+                            | ((input[pos + 1] as u32 & 0x3F) << 12)
+                            | ((input[pos + 2] as u32 & 0x3F) << 6)
+                            | (input[pos + 3] as u32 & 0x3F)
+                    }
+                    _ => unreachable!(),
+                };
+                if code_point_bounds_violation(cp, seq_len).is_none() {
+                    None
                 } else {
-                    // Either a real `InvalidLeadByte` (a stray
-                    // continuation byte, or a never-valid lead in
-                    // 0xF8-0xFF), or one of `OverlongEncoding` /
-                    // `OutOfRangeCodepoint` on a never-valid-at-any-length
-                    // lead byte (0xC0/0xC1/0xF5-0xF7, excluded from
-                    // `is_wide_bounds_violation` above) -- both are a
-                    // single byte with no sequence in progress, so
-                    // WHATWG's maximal subpart is that one byte alone.
-                    push_validated(&mut out, input, pos, abs_offset);
-                    out.push('\u{FFFD}');
-                    pos = abs_offset + 1;
+                    Some(if is_never_valid_lead_byte(byte, seq_len) {
+                        pos + 1
+                    } else {
+                        pos + seq_len
+                    })
                 }
             }
+        };
+
+        match bad {
+            Some(resume_at) => {
+                out.push_str(
+                    core::str::from_utf8(&input[run_start..pos]).expect("already validated"),
+                );
+                out.push('\u{FFFD}');
+                pos = resume_at;
+                run_start = pos;
+            }
+            None => pos += seq_len,
         }
     }
+
+    out.push_str(core::str::from_utf8(&input[run_start..pos]).expect("already validated"));
     out
 }
 
