@@ -2956,6 +2956,65 @@ fn test_split_doc_with_no_doc_flag() -> Result<()> {
     Ok(())
 }
 
+/// #1699: unlike [`test_split_doc_with_no_doc_flag`] above (whose `split_doc`
+/// filter routes through `SplitDocState::write_separator`, which already
+/// checked `--no-doc`), a plain multi-document *input* stream with an
+/// identity filter takes the M2 fast path's `stream_cursor!`/
+/// `emit_yaml_doc_separator`, which had no `--no-doc` check at all --
+/// confirmed live to still emit `---` on unmodified `main`.
+#[test]
+fn test_multidoc_input_with_no_doc_flag_1699() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+
+    let (output, code) = run_yq_stdin(".", input, &["--no-doc"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\nb: 2\n");
+
+    // Baseline: without --no-doc, the separator is still there.
+    let (output, code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\n---\nb: 2\n");
+
+    Ok(())
+}
+
+/// Same fix, evaluated (not identity) path -- `emit_yaml_doc_separator`'s
+/// second call site (#1699).
+#[test]
+fn test_multidoc_input_with_no_doc_flag_evaluated_1699() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+
+    let (output, code) = run_yq_stdin(". as $x | $x", input, &["--no-doc"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\nb: 2\n");
+
+    Ok(())
+}
+
+/// Same fix, `--inplace` (#1699).
+#[test]
+fn test_multidoc_input_with_no_doc_flag_inplace_1699() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+    writeln!(input_file, "---")?;
+    writeln!(input_file, "b: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("--no-doc")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "a: 1\nb: 2\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_split_doc_json_output() -> Result<()> {
     // JSON output should not get --- separators

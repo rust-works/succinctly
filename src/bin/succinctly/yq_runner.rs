@@ -1827,12 +1827,19 @@ fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> Commen
 /// output: never before the first, and never around a document whose query
 /// yields no results. `will_output` says whether the current document is about
 /// to emit anything; `streamed` records that an earlier document already did.
+///
+/// `no_doc` suppresses the separator itself while still updating `streamed`
+/// (#1699) -- mirroring `SplitDocState::write_separator`'s existing
+/// `!config.no_doc` check, which this fast path had no equivalent of before:
+/// the DOM path (the eval-all loop above) already respects `--no-doc`, but
+/// this macro-shared M2 path wrote `---` unconditionally.
 fn emit_yaml_doc_separator<W: std::io::Write>(
     writer: &mut W,
     streamed: &mut bool,
     will_output: bool,
+    no_doc: bool,
 ) -> std::io::Result<()> {
-    if *streamed && will_output {
+    if *streamed && will_output && !no_doc {
         writeln!(writer, "---")?;
     }
     *streamed |= will_output;
@@ -3392,7 +3399,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // `$cursor` here is the whole document being
                     // redisplayed as itself - its own trailing comment,
                     // if any, must be kept (#710).
-                    emit_yaml_doc_separator($writer, $doc_streamed, true)?;
+                    emit_yaml_doc_separator($writer, $doc_streamed, true, output_config.no_doc)?;
                     stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                         $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
                     })?;
@@ -3411,7 +3418,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // output (`GenericResult::Halt`) answers `false`
                     // there; an output-bearing halt
                     // (`GenericResult::Partial`) answers `true`.
-                    emit_yaml_doc_separator($writer, $doc_streamed, result.produces_output())?;
+                    emit_yaml_doc_separator(
+                        $writer,
+                        $doc_streamed,
+                        result.produces_output(),
+                        output_config.no_doc,
+                    )?;
                     let stats = stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
                         result.stream_yaml(out, yaml_indent, sort_keys, |w| w.write_str("\n"))
                     })?;
