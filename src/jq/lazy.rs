@@ -28,8 +28,7 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    colliding_display_key_error, effective_len, key_display_string, key_display_string_kind,
-    DisplayKeyGuard, DistinctKeyCursors,
+    effective_len, key_display_string, resolve_display_key, DisplayKeyGuard, DistinctKeyCursors,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -759,17 +758,7 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 // won't decode is preserved via its raw source span rather
                 // than raised on (#1247/#1642), matching
                 // `length`/`keys_unsorted`/`.`.
-                if let Some((cow, is_fallback)) = key_display_string_kind(&field.key()) {
-                    let key = cow.into_owned();
-                    // Two decode-failure keys (or a decode-failure key and
-                    // an unrelated one) can share a display spelling --
-                    // #1385 forbids treating them as the same key, but this
-                    // `IndexMap` cannot hold two entries under one string.
-                    // Raise rather than silently overwrite the earlier
-                    // value (#1642).
-                    if !guard.check(&map, &key, is_fallback) {
-                        return Err(colliding_display_key_error(&key));
-                    }
+                if let Some(key) = resolve_display_key(&field.key(), &map, &mut guard)? {
                     let value_cursor = field.value_cursor();
                     map.insert(key, cursor_to_owned_at_depth(&value_cursor, depth + 1)?);
                 }

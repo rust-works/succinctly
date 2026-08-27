@@ -1456,6 +1456,38 @@ fn test_input_format_json_bridge_preserves_decode_failure_key_1642() -> Result<(
     Ok(())
 }
 
+/// #1738: the `--input-format json` bridge's own `DisplayKeyGuard` check
+/// was missing entirely -- unlike every other `to_owned`-shaped
+/// materializer (#1642) -- so a decode-failure key colliding with another
+/// key's display spelling silently overwrote it instead of raising. `"a\q"`
+/// (an invalid `\q` escape, decode failure, falls back to its raw span
+/// `a\q`) and `"a\\q"` (a valid escape that decodes to the identical `a\q`)
+/// collide exactly like eval_generic's own colliding-key tests. Before this
+/// fix, `.[0]` here silently returned `{"a\q": 2}`, one value quietly
+/// dropped, with exit 0.
+#[test]
+fn test_input_format_json_bridge_raises_on_colliding_decode_failure_key_1738() -> Result<()> {
+    let json = r#"{"a\q":1,"a\\q":2}"#;
+
+    let (_output, stderr, code) =
+        run_yq_stdin_with_stderr(".[0]", json, &["--input-format", "json", "--slurp"])?;
+    assert_eq!(code, 1, "--slurp should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    let (_output, stderr, code) =
+        run_yq_stdin_with_stderr(".[0]", json, &["--input-format", "json", "--eval-all"])?;
+    assert_eq!(code, 1, "--eval-all should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`

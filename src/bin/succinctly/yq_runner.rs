@@ -9,8 +9,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, key_display_string, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec,
+    effective_keys, resolve_display_key, DisplayKeyGuard, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec,
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
@@ -593,14 +593,22 @@ fn gather_input_sources(
 /// clearly-scoped primitive the library exports for this -- everything
 /// else about the walk stays here, matching where `canonicalize_json_numbers`
 /// always lived before this fix, just fused into one pass instead of two.
-fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> OwnedValue {
+///
+/// Returns `Err` when two colliding decode-failure keys (#1642/#1738) would
+/// otherwise silently overwrite one another in the same object -- see
+/// `eval_generic::to_owned_at_depth`'s identical guard, which this function
+/// now shares via [`resolve_display_key`] rather than the hand-rolled
+/// `key_display_string` call it used to make (#1738: that gap meant this,
+/// the `--input-format json` bridge, was the one materializer PR #1672 never
+/// reached).
+fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_canonicalizing_numbers_at_depth(value, 0)
 }
 
 fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     value: &V,
     depth: usize,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     // `assert_nesting_depth` (256, matching `eval_generic::to_owned_at_depth`
     // exactly), not `assert_value_tree_depth` (384) -- this walks a
     // `DocumentCursor`-backed `V` directly, the same recursion shape
@@ -612,23 +620,25 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     // the only pass -- there's no first, 256-guarded `to_owned` call ahead
     // of it anymore to bind the real ceiling).
     assert_nesting_depth(depth);
-    if let Some(fields) = value.as_object() {
+    Ok(if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
+        let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            // `key_display_string`, not `field.key_str()`: a key that will
+            // `resolve_display_key`, not `field.key_str()`: a key that will
             // not *decode* (#1247/#1385) is preserved via its raw source
             // span rather than dropped (#1642) -- this loop used to
             // silently drop such a field under `--slurp`/`--eval-all`/
             // `--inplace` (the only callers of `parse_input`, hence of this
             // function), one short of `length`'s real field count. A key
             // the format's grammar never allowed at all (#1194) is still
-            // dropped, same as before this fix (this function has no error
-            // channel to raise through).
-            if let Some(key) = key_display_string(&field.key) {
+            // dropped, same as before this fix. Two colliding decode-failure
+            // keys now raise instead of silently overwriting one another
+            // (#1642/#1738), matching every other materializer.
+            if let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? {
                 map.insert(
-                    key.into_owned(),
-                    to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1),
+                    key,
+                    to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
                 );
             }
             f = rest;
@@ -638,7 +648,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         let mut items = Vec::new();
         let mut elems = elements;
         while let Some((elem, rest)) = elems.uncons() {
-            items.push(to_owned_canonicalizing_numbers_at_depth(&elem, depth + 1));
+            items.push(to_owned_canonicalizing_numbers_at_depth(&elem, depth + 1)?);
             elems = rest;
         }
         OwnedValue::Array(items)
@@ -671,7 +681,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // Matches `to_owned_at_depth`'s own `else` arm (#1098) --
         // unaffected by number canonicalization.
         OwnedValue::Null
-    }
+    })
 }
 
 /// Parse input bytes according to the specified format.
@@ -680,7 +690,9 @@ fn parse_input(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
         InputFormat::Json => {
             let index = JsonIndex::build(bytes);
             let cursor = index.root(bytes);
-            Ok(vec![to_owned_canonicalizing_numbers(&cursor.value())])
+            let value = to_owned_canonicalizing_numbers(&cursor.value())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(vec![value])
         }
         InputFormat::Yaml | InputFormat::Auto => {
             // Parse as YAML (Auto defaults to YAML when no extension hint)
@@ -5511,7 +5523,7 @@ mod tests {
         let json = linear_json_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = to_owned_canonicalizing_numbers(&cursor.value());
+        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_json_nest(256);
@@ -5538,7 +5550,7 @@ mod tests {
         let json = br#"{"int": 1, "float": 1.50, "exp": 1e2, "neg": -3, "arr": [1.0, 2], "s": "x", "b": true, "n": null}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let owned = to_owned_canonicalizing_numbers(&cursor.value());
+        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
         let OwnedValue::Object(map) = owned else {
             panic!("expected an object")
         };
@@ -5589,7 +5601,7 @@ mod tests {
         for json in [br#"{"n": 5.}"#.as_slice(), br#"{"n": .5}"#.as_slice()] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let owned = to_owned_canonicalizing_numbers(&cursor.value());
+            let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
@@ -5616,7 +5628,7 @@ mod tests {
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
-            let owned = to_owned_canonicalizing_numbers(&cursor.value());
+            let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
             let OwnedValue::Object(map) = owned else {
                 panic!("expected an object for {json:?}")
             };
