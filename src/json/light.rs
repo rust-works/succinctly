@@ -2511,6 +2511,22 @@ mod tests {
         assert_eq!(DocumentCursor::line_comment(&root), None);
     }
 
+    /// `key_raw_source_span`'s non-`String` arm is unreachable via any real
+    /// evaluation path -- `key_display_string_kind` only calls it once
+    /// `string_decode_error()` is `Some`, which for this type is itself
+    /// only `Some` on the `String` arm (#1642) -- but the trait method
+    /// still needs an answer for every variant. Calls it directly on a
+    /// non-string value to pin that contract: no span to show for
+    /// something that was never a string in the first place.
+    #[test]
+    fn test_key_raw_source_span_is_none_for_non_string_value_1642() {
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        assert!(matches!(value, StandardJson::Number(_)));
+        assert_eq!(value.key_raw_source_span(), None);
+    }
+
     /// `stream_json_as_yaml`'s scalar-string arm previously read
     /// `raw_bytes()` (the source JSON bytes, quotes and escapes included)
     /// instead of the decoded `as_str()` content, so a plain string value
