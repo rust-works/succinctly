@@ -17137,6 +17137,46 @@ fn test_jq_trailing_comma_raises_under_sort_keys_color_and_slurp_1676() -> Resul
     Ok(())
 }
 
+/// #1676: a *doubled* trailing/leading delimiter (`[1,2,,]`, `{"a":1,,}`) --
+/// `following_gap_ok`'s own doubled-delimiter arm, the forward-scan mirror
+/// of `preceding_gap_ok`'s existing one.
+#[test]
+fn test_jq_doubled_trailing_comma_rejected_1676() -> Result<()> {
+    for input in ["[1,2,,]", r#"{"a":1,,}"#] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1676: the success side of `validate_json_delimiters`'s new trailing-gap
+/// check on the `-S`/`-C`/`--slurp` fallback path -- a structurally *valid*
+/// container (clean trailing gap) reached via a leniency trigger elsewhere
+/// in the same document (`serde_json` rejects the leading zero, routing to
+/// `find_json_values` + `validate_json_delimiters` same as the malformed
+/// cases above), covering both a scalar and a container last child/value.
+#[test]
+fn test_jq_wellformed_trailing_gap_survives_leniency_fallback_1676() -> Result<()> {
+    for (input, expected) in [
+        ("[01,2]", "[1,2]"),
+        ("[01,[2,3]]", "[1,[2,3]]"),
+        (r#"{"a":01,"b":2}"#, r#"{"a":1,"b":2}"#),
+        (r#"{"a":01,"b":[2,3]}"#, r#"{"a":1,"b":[2,3]}"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-S", "-c", "."], Some(input))?;
+        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
 /// #1643 follow-up: a malformed value elsewhere in a multi-value stream
 /// (not just the first) is still caught under `-S`, since
 /// `parse_json_stream`'s fallback validates every span it materializes,
