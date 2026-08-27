@@ -3070,6 +3070,12 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1620/#1660: same decode-failure exclusion as
+            // `try_pattern_alternatives` -- always propagates, `is_last` or
+            // not.
+            Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+                return Flow::Escaped(Control::Error(e));
+            }
             // #1457: `Break` falls through like `Error`, not immediately
             // like `Halt` -- same live-verified correction
             // `try_pattern_alternatives` itself documents.
@@ -6767,14 +6773,16 @@ fn builtin_ascii_downcase<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
                 let lowered: String = cow.chars().map(|c| c.to_ascii_lowercase()).collect();
                 QueryResult::Owned(OwnedValue::String(lowered))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
             }
-        }
+            // #1620/#1660: an undecodable string must raise, not silently
+            // substitute an empty string -- same rule as the sibling string
+            // builtins converted by #1647.
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new("explode input must be a string")),
     }
@@ -6786,14 +6794,14 @@ fn builtin_ascii_upcase<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
                 let uppered: String = cow.chars().map(|c| c.to_ascii_uppercase()).collect();
                 QueryResult::Owned(OwnedValue::String(uppered))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
             }
-        }
+            // #1620/#1660: same decode-failure exclusion as `ascii_downcase`.
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         // As `ascii_downcase`: jq defines both as `explode | map(…) | implode`,
         // so both report `explode`'s refusal.
@@ -6827,17 +6835,18 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(to_owned(&value));
             };
             let result = match &value {
-                StandardJson::String(s) => {
-                    if let Ok(cow) = s.as_str() {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => {
                         if cow.starts_with(&prefix) {
                             OwnedValue::String(cow[prefix.len()..].to_string())
                         } else {
                             OwnedValue::String(cow.into_owned())
                         }
-                    } else {
-                        OwnedValue::String(String::new())
                     }
-                }
+                    // #1620/#1660: an undecodable string must raise, not
+                    // silently substitute an empty string.
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+                },
                 // jq's ltrimstr is total: a non-string input passes through
                 // unchanged.
                 _ => to_owned(&value),
@@ -6866,17 +6875,18 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(to_owned(&value));
             };
             let result = match &value {
-                StandardJson::String(s) => {
-                    if let Ok(cow) = s.as_str() {
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => {
                         if cow.ends_with(&suffix) {
                             OwnedValue::String(cow[..cow.len() - suffix.len()].to_string())
                         } else {
                             OwnedValue::String(cow.into_owned())
                         }
-                    } else {
-                        OwnedValue::String(String::new())
                     }
-                }
+                    // #1620/#1660: same decode-failure exclusion as
+                    // `ltrimstr`.
+                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+                },
                 // jq's rtrimstr is total: a non-string input passes through
                 // unchanged.
                 _ => to_owned(&value),
@@ -6903,10 +6913,13 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Error(EvalError::new("startswith() requires string inputs"));
             };
             match &value {
-                StandardJson::String(s) => {
-                    let starts = s.as_str().is_ok_and(|cow| cow.starts_with(&prefix));
-                    QueryResult::Owned(OwnedValue::Bool(starts))
-                }
+                // #1620/#1660: `.is_ok_and(...)` treated a decode `Err` the
+                // same as "no match", silently returning `false` instead of
+                // raising.
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => QueryResult::Owned(OwnedValue::Bool(cow.starts_with(&prefix))),
+                    Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+                },
                 _ if optional => QueryResult::None,
                 _ => QueryResult::Error(EvalError::new("startswith() requires string inputs")),
             }
@@ -6931,10 +6944,12 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Error(EvalError::new("endswith() requires string inputs"));
             };
             match &value {
-                StandardJson::String(s) => {
-                    let ends = s.as_str().is_ok_and(|cow| cow.ends_with(&suffix));
-                    QueryResult::Owned(OwnedValue::Bool(ends))
-                }
+                // #1620/#1660: same decode-failure exclusion as
+                // `startswith`.
+                StandardJson::String(s) => match s.as_str() {
+                    Ok(cow) => QueryResult::Owned(OwnedValue::Bool(cow.ends_with(&suffix))),
+                    Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+                },
                 _ if optional => QueryResult::None,
                 _ => QueryResult::Error(EvalError::new("endswith() requires string inputs")),
             }
@@ -6964,8 +6979,13 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             match &value {
                 StandardJson::String(s) => {
-                    let Ok(cow) = s.as_str() else {
-                        return QueryResult::Owned(OwnedValue::Array(vec![]));
+                    // #1620/#1660: an undecodable string must raise, not
+                    // silently substitute an empty array.
+                    let cow = match s.as_str() {
+                        Ok(cow) => cow,
+                        Err(e) => {
+                            return QueryResult::Error(EvalError::decode_failure(e.message()))
+                        }
                     };
                     // jq: split("") returns each character as a separate element
                     // Rust's split("") includes empty strings at boundaries, so special-case it
@@ -22209,6 +22229,21 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         state = update_vals.into_iter().last().unwrap_or(OwnedValue::Null);
         match update_control {
             None => return (state, None),
+            // #1620/#1660: a decode failure always propagates, `is_last` or
+            // not -- mirroring `try_pattern_alternatives`'s own exclusion.
+            // Not currently reachable through any live input: `update` only
+            // ever sees fully-materialized `OwnedValue`s here -- `state`
+            // (round-tripped through `to_json_for_reindex`/`JsonIndex`, but
+            // only ever re-encoding an already-valid Rust `String`) and every
+            // pattern-bound `$var` (spliced in as an already-materialized
+            // literal by `substitute_vars`, built from `input_val: &OwnedValue`
+            // one level up in `eval_reduce`) -- so `.as_str()` can never fail
+            // on anything UPDATE evaluates. Kept for parity with the sibling
+            // functions and as a guard against a future change (e.g. lazy
+            // `$var` binding) reopening a path to a live decode failure here.
+            Some(Control::Error(e)) if e.is_decode_failure() => {
+                return (state, Some(Control::Error(e)));
+            }
             Some(Control::Error(_) | Control::Break(_)) if !is_last => {}
             Some(control) => return (state, Some(control)),
         }
@@ -22658,8 +22693,21 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// than calling this, since its single UPDATE-only retry predates this
 /// helper; consolidating it too is tracked separately (#1570) rather than
 /// attempted here, to keep this fix scoped to the bug it's actually fixing.
+///
+/// #1620/#1660: a decode failure is never retryable, `is_last` or not --
+/// same exclusion as `try_pattern_alternatives`/`eval_try`, applied here
+/// once so neither of this function's two call sites has to remember it
+/// independently. Like `try_reduce_step_alternatives`'s equivalent guard,
+/// not currently reachable through any live input -- both UPDATE and
+/// EXTRACT only ever evaluate fully-materialized `OwnedValue`s here, never a
+/// cursor over the original document's raw bytes. Kept for parity and as a
+/// guard against a future change reopening a path to one.
 fn is_retryable_control(control: &Control, is_last: bool) -> bool {
-    !is_last && matches!(control, Control::Error(_) | Control::Break(_))
+    match control {
+        Control::Error(e) if e.is_decode_failure() => false,
+        Control::Error(_) | Control::Break(_) => !is_last,
+        Control::Halt(_) => false,
+    }
 }
 
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
@@ -33146,6 +33194,13 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return Ok((carried, None));
             }
             QueryResult::None => return Ok((carried, None)),
+            // #1620/#1660: a decode failure must never be treated as "this
+            // alternative failed to match, try the next one" -- it always
+            // propagates, `is_last` or not, the same way `eval_try` never
+            // suppresses it regardless of whether a `catch` handler exists.
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                return Ok((carried, Some(Control::Error(e))));
+            }
             QueryResult::Error(e) => {
                 if is_last {
                     return Ok((carried, Some(Control::Error(e))));
@@ -33166,6 +33221,11 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => {
                 carried.extend(vs);
                 match control {
+                    // Same #1620/#1660 decode-failure exclusion as the bare
+                    // `Error` arm above.
+                    Control::Error(ref e) if e.is_decode_failure() => {
+                        return Ok((carried, Some(control)));
+                    }
                     Control::Error(_) | Control::Break(_) => {
                         if is_last {
                             return Ok((carried, Some(control)));
@@ -35233,6 +35293,129 @@ mod tests {
             "try (.a | keys) catch \"caught\"",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "caught");
+            }
+        );
+    }
+
+    /// #1660: a `?//`-alternative retry must not treat a decode failure the
+    /// same as an ordinary pattern-match/body failure -- it always
+    /// propagates, even when the current alternative isn't the last one.
+    /// Before the fix, this silently fell through to the second alternative
+    /// (`$y` from `{q:$y}`) and printed `2`.
+    #[test]
+    fn test_pattern_alternative_retry_does_not_swallow_decode_failure_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\", \"p\": 1, \"q\": 2}",
+            ". as {p:$y} ?// {q:$y} | (if $y==1 then (.a|tonumber) else $y end)",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660: same as above, but wrapped in an array collector to force the
+    /// streaming/sink-based `each_as_pattern`/`each_pattern_alternatives`
+    /// dispatch rather than the single-value `eval_as_pattern`/
+    /// `try_pattern_alternatives` path, confirming both twins got the fix.
+    #[test]
+    fn test_pattern_alternative_retry_does_not_swallow_decode_failure_each_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\", \"p\": 1, \"q\": 2}",
+            "[. as {p:$y} ?// {q:$y} | (if $y==1 then (.a|tonumber) else $y end)]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660: `startswith`/`endswith` used `.is_ok_and(...)`, which treats a
+    /// decode `Err` the same as "no match" and silently returns `false`
+    /// instead of raising -- worse than an ordinary suppression, since it
+    /// produces a plausible-looking wrong value rather than an error `?`
+    /// could even suppress.
+    #[test]
+    fn test_startswith_endswith_raise_on_decode_failure_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#".a | startswith("x")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#".a | endswith("x")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660: `split` returned an empty array on a decode failure instead of
+    /// raising.
+    #[test]
+    fn test_split_raises_on_decode_failure_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#".a | split(",")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660: `ascii_downcase`/`ascii_upcase` substituted an empty string on
+    /// a decode failure instead of raising.
+    #[test]
+    fn test_ascii_case_builtins_raise_on_decode_failure_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a | ascii_downcase",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a | ascii_upcase",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660: `ltrimstr`/`rtrimstr` substituted an empty string on a decode
+    /// failure instead of raising, for both the "prefix/suffix matches" and
+    /// "doesn't match" branches (both used to silently vanish into `""`).
+    #[test]
+    fn test_ltrimstr_rtrimstr_raise_on_decode_failure_1660() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#".a | ltrimstr("x")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#".a | rtrimstr("x")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #1660 negative control: an *ordinary* error inside a `?//`
+    /// alternative's body must still retry the next alternative, proving
+    /// the new decode-failure exclusion is scoped correctly and doesn't
+    /// suppress the pre-existing #1365 retry behavior for anything else.
+    #[test]
+    fn test_pattern_alternative_retry_still_retries_ordinary_errors_1660() {
+        query!(
+            b"{\"p\": 1, \"q\": 2}",
+            ". as {p:$y} ?// {q:$y} | (if $y==1 then error(\"boom\") else $y end)",
+            QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => {
+                assert_eq!(n, 2);
             }
         );
     }

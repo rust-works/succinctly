@@ -3460,7 +3460,9 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
                 let key = match f.key() {
                     StandardJson::String(s) => match s.as_str() {
                         Ok(cow) => cow.to_string(),
-                        Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
+                        Err(e) => {
+                            return Err(EvalError::decode_failure(format!("{e} in object key")))
+                        }
                     },
                     _ => return Err(EvalError::malformed_json_text(parent_cursor.text())),
                 };

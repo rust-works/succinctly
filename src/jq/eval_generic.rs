@@ -1313,7 +1313,9 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
                 let key = match field.key() {
                     StandardJson::String(s) => match s.as_str() {
                         Ok(cow) => cow.to_string(),
-                        Err(e) => return Err(EvalError::new(format!("{e} in object key"))),
+                        Err(e) => {
+                            return Err(EvalError::decode_failure(format!("{e} in object key")))
+                        }
                     },
                     _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
                 };
