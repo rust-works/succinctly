@@ -1007,6 +1007,20 @@ impl EvalError {
         )
     }
 
+    /// Whether this error class is *always* uncatchable, with no positional
+    /// nuance — [`Self::is_invalid_path_expression`] or
+    /// [`Self::is_decode_failure`]. Unlike
+    /// [`Self::is_untracked_navigation_error`], which genuinely depends on
+    /// *where* the error was caught (a bare postfix `?` on the primitive
+    /// that raised it vs. anything else), both of these mean the same thing
+    /// at every call site that checks them: never suppressed by `?`, never
+    /// handed to a `catch` handler. A future always-uncatchable error class
+    /// only needs to be added here, not hand-copied into every `?`/`try`
+    /// dispatch that currently ANDs the two checks together.
+    pub fn is_uncatchable(&self) -> bool {
+        self.is_invalid_path_expression() || self.is_decode_failure()
+    }
+
     /// `Cannot check whether <container> has a <key type> key`.
     pub fn cannot_check_has(container_type: &str, key_type: &str) -> Self {
         Self::new(format!(

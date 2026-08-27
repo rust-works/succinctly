@@ -378,6 +378,31 @@ fn to_owned_for_diagnostic<V: DocumentValue>(value: &V, cursor: Option<V::Cursor
     to_owned_with_cursor(value, cursor).unwrap_or(OwnedValue::Null)
 }
 
+/// The shared "is this a decode failure, an optional no-op, or a genuine
+/// type error" three-way check every native-arm dispatcher (`Iterate`,
+/// `Map`, `Length`, `Keys`, `KeysUnsorted`, `ToNumber`) needs once its own
+/// type-specific branches are exhausted -- decode-failure must be checked
+/// *before* `optional` (#1620), not after, so `.a?` on an undecodable
+/// string still raises rather than silently swallowing it.
+///
+/// `fallback` is only called for the genuine type-error case, so it can
+/// build a builtin-specific `EvalError` (`cannot_iterate_with`,
+/// `has_no_length`, ...) without paying for it on the two more common
+/// exits above.
+fn decode_failure_or<V: DocumentValue>(
+    value: &V,
+    optional: bool,
+    fallback: impl FnOnce() -> GenericResult<V>,
+) -> GenericResult<V> {
+    if let Some(reason) = value.string_decode_error() {
+        GenericResult::Error(EvalError::decode_failure(reason))
+    } else if optional {
+        GenericResult::None
+    } else {
+        fallback()
+    }
+}
+
 /// The jq `type` name for `value` at `cursor`, resolving an explicit YAML
 /// tag first (e.g. `!!str 1` is `"string"`, not `"number"` — issue #747)
 /// and falling back to [`DocumentValue::type_name`] otherwise. Mirrors
@@ -3811,15 +3836,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     }
                     Err(err) => GenericResult::Error(err),
                 }
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_with(
-                    S::TAG,
-                    &to_owned_for_diagnostic(&value, cursor),
-                ))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::cannot_iterate_with(
+                        S::TAG,
+                        &to_owned_for_diagnostic(&value, cursor),
+                    ))
+                })
             }
         }
 
@@ -6653,15 +6676,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(LazySeq::new(source).push_map(f, S::TAG))
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_iterate_with(
-                    S::TAG,
-                    &to_owned_for_diagnostic(&value, cursor),
-                ))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::cannot_iterate_with(
+                        S::TAG,
+                        &to_owned_for_diagnostic(&value, cursor),
+                    ))
+                })
             }
         }
 
@@ -6830,14 +6851,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 })
             } else if let Some(f) = value.as_f64() {
                 GenericResult::Owned(OwnedValue::Float(f.abs()))
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_length(&to_owned_for_diagnostic(
-                    &value, cursor,
-                )))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::has_no_length(&to_owned_for_diagnostic(
+                        &value, cursor,
+                    )))
+                })
             }
         }
 
@@ -6861,14 +6880,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // yet; `length`, `.[]`, `.[n]`, `first`, and `last` can all
                 // answer directly from `len` (see the `Pipe` dispatch below).
                 GenericResult::LazyIndexRange(elements.len())
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
-                    &value, cursor,
-                )))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                        &value, cursor,
+                    )))
+                })
             }
         }
 
@@ -6887,14 +6904,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(elements) = value.as_array() {
                 // Same laziness as the array branch of `Keys` above (#684).
                 GenericResult::LazyIndexRange(elements.len())
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
-                    &value, cursor,
-                )))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                        &value, cursor,
+                    )))
+                })
             }
         }
 
@@ -6977,18 +6992,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     entries.push(OwnedValue::Object(entry));
                 }
                 GenericResult::Owned(OwnedValue::Array(entries))
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
             } else {
-                // No `optional`-guarded arm here: `Builtin::ToEntries` isn't
-                // `IndexExpr`/`SliceExpr`, so #693's dispatch never forces
-                // `optional = true` into this native arm — `to_entries?`
-                // evaluates it at the ambient `optional` (normally `false`)
-                // and lets the outer `Expr::Optional`/`eval_try`-style catch
-                // convert the resulting `Error` to `None` once instead.
-                GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
-                    &value, cursor,
-                )))
+                // `optional: false` unconditionally: `Builtin::ToEntries`
+                // isn't `IndexExpr`/`SliceExpr`, so #693's dispatch never
+                // forces `optional = true` into this native arm --
+                // `to_entries?` evaluates it at the ambient `optional`
+                // (normally `false`) and lets the outer
+                // `Expr::Optional`/`eval_try`-style catch convert the
+                // resulting `Error` to `None` once instead.
+                decode_failure_or(&value, false, || {
+                    GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
+                        &value, cursor,
+                    )))
+                })
             }
         }
 
@@ -7185,14 +7201,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Err(_) if optional => GenericResult::None,
                     Err(e) => GenericResult::Error(e),
                 }
-            } else if let Some(reason) = value.string_decode_error() {
-                GenericResult::Error(EvalError::decode_failure(reason))
-            } else if optional {
-                GenericResult::None
             } else {
-                GenericResult::Error(EvalError::cannot_parse_as_number(&to_owned_for_diagnostic(
-                    &value, cursor,
-                )))
+                decode_failure_or(&value, optional, || {
+                    GenericResult::Error(EvalError::cannot_parse_as_number(
+                        &to_owned_for_diagnostic(&value, cursor),
+                    ))
+                })
             }
         }
 
