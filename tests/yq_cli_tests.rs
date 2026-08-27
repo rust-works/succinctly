@@ -1485,6 +1485,33 @@ fn test_input_format_json_bridge_raises_on_colliding_decode_failure_key_1738() -
         "expected an 'ambiguous' error, got: {stderr}"
     );
 
+    // `--inplace` is `parse_input`'s third caller (per
+    // `to_owned_canonicalizing_numbers`'s own doc comment), but only on its
+    // DOM fallback path -- `-P` forces that path the same way an assignment
+    // or `--arg` would, where a plain M2-streamable filter like `.` or
+    // `keys` (#685) takes a separate fast path that never calls
+    // `parse_input` at all and so can't hit this collision.
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{json}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-P")
+        .args(["--input-format", "json"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace -P should raise, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
     Ok(())
 }
 
