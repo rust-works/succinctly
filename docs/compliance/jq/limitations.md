@@ -199,7 +199,7 @@ recorded in prose instead rather than dropped silently.
 
 ## An open gap in jq's own UTF-8 replacement-character substitution
 
-`substitute_invalid_utf8_jq_style` ([src/text/utf8/mod.rs](../../src/text/utf8/mod.rs),
+`substitute_invalid_utf8_jq_style` ([src/text/utf8/mod.rs](../../../src/text/utf8/mod.rs),
 #1617) matches jq 1.7.1's maximal-subpart substitution rule for document/raw-input decode,
 and — since #1719 — for `@base64d`/`@urid`'s own invalid-UTF-8 output too, collapsing a
 structurally-valid overlong/surrogate/out-of-range 3-/4-byte lead to a single U+FFFD where

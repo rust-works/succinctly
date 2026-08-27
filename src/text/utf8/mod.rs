@@ -726,6 +726,16 @@ pub fn format_byte(byte: u8) -> String {
 /// collapsing `0xF0`-`0xF4` case and would be wrongly collapsed by a rule
 /// keyed on the error kind alone).
 ///
+/// **Known remaining gap (#1717, not fixed here):** the "agree on every
+/// other kind" claim above is not quite exact for `InvalidContinuationByte`.
+/// When the rescanned byte after an invalid lead lands at the input's very
+/// last byte, real jq silently drops it; this function (like WHATWG) keeps
+/// it as its own literal character. Likely an off-by-one in jq's own
+/// end-of-buffer lookahead rather than a designed rule -- per ADR-0018
+/// rule 4, bug-for-bug replication is the correct resolution if picked up,
+/// not "fixing" it into the more sensible WHATWG-consistent shape.
+///
+
 /// A single left-to-right scan, not a loop over [`validate_utf8`]: that
 /// function's AVX2 path has no early exit (it scans every 32-byte block of
 /// its input before checking for an error at all, since its job is a

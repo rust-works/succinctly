@@ -189,12 +189,17 @@ pub trait EvalSemantics: Copy + Default {
     /// diverge from.
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool;
 
-    /// If true (jq), decoding invalid UTF-8 bytes to a lossy `String`
-    /// (`@base64d`/`@urid`'s own decode, #1719; also document/raw-input
-    /// decode via `substitute_invalid_utf8_jq_style` directly, #1617) uses
-    /// jq's maximal-subpart rule: a structurally-valid overlong/surrogate/
-    /// out-of-range 3-/4-byte lead collapses to a single U+FFFD, live-
-    /// verified against jq 1.7.1 (`\xe0\x80\x80` -> one U+FFFD, not three).
+    /// If true (jq), `@base64d`/`@urid`'s own lossy-decode arm (#1719, the
+    /// sole reader of this const -- see `owned_string_from_decoded_bytes`)
+    /// uses jq's maximal-subpart rule: a structurally-valid overlong/
+    /// surrogate/out-of-range 3-/4-byte lead collapses to a single U+FFFD,
+    /// live-verified against jq 1.7.1 (`\xe0\x80\x80` -> one U+FFFD, not
+    /// three). Document/raw-input decode (#1617) uses this same rule too,
+    /// via a direct, unconditional call to `substitute_invalid_utf8_jq_style`
+    /// in the jq-only `jq_runner.rs` binary -- not gated on this const,
+    /// since that file has no `S: EvalSemantics` generic to read it from,
+    /// but it agrees with `S = JqSemantics`'s value here by construction
+    /// (jq-only binary, jq-only behavior).
     ///
     /// If false (yq), plain `String::from_utf8_lossy` (WHATWG's rule, one
     /// U+FFFD per byte) is used instead -- yq has no oracle-matching rule
@@ -8685,15 +8690,9 @@ fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String 
 /// never error on bad UTF-8" decode policy has one definition instead of
 /// two independently-copy-pasted tails.
 ///
-/// Note this is necessarily an approximation of real yq's own behavior for
-/// input that decodes to *invalid* UTF-8 (e.g. `"%FF" | @urid`): real yq
-/// (backed by Go, whose strings are arbitrary byte sequences) passes such
-/// bytes through unchanged, but Rust's `String` cannot hold invalid UTF-8
-/// at all, so lossy substitution is the closest correct representation
-/// available here, not a verified oracle match for that specific case.
-///
-/// Which lossy substitution rule the invalid-UTF-8 arm uses is per-mode --
-/// see `EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE` (#1719).
+/// Which lossy substitution rule the invalid-UTF-8 arm uses is per-mode,
+/// and neither is a verified oracle match on every input -- see
+/// `EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE` (#1719).
 fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| {
         if S::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE {
