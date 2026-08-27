@@ -10,6 +10,10 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
 /// runs, since this file is itself gated on `cli`, and bakes the resulting
@@ -33,9 +37,11 @@ fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, Strin
     }
 
     let output = cmd.wait_with_output()?;
-    let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((stdout, stderr, exit_code))
 }
 
@@ -49,9 +55,11 @@ fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, St
         .stderr(Stdio::piped())
         .output()?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((stdout, stderr, exit_code))
 }
 
@@ -390,7 +398,11 @@ fn test_multiple_files_all_valid() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
-    assert_eq!(output.status.code().unwrap_or(-1), 0);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_eq!(code, 0);
     Ok(())
 }
 
@@ -421,7 +433,11 @@ fn test_multiple_files_one_invalid() -> Result<()> {
         .stderr(Stdio::piped())
         .output()?;
 
-    assert_eq!(output.status.code().unwrap_or(-1), 1);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_eq!(code, 1);
     Ok(())
 }
 

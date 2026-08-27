@@ -15,6 +15,10 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use tempfile::{NamedTempFile, TempDir};
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
 /// runs, since this file is itself gated on `cli`, and bakes the resulting
@@ -38,8 +42,10 @@ fn run_validate_stdin(input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, Str
     }
 
     let output = cmd.wait_with_output()?;
-    let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((output.stdout, stderr, exit_code))
 }
 
@@ -53,8 +59,10 @@ fn run_validate_files(paths: &[&str], extra_args: &[&str]) -> Result<(Vec<u8>, S
         .stderr(Stdio::piped())
         .output()?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((output.stdout, stderr, exit_code))
 }
 
@@ -67,8 +75,10 @@ fn run_generate(size: &str, extra_args: &[&str]) -> Result<(Vec<u8>, String, i32
         .stderr(Stdio::piped())
         .output()?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((output.stdout, stderr, exit_code))
 }
 
@@ -407,11 +417,10 @@ fn generate_suite_writes_all_patterns() -> Result<()> {
         .args(["--max-size", "1kb", "--seed", "42", "--clean", "--verify"])
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code().unwrap_or(-1),
-        0,
-        "generate-suite failed: {stderr}"
-    );
+    let Some(code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_eq!(code, 0, "generate-suite failed: {stderr}");
 
     // One subdirectory per pattern, each holding a valid-UTF-8 1kb.txt file.
     let mut found = 0;

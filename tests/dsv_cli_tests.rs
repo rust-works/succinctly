@@ -13,6 +13,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
 /// runs, since this file is itself gated on `cli`, and bakes the resulting
@@ -30,9 +34,11 @@ fn run_generate(size: &str, extra_args: &[&str]) -> Result<(String, String, i32)
         .stderr(Stdio::piped())
         .output()?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((stdout, stderr, exit_code))
 }
 
