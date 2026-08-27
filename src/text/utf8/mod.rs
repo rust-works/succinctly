@@ -2944,9 +2944,10 @@ mod substitute_invalid_utf8_jq_style_tests {
         );
         // Genuine truncation (every available byte IS a valid
         // continuation, there just aren't enough of them) must still
-        // collapse to one U+FFFD, not regress to per-byte. Unaffected by
-        // #1717 -- a completely different branch (`invalid_subpart_end`'s
-        // "ran out of bytes" case, not "hit an invalid byte").
+        // collapse to one U+FFFD, not regress to per-byte. Same
+        // `len - pos < seq_len` condition #1717 fixed above -- there's no
+        // separate "ran out of bytes" branch left to distinguish it from,
+        // just a different reason the condition happens to hold.
         assert_eq!(substitute_invalid_utf8_jq_style(&[0xE1, 0x80]), "\u{FFFD}");
         assert_eq!(
             substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80]),
@@ -3176,14 +3177,14 @@ mod substitute_invalid_utf8_jq_style_tests {
             substitute_invalid_utf8_jq_style(&[0xF0, 0x90, 0x80, b'A']),
             "\u{FFFD}A"
         );
-        // 4-byte lead, good=1, *two* bytes of headroom (len - pos == 4 ==
+        // 4-byte lead, good=1, *one* byte of headroom (len - pos == 4 ==
         // seq_len) -- the sibling of the previously-missed drop case above,
         // one byte further along the same axis: kept, not dropped.
         assert_eq!(
             substitute_invalid_utf8_jq_style(&[0xF0, 0x80, b'A', b'B']),
             "\u{FFFD}AB"
         );
-        // 4-byte lead, good=0, three bytes of headroom (len - pos == 4 ==
+        // 4-byte lead, good=0, two bytes of headroom (len - pos == 4 ==
         // seq_len): kept, exactly as
         // `invalid_continuation_byte_rescans_the_offending_byte` above
         // already covers for the 3-byte-lead sibling.
