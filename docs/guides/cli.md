@@ -419,7 +419,7 @@ succinctly yq '.users[]' input.yaml
 - `-M, --no-colors`: Disable colorized output
 - `-N, --no-doc`: Don't print document separators (`---`)
 - `-P, --prettyPrint`: Pretty print, expand flow styles to block style
-- `--tab`: Use tabs for indentation
+- `--tab`: Use tabs for indentation (write-only — see [yq Language Reference § Known Limitations](../reference/yq-language.md#known-limitations))
 - `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`
 - `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter). Suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
 
