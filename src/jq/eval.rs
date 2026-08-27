@@ -8651,8 +8651,22 @@ fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String 
 /// bytes through unchanged, but Rust's `String` cannot hold invalid UTF-8
 /// at all, so lossy substitution is the closest correct representation
 /// available here, not a verified oracle match for that specific case.
-fn owned_string_from_decoded_bytes(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+///
+/// In jq mode, the invalid-UTF-8 arm uses jq's own maximal-subpart
+/// substitution rule (`substitute_invalid_utf8_jq_style`, #1617) rather than
+/// `String::from_utf8_lossy`'s WHATWG rule -- real jq's `@base64d` collapses
+/// an overlong/surrogate/out-of-range 3-/4-byte lead to one U+FFFD, where
+/// WHATWG emits one per byte (#1719). yq mode is unaffected: yq has no
+/// oracle-matching rule to switch to here (see the note above), so it keeps
+/// the existing lossy fallback.
+fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).unwrap_or_else(|e| {
+        if S::TAG == EvalTag::Jq {
+            crate::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
+        } else {
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        }
+    })
 }
 
 /// @urid - URI/percent decode
@@ -8715,7 +8729,7 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
         result.push(bytes[i]);
         i += 1;
     }
-    Ok(owned_string_from_decoded_bytes(result))
+    Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 
 /// Quote a CSV/DSV string field: wrap in `"..."`, doubling inner `"`.
@@ -9066,7 +9080,7 @@ fn format_base64d<S: EvalSemantics>(
             _ => unreachable!("a full quantum always flushes before the loop can exit here"),
         }
 
-        return Ok(owned_string_from_decoded_bytes(result));
+        return Ok(owned_string_from_decoded_bytes::<S>(result));
     }
 
     // Real jq truncates at the *first* `=` in the (whitespace-
@@ -9172,7 +9186,7 @@ fn format_base64d<S: EvalSemantics>(
     // (`null`/`true`/... above) reaches this exact case for the first
     // time, and the strict conversion previously here would have produced
     // a different wrong error instead of matching the oracle.
-    Ok(owned_string_from_decoded_bytes(result))
+    Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 
 /// @html - HTML entity escape
@@ -40614,6 +40628,20 @@ mod tests {
         query!(br#""aGVsbG8=""#, "@base64d",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "hello");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_base64d_overlong_collapses_to_one_fffd_1719() {
+        // #1719: an overlong 3-byte lead decoded from base64 ("4ICA" ==
+        // [0xE0, 0x80, 0x80]) must collapse to one U+FFFD in jq mode, same
+        // as #1617's document-decode fix -- not one per byte, which is
+        // what `String::from_utf8_lossy` (and this codebase, pre-#1719)
+        // would give. Confirmed live against jq 1.7.1.
+        query!(br#""4ICA""#, "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\u{FFFD}");
             }
         );
     }
