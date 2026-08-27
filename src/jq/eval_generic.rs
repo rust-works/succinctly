@@ -4940,15 +4940,13 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Stopped { pending } => return Flow::Stopped { pending },
             // #1620/#1660: same decode-failure exclusion as
             // `eval::each_pattern_alternatives` -- always propagates,
-            // `is_last` or not. Currently unreachable through any live
-            // input: every public entry point dispatches `Expr::AsPattern`
-            // through `eval_single`'s wildcard fallback (which eagerly
-            // materializes the whole scope and bridges to `eval.rs`'s
-            // already-fixed evaluator) rather than this function's own
-            // caller (`each_as_pattern_generic`/`eval_each_generic`), so
-            // this loop never actually runs today. Kept as a stale-twin
-            // parity fix and a guard against a future change reopening a
-            // path to it.
+            // `is_last` or not. Live and load-bearing, not merely
+            // stale-twin parity: `first([.p,.q] as [$y] ?// [$z,$y] | ...)`
+            // reaches this loop via `eval_each_generic`'s own native
+            // `Expr::AsPattern` arm (`each_as_pattern_generic`), not
+            // `eval_single`'s wildcard fallback -- confirmed by removing
+            // this arm and observing the exact silently-wrong-value bug
+            // #1660 fixes elsewhere reappear here too.
             Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
                 return Flow::Escaped(Control::Error(e));
             }
@@ -7434,6 +7432,38 @@ mod tests {
                     "caught".to_string(),
                 )))),
             },
+            value,
+        );
+
+        match result {
+            GenericResult::Error(e) => assert!(
+                e.is_decode_failure() && e.message.contains("invalid UTF-8"),
+                "message: {}",
+                e.message
+            ),
+            other => panic!("expected an uncaught decode-failure error, got {other:?}"),
+        }
+    }
+
+    /// #1660: `each_pattern_alternatives_generic`'s own decode-failure
+    /// exclusion, reached via this module's *native* `Expr::AsPattern` arm
+    /// (`each_as_pattern_generic`) rather than the reindex-bridge wildcard
+    /// the two tests above exercise -- `first(...)` drives evaluation
+    /// through `eval_each_generic` directly, which is what actually calls
+    /// into this function. Before the fix, a decode failure inside a
+    /// non-last `?//` alternative's body silently fell through to the next
+    /// alternative here too, exactly like `eval::each_pattern_alternatives`.
+    #[test]
+    fn test_generic_pattern_alternative_retry_does_not_swallow_decode_failure_1660() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\", \"p\": 1, \"q\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        let result = eval(
+            &parse("first([.p,.q] as [$y] ?// [$z,$y] | (if $y==1 then (.a|length) else $y end))")
+                .unwrap(),
             value,
         );
 

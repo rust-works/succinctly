@@ -22683,13 +22683,16 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// since there's nothing left to fall through to.
 ///
 /// Shared by both of [`try_foreach_step_alternatives`]'s retry decisions
-/// (UPDATE's own, and EXTRACT's -- #1458) so the two can't independently
-/// drift on what counts as retryable, the way `try_pattern_alternatives`'s
-/// own copy of this same predicate already once did (#1457).
-/// [`try_reduce_step_alternatives`] hand-rolls an equivalent match rather
-/// than calling this, since its single UPDATE-only retry predates this
-/// helper; consolidating it too is tracked separately (#1570) rather than
-/// attempted here, to keep this fix scoped to the bug it's actually fixing.
+/// (UPDATE's own, and EXTRACT's -- #1458), and by [`try_pattern_alternatives`]'s
+/// own `Partial` arm (#1660 code review -- that arm used to hand-roll an
+/// identical copy of this exact match, the same drift risk #1457 already
+/// found once in this function's *other* caller before this helper existed)
+/// so none of these call sites can independently drift on what counts as
+/// retryable. [`try_reduce_step_alternatives`] hand-rolls an equivalent
+/// match rather than calling this, since its single UPDATE-only retry
+/// predates this helper; consolidating it too is tracked separately (#1570)
+/// rather than attempted here, to keep this fix scoped to the bug it's
+/// actually fixing.
 ///
 /// #1620/#1660: a decode failure is never retryable, `is_last` or not --
 /// same exclusion as `try_pattern_alternatives`/`eval_try`, applied here
@@ -33210,22 +33213,20 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 continue;
             }
             QueryResult::Halt(code) => return Ok((carried, Some(Control::Halt(code)))),
+            // `is_retryable_control` (#1660 code review): this arm used to
+            // hand-roll the same three-way decode-failure/`is_last`/`Halt`
+            // classification `is_retryable_control` already centralizes for
+            // `try_foreach_step_alternatives`'s two call sites -- reusing it
+            // here instead closes the gap its own doc comment warns about
+            // (a third independently-maintained copy silently diverging,
+            // the way `try_pattern_alternatives`'s pre-#1660 copy of this
+            // exact predicate already once did, #1457).
             QueryResult::Partial(vs, control) => {
                 carried.extend(vs);
-                match control {
-                    // Same #1620/#1660 decode-failure exclusion as the bare
-                    // `Error` arm above.
-                    Control::Error(ref e) if e.is_decode_failure() => {
-                        return Ok((carried, Some(control)));
-                    }
-                    Control::Error(_) | Control::Break(_) => {
-                        if is_last {
-                            return Ok((carried, Some(control)));
-                        }
-                        continue;
-                    }
-                    Control::Halt(_) => return Ok((carried, Some(control))),
+                if is_retryable_control(&control, is_last) {
+                    continue;
                 }
+                return Ok((carried, Some(control)));
             }
         }
     }
@@ -35259,10 +35260,12 @@ mod tests {
 
     /// #1620: `try`/`catch` -- `eval_try`, this module's own native
     /// dispatch for both `Expr::Try` and `Expr::Optional` -- must not catch
-    /// a decode failure either. Uses `tonumber`, not `length`: `eval.rs`'s
-    /// own `builtin_length` silently substitutes `0` on a decode failure
-    /// instead of raising at all -- a separate, `to_owned`-family-shaped gap
-    /// (also not reachable via the CLI), out of #1620's scope.
+    /// a decode failure either. Uses `tonumber`, not `length`: at the time
+    /// this test was written, `eval.rs`'s own `builtin_length` silently
+    /// substituted `0` on a decode failure instead of raising at all -- #1660
+    /// has since fixed that (see `test_length_and_friends_raise_on_decode_failure_1660`
+    /// for `length`'s own coverage), but `tonumber` is kept here rather than
+    /// switched to avoid entangling this test with that unrelated fix.
     #[test]
     fn test_try_catch_does_not_catch_decode_failure_1620() {
         query!(
@@ -35397,6 +35400,32 @@ mod tests {
         );
     }
 
+    /// #1660 code review: `length`/`utf8bytelength`/`reverse`/`trim`/
+    /// `ltrim`/`rtrim` share the exact `if let Ok(cow) = s.as_str() {...}
+    /// else { <silent substitute> }` shape the original sweep fixed for
+    /// `startswith`/`endswith`/`split`/`ascii_downcase`/`ascii_upcase`/
+    /// `ltrimstr`/`rtrimstr`, but were missed from that first pass despite
+    /// being immediately adjacent in the same file.
+    #[test]
+    fn test_length_and_friends_raise_on_decode_failure_1660() {
+        for expr in [
+            ".a | length",
+            ".a | utf8bytelength",
+            ".a | reverse",
+            ".a | trim",
+            ".a | ltrim",
+            ".a | rtrim",
+        ] {
+            query!(
+                b"{\"a\": \"\xff\xfe\"}",
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(e.message.contains("invalid UTF-8"), "expr={expr} message: {}", e.message);
+                }
+            );
+        }
+    }
+
     /// #1660 negative control: an *ordinary* error inside a `?//`
     /// alternative's body must still retry the next alternative, proving
     /// the new decode-failure exclusion is scoped correctly and doesn't
@@ -35418,10 +35447,11 @@ mod tests {
     /// collided with a user's own `error(...)` raising one of those exact
     /// strings, wrongly forcing an ordinary, catchable error uncatchable.
     /// Live-verified against jq 1.7.1: real jq retries/catches/suppresses
-    /// these normally. `EvalError::decode_failure` now sets a dedicated
-    /// field instead of relying on `reason`'s text, so this must retry
-    /// (not propagate) exactly like the "ordinary error" negative control
-    /// above.
+    /// these normally. `is_decode_failure()` now checks `self.value.is_some()`
+    /// first (see its own doc comment in `error.rs`) -- true only for a
+    /// user's `error(v)`, never for an internally-raised decode failure --
+    /// so this must retry (not propagate) exactly like the "ordinary error"
+    /// negative control above.
     #[test]
     fn test_pattern_alternative_retry_not_confused_by_decode_failure_wording_1660() {
         for wording in [
