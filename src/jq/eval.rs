@@ -55121,6 +55121,44 @@ mod tests {
     }
 
     #[test]
+    fn flatten_delete_path_identity_arm_called_directly() {
+        // Before #1651, a comma branch that flattened to the document root
+        // (a bare `.` sibling, `del(., .a)`) reached this `Expr::Identity`
+        // arm through `builtin_del`'s own multi-path walk. `resolve_dynamic_indexes`'s
+        // `short_circuit_del_root` flag now catches every such branch first
+        // and returns `[Expr::Identity]` before `flatten_delete_path` is ever
+        // called on it, so that route is gone -- the arm's only remaining
+        // caller through the CLI is `yq_del_slice_outcome`'s bare,
+        // non-comma `del(.)`-shaped yq path. Exercised directly here rather
+        // than depending on that indirect route to keep it covered.
+        let mut steps = Vec::new();
+        flatten_delete_path(&Expr::Identity, false, &mut steps);
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn delete_expr_paths_at_exhausted_sibling_guard_called_directly() {
+        // #1651's `short_circuit_del_root` flag intercepts every comma
+        // branch that resolves to the document root before `builtin_del`
+        // ever calls `delete_expr_paths_at`, and `delete_expr_object_paths`/
+        // `delete_expr_array_paths` both filter an exhausted sibling into
+        // their own `terminal` set before recursing back in -- so this
+        // guard's `paths.iter().any(|path| path.len() == start)` arm can no
+        // longer be reached from any parseable query. Kept anyway: it is
+        // the panic-preventing check standing in front of
+        // `delete_expr_object_paths`/`delete_expr_array_paths`'s own
+        // `path[start]` indexing, which would panic on an empty path
+        // instead of returning cleanly if a future caller ever violated the
+        // invariant. Exercised directly, the same way the parser-unreachable
+        // `builtin_*` functions above are.
+        let empty: &[DeleteStep] = &[];
+        match delete_expr_paths_at(OwnedValue::Null, &[empty], 0) {
+            Ok(OwnedValue::Null) => {}
+            other => panic!("expected Ok(Null), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn builtin_limit_propagates_halt_from_expr_argument() {
         // `Builtin::Limit` is never constructed by the parser: a CLI
         // `limit(n; expr)` always parses through `parse_limit_expr` (matched
