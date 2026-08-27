@@ -735,7 +735,6 @@ pub fn format_byte(byte: u8) -> String {
 /// rule 4, bug-for-bug replication is the correct resolution if picked up,
 /// not "fixing" it into the more sensible WHATWG-consistent shape.
 ///
-
 /// A single left-to-right scan, not a loop over [`validate_utf8`]: that
 /// function's AVX2 path has no early exit (it scans every 32-byte block of
 /// its input before checking for an error at all, since its job is a
