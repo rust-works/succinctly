@@ -1087,6 +1087,40 @@ this. Tracked in
 (item 9) as a residual, not silently reintroduced — `each_limit_generic`'s own doc comment
 carries the same note at the call site.
 
+## `--seq`'s malformed-record warning covers one of jq's several message shapes
+
+Real jq warns on stderr ("`jq: ignoring parse error: ...`") whenever it silently drops a
+malformed `--seq` (RFC 7464) record; `succinctly jq` used to drop the record with no
+diagnostic at all. [#1525](https://github.com/rust-works/succinctly/issues/1525) added the
+warning for exactly one of jq's message templates: content with no RS byte anywhere in the
+input, where jq's own reader never resyncs onto anything and reports the abandonment
+unconditionally at EOF ("`Unfinished abandoned text at EOF at line L, column C`") regardless
+of what the content actually is, even fully valid JSON:
+
+```
+$ printf '1 2' | jq --seq -c '.'                  # jq:          jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3
+$ printf '1 2' | succinctly jq --seq -c '.'       # succinctly:  same (#1525)
+```
+
+A malformed record that *does* start with an RS byte gets one of at least three other jq
+message templates instead, depending on exactly how it's malformed — none implemented yet:
+
+```
+$ printf '\x1e"unterminated\n' | jq --seq -c '.'
+jq: ignoring parse error: Unfinished string at EOF at line 2, column 0
+$ printf '\x1e[1,2\n'          | jq --seq -c '.'
+jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 0
+$ printf '\x1exyz\n'           | jq --seq -c '.'
+jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)
+```
+
+`succinctly jq --seq` emits nothing on stderr for any of these — output-wise it's already
+correct (RFC 7464's own recommended failure mode, #1093/#1267/#1243: the malformed record is
+dropped either way), the gap is purely the missing diagnostic. Matching these needs enough
+of jq's own incremental-parser failure classification to know which of its internal states a
+segment would have failed in, not just whether it parses — deliberately deferred, tracked in
+[#1723](https://github.com/rust-works/succinctly/issues/1723).
+
 ## Deliberate divergences (ADR-0018 rule 4)
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
