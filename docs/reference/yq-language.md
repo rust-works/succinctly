@@ -386,6 +386,7 @@ surface (#1512):
 | `nth(n)`, `nth(n; f)`                                | The `n`th value / output of `f`               |
 | `combinations`, `combinations(n)`                    | Cartesian product of an array of arrays       |
 | `pow(base; exp)`                                     | Exponentiation                                |
+| `bsearch(target)`                                    | Binary search index in a sorted array         |
 | `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
 
 ```bash
