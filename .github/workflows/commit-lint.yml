@@ -25,3 +25,11 @@ jobs:
         with:
           command: lint
           strict: true
+          # Pin, matching ci.yml's omni-dev-coverage-check precedent: `rust-works/omni-dev`
+          # is a private repo, so `version: latest`'s own resolution step -- an
+          # unauthenticated-for-us call to its GitHub releases API -- 404s under the
+          # workflow's own repo-scoped token, which has no cross-repo visibility into a
+          # different private repo. Pinning skips that call entirely. `lint` itself needs
+          # omni-dev >= 0.40.0 (see the action's own `command` input doc); 0.41.0 is the
+          # latest release as of this pin.
+          version: 0.41.0
