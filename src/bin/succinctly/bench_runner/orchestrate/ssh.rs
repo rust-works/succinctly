@@ -235,11 +235,37 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ExecOutput> {
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
 
+    let exit_code = status
+        .code()
+        .ok_or_else(|| signal_death_error(status, &stderr))?;
+
     Ok(ExecOutput {
         stdout,
         stderr,
-        exit_code: status.code().unwrap_or(-1),
+        exit_code,
     })
+}
+
+/// Builds the "child was killed by signal N" error for a signal-terminated
+/// process (`ExitStatus::code()` returns `None` only in that case, on Unix).
+/// Mirrors `tests/common/cargo_run_exit.rs`'s `signal_death_error` (#1691) —
+/// duplicated rather than shared because production code can't depend on a
+/// `tests/` module. Without this, a signal-killed remote `ssh`/`rsync` child
+/// (OOM kill, network drop, another process's `pkill`) silently coerced to a
+/// fake exit code `-1`, reporting as a generic non-zero-exit failure with no
+/// indication a signal was ever involved (#1696).
+fn signal_death_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    anyhow::anyhow!(
+        "child was killed by signal {}; stderr:\n{stderr}",
+        signal.map_or_else(|| "<unknown>".to_string(), |s| s.to_string()),
+    )
 }
 
 /// Recursively copy the *contents* of `src` into `dst` (creating `dst` if
@@ -332,6 +358,21 @@ mod tests {
             .unwrap();
         assert_eq!(out.exit_code, 3);
         assert!(!out.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn localhost_exec_signal_death_names_the_signal() {
+        // `kill -9 $$` terminates the shell itself via SIGKILL (9), so
+        // `ExitStatus::code()` returns `None` -- the case this test exists
+        // to cover, rather than a plain nonzero exit.
+        let err = SystemSsh
+            .exec(&node("localhost"), "kill -9 $$", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("signal 9"),
+            "expected error to name signal 9, got: {err}"
+        );
     }
 
     #[test]
