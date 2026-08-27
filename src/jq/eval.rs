@@ -17959,10 +17959,10 @@ fn resolve_node<'a, S: EvalSemantics>(
             // only a genuine error or a break (below) reaches `catch`;
             // everything else propagates unchanged, as does an
             // invalid-path-expression complaint (#530) and, per the same
-            // reasoning, a decode failure (#1247, #1620).
-            Err((prefix, EvalEscape::Error(e)))
-                if !e.is_invalid_path_expression() && !e.is_decode_failure() =>
-            {
+            // reasoning, a decode failure (#1247, #1620) — both always
+            // uncatchable, with no positional nuance either shares with
+            // `is_untracked_navigation_error` above.
+            Err((prefix, EvalEscape::Error(e))) if !e.is_uncatchable() => {
                 resolve_catch::<S>(catch.as_deref(), prefix, e.payload())
             }
             // `catch` catches a `break` the same way it catches a raised
