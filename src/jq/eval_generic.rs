@@ -1290,7 +1290,7 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
         StandardJson::String(s) => OwnedValue::String(
             s.as_str()
-                .map_err(|e| EvalError::new(format!("{e}")))?
+                .map_err(|e| EvalError::decode_failure(format!("{e}")))?
                 .to_string(),
         ),
         StandardJson::Array(elements) => {
@@ -4938,6 +4938,20 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
         match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1620/#1660: same decode-failure exclusion as
+            // `eval::each_pattern_alternatives` -- always propagates,
+            // `is_last` or not. Currently unreachable through any live
+            // input: every public entry point dispatches `Expr::AsPattern`
+            // through `eval_single`'s wildcard fallback (which eagerly
+            // materializes the whole scope and bridges to `eval.rs`'s
+            // already-fixed evaluator) rather than this function's own
+            // caller (`each_as_pattern_generic`/`eval_each_generic`), so
+            // this loop never actually runs today. Kept as a stale-twin
+            // parity fix and a guard against a future change reopening a
+            // path to it.
+            Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+                return Flow::Escaped(Control::Error(e));
+            }
             // #1457: `Break` falls through like `Error`, not immediately
             // like `Halt` -- same live-verified correction
             // `eval::each_pattern_alternatives` itself documents.
