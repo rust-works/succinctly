@@ -6228,6 +6228,25 @@ fn test_null_input_color_output_yaml() -> Result<()> {
     Ok(())
 }
 
+/// #1577 follow-up to the `test_null_input_color_output_yaml` fix above:
+/// before this PR, [`test_duplicate_mapping_key_survives_slurp_json_color`]
+/// (then named `test_slurp_color_output_json`) was the only test exercising
+/// `output_value`'s JSON `config.use_color` branch, since `--slurp -o=json`
+/// had no fast path at all. Now that `can_slurp_fast_path` accepts JSON too,
+/// that test moved onto the streaming path and stopped covering it -- same
+/// gap, same fix: `--null-input` has no cursor to stream from, so it stays
+/// on the DOM path regardless of output format.
+#[test]
+fn test_null_input_color_output_json() -> Result<()> {
+    let (output, code) = run_yq_stdin("{a: 1}", "", &["-n", "-C", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output,
+        "\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\n"
+    );
+    Ok(())
+}
+
 /// #809: `-C --inplace` fell through to the `OwnedValue`/`IndexMap` DOM
 /// path for any non-compact indent (`can_inplace_yaml_fast_path` excluded
 /// color via `can_stream_pretty`), collapsing duplicate keys — mirrors
