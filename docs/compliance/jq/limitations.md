@@ -262,8 +262,9 @@ off-by-one in jq's own end-of-buffer lookahead rather than a designed rule eithe
 per ADR-0018 rule 4 the correct resolution, where reached, is bug-for-bug replication
 rather than "fixing" the substitution into the more sensible WHATWG-consistent shape. See
 [docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
-substitution-mechanism history and [#1717](https://github.com/rust-works/succinctly/issues/1717)
-for the document/raw-input granularity gap this leaves open.
+substitution-mechanism history, [#1717](https://github.com/rust-works/succinctly/issues/1717)
+for the algorithm fix itself, and #1743/#1742 above for the two granularity gaps it leaves
+open.
 
 ## Conversion diagnostics beyond a single token
 
