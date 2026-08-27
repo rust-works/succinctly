@@ -30504,7 +30504,10 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
     }
 
     // Generate Cartesian product
-    let results = cartesian_product(&arrays);
+    let results = match cartesian_product(&arrays) {
+        Ok(results) => results,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::ManyOwned(results)
 }
 
@@ -30581,19 +30584,41 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::None;
     }
 
-    // Create n copies of the base array and compute Cartesian product
-    let arrays: Vec<Vec<OwnedValue>> = (0..n).map(|_| base_array.clone()).collect();
-    let results = cartesian_product(&arrays);
+    // Create n copies of the base array and compute Cartesian product. `n`
+    // alone drives this Vec's size (each clone is pushed one at a time
+    // rather than collected via a TrustedLen `map`, which is what let a
+    // huge `n` reach the allocator directly here before -- confirmed live,
+    // `[1] | combinations(288230376151711744)` aborted the process; #1669),
+    // so it needs its own guard independent of `cartesian_product`'s own.
+    let mut arrays: Vec<Vec<OwnedValue>> = match try_reserve_product(&[n]) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    for _ in 0..n {
+        arrays.push(base_array.clone());
+    }
+    let results = match cartesian_product(&arrays) {
+        Ok(results) => results,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::ManyOwned(results)
 }
 
-/// Compute the Cartesian product of a list of arrays
-fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Vec<OwnedValue> {
+/// Compute the Cartesian product of a list of arrays.
+///
+/// The result has one entry per combination -- `arrays.iter().map(Vec::len)`'s
+/// product -- so that product is exactly what [`try_reserve_product`] guards
+/// before the loop below grows `results` one push at a time: without this,
+/// `results` grows via ordinary `Vec` doubling with no upfront size check at
+/// all, the identical missed guard #1612/#1634 already closed for other
+/// generator-controlled cross products (#1669).
+fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
-        return vec![OwnedValue::Array(Vec::new())];
+        return Ok(vec![OwnedValue::Array(Vec::new())]);
     }
 
-    let mut results = Vec::new();
+    let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
+    let mut results = try_reserve_product(&lens)?;
     let mut indices = vec![0usize; arrays.len()];
 
     loop {
@@ -30624,7 +30649,7 @@ fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Vec<OwnedValue> {
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Builtin: builtins - list all builtin function names

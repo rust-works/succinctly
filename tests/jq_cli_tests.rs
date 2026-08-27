@@ -22531,6 +22531,74 @@ fn test_jq_string_repeat_huge_count_compound_assign_does_not_panic_1612() -> Res
     Ok(())
 }
 
+/// #1669: `combinations(n)`'s own `n`-sized allocation (independent of
+/// `cartesian_product`'s, since it runs before that's ever reached) used to
+/// hand a generator-controlled `n` straight to `Vec`'s `TrustedLen` `collect`
+/// specialization with no guard at all -- confirmed live before this fix:
+/// `[1] | combinations(288230376151711744)` aborted the process (SIGABRT,
+/// exit 134), not a catchable `EvalError`.
+#[test]
+fn test_jq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "combinations(288230376151711744)"], Some("[1]"))?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("Cannot allocate"), "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1669: `combinations(n)`'s *second* allocation risk -- once its own
+/// `n`-sized guard above passes (a small `n` is cheap on its own), the
+/// `cartesian_product(&arrays)` call that follows can still overflow on
+/// `base_array.len()^n`, a completely different quantity `try_reserve_product(&[n])`
+/// never sees. `n=10` is trivial by itself; `1000^10` is not.
+#[test]
+fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "-c", "[range(1000)] | combinations(10) | length"],
+        None,
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("Cannot allocate"), "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1669: `cartesian_product` (backing bare `combinations` on an array of
+/// arrays, and reached a second time by `combinations(n)` after its own
+/// `n`-sized guard above) grew its `results` via ordinary `Vec` push-growth
+/// with no upfront size check -- slower to trigger than the `n`-guard above
+/// since growth is incremental, but the identical missed guard. Five
+/// 100000-element arrays make the product overflow `usize` by the fourth
+/// factor, so this must fail fast rather than attempt to enumerate any of
+/// the 10^25 combinations.
+#[test]
+fn test_jq_combinations_cartesian_product_length_overflow_does_not_abort_1669() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "[range(100000)] as $a | [$a,$a,$a,$a,$a] | combinations | length",
+        ],
+        Some("{}"),
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("Cannot allocate"), "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1487: `parent(n)`'s `n` argument used to cast via bit-reinterpreting
 /// `as usize` for an `Int` (a negative value wraps to a huge count, treated
 /// as overshooting past root -- `{}`) but a saturating `as usize` for a
