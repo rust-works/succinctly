@@ -3191,16 +3191,43 @@ fn test_join_output_multidoc_dom_path_does_not_corrupt_1701() -> Result<()> {
     Ok(())
 }
 
-/// Same fix, `--eval-all` (#1701 code review round 2).
+/// `-0` counterpart of the above (#1701 code review round 4 gap sweep):
+/// the standard multi-file DOM loop's separator guard had only ever been
+/// tested with `--join-output`, never `-0`.
+#[test]
+fn test_nul_output_multidoc_dom_path_does_not_corrupt_1701() -> Result<()> {
+    let input = "a: 1\n---\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".a + 0", input, &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\0\n---\n2\0");
+
+    Ok(())
+}
+
+/// Same fix, `--eval-all` (#1701 code review round 2). `.[]` (not `.`)
+/// is required to actually exercise the between-results `---` guard
+/// (`yq_runner.rs`'s `results.len() > 1 && i > 0` arm) -- `.` combines
+/// every document into a single array result under `--eval-all`, so it
+/// never reaches that branch at all (found by a round-4 gap sweep: the
+/// original version of this test round-tripped cleanly but tested a
+/// strictly weaker property than its own doc comment claimed).
 #[test]
 fn test_join_output_eval_all_does_not_corrupt_1701() -> Result<()> {
     let input = "a: 1\n---\nb: 2\n";
-    let (output, code) = run_yq_stdin(".", input, &["--eval-all", "--join-output"])?;
+    let (output, code) = run_yq_stdin(".[]", input, &["--eval-all", "--join-output"])?;
     assert_eq!(code, 0);
-    // --eval-all combines every document into one evaluation, so `.`
-    // yields a single array result here -- no `---` boundary is involved,
-    // this just confirms the branch still round-trips cleanly.
-    assert_eq!(output, "- a: 1\n- b: 2");
+    assert_eq!(output, "a: 1\n---\nb: 2");
+    Ok(())
+}
+
+/// `-0` counterpart of the above (#1701 code review round 4 gap sweep).
+#[test]
+fn test_nul_output_eval_all_does_not_corrupt_1701() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+    let (output, code) = run_yq_stdin(".[]", input, &["--eval-all", "-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "a: 1\0\n---\nb: 2\0");
     Ok(())
 }
 
@@ -3224,6 +3251,32 @@ fn test_join_output_inplace_dom_path_does_not_corrupt_1701() -> Result<()> {
     assert!(output.status.success());
     let rewritten = std::fs::read_to_string(input_file.path())?;
     assert_eq!(rewritten, "1\n---\n2");
+
+    Ok(())
+}
+
+/// `-0` counterpart of the above (#1701 code review round 4 gap sweep):
+/// the `--inplace` DOM path's separator guard had only ever been tested
+/// with `--join-output`, never `-0`.
+#[test]
+fn test_nul_output_inplace_dom_path_does_not_corrupt_1701() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "a: 1")?;
+    writeln!(input_file, "---")?;
+    writeln!(input_file, "a: 2")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-0")
+        .arg(".a + 0")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read(input_file.path())?;
+    assert_eq!(rewritten, b"1\0\n---\n2\0");
 
     Ok(())
 }
@@ -12348,6 +12401,74 @@ fn test_front_matter_process_inplace_rewrites_file() -> Result<()> {
         rewritten,
         "---\ntitle: New\ntags:\n  - a\n  - b\n---\n# Body\n\nSome text.\n"
     );
+    Ok(())
+}
+
+/// #1701 code review round 4: unlike every other `---`-writing site in
+/// `yq_runner.rs`, `--front-matter=process`'s own closing fence had no
+/// `write_doc_marker_newline_guard` protection, so `--join-output`/`-0`
+/// glued it directly onto the front matter's own last byte -- e.g.
+/// `a: 1---` instead of `a: 1\n---`, silently corrupting the document
+/// boundary the same way #1701's other fixes already prevent elsewhere.
+/// Originally deferred as #1712; fixed directly here once the same
+/// "was anything actually written" gating the other sites already had
+/// for free (`any_output_this_file`) was added for this site too.
+#[test]
+fn test_join_output_front_matter_process_does_not_corrupt_1701() -> Result<()> {
+    let input = "---\na: 1\n---\nbody one\n";
+    let (output, code) = run_yq_stdin(".", input, &["--front-matter", "process", "--join-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "---\na: 1\n---\nbody one\n");
+    Ok(())
+}
+
+/// `-0` counterpart of the above.
+#[test]
+fn test_nul_output_front_matter_process_does_not_corrupt_1701() -> Result<()> {
+    let input = "---\na: 1\n---\nbody one\n";
+    let (output, code) = run_yq_stdin(".", input, &["--front-matter", "process", "-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "---\na: 1\0\n---\nbody one\n");
+    Ok(())
+}
+
+/// Same fix on the `--inplace` path, which persists corruption to disk
+/// if unfixed.
+#[test]
+fn test_join_output_front_matter_process_inplace_does_not_corrupt_1701() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "---\na: 1\n---\nbody one\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .args(["--front-matter", "process", "-i", "--join-output"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+
+    let rewritten = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(rewritten, "---\na: 1\n---\nbody one\n");
+    Ok(())
+}
+
+/// Edge case the guard must not regress: when the document loop produces
+/// zero real output (e.g. `empty`), the closing fence must NOT gain a
+/// spurious leading blank line -- the guard is gated on
+/// `any_output_this_file`/`any_real_output`, not applied unconditionally,
+/// specifically to avoid this (the reason this fix was originally
+/// deferred as #1712 rather than attempted blindly).
+#[test]
+fn test_front_matter_process_empty_filter_no_spurious_blank_line_1701() -> Result<()> {
+    let input = "---\na: 1\n---\nbody one\n";
+    let (output, code) = run_yq_stdin(
+        "empty",
+        input,
+        &["--front-matter", "process", "--join-output"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "---\n---\nbody one\n");
     Ok(())
 }
 

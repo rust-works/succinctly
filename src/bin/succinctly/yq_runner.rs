@@ -4531,6 +4531,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             };
 
             if let Some(body) = &front_matter_body {
+                // #1701 code review round 4: same fix as every other `---`
+                // writer -- but gated on `any_real_output`, not applied
+                // unconditionally: `output_buffer` at this point holds only
+                // the opening fence's own hardcoded (always-`\n`-terminated)
+                // `writeln!` when no document produced real output (e.g. a
+                // halt before evaluating anything), and the guard would
+                // insert a spurious leading blank line there instead of
+                // fixing anything -- it's only the *document content*
+                // `output_value` wrote, subject to `-0`/`--join-output`,
+                // that can need it.
+                if any_real_output {
+                    write_doc_marker_newline_guard(
+                        &mut output_buffer,
+                        Terminator::from_config(&output_config),
+                    )?;
+                }
                 output_buffer.extend_from_slice(b"---");
                 output_buffer.extend_from_slice(front_matter::body_line_ending(body));
                 output_buffer.extend_from_slice(body);
@@ -4684,6 +4700,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if front_matter_body.is_some() {
                 writeln!(writer, "---")?;
             }
+            // Tracks "did this file's own document loop write any real
+            // output" (#1701 code review round 4), separately from
+            // `any_yaml_doc_output` above (invocation-wide, drives the
+            // *inter-document* `---` decision, not this file's closing
+            // front-matter fence) -- mirrors the `--inplace` path's own
+            // `any_real_output`.
+            let mut any_output_this_file = false;
             for results in doc_results {
                 // Add document separator in YAML mode for multi-doc,
                 // between YAML-resolved documents only, not before the
@@ -4723,10 +4746,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(&mut writer, &result, &comments, &file_output_config)?;
+                    any_output_this_file = true;
                 }
             }
             if let Some(body) = front_matter_body {
                 let line_ending = front_matter::body_line_ending(body);
+                // #1701 code review round 4: same fix as the `--inplace`
+                // path's closing fence -- gated on whether this file's
+                // document loop actually wrote anything (subject to
+                // `-0`/`--join-output`), not applied unconditionally: with
+                // zero real output, `writer` at this point holds only the
+                // opening fence's own always-`\n`-terminated `writeln!`.
+                if any_output_this_file {
+                    write_doc_marker_newline_guard(
+                        &mut writer,
+                        Terminator::from_config(&file_output_config),
+                    )?;
+                }
                 writer.write_all(b"---")?;
                 writer.write_all(line_ending)?;
                 writer.write_all(body)?;
