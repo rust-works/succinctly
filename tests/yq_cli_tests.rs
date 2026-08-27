@@ -18439,6 +18439,46 @@ fn test_1162_bare_root_object_slice_del_is_noop() -> Result<()> {
     Ok(())
 }
 
+/// A bare, non-optional `del(.)` deletes the whole document and emits
+/// *nothing* in real yq — not even `null` — unlike `succinctly jq`/real jq,
+/// which both produce `null` (#1702, verified live against yq v4.53.3 on
+/// scalar/array/object targets alike).
+#[test]
+fn test_1702_yq_bare_root_del_emits_nothing() -> Result<()> {
+    for input in [r#"{"a":1}"#, r"[1,2,3]", r"5"] {
+        let (out, code) = run_yq_stdin("del(.)", input, &["-o=json"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "", "input was {input}");
+    }
+    Ok(())
+}
+
+/// `del(.?)` — the root's own `.` marked optional — is a full no-op in real
+/// yq: the original value passes through unchanged, unlike `succinctly
+/// jq`/real jq's `null` (#1702, verified live).
+#[test]
+fn test_1702_yq_optional_root_del_is_noop() -> Result<()> {
+    for input in [r#"{"a":1}"#, r"[1,2,3]", r"5"] {
+        let (out, code) = run_yq_stdin("del(.?)", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), input);
+    }
+    Ok(())
+}
+
+/// A comma naming the root alongside another path (`del(., .c)`) already
+/// collapses to a single root-delete branch upstream (#1651's
+/// `short_circuit_del_root`) before #1702's check ever runs — confirming the
+/// two fixes compose rather than double-handling the same shape. Real yq
+/// emits nothing here too (verified live).
+#[test]
+fn test_1702_yq_comma_with_root_del_emits_nothing() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(., .c)", r#"{"a":1,"c":2}"#, &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+    Ok(())
+}
+
 /// A comma-grouped multi-path `del()` (`delete_expr_paths_at`'s own sibling-
 /// grouping walker, a completely separate code path from the single-path
 /// case above) gets the same widened rule for each resolved path

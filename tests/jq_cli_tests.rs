@@ -22933,3 +22933,16 @@ fn test_parent_n_non_numeric_argument_reports_real_type_name_1487() -> Result<()
     );
     Ok(())
 }
+
+/// #1702 fixed `del(.)`/`del(.?)` to emit nothing / no-op in yq mode; confirm
+/// `succinctly jq` still follows real jq's own model unchanged — both
+/// produce `null` on any target.
+#[test]
+fn test_jq_mode_root_del_still_null_after_1702() -> Result<()> {
+    for expr in ["del(.)", "del(.?)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", expr], Some(r#"{"a":1}"#))?;
+        assert_eq!(stdout.trim(), "null", "expr={expr} stderr: {stderr:?}");
+        assert_eq!(code, 0, "expr={expr} stderr: {stderr:?}");
+    }
+    Ok(())
+}

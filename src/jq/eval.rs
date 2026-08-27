@@ -27724,6 +27724,25 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 YqDelSliceOutcome::Noop => continue,
                 YqDelSliceOutcome::NotApplicable => path,
             };
+            // yq's root-delete rule (#1702): real yq deletes the whole
+            // document and emits nothing for a bare `del(.)` (no `?`
+            // anywhere), and treats `del(.?)` as a full no-op — the
+            // optional root delete never fires. `succinctly` previously
+            // followed jq's model for both (`del(.)` => `null`,
+            // `del(.?)` => `null`), which is correct for `succinctly jq`
+            // but not `succinctly yq`. Checked here, ahead of
+            // `delete_at_path`, rather than inside its `Expr::Identity`
+            // arm, since that arm has no way to signal "no output at
+            // all" through its `Result<(), EvalError>` return type.
+            if S::TAG == EvalTag::Yq {
+                match effective_path {
+                    Expr::Identity => return QueryResult::None,
+                    Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Identity) => {
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if let Err(e) =
                 delete_at_path(&mut result, effective_path, false, S::TAG == EvalTag::Yq)
             {
