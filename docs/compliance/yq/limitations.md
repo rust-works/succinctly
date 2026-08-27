@@ -131,12 +131,13 @@ $ printf 'a: 1\n---\nb: 2\n' | succinctly yq -0 '.' | od -c
 
 This is rule 4(a), not a new carve-out — same shape as anchor soundness above: real yq emits
 `---`-boundary output real yq cannot itself re-read, so inserting the missing newline is
-permitted rather than bug-for-bug reproduced. `--join-output` has no real-yq counterpart at
-all (it is a succinctly-only spelling of jq-style "no separator" semantics colliding with a
-name real yq uses for something else entirely — see
-[#1710](https://github.com/rust-works/succinctly/issues/1710)), so for that flag there was
-never a reference behaviour to diverge from in the first place; the same guard is applied to
-it purely for internal consistency, not for fidelity.
+permitted rather than bug-for-bug reproduced. The long form, `--join-output`, has no real-yq
+counterpart at all (`Error: unknown flag: --join-output`), so for *that* spelling there was
+never a reference behaviour to diverge from in the first place. The short form, `-j`, is a
+different story — it collides with a real yq flag of the same name but an unrelated meaning
+(see "`-j`/`--join-output` collides with real yq's own `-j`" below) — but the guard's
+own justification doesn't change either way: it's applied to both spellings purely for
+internal consistency between them, not for fidelity to anything real yq does with `-j`.
 
 Scope note: this entry covers only the `---`-boundary corruption. The reparsed value shown
 above still differs from the original once the embedded `\0` itself is considered — succinctly
@@ -206,6 +207,38 @@ at all. The justification is the spec target, which is why the case belongs here
 
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
+
+### `-j`/`--join-output` collides with real yq's own `-j`
+
+Not an [extension](#extensions) — real yq's arg parser does accept `-j`, so this fails rule
+5's own test ("changes the behaviour of no filter the reference also accepts"), and none of
+rule 4's four carve-outs (unreadable output, corruption, a discarded write, or taking the
+process down) apply either. It's a plain, unaddressed name collision: `succinctly yq`'s
+`-j`/`--join-output` implements jq-style "no separator, concatenate raw" output (apparently
+ported from `JqCommand`'s own legitimate `-j`, which does match real jq's `-j`). Real yq's
+own `-j` means something else entirely — a deprecated alias for `--tojson` (forces
+`-o=json`, prints a deprecation warning to stderr). The long form, `--join-output`, does not
+exist in real yq at all. Confirmed live against the pinned v4.53.3 binary:
+
+```bash
+$ yq -j '.' <<< 'a: 1'
+Flag --tojson has been deprecated, please use -o=json instead
+{
+  "a": 1
+}
+$ yq --join-output '.' <<< 'a: 1'
+Error: unknown flag: --join-output
+```
+
+A user who knows real yq's `-j` and reasonably expects `succinctly yq -j` to behave the same
+way gets something unrelated instead. Long-standing (predates #1701, ported alongside
+`JqCommand`'s own `-j`), found and recorded by
+[#1710](https://github.com/rust-works/succinctly/issues/1710) — a documentation-only fix
+(see [docs/guides/cli.md](../../guides/cli.md) for the matching caveat on the flag's own
+listing); remapping `-j` to real yq's actual `--tojson` meaning, which #1710 also raised, is
+a bigger, more disruptive change not attempted there. "Anchor soundness" above discusses this
+same flag from a different angle — why `-0`/`-j` output getting a newline-guarded `---` is a
+*permitted* rule-4(a) divergence, independent of the name-collision question here.
 
 ### Duplicate mapping keys — the format leak and `.[]` collapse are resolved; four narrower gaps remain
 
@@ -785,26 +818,6 @@ no filter the reference also accepts — an extension is not a divergence.
 
 **Wholly new syntax, unconditional** — `at_offset`/`at_position`, `@dsv`. Neither jq nor yq
 has anything resembling these; there is no reference token to gate them against.
-
-**A flag name real yq also uses, for something unrelated** — `-j`/`--join-output`. In yq
-mode this implements jq-style "no separator, concatenate raw" output (apparently ported from
-`JqCommand`'s own legitimate `-j`, which does match real jq's `-j`). Real yq's own `-j` means
-something else entirely: a deprecated alias for `--tojson` (forces `-o=json`, prints a
-deprecation warning to stderr); the long form `--join-output` does not exist in real yq at
-all (`Error: unknown flag: --join-output`), confirmed live against the pinned v4.53.3 binary:
-
-```bash
-$ yq -j '.'            <<< 'a: 1'   # Flag --tojson has been deprecated, please use -o=json instead
-                                     # {"a": 1}
-$ yq --join-output '.' <<< 'a: 1'   # Error: unknown flag: --join-output
-```
-
-This is the one extension in this file where the *name itself* collides with real yq surface
-rather than being wholly novel — a user who knows real yq's `-j` and reasonably expects
-`succinctly yq -j` to behave the same way gets something unrelated instead. Long-standing
-(predates #1701, ported alongside `JqCommand`'s own `-j`), found and recorded by
-[#1710](https://github.com/rust-works/succinctly/issues/1710). See
-[docs/guides/cli.md](../../guides/cli.md) for the same caveat on the flag's own listing.
 
 **jq-styled syntax real yq's lexer rejects, gated behind `--jq-extensions`, off by default
 ([#1512](https://github.com/rust-works/succinctly/issues/1512))** — `paths`, `getpath`,
