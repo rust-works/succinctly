@@ -17544,8 +17544,10 @@ fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
 /// `"null" | @base64d` succeeds as `"��e"` in yq v4.53.3 rather
 /// than erroring). This is yq mode's own WHATWG-lossy fallback, unaffected
 /// by #1719 (jq mode only) -- real jq 1.7.1 gives a different value here,
-/// `"��"` with no trailing `e` (the #1717 quirk, unrelated to
-/// this test), so do not read the value below as a cross-mode oracle match.
+/// `"��"` with no trailing `e`. jq mode now reproduces that value
+/// exactly (#1717, fixed), but yq mode has no oracle-matching rule to
+/// switch to, so it keeps this WHATWG value; do not read it as a
+/// cross-mode oracle match.
 #[test]
 fn test_base64d_invalid_utf8_is_lossy_not_error_1109() -> Result<()> {
     let (out, code) = run_yq_stdin("@base64d", r#""null""#, &["-o", "json"])?;
@@ -20378,41 +20380,42 @@ fn test_jq_base64d_invalid_trailing_byte_uses_invalid_data_message_1146() -> Res
 /// `owned_string_from_decoded_bytes` exists to handle) previously had no
 /// regression test -- only the yq-mode variant was covered.
 ///
-/// `base64_decode_lossy` computes the WHATWG rule, not jq's own
-/// maximal-subpart rule (#1617/#1719) -- they happen to agree here because
-/// "null" decodes to a byte sequence that hits #1717's still-open quirk
-/// (jq drops the final rescanned byte at a string's last byte; neither
-/// substitution rule replicates that drop, so both land on the same
-/// 3-codepoint answer, not jq 1.7.1's real 2-codepoint one). This test
-/// therefore does not prove full jq-oracle parity for this input -- see
-/// `owned_string_from_decoded_bytes`'s doc comment in `src/jq/eval.rs`.
+/// "null" decodes to `[0x9E, 0xE9, 0x65]`: a stray continuation byte (one
+/// U+FFFD on its own), then a 3-byte lead (0xE9) whose sole continuation
+/// candidate (0x65, `'e'`) is both invalid *and* the buffer's last byte --
+/// exactly #1717's shortfall-2-at-end shape. `base64_decode_lossy`
+/// (WHATWG) does not model that drop and so no longer matches this
+/// call's own asserted value below; the literal replaces it, matching
+/// jq 1.7.1 exactly (`printf '"null"' | jq -j '@base64d'` ->
+/// two U+FFFD, no trailing `e`, confirmed live).
 #[test]
 fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"null\"", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
-    let expected = base64_decode_lossy("null");
-    assert_eq!(out.trim(), format!("{expected:?}"));
+    assert_eq!(out.trim(), "\"\u{fffd}\u{fffd}\"");
     Ok(())
 }
 
-/// #1717, reached via `@base64d` -- pins the CURRENT (known-divergent from
-/// real jq) behavior, not a target to match. Base64 "4UE=" decodes to raw
-/// bytes `[0xE1, 0x41]`: a 3-byte lead followed by an invalid continuation
-/// byte ('A') at the string's last byte. Real jq 1.7.1 drops that trailing
-/// byte entirely (`echo '"4UE="' | jq -c '@base64d|explode'` -> `[65533]`);
-/// succinctly keeps it (`[65533,65]`), matching `String::from_utf8_lossy`'s
-/// WHATWG answer -- unaffected by #1719, since jq-style substitution
-/// (#1617/#1719) agrees with WHATWG on this specific shape (confirmed live,
-/// byte-identical output before and after #1719). This pins the status quo
-/// so a future #1717 fix has a base64d-reachable regression test to update,
-/// and so nobody accidentally "fixes" this call site alone without #1717's
-/// own document-decode call sites (see docs/compliance/jq/limitations.md
-/// § "An open gap in jq's own UTF-8 replacement-character substitution").
+/// #1717, reached via `@base64d`. Base64 "4UE=" decodes to raw bytes
+/// `[0xE1, 0x41]`: a 3-byte lead followed by an invalid continuation byte
+/// ('A') at the string's last byte -- shortfall 2, at end. Real jq 1.7.1
+/// drops that trailing byte entirely
+/// (`echo '"4UE="' | jq -c '@base64d|explode'` -> `[65533]`), and
+/// `succinctly` now matches exactly, via `owned_string_from_decoded_bytes`
+/// (`src/jq/eval.rs`) calling the fixed `substitute_invalid_utf8_jq_style`
+/// (`src/text/utf8/mod.rs`). Document/raw-input decode
+/// (`jq_runner.rs`'s `utf8_lossy_document`/`get_inputs`) does *not* gain
+/// this fix -- it substitutes a whole file/document buffer at once, so
+/// "last byte of input" almost never coincides with "last byte of one
+/// JSON string's own content" the way it naturally does here, where
+/// `input` already *is* one decoded string's bytes. See
+/// docs/compliance/jq/limitations.md § "An open gap in jq's own UTF-8
+/// replacement-character substitution" for the granularity distinction.
 #[test]
-fn test_jq_base64d_drops_trailing_byte_quirk_unaffected_1717() -> Result<()> {
+fn test_jq_base64d_drops_trailing_byte_quirk_fixed_1717() -> Result<()> {
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"4UE=\"", &["-c"])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[65533,65]");
+    assert_eq!(out.trim(), "[65533]");
     Ok(())
 }
 
