@@ -1110,7 +1110,10 @@ pub struct YqCommand {
     #[arg(short = 'P', long = "prettyPrint")]
     pub pretty_print: bool,
 
-    /// Use tabs for indentation
+    /// Use tabs for indentation. Write-only: succinctly's own YAML reader (like
+    /// the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so
+    /// this flag's YAML output cannot be read back by `succinctly yq` itself,
+    /// or by other spec-strict YAML parsers (#1684).
     #[arg(long)]
     pub tab: bool,
 

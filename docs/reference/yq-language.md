@@ -432,7 +432,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `-i, --inplace`       | Update file in place                          |
 | `-0, --nul-output`    | Use NUL separator instead of newline          |
 | `--no-doc`            | Omit document separators (`---`)              |
-| `--tab`               | Use tabs for indentation                      |
+| `--tab`               | Use tabs for indentation (write-only — see [Known Limitations](#known-limitations)) |
 | `--split-exp EXPR`    | Split output into one file per result (below) |
 
 ### `--front-matter`
@@ -523,6 +523,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 3. **`file_index`/`key`/`document_index` in complex expressions** - Resolve through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, `label`, array literals (`[...]`, since #1302 gave `Expr::Array` its own path-context recursion), and user-defined functions; still return `0` inside object literals (`{...}`) or `any`/`all`
 4. **`--slurp`/`--eval-all` output has no comments** - both combine documents through the `OwnedValue` DOM (which carries no comment data) before evaluating, unlike the default per-document path
 5. **`--front-matter` position builtins use the extracted block's own coordinates** - `at_offset`, `at_position`, `line`, and `column` resolve against the extracted YAML slice, not the original file; a reported `line`/`column` is offset from the file's real line/column by the front-matter header's length
+6. **`--tab` output does not round-trip** - succinctly's own YAML reader (like the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so any nested `--tab` YAML output cannot be read back by `succinctly yq` itself, or by other spec-strict YAML parsers. Real yq v4.53.3 has no `--tab` flag at all (confirmed live: `unknown flag: --tab`), so this is a succinctly-only extension with no round-trip oracle to satisfy — it is write-only by design (#1684)
 
 ---
 
