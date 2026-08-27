@@ -23,7 +23,7 @@ use succinctly::jq::{
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
     format_float_yq_yaml, format_float_yq_yaml_nested, resolve_plain, resolve_tagged,
-    stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
+    stream_json_sequence, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
@@ -3275,17 +3275,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && context.named.is_empty();
     let can_inplace_fast_path = can_inplace_json_fast_path || can_inplace_yaml_fast_path;
 
-    // `--slurp`'s fast path (#478) is narrower than the two gates above:
-    // scoped to plain identity only (`is_identity`, not the broader
-    // `is_m2_streamable` set), since a non-trivial filter over the slurped
-    // array needs real evaluation. `-o json --slurp` still uses the slow
-    // DOM path below — an explicit, documented scope limit rather than a
-    // silent gap. Color no longer excludes this gate either (#809): the
-    // call site now wraps `stream_yaml_sequence` in `stream_maybe_colored`,
-    // same as the stdout/inplace paths.
+    // `--slurp`'s fast path (#478, extended to `-o=json` by #1577) is
+    // narrower than the two gates above: scoped to plain identity only
+    // (`is_identity`, not the broader `is_m2_streamable` set), since a
+    // non-trivial filter over the slurped array needs real evaluation.
+    // Color no longer excludes this gate either (#809): the call site wraps
+    // `stream_yaml_sequence`/`stream_json_sequence` in `stream_maybe_colored`,
+    // same as the stdout/inplace paths. Unlike the other gates above, this
+    // one never OR's in `output_config.compact` for YAML -- preserved as-is
+    // from before #1577, which only adds the JSON arm and its established
+    // `compact || (pretty-or-colored && !ascii_output)` split (matching
+    // `can_json_fast_path`'s identical asymmetry: `--ascii-output`'s
+    // escaping isn't implemented by the pretty/colored streaming path, only
+    // by the compact one).
     let can_slurp_fast_path = is_identity
-        && can_stream_pretty_or_colored
-        && output_config.output_format == OutputFormat::Yaml
+        && match output_config.output_format {
+            OutputFormat::Json => {
+                output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output)
+            }
+            OutputFormat::Yaml => can_stream_pretty_or_colored,
+            _ => false,
+        }
         && !args.null_input
         && !args.raw_input
         && args.front_matter.is_none()
@@ -3992,19 +4002,38 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // matching jq/yq `-e` semantics for arrays.
                 any_truthy = true;
             }
-            // Buffer-and-colorize (#748, extended to `--slurp` by #809):
-            // `stream_yaml_sequence` is generic over `core::fmt::Write`, so
-            // it slots into `stream_maybe_colored` unmodified.
-            stream_maybe_colored(&mut writer, output_config.use_color, colorize_yaml, |out| {
-                stream_yaml_sequence(
-                    cursors.iter().copied(),
-                    out,
-                    0,
-                    yaml_indent_spaces,
-                    indent_unit,
-                    sort_keys,
-                )
-            })?;
+            // Buffer-and-colorize (#748, extended to `--slurp` by #809, and
+            // to `-o=json` by #1577): `stream_yaml_sequence`/
+            // `stream_json_sequence` are both generic over `core::fmt::Write`,
+            // so each slots into `stream_maybe_colored` unmodified.
+            if output_config.output_format == OutputFormat::Json {
+                stream_maybe_colored(
+                    &mut writer,
+                    output_config.use_color,
+                    |s| output::colorize_json(s, &ColorScheme::default()),
+                    |out| {
+                        stream_json_sequence(
+                            cursors.iter().copied(),
+                            out,
+                            0,
+                            json_indent_spaces,
+                            indent_unit,
+                            sort_keys,
+                        )
+                    },
+                )?;
+            } else {
+                stream_maybe_colored(&mut writer, output_config.use_color, colorize_yaml, |out| {
+                    stream_yaml_sequence(
+                        cursors.iter().copied(),
+                        out,
+                        0,
+                        yaml_indent_spaces,
+                        indent_unit,
+                        sort_keys,
+                    )
+                })?;
+            }
             writeln!(writer)?;
         } else {
             // #1493: resolve `Auto` against the uniform format of every
