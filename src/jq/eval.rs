@@ -9180,12 +9180,24 @@ fn format_base64d<S: EvalSemantics>(
     // Lossy, not strict: real jq/yq's own `@base64d` never errors on
     // invalid UTF-8 in the decoded bytes -- it substitutes the standard
     // replacement character, confirmed live against both oracles
-    // (`"null" | @base64d` succeeds as `"\u{fffd}\u{fffd}e"` in jq 1.7.1,
-    // not an error). This surfaced while adding this function's `S`
-    // parameter (#1109): yq mode's new scalar-stringification path
-    // (`null`/`true`/... above) reaches this exact case for the first
-    // time, and the strict conversion previously here would have produced
-    // a different wrong error instead of matching the oracle.
+    // (`"null" | @base64d` succeeds in jq 1.7.1, not an error). This
+    // surfaced while adding this function's `S` parameter (#1109): yq
+    // mode's new scalar-stringification path (`null`/`true`/... above)
+    // reaches this exact case for the first time, and the strict
+    // conversion previously here would have produced a different wrong
+    // error instead of matching the oracle.
+    //
+    // Note the exact byte sequence real jq 1.7.1 emits for `"null"` is
+    // `"\u{fffd}\u{fffd}"` (two U+FFFD, no trailing byte) -- an earlier
+    // version of this comment claimed a trailing `e` that live-testing
+    // against the pinned binary (2026-08-27, re-verifying #1719) disproves.
+    // That third byte is the still-open #1717 quirk: jq drops the byte a
+    // rescan lands on when it's the string's very last byte, which neither
+    // `substitute_invalid_utf8_jq_style` (#1617/#1719, jq mode below) nor
+    // plain `String::from_utf8_lossy` (yq mode) replicates -- both keep it,
+    // so this specific example does not fully round-trip the oracle either
+    // way. #1719's fix is scoped to the overlong/surrogate/out-of-range
+    // collapse rule only; see `test_jq_base64d_invalid_utf8_is_lossy_not_error_1146`.
     Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 
@@ -40642,6 +40654,21 @@ mod tests {
         query!(br#""4ICA""#, "@base64d",
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "\u{FFFD}");
+            }
+        );
+    }
+
+    #[test]
+    fn test_format_base64d_yq_mode_keeps_per_byte_lossy_1719() {
+        // Sibling of the jq-mode test above: #1719 only switched jq mode's
+        // substitution rule. yq mode has no oracle-matching rule to switch
+        // to (real yq passes invalid-UTF-8 bytes through unchanged, which
+        // Rust's `String` can't represent), so it must keep emitting one
+        // U+FFFD per byte here -- pinned so a future refactor collapsing
+        // the `S::TAG` branch can't silently apply jq's rule to yq too.
+        yq_query!(br#""4ICA""#, "@base64d",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "\u{FFFD}\u{FFFD}\u{FFFD}");
             }
         );
     }
