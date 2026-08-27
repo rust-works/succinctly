@@ -13884,6 +13884,57 @@ mod tests {
         assert_eq!(out, "- \u{FFFD}\u{FFFD}");
     }
 
+    /// The sibling of the test above with a genuinely #1194-malformed key:
+    /// `stream_json`/`stream_yaml`'s `LazyKeys { sorted: true, .. }` arm
+    /// still raises through `materialize_lazy_keys`'s `Err` side (#1642 only
+    /// relaxed the decode-failure case above, not this structural one) --
+    /// nothing reaches `out` on either output format, matching every other
+    /// `keys`/`length`/`.` route's agreement on a malformed member (#1194).
+    #[test]
+    fn test_stream_sorted_lazy_keys_arm_raises_on_malformed_key_1194() {
+        let json: &[u8] = b"{123: 1}";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys").unwrap(), cursor);
+        assert!(matches!(
+            result,
+            GenericResult::LazyKeys { sorted: true, .. }
+        ));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert!(stats.error.is_some());
+        assert_eq!(out, "");
+
+        let mut out = String::new();
+        let stats = result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert!(stats.error.is_some());
+        assert_eq!(out, "");
+    }
+
+    /// `GenericResult::materialize_lazy`'s `LazyKeys` arm `Err` side:
+    /// reached whenever a `LazyKeys` result is materialized by a consumer
+    /// other than `stream_json`/`stream_yaml`/`fold_lazy_keys_stage` (which
+    /// each have their own dedicated tests) -- here, `push_generic_owned_values`
+    /// inside `Expr::Comma`'s evaluation. `keys, 1` puts a bare `keys` as
+    /// the comma's first operand over a document with a #1194-malformed
+    /// key; `push_generic_owned_values` calls `materialize_lazy` on it
+    /// before `to_owned`/`to_owned_cursor` ever run, converting the
+    /// `LazyKeys` into `GenericResult::Error` directly.
+    #[test]
+    fn test_materialize_lazy_keys_arm_raises_on_malformed_key_1194() {
+        let json: &[u8] = b"{123: 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys, 1").unwrap(), cursor);
+        assert!(result.is_error(), "{result:?}");
+    }
+
     /// `stream_json`'s `LazySeq` arm falls back to materializing each
     /// `LazyElem` via `lazy_elem_to_owned` whenever
     /// `sequence_streamable_cursors` answers `None` -- unconditional for
@@ -14035,6 +14086,22 @@ mod tests {
             GenericResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "\u{FFFD}\u{FFFD}"),
             other => panic!("expected Owned(String(..)): {other:?}"),
         }
+    }
+
+    /// The sibling of the test above with a genuinely #1194-malformed key
+    /// rather than a mere decode failure: `materialize_lazy_keys`'s `Err`
+    /// arm inside `fold_lazy_keys_stage`'s catch-all still raises, since
+    /// #1642 only relaxed the decode-failure case, not this one. Same
+    /// `keys | .[0]` shape reaching the same catch-all arm (see that
+    /// test's own doc comment for why `.[0]` falls here rather than one of
+    /// the dedicated fast-path arms).
+    #[test]
+    fn test_fold_lazy_keys_stage_catchall_raises_on_malformed_key_1194() {
+        let json: &[u8] = b"{123: 1}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys | .[0]").unwrap(), cursor);
+        assert!(result.is_error(), "{result:?}");
     }
 
     /// `each_lazy_keys_iterate_sink`'s sorted branch (#1599) decodes and
