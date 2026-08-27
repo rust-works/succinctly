@@ -188,6 +188,27 @@ pub trait EvalSemantics: Copy + Default {
     /// `if`/`then`/`else` outright, so there is no yq answer for it to
     /// diverge from.
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool;
+
+    /// If true (jq), decoding invalid UTF-8 bytes to a lossy `String`
+    /// (`@base64d`/`@urid`'s own decode, #1719; also document/raw-input
+    /// decode via `substitute_invalid_utf8_jq_style` directly, #1617) uses
+    /// jq's maximal-subpart rule: a structurally-valid overlong/surrogate/
+    /// out-of-range 3-/4-byte lead collapses to a single U+FFFD, live-
+    /// verified against jq 1.7.1 (`\xe0\x80\x80` -> one U+FFFD, not three).
+    ///
+    /// If false (yq), plain `String::from_utf8_lossy` (WHATWG's rule, one
+    /// U+FFFD per byte) is used instead -- yq has no oracle-matching rule
+    /// to switch to here: real yq (backed by Go) passes invalid-UTF-8
+    /// bytes through unchanged, which Rust's `String` cannot represent at
+    /// all, so this is the closest available approximation, not a verified
+    /// oracle match.
+    ///
+    /// Neither rule fully matches jq on every input: `substitute_invalid_utf8_jq_style`
+    /// has its own separate, deliberately-unmatched gap (#1717) where jq
+    /// drops a byte this codebase keeps -- see
+    /// docs/compliance/jq/limitations.md's "An open gap in jq's own UTF-8
+    /// replacement-character substitution".
+    const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -214,6 +235,7 @@ impl EvalSemantics for JqSemantics {
     const COLLAPSE_DUPLICATE_KEYS: bool = true;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = None;
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = false;
+    const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
 }
 
 /// yq-compatible evaluation semantics.
@@ -242,6 +264,7 @@ impl EvalSemantics for YqSemantics {
     const COLLAPSE_DUPLICATE_KEYS: bool = false;
     const MAX_STRING_REPEAT_BYTES: Option<u128> = Some(10 * 1024 * 1024);
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = true;
+    const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -8652,16 +8675,11 @@ fn yq_stringify_scalar_or_empty<S: EvalSemantics>(value: &OwnedValue) -> String 
 /// at all, so lossy substitution is the closest correct representation
 /// available here, not a verified oracle match for that specific case.
 ///
-/// In jq mode, the invalid-UTF-8 arm uses jq's own maximal-subpart
-/// substitution rule (`substitute_invalid_utf8_jq_style`, #1617) rather than
-/// `String::from_utf8_lossy`'s WHATWG rule -- real jq's `@base64d` collapses
-/// an overlong/surrogate/out-of-range 3-/4-byte lead to one U+FFFD, where
-/// WHATWG emits one per byte (#1719). yq mode is unaffected: yq has no
-/// oracle-matching rule to switch to here (see the note above), so it keeps
-/// the existing lossy fallback.
+/// Which lossy substitution rule the invalid-UTF-8 arm uses is per-mode --
+/// see `EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE` (#1719).
 fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| {
-        if S::TAG == EvalTag::Jq {
+        if S::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE {
             crate::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
         } else {
             String::from_utf8_lossy(e.as_bytes()).into_owned()
@@ -8682,6 +8700,12 @@ fn owned_string_from_decoded_bytes<S: EvalSemantics>(bytes: Vec<u8>) -> String {
 /// real yq); [`format_uri`]'s own unconditional stringification (in both
 /// jq and yq mode) is a separate, pre-existing divergence from real yq,
 /// not touched here.
+///
+/// Percent-decoded bytes that turn out to be invalid UTF-8 go through
+/// [`owned_string_from_decoded_bytes`], whose substitution rule is
+/// per-mode (`EvalSemantics::UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE`,
+/// #1719) even here, despite `@urid` itself having no jq oracle to verify
+/// against -- "mode decides" per ADR-0018 applies regardless.
 fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<String, EvalError> {
     let s = match value {
         OwnedValue::String(s) => s.clone(),
@@ -9179,25 +9203,20 @@ fn format_base64d<S: EvalSemantics>(
 
     // Lossy, not strict: real jq/yq's own `@base64d` never errors on
     // invalid UTF-8 in the decoded bytes -- it substitutes the standard
-    // replacement character, confirmed live against both oracles
-    // (`"null" | @base64d` succeeds in jq 1.7.1, not an error). This
+    // replacement character (confirmed live: real jq 1.7.1 gives
+    // `"\u{fffd}\u{fffd}"` for `"null" | @base64d`, not an error). This
     // surfaced while adding this function's `S` parameter (#1109): yq
     // mode's new scalar-stringification path (`null`/`true`/... above)
     // reaches this exact case for the first time, and the strict
     // conversion previously here would have produced a different wrong
     // error instead of matching the oracle.
     //
-    // Note the exact byte sequence real jq 1.7.1 emits for `"null"` is
-    // `"\u{fffd}\u{fffd}"` (two U+FFFD, no trailing byte) -- an earlier
-    // version of this comment claimed a trailing `e` that live-testing
-    // against the pinned binary (2026-08-27, re-verifying #1719) disproves.
-    // That third byte is the still-open #1717 quirk: jq drops the byte a
-    // rescan lands on when it's the string's very last byte, which neither
-    // `substitute_invalid_utf8_jq_style` (#1617/#1719, jq mode below) nor
-    // plain `String::from_utf8_lossy` (yq mode) replicates -- both keep it,
-    // so this specific example does not fully round-trip the oracle either
-    // way. #1719's fix is scoped to the overlong/surrogate/out-of-range
-    // collapse rule only; see `test_jq_base64d_invalid_utf8_is_lossy_not_error_1146`.
+    // That value does not fully round-trip the oracle even after #1719:
+    // succinctly's own decode of `"null"` keeps a third byte real jq drops
+    // (the still-open #1717 quirk -- see
+    // docs/compliance/jq/limitations.md's "An open gap in jq's own UTF-8
+    // replacement-character substitution"). #1719's fix below is scoped to
+    // the overlong/surrogate/out-of-range collapse rule only.
     Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 

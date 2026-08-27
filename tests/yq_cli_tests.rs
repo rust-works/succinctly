@@ -20566,6 +20566,22 @@ fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> 
     Ok(())
 }
 
+/// #1719 also switched `@urid`'s jq-mode invalid-UTF-8 substitution rule
+/// (same `owned_string_from_decoded_bytes` call site as `@base64d`), even
+/// though `@urid` itself has no real jq oracle to verify against -- "mode
+/// decides" applies regardless (see `format_urid`'s own doc comment). An
+/// overlong percent-decoded 3-byte lead now collapses to one U+FFFD in jq
+/// mode, same as the `%FF` single-invalid-byte case above stayed
+/// unaffected (WHATWG and jq's rule already agreed on that shape).
+#[test]
+fn test_jq_urid_overlong_percent_decode_collapses_to_one_fffd_1719() -> Result<()> {
+    let (out, _stderr, code) =
+        run_jq_stdin_with_stderr("@urid | explode", "\"%E0%80%80\"", &["-c"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[65533]");
+    Ok(())
+}
+
 /// #1138: real jq has no `@urid` at all (it's a succinctly extension
 /// reachable in both modes, per `format_urid`'s own doc comment), so
 /// there's no jq oracle to preserve the old silent-passthrough behavior
