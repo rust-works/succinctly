@@ -3283,15 +3283,24 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // `stream_yaml_sequence`/`stream_json_sequence` in `stream_maybe_colored`,
     // same as the stdout/inplace paths. Unlike the other gates above, this
     // one never OR's in `output_config.compact` for YAML -- preserved as-is
-    // from before #1577, which only adds the JSON arm and its established
-    // `compact || (pretty-or-colored && !ascii_output)` split (matching
-    // `can_json_fast_path`'s identical asymmetry: `--ascii-output`'s
-    // escaping isn't implemented by the pretty/colored streaming path, only
-    // by the compact one).
+    // from before #1577.
+    //
+    // The JSON arm deliberately does NOT copy `can_json_fast_path`'s
+    // `compact || (pretty-or-colored && !ascii_output)` shape verbatim: that
+    // condition already lets `--ascii-output` through unescaped in compact
+    // mode today (#1693, a live, pre-existing bug -- none of the M2 JSON
+    // streamers implement ASCII escaping at all, contrary to what that
+    // condition's shape implies). Copying it here would have been a new
+    // regression, not an inherited gap: before this arm existed, `--slurp
+    // -o=json` had no fast path in *any* combination, so `--ascii-output`
+    // always reached the DOM path's correct escaping. `!args.ascii_output`
+    // is therefore required unconditionally, keeping that combination on
+    // the DOM path exactly as it was pre-#1577, until #1693 gives the M2
+    // streamers real ASCII-escaping support to extend this to.
     let can_slurp_fast_path = is_identity
         && match output_config.output_format {
             OutputFormat::Json => {
-                output_config.compact || (can_stream_pretty_or_colored && !args.ascii_output)
+                !args.ascii_output && (output_config.compact || can_stream_pretty_or_colored)
             }
             OutputFormat::Yaml => can_stream_pretty_or_colored,
             _ => false,

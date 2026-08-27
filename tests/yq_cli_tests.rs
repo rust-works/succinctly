@@ -1439,6 +1439,30 @@ fn test_duplicate_mapping_key_survives_slurp_json() -> Result<()> {
     Ok(())
 }
 
+/// #1577 code review: the JSON arm of `can_slurp_fast_path` must not copy
+/// `can_json_fast_path`'s `compact || (... && !ascii_output)` shape
+/// verbatim -- that would let `--ascii-output` through unescaped in compact
+/// mode, a genuine *regression* rather than an inherited gap: before this
+/// arm existed, `--slurp -o=json` had no fast path in any combination, so
+/// `--ascii-output` always reached the DOM path's correct `\uXXXX` escaping
+/// (`-I0` compact included). Verified live against a pre-#1577 build that
+/// this exact command already escaped correctly, so this pins the
+/// regression-prevention, not merely today's behavior.
+#[test]
+fn test_slurp_json_ascii_output_still_escapes_in_compact_mode_1577() -> Result<()> {
+    let yaml = "a: \"h\u{e9}llo\"\n";
+
+    let (compact, code) = run_yq_stdin(
+        ".",
+        yaml,
+        &["--slurp", "-o", "json", "-I0", "--ascii-output"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "[{\"a\":\"h\\u00e9llo\"}]\n");
+
+    Ok(())
+}
+
 /// #1577: like [`test_duplicate_mapping_key_survives_slurp_multiple_sources`],
 /// but for JSON output -- duplicate keys within one source must survive
 /// `--slurp -o=json` combining documents from multiple files, not just a
