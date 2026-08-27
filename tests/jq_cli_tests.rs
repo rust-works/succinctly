@@ -3993,6 +3993,122 @@ fn test_seq_ignores_parse_errors() -> Result<()> {
     Ok(())
 }
 
+/// #1525: real jq warns on stderr ("ignoring parse error: Unfinished
+/// abandoned text at EOF at line L, column C") when `--seq` input has no
+/// RS byte anywhere at all -- RFC 7464 requires every record to start
+/// with one, so jq's reader never resyncs onto unprefixed content and
+/// reports the abandonment unconditionally at EOF, regardless of what the
+/// content actually is (even fully valid JSON, per the last case below).
+/// Every expected value was live-verified against the pinned jq 1.7.1
+/// binary.
+#[test]
+fn test_seq_no_rs_byte_warns_1525() -> Result<()> {
+    for (input, expected_line, expected_column) in [
+        ("1 2", 1, 3),
+        ("true false", 1, 10),
+        ("null", 1, 4),
+        ("ab\ncd", 2, 2),
+        ("ab\ncd\n", 3, 0),
+        ("", 1, 0),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))
+            .unwrap_or_else(|e| panic!("input {input:?}: failed to run: {e}"));
+        assert_eq!(code, 0, "input {input:?}: stdout: {stdout}");
+        assert_eq!(
+            stderr.trim(),
+            format!(
+                "jq: ignoring parse error: Unfinished abandoned text at EOF at line {expected_line}, column {expected_column}"
+            ),
+            "input {input:?}"
+        );
+        assert_eq!(stdout, "", "input {input:?}: no value should be output");
+    }
+    Ok(())
+}
+
+/// #1525: a malformed record that *does* start with an RS byte must not
+/// trigger the "no RS byte" warning above -- it's silently dropped per
+/// RFC 7464 (#1093/#1267), with no diagnostic, exactly as before this fix
+/// (jq's own warning for this shape uses a different message template
+/// entirely -- "Invalid numeric literal ... (need RS to resync)" or
+/// "Unfinished string/JSON term at EOF" depending on how it's malformed --
+/// deliberately not attempted here, tracked separately as #1723).
+#[test]
+fn test_seq_malformed_record_with_rs_byte_does_not_warn_1525() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["--seq", "-c", "."], Some("\u{1e}not valid json\n")).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stderr, "");
+    assert_eq!(stdout, "");
+    Ok(())
+}
+
+/// #1525: an RS-less file combined with an RS-containing one triggers no
+/// warning at all -- real jq treats the whole `--seq` input as one
+/// continuous stream, and the RS-containing file satisfies the "every
+/// record starts with an RS byte" requirement for the stream as a whole.
+#[test]
+fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<()> {
+    let mut valid_file = NamedTempFile::new()?;
+    writeln!(valid_file, "\u{1e}1")?;
+    let mut empty_file = NamedTempFile::new()?;
+    write!(empty_file, "")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .args(["--seq", "-c", "."])
+        .arg(valid_file.path())
+        .arg(empty_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr)?, "");
+    // `--seq` RS-prefixes output too (RFC 7464), same as real jq.
+    assert_eq!(String::from_utf8(output.stdout)?.trim(), "\u{1e}1");
+    Ok(())
+}
+
+/// #1525: two RS-less files report a line/column computed from their
+/// *concatenation*, not either file's own content alone -- oracle-verified
+/// against the pinned jq 1.7.1 binary.
+#[test]
+fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    write!(file_a, "ab")?;
+    let mut file_b = NamedTempFile::new()?;
+    write!(file_b, "cd")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("jq")
+        .args(["--seq", "-c", "."])
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr)?.trim(),
+        "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 4"
+    );
+    Ok(())
+}
+
+/// #1525: `-R --seq` combined lets `-R` take over raw-text handling
+/// entirely (matching this codebase's existing `slurp_eof_line` priority
+/// for the same combination) -- no RS-byte warning, since RFC 7464
+/// record-splitting never applies in raw-input mode.
+#[test]
+fn test_seq_raw_input_combo_does_not_warn_1525() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-R", "--seq", "-c", "."], Some("xyz")).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stderr, "");
+    // `--seq` RS-prefixes output too (RFC 7464), same as real jq.
+    assert_eq!(stdout.trim(), "\u{1e}\"xyz\"");
+    Ok(())
+}
+
 /// #1213: `--seq`'s error-location reporting stays correct once its
 /// per-value line lookup is incremental (`LineCounter`) instead of a
 /// from-scratch rescan per value -- the erroring record here is deep enough

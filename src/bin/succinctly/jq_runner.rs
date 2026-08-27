@@ -1703,6 +1703,44 @@ fn get_inputs(
         raw_inputs.push((file_idx, raw));
     }
 
+    // #1525: real jq warns on stderr when it drops a malformed --seq
+    // record; succinctly silently ignored malformed records entirely
+    // (RFC 7464's own recommended failure mode, #1243, still correct for
+    // *output*) with no diagnostic. This covers exactly one of jq's
+    // several message shapes: content with no RS byte anywhere at all.
+    // RFC 7464 requires every record to start with one, so jq's --seq
+    // reader never resyncs onto unprefixed content -- it reports the
+    // abandonment unconditionally the instant EOF arrives, regardless of
+    // what the content actually is, even fully valid JSON (oracle-
+    // verified: `printf 'null' | jq --seq '.'` still warns). A malformed
+    // record that *does* start with an RS byte gets one of several other
+    // jq message templates ("Unfinished string at EOF", "Unfinished JSON
+    // term at EOF", "Invalid numeric literal ... (need RS to resync)")
+    // depending on exactly how it's malformed -- matching those needs
+    // deeper investigation into jq's own incremental-parser error states
+    // and is intentionally out of scope here; tracked separately (#1723).
+    //
+    // Checked once across every source concatenated, not per file: `-R`
+    // takes over entirely from `--seq` for raw-text mode (`!args.raw_input`
+    // matches the same priority `slurp_eof_line` below already gives it),
+    // and real jq treats the whole `--seq` input -- single file, multiple
+    // files, `-s` or not -- as one continuous byte stream for this check.
+    // Oracle-verified: an RS-less short file combined with an RS-containing
+    // one triggers no warning at all, and two RS-less files together report
+    // a line/column computed from their *concatenation*, not either file's
+    // own content alone.
+    if args.seq && !args.raw_input && !raw_inputs.iter().any(|(_, raw)| raw.contains('\u{1E}')) {
+        let mut combined = String::new();
+        for (_, raw) in &raw_inputs {
+            combined.push_str(raw);
+        }
+        let line = 1 + combined.matches('\n').count();
+        let column = combined.rsplit('\n').next().unwrap_or("").len();
+        eprintln!(
+            "jq: ignoring parse error: Unfinished abandoned text at EOF at line {line}, column {column}"
+        );
+    }
+
     let mut locations = InputLocations::new(
         files
             .iter()
