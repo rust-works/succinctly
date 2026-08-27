@@ -1415,6 +1415,59 @@ fn test_duplicate_mapping_key_survives_slurp_multiple_sources() -> Result<()> {
     Ok(())
 }
 
+/// #1577: `-o=json --slurp` used to be the one combination `can_slurp_fast_path`
+/// always excluded (it required YAML output), falling through to the DOM
+/// path's `IndexMap`-backed array builder, which collapses a duplicate key
+/// to just its last value (`{"a":2}`, dropping `"a":1` entirely) -- unlike
+/// YAML output on the identical input, per
+/// [`test_duplicate_mapping_key_survives_slurp`]. `stream_json_sequence`
+/// (#757) is `stream_yaml_sequence`'s JSON-writing sibling, so extending
+/// `can_slurp_fast_path` to `OutputFormat::Json` was mostly wiring; both
+/// `-I0` (compact) and pretty (default `-I2`) go through it.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp_json() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (compact, code) = run_yq_stdin(".", yaml, &["--slurp", "-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact, "[{\"a\":1,\"a\":2}]\n");
+
+    let (pretty, code) = run_yq_stdin(".", yaml, &["--slurp", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(pretty, "[\n  {\n    \"a\": 1,\n    \"a\": 2\n  }\n]\n");
+
+    Ok(())
+}
+
+/// #1577: like [`test_duplicate_mapping_key_survives_slurp_multiple_sources`],
+/// but for JSON output -- duplicate keys within one source must survive
+/// `--slurp -o=json` combining documents from multiple files, not just a
+/// single source.
+#[test]
+fn test_duplicate_mapping_key_survives_slurp_json_multiple_sources() -> Result<()> {
+    let mut file_a = NamedTempFile::new()?;
+    writeln!(file_a, "a: 1\na: 2")?;
+    let mut file_b = NamedTempFile::new()?;
+    writeln!(file_b, "b: 3")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--slurp")
+        .arg("-o")
+        .arg("json")
+        .arg("-I0")
+        .arg(".")
+        .arg(file_a.path())
+        .arg(file_b.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(output.status.success());
+    assert_eq!(stdout, "[{\"a\":1,\"a\":2},{\"b\":3}]\n");
+    Ok(())
+}
+
 /// #478: `can_slurp_fast_path` tracks `-e`/`--exit-status` by inspecting the
 /// built cursor list directly (`any_truthy = true` whenever `--slurp`
 /// produces its one array result), a separate code path from the non-slurp
@@ -2392,32 +2445,47 @@ fn test_inplace_json_output_fast_path() -> Result<()> {
     Ok(())
 }
 
-/// #224: `--slurp` with `-o json` is the one combination `can_slurp_fast_path`
-/// always excludes (it requires YAML output), so it routes through the slow
-/// `parse_input` -> `yaml_to_owned_value` -> `resolved_scalar_to_owned` DOM
-/// path instead of the M2 cursor streamer. The extensive tag/alias tests
-/// added by #224 elsewhere in this file all exercise the direct/M2 path
-/// (`-o=json` without `--slurp`), leaving this DOM path's
-/// `ResolvedScalar::Float` arm uncovered.
+/// #224: `--slurp` with `-o json` used to be the one combination
+/// `can_slurp_fast_path` always excluded (it required YAML output); #1577
+/// extended it to JSON too, so a bare `--slurp -o json` identity query no
+/// longer reaches this DOM path on its own. An unused `--arg` (`context.
+/// named.is_empty()`, the same trick `test_keys_unsorted_yaml_dom_fallback_
+/// matches_lazy_685`/`test_yaml_root_container_anchor_survives_the_dom_
+/// path_763` already use) forces `can_slurp_fast_path` false regardless of
+/// `is_identity`, routing this test back through the slow `parse_input` ->
+/// `yaml_to_owned_value` -> `resolved_scalar_to_owned` DOM path instead of
+/// the M2 cursor streamer, so its `ResolvedScalar::Float` arm stays covered
+/// (verified live: the M2 path this test used to (and, without `--arg`,
+/// still would) take produces the identical `3.14`, so this pins the DOM
+/// arm specifically, not a behavior difference between the two paths).
 #[test]
 fn test_slurp_json_float_scalar_through_dom_path() -> Result<()> {
-    let (output, code) = run_yq_stdin(".", "pi: 3.14\n", &["--slurp", "-o", "json", "-I0"])?;
+    let (output, code) = run_yq_stdin(
+        ".",
+        "pi: 3.14\n",
+        &["--slurp", "-o", "json", "-I0", "--arg", "unused", "x"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"[{"pi":3.14}]"#);
     Ok(())
 }
 
 /// #224: like [`test_slurp_json_float_scalar_through_dom_path`], forces the
-/// DOM path via `--slurp -o json`, but exercises `yaml_to_owned_value`'s
-/// explicit-tag check (`cursor.explicit_tag()` + `resolve_tagged`) instead —
-/// the DOM path's copy of the core fix under test in this PR. Mirrors the
-/// already-tested direct-path case (`test_yaml_anchored_tag_in_seq_item_resolves`,
+/// DOM path via an unused `--arg` (see that test's own doc comment for why,
+/// post-#1577), but exercises `yaml_to_owned_value`'s explicit-tag check
+/// (`cursor.explicit_tag()` + `resolve_tagged`) instead — the DOM path's
+/// copy of the core fix under test in this PR. Mirrors the already-tested
+/// direct-path case (`test_yaml_anchored_tag_in_seq_item_resolves`,
 /// `test_yaml_default_output_preserves_the_literal_tag`'s "value, quoted"
 /// case) where a core-schema tag forces resolution regardless of quoting:
 /// `!!int "5"` becomes the number `5`, not the string `"5"`.
 #[test]
 fn test_slurp_json_explicit_tag_through_dom_path() -> Result<()> {
-    let (output, code) = run_yq_stdin(".", "a: !!int \"5\"\n", &["--slurp", "-o", "json", "-I0"])?;
+    let (output, code) = run_yq_stdin(
+        ".",
+        "a: !!int \"5\"\n",
+        &["--slurp", "-o", "json", "-I0", "--arg", "unused", "x"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"[{"a":5}]"#);
     Ok(())
@@ -2429,31 +2497,39 @@ fn test_slurp_json_explicit_tag_through_dom_path() -> Result<()> {
 /// quoted-string-preservation check below it, rather than resolving.
 #[test]
 fn test_slurp_json_custom_tag_falls_through_on_dom_path() -> Result<()> {
-    let (output, code) =
-        run_yq_stdin(".", "a: !custom \"5\"\n", &["--slurp", "-o", "json", "-I0"])?;
+    let (output, code) = run_yq_stdin(
+        ".",
+        "a: !custom \"5\"\n",
+        &["--slurp", "-o", "json", "-I0", "--arg", "unused", "x"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"[{"a":"5"}]"#);
     Ok(())
 }
 
-/// #224: like the two tests above, forces `--slurp -o json`'s DOM path, this
-/// time through `yaml_to_owned_value`'s `YamlValue::Alias` arm. That arm now
-/// recurses on the target *cursor* rather than a bare `YamlValue`, since a
-/// tag on the aliased node lives on the cursor's `bp_pos` and a bare value
-/// has already lost it. Checks a plain aliased scalar first, then — mirroring
-/// the direct-path `test_yaml_anchored_tag_in_seq_item_resolves` — an aliased
-/// node whose *source* carries an explicit tag, which is the only case that
-/// can tell "cursor passed through" apart from "bare value passed through".
+/// #224: like the two tests above, forces the DOM path via an unused
+/// `--arg` (post-#1577), this time through `yaml_to_owned_value`'s
+/// `YamlValue::Alias` arm. That arm now recurses on the target *cursor*
+/// rather than a bare `YamlValue`, since a tag on the aliased node lives on
+/// the cursor's `bp_pos` and a bare value has already lost it. Checks a
+/// plain aliased scalar first, then — mirroring the direct-path
+/// `test_yaml_anchored_tag_in_seq_item_resolves` — an aliased node whose
+/// *source* carries an explicit tag, which is the only case that can tell
+/// "cursor passed through" apart from "bare value passed through".
 #[test]
 fn test_slurp_json_alias_through_dom_path() -> Result<()> {
-    let (plain, code) = run_yq_stdin(".", "a: &x 1\nb: *x\n", &["--slurp", "-o", "json", "-I0"])?;
+    let (plain, code) = run_yq_stdin(
+        ".",
+        "a: &x 1\nb: *x\n",
+        &["--slurp", "-o", "json", "-I0", "--arg", "unused", "x"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(plain.trim(), r#"[{"a":1,"b":1}]"#);
 
     let (tagged, code) = run_yq_stdin(
         ".",
         "items:\n  - &a !!str x\n  - *a\n",
-        &["--slurp", "-o", "json", "-I0"],
+        &["--slurp", "-o", "json", "-I0", "--arg", "unused", "x"],
     )?;
     assert_eq!(code, 0);
     assert_eq!(tagged.trim(), r#"[{"items":["x","x"]}]"#);
@@ -6093,24 +6169,21 @@ fn test_color_compact_quoted_key_with_escaped_quote_785() -> Result<()> {
     Ok(())
 }
 
-/// Unlike [`test_slurp_color_output_yaml`], `-o json --slurp` stays on the
-/// `OwnedValue`/`IndexMap` DOM path regardless of `-C` — `can_slurp_fast_path`
-/// requires YAML output, so `-o json --slurp` is unaffected by #809's fix and
-/// still collapses duplicate keys, exactly as it did (with or without color)
-/// before #809. This is the same pre-existing, separately-scoped `-o json
-/// --slurp` limitation the `can_slurp_fast_path` code comment documents, not
-/// a `-C`-specific gap. Exercises `output_value`'s `config.use_color` JSON
-/// branch, which #748's M2-fast-path color fix made unreachable from every
-/// other angle.
+/// #1577: like [`test_slurp_color_output_yaml`], `-o json --slurp` now also
+/// takes `can_slurp_fast_path` (previously YAML-output only), preserving
+/// both duplicate keys instead of the DOM/`IndexMap` path's silent collapse
+/// to just the last one -- with `-C` color still applied, same as YAML's own
+/// M2 color fix (#809). Exercises `stream_json_sequence`'s own
+/// `stream_maybe_colored`/`colorize_json` wrapping via this new call site.
 #[test]
-fn test_slurp_color_output_json() -> Result<()> {
+fn test_duplicate_mapping_key_survives_slurp_json_color() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
 
     let (output, code) = run_yq_stdin(".", yaml, &["--slurp", "-C", "-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(
         output,
-        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
+        "\u{1b}[1;39m[\u{1b}[0m\u{1b}[1;39m{\u{1b}[0m\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m1\u{1b}[0m,\u{1b}[1;34m\"a\"\u{1b}[0m:\u{1b}[0;39m2\u{1b}[0m\u{1b}[1;39m}\u{1b}[0m\u{1b}[1;39m]\u{1b}[0m\n"
     );
 
     Ok(())
