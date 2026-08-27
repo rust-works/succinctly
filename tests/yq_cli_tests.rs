@@ -9406,13 +9406,15 @@ fn test_dom_path_indent_zero_json_output_still_compact_1575() -> Result<()> {
 /// `--tab` output cannot be read back by succinctly's own YAML parser at
 /// *any* indent width or nesting shape — pure, unmixed tab indentation
 /// alone already fails with "tab character used for indentation" on
-/// unmodified `main`, unrelated to `-I0` or this fix (tracked separately as
-/// #1684). This fix's `compute_indent_str` change makes `--tab -I=0`
-/// combined with a compact block-sequence item newly mix 2 literal spaces
-/// (the sequence item's own fixed `- `-width offset, #785/#1362) with
-/// tab-based per-level indent on the same line — pinning that exact,
-/// still-broken output here so a future change to either side doesn't
-/// silently shift it without updating #1684's own investigation.
+/// unmodified `main`, unrelated to `-I0` or this fix. This is now a
+/// deliberate, documented limitation (docs/reference/yq-language.md §
+/// Known Limitations, #1684), not a bug to fix: real yq has no `--tab`
+/// flag at all, so there's no round-trip oracle to satisfy. This fix's
+/// `compute_indent_str` change makes `--tab -I=0` combined with a compact
+/// block-sequence item mix 2 literal spaces (the sequence item's own
+/// fixed `- `-width offset, #785/#1362) with tab-based per-level indent on
+/// the same line — pinning that exact output here so a future change to
+/// either side doesn't silently shift it.
 #[test]
 fn test_dom_path_indent_zero_tab_is_pinned_not_fixed_1575() -> Result<()> {
     let yaml = "a:\n  b:\n    c: 1\n";
@@ -9420,9 +9422,34 @@ fn test_dom_path_indent_zero_tab_is_pinned_not_fixed_1575() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out, "- key: a\n  value:\n  \tb:\n  \t\tc: 1\n");
 
-    // Read-back still fails — see #1684, not attempted here.
+    // Read-back fails by design — see #1684 and
+    // test_tab_output_does_not_round_trip_through_own_reader_1684 below.
     let (_, stderr, code) =
         run_yq_stdin_with_stderr(".[0].value", &out, &["-o=yaml", "-I=0", "--tab"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("tab character used for indentation"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1684: `--tab` output is write-only — succinctly's own YAML reader (like
+/// the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so
+/// *any* nested `--tab` output fails to read back, not just the `-I0`/
+/// compact-sequence-item interaction pinned above by
+/// [`test_dom_path_indent_zero_tab_is_pinned_not_fixed_1575`]. This is a
+/// deliberate, documented limitation (docs/reference/yq-language.md §
+/// Known Limitations), not a bug: real yq has no `--tab` flag to serve as
+/// a round-trip oracle.
+#[test]
+fn test_tab_output_does_not_round_trip_through_own_reader_1684() -> Result<()> {
+    let yaml = "a:\n  b:\n    c:\n      d: 1\n";
+    let (out, code) = run_yq_stdin(".", yaml, &["-o=yaml", "--tab"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\n\tb:\n\t\tc:\n\t\t\td: 1\n");
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a.b.c.d", &out, &["--tab"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("tab character used for indentation"),
