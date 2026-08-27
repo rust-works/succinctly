@@ -15,6 +15,10 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use tempfile::{NamedTempFile, TempDir};
 
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::signal_death_error;
+
 /// Helper to run yq command with input from stdin
 fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -32,7 +36,10 @@ fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(Strin
 
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, exit_code))
 }
@@ -59,7 +66,9 @@ fn run_yq_stdin_with_stderr(
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, stderr, exit_code))
 }
@@ -89,7 +98,9 @@ fn run_yq_stdin_bytes_with_stderr(
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, stderr, exit_code))
 }
@@ -119,7 +130,9 @@ fn run_jq_stdin_with_stderr(
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, stderr, exit_code))
 }
@@ -134,7 +147,10 @@ fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(St
         .output()?;
 
     let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, exit_code))
 }
@@ -5574,7 +5590,11 @@ fn test_block_scalar_style_preserved_through_slurp() -> Result<()> {
         .spawn()?;
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert_eq!(output.status.code().unwrap_or(-1), 0);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_eq!(code, 0);
     assert_eq!(stdout, "- - |\n    line1\n    line2\n");
     Ok(())
 }
@@ -6504,7 +6524,10 @@ fn run_yq_from_file(
         .output()?;
 
     let stdout = String::from_utf8(output.stdout)?;
-    let exit_code = output.status.code().unwrap_or(-1);
+    let Some(exit_code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
 
     Ok((stdout, exit_code))
 }
@@ -11884,11 +11907,11 @@ fn test_713_jq_mode_unaffected() -> Result<()> {
         .unwrap()
         .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
     let output = child.wait_with_output()?;
-    assert_ne!(
-        output.status.code().unwrap_or(-1),
-        0,
-        "array * array must still error in jq mode"
-    );
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_ne!(code, 0, "array * array must still error in jq mode");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
     cmd.arg("jq")
@@ -11903,9 +11926,12 @@ fn test_713_jq_mode_unaffected() -> Result<()> {
         .unwrap()
         .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
     let output = child.wait_with_output()?;
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
     assert_ne!(
-        output.status.code().unwrap_or(-1),
-        0,
+        code, 0,
         "flag suffixes must still be unrecognized in jq mode"
     );
 
@@ -12703,7 +12729,9 @@ fn run_yq_files(
         .output()?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let code = output.status.code().unwrap_or(-1);
+    let Some(code) = output.status.code() else {
+        return Err(signal_death_error(output.status, &stderr));
+    };
     Ok((stdout, stderr, code))
 }
 
@@ -15383,13 +15411,18 @@ fn test_jq_sub_3arg_unaffected_by_1122() -> Result<()> {
         .arg(r#""AAA" | sub("a";"X";"i")"#)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = cmd.stdin.take() {
         stdin.write_all(b"null")?;
     }
     let output = cmd.wait_with_output()?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert_eq!(output.status.code().unwrap_or(-1), 0, "stdout: {stdout:?}");
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim_end(), "\"XAA\"");
     Ok(())
 }
@@ -16932,7 +16965,11 @@ fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
         .spawn()?;
     child.stdin.take().unwrap().write_all(b"42")?;
     let output = child.wait_with_output()?;
-    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_ne!(code, 0);
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
     cmd.arg("jq").arg("@base64d");
@@ -16943,7 +16980,11 @@ fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
         .spawn()?;
     child.stdin.take().unwrap().write_all(b"42")?;
     let output = child.wait_with_output()?;
-    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_ne!(code, 0);
     Ok(())
 }
 
@@ -19430,7 +19471,11 @@ fn test_jq_base64d_does_not_trim_whitespace_1123() -> Result<()> {
         .spawn()?;
     child.stdin.take().unwrap().write_all(br#"" aGVsbG8=""#)?;
     let output = child.wait_with_output()?;
-    assert_ne!(output.status.code().unwrap_or(-1), 0);
+    let Some(code) = output.status.code() else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(signal_death_error(output.status, &stderr));
+    };
+    assert_ne!(code, 0);
     Ok(())
 }
 
