@@ -805,21 +805,27 @@ pub(crate) fn key_display_string_kind<V: DocumentValue>(key: &V) -> Option<(Cow<
 }
 
 /// Guards a display-keyed `IndexMap` (`to_owned`/`materialize`, #1642)
-/// against silently merging two keys that [`key_display_string_kind`]'s own
-/// contract forbids treating as the same key: a decode-failure key's
-/// fallback spelling colliding with another decode-failure key's, or with
-/// an unrelated key that happens to decode to the identical text. An
-/// `IndexMap<String, _>` has no way to hold two entries under one string,
-/// so letting that insert happen the ordinary way silently drops the
-/// earlier value -- quieter data loss than #1247's original raise, which
-/// this fix relaxed but must not replace with a worse failure mode.
+/// against silently merging two keys that `key_display_string_kind`'s own
+/// contract forbids treating as the same key.
+///
+/// A decode-failure key's fallback spelling can collide with another
+/// decode-failure key's, or with an unrelated key that happens to decode to
+/// the identical text. An `IndexMap<String, _>` has no way to hold two
+/// entries under one string, so letting that insert happen the ordinary way
+/// silently drops the earlier value -- quieter data loss than #1247's
+/// original raise, which this fix relaxed but must not replace with a worse
+/// failure mode.
 ///
 /// An *ordinary* repeated key -- neither side a decode-failure fallback --
 /// still overwrites without complaint here, matching jq's normal
 /// last-key-wins duplicate handling; only a fallback spelling on either
 /// side of the collision is refused.
+///
+/// `pub`, not `pub(crate)`: `succinctly-cli`'s `yq_runner.rs` (a separate
+/// binary crate) constructs one per object via [`resolve_display_key`], same
+/// reasoning [`key_display_string`] itself documents for why it is `pub`.
 #[derive(Default)]
-pub(crate) struct DisplayKeyGuard {
+pub struct DisplayKeyGuard {
     fallback_keys: Vec<String>,
 }
 
@@ -856,6 +862,34 @@ pub(crate) fn colliding_display_key_error(key: &str) -> EvalError {
         "object key \"{key}\" is ambiguous: an undecodable key's display form \
          collides with another key of the same name and cannot be represented"
     ))
+}
+
+/// The full display-key resolution sequence a `to_owned`-shaped materializer
+/// needs for one field, in one call.
+///
+/// Gets the display spelling (`None` when the key does not stringify at all
+/// -- #1194's territory, the caller's own job to handle), guards it against
+/// a colliding decode-failure fallback (#1642), and raises
+/// `colliding_display_key_error` instead of allowing a silent overwrite.
+///
+/// Shared by `eval_generic.rs`'s three `to_owned*_at_depth` conversions,
+/// `lazy.rs`'s `cursor_to_owned_at_depth`, and `succinctly-cli`'s
+/// `yq_runner.rs` `--input-format json` bridge (`pub` for that reason,
+/// same as [`DisplayKeyGuard`] and [`key_display_string`] before it) -- one
+/// definition rather than a fifth hand-copied guard-and-raise sequence.
+pub fn resolve_display_key<V: DocumentValue, T>(
+    key: &V,
+    map: &IndexMap<String, T>,
+    guard: &mut DisplayKeyGuard,
+) -> Result<Option<String>, EvalError> {
+    let Some((key, is_fallback)) = key_display_string_kind(key) else {
+        return Ok(None);
+    };
+    let key = key.into_owned();
+    if !guard.check(map, &key, is_fallback) {
+        return Err(colliding_display_key_error(&key));
+    }
+    Ok(Some(key))
 }
 
 /// An open-addressed set of key hashes: "have I seen this one?" answered

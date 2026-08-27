@@ -22,10 +22,10 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, collapsed_fields_if, colliding_display_key_error, effective_fields,
-    effective_fields_checked, effective_keys, effective_len_checked, key_display_string,
-    key_display_string_kind, key_is_malformed, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor,
-    DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
+    effective_keys, effective_len_checked, key_display_string, key_is_malformed,
+    resolve_display_key, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
@@ -174,18 +174,9 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
             // and that still raises: dropping the field silently is #1194,
             // the disagreement #1385's postmortem names as the thing to
             // avoid.
-            let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
-            let key = key.into_owned();
-            // Two decode-failure keys (or a decode-failure key and an
-            // unrelated one) can share a display spelling -- #1385 forbids
-            // treating them as the same key, but this `IndexMap` cannot
-            // hold two entries under one string. Raise rather than let the
-            // insert below silently overwrite the earlier value (#1642).
-            if !guard.check(&map, &key, is_fallback) {
-                return Err(colliding_display_key_error(&key));
-            }
             map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
             f = rest;
         }
@@ -279,15 +270,9 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             // these two conversions are copies of each other and a fix that
             // moved only one would leave the cursor and value domains
             // disagreeing about whether a document is valid.
-            let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
-            let key = key.into_owned();
-            // See `to_owned_at_depth`'s identical guard: two colliding
-            // display-fallback keys must raise, not silently overwrite.
-            if !guard.check(&map, &key, is_fallback) {
-                return Err(colliding_display_key_error(&key));
-            }
             map.insert(
                 key,
                 to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
@@ -725,18 +710,9 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             // source span; still raise on a key the format's grammar never
             // allowed at all (#1194) -- this arm used to silently drop such
             // a field instead of raising, the same swallow #1194 names.
-            let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
-            let key = key.into_owned();
-            // See `to_owned_at_depth`'s identical guard. `map`,
-            // `comment_map` and `key_comment_map` are always populated
-            // together for the same key, so checking `map` alone catches a
-            // collision that would otherwise silently drop the earlier
-            // key's value *and* comment.
-            if !guard.check(&map, &key, is_fallback) {
-                return Err(colliding_display_key_error(&key));
-            }
             let (v, c) = to_owned_with_comments_at_depth(
                 &field.value,
                 Some(&field.value_cursor),
