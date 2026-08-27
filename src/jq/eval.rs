@@ -5698,13 +5698,12 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     match &value {
         StandardJson::Null => QueryResult::Owned(OwnedValue::Int(0)),
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::Int(cow.chars().count() as i64))
-            } else {
-                QueryResult::Owned(OwnedValue::Int(0))
-            }
-        }
+        // #1620/#1660: an undecodable string must raise, not silently
+        // substitute a length of 0.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => QueryResult::Owned(OwnedValue::Int(cow.chars().count() as i64)),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         StandardJson::Array(elements) => {
             QueryResult::Owned(OwnedValue::Int((*elements).count() as i64))
         }
@@ -5744,13 +5743,11 @@ fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::Int(cow.len() as i64))
-            } else {
-                QueryResult::Owned(OwnedValue::Int(0))
-            }
-        }
+        // #1620/#1660: same decode-failure exclusion as `length`.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => QueryResult::Owned(OwnedValue::Int(cow.len() as i64)),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned(&value))),
     }
@@ -7540,15 +7537,15 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
             items.reverse();
             QueryResult::Owned(OwnedValue::Array(items))
         }
-        StandardJson::String(s) => {
-            // reverse also works on strings
-            if let Ok(cow) = s.as_str() {
+        // reverse also works on strings. #1620/#1660: an undecodable string
+        // must raise, not silently substitute an empty string.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
                 let reversed: String = cow.chars().rev().collect();
                 QueryResult::Owned(OwnedValue::String(reversed))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
             }
-        }
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         // jq: null | reverse => []
         StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
         _ if optional => QueryResult::None,
@@ -32350,13 +32347,12 @@ fn builtin_trim<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::String(cow.trim().into()))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
-            }
-        }
+        // #1620/#1660: an undecodable string must raise, not silently
+        // substitute an empty string.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => QueryResult::Owned(OwnedValue::String(cow.trim().into())),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new("trim requires string")),
     }
@@ -32368,13 +32364,11 @@ fn builtin_ltrim<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::String(cow.trim_start().into()))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
-            }
-        }
+        // #1620/#1660: same decode-failure exclusion as `trim`.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => QueryResult::Owned(OwnedValue::String(cow.trim_start().into())),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new("ltrim requires string")),
     }
@@ -32386,13 +32380,11 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match &value {
-        StandardJson::String(s) => {
-            if let Ok(cow) = s.as_str() {
-                QueryResult::Owned(OwnedValue::String(cow.trim_end().into()))
-            } else {
-                QueryResult::Owned(OwnedValue::String(String::new()))
-            }
-        }
+        // #1620/#1660: same decode-failure exclusion as `trim`.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => QueryResult::Owned(OwnedValue::String(cow.trim_end().into())),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::new("rtrim requires string")),
     }
@@ -35417,6 +35409,64 @@ mod tests {
             QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => {
                 assert_eq!(n, 2);
             }
+        );
+    }
+
+    /// #1660 code review: `is_decode_failure()` used to classify purely by
+    /// matching `message` against a handful of literal strings (e.g.
+    /// `"invalid escape sequence"`, `"invalid number format"`) -- which
+    /// collided with a user's own `error(...)` raising one of those exact
+    /// strings, wrongly forcing an ordinary, catchable error uncatchable.
+    /// Live-verified against jq 1.7.1: real jq retries/catches/suppresses
+    /// these normally. `EvalError::decode_failure` now sets a dedicated
+    /// field instead of relying on `reason`'s text, so this must retry
+    /// (not propagate) exactly like the "ordinary error" negative control
+    /// above.
+    #[test]
+    fn test_pattern_alternative_retry_not_confused_by_decode_failure_wording_1660() {
+        for wording in [
+            "invalid UTF-8 in string",
+            "invalid number format",
+            "invalid escape sequence in string",
+            "invalid unicode escape sequence",
+            "invalid escape sequence",
+        ] {
+            let expr = format!(
+                ". as {{p:$y}} ?// {{q:$y}} | (if $y==1 then error(\"{wording}\") else $y end)"
+            );
+            query!(
+                b"{\"p\": 1, \"q\": 2}",
+                &expr,
+                QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => {
+                    assert_eq!(n, 2, "wording: {wording}");
+                }
+            );
+        }
+    }
+
+    /// #1660 code review, `try`/`catch` side of the same collision: a
+    /// user's own `error("invalid escape sequence")` must still be
+    /// catchable, matching jq 1.7.1.
+    #[test]
+    fn test_try_catch_not_confused_by_decode_failure_wording_1660() {
+        query!(
+            b"null",
+            "try error(\"invalid escape sequence\") catch \"caught\"",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "caught");
+            }
+        );
+    }
+
+    /// #1660 code review, `?` side of the same collision: a user's own
+    /// `error("invalid number format")?` must still be suppressed, matching
+    /// jq 1.7.1.
+    #[test]
+    fn test_optional_not_confused_by_decode_failure_wording_1660() {
+        query!(
+            b"null",
+            "error(\"invalid number format\")?",
+            QueryResult::None => {}
         );
     }
 

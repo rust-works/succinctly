@@ -3439,7 +3439,7 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
             // Keep string lazy - use raw bytes reference instead of decoding
             JqValue::String(
                 s.as_str()
-                    .map_err(|e| EvalError::new(format!("{e}")))?
+                    .map_err(|e| EvalError::decode_failure(format!("{e}")))?
                     .to_string(),
             )
         }

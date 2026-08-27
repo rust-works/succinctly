@@ -738,7 +738,7 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // eval_generic.rs swallowed the same case as `null`. Both raise
             // now, with the wording #1192 established.
             s.as_str()
-                .map_err(|e| EvalError::new(format!("{e}")))?
+                .map_err(|e| EvalError::decode_failure(format!("{e}")))?
                 .into_owned(),
         ),
         StandardJson::Array(_) => {

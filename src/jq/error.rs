@@ -965,12 +965,34 @@ impl EvalError {
         Self::new(reason)
     }
 
-    /// Whether this is a [`Self::decode_failure`] — see #1620. Every
+    /// Whether this is a [`Self::decode_failure`] — see #1620/#1660. Every
     /// `?`/`try`/`catch` boundary consults this so a decode failure passes
     /// through unmatched instead of being suppressed, the same way
     /// [`Self::is_invalid_path_expression`] exempts its own narrow error
     /// class without leaving the ordinary catchable `Error` channel.
+    ///
+    /// #1660 code review: classifying purely by matching `message` against
+    /// these literal strings collided with a user's own `error("invalid
+    /// escape sequence")` -- live-verified against jq 1.7.1, real jq
+    /// retries/catches/suppresses it as an ordinary error, where the naive
+    /// string match wrongly forced it uncatchable. `self.value.is_some()`
+    /// -- true only for [`Self::from_value`]/[`Self::from_value_with`],
+    /// i.e. exactly `error(v)` -- rules that out first at zero extra
+    /// storage cost: every constructor besides those two routes through
+    /// [`Self::new`], which always leaves `value` `None` (confirmed by
+    /// grep -- `Self { ... }` literal construction exists nowhere else in
+    /// this file), so an internally-raised decode failure is unaffected. A
+    /// dedicated boolean field was tried first instead of this check, but
+    /// `EvalError` had no spare padding to absorb it: the extra 8 bytes
+    /// propagated into `QueryResult`/`Control`'s recursive-materializer
+    /// call frames and turned a previously-controlled "nesting depth
+    /// exceeds limit" panic into a genuine stack overflow during unwind
+    /// (`jq::lazy::tests::into_owned_panics_past_nesting_depth_limit_1021`)
+    /// -- reverted in favor of this zero-size-cost check instead.
     pub fn is_decode_failure(&self) -> bool {
+        if self.value.is_some() {
+            return false;
+        }
         let base = self
             .message
             .strip_suffix(" in object key")
