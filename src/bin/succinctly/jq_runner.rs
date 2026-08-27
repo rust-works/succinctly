@@ -2180,12 +2180,9 @@ impl ErrorAt<'_> {
 ///
 /// Valid input is returned untouched and unallocated -- the check is a
 /// whole-input SIMD pass (~1.1 ms on 8.4 MB) and only a document that
-/// actually fails it pays for a copy. The substitution itself uses jq's
-/// own maximal-subpart rule (`substitute_invalid_utf8_jq_style`), not
-/// `String::from_utf8_lossy`'s WHATWG rule -- the two disagree on an
-/// overlong/surrogate/out-of-range value from a structurally valid 3- or
-/// 4-byte lead, where jq emits one U+FFFD for the whole sequence and
-/// WHATWG emits one per byte (#1617).
+/// actually fails it pays for a copy, via
+/// [`substitute_invalid_utf8_jq_style`](succinctly::text::utf8::substitute_invalid_utf8_jq_style),
+/// whose own docs cover the substitution rule itself (#1617).
 ///
 /// Document input only, and only when `--validate` is off: the strict
 /// validator has to see the original bytes, or the substitution repairs the
