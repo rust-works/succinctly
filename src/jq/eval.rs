@@ -10733,32 +10733,35 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     // Simplified: just return the value as JSON lines format
     let owned = to_owned(&value);
-    fn collect_stream(value: &OwnedValue, path: &[OwnedValue], results: &mut Vec<OwnedValue>) {
+    fn collect_stream(
+        value: &OwnedValue,
+        path: &mut Vec<OwnedValue>,
+        results: &mut Vec<OwnedValue>,
+    ) {
         match value {
             OwnedValue::Array(arr) => {
                 for (i, v) in arr.iter().enumerate() {
-                    let mut new_path = path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    collect_stream(v, &new_path, results);
+                    path.push(OwnedValue::Int(i as i64));
+                    collect_stream(v, path, results);
+                    path.pop();
                 }
             }
             OwnedValue::Object(obj) => {
                 for (k, v) in obj {
-                    let mut new_path = path.to_vec();
-                    new_path.push(OwnedValue::String(k.clone()));
-                    collect_stream(v, &new_path, results);
+                    path.push(OwnedValue::String(k.clone()));
+                    collect_stream(v, path, results);
+                    path.pop();
                 }
             }
             _ => {
-                let entry =
-                    OwnedValue::Array(vec![OwnedValue::Array(path.to_vec()), value.clone()]);
+                let entry = OwnedValue::Array(vec![OwnedValue::Array(path.clone()), value.clone()]);
                 results.push(entry);
             }
         }
     }
 
     let mut results = Vec::new();
-    collect_stream(&owned, &[], &mut results);
+    collect_stream(&owned, &mut Vec::new(), &mut results);
     QueryResult::Owned(OwnedValue::Array(results))
 }
 
@@ -25996,25 +25999,36 @@ fn extend(current_path: &[OwnedValue], component: OwnedValue) -> Vec<OwnedValue>
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent) — `current_path`
 /// already grows by exactly one component per descent from both call sites
-/// (`builtin_paths`/`builtin_paths_filter`, both starting at `&[]`), so its
-/// length doubles as the recursion depth with no extra parameter needed.
-fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Vec<OwnedValue>) {
+/// (`builtin_paths`/`builtin_paths_filter`, both starting at an empty
+/// `Vec`), so its length doubles as the recursion depth with no extra
+/// parameter needed.
+///
+/// `current_path` is threaded through with push/recurse/pop rather than
+/// clone-and-extend (#1657, mirroring `eval_generic::collect_paths_generic`'s
+/// #701 fix) — every `push` is matched by exactly one `pop` on every exit
+/// path out of that iteration, so a fresh `O(depth)` prefix no longer has to
+/// be rebuilt at every node just to extend it by one component.
+fn collect_paths(
+    value: &OwnedValue,
+    current_path: &mut Vec<OwnedValue>,
+    paths: &mut Vec<OwnedValue>,
+) {
     assert_value_tree_depth(current_path.len());
     match value {
         OwnedValue::Object(entries) => {
             for (key, val) in entries {
-                let mut new_path = current_path.to_vec();
-                new_path.push(OwnedValue::String(key.clone()));
-                paths.push(OwnedValue::Array(new_path.clone()));
-                collect_paths(val, &new_path, paths);
+                current_path.push(OwnedValue::String(key.clone()));
+                paths.push(OwnedValue::Array(current_path.clone()));
+                collect_paths(val, current_path, paths);
+                current_path.pop();
             }
         }
         OwnedValue::Array(arr) => {
             for (i, val) in arr.iter().enumerate() {
-                let mut new_path = current_path.to_vec();
-                new_path.push(OwnedValue::Int(i as i64));
-                paths.push(OwnedValue::Array(new_path.clone()));
-                collect_paths(val, &new_path, paths);
+                current_path.push(OwnedValue::Int(i as i64));
+                paths.push(OwnedValue::Array(current_path.clone()));
+                collect_paths(val, current_path, paths);
+                current_path.pop();
             }
         }
         _ => {}
@@ -26030,34 +26044,49 @@ fn collect_paths(value: &OwnedValue, current_path: &[OwnedValue], paths: &mut Ve
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent) — `path` already
 /// grows by exactly one component per descent from its sole call site
-/// (`builtin_tostream`, starting at `&[]`), so its length doubles as the
-/// recursion depth with no extra parameter needed.
-fn collect_tostream_events(value: &OwnedValue, path: &[OwnedValue], events: &mut Vec<OwnedValue>) {
+/// (`builtin_tostream`, starting at an empty `Vec`), so its length doubles as
+/// the recursion depth with no extra parameter needed.
+///
+/// `path` is threaded through with push/recurse/pop rather than
+/// clone-and-extend (#1657, mirroring `eval_generic::collect_paths_generic`'s
+/// #701 fix): every `push` is matched by exactly one `pop` on every exit path
+/// out of that iteration. The closing `[path]` marker re-pushes the last
+/// child's own key/index after the loop — for an array that's an O(1) index
+/// recompute (`arr.len() - 1`); for an object, `IndexMap::last()` reads the
+/// final entry's key in O(1) without an extra clone-per-iteration to track
+/// it.
+fn collect_tostream_events(
+    value: &OwnedValue,
+    path: &mut Vec<OwnedValue>,
+    events: &mut Vec<OwnedValue>,
+) {
     assert_value_tree_depth(path.len());
     match value {
         OwnedValue::Object(entries) if !entries.is_empty() => {
-            let mut last_path = path.to_vec();
             for (key, val) in entries {
-                let mut child_path = path.to_vec();
-                child_path.push(OwnedValue::String(key.clone()));
-                collect_tostream_events(val, &child_path, events);
-                last_path = child_path;
+                path.push(OwnedValue::String(key.clone()));
+                collect_tostream_events(val, path, events);
+                path.pop();
             }
-            events.push(OwnedValue::Array(vec![OwnedValue::Array(last_path)]));
+            if let Some((last_key, _)) = entries.last() {
+                path.push(OwnedValue::String(last_key.clone()));
+                events.push(OwnedValue::Array(vec![OwnedValue::Array(path.clone())]));
+                path.pop();
+            }
         }
         OwnedValue::Array(arr) if !arr.is_empty() => {
-            let mut last_path = path.to_vec();
             for (i, val) in arr.iter().enumerate() {
-                let mut child_path = path.to_vec();
-                child_path.push(OwnedValue::Int(i as i64));
-                collect_tostream_events(val, &child_path, events);
-                last_path = child_path;
+                path.push(OwnedValue::Int(i as i64));
+                collect_tostream_events(val, path, events);
+                path.pop();
             }
-            events.push(OwnedValue::Array(vec![OwnedValue::Array(last_path)]));
+            path.push(OwnedValue::Int((arr.len() - 1) as i64));
+            events.push(OwnedValue::Array(vec![OwnedValue::Array(path.clone())]));
+            path.pop();
         }
         leaf => {
             events.push(OwnedValue::Array(vec![
-                OwnedValue::Array(path.to_vec()),
+                OwnedValue::Array(path.clone()),
                 leaf.clone(),
             ]));
         }
@@ -26071,7 +26100,7 @@ fn builtin_tostream<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let mut events = Vec::new();
-    collect_tostream_events(&owned, &[], &mut events);
+    collect_tostream_events(&owned, &mut Vec::new(), &mut events);
     // Always non-empty: every value (including an empty container or a
     // top-level scalar) produces at least one leaf event -- routed through
     // `collapse_vec` anyway (#1067) so a future change to
@@ -26219,7 +26248,7 @@ fn builtin_paths<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let mut paths = Vec::new();
-    collect_paths(&owned, &[], &mut paths);
+    collect_paths(&owned, &mut Vec::new(), &mut paths);
     // Stream individual paths instead of wrapping in array
     owned_vec_to_result(paths)
 }
@@ -26303,7 +26332,7 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     let mut all_paths = Vec::new();
-    collect_paths(&owned, &[], &mut all_paths);
+    collect_paths(&owned, &mut Vec::new(), &mut all_paths);
 
     for path in all_paths {
         let OwnedValue::Array(path_arr) = &path else {
@@ -26394,9 +26423,14 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
 /// `collect_paths`/`collect_tostream_events` (#1021) already established:
 /// `current_path` grows by exactly one element per descent, so its length
 /// already tracks tree depth without duplicating a counter.
+///
+/// `current_path` is threaded through with push/recurse/pop rather than
+/// clone-and-extend (#1657, mirroring `eval_generic::collect_paths_generic`'s
+/// #701 fix and `collect_paths`'s own #1657 fix above) — every `push` is
+/// matched by exactly one `pop` on every exit path out of that iteration.
 fn collect_leaf_paths(
     value: &OwnedValue,
-    current_path: &[OwnedValue],
+    current_path: &mut Vec<OwnedValue>,
     paths: &mut Vec<OwnedValue>,
 ) {
     assert_value_tree_depth(current_path.len());
@@ -26404,30 +26438,30 @@ fn collect_leaf_paths(
         OwnedValue::Object(entries) => {
             if entries.is_empty() {
                 // Empty object is a leaf
-                paths.push(OwnedValue::Array(current_path.to_vec()));
+                paths.push(OwnedValue::Array(current_path.clone()));
             } else {
                 for (key, val) in entries {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::String(key.clone()));
-                    collect_leaf_paths(val, &new_path, paths);
+                    current_path.push(OwnedValue::String(key.clone()));
+                    collect_leaf_paths(val, current_path, paths);
+                    current_path.pop();
                 }
             }
         }
         OwnedValue::Array(arr) => {
             if arr.is_empty() {
                 // Empty array is a leaf
-                paths.push(OwnedValue::Array(current_path.to_vec()));
+                paths.push(OwnedValue::Array(current_path.clone()));
             } else {
                 for (i, val) in arr.iter().enumerate() {
-                    let mut new_path = current_path.to_vec();
-                    new_path.push(OwnedValue::Int(i as i64));
-                    collect_leaf_paths(val, &new_path, paths);
+                    current_path.push(OwnedValue::Int(i as i64));
+                    collect_leaf_paths(val, current_path, paths);
+                    current_path.pop();
                 }
             }
         }
         _ => {
             // Scalar value is a leaf
-            paths.push(OwnedValue::Array(current_path.to_vec()));
+            paths.push(OwnedValue::Array(current_path.clone()));
         }
     }
 }
@@ -26444,7 +26478,7 @@ fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     let owned = to_owned(&value);
     let mut paths = Vec::new();
-    collect_leaf_paths(&owned, &[], &mut paths);
+    collect_leaf_paths(&owned, &mut Vec::new(), &mut paths);
     // Stream individual paths instead of wrapping in array
     owned_vec_to_result(paths)
 }
@@ -55900,13 +55934,13 @@ mod tests {
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut paths = Vec::new();
-        collect_paths(&under, &[], &mut paths);
+        collect_paths(&under, &mut Vec::new(), &mut paths);
         assert_eq!(paths.len(), MAX_VALUE_TREE_DEPTH - 1);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut paths = Vec::new();
-            collect_paths(&over, &[], &mut paths);
+            collect_paths(&over, &mut Vec::new(), &mut paths);
         }));
         assert!(
             result.is_err(),
@@ -55923,13 +55957,13 @@ mod tests {
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut events = Vec::new();
-        collect_tostream_events(&under, &[], &mut events);
+        collect_tostream_events(&under, &mut Vec::new(), &mut events);
         assert!(!events.is_empty());
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut events = Vec::new();
-            collect_tostream_events(&over, &[], &mut events);
+            collect_tostream_events(&over, &mut Vec::new(), &mut events);
         }));
         assert!(
             result.is_err(),
@@ -56095,13 +56129,13 @@ mod tests {
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut paths = Vec::new();
-        collect_leaf_paths(&under, &[], &mut paths);
+        collect_leaf_paths(&under, &mut Vec::new(), &mut paths);
         assert_eq!(paths.len(), 1);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut paths = Vec::new();
-            collect_leaf_paths(&over, &[], &mut paths);
+            collect_leaf_paths(&over, &mut Vec::new(), &mut paths);
         }));
         assert!(
             result.is_err(),
@@ -56112,13 +56146,13 @@ mod tests {
         // `Array`'s -- exercise its own boundary too (#1025 code review).
         let under_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut paths = Vec::new();
-        collect_leaf_paths(&under_obj, &[], &mut paths);
+        collect_leaf_paths(&under_obj, &mut Vec::new(), &mut paths);
         assert_eq!(paths.len(), 1);
 
         let over_obj = linear_object_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut paths = Vec::new();
-            collect_leaf_paths(&over_obj, &[], &mut paths);
+            collect_leaf_paths(&over_obj, &mut Vec::new(), &mut paths);
         }));
         assert!(
             result.is_err(),
