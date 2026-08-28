@@ -6518,6 +6518,220 @@ fn test_if_path_context_many_owned_continuation_stops_mid_loop_1409() -> Result<
     Ok(())
 }
 
+/// `needs_path_context` had no `Expr::As` arm (#1663), so `EXPR as $v |
+/// body` -- the ordinary jq variable-binding idiom, not some rare shape --
+/// silently lost path context whenever `key`/`parent`/`file_index`
+/// appeared in either `EXPR` or `body`. This is the single most
+/// consequential case in #1663's own filing: `.a.b | . as $x | parent(1)`
+/// returned `{}` instead of `{"b":1}`. Unlike #1302's `Array`/#1334's
+/// `StringInterpolation`, neither `expr` nor `body` navigate away from the
+/// caller's own position -- `eval_as` (the pre-existing, non-path-context
+/// evaluator) already evaluates both against the same `value` -- so `rest`
+/// after the whole `as` expression sees the *same*, unreset position too
+/// (`continue_rest_with_context`, not `continue_rest_with_fresh_root`).
+/// Verified live against real yq v4.53.3 (`key`/`parent` are succinctly
+/// extensions with no real-jq equivalent, so jq mode here pins internal
+/// consistency against yq's own oracle, not jq's).
+#[test]
+fn test_as_path_context_builtins_1663() -> Result<()> {
+    // The issue's own headline repro.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b | . as $x | parent(1)"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"b":1}"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | . as $x | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    // Multiple builtins and a deeper `parent(n)`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b.c | . as $x | [key, parent(2)]"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["c",{"b":{"c":1}}]"#);
+
+    // `rest` after the whole `as` expression sees the *unreset* position --
+    // the opposite of #1302/#1334's fresh-root behavior, and the reason
+    // this arm calls `continue_rest_with_context` rather than
+    // `continue_rest_with_fresh_root`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b | (. as $x | $x) | key"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""b""#);
+
+    // Nested `as` expressions, path context threading through both levels.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b | . as $x | . as $y | key"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""b""#);
+
+    // A plain `as` (no path-context builtin in either half) takes the
+    // original, unmodified code path and must be entirely unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a as $x | $x + 1"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+
+    Ok(())
+}
+
+/// #1663: unlike #1302's `Array` (atomic construction) or #1334's
+/// `StringInterpolation`, `as` is deliberately *non-atomic*: `eval_as`'s own
+/// doc comment establishes that `(1,2,error("x")) as $v | $v + 10` keeps
+/// `11`, `12` as a real prefix before the error, matching jq's own
+/// generator-processes-each-bound-value-as-produced semantics. Every case
+/// below is a `key`-substituted mirror of a `1`-only query already run
+/// against the pre-existing `eval_as` path, confirming the new path-context
+/// arm reproduces the exact same prefix-preserving behavior rather than
+/// accidentally becoming atomic like `Array` did.
+#[test]
+fn test_as_path_context_builtin_prefix_preserving_not_atomic_1663() -> Result<()> {
+    // Zero outputs from the bind expression -> zero outputs overall, not an
+    // error (mirrors `select`'s ordinary "no match" behavior).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | select(key == \"z\") as $x | $x"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // A bare error from the bind expression, with no successful output
+    // preceding it, propagates as a bare error -- no prefix to speak of.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | (key | error(\"boom\")) as $x | $x"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // The bind expression produces a real prefix (`key` => "a") before
+    // erroring -- the prefix survives on stdout, the error still raises.
+    // Exercises the `Partial(_, Control::Error(_))` arm of the bind match.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | (key, error(\"boom\")) as $x | $x"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout.trim(), r#""a""#);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // The error is in the *body*, not the bind expression: `key` (=> "a")
+    // still comes out for the first bound value before the second bound
+    // value's body evaluation errors and stops the loop.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            ".a | (1,2) as $x | (if $x==1 then key else error(\"boom\") end)",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout.trim(), r#""a""#);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `?` wrapping the whole `as` expression swallows the trailing error
+    // but keeps the already-produced prefix -- matching real jq's own
+    // `((1, error("x")) as $v | $v)?` => `1`, confirmed live.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | ((key, error(\"boom\")) as $x | $x)?"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    // A bare `break` out of the bind expression (no prior output) aborts
+    // the whole `as` expression and unwinds to the enclosing label -- the
+    // comma's second branch ("reached") must never run.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a | (key | break $out) as $x | $x), \"reached\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "break must discard, not emit, the as expression"
+    );
+
+    // Same, but with a real prefix already produced before the break --
+    // exercises the `Partial(_, Control::Break(_))` arm.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a | (key, break $out) as $x | $x), \"reached\")",
+        ],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    // `halt_error(n)` from the bind expression propagates its own exit
+    // code, with the already-produced prefix still on stdout.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (key, halt_error(9)) as $x | $x"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout.trim(), r#""a""#);
+
+    Ok(())
+}
+
+/// Documents four deliberate, narrow gaps #1663 leaves open rather than
+/// silently missing: `needs_path_context` still has no arm for
+/// `Expr::AsPattern` (destructuring `as`), `Expr::Reduce`, `Expr::Foreach`,
+/// or `Expr::Limit`, so a path-context builtin inside any of these four
+/// still falls through to the generic fallback and stubs to its zero
+/// default, exactly as before this fix. `Expr::Object` has the identical
+/// gap but is tracked separately as #1332 (already true before #1663, per
+/// the `Array` arm's own doc comment). Only `Expr::As` -- the single most
+/// consequential shape per #1663's own filing (the ordinary
+/// `EXPR as $v | body` idiom) -- was fixed here; the remaining four have
+/// no real-yq oracle to verify a fix against (yq's lexer rejects
+/// destructuring `as`, `reduce`, `foreach`, and `limit` outright) and
+/// `Reduce`/`Foreach` in particular raise a real semantic question (what
+/// should `key` mean while evaluating the fold's own accumulator, which
+/// has no document position?) that #1663's own investigation didn't
+/// settle. Filed as a follow-up rather than guessed at here. Pinned so a
+/// future regression or accidental fix is visible either way, matching
+/// #1306's identical "known gap" precedent
+/// (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
+#[test]
+fn test_as_pattern_reduce_foreach_limit_path_context_still_known_gaps_1663() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | . as [$x] | key"], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | reduce .[] as $x (key; .)"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [foreach .[] as $x (key; .)]"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[null,null]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(1; key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[null]");
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::Array` arm (#1302), so `[key]` --
 /// semantically equivalent to `(key,key)`'s single-branch case, just
 /// array-wrapped instead of comma-joined -- silently lost path context and

@@ -763,6 +763,13 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // as a known gap rather than paying for a full
         // `expand_func_calls` just to answer this routing question.
         Expr::FuncDef { body, then, .. } => needs_path_context(body) || needs_path_context(then),
+        // `EXPR as $v | body` (#1663): neither `expr` nor `body` navigate
+        // away from the caller's own position -- `eval_as` evaluates both
+        // against the same `value` -- so a `key`/`parent`/`file_index`
+        // inside either one needs the same ambient context the caller has.
+        // This is the single most common trigger for this whole bug class:
+        // `.a.b | . as $x | parent(1)` previously silently stubbed to `{}`.
+        Expr::As { expr, body, .. } => needs_path_context(expr) || needs_path_context(body),
         _ => false,
     }
 }
@@ -25753,6 +25760,102 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     optional,
                 )
             }
+        }
+        Expr::As { expr, var, body } if needs_path_context(expr) || needs_path_context(body) => {
+            // #1663: mirrors `eval_as`'s own owned-value logic (bind
+            // `expr`'s outputs, substitute into `body` per bound value,
+            // evaluate each) but routes both `expr` and the substituted
+            // `body` through this path-context evaluator instead of
+            // `eval_single` -- neither one navigates away from `value`
+            // (both evaluate against the same position `eval_as` itself
+            // uses), so `key`/`parent`/`file_index` inside either sees the
+            // caller's own ambient position, unchanged.
+            //
+            // Unlike the `Array` arm below, `optional` is *not* forced to
+            // `false` here: `eval_as`'s own doc comment establishes that
+            // `as` is deliberately non-atomic under `?` --
+            // `(1,2,error("x")) as $v | $v + 10` keeps `11`, `12` as a real
+            // prefix, unlike `[...]`'s atomicity -- so it's passed straight
+            // through to both evaluations, exactly as `eval_as` does.
+            let bound_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
+                match bound_result {
+                    QueryResult::Owned(v) => (vec![v], None),
+                    QueryResult::ManyOwned(vs) => (vs, None),
+                    QueryResult::None => return QueryResult::None,
+                    QueryResult::Error(e) => return QueryResult::Error(e),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    QueryResult::Partial(vs, control) => (vs, Some(control)),
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                };
+
+            let mut all_results: Vec<OwnedValue> = Vec::new();
+            let mut loop_control: Option<Control> = None;
+            for bound_val in bound_values {
+                let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+                let body_result = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(&substituted_body),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                match body_result {
+                    QueryResult::Owned(v) => all_results.push(v),
+                    QueryResult::ManyOwned(vs) => all_results.extend(vs),
+                    QueryResult::None => {}
+                    QueryResult::Error(e) => {
+                        loop_control = Some(Control::Error(e));
+                        break;
+                    }
+                    QueryResult::Break(label) => {
+                        loop_control = Some(Control::Break(label));
+                        break;
+                    }
+                    QueryResult::Halt(code) => {
+                        loop_control = Some(Control::Halt(code));
+                        break;
+                    }
+                    QueryResult::Partial(vs, control) => {
+                        all_results.extend(vs);
+                        loop_control = Some(control);
+                        break;
+                    }
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                }
+            }
+
+            let combined = match loop_control.or(bound_control) {
+                Some(control) => partial(all_results, control),
+                None => owned_vec_to_result(all_results),
+            };
+            continue_rest_with_context::<W, S>(
+                combined,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
             // Value-constructing expressions reset the path context
