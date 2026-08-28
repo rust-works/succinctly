@@ -17056,14 +17056,17 @@ fn test_jq_trailing_leading_comma_now_rejected_1676() -> Result<()> {
 /// doc comment already explains is too expensive to pay unconditionally.
 /// Pinned here, same discipline as #1643's own now-fixed gap test above, so
 /// a future fix for *this* narrower residual updates this test rather than
-/// silently landing uncovered. Real jq rejects both (confirmed live against
-/// `/usr/bin/jq` 1.7.1): `{"a":[1,2],}` and `[[1,2],]` are both parse
-/// errors there.
+/// silently landing uncovered. Real jq rejects all four (confirmed live
+/// against `/usr/bin/jq` 1.7.1), including the empty-inner-container variant
+/// (`[[],]`, `{"a":{},}`) -- an empty container is still a container for
+/// `scalar_end_pos`'s purposes, so it hits the same skip.
 #[test]
 fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() -> Result<()> {
     for (input, expected) in [
         (r#"{"a":[1,2],}"#, r#"{"a":[1,2]}"#),
         ("[[1,2],]", "[[1,2]]"),
+        ("[[],]", "[[]]"),
+        (r#"{"a":{},}"#, r#"{"a":{}}"#),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
         assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
@@ -17087,13 +17090,25 @@ fn test_jq_missing_delimiter_raises_under_sort_keys_color_and_slurp_1643() -> Re
         vec!["-C", "-c", "."],
         vec!["-c", "--slurp", "."],
     ] {
-        let (out, stderr, code) = run_jq_full(&args, Some(r#"{"a" 1}"#))?;
-        assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
-        assert!(out.trim().is_empty(), "{args:?}: unexpected output {out:?}");
-        assert!(
-            stderr.contains("Invalid JSON text"),
-            "{args:?}: stderr: {stderr:?}"
-        );
+        // Object and array shapes both exercise `validate_json_delimiters`,
+        // but its two arms are independent code paths -- only the object
+        // shape was covered here before #1676 touched (and thus surfaced
+        // the gap in) the array arm's own neighboring lines.
+        for input in [r#"{"a" 1}"#, "[1 2,3]"] {
+            let (out, stderr, code) = run_jq_full(&args, Some(input))?;
+            assert_eq!(
+                code, 5,
+                "{args:?} {input}: out: {out:?}, stderr: {stderr:?}"
+            );
+            assert!(
+                out.trim().is_empty(),
+                "{args:?} {input}: unexpected output {out:?}"
+            );
+            assert!(
+                stderr.contains("Invalid JSON text"),
+                "{args:?} {input}: stderr: {stderr:?}"
+            );
+        }
     }
 
     Ok(())
@@ -17157,10 +17172,14 @@ fn test_jq_doubled_trailing_comma_rejected_1676() -> Result<()> {
 
 /// #1676: the success side of `validate_json_delimiters`'s new trailing-gap
 /// check on the `-S`/`-C`/`--slurp` fallback path -- a structurally *valid*
-/// container (clean trailing gap) reached via a leniency trigger elsewhere
-/// in the same document (`serde_json` rejects the leading zero, routing to
-/// `find_json_values` + `validate_json_delimiters` same as the malformed
-/// cases above), covering both a scalar and a container last child/value.
+/// container reached via a leniency trigger elsewhere in the same document
+/// (`serde_json` rejects the leading zero, routing to `find_json_values` +
+/// `validate_json_delimiters` same as the malformed cases above). Covers
+/// both a scalar last element/value (where `trailing_gap_ok` actually runs
+/// and must correctly say "clean") and a container one (`[01,[2,3]]` etc. --
+/// where the check is skipped per `scalar_end_pos`'s own doc comment, so
+/// these two cases only confirm the *skip* itself doesn't wrongly reject,
+/// not that `trailing_gap_ok`'s own logic is exercised for a container).
 #[test]
 fn test_jq_wellformed_trailing_gap_survives_leniency_fallback_1676() -> Result<()> {
     for (input, expected) in [
