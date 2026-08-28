@@ -562,6 +562,69 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Fallible twin of [`to_owned`], raising [`EvalError::decode_failure`] on an
+/// undecodable string value instead of silently substituting an empty string
+/// (#1746) -- mirrors `eval_generic::to_owned_at_depth`'s already-fixed
+/// shape (#1247/#1620/#1660), which this private, `StandardJson`-specific
+/// copy never received.
+///
+/// Used only at this file's primary result-value materialization points
+/// (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
+/// `map_over`/`builtin_map_values`, `builtin_to_entries`) rather than
+/// replacing [`to_owned`] everywhere: this file has on the order of 200
+/// other `to_owned` call sites (mostly `QueryResult` collector boilerplate
+/// and error-message rendering), and changing the infallible function's own
+/// signature would force a Result-threading edit at every one of them in a
+/// single change. Left as a documented gap for a follow-up rather than
+/// attempted here (#1746's own comment thread).
+///
+/// Key handling is intentionally unchanged from [`to_owned`]: an object
+/// field whose key fails to decode is still silently dropped (a distinct,
+/// #1194-shaped structural gap, not this function's #1247-shaped one).
+fn to_owned_checked<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    to_owned_checked_at_depth(value, 0)
+}
+
+fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+    depth: usize,
+) -> Result<OwnedValue, EvalError> {
+    assert_value_tree_depth(depth);
+    Ok(match value {
+        StandardJson::Null => OwnedValue::Null,
+        StandardJson::Bool(b) => OwnedValue::Bool(*b),
+        StandardJson::Number(n) => OwnedValue::from_number_bytes(n.raw_bytes()),
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => OwnedValue::String(cow.into_owned()),
+            Err(e) => return Err(EvalError::decode_failure(e.message())),
+        },
+        StandardJson::Array(elements) => {
+            let items: Vec<OwnedValue> = (*elements)
+                .map(|e| to_owned_checked_at_depth(&e, depth + 1))
+                .collect::<Result<_, _>>()?;
+            OwnedValue::Array(items)
+        }
+        StandardJson::Object(fields) => {
+            let mut map = IndexMap::new();
+            for field in *fields {
+                // Get the key as a string
+                if let StandardJson::String(key_str_val) = field.key() {
+                    if let Ok(cow) = key_str_val.as_str() {
+                        map.insert(
+                            cow.into_owned(),
+                            to_owned_checked_at_depth(&field.value(), depth + 1)?,
+                        );
+                    }
+                }
+            }
+            OwnedValue::Object(map)
+        }
+        StandardJson::Error(_) => OwnedValue::Null,
+    })
+}
+
 /// Materialize a key/slice-bound candidate just enough to classify it.
 ///
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
@@ -6188,10 +6251,20 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut results = Vec::new();
     for elem in elements {
         match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-            QueryResult::One(v) => results.push(to_owned(&v)),
+            QueryResult::One(v) => match to_owned_checked(&v) {
+                Ok(owned) => results.push(owned),
+                Err(e) => return QueryResult::Error(e),
+            },
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Owned(v) => results.push(v),
-            QueryResult::Many(vs) => results.extend(vs.iter().map(to_owned)),
+            QueryResult::Many(vs) => match vs
+                .iter()
+                .map(to_owned_checked)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(owned) => results.extend(owned),
+                Err(e) => return QueryResult::Error(e),
+            },
             QueryResult::ManyOwned(vs) => results.extend(vs),
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
@@ -6249,16 +6322,24 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // Apply f to the value
                 let field_val = field.value();
                 match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
-                    QueryResult::One(v) => {
-                        result_map.insert(key, to_owned(&v));
-                    }
+                    QueryResult::One(v) => match to_owned_checked(&v) {
+                        Ok(owned) => {
+                            result_map.insert(key, owned);
+                        }
+                        Err(e) => return QueryResult::Error(e),
+                    },
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => {
                         result_map.insert(key, v);
                     }
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            result_map.insert(key, to_owned(v));
+                            match to_owned_checked(v) {
+                                Ok(owned) => {
+                                    result_map.insert(key, owned);
+                                }
+                                Err(e) => return QueryResult::Error(e),
+                            }
                         }
                     }
                     QueryResult::ManyOwned(vs) => {
@@ -6289,12 +6370,18 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut results = Vec::new();
             for elem in elements {
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-                    QueryResult::One(v) => results.push(to_owned(&v)),
+                    QueryResult::One(v) => match to_owned_checked(&v) {
+                        Ok(owned) => results.push(owned),
+                        Err(e) => return QueryResult::Error(e),
+                    },
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            results.push(to_owned(v));
+                            match to_owned_checked(v) {
+                                Ok(owned) => results.push(owned),
+                                Err(e) => return QueryResult::Error(e),
+                            }
                         }
                     }
                     QueryResult::ManyOwned(vs) => {
@@ -7939,16 +8026,19 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let entries: Vec<OwnedValue> = elements
+            let entries: Result<Vec<OwnedValue>, EvalError> = elements
                 .enumerate()
                 .map(|(i, elem)| {
                     let mut entry = IndexMap::new();
                     entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                    entry.insert("value".to_string(), to_owned(&elem));
-                    OwnedValue::Object(entry)
+                    entry.insert("value".to_string(), to_owned_checked(&elem)?);
+                    Ok(OwnedValue::Object(entry))
                 })
                 .collect();
-            QueryResult::Owned(OwnedValue::Array(entries))
+            match entries {
+                Ok(entries) => QueryResult::Owned(OwnedValue::Array(entries)),
+                Err(e) => QueryResult::Error(e),
+            }
         }
         StandardJson::Object(fields) => {
             let mut entries: Vec<OwnedValue> = Vec::new();
@@ -7962,7 +8052,10 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 } else {
                     continue;
                 };
-                let val = to_owned(&field.value());
+                let val = match to_owned_checked(&field.value()) {
+                    Ok(val) => val,
+                    Err(e) => return QueryResult::Error(e),
+                };
 
                 let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::String(key));
@@ -15013,9 +15106,15 @@ fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'_, W>,
 ) -> Option<OwnedValue> {
+    // A decode-failure `Err` here falls through to `None` like any other
+    // "doesn't apply" reason above -- this function's callers
+    // (`eval_compound_assign`/`eval_alternative_assign`) always fall
+    // through to `eval_update` on `None`, whose own `to_owned_checked` call
+    // raises the identical error properly (#1746), so nothing is lost by
+    // not threading a `Result` through this wrapper too.
     match yq_assign_noop_check::<W, S>(path_expr, input) {
-        YqAssignNoopCheck::Skip(unchanged) => Some(unchanged),
-        YqAssignNoopCheck::Continue { .. } | YqAssignNoopCheck::NotChecked => None,
+        Ok(YqAssignNoopCheck::Skip(unchanged)) => Some(unchanged),
+        Ok(YqAssignNoopCheck::Continue { .. } | YqAssignNoopCheck::NotChecked) | Err(_) => None,
     }
 }
 
@@ -15052,11 +15151,11 @@ enum YqAssignNoopCheck {
 fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'_, W>,
-) -> YqAssignNoopCheck {
+) -> Result<YqAssignNoopCheck, EvalError> {
     if S::TAG != EvalTag::Yq || needs_path_prepass(path_expr) {
-        return YqAssignNoopCheck::NotChecked;
+        return Ok(YqAssignNoopCheck::NotChecked);
     }
-    let pristine = to_owned(input);
+    let pristine = to_owned_checked(input)?;
     // A static path (the only kind reaching this point) never actually
     // evaluates `path_expr` -- `resolve_dynamic_indexes`'s own fast path
     // is an unconditional `Ok(vec![path_expr.clone()])` -- so this can't
@@ -15065,13 +15164,15 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // before this function existed.
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
         Ok(paths) => paths,
-        Err(_) => return YqAssignNoopCheck::NotChecked,
+        Err(_) => return Ok(YqAssignNoopCheck::NotChecked),
     };
-    if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
-        YqAssignNoopCheck::Skip(pristine)
-    } else {
-        YqAssignNoopCheck::Continue { pristine, paths }
-    }
+    Ok(
+        if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
+            YqAssignNoopCheck::Skip(pristine)
+        } else {
+            YqAssignNoopCheck::Continue { pristine, paths }
+        },
+    )
 }
 
 /// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching
@@ -15085,7 +15186,10 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let yq_noop_check = yq_assign_noop_check::<_, S>(path_expr, &input);
+    let yq_noop_check = match yq_assign_noop_check::<_, S>(path_expr, &input) {
+        Ok(check) => check,
+        Err(e) => return QueryResult::Error(e),
+    };
     if let YqAssignNoopCheck::Skip(unchanged) = yq_noop_check {
         return QueryResult::Owned(unchanged);
     }
@@ -15098,12 +15202,18 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (`Partial`) share one code path below instead of two.
     let (rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
         match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::One(v) => match to_owned_checked(&v) {
+                Ok(owned) => (vec![owned], None),
+                Err(e) => return QueryResult::Error(e),
+            },
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
             QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect() {
+                Ok(owned) => (owned, None),
+                Err(e) => return QueryResult::Error(e),
+            },
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => (Vec::new(), None),
             QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
@@ -15151,7 +15261,10 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
-            let pristine = to_owned(&input);
+            let pristine = match to_owned_checked(&input) {
+                Ok(pristine) => pristine,
+                Err(e) => return QueryResult::Error(e),
+            };
             let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
                 Ok(paths) => paths,
                 // `?` swallows only a genuine error; a halt always escapes,
@@ -15260,7 +15373,10 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
     // Convert input to owned for modification
-    let mut result = to_owned(&input);
+    let mut result = match to_owned_checked(&input) {
+        Ok(result) => result,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // Computed keys resolve against the original document, before any update.
     //
@@ -17565,11 +17681,14 @@ fn resolve_node<'a, S: EvalSemantics>(
                     // already-resolved prefix: `halt`/`halt_error(n)` is
                     // never caught by `?`, in path expressions any more than
                     // in value position (#791), an invalid-path-expression
-                    // complaint survives `?` too (#530), and — only for a
-                    // bare navigation primitive — so does #843's "near
-                    // attempt" complaint.
+                    // complaint survives `?` too (#530), a decode failure
+                    // does as well -- matching the sibling `Expr::Try` arm's
+                    // `is_uncatchable()` guard, since `expr?` is documented
+                    // sugar for `try expr` and the two must agree (#1746) --
+                    // and — only for a bare navigation primitive — so does
+                    // #843's "near attempt" complaint.
                     Err((prefix, EvalEscape::Error(e)))
-                        if !(e.is_invalid_path_expression()
+                        if !(e.is_uncatchable()
                             || (bare_navigation_primitive
                                 && e.is_untracked_navigation_error())) =>
                     {
@@ -25944,7 +26063,10 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = to_owned(&value);
+    let owned = match to_owned_checked(&value) {
+        Ok(owned) => owned,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // Computed keys must become static components before the tracker runs — it
     // ignores anything it does not recognise, so an unresolved one would
@@ -56397,6 +56519,109 @@ mod tests {
             result.is_err(),
             "to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// #1746: this file's own private `to_owned`/`to_owned_at_depth` never
+    /// received the #1247/#1620/#1660 decode-failure raising sweep --
+    /// `builtin_path`/`eval_assign`/`eval_update` all materialized the whole
+    /// document through it, silently corrupting an untouched sibling field's
+    /// undecodable string into `""` instead of raising. `\ud800` is a lone
+    /// UTF-16 surrogate -- syntactically a valid JSON string escape (the
+    /// semi-index scanner accepts the span leniently) but never decodable to
+    /// UTF-8, the identical repro shape #1738 used for `eval_generic`'s own
+    /// sibling bug. Confirmed live before this fix: `.a = 5` on this input
+    /// returned `{"a": 5, "b": ""}`, corrupting `.b` even though only `.a`
+    /// was touched.
+    #[test]
+    fn eval_rs_to_owned_raises_decode_failure_on_untouched_sibling_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a = 5").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: a decode failure raised through this path must be
+    /// uncatchable, matching every other decode-failure raise in the
+    /// codebase (#1247/#1620/#1660) -- a trailing `?` must not silently
+    /// swallow it back into the same corrupted-output shape the primary fix
+    /// just closed.
+    #[test]
+    fn eval_rs_to_owned_decode_failure_uncatchable_by_optional_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("(.a = 5)?").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected the decode failure to survive `?` uncaught, got: {other:?}"),
+        }
+    }
+
+    /// #1746: `eval_update` (`|=`) has the identical whole-document
+    /// materialization as `eval_assign`, and shares no code with it --
+    /// needs its own repro. `.a |= (.+1)` on the same shape must raise
+    /// rather than corrupt `.b`.
+    #[test]
+    fn eval_rs_eval_update_raises_decode_failure_on_untouched_sibling_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a |= (.+1)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746: `map(f)`'s own `to_owned` call (`map_over`) sits on the
+    /// primary result path, unlike `keys`/`.[]`, which don't materialize
+    /// element values in their own arms at all (#1746 review corrected the
+    /// issue's own framing there) -- `map(.)` over an array holding an
+    /// undecodable string must raise instead of silently mapping it to `""`.
+    #[test]
+    fn eval_rs_map_raises_decode_failure_instead_of_corrupting_1746() {
+        let json: &[u8] = br#"[1,"\ud800"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map(.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746: `to_entries`'s own `to_owned` call on each value is on the
+    /// primary result path -- an undecodable value must raise instead of
+    /// silently becoming `""` in the emitted `{key, value}` entry.
+    #[test]
+    fn eval_rs_to_entries_raises_decode_failure_instead_of_corrupting_1746() {
+        let json: &[u8] = br#"{"a":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("to_entries").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
     }
 
     /// #1017: `*`/`*=` merge had no guard anywhere in the mutually-recursive
