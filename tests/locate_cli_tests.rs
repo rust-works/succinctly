@@ -148,3 +148,29 @@ fn yq_locate_warns_but_still_answers_on_invalid_utf8() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1759 (found reviewing #1627/PR #1758): the warn-and-keep-answering fix
+/// only covers an invalid byte inside a *value* -- one inside a *mapping
+/// key* on the path to the requested offset still fails outright, since
+/// `path_to_bp` can't build a path expression without decoding every
+/// ancestor key. Pinning this as the current, documented behavior (not the
+/// desired end state -- see #1759) rather than leaving it unasserted.
+#[test]
+fn yq_locate_still_fails_when_invalid_utf8_is_in_an_ancestor_key() -> Result<()> {
+    let mut fixture = tempfile::NamedTempFile::new().expect("create temp fixture");
+    std::io::Write::write_all(&mut fixture, b"a: 1\n\"b\xe4c\": 2\n").expect("write fixture");
+    let path = fixture.path().to_str().expect("utf8 path");
+
+    let (_, stderr, code) = run(&["yq-locate", path, "--offset", "7"])?;
+
+    assert_ne!(code, 0, "expected a failure, got: {stderr}");
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "expected a UTF-8 warning on stderr, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Could not locate position"),
+        "expected a locate failure on stderr, got: {stderr}"
+    );
+    Ok(())
+}
