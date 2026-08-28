@@ -56766,6 +56766,77 @@ mod tests {
         }
     }
 
+    /// #1746 review: the success (`Ok`) arm of the `One`/`Many`
+    /// `to_owned_checked` match blocks added by this fix needs its own
+    /// coverage -- every other new test here constructs a failure. Clean
+    /// input through the same shapes must still produce the ordinary,
+    /// uncorrupted result.
+    #[test]
+    fn eval_rs_map_values_and_assign_succeed_on_clean_input_1746() {
+        // `map_values`, object arm, `One` and `Many` shapes.
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map_values(.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
+            }
+            other => panic!("object/One: unexpected result: {other:?}"),
+        }
+        let expr = parse("map_values(.,.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), Some(&OwnedValue::Int(1)));
+            }
+            other => panic!("object/Many: unexpected result: {other:?}"),
+        }
+
+        // `map_values`, array arm, `One` and `Many` shapes.
+        let json: &[u8] = br#"["x"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map_values(.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+            }
+            other => panic!("array/One: unexpected result: {other:?}"),
+        }
+        let expr = parse("map_values(.,.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+            }
+            other => panic!("array/Many: unexpected result: {other:?}"),
+        }
+
+        // `eval_assign`'s RHS materialization, `One` and `Many` shapes.
+        let json: &[u8] = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a = .b").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), Some(&OwnedValue::Int(2)));
+            }
+            other => panic!("assign/One: unexpected result: {other:?}"),
+        }
+        let expr = parse(".a = (.b, .b)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs.len(), 2);
+                for v in vs {
+                    let OwnedValue::Object(m) = v else {
+                        panic!("assign/Many: expected an object")
+                    };
+                    assert_eq!(m.get("a"), Some(&OwnedValue::Int(2)));
+                }
+            }
+            other => panic!("assign/Many: unexpected result: {other:?}"),
+        }
+    }
+
     /// #1017: `*`/`*=` merge had no guard anywhere in the mutually-recursive
     /// `merge_values`/`merge_existing`/`merge_object_fields`/
     /// `merge_arrays_by_index` family; `deep_merge_arrays` (the `d` flag)
