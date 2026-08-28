@@ -1214,6 +1214,46 @@ Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../
 [`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
 (the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
 
+## A truncating consumer of `keys_unsorted[]` skips a malformed member it never needed
+
+Sibling of the `map(f)` divergence directly above, for the same underlying reason: a
+[#1194](https://github.com/rust-works/succinctly/issues/1194) malformed object member
+(a non-string key, or an unpaired trailing member with no value) is detected by walking
+the object, and a demand-aware consumer that stops pulling early never walks past its own
+stopping point.
+
+[#1629](https://github.com/rust-works/succinctly/issues/1629) made every `keys_unsorted`
+arm that already walks the whole object regardless (`keys_unsorted[]`, `| last`, a
+*negative* `[n]`) raise on a malformed member, riding that walk for free.
+[#1770](https://github.com/rust-works/succinctly/issues/1770) extended the same check to
+`first(keys_unsorted[])`/`limit(n; keys_unsorted[])` for a malformed key the sink *actually
+pulls* — `DistinctKeyCursors::next` already decodes every key it yields to hash it, so
+checking it there costs nothing extra:
+
+```
+$ echo '{123: 1, "b": 2}' | succinctly jq -c 'first(keys_unsorted[])'      # error, exit 5
+$ echo '{"a":1, 123:2}'   | succinctly jq -c 'limit(2; keys_unsorted[])'   # "a", then error, exit 5
+```
+
+What neither fix reaches: a malformed member sitting *after* whatever the consumer
+actually pulled. Detecting an unpaired tail specifically requires reaching exhaustion
+(there is no per-key signal for "the object ends improperly" the way there is for "this
+key isn't a string") — which a truncating consumer may never do by design:
+
+```
+$ echo '{"a":1,123:2}' | succinctly jq -c 'first(keys_unsorted[])'   # "a", exit 0
+$ echo '{"a":1,"b"}'   | succinctly jq -c 'first(keys_unsorted[])'   # "a", exit 0
+$ echo '{"a":1,123:2}' | succinctly jq -c 'keys_unsorted[]'          # error, exit 5 (unaffected -- always exhausts)
+```
+
+Deliberate, for the same reason the `map(f)` divergence above is: restoring the check here
+would mean walking past the point the demand-aware sink stopped, defeating the reason
+`each_lazy_keys_iterate_sink` (`src/jq/eval_generic.rs`) exists rather than routing through
+the already-checked, always-walks `fold_lazy_keys_stage`. Pinned by
+[`test_jq_keys_unsorted_demand_aware_raises_on_pulled_malformed_key_1770`](../../../tests/jq_cli_tests.rs)
+and
+[`test_jq_keys_unsorted_demand_aware_still_known_gap_past_what_it_pulled_1770`](../../../tests/jq_cli_tests.rs).
+
 ## `limit`'s own `n` argument is not demand-aware when it is itself a generator
 
 Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention
