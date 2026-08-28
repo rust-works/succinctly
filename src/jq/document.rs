@@ -831,18 +831,20 @@ pub struct DisplayKeyGuard {
 
 impl DisplayKeyGuard {
     /// Checks `key` (with the `is_fallback` flag from
-    /// [`key_display_string_kind`]) against every key already present in
-    /// `map` and every fallback key this guard has already approved.
-    /// Returns `true` when it is safe to insert (a fresh key, or an
-    /// ordinary repeat); `false` when inserting would silently collapse two
-    /// keys that must stay distinct, in which case the caller should raise
-    /// instead.
-    pub(crate) fn check<T>(
-        &mut self,
-        map: &IndexMap<String, T>,
-        key: &str,
-        is_fallback: bool,
-    ) -> bool {
+    /// [`key_display_string_kind`], or an equivalent per-format classifier --
+    /// see `YamlValue::key_string_kind` for YAML's own, #1749) against every
+    /// key already present in `map` and every fallback key this guard has
+    /// already approved. Returns `true` when it is safe to insert (a fresh
+    /// key, or an ordinary repeat); `false` when inserting would silently
+    /// collapse two keys that must stay distinct, in which case the caller
+    /// should raise instead.
+    ///
+    /// `pub`, not `pub(crate)`: `succinctly-cli`'s `yq_runner.rs`
+    /// (`yaml_to_owned_value`, a `YamlCursor`-native materializer that
+    /// doesn't go through the `DocumentValue`/`resolve_display_key` path)
+    /// needs to drive this guard itself with its own `is_fallback`
+    /// classification, same reasoning the struct itself is `pub` for.
+    pub fn check<T>(&mut self, map: &IndexMap<String, T>, key: &str, is_fallback: bool) -> bool {
         let collides = map.contains_key(key)
             && (is_fallback || self.fallback_keys.iter().any(|seen| seen.as_str() == key));
         if !collides && is_fallback {

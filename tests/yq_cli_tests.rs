@@ -1515,6 +1515,74 @@ fn test_input_format_json_bridge_raises_on_colliding_decode_failure_key_1738() -
     Ok(())
 }
 
+/// #1749: `yaml_to_owned_value`'s own `Mapping` arm (`--slurp`/`--eval-all`/
+/// `--inplace`'s DOM fallback) is `YamlCursor`-native, not
+/// `DocumentValue`-generic, so it isn't one of the call sites #1738 fixed --
+/// found while reviewing that PR. Two different complex (non-scalar) keys
+/// both stringify to `""` under yq's own key-display rule (#222); real yq's
+/// streaming output (and succinctly's own, confirmed unaffected by
+/// `test_duplicate_mapping_key_survives_yaml_output`-style checks) just
+/// emits the resulting duplicate key twice, but `OwnedValue::Object`'s
+/// `IndexMap` cannot. Before this fix, `.[0]` here silently returned
+/// `{"": "b"}`, dropping `"a"` with no error at all (exit 0).
+#[test]
+fn test_yaml_native_dom_raises_on_colliding_complex_key_1749() -> Result<()> {
+    let yaml = "? [1,2]\n: a\n? [3,4]\n: b\n";
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--slurp"])?;
+    assert_eq!(code, 1, "--slurp should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--eval-all"])?;
+    assert_eq!(code, 1, "--eval-all should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    // `-P` forces the DOM path the same way an assignment or `--arg` would
+    // -- see the #1738 test above's identical note.
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{yaml}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg("-P")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace -P should raise, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    Ok(())
+}
+
+/// #1749 sibling: an *ordinary* repeated scalar key (neither side complex)
+/// must keep overwriting without complaint through the same DOM path --
+/// only a complex/undecodable key's fallback spelling is refused, matching
+/// #1738's own "ordinary repeat still overwrites" rule for JSON.
+#[test]
+fn test_yaml_native_dom_ordinary_repeated_key_still_overwrites_1749() -> Result<()> {
+    let yaml = "a: 1\na: 2\n";
+
+    let (output, code) = run_yq_stdin(".[0]", yaml, &["--slurp", "-o=json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":2}"#);
+
+    Ok(())
+}
+
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
 /// (`yaml_to_owned_value`) #442 didn't touch, so it kept collapsing
 /// duplicate keys within each slurped element even after plain `yq '.'`
