@@ -15248,7 +15248,8 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // interaction shape is tracked separately as #1779).
     if S::TAG == EvalTag::Yq && terminal.is_none() && rhs_values.len() > 1 {
         let last = rhs_values.pop().expect("len > 1 checked above");
-        rhs_values = vec![last];
+        rhs_values.clear();
+        rhs_values.push(last);
     }
 
     // Resolve computed keys against the *original* document, before any
