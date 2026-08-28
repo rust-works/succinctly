@@ -633,16 +633,20 @@ what Stage 6 is left with is bad escapes only.
   eagerly, strictly materializes upfront), but the crate's public library API
   (`succinctly::jq::eval`/`eval_using`) feeds raw, untrusted bytes straight into
   `JsonIndex::build` and this evaluator, with no re-serialization step and no upstream
-  decode-failure check to have already caught it. #1746 fixed the primary result-value
-  materialization points (`builtin_path`, `eval_assign`, `eval_update`,
-  `yq_assign_noop_check`, `map`/`map_values`, `to_entries`) via a new fallible
+  decode-failure check to have already caught it. #1746 added a new fallible
   `to_owned_checked`/`to_owned_checked_at_depth` sibling, mirroring
-  `eval_generic::to_owned_at_depth`'s already-fixed shape. The plain, infallible
-  `to_owned`/`to_owned_at_depth` remains in place for this file's ~200 other call sites
-  (mostly `QueryResult` collector boilerplate and error-message rendering) — deliberately
-  out of scope for #1746, since changing that function's own signature would force a
-  Result-threading edit at every one of them in a single change; left as a documented
-  follow-up rather than attempted there.
+  `eval_generic::to_owned_at_depth`'s already-fixed shape, and fixed the whole-document
+  read/write family (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
+  `builtin_setpath`, `builtin_del`, `delpaths_one`) plus `map`/`map_values`/`to_entries`.
+  A systematic audit run during that PR's own review found roughly 50 more builtins with
+  the identical shape (a container's own elements/fields materialized straight into a
+  returned `QueryResult::Owned`/`ManyOwned`, uncaught) — `flatten`/`pick`/`omit`/`add`/
+  `sort`/`unique`/`group_by`/`min_by`/`max_by`/`getpath`/`recurse`/`walk`/`tostream`/format
+  functions (`@base64` etc.) among them — filed as #1755 rather than folded into #1746's
+  own PR, which was already a substantial diff closing the originally-reported repro. The
+  plain, infallible `to_owned`/`to_owned_at_depth` remains in place for those sites plus
+  this file's remaining ~150 genuine `QueryResult`-collector-boilerplate/error-message-
+  rendering sites (audited and confirmed safe or out of scope, per #1755's own site list).
 - **Buffering the whole record so the streaming path can reject cleanly.** That would
   reverse P9 (direct YAML-to-JSON streaming, a 2.3× win) for a malformed-input edge case.
 

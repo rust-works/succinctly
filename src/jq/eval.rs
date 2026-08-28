@@ -27087,7 +27087,11 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(EvalError::path_must_be_array())
                 };
             };
-            match set_value_at_path(to_owned(&value), &path, new_val) {
+            let owned = match to_owned_checked(&value) {
+                Ok(owned) => owned,
+                Err(e) => return QueryResult::Error(e),
+            };
+            match set_value_at_path(owned, &path, new_val) {
                 Ok(result) => QueryResult::Owned(result),
                 // An optional context swallows the refusal, as it does for
                 // every other builtin here.
@@ -27832,7 +27836,10 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Convert to owned and delete the path
-    let result = to_owned(&value);
+    let result = match to_owned_checked(&value) {
+        Ok(result) => result,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // `optional` here is `del(...)`'s *own* `?` (`del(.a)?`), i.e. jq's
     // `try del(.a) catch empty` around the whole call — not a per-step
@@ -31635,9 +31642,9 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // array, so only the first entry needs checking: `delpaths([[],[0]])` and
     // `delpaths([[0],[]])` are both `null`.
     let result = match paths.first() {
-        None => Ok(to_owned(value)),
+        None => to_owned_checked(value),
         Some([]) => Ok(OwnedValue::Null),
-        Some(_) => delete_paths_sorted(to_owned(value), &paths, 0),
+        Some(_) => to_owned_checked(value).and_then(|v| delete_paths_sorted(v, &paths, 0)),
     };
     match result {
         Ok(v) => QueryResult::Owned(v),
@@ -56763,6 +56770,108 @@ mod tests {
                 "expected a decode-failure error, got: {e:?}"
             ),
             other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `eval_rhs_once` (the RHS materializer shared by every
+    /// compound/alternative assignment operator: `+=`, `-=`, `*=`, `/=`,
+    /// `%=`, `//=`) still calls the plain, unchecked `to_owned` -- but its
+    /// own corruption is unobservable through either of its two callers
+    /// (`eval_compound_assign`/`eval_alternative_assign`): both always call
+    /// `eval_update` immediately afterward on the *same, unmodified* input,
+    /// and `eval_update`'s own (already-fixed) `to_owned_checked(&input)`
+    /// re-materializes and decode-checks the whole document before the
+    /// (possibly-corrupted) RHS value is ever used. This pins that masking,
+    /// not a fix to `eval_rhs_once` itself -- confirmed by review that no
+    /// jq-constructible input can make `eval_rhs_once`'s own bug
+    /// independently observable, since every string it can navigate to must
+    /// already be part of the same input `eval_update` re-checks.
+    #[test]
+    fn eval_rs_compound_assign_raises_decode_failure_via_eval_update_1746() {
+        let json: &[u8] = br#"{"a":"x","b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a += .b").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `builtin_setpath`, `builtin_del`, and `delpaths_one` are
+    /// three more whole-document read-modify-write entry points in the exact
+    /// same shape as `builtin_path`/`eval_assign`/`eval_update` -- the
+    /// original #1746 issue's own summary line names `del()` among the
+    /// affected operations, so these were always in scope, just missed by
+    /// the first pass's site search (found by review).
+    #[test]
+    fn eval_rs_setpath_del_delpaths_raise_decode_failure_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("setpath([\"a\"]; 5)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "setpath: {e:?}"),
+            other => panic!("setpath: expected a decode-failure error, got: {other:?}"),
+        }
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("del(.a)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "del: {e:?}"),
+            other => panic!("del: expected a decode-failure error, got: {other:?}"),
+        }
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("delpaths([[\"a\"]])").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "delpaths: {e:?}"),
+            other => panic!("delpaths: expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `setpath`/`del`/`delpaths` must still succeed normally
+    /// on clean input -- the added guard must not disturb the ordinary case.
+    #[test]
+    fn eval_rs_setpath_del_delpaths_succeed_on_clean_input_1746() {
+        let json: &[u8] = br#"{"a":1,"b":2}"#;
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("setpath([\"a\"]; 5)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), Some(&OwnedValue::Int(5)));
+            }
+            other => panic!("setpath: unexpected result: {other:?}"),
+        }
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("del(.a)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), None);
+                assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
+            }
+            other => panic!("del: unexpected result: {other:?}"),
+        }
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("delpaths([[\"a\"]])").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Object(m)) => {
+                assert_eq!(m.get("a"), None);
+                assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
+            }
+            other => panic!("delpaths: unexpected result: {other:?}"),
         }
     }
 
