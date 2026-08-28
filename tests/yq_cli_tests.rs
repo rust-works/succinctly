@@ -16313,15 +16313,17 @@ fn test_yq_sub_3arg_invalid_pattern_still_errors_1122() -> Result<()> {
     Ok(())
 }
 
-/// #1122/#1443: a non-string *pattern* still errors -- confirmed this is
-/// a real, pre-existing divergence from real yq (which coerces `1` to
-/// `"1"` and matches literally) shared by the whole regex builtin family
-/// in yq mode, tracked separately as #1443 rather than fixed here. Pinned
-/// as succinctly's current behaviour for this arity-3 path specifically.
+/// #1443 fixed the gap #1122's own comment named: a non-string *pattern*
+/// now coerces to its string form and matches literally in yq mode,
+/// matching real yq v4.53.3 (`sub(1;"X";"g")` on `"a1c"` is `"ac"` --
+/// pattern `1` coerces to `"1"`, then #1122's own already-documented bug
+/// applies: arity-3 `sub` never reads its replacement/flags at all, always
+/// performing a global replace-with-empty-string using only the pattern).
 #[test]
-fn test_yq_sub_3arg_non_string_pattern_errors_1122() -> Result<()> {
-    let (_output, code) = run_yq_stdin(r#"sub(1; "X"; "g")"#, "\"a1c\"\n", &["-o", "json"])?;
-    assert_ne!(code, 0);
+fn test_yq_sub_3arg_non_string_pattern_coerces_1443() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"sub(1; "X"; "g")"#, "\"a1c\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "\"ac\"");
     Ok(())
 }
 
@@ -21709,6 +21711,80 @@ fn test_yq_regex_flag_grammar_jq_mode_unaffected_1426() -> Result<()> {
         run_jq_stdin_with_stderr("test(\"a|aa|aaa\";\"l\")", "\"aaa\"", &["-c"])?;
     assert_eq!(code, 0, "stderr={stderr}");
     assert_eq!(stdout.trim(), "true");
+    Ok(())
+}
+
+/// #1443: yq mode coerces a scalar (non-container) regex pattern argument to
+/// its string form and matches literally, instead of raising -- live-
+/// verified against yq v4.53.3 across `test`/`match`/`capture`/2-arg `sub`/
+/// 3-arg `sub`.
+#[test]
+fn test_yq_regex_pattern_coercion_scalar_1443() -> Result<()> {
+    let (out, code) = run_yq_stdin("test(1)", "a1c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("test(null)", "a1c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "false");
+
+    let (out, code) = run_yq_stdin("test(true)", "atruec", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("test(1.5)", "a1.5c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin("sub(1;\"X\")", "a1c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "\"aXc\"");
+
+    // Real yq's arity-3 `sub` never reads its replacement/flags at all --
+    // an unrelated, already-documented bug (#1122) reproduced bug-for-bug --
+    // so this only confirms the *pattern* coercion composes with it: the
+    // numeric pattern still matches literally before that empty-replace
+    // behavior kicks in.
+    let (out, code) = run_yq_stdin("sub(1;\"X\";\"g\")", "a1c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "\"ac\"");
+
+    Ok(())
+}
+
+/// #1443 known gap: a *container* (array/object) pattern still errors in
+/// succinctly, but real yq doesn't error there either -- live-verified
+/// against v4.53.3: `sub([1];"X";"g")` on `"a1c"` is `"a1c"` unchanged
+/// (no match, no error), and `sub({};"X";"g")` on `"a{}c"` is `"ac"`
+/// (matches literally, same as a scalar pattern). This issue's own repro
+/// was scoped to scalars (numbers); nailing down exactly how real yq
+/// stringifies a container pattern needs more live verification than this
+/// fix attempts -- see the exclusion's own doc comment on
+/// `resolve_regex_args`/`yq_sub_arity3_empty_replace`. Pinned here as
+/// succinctly's current (imperfect) behavior, not real yq's.
+#[test]
+fn test_yq_regex_pattern_coercion_container_known_gap_1443() -> Result<()> {
+    let (out, code) = run_yq_stdin("sub([1];\"X\";\"g\")", "a1c", &["-o", "json"])?;
+    assert_ne!(code, 0, "out={out}");
+
+    let (out, code) = run_yq_stdin("sub({};\"X\";\"g\")", "a1c", &["-o", "json"])?;
+    assert_ne!(code, 0, "out={out}");
+
+    Ok(())
+}
+
+/// #1443 negative control: jq mode is unaffected -- a non-string pattern
+/// still raises the ordinary strict-typing error, matching real jq.
+#[test]
+fn test_jq_regex_pattern_coercion_does_not_apply_1443() -> Result<()> {
+    let (_, stderr, code) = run_jq_stdin_with_stderr("test(1)", "\"a1c\"", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("not a string or array"), "stderr={stderr}");
+
+    let (_, stderr, code) = run_jq_stdin_with_stderr("sub(1;\"X\")", "\"a1c\"", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("is not a string"), "stderr={stderr}");
+
     Ok(())
 }
 
