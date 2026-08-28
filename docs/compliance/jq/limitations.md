@@ -621,20 +621,32 @@ is the opt-in form for callers who want it (exit 3, its own separately-pinned co
 `--slurp`, `--sort-keys`, `--ascii-output`, and any filter shape that costs the value its cursor
 (a comma, an `if`) — because #1247 made the `to_owned`/`cursor_to_owned` family fallible and
 this check rides along with it. Bare `.[]` and the identity printer raise now too (#1641, below).
-One route remains, and it never walks the whole object, so it is not in a position to find the
-malformed member at all:
+
+This is `keys_unsorted`'s **positional** fast paths — `[]`, `[0]`, `[n]`, `first`, `last` — where
+`#1514` and `#1599` deliberately took the whole-object probe *off* the arms that don't otherwise
+need it. #1629 restored the check on every arm that already pays for a walk regardless (`[]`,
+`last`, and a *negative* `[n]`, which has to know the object's length to normalize against) —
+free, since the check rides the walk rather than adding one:
 
 ```
-$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[]'     # 123 then "b", exit 0
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[]'      # exit 5 now (was: 123 then "b", exit 0)
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted | last' # exit 5 now (was: "b",           exit 0)
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[-1]'    # exit 5 now (was: "b",           exit 0)
 ```
 
-This is `keys_unsorted`'s **positional** fast paths — `[]`, `[0]`, `[n]`, `first`, `last`.
-`#1514` and `#1599` deliberately took the whole-object probe *off* these arms: `first` and `[0]`
-answer from one `uncons_key` because collapsing keeps every key at its first position, so the
-answer holds whatever the rest of the object turns out to be. Restoring a #1194 check means
-restoring exactly the walk those two issues removed, which is why it is tracked separately
-(#1629) rather than fixed here. `keys_unsorted | length` is *not* in this set — it reaches
-`effective_len`, which walks, and so carries the check for free.
+**Still not fixed, and deliberately so: `first`, `[0]`, and a *positive* `[n]`.** These three
+answer from one `uncons_key`/a short early-exit walk (collapsing keeps every key at its first
+position, so a small positive index never needs to look past it) — restoring the check here means
+restoring exactly the walk #1514/#1599 removed, on the one arm shape built to avoid it entirely:
+
+```
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[0]'      # 123, exit 0 -- unfixed
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted | first' # 123, exit 0 -- unfixed
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[1]'      # "b",  exit 0 -- unfixed
+```
+
+`keys_unsorted | length` is not in this set at all — it reaches `effective_len`, which walks, and
+so has carried the check for free since #1628.
 
 Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
 and finds a non-string key once its `[` is already out, so a **truncated** array can reach

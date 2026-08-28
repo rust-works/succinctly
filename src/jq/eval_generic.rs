@@ -828,16 +828,34 @@ fn materialize_lazy_keys<V: DocumentValue>(
 }
 
 /// An object's key cursors in document order, with a repeated key dropped
-/// after its first occurrence when the mode collapses (#1514).
+/// after its first occurrence when the mode collapses (#1514), refusing an
+/// object whose members the format's grammar never allowed (#1194, #1629).
 ///
 /// Materializes what [`DistinctKeyCursors`] streams. `.[]` over a key array
 /// has to hand back every cursor at once, but the dedup still happens during
 /// the single walk that collects them -- where before, the caller ran a
 /// whole separate `document::census` and then walked again to build this.
-fn distinct_key_cursors<V: DocumentValue>(fields: &V::Fields, collapse: bool) -> Vec<V::Cursor> {
-    DistinctKeyCursors::new(fields, collapse)
-        .map(|(_, cursor)| cursor)
-        .collect()
+/// The #1194 check rides along in that same walk, the same way
+/// [`effective_keys`] already checks during its own single
+/// [`DistinctKeyCursors`] walk -- one pass, not a second one bolted on top,
+/// which on a wide object would double the walk this arm already pays for
+/// (the exact mistake #1678's own perf-guard catch was about).
+fn distinct_key_cursors_checked<V: DocumentValue>(
+    fields: &V::Fields,
+    collapse: bool,
+) -> Result<Vec<V::Cursor>, EvalError> {
+    let mut out = Vec::new();
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (key, cursor) in cursors.by_ref() {
+        if key_is_malformed(&key) {
+            return Err(fields.malformed_member_error());
+        }
+        out.push(cursor);
+    }
+    if cursors.ended_unpaired() {
+        return Err(fields.malformed_member_error());
+    }
+    Ok(out)
 }
 
 /// Materialize a `GenericResult::LazyIndexRange` fallback: build the
@@ -3056,14 +3074,15 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // the `if !sorted` guard on a new arm here without
         // re-deriving why document order would still be a
         // correct answer.
-        Expr::Iterate if !sorted => {
-            let cursors = distinct_key_cursors::<V>(&fields, collapse);
-            if cursors.is_empty() {
-                GenericResult::None
-            } else {
-                GenericResult::ManyCursor(cursors)
-            }
-        }
+        // #1629: unlike `first`/`.[0]` below, this arm already walks the
+        // whole object to collect every cursor, so the #1194 check
+        // (`distinct_key_cursors_checked`) rides along for free -- same
+        // reasoning as `Builtin::Length`'s arm above.
+        Expr::Iterate if !sorted => match distinct_key_cursors_checked::<V>(&fields, collapse) {
+            Ok(cursors) if cursors.is_empty() => GenericResult::None,
+            Ok(cursors) => GenericResult::ManyCursor(cursors),
+            Err(err) => GenericResult::Error(err),
+        },
         // `.[0]` is `first` by another spelling, so it takes
         // the `Builtin::First` arm's reasoning below rather
         // than the general positional one: collapsing keeps a
@@ -3080,58 +3099,59 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 None => GenericResult::Owned(OwnedValue::Null),
             }
         }
+        // #1629: a negative index always has to walk the whole object
+        // anyway (to normalize against its length), so the #1194 check
+        // (`effective_fields_checked`, in place of the unchecked
+        // `collapsed_fields_if`/`fields.len()` pair) rides along for free
+        // -- same reasoning as `Expr::Iterate` above. This mirrors real
+        // jq's own rule: it can't even *parse* an object with a malformed
+        // member, so every access into it raises, not just the ones that
+        // happen to touch the bad member (verified live against pinned jq
+        // 1.7.1: `{"a":1,"b":2,123:3} | keys_unsorted[0]` raises the same
+        // parse error as `keys_unsorted[2]` would).
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted && *idx < 0 => {
+            match effective_fields_checked(&fields, collapse) {
+                Ok(eff) => {
+                    let target = usize::try_from(eff.len() as i64 + idx).ok();
+                    match target.and_then(|t| eff.into_iter().nth(t)) {
+                        Some(field) => GenericResult::OneCursor(field.key_cursor),
+                        None => GenericResult::Owned(OwnedValue::Null),
+                    }
+                }
+                Err(err) => GenericResult::Error(err),
+            }
+        }
+        // A *positive* index, unlike the negative arm above, does not
+        // otherwise need to know the whole object -- it walks only as far
+        // as the target position (or, when collapsed, the free probe
+        // `collapsed_fields_if` already runs). Adding the #1194 check here
+        // would mean walking the rest of the object purely to validate it,
+        // undoing exactly the early-exit #1514/#1599 built. Left
+        // unchecked, same as `Builtin::First`/`.[0]` below -- see #1629's
+        // own accounting of this tradeoff (its "Option 1") and
+        // `docs/compliance/jq/limitations.md`.
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
-            // Positional: a collapsed object has fewer
-            // members, so `.[n]` lands elsewhere. This is one
-            // of the two arms that still has to know the
-            // whole answer before it can pick an element.
-            //
-            // Negative indices need the length to normalize
-            // against, same as `Expr::Index`'s array arm
-            // above; positive indices skip straight to the
-            // walk. Out-of-bounds is `null`, never an error
-            // (#307), matching that same arm.
             let collapsed = collapsed_fields_if(&fields, collapse);
             if let Some(eff) = collapsed {
-                let target = if *idx < 0 {
-                    usize::try_from(eff.len() as i64 + idx).ok()
-                } else {
-                    Some(*idx as usize)
-                };
-                match target.and_then(|t| eff.into_iter().nth(t)) {
+                match eff.into_iter().nth(*idx as usize) {
                     Some(field) => GenericResult::OneCursor(field.key_cursor),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             } else {
-                let target = if *idx < 0 {
-                    let len = fields.len();
-                    let normalized = len as i64 + idx;
-                    if normalized < 0 {
-                        None
-                    } else {
-                        Some(normalized as usize)
+                let target = *idx as usize;
+                let mut current = fields;
+                let mut found = None;
+                let mut i = 0usize;
+                while let Some((field, rest)) = current.uncons() {
+                    if i == target {
+                        found = Some(field.key_cursor);
+                        break;
                     }
-                } else {
-                    Some(*idx as usize)
-                };
-                match target {
-                    Some(target) => {
-                        let mut current = fields;
-                        let mut found = None;
-                        let mut i = 0usize;
-                        while let Some((field, rest)) = current.uncons() {
-                            if i == target {
-                                found = Some(field.key_cursor);
-                                break;
-                            }
-                            current = rest;
-                            i += 1;
-                        }
-                        match found {
-                            Some(c) => GenericResult::OneCursor(c),
-                            None => GenericResult::Owned(OwnedValue::Null),
-                        }
-                    }
+                    current = rest;
+                    i += 1;
+                }
+                match found {
+                    Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
             }
@@ -3139,6 +3159,12 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // No probe: collapsing keeps every key at its *first*
         // position, and the first field is nobody's repeat, so
         // it survives whatever the rest of the object does.
+        //
+        // #1629: deliberately still unchecked, same reasoning as the
+        // positive-index arm above -- this is the one arm that exists to
+        // be genuinely O(1) (#1514/#1599), and a #1194 check would cost
+        // strictly more than the answer itself. See
+        // `docs/compliance/jq/limitations.md`.
         Expr::Builtin(Builtin::First) if !sorted => match fields.uncons() {
             Some((field, _)) => GenericResult::OneCursor(field.key_cursor),
             None => GenericResult::Owned(OwnedValue::Null),
@@ -3146,6 +3172,11 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // The other positional arm: the last field *is*
         // droppable — if its key repeats an earlier one it
         // collapses away and some other field ends up last.
+        //
+        // #1629: unlike `First`/`.[0]` above, *both* branches here already
+        // walk the whole object (there is no way to find "the last field"
+        // without reaching the end), so the #1194 check rides along for
+        // free either way.
         Expr::Builtin(Builtin::Last) if !sorted => {
             let collapsed = collapsed_fields_if(&fields, collapse);
             if let Some(eff) = collapsed {
@@ -3157,8 +3188,14 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 let mut current = fields;
                 let mut last_cursor = None;
                 while let Some((field, rest)) = current.uncons() {
+                    if key_is_malformed(&field.key) {
+                        return GenericResult::Error(current.malformed_member_error());
+                    }
                     last_cursor = Some(field.key_cursor);
                     current = rest;
+                }
+                if current.ends_unpaired() {
+                    return GenericResult::Error(current.malformed_member_error());
                 }
                 match last_cursor {
                     Some(c) => GenericResult::OneCursor(c),
@@ -3441,9 +3478,10 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// Neither is needed here. "First occurrence wins" is an *online* rule, so
 /// the dedup rides along with the walk instead of preceding it -- exactly
 /// what `fold_lazy_keys_stage`'s own `Expr::Iterate` arm switched to in
-/// #1514, via the `distinct_key_cursors` wrapper. That arm has to hand back
-/// every cursor at once to build a `ManyCursor`, so it collects; this one
-/// drives elements one at a time and can consume the iterator directly.
+/// #1514, via the `distinct_key_cursors_checked` wrapper. That arm has to
+/// hand back every cursor at once to build a `ManyCursor`, so it collects;
+/// this one drives elements one at a time and can consume the iterator
+/// directly.
 ///
 /// **The early exit is not unconditional.** It holds until a repeated key
 /// is *reached*: at that point `DistinctKeyCursors` calls
