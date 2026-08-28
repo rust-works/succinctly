@@ -12,7 +12,9 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES};
+use cargo_run_exit::{
+    cargo_run_features, classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES,
+};
 
 /// Maximum retries for spawning the pre-built binary directly.
 ///
@@ -136,7 +138,7 @@ fn run_jq_stdin_streams(
                 "run",
                 "--quiet",
                 "--features",
-                "cli",
+                cargo_run_features(),
                 "--bin",
                 "succinctly",
                 "--",
@@ -233,7 +235,7 @@ fn run_jq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(St
                 "run",
                 "--quiet",
                 "--features",
-                "cli",
+                cargo_run_features(),
                 "--bin",
                 "succinctly",
                 "--",
@@ -266,7 +268,7 @@ fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
                 "run",
                 "--quiet",
                 "--features",
-                "cli",
+                cargo_run_features(),
                 "--bin",
                 "succinctly",
                 "--",
@@ -408,7 +410,7 @@ fn test_unary_minus() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -437,7 +439,7 @@ fn test_unary_minus_expression() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -466,7 +468,7 @@ fn test_double_negation() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -561,7 +563,7 @@ fn test_slurp_with_raw_input_multiple_files() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -1298,7 +1300,7 @@ fn test_from_file() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -1534,7 +1536,7 @@ fn test_multiple_file_inputs() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -1606,7 +1608,7 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -1651,7 +1653,7 @@ fn jq_stderr(filter: &str, input: &str, extra_args: &[&str]) -> Result<String> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -1872,7 +1874,7 @@ fn test_contains_type_mismatch_errors() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -2387,7 +2389,7 @@ fn test_default_identity_filter() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -2415,7 +2417,7 @@ fn test_jq_help() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3486,7 +3488,7 @@ fn test_args_positional() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3511,7 +3513,7 @@ fn test_jsonargs_positional() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3537,7 +3539,7 @@ fn test_args_named() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3567,7 +3569,7 @@ fn test_args_combined() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3602,7 +3604,7 @@ fn test_no_color_env_var() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3638,7 +3640,7 @@ fn test_jq_colors_env_var() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3667,7 +3669,7 @@ fn test_color_output_overrides_no_color() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3696,7 +3698,7 @@ fn test_monochrome_overrides_jq_colors() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3726,7 +3728,7 @@ fn test_jq_colors_invalid_spec_warns_and_uses_defaults() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3774,7 +3776,7 @@ fn test_build_configuration_flag() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3810,7 +3812,7 @@ fn test_include_directive() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3847,7 +3849,7 @@ fn test_import_directive() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3879,7 +3881,7 @@ fn test_library_path_option() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3909,7 +3911,7 @@ fn test_jq_library_path_env() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3940,7 +3942,7 @@ fn test_module_not_found_error() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -3969,7 +3971,7 @@ fn test_namespaced_call_parse() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -4004,7 +4006,7 @@ fn test_home_jq_file_autoload() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -4048,7 +4050,7 @@ fn test_home_jq_dir_search_path() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -4084,7 +4086,7 @@ fn test_import_with_namespace() -> Result<()> {
         .args([
             "run",
             "--features",
-            "cli",
+            cargo_run_features(),
             "--bin",
             "succinctly",
             "--",
@@ -4205,7 +4207,7 @@ fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Resul
                 "run",
                 "--quiet",
                 "--features",
-                "cli",
+                cargo_run_features(),
                 "--bin",
                 "succinctly",
                 "--",

@@ -26,7 +26,7 @@ use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, MAX_CARGO_RETRIES};
+use cargo_run_exit::{cargo_run_features, classify_cargo_run_exit, MAX_CARGO_RETRIES};
 
 /// Run `succinctly <args>` with `stdin` piped in, returning captured stdout.
 ///
@@ -36,7 +36,14 @@ use cargo_run_exit::{classify_cargo_run_exit, MAX_CARGO_RETRIES};
 fn run(args: &[&str], stdin: &str) -> Result<String> {
     for attempt in 0..MAX_CARGO_RETRIES {
         let mut cmd = Command::new("cargo")
-            .args(["run", "--features", "cli", "--bin", "succinctly", "--"])
+            .args([
+                "run",
+                "--features",
+                cargo_run_features(),
+                "--bin",
+                "succinctly",
+                "--",
+            ])
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -12,7 +12,9 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, exit_code_or_signal_death, MAX_CARGO_RETRIES};
+use cargo_run_exit::{
+    cargo_run_features, classify_cargo_run_exit, exit_code_or_signal_death, MAX_CARGO_RETRIES,
+};
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -380,7 +382,7 @@ fn run_json_validate_via_cargo(files: &[&std::path::Path]) -> Result<i32> {
             .args([
                 "run",
                 "--features",
-                "cli",
+                cargo_run_features(),
                 "--bin",
                 "succinctly",
                 "--",
