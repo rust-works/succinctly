@@ -138,6 +138,13 @@ def machine_warnings():
             idle = float(idle_samples[-1])
             if idle < 75.0:
                 warnings.append(f"{100.0 - idle:.0f}% CPU busy (instantaneous, `top -l 2`)")
+        else:
+            # `top`'s output format could drift, or the command could fail outright
+            # (run_text swallows both to "") -- surface that as a warning rather than
+            # silently skipping the CPU check, which would read a genuinely busy
+            # machine as idle with no indication why the check found nothing.
+            warnings.append("could not read instantaneous CPU usage from `top -l 2 -n 0` "
+                            "-- the CPU-idleness check did not run")
     else:
         load1 = os.getloadavg()[0]
         if load1 > 1.0:
