@@ -721,13 +721,29 @@ fn ascii_key_hash(key: &[u8]) -> Option<u64> {
     ascii.then_some(hash)
 }
 
-/// The hash a field's key compares under, or `None` when the key does not
-/// stringify at all (a YAML alias or complex key, or a JSON escape that
-/// will not decode).
+/// The hash a field's key compares under, or `None` when the key has no
+/// reliable identity: a JSON escape that will not decode, or -- since
+/// #1678 -- a YAML scalar key with the same problem.
 ///
-/// Prefers the raw span (see [`ascii_key_hash`]) and falls back to the
-/// decoded key, which is what every exact resolution downstream uses.
+/// Must check [`DocumentValue::string_decode_error`] first, not
+/// [`key_string`](DocumentValue::key_string): YAML's `key_string()`
+/// override never returns `None` at all (#222 -- a complex or undecodable
+/// key stringifies to `""` rather than being dropped), so a YAML
+/// decode-failure key would otherwise hash its `""` fallback like a real
+/// key and silently collapse with any other undecodable key in the same
+/// object under `collapse: true` (#1385's "never a duplicate" rule exists
+/// precisely to prevent that). JSON's two checks are redundant with each
+/// other (both resolve via `as_str`), so this changes nothing there --
+/// same mirroring [`key_display_string_kind`] already does for the
+/// display-string case.
+///
+/// Otherwise prefers the raw span (see [`ascii_key_hash`]) and falls back
+/// to the decoded key, which is what every exact resolution downstream
+/// uses.
 fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
+    if key.string_decode_error().is_some() {
+        return None;
+    }
     if let Some(raw) = key.key_raw_unescaped() {
         if let Some(hash) = ascii_key_hash(raw) {
             return Some(hash);
@@ -1916,7 +1932,8 @@ mod checked_len_tests {
 #[cfg(test)]
 mod key_display_string_tests {
     use super::{
-        effective_keys, key_display_string, key_is_malformed, DocumentFields, DocumentValue,
+        effective_keys, effective_len_checked, key_display_string, key_is_malformed,
+        DocumentFields, DocumentValue,
     };
     use crate::json::JsonIndex;
 
@@ -1993,6 +2010,29 @@ mod key_display_string_tests {
             effective_keys(&fields, false).expect("well formed"),
             vec!["a".to_string(), "a".to_string(), "b".to_string()]
         );
+    }
+
+    /// YAML counterpart of [`effective_keys_never_collapses_colliding_decode_failures_1642`]
+    /// -- #1678. Unlike JSON, `YamlValue::key_string()` never returns `None`
+    /// at all (#222), so before `key_hash_of` learned to check
+    /// `string_decode_error()` first, two different undecodable YAML keys
+    /// hashed the same `""` fallback and silently collapsed into one,
+    /// violating #1385's "never a duplicate" rule on this format too.
+    #[test]
+    fn effective_keys_never_collapses_colliding_yaml_decode_failures_1678() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"\"a\\qb\": 1\n\"a\\zc\": 2\n";
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let fields = mapping_cursor.value().as_object().expect("a mapping");
+
+        assert_eq!(effective_len_checked(&fields, true).ok(), Some(2));
+        let keys = effective_keys(&fields, true).expect("no genuine #1194 fault");
+        assert_eq!(keys, vec![String::new(), String::new()]);
     }
 
     /// `DocumentFields::keys()`'s per-field raise for a key the format's
