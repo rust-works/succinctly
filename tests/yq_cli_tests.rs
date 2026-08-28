@@ -1568,6 +1568,42 @@ fn test_yaml_native_dom_raises_on_colliding_complex_key_1749() -> Result<()> {
     Ok(())
 }
 
+/// #1749 sibling: a *decode-failure* string key (an invalid escape, falling
+/// back to `""` the same way a complex key does) colliding with another key
+/// of the same fallback spelling raises too -- `YamlValue::key_string_kind`'s
+/// `String`/decode-failure branch, not just its complex-key branches.
+#[test]
+fn test_yaml_native_dom_raises_on_colliding_decode_failure_key_1749() -> Result<()> {
+    let yaml = "\"a\\qb\": 1\n\"a\\zc\": 2\n";
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--slurp"])?;
+    assert_eq!(code, 1, "--slurp should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    Ok(())
+}
+
+/// #1749 sibling: an *alias* key whose target is itself a decode-failure
+/// string colliding with a direct decode-failure key -- `key_string_kind`'s
+/// `Alias`-to-`String` branch specifically, not the direct `String` branch
+/// the test above covers.
+#[test]
+fn test_yaml_native_dom_raises_on_colliding_alias_to_decode_failure_key_1749() -> Result<()> {
+    let yaml = "&x \"a\\qb\": 1\n*x: 2\n";
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--slurp"])?;
+    assert_eq!(code, 1, "--slurp should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1749 sibling: an *ordinary* repeated scalar key (neither side complex)
 /// must keep overwriting without complaint through the same DOM path --
 /// only a complex/undecodable key's fallback spelling is refused, matching
