@@ -27,7 +27,7 @@ use succinctly::json::JsonIndex;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
+    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts, Terminator,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -3595,13 +3595,13 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     Ok(())
 }
 
-/// Write the appropriate line terminator based on config.
+/// Write the appropriate line terminator based on config. The NUL/newline/
+/// join three-way choice itself is shared with yq_runner.rs's own
+/// `terminator_from_config` via `output::Terminator` (#1711) -- jq mode's
+/// own `--unbuffered` flush has no yq-mode equivalent at this call site,
+/// so it stays local rather than folding into the shared type.
 fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> {
-    if config.raw_output0 {
-        out.write_all(&[0])?; // NUL byte
-    } else if !config.join_output {
-        out.write_all(b"\n")?;
-    }
+    Terminator::new(config.raw_output0, config.join_output).write_io(out)?;
     if config.unbuffered {
         out.flush()?;
     }
