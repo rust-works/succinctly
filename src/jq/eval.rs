@@ -6961,27 +6961,30 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
     pattern_owned: OwnedValue,
     edge: StringEdge,
 ) -> QueryResult<'a, W> {
-    // `to_owned` stays inside the closure rather than being hoisted -- it is
-    // only reached on these two cold paths, so hoisting would pay for a
-    // whole-document copy on the hot one.
+    // `to_owned` stays inside this function rather than being hoisted into
+    // its caller -- it is only reached on these two cold paths, so hoisting
+    // would pay for a whole-document copy on the hot one.
     let OwnedValue::String(pattern) = pattern_owned else {
         return QueryResult::Owned(to_owned(value));
     };
     let result = match value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => {
-                let matched = match edge {
-                    StringEdge::Prefix => cow.starts_with(&pattern),
-                    StringEdge::Suffix => cow.ends_with(&pattern),
-                };
-                if matched {
-                    let trimmed = match edge {
-                        StringEdge::Prefix => &cow[pattern.len()..],
-                        StringEdge::Suffix => &cow[..cow.len() - pattern.len()],
-                    };
-                    OwnedValue::String(trimmed.to_string())
-                } else {
-                    OwnedValue::String(cow.into_owned())
+                // Slicing is only ever reached once `matched` is confirmed
+                // true -- `pattern.len() <= cow.len()` follows from
+                // `starts_with`/`ends_with` succeeding, which is what makes
+                // the slice sound. Computing the slice unconditionally
+                // (matched or not) would let a pattern longer than `cow`
+                // panic on the subtraction, so the two stay in one `match`
+                // per edge rather than being split into an eager pair.
+                match edge {
+                    StringEdge::Prefix if cow.starts_with(&pattern) => {
+                        OwnedValue::String(cow[pattern.len()..].to_string())
+                    }
+                    StringEdge::Suffix if cow.ends_with(&pattern) => {
+                        OwnedValue::String(cow[..cow.len() - pattern.len()].to_string())
+                    }
+                    StringEdge::Prefix | StringEdge::Suffix => OwnedValue::String(cow.into_owned()),
                 }
             }
             // #1620/#1660: an undecodable string must raise, not silently
@@ -10748,9 +10751,14 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::Null)
             }
             // Unlike `First`, this has to walk the whole array before it
-            // knows the answer -- collected into a `Vec` first (rather than
-            // e.g. `DoubleEndedIterator::rev`) because `DocumentElements`'s
-            // cursor walk is forward-only, same as `First`/`All` above.
+            // knows the answer. Carried over verbatim from the pre-merge
+            // `rindex_with_pattern` (#1538 is a pure consolidation, not a
+            // perf change): collects into a `Vec` and walks it in reverse,
+            // which costs an O(n) allocation + element clones a plain
+            // forward pass with a running "last match" accumulator would
+            // avoid -- `DocumentElements`'s cursor being forward-only rules
+            // out `DoubleEndedIterator::rev` directly, but does not require
+            // collecting first. Left as-is here; tracked as a follow-up.
             SearchOccurrence::Last => {
                 let items: Vec<_> = (*elements).collect();
                 for (i, elem) in items.iter().enumerate().rev() {
