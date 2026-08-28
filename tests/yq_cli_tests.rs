@@ -3441,6 +3441,93 @@ fn test_join_output_multidoc_does_not_corrupt_documents_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1708: `-0`/`--join-output` combined with `-C` (color) on the M2 fast
+/// path's evaluated (non-identity) branch embedded the terminator byte
+/// *inside* the ANSI color span, before the trailing reset code --
+/// `colorize_yaml`'s per-token spans weren't self-closing, so the
+/// terminator (baked into the same buffer that gets colorized as a whole)
+/// ended up sandwiched before the function's one unconditional trailing
+/// reset. The reset must come before the terminator, matching the identity
+/// branch and the DOM path, both already correct.
+#[test]
+fn test_color_terminator_ordering_evaluated_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    let reset_pos = output.find("\x1b[0m").expect("expected a reset code");
+    let terminator_pos = output.find('\0').expect("expected a NUL terminator");
+    assert!(
+        reset_pos < terminator_pos,
+        "reset must precede the terminator, got: {output:?}"
+    );
+    Ok(())
+}
+
+/// #1708: the identity branch already placed the terminator correctly --
+/// pinned here as a regression guard, since this fix's own sentinel-marker
+/// mechanism is only wired into the evaluated branch's terminator write.
+#[test]
+fn test_color_terminator_ordering_identity_unaffected_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: 1\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    let reset_pos = output.rfind("\x1b[0m").expect("expected a reset code");
+    let terminator_pos = output.find('\0').expect("expected a NUL terminator");
+    assert!(
+        reset_pos < terminator_pos,
+        "reset must precede the terminator, got: {output:?}"
+    );
+    Ok(())
+}
+
+/// #1708: `-o=json` never had this bug -- `colorize_json`'s per-token spans
+/// already self-close immediately, unlike `colorize_yaml`'s. Pinned as a
+/// regression guard for the (deliberately unmodified) JSON output path.
+#[test]
+fn test_color_terminator_ordering_json_output_unaffected_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-o=json", "-C", "-0"])?;
+    assert_eq!(code, 0);
+    let reset_pos = output.find("\x1b[0m").expect("expected a reset code");
+    let terminator_pos = output.find('\0').expect("expected a NUL terminator");
+    assert!(
+        reset_pos < terminator_pos,
+        "reset must precede the terminator, got: {output:?}"
+    );
+    Ok(())
+}
+
+/// #1708: a multi-result evaluated stream must place *every* terminator
+/// correctly, not just the last one -- each result's own color span must
+/// close before its own terminator, not leak into the next result's span
+/// (or get caught by the one trailing reset at the very end of the whole
+/// buffer). This shape was never even attempted by #1701's own terminator
+/// centralization (see this issue's "Why not fixed in #1701's own PR").
+#[test]
+fn test_color_terminator_ordering_multi_result_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a[]", "a: [1, 2]\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
+    assert_eq!(
+        terminator_positions.len(),
+        2,
+        "expected two NUL terminators, got: {output:?}"
+    );
+    // Every reset code that precedes a given terminator must actually be
+    // the one guarding *that* terminator's own result -- checked here by
+    // confirming a reset immediately precedes each terminator with no
+    // other terminator in between.
+    let mut search_from = 0;
+    for &term_pos in &terminator_positions {
+        let reset_pos = output[search_from..term_pos]
+            .rfind("\x1b[0m")
+            .map(|p| p + search_from);
+        assert!(
+            reset_pos.is_some_and(|p| p < term_pos),
+            "expected a reset code immediately before terminator at {term_pos}, got: {output:?}"
+        );
+        search_from = term_pos + 1;
+    }
+    Ok(())
+}
+
 /// Same fix, `-0`/`--nul-output` (#1701 code review). Unlike `--join-output`
 /// above, `-0`'s own glued-`---` case was confirmed byte-identical to real
 /// yq's own multi-doc `-0` output -- but real yq can't reparse that output
