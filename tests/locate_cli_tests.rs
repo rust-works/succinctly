@@ -126,3 +126,25 @@ fn jq_locate_leading_dot_number_byte_range_is_exact() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1627: `yq`/`yq --validate`/`at_offset` all reject an encoding-invalid
+/// document at the input boundary (#1391/#1242), but `yq-locate` -- a
+/// diagnostic tool for "what's at byte N", most useful on exactly the file a
+/// parser just rejected -- deliberately keeps answering instead, warning to
+/// stderr rather than silently disagreeing with the rest of the yq surface.
+#[test]
+fn yq_locate_warns_but_still_answers_on_invalid_utf8() -> Result<()> {
+    let mut fixture = tempfile::NamedTempFile::new().expect("create temp fixture");
+    std::io::Write::write_all(&mut fixture, b"a: 1\nb: \"x\xe4y\"\n").expect("write fixture");
+    let path = fixture.path().to_str().expect("utf8 path");
+
+    let (stdout, stderr, code) = run(&["yq-locate", path, "--offset", "9"])?;
+
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, ".[0].b");
+    assert!(
+        stderr.contains("not valid UTF-8"),
+        "expected a UTF-8 warning on stderr, got: {stderr}"
+    );
+    Ok(())
+}

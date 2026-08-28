@@ -784,6 +784,12 @@ succinctly yq-locate config.yaml --offset 42 --format json
 # Output: {"expression":".users[0].name","type":"string","start":38,"end":52}
 ```
 
+Unlike `succinctly yq`/`yq --validate`/`at_offset`, which all reject a YAML document
+containing invalid UTF-8 at the input boundary, `yq-locate` deliberately keeps answering on
+one: warns to stderr and continues, rather than refusing outright. Asking "what's at byte
+N" of a file a parser just rejected is the normal case for a diagnostic tool, not an edge
+case (#1627).
+
 ---
 
 ## Environment Variables
