@@ -213,6 +213,29 @@ Per #531's timeline, a content-identical amend + force-push and a
 close/reopen did *not* revive triggering, but a real rebase (new commit
 SHAs) did — if you hit this, a rebase is a known workaround.
 
+### Keeping a stacked PR bisectable
+
+CI builds a PR's head commit and the merge queue's replay result — not each
+commit in a multi-commit PR individually. A PR that only compiles once every
+commit is applied, but not partway through the stack, merges cleanly and
+passes every check, yet leaves a broken commit sitting on `main` (#1626: an
+intermediate commit left two CLI call sites unadapted after a signature
+change; the very next commit in the same PR fixed them as an aside, so
+nothing outside that PR ever saw the gap). `git bisect` across that range
+then fails to build instead of answering, at exactly the moment a stray
+build error is most expensive — the natural reading is "the bug is here."
+
+Before pushing a stacked series, check that every commit in it builds on its
+own:
+
+```bash
+git rebase --exec 'cargo check --features cli' -i <base>
+```
+
+This is cheap (`cargo check` doesn't produce a binary) and catches the class
+of gap #1626 found before it reaches `main`, rather than leaving it for a
+future bisector to notice and `git bisect skip` past.
+
 ## Architecture Guidelines
 
 ### Memory Layout
