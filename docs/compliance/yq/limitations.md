@@ -786,6 +786,35 @@ another key of the same name and cannot be represented
 An *ordinary* repeated key (no decode failure on either side) is unaffected and still
 collapses to its last value, matching yq's normal duplicate-key handling.
 
+**`--slurp`/`--eval-all`/`--inplace`'s own DOM fallback catches a second, wider trigger
+the paragraph above's routes do not, as of
+[#1749](https://github.com/rust-works/succinctly/issues/1749).** Those three flags
+materialize through a separate, `YamlCursor`-native conversion
+(`yaml_to_owned_value` in
+[src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs)), not the
+`DocumentValue`-generic path `--arg`/`-P`/`.,.,` use. It reuses the same
+`DisplayKeyGuard`/`colliding_display_key_error` machinery, but drives it with its own
+`YamlValue::key_string_kind` classification, which also flags a **complex** key
+(mapping, sequence, `null`, or a non-scalar/dangling alias -- not just a decode-failure
+string) as a fallback spelling. Real yq keeps both entries in this case too (its
+underlying representation isn't a plain map); succinctly's `OwnedValue::Object`
+structurally cannot, so this raises rather than silently discarding one:
+
+```console
+$ printf '? [1,2]\n: a\n? [3,4]\n: b\n' | succinctly yq --slurp '.[0]'
+Error: object key "" is ambiguous: an undecodable key's display form collides with
+another key of the same name and cannot be represented
+```
+
+**This wider trigger is currently `--slurp`/`--eval-all`/`--inplace`-only.** The
+`--arg`/`-P` route's own `key_display_string_kind` (JSON-oriented, shared across every
+`DocumentValue` implementor) does not yet recognize a YAML complex key as fallback --
+only a decode-failure string key, same as the paragraph above -- so the identical input
+through `--arg`/`-P` still silently drops one entry rather than raising. Tracked as
+[#1753](https://github.com/rust-works/succinctly/issues/1753), along with a related gap
+in the `load()` builtin's own separate YAML-mapping conversion, which has no collision
+guard at all.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

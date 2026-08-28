@@ -1515,6 +1515,42 @@ fn test_input_format_json_bridge_raises_on_colliding_decode_failure_key_1738() -
     Ok(())
 }
 
+/// #1749 sibling: `DisplayKeyGuard::check`'s own contract is "a fallback
+/// spelling on *either side* of the collision is refused" (`document.rs`'s
+/// own doc comment) -- not just fallback-vs-fallback. Pins both orders: a
+/// genuine `""` key followed by a complex key that also stringifies to
+/// `""`, and the reverse.
+#[test]
+fn test_yaml_native_dom_raises_on_genuine_then_fallback_empty_key_1749() -> Result<()> {
+    for yaml in ["\"\": 1\n? [1,2]\n: 2\n", "? [1,2]\n: 1\n\"\": 2\n"] {
+        let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--slurp"])?;
+        assert_eq!(code, 1, "{yaml:?} should raise, stderr: {stderr}");
+        assert!(
+            stderr.contains("ambiguous"),
+            "{yaml:?}: expected an 'ambiguous' error, got: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1749 sibling: three (not just two) colliding complex keys -- pins that
+/// the guard fires at the second occurrence regardless of how many more
+/// would have followed, not just "eventually, somehow" for exactly two.
+#[test]
+fn test_yaml_native_dom_raises_on_three_colliding_complex_keys_1749() -> Result<()> {
+    let yaml = "? [1,2]\n: a\n? [3,4]\n: b\n? [5,6]\n: c\n";
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(".[0]", yaml, &["--slurp"])?;
+    assert_eq!(code, 1, "should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected an 'ambiguous' error, got: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1749: `yaml_to_owned_value`'s own `Mapping` arm (`--slurp`/`--eval-all`/
 /// `--inplace`'s DOM fallback) is `YamlCursor`-native, not
 /// `DocumentValue`-generic, so it isn't one of the call sites #1738 fixed --

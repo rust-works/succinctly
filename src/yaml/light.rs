@@ -6171,25 +6171,28 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
     /// (which is `false` here) or an ordinary non-empty key (also `false`).
     pub fn key_string_kind(&self) -> (Cow<'a, str>, bool) {
         match self {
-            YamlValue::String(s) => match s.as_str() {
-                Ok(text) => (text, false),
-                Err(_) => (Cow::Borrowed(""), true),
-            },
+            YamlValue::String(s) => string_key_kind(s),
             YamlValue::Alias {
                 target: Some(target),
                 ..
-            } => {
-                if let YamlValue::String(s) = target.value() {
-                    match s.as_str() {
-                        Ok(text) => (text, false),
-                        Err(_) => (Cow::Borrowed(""), true),
-                    }
-                } else {
-                    (Cow::Borrowed(""), true)
-                }
-            }
+            } => match target.value() {
+                YamlValue::String(s) => string_key_kind(&s),
+                _ => (Cow::Borrowed(""), true),
+            },
             _ => (Cow::Borrowed(""), true),
         }
+    }
+}
+
+/// The [`key_string_kind`](YamlValue::key_string_kind) result for a genuine
+/// `String` key: its decoded content on success, or the shared `""`
+/// fallback (marked `is_fallback`) on a decode failure. Shared by
+/// `key_string_kind`'s direct-`String` and `Alias`-to-`String` arms so the
+/// two don't drift independently.
+fn string_key_kind<'a>(s: &YamlString<'a>) -> (Cow<'a, str>, bool) {
+    match s.as_str() {
+        Ok(text) => (text, false),
+        Err(_) => (Cow::Borrowed(""), true),
     }
 }
 
