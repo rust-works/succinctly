@@ -3472,6 +3472,35 @@ fn test_raw_output_json_evaluated_strips_quotes_1715() -> Result<()> {
     Ok(())
 }
 
+/// #1715 review: `--inplace` gates the identical bug independently via
+/// `can_inplace_json_fast_path`, which shares `can_stream_json_output_style`
+/// with the stdout gates above -- same one-line fix, but a distinct code
+/// path (its own `stream_cursor!` call site) that no test here exercised.
+/// Confirmed live on the pre-fix commit: `-o json -r -i` wrote the literal
+/// quoted `"hello"` back to disk instead of `hello`.
+#[test]
+fn test_raw_output_json_inplace_strips_quotes_1715() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "\"hello\"")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-o")
+        .arg("json")
+        .arg("-r")
+        .arg("-i")
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert!(output.status.success());
+    let rewritten = std::fs::read(input_file.path())?;
+    assert_eq!(rewritten, b"hello\n");
+
+    Ok(())
+}
+
 /// `--join-output` also sets `raw_output` (`OutputConfig::from_args`) and
 /// suppresses the terminator entirely -- verified against the pinned jq
 /// 1.7.1 oracle (`echo '["hello","world"]' | jq -j '.[]'` -> `helloworld`).
