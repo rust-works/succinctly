@@ -3441,6 +3441,52 @@ fn test_join_output_multidoc_does_not_corrupt_documents_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1715: the M2 fast path's JSON streaming never consulted `raw_output`,
+/// so `-r` failed to strip JSON string quoting -- unlike the DOM path's
+/// `output_value`, which handles it correctly. Confirmed live to still
+/// print `"hello"` (quoted) on unmodified `main`. Fixed by excluding
+/// `raw_output` from JSON fast-path eligibility (`can_stream_json_output_style`)
+/// rather than teaching the M2 streamers the special case, so this falls
+/// back to the already-correct DOM path.
+#[test]
+fn test_raw_output_json_identity_strips_quotes_1715() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "\"hello\"\n", &["-o", "json", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "hello\n");
+
+    // Baseline: without -r, the M2 fast path still quotes normally.
+    let (output, code) = run_yq_stdin(".", "\"hello\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\"hello\"\n");
+
+    Ok(())
+}
+
+/// Same fix, evaluated (multi-result) path -- each iterated string must be
+/// unquoted, not just a bare identity scalar.
+#[test]
+fn test_raw_output_json_evaluated_strips_quotes_1715() -> Result<()> {
+    let (output, code) = run_yq_stdin(".[]", "[\"hello\", \"world\"]\n", &["-o", "json", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "hello\nworld\n");
+    Ok(())
+}
+
+/// `--join-output` also sets `raw_output` (`OutputConfig::from_args`) and
+/// suppresses the terminator entirely -- verified against the pinned jq
+/// 1.7.1 oracle (`echo '["hello","world"]' | jq -j '.[]'` -> `helloworld`).
+#[test]
+fn test_join_output_json_strips_quotes_1715() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".[]",
+        "[\"hello\", \"world\"]\n",
+        &["-o", "json", "--join-output"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "helloworld");
+    Ok(())
+}
+
 /// #1708: `-0`/`--join-output` combined with `-C` (color) on the M2 fast
 /// path's evaluated (non-identity) branch embedded the terminator byte
 /// *inside* the ANSI color span, before the trailing reset code --

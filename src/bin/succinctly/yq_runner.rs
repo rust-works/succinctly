@@ -3515,8 +3515,25 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // `can_slurp_fast_path`'s JSON arm) per /code-review on #1693's own PR:
     // `can_slurp_fast_path` originally diverged from this exact predicate
     // because #1577 copied it by hand instead of sharing it.
-    let can_stream_json_output_style =
-        !args.ascii_output && (output_config.compact || can_stream_pretty_or_colored);
+    // `!output_config.raw_output` (#1715): none of the M2 JSON streamers
+    // consult `raw_output` at all, so `-r`/`-0`/`--join-output` (which all
+    // set it, see `OutputConfig::from_args`) fail to strip JSON string
+    // quoting on this path -- unlike the DOM path's `output_value`, whose
+    // `if config.raw_output { if let OwnedValue::String(s) = value ... }`
+    // arm handles it correctly. Excluded from fast-path eligibility here
+    // rather than fixed inside the streamers themselves: the real fix needs
+    // `GenericResult::stream_json`/`YamlCursor::stream_json` to special-case
+    // a lone string value the same way, which is nontrivial for the
+    // multi-result evaluated case (`stream_json` owns the whole per-value
+    // streaming+separator logic internally) -- this is the low-risk
+    // direction the issue itself names, giving up the fast path's
+    // performance advantage only for this one flag combination rather than
+    // risk a wrong fix to the streamers. Same reasoning YAML never needed:
+    // YAML's own scalar rendering is already unquoted by default (`-r`-like
+    // even without `-r`), so `can_yaml_fast_path` never had this gap.
+    let can_stream_json_output_style = !args.ascii_output
+        && !output_config.raw_output
+        && (output_config.compact || can_stream_pretty_or_colored);
     let can_json_fast_path = is_m2_streamable
         && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
