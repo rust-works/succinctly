@@ -11514,6 +11514,34 @@ fn resolve_regex_args<S: EvalSemantics>(
     // live even for a 1-element array with no explicit flags slot at all:
     // `test([1])` -> "number (1) is not a string", not the bare "not a
     // string or array" `test(1)` alone would give.
+    // yq mode coerces a scalar (non-container) pattern to its string form
+    // and matches literally, instead of raising -- live-verified against
+    // v4.53.3 across the whole family (#1443): `test(1)` => `true` on
+    // `"a1c"`, `sub(1;"X")` => `"aXc"`, `match(true)`/`capture(null)` behave
+    // the same way. jq mode is unaffected -- real jq 1.7.1 errors on all of
+    // these, matching its general strict-typing philosophy elsewhere.
+    // `Array`/`Object` are deliberately excluded, mirroring the same
+    // exclusion in the flags-coercion check above: this fix's own live
+    // probes showed a container pattern doesn't simply error in yq either,
+    // but nailing down its exact stringification rule needs more
+    // verification than #1443 itself scoped (its repro was numbers) --
+    // left to fall through to the existing unpack-or-error handling below
+    // rather than guessed at.
+    if S::TAG == EvalTag::Yq
+        && matches!(
+            raw_pattern,
+            OwnedValue::Null
+                | OwnedValue::Bool(_)
+                | OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::NumberLiteral(..)
+        )
+    {
+        let pattern = owned_to_string::<S>(&raw_pattern);
+        let flags = validate_regex_flags(raw_flags)?;
+        return Ok((pattern, flags));
+    }
+
     let pattern = match raw_pattern {
         OwnedValue::String(s) => s,
         v if array_unpacked || flags_present || matches!(family, RegexArgFamily::Sub) => {
@@ -12606,9 +12634,25 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         ArgFanout::yq_native::<S>(),
         move |raw_pattern| {
-            let pattern = match raw_pattern {
-                OwnedValue::String(s) => s,
-                v => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+            // #1443: yq mode coerces a scalar pattern to its string form
+            // instead of raising, same as the arity-2 family above (which
+            // this arity-3 form otherwise diverged from -- see this
+            // function's own doc comment, previously left unfixed here).
+            let pattern = if S::TAG == EvalTag::Yq
+                && matches!(
+                    raw_pattern,
+                    OwnedValue::Null
+                        | OwnedValue::Bool(_)
+                        | OwnedValue::Int(_)
+                        | OwnedValue::Float(_)
+                        | OwnedValue::NumberLiteral(..)
+                ) {
+                owned_to_string::<S>(&raw_pattern)
+            } else {
+                match raw_pattern {
+                    OwnedValue::String(s) => s,
+                    v => return QueryResult::Error(EvalError::is_not_a_string(&v)),
+                }
             };
 
             // The three `if optional` guards below mirror every sibling
