@@ -3583,6 +3583,24 @@ fn test_color_terminator_ordering_survives_embedded_control_char_in_value_1708()
     Ok(())
 }
 
+/// #1708 second review pass: `colorize_yaml`'s unconditional trailing reset
+/// used to fire even when the boundary-drain loop just above it had already
+/// closed every span and written the real terminator -- placing a redundant
+/// reset *after* the terminator instead of nothing at all, relocating (not
+/// fixing) the "reset must precede terminator" defect to the tail of the
+/// buffer. The terminator must be the actual last byte of output.
+#[test]
+fn test_color_terminator_ordering_terminator_is_final_byte_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.as_bytes().last(),
+        Some(&0u8),
+        "the NUL terminator must be the final byte, got: {output:?}"
+    );
+    Ok(())
+}
+
 /// Same fix, `-0`/`--nul-output` (#1701 code review). Unlike `--join-output`
 /// above, `-0`'s own glued-`---` case was confirmed byte-identical to real
 /// yq's own multi-doc `-0` output -- but real yq can't reparse that output
@@ -6925,9 +6943,14 @@ fn test_color_output_survives_iteration_with_duplicate_keys() -> Result<()> {
 
     let (output, code) = run_yq_stdin(".[]", yaml, &["-C"])?;
     assert_eq!(code, 0);
+    // No trailing `\x1b[0m` after the last result's own newline terminator
+    // (#1708 second review pass): that extra reset used to fire even when
+    // every result's own boundary-close had already emitted one, which is
+    // the same "reset after terminator" defect this issue was filed for,
+    // just for the default newline terminator instead of `-0`'s NUL.
     assert_eq!(
         output,
-        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\n\u{1b}[36mb\u{1b}[0m: 3\n\u{1b}[0m"
+        "\u{1b}[36ma\u{1b}[0m: 1\n\u{1b}[36ma\u{1b}[0m: 2\n\u{1b}[36mb\u{1b}[0m: 3\n"
     );
 
     Ok(())
