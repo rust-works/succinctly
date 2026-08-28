@@ -21229,17 +21229,21 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// surfacing the later sibling's error instead of jq's real one and
     /// leaking that untracked branch's stale path into the assembled prefix
     /// (#1560).
-    fn reject_untracked_prefix_too<'a>(
-        result: Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>,
+    fn reject_untracked_prefix_too(
+        result: PathResolveResult<'_>,
         near_iterate: bool,
-    ) -> Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)> {
-        match result {
-            Ok(branches) => reject_untracked_at_terminal(branches, near_iterate),
-            Err((prefix, e)) => match reject_untracked_at_terminal(prefix, near_iterate) {
-                Ok(prefix) => Err((prefix, e)),
-                terminal_violation => terminal_violation,
-            },
-        }
+    ) -> PathResolveResult<'_> {
+        let (prefix, escape) = match result {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
+        // `?` here is the priority rule: a terminal violation found in
+        // `prefix` propagates immediately, discarding `escape` (a later
+        // sibling's own error/break/halt that never got the chance to run
+        // in real jq either) -- exactly `path_result`'s own `Some`/`None`
+        // combine once a violation-free `prefix` reaches it.
+        let checked = reject_untracked_at_terminal(prefix, near_iterate)?;
+        path_result(checked, escape)
     }
 
     /// Is this a bare trailing iterate — `Expr::Iterate` or
