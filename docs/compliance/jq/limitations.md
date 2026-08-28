@@ -5,7 +5,7 @@
 This page records how closely succinctly's evaluator reproduces jq's *error messages*,
 measured against the pinned `jq` binary rather than asserted. It is one of the two pages
 [ADR-0018](../../adrs/adr-0018.md) obliges: that record makes jq-fidelity the rule for jq
-mode, permits divergence only under three named conditions, and requires every divergence to
+mode, permits divergence only under four named conditions, and requires every divergence to
 be written down — so **this page is the enumeration of exceptions to ADR-0018** for jq mode,
 as [yq Limitations](../yq/limitations.md) is for yq mode. Since
 [#158](https://github.com/rust-works/succinctly/issues/158) bound the raised value as
@@ -1309,7 +1309,7 @@ abort-on-parse-error for every ordinary evaluation error, not just a decode fail
 [#1247](https://github.com/rust-works/succinctly/issues/1247)'s own design doc
 ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md), Stage 4)
 calls succinctly's behaviour "the more useful of the two" and treats it as settled — but
-none of ADR-0018's three permitted conditions actually cover it (the output is readable,
+none of ADR-0018's four permitted conditions actually cover it (the output is readable,
 nothing is corrupted or discarded, and the process does not die either way), so per rule 4
 it is recorded here as a still-open policy question, matching
 [yq Limitations](../yq/limitations.md)'s "Merge-flag `+` and `d` combined" precedent for a

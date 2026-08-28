@@ -6,7 +6,7 @@ This page records where `succinctly yq` behaves differently from `mikefarah/yq`,
 It is the yq-mode counterpart to
 [jq Error Message Conformance](../jq/limitations.md), and it exists because
 [ADR-0018](../../adrs/adr-0018.md) requires it: that record makes yq-fidelity the rule for
-yq mode, permits divergence only under three named conditions, and obliges every divergence
+yq mode, permits divergence only under four named conditions, and obliges every divergence
 to be written down. **This page is the enumeration of exceptions to ADR-0018.** A divergence
 that is not recorded here is not a decision — it is a bug nobody has found yet.
 
@@ -42,7 +42,7 @@ manifest to close this hole is worth its own issue.
 ## Deliberate divergences (ADR-0018 rule 4)
 
 These are the cases where succinctly knowingly does not match real yq. Each is measured
-against the three permitted conditions — including the one below that fails them, which is
+against the four permitted conditions — including the one below that fails them, which is
 labelled as such rather than grandfathered.
 
 ### Anchor soundness: never emit YAML we cannot read back — rule 4(a)
@@ -158,7 +158,7 @@ $ succinctly yq -o=json -I=0 '.a *=+d .b | .a' arr.yaml # [1,2,3,4]
 
 This was accepted as a "documented simplification" of behaviour that is surprising and
 untested upstream. Under ADR-0018 rule 4 that is **not** a valid justification — the output
-is readable, no data is corrupted and no process dies, so none of the three conditions
+is readable, no data is corrupted and no process dies, so none of the four conditions
 applies. It is recorded here as a divergence to be either fixed or re-justified, not as a
 settled decision. The plain (non-combined) flags all match real yq:
 
