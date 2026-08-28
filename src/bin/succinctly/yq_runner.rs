@@ -234,20 +234,23 @@ impl OutputConfig {
         }
     }
 
-    /// `-I0`/`-I1` both clamp to width 2 for YAML output (#1486, #1575):
-    /// real yq's YAML output at `-I1` is byte-identical to its own `-I2`
-    /// output at every level, mirroring the fast-path streamer's identical
-    /// clamp on `yaml_indent_spaces` below; `-I0` reuses the same clamp
-    /// rather than modeling real yq's own irregular `-I0`-behaves-like-`-I4`
-    /// quirk (see `compute_indent_str`'s own comment on the clamp). JSON has
-    /// no such quirk (verified live: `-I1 -o=json` genuinely indents 1
-    /// space per level in real yq, and `-I0 -o=json` means compact/flow,
-    /// handled separately by `OutputConfig::compact`) -- `indent_str` is
-    /// shared by both formats' DOM emitters (see its use in the JSON branch
-    /// of `output_value`), so the clamp only applies when `output_value`
-    /// will actually take the YAML branch, i.e. `effective_output_format ==
-    /// Yaml` exactly -- matching that dispatch's own condition, not its
-    /// complement.
+    /// The YAML clamp itself -- `-I0`/`-I1` both landing on width 2 -- is
+    /// `IndentSpec::for_yaml`'s rule (#1486, #1575, #1685; shared with the
+    /// M2 streaming fast path's own indent setup below, previously an
+    /// independently hand-encoded copy of the identical formula). `indent_str`
+    /// is shared by both formats' DOM emitters (see its use in the JSON
+    /// branch of `output_value`), so the clamp only applies when
+    /// `output_value` will actually take the YAML branch, i.e.
+    /// `effective_output_format == Yaml` exactly -- matching that dispatch's
+    /// own condition, not its complement. JSON has no such clamp (verified
+    /// live: `-I1 -o=json` genuinely indents 1 space per level in real yq,
+    /// and `-I0 -o=json` means compact/flow, handled separately by
+    /// `OutputConfig::compact`).
+    ///
+    /// `--tab` is handled once here rather than delegated to
+    /// `IndentSpec::for_yaml`: unlike the clamp, a single tab character
+    /// applies to *both* output formats identically, so it belongs at this
+    /// shared entry point, not inside the YAML-specific constructor.
     ///
     /// Takes the caller's *effective* format rather than reading
     /// `args.output_format` directly: `Self::from_args` passes
@@ -262,23 +265,10 @@ impl OutputConfig {
         if args.tab {
             return "\t".to_string();
         }
-        let width = args.indent as usize;
         let width = if effective_output_format == OutputFormat::Yaml {
-            // This clamp used to run only for a nonzero `args.indent`; an
-            // early return above it short-circuited `-I0` straight to an
-            // empty string instead. YAML's significant whitespace then read
-            // a nested container's fields back as siblings of their parent
-            // key, silently losing the whole value on read-back (#1575).
-            // `0.max(2)` already lands on the same width-2 convention the M2
-            // streaming fast path uses for its own `-I0`
-            // (`yaml_indent_spaces` below), so letting `-I0` reach this
-            // clamp like every other width is the whole fix. JSON is
-            // unaffected either way: `-I0` there means compact/flow, and
-            // `OutputConfig::compact` already forces JSON's own indent to
-            // `""` independently of this string.
-            width.max(2)
+            IndentSpec::for_yaml(args.indent, false).width
         } else {
-            width
+            args.indent as usize
         };
         " ".repeat(width)
     }
@@ -3610,35 +3600,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.front_matter.is_none()
         && context.named.is_empty();
 
-    // Indent width/unit for the fast path's streamers. `--tab` always means
-    // exactly one tab per level, ignoring `-I`'s numeric value — matching
-    // `OutputConfig::indent_str`'s DOM-path behavior above. YAML's `-I0` is
-    // otherwise a special case: real `yq` treats it as "use the library
-    // default" (4 spaces), and succinctly's existing (pre-#442) compact-YAML
-    // fast path hardcodes 2 regardless of `-I` — preserved as-is here since
-    // reconciling that mismatch is a separate, out-of-scope issue. `-I1`
-    // clamps to 2 (#1486): real yq's YAML output at `-I1` is byte-identical
-    // to its own `-I2` output at every level (mappings, sequences, and
-    // compact/anchor-deferred sequence items alike, verified live against
-    // v4.53.3) — every other value (`-I2` and above) threads through
-    // directly, matching what the DOM path already produces (verified
-    // against `-I1` through `-I6`). JSON has no such quirk: `-I0` means
-    // compact/flow and `-I1` genuinely means a literal 1-space step, for
-    // both real yq and succinctly today (verified live: `-I1 -o=json`
-    // indents 1/2/3 spaces per level in real yq, not clamped).
+    // Indent width/unit for the fast path's streamers. YAML's clamp
+    // (`-I0`/`-I1` both landing on width 2, `--tab` always one tab per
+    // level) is `IndentSpec::for_yaml`'s rule -- shared with
+    // `OutputConfig::compute_indent_str`'s DOM-path equivalent above,
+    // previously an independently hand-encoded copy of the identical
+    // formula (#1685). JSON has no such clamp: `-I0` means compact/flow and
+    // `-I1` genuinely means a literal 1-space step, for both real yq and
+    // succinctly today (verified live: `-I1 -o=json` indents 1/2/3 spaces
+    // per level in real yq, not clamped) -- `--tab` still means one tab per
+    // level regardless of format, so `json_indent` threads `args.tab`
+    // through its own `unit` the same way `yaml_indent`'s does.
     let indent_unit: char = if args.tab { '\t' } else { ' ' };
-    let yaml_indent_spaces: usize = if args.tab {
-        1
-    } else if args.indent == 0 {
-        2
-    } else {
-        (args.indent as usize).max(2)
-    };
+    let yaml_indent = IndentSpec::for_yaml(args.indent, args.tab);
     let json_indent_spaces: usize = if args.tab { 1 } else { args.indent as usize };
-    let yaml_indent = IndentSpec {
-        width: yaml_indent_spaces,
-        unit: indent_unit,
-    };
     let json_indent = IndentSpec {
         width: json_indent_spaces,
         unit: indent_unit,
@@ -4418,7 +4393,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             cursors.iter().copied(),
                             out,
                             0,
-                            yaml_indent_spaces,
+                            yaml_indent.width,
                             indent_unit,
                             sort_keys,
                         )
