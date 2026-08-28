@@ -30,7 +30,7 @@ use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
     self, exit_codes, flush_then_err, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle,
-    InputLocation, JsonFormatOpts,
+    InputLocation, JsonFormatOpts, Terminator,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -1983,7 +1983,7 @@ impl SplitDocState {
     fn write_separator<W: Write>(&mut self, writer: &mut W, config: &OutputConfig) -> Result<()> {
         if self.has_split_doc && config.output_format == OutputFormat::Yaml && !config.no_doc {
             if !self.is_first_output {
-                write_doc_separator_marker(writer, Terminator::from_config(config))?;
+                write_doc_separator_marker(writer, terminator_from_config(config))?;
             }
             self.is_first_output = false;
         }
@@ -1991,71 +1991,35 @@ impl SplitDocState {
     }
 }
 
-/// Which terminator (if any) follows a written value, per `-0`/`--nul-output`
-/// and `-j`/`--join-output`. NUL wins over join (`-0 -j` still separates on
-/// NUL, not nothing) -- verified against real *jq* 1.7.1
-/// (`--raw-output0 -j`, order-independent either way), not yq: the pinned
-/// yq oracle (Homebrew v4.53.3) has no `--join-output` flag at all (it
-/// errors "unknown flag"), and its own `-j` is an unrelated, deprecated
-/// alias for `--tojson`. yq-mode's `-j`/`--join-output` borrows jq's flag
-/// meaning and collides with real yq's own `-j` — a documented open
-/// divergence (docs/compliance/yq/limitations.md), not a real-yq behavior
-/// to match. A bare newline is the default when neither flag is set.
+/// [`output::Terminator`] reads its NUL/newline/join precedence off two
+/// plain `bool`s, not `OutputConfig` directly, since jq_runner.rs's own
+/// `OutputConfig` names the same flag `raw_output0` rather than
+/// `nul_output` (#1711) -- this is yq-mode's own thin wrapper reading the
+/// right fields once, so no call site here can transpose them.
 ///
-/// Split out from [`write_terminator`] (#1701) so the same three-way choice
-/// can also drive the M2 fast path's own terminator writes -- previously
-/// `stream_cursor!` hardcoded a bare newline unconditionally, ignoring both
-/// flags whenever the fast path was taken (confirmed live on unmodified
-/// `main`, same root cause and fix shape as #1699's `--no-doc` gap in the
-/// same macro).
-#[derive(Clone, Copy)]
-enum Terminator {
-    Nul,
-    Newline,
-    None,
-}
-
-impl Terminator {
-    /// Takes `&OutputConfig` (not two positional bools) so no call site can
-    /// silently transpose `nul_output`/`join_output` -- the exact risk
-    /// `stream_cursor!`'s own `$output_config:expr` consolidation (#1701
-    /// code review) was about, one level up from here.
-    fn from_config(config: &OutputConfig) -> Self {
-        if config.nul_output {
-            Self::Nul
-        } else if !config.join_output {
-            Self::Newline
-        } else {
-            Self::None
-        }
-    }
-
-    /// Write this terminator to an `io::Write` sink (the M2 path's own
-    /// `$writer`, and every DOM-path caller of `write_terminator`).
-    fn write_io<W: Write>(self, writer: &mut W) -> std::io::Result<()> {
-        match self {
-            Self::Nul => writer.write_all(&[0]),
-            Self::Newline => writeln!(writer),
-            Self::None => Ok(()),
-        }
-    }
-
-    /// Write this terminator to a `core::fmt::Write` sink -- the M2 path's
-    /// per-result callbacks passed into `stream_yaml`/`stream_json`, which
-    /// write into a buffered `fmt::Write` target rather than `$writer`
-    /// itself.
-    fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
-        match self {
-            Self::Nul => writer.write_char('\0'),
-            Self::Newline => writer.write_char('\n'),
-            Self::None => Ok(()),
-        }
-    }
+/// NUL wins over join (`-0 -j` still separates on NUL, not nothing) --
+/// verified against real *jq* 1.7.1 (`--raw-output0 -j`, order-independent
+/// either way), not yq: the pinned yq oracle (Homebrew v4.53.3) has no
+/// `--join-output` flag at all (it errors "unknown flag"), and its own
+/// `-j` is an unrelated, deprecated alias for `--tojson`. yq-mode's
+/// `-j`/`--join-output` borrows jq's flag meaning and collides with real
+/// yq's own `-j` — a documented open divergence
+/// (docs/compliance/yq/limitations.md), not a real-yq behavior to match.
+/// A bare newline is the default when neither flag is set.
+///
+/// Threaded through `stream_cursor!`'s own `$output_config:expr` (#1701
+/// code review) so the same three-way choice also drives the M2 fast
+/// path's own terminator writes -- previously `stream_cursor!` hardcoded a
+/// bare newline unconditionally, ignoring both flags whenever the fast
+/// path was taken (confirmed live on unmodified `main`, same root cause
+/// and fix shape as #1699's `--no-doc` gap in the same macro).
+fn terminator_from_config(config: &OutputConfig) -> Terminator {
+    Terminator::new(config.nul_output, config.join_output)
 }
 
 /// Write the appropriate line terminator based on output config.
 fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<()> {
-    Terminator::from_config(config).write_io(writer)?;
+    terminator_from_config(config).write_io(writer)?;
     Ok(())
 }
 
@@ -3671,7 +3635,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // overridden per call site).
     macro_rules! stream_cursor {
         ($cursor:expr, $writer:expr, $is_yaml:expr, $doc_streamed:expr, $use_color:expr, $output_config:expr) => {{
-            let terminator = Terminator::from_config(&$output_config);
+            let terminator = terminator_from_config(&$output_config);
             if $is_yaml {
                 // M2 YAML path: YAML output streaming
                 if is_identity {
@@ -4100,7 +4064,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // (#1701 code review): the previous result's own
                 // `write_terminator` call (inside `output_value` below)
                 // might have written `\0`/nothing rather than `\n`.
-                write_doc_separator_marker(&mut writer, Terminator::from_config(&output_config))?;
+                write_doc_separator_marker(&mut writer, terminator_from_config(&output_config))?;
             }
             any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(&mut writer, result, &CommentTree::empty(), &output_config)?;
@@ -4699,7 +4663,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             // `\n`.
                             write_doc_separator_marker(
                                 &mut buf_writer,
-                                Terminator::from_config(&output_config),
+                                terminator_from_config(&output_config),
                             )?;
                         }
                         doc_had_output = true;
@@ -4742,7 +4706,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if any_real_output {
                     write_doc_marker_newline_guard(
                         &mut output_buffer,
-                        Terminator::from_config(&output_config),
+                        terminator_from_config(&output_config),
                     )?;
                 }
                 output_buffer.extend_from_slice(b"---");
@@ -4933,7 +4897,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // own terminator might not have been `\n`.
                     write_doc_separator_marker(
                         &mut writer,
-                        Terminator::from_config(&file_output_config),
+                        terminator_from_config(&file_output_config),
                     )?;
                 }
                 if file_output_config.output_format == OutputFormat::Yaml {
@@ -4957,7 +4921,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if any_output_this_file {
                     write_doc_marker_newline_guard(
                         &mut writer,
-                        Terminator::from_config(&file_output_config),
+                        terminator_from_config(&file_output_config),
                     )?;
                 }
                 writer.write_all(b"---")?;

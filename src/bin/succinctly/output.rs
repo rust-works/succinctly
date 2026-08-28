@@ -54,6 +54,56 @@ pub fn json_bytes_to_owned_value(bytes: &[u8]) -> Result<OwnedValue, EvalError> 
     generic_to_owned(&cursor.value())
 }
 
+/// Which terminator follows a written value: NUL (`-0`/`--nul-output`),
+/// a bare newline (the default), or nothing (`-j`/`--join-output`). `nul`
+/// wins over `join` in both runners' own precedence, matching real jq/yq:
+/// `-0 -j` together behaves as `-0`.
+///
+/// Shared by `jq_runner.rs` and `yq_runner.rs` (#1701, #1711) -- both
+/// binaries' own `OutputConfig` agree on this exact three-way rule but
+/// don't share a type (different field names: `raw_output0` vs
+/// `nul_output`), so each keeps a thin local `Terminator::new(nul, join)`
+/// wrapper reading its own config's fields rather than this module taking
+/// either `OutputConfig` directly.
+#[derive(Clone, Copy)]
+pub enum Terminator {
+    Nul,
+    Newline,
+    None,
+}
+
+impl Terminator {
+    pub fn new(nul: bool, join: bool) -> Self {
+        if nul {
+            Self::Nul
+        } else if !join {
+            Self::Newline
+        } else {
+            Self::None
+        }
+    }
+
+    /// Write this terminator to an `io::Write` sink.
+    pub fn write_io<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::Nul => writer.write_all(&[0]),
+            Self::Newline => writeln!(writer),
+            Self::None => Ok(()),
+        }
+    }
+
+    /// Write this terminator to a `core::fmt::Write` sink -- yq's M2 path's
+    /// per-result callbacks, which write into a buffered `fmt::Write`
+    /// target rather than the process's own `io::Write` sink directly.
+    pub fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
+        match self {
+            Self::Nul => writer.write_char('\0'),
+            Self::Newline => writer.write_char('\n'),
+            Self::None => Ok(()),
+        }
+    }
+}
+
 /// Exit codes matching jq behavior
 pub mod exit_codes {
     pub const SUCCESS: i32 = 0;
