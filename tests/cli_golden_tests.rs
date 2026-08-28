@@ -9,13 +9,22 @@ use std::time::Duration;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES};
+use cargo_run_exit::{
+    cargo_run_features, classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES,
+};
 
 /// Helper to run a CLI command and capture its output
 fn run_cli(args: &[&str]) -> Result<String> {
     for attempt in 0..MAX_CARGO_RETRIES {
         let output = Command::new("cargo")
-            .args(["run", "--features", "cli", "--bin", "succinctly", "--"])
+            .args([
+                "run",
+                "--features",
+                cargo_run_features(),
+                "--bin",
+                "succinctly",
+                "--",
+            ])
             .args(args)
             .output()?;
 

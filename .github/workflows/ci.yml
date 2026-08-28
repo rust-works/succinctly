@@ -150,6 +150,17 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
+      # `tests/orchestrate_cli_tests.rs` is `#![cfg(feature = "bench-runner")]`
+      # and was never previously built or run by any `cargo test` step here
+      # (#1705) -- run in its own step, isolated from the `cli`-only tests
+      # above (whose `cargo run`-spawned CLI subprocesses would otherwise
+      # re-link the shared `target/debug/succinctly` binary with a narrower
+      # feature set, dropping the `bench` subcommand out from under this
+      # test target if it ran afterward in the same invocation).
+      - name: Run bench-runner-gated tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose
@@ -245,6 +256,10 @@ jobs:
       - name: Run cli-gated tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
+
+      - name: Run bench-runner-gated tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
 
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
@@ -344,6 +359,10 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test jq_golden_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
 
+      - name: Run bench-runner-gated tests
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
+
       - name: Run tests
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose
@@ -405,6 +424,9 @@ jobs:
 
       - name: Run cli-gated tests
         run: cargo test --features cli --test yq_cli_tests --test yq_golden_tests --test yq_path_consistency_tests --test yaml_bench_suite_coverage --test dsv_cli_tests --test text_cli_tests --test json_validate_tests --test yaml_validate_tests
+
+      - name: Run bench-runner-gated tests
+        run: cargo test --features cli,bench-runner --test orchestrate_cli_tests
 
       - name: Run tests
         run: cargo test --verbose

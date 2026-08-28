@@ -1,9 +1,10 @@
 //! Shared exit-code classification for `cargo run`-spawned CLI test helpers.
 //!
 //! Included by `tests/jq_cli_tests.rs`, `tests/cli_golden_tests.rs`,
-//! `tests/cli_characterization_tests.rs` and `tests/deep_nesting_valid_tests.rs`
-//! via `#[path = ...] mod`, per the `tests/common/` convention `json_oracle.rs`
-//! established. #1516 fixed the signal-death misdiagnosis
+//! `tests/cli_characterization_tests.rs`, `tests/deep_nesting_valid_tests.rs`
+//! and `tests/json_validate_tests.rs` via `#[path = ...] mod`, per the
+//! `tests/common/` convention `json_oracle.rs` established. #1516 fixed the
+//! signal-death misdiagnosis
 //! (`.code().unwrap_or(-1)` silently coercing a killed child to a fake exit
 //! code) in `jq_cli_tests.rs` alone; its own `/code-review` found the
 //! identical pattern hand-rolled in three more files (#1546). Sharing one
@@ -23,6 +24,30 @@ use anyhow::Result;
 
 #[path = "../../src/bin/succinctly/exit_status.rs"]
 mod exit_status;
+
+/// The `--features` value a `cargo run`-spawned CLI subprocess should build
+/// with -- always `cli` (needed for the binary itself), plus `bench-runner`
+/// whenever the enclosing `cargo test` invocation also requested it.
+///
+/// A hardcoded `"cli"` at each call site used to clobber a shared
+/// `target/debug/succinctly` binary another test target in the same run
+/// depends on (#1705): `cargo run --features cli` rebuilds and relinks that
+/// exact path with a narrower feature set than the outer `cargo test
+/// --features cli,...,bench-runner` invocation that compiled *this* test
+/// binary, silently dropping the `bench` subcommand out from under
+/// `tests/orchestrate_cli_tests.rs`'s own `env!("CARGO_BIN_EXE_succinctly")`
+/// if that test target happens to run afterward in the same `cargo test`
+/// process. `cfg!(feature = "bench-runner")` reads whether *this* compiled
+/// test binary was built with it, which is exactly the feature set the
+/// inner `cargo run` needs to match to avoid re-linking the shared binary
+/// out from under a sibling test target.
+pub fn cargo_run_features() -> &'static str {
+    if cfg!(feature = "bench-runner") {
+        "cli,bench-runner"
+    } else {
+        "cli"
+    }
+}
 
 /// Maximum retries for a `cargo run` command that fails with exit code 101,
 /// or whose child is killed by a signal (`ExitStatus::code()` returns `None`
