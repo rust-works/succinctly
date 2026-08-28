@@ -23,6 +23,7 @@ import argparse
 import glob
 import hashlib
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -58,7 +59,12 @@ def parse_args(argv=None):
     p.add_argument("--no-identity", action="store_true",
                    help="skip the output identity gate (rule 4) — for control runs")
     p.add_argument("--force", action="store_true",
-                   help="run even if the machine looks busy or is on battery")
+                   help="run even if the machine looks CPU-busy or has build/benchmark "
+                        "processes running (does NOT waive the battery check)")
+    p.add_argument("--force-battery", action="store_true",
+                   help="run even on battery power — separate from --force (#1640) so "
+                        "the one check that's never a false positive can't be waived by "
+                        "the same flag that waives the noisy heuristics")
     return p.parse_args(argv)
 
 
@@ -102,25 +108,48 @@ def profile_status(args):
             "docs/guides/benchmarking.md § A/B Benchmarking Method, rule 9.")
 
 
+def battery_warning():
+    """Rule 6: never benchmark a laptop on battery — the one check here that's never a
+    false positive, so it gets its own --force-battery flag (#1640) rather than sharing
+    --force with the noisier heuristics below."""
+    if sys.platform != "darwin":
+        return None
+    batt = run_text(["pmset", "-g", "batt"])
+    if "Battery Power" in batt:
+        return "running on battery — never benchmark a laptop unplugged"
+    return None
+
+
 def machine_warnings():
-    """Rule 6: read the signals that actually mean 'busy', not the load average."""
+    """Rule 6: read the signals that actually mean 'busy right now', not a proxy that
+    only correlates with it. Two prior proxies were tried and rejected here (#1640):
+    macOS load average counts uninterruptible-wait threads, and `ps -o pcpu` reports
+    each process's *lifetime-average* CPU, not its instantaneous usage — summing that
+    across a long-uptime machine gives a number that only ever grows, unrelated to
+    current load (a 26-day-uptime idle Mac read 30% "busy" from iTerm2/WindowServer/
+    DriverKit's accumulated CPU-seconds alone)."""
     warnings = []
     if sys.platform == "darwin":
-        batt = run_text(["pmset", "-g", "batt"])
-        if "Battery Power" in batt:
-            warnings.append("running on battery — never benchmark a laptop unplugged")
-        # macOS load average counts uninterruptible-wait threads; sum actual CPU instead.
-        ps = run_text(["ps", "-Ao", "pcpu"])
-        total = sum(float(x) for x in ps.split()[1:] if x.replace(".", "", 1).isdigit())
-        if total > 25.0:
-            warnings.append(f"{total:.0f}% CPU busy across all processes")
+        # Discard `top`'s first sample (itself a lifetime average since boot); the
+        # second is the instantaneous delta between the two samples.
+        top = run_text(["top", "-l", "2", "-n", "0"])
+        idle_samples = re.findall(r"([\d.]+)%\s*idle", top)
+        if len(idle_samples) >= 2:
+            idle = float(idle_samples[-1])
+            if idle < 75.0:
+                warnings.append(f"{100.0 - idle:.0f}% CPU busy (instantaneous, `top -l 2`)")
     else:
         load1 = os.getloadavg()[0]
         if load1 > 1.0:
             warnings.append(f"1-minute load average is {load1:.2f}")
-    busy = run_text(["pgrep", "-fl", "cargo|rustc|criterion|claude"])
+    # `claude` deliberately excluded: Claude Code's own background helper
+    # (`--chrome-native-host`) matches this pattern, sleeping, on any machine with the
+    # CLI installed — that fired on every run regardless of load (#1640). Real build
+    # tools are a reliable signal on their own; a concurrent agent that's actually
+    # compiling shows up as `cargo`/`rustc` here too.
+    busy = run_text(["pgrep", "-fl", "cargo|rustc|criterion"])
     if busy.strip():
-        warnings.append("build or agent processes are running:\n    "
+        warnings.append("build or benchmark processes are running:\n    "
                         + "\n    ".join(busy.strip().splitlines()[:5]))
     return warnings
 
@@ -203,6 +232,12 @@ def main(argv=None):
     inputs = collect_inputs(args)
     if not inputs:
         sys.exit("no inputs: pass --corpus and/or --files")
+
+    battery = battery_warning()
+    if battery:
+        print(f"WARNING: {battery}")
+        if not args.force_battery:
+            sys.exit("machine is on battery; plug in or pass --force-battery")
 
     warnings = machine_warnings()
     for w in warnings:
