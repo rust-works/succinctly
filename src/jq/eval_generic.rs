@@ -3535,6 +3535,22 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// scalar resolve, not a cheap re-read), measurable as a ~5% regression on
 /// a query that walks every key and matches none. Carrying the value
 /// through instead removes that redundancy without changing output.
+/// **Deliberate divergence, sibling of `each_lazy_seq_iterate_sink`'s own
+/// (#725/#1565): a malformed key past whatever the consumer actually pulls
+/// is never detected.** #1629 taught the non-demand-aware `keys_unsorted`
+/// arms (`fold_lazy_keys_stage`) to raise on a #1194 malformed member by
+/// walking the whole object -- correct there because those arms already pay
+/// for a full walk regardless. This function exists specifically so
+/// `first(keys_unsorted[])`/`limit(n; keys_unsorted[])` do NOT pay for a
+/// full walk, so an unconditional whole-object check would defeat the
+/// point. What it *can* do for free: `DistinctKeyCursors::next` already
+/// decodes every key it yields (to hash it), so a key the consumer actually
+/// pulls is checked below at no extra cost -- but a malformed key, or an
+/// unpaired tail, sitting *after* the last element the consumer pulled is
+/// never reached, the same way `each_lazy_seq_iterate_sink`'s doc comment
+/// above describes for a `map(f)` failure past what `first` needed. Pinned
+/// by the `..._1770` tests below; recorded in
+/// `docs/compliance/jq/limitations.md`.
 fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     fields: &V::Fields,
     sorted: bool,
@@ -3545,8 +3561,13 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     if !sorted {
         return drive_pipe_elements_generic::<S, V>(
-            DistinctKeyCursors::new(fields, collapse)
-                .map(|(value, cursor)| Ok(GenericItem::OneCursorValue(cursor, value))),
+            DistinctKeyCursors::new(fields, collapse).map(|(value, cursor)| {
+                if key_is_malformed(&value) {
+                    Err(Control::Error(fields.malformed_member_error()))
+                } else {
+                    Ok(GenericItem::OneCursorValue(cursor, value))
+                }
+            }),
             rest,
             optional,
             sink,

@@ -16946,6 +16946,77 @@ fn test_jq_keys_unsorted_positional_early_exit_arms_still_known_gap_1629() -> Re
     Ok(())
 }
 
+/// #1770: `first(keys_unsorted[])`/`limit(n; keys_unsorted[])` raise on a
+/// malformed key the demand-aware sink actually pulls -- `each_lazy_keys_iterate_sink`'s
+/// `!sorted` arm now checks `key_is_malformed` on each key `DistinctKeyCursors::next`
+/// already decodes, matching bare `keys_unsorted[]` for this shape. Sibling of #1629,
+/// which fixed the non-demand-aware `fold_lazy_keys_stage` arms; this covers the
+/// demand-aware path #1629 didn't touch.
+#[test]
+fn test_jq_keys_unsorted_demand_aware_raises_on_pulled_malformed_key_1770() -> Result<()> {
+    let input = r#"{123: 1, "b": 2}"#;
+    for filter in ["first(keys_unsorted[])", "limit(1; keys_unsorted[])"] {
+        let (out, _stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter} on {input}: out: {out:?}");
+        assert!(out.trim().is_empty(), "{filter} on {input}: out: {out:?}");
+    }
+
+    // Not just the first pulled element: a malformed key pulled *second*
+    // (well-formed "a" first, non-string 123 second) still raises once
+    // `limit` actually reaches it -- "a" survives as a partial output ahead
+    // of the error, same as bare `keys_unsorted[]`'s own partial-prefix
+    // behavior.
+    let (out, _stderr, code) = run_jq_full(
+        &["-c", "limit(2; keys_unsorted[])"],
+        Some(r#"{"a":1, 123:2}"#),
+    )?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert_eq!(out.trim(), "\"a\"");
+
+    // A well-formed object still answers normally -- the fix must not make
+    // every demand-aware pull pay for a check it never fails.
+    let input = r#"{"a":1,"b":2,"c":3}"#;
+    let (out, _stderr, code) = run_jq_full(&["-c", "first(keys_unsorted[])"], Some(input))?;
+    assert_eq!((out.trim(), code), ("\"a\"", 0));
+    let (out, _stderr, code) = run_jq_full(&["-c", "limit(2; keys_unsorted[])"], Some(input))?;
+    assert_eq!((out, code), ("\"a\"\n\"b\"\n".to_string(), 0));
+
+    Ok(())
+}
+
+/// #1770: deliberately still a known gap -- a malformed key (or an unpaired
+/// tail) sitting *after* whatever the consumer actually pulled is never
+/// detected, since finding it would require walking past the point the
+/// demand-aware sink stopped, defeating the reason it exists (#1514/#1599).
+/// Sibling of `each_lazy_seq_iterate_sink`'s own #725/#1565 divergence.
+/// Pinned as a known, documented divergence
+/// (`docs/compliance/jq/limitations.md`) -- if this starts raising, that is
+/// a deliberate future fix, not a regression, and this test should be
+/// updated alongside it.
+#[test]
+fn test_jq_keys_unsorted_demand_aware_still_known_gap_past_what_it_pulled_1770() -> Result<()> {
+    // Malformed key past the one element `first` pulls.
+    let (out, _stderr, code) =
+        run_jq_full(&["-c", "first(keys_unsorted[])"], Some(r#"{"a":1,123:2}"#))?;
+    assert_eq!((out.trim(), code), ("\"a\"", 0));
+
+    // An unpaired tail past what `first` pulls (two spellings: a truncated
+    // member with no value at all, and one with neither `:` nor value).
+    for input in [r#"{"a":1,"b"}"#, r#"{"a":1, invalid}"#] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "first(keys_unsorted[])"], Some(input))?;
+        assert_eq!((out.trim(), code), ("\"a\"", 0), "input {input}");
+    }
+
+    // Bare iteration over the identical documents still raises (unaffected
+    // by this gap -- it always reaches exhaustion).
+    for input in [r#"{"a":1,123:2}"#, r#"{"a":1,"b"}"#, r#"{"a":1, invalid}"#] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[]"], Some(input))?;
+        assert_eq!(code, 5, "input {input}: out: {out:?}");
+    }
+
+    Ok(())
+}
+
 /// #1194: a malformed member raises whether or not the run takes the lazy
 /// path.
 ///
