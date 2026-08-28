@@ -91,7 +91,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is left unbudgeted, since it does no evaluator work of its own and
   charging it too would wrongly cap legitimate high-cardinality output.
 
+- **A decode failure (invalid UTF-8, or a structurally malformed value) now
+  raises instead of silently materializing as `null`, `""`, or a dropped
+  field**, on nearly every route that turns lazily-indexed JSON/YAML into an
+  owned value (#1242, #1247). Concretely:
+
+  - **`succinctly yq` rejects a non-UTF-8 document outright** (exit 1,
+    `YAML parse error: invalid UTF-8 ...`), unconditionally rather than only
+    under `--validate`, where it previously accepted it and returned `null`
+    for the affected scalar at exit 0. Matches real yq.
+  - **`succinctly yaml validate` / `yq --validate` grew a UTF-8 check** they
+    never had — `YamlValidationErrorKind::InvalidUtf8` was declared but
+    never constructed before this.
+  - **`succinctly jq` substitutes U+FFFD** for invalid UTF-8 in document/raw
+    input (and, since #1719, in `@base64d`/`@urid`'s own decoded output)
+    instead of echoing raw bytes to stdout, matching jq 1.7.1's
+    maximal-subpart substitution rule. A remaining fidelity gap against a
+    second jq quirk here is tracked as #1617/#1717 (see
+    [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md#jqs-own-utf-8-replacement-character-substitution-fixed-at-function-granularity-open-at-document-granularity)).
+  - Two streaming-output writers were deliberately left out of this sweep as
+    a deferred "Stage 6" (their only error channel is `core::fmt::Result`,
+    which carries no message) and still silently substitute — see
+    [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md#a-bad-escape-in-a-streamed-scalar-still-degrades-silently-instead-of-raising).
+  - A structurally malformed object key (#1194) preserves rather than raises
+    on the materializing routes, a deliberate divergence recorded by #1642 —
+    the two are handled differently by design, not by omission.
+
+  **Breaking:** every signature below returns `Result<_, EvalError>` where it
+  previously returned the bare value — any downstream caller of the public
+  `succinctly::jq` API using one of these will need a `?` or an explicit
+  match at the call site:
+
+  | item | before | after |
+  |---|---|---|
+  | `jq::lazy::JqValue::materialize` | `-> OwnedValue` | `-> Result<OwnedValue, EvalError>` |
+  | `jq::lazy::JqValue::into_owned` | `-> OwnedValue` | `-> Result<OwnedValue, EvalError>` |
+  | `jq::eval_generic::to_owned` | `-> OwnedValue` | `-> Result<OwnedValue, EvalError>` |
+  | `jq::eval_generic::to_owned_cursor` | `-> OwnedValue` | `-> Result<OwnedValue, EvalError>` |
+  | `jq::eval_generic::to_owned_with_comments` | `-> (OwnedValue, CommentTree)` | `-> Result<(OwnedValue, CommentTree), EvalError>` |
+  | `GenericResult::into_owned` | `-> Option<OwnedValue>` | `-> Result<Option<OwnedValue>, EvalError>` |
+  | `GenericResult::collect_owned` | `-> Vec<OwnedValue>` | `-> Result<Vec<OwnedValue>, EvalError>` |
+  | `DocumentFields::keys` | `-> Vec<String>` | `-> Result<Vec<String>, EvalError>` |
+  | `jq::document::effective_keys` | `-> Vec<String>` | `-> Result<Vec<String>, EvalError>` |
+
+  Also breaking: `yaml::validate::YamlValidationErrorKind::InvalidUtf8` went
+  from a unit variant to `InvalidUtf8 { reason: &'static str }`, so any
+  exhaustive `match` on it will need updating.
+
 ### Added
+
+- **New public surface supporting the decode-failure raising above (#1247):**
+  `DocumentValue::string_decode_error`, `JsonError::message`,
+  `YamlStringError::message`, `Utf8ErrorKind::message`.
 
 - **`yq` gains `--front-matter`, `--split-exp`, and `--eval-all`/`file_index`**
   (#715), closing three real `yq` CLI gaps found by a systematic gap-audit:
