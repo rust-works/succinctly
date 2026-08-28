@@ -16861,6 +16861,68 @@ fn test_jq_keys_unsorted_on_malformed_object_errors_1194() -> Result<()> {
     Ok(())
 }
 
+/// #1629: `keys_unsorted`'s **positional** fast paths -- `[]`, `[n]`,
+/// `first`, `last` -- still answered from a malformed object, disagreeing
+/// with `keys_unsorted`/`keys_unsorted | length` (already fixed above) on
+/// the very same document. Fixed on every arm that already pays for a full
+/// walk regardless (`[]`, `last`, and a *negative* `[n]`, which needs the
+/// object's length to normalize against): the #1194 check now rides that
+/// walk for free, matching real jq (verified live against pinned jq 1.7.1),
+/// which refuses to even parse a document with a non-string key -- so every
+/// access into it raises, not just the ones that touch the bad member.
+#[test]
+fn test_jq_keys_unsorted_positional_walked_arms_raise_1629() -> Result<()> {
+    for input in [r#"{123: 1, "b": 2}"#, r#"{"a":1, invalid}"#] {
+        for filter in [
+            "keys_unsorted[]",
+            "keys_unsorted | last",
+            "keys_unsorted[-1]",
+        ] {
+            let (out, _stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+            assert_eq!(code, 5, "{filter} on {input}: out: {out:?}");
+            assert!(out.trim().is_empty(), "{filter} on {input}: out: {out:?}");
+        }
+    }
+
+    // A well-formed object still answers normally on all three -- the fix
+    // must not make every keys_unsorted positional access pay for a check
+    // it never fails.
+    let input = r#"{"a":1,"b":2,"c":3}"#;
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[]"], Some(input))?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "\"a\"\n\"b\"\n\"c\"\n");
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(input))?;
+    assert_eq!((out.trim(), code), ("\"c\"", 0));
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[-1]"], Some(input))?;
+    assert_eq!((out.trim(), code), ("\"c\"", 0));
+
+    Ok(())
+}
+
+/// #1629: `first`, `.[0]`, and a *positive* `.[n]` are the one shape left
+/// unfixed -- deliberately. They exist specifically to answer in O(1) (or a
+/// short early-exit walk) without looking at the rest of the object
+/// (#1514/#1599); restoring the #1194 check here would restore exactly the
+/// walk those two issues removed. Pinned as a known, documented divergence
+/// (`docs/compliance/jq/limitations.md`) rather than left to silently drift
+/// -- if one of these three starts raising, that is a deliberate future
+/// fix, not a regression, and this test should be updated alongside it.
+#[test]
+fn test_jq_keys_unsorted_positional_early_exit_arms_still_known_gap_1629() -> Result<()> {
+    let input = r#"{123: 1, "b": 2}"#;
+
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[0]"], Some(input))?;
+    assert_eq!((out.trim(), code), ("123", 0));
+
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted | first"], Some(input))?;
+    assert_eq!((out.trim(), code), ("123", 0));
+
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[1]"], Some(input))?;
+    assert_eq!((out.trim(), code), ("\"b\"", 0));
+
+    Ok(())
+}
+
 /// #1194: a malformed member raises whether or not the run takes the lazy
 /// path.
 ///
