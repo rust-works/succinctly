@@ -830,9 +830,9 @@ pub struct DisplayKeyGuard {
 }
 
 impl DisplayKeyGuard {
-    /// Checks `key` (with the `is_fallback` flag from
-    /// [`key_display_string_kind`], or an equivalent per-format classifier --
-    /// see `YamlValue::key_string_kind` for YAML's own, #1749) against every
+    /// Checks `key` (with the `is_fallback` flag from `key_display_string_kind`
+    /// [private, JSON's own], or an equivalent per-format classifier -- see
+    /// `YamlValue::key_string_kind` for YAML's own, #1749) against every
     /// key already present in `map` and every fallback key this guard has
     /// already approved. Returns `true` when it is safe to insert (a fresh
     /// key, or an ordinary repeat); `false` when inserting would silently
