@@ -3181,18 +3181,33 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // #1629: unlike `First`/`.[0]` above, this arm already walks the
         // whole object regardless (there is no way to find "the last
         // field" without reaching the end), so the #1194 check rides along
-        // for free -- same helper as the negative-index arm above. An
-        // earlier version of this arm hand-rolled the walk separately per
-        // branch and missed the check entirely on the collapsed one
-        // (`collapsed_fields_if` returning `Some`, i.e. jq mode with a
-        // genuine duplicate key) -- caught by code review before merge.
+        // for free. Tracks only the running last cursor rather than calling
+        // `distinct_key_cursors_checked` -- unlike the negative-index arm
+        // above, this one never needs random access into the collected
+        // list, so collecting one would be a pure O(n)-space cost for an
+        // O(1)-space answer (review caught this on the first version of
+        // this fix, which called that helper here too). An earlier version
+        // still hand-rolled the walk separately per branch and missed the
+        // check entirely on the collapsed one (`collapsed_fields_if`
+        // returning `Some`, i.e. jq mode with a genuine duplicate key) --
+        // also caught by code review before merge. `DistinctKeyCursors`
+        // itself already handles collapse=true/false, so there is no
+        // branch left to miss.
         Expr::Builtin(Builtin::Last) if !sorted => {
-            match distinct_key_cursors_checked::<V>(&fields, collapse) {
-                Ok(cursors) => match cursors.into_iter().next_back() {
-                    Some(cursor) => GenericResult::OneCursor(cursor),
-                    None => GenericResult::Owned(OwnedValue::Null),
-                },
-                Err(err) => GenericResult::Error(err),
+            let mut cursors = DistinctKeyCursors::new(&fields, collapse);
+            let mut last_cursor = None;
+            for (key, cursor) in cursors.by_ref() {
+                if key_is_malformed(&key) {
+                    return GenericResult::Error(fields.malformed_member_error());
+                }
+                last_cursor = Some(cursor);
+            }
+            if cursors.ended_unpaired() {
+                return GenericResult::Error(fields.malformed_member_error());
+            }
+            match last_cursor {
+                Some(c) => GenericResult::OneCursor(c),
+                None => GenericResult::Owned(OwnedValue::Null),
             }
         }
         // Slice 1 (#724): stay lazy instead of falling
