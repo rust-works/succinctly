@@ -56624,6 +56624,148 @@ mod tests {
         }
     }
 
+    /// #1746 review: `to_entries`'s *array* arm (a separate `to_owned_checked`
+    /// call from the object arm's, covered above) needs its own repro.
+    #[test]
+    fn eval_rs_to_entries_array_raises_decode_failure_1746() {
+        let json: &[u8] = br#"[1,"\ud800"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("to_entries").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `map_values(f)`, a sibling of `map(f)` with its own
+    /// independent `to_owned_checked` calls (object and array arms, `One`
+    /// and `Many` result shapes each) -- none of which `map(f)`'s own test
+    /// above exercises. Four shapes covered here.
+    #[test]
+    fn eval_rs_map_values_raises_decode_failure_1746() {
+        // Object arm, `One` shape (the map body's ordinary single output).
+        let json: &[u8] = br#"{"a":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map_values(.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/One: {e:?}"),
+            other => panic!("object/One: expected a decode-failure error, got: {other:?}"),
+        }
+
+        // Object arm, `Many` shape (`map_values` takes only the first
+        // output, per jq semantics -- still must decode-check it).
+        let expr = parse("map_values(.,.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "object/Many: {e:?}"),
+            other => panic!("object/Many: expected a decode-failure error, got: {other:?}"),
+        }
+
+        // Array arm, `One` shape.
+        let json: &[u8] = br#"["\ud800"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map_values(.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/One: {e:?}"),
+            other => panic!("array/One: expected a decode-failure error, got: {other:?}"),
+        }
+
+        // Array arm, `Many` shape.
+        let expr = parse("map_values(.,.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "array/Many: {e:?}"),
+            other => panic!("array/Many: expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `map(f)`'s `Many` result shape (`map_over`'s own
+    /// distinct code path from the `One` shape #1746's own test above
+    /// covers) -- `f` producing 2+ borrowed outputs per element.
+    #[test]
+    fn eval_rs_map_many_shape_raises_decode_failure_1746() {
+        let json: &[u8] = br#"[1,"\ud800"]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("map(.,.)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `path(...)` itself (`builtin_path`'s own top-level
+    /// `to_owned_checked` call) needs a direct repro -- `eval_assign`'s
+    /// tests above exercise `=`/`|=`, not `path()`.
+    #[test]
+    fn eval_rs_builtin_path_raises_decode_failure_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("path(.a)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `eval_assign`'s RHS materialization needs its own
+    /// `One`/`Many` shape coverage -- the primary repro test above assigns
+    /// a plain literal (`Owned`, no `to_owned_checked` call at all on the
+    /// RHS side); assigning a borrowed cursor value exercises the RHS-side
+    /// `to_owned_checked` calls specifically.
+    #[test]
+    fn eval_rs_eval_assign_rhs_raises_decode_failure_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+
+        // `One` shape: RHS is a single borrowed cursor.
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a = .b").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "One: {e:?}"),
+            other => panic!("One: expected a decode-failure error, got: {other:?}"),
+        }
+
+        // `Many` shape: RHS produces 2+ borrowed outputs.
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a = (.b, .b)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "Many: {e:?}"),
+            other => panic!("Many: expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `yq_assign_noop_check`'s own `to_owned_checked` call
+    /// (only reached in yq mode with a static path -- jq mode always
+    /// short-circuits to `NotChecked` before ever calling it) and
+    /// `eval_assign`'s propagation of its `Err`.
+    #[test]
+    fn eval_rs_yq_assign_noop_check_raises_decode_failure_1746() {
+        let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(".a = 5").unwrap();
+        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!("expected a decode-failure error, got: {other:?}"),
+        }
+    }
+
     /// #1017: `*`/`*=` merge had no guard anywhere in the mutually-recursive
     /// `merge_values`/`merge_existing`/`merge_object_fields`/
     /// `merge_arrays_by_index` family; `deep_merge_arrays` (the `d` flag)
