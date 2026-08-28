@@ -107,8 +107,11 @@ impl<W: Write> ColorSink<'_, W> {
     /// is in: records a boundary for `colorize_yaml` to place later when
     /// `Buffered`, or writes it immediately when `Direct` -- so a caller
     /// never needs its own `use_color` check to pick between the two, only
-    /// `ColorSink`'s own variant (which already reflects it).
-    fn write_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
+    /// `ColorSink`'s own variant (which already reflects it). Named
+    /// distinctly from the free [`write_terminator`] function (which writes
+    /// to the real `$writer`/`OutputConfig` outside any `ColorSink` at all)
+    /// to keep the two apart when searching this file.
+    fn write_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
         if matches!(self, ColorSink::Buffered(..)) {
             self.record_boundary();
             Ok(())
@@ -2855,12 +2858,18 @@ fn compact_item_opens_with_key(rest_of_line: &str) -> bool {
 /// (the identity/DOM paths, which write their terminator directly outside
 /// any buffer) passes an empty slice, and `yaml` is colorized exactly as
 /// before.
-// `close_and_terminate!`'s state resets are dead in its post-loop drain call
-// (nothing reads `at_key_start`/`escape_next` after the function returns,
-// and only the drain's *last* iteration's `trailing_reset_needed` write
-// matters) but live in its main-loop call -- sharing one macro definition
-// between both call sites is worth the otherwise-harmless dead stores.
-#[allow(unused_assignments)]
+// A per-statement `#[allow]` on a `close_and_terminate!()` invocation below
+// doesn't reach the assignments the macro expands to (rustc: "will be
+// ignored, since it's applied to the macro invocation"), so this covers the
+// whole function instead.
+#[allow(unused_assignments)] // STYLE-0004: close_and_terminate!'s state
+                             // resets serve its two call sites asymmetrically -- `at_key_start`/
+                             // `escape_next` are read by the main loop below but dead at the trailing
+                             // drain (nothing reads them after this function returns), while
+                             // `trailing_reset_needed` is read by the final check below but dead inside
+                             // the main loop (unconditionally overwritten by the very next line there).
+                             // Sharing one macro between both sites, rather than hand-duplicating this
+                             // close/terminate logic, is worth the resulting dead stores.
 fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> String {
     let mut result = String::with_capacity(yaml.len() * 2 + boundaries.len() * 5);
     let mut in_string = false;
@@ -3732,7 +3741,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
                             result.stream_yaml(out, yaml_indent, sort_keys, |w| {
-                                w.write_terminator(terminator)
+                                w.write_result_terminator(terminator)
                             })
                         },
                     )?;
