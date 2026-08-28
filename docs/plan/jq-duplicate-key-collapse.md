@@ -44,7 +44,7 @@ same document, and `map_values(.)` — a no-op transform — changes the key cou
 document cannot both have two keys and three. This is why "record it as a semi-indexing
 divergence" is not available: it would mean documenting a contradiction. ADR-0018 rule 4 closes
 the door from the other side — "our architecture makes it awkward" is explicitly not one of the
-three admissible divergence justifications.
+four admissible divergence justifications.
 
 This producer is the root of seven symptom issues patched one consumer at a time: #443, #442,
 #478, #1251, #1170 on the jq side; #1342/#1343/#1344 on the yq side.
@@ -289,7 +289,7 @@ repetition, so drift cancels, median of the per-repetition ratios) gave:
 
 Call it **4-6% on jq-mode streaming output over object-heavy JSON, and free on `length`**.
 
-**This misses the ≤2% target.** It is shipped anyway: ADR-0018 rule 4 admits three grounds for
+**This misses the ≤2% target.** It is shipped anyway: ADR-0018 rule 4 admits four grounds for
 diverging from the reference and performance is not among them, so the choice was never
 "collapse or stay fast" but "how cheaply can the collapse be made". `length` is free because
 the evaluator already walked the field list; the residue is entirely the printer's, which is
