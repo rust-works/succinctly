@@ -25777,6 +25777,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // `(1,2,error("x")) as $v | $v + 10` keeps `11`, `12` as a real
             // prefix, unlike `[...]`'s atomicity -- so it's passed straight
             // through to both evaluations, exactly as `eval_as` does.
+            //
+            // #1663 code review: uses `materialize_bound_values` (shared
+            // with `each_as`/`each_as_pattern`, #1462) and
+            // `accumulate_path_context_step` (shared with every other
+            // fan-out loop in this function, #715 follow-up) rather than
+            // hand-rolling a 5th/7th copy of either -- both were built
+            // specifically because past copies of this exact unpacking and
+            // accumulate-or-stop shape drifted out of sync with each other.
             let bound_result = eval_pipe_with_path_context_internal::<W, S>(
                 core::slice::from_ref(expr),
                 value,
@@ -25785,25 +25793,21 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 current_path,
                 optional,
             );
-            let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
-                match bound_result {
-                    QueryResult::Owned(v) => (vec![v], None),
-                    QueryResult::ManyOwned(vs) => (vs, None),
-                    QueryResult::None => return QueryResult::None,
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    QueryResult::Partial(vs, control) => (vs, Some(control)),
-                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                        unreachable!(
-                            "eval_pipe_with_path_context_internal only ever produces \
-                             Owned/ManyOwned/None/Error/Break/Partial"
-                        )
-                    }
-                };
+            let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
+                Ok(pair) => pair,
+                Err(Flow::Exhausted) => return QueryResult::None,
+                Err(Flow::Escaped(Control::Error(e))) => return QueryResult::Error(e),
+                Err(Flow::Escaped(Control::Break(label))) => return QueryResult::Break(label),
+                Err(Flow::Escaped(Control::Halt(code))) => return QueryResult::Halt(code),
+                Err(Flow::Stopped { .. }) => unreachable!(
+                    "materialize_bound_values only ever produces Exhausted/Escaped, \
+                     never Stopped (that variant is sink-driven laziness this eager \
+                     evaluator never uses)"
+                ),
+            };
 
             let mut all_results: Vec<OwnedValue> = Vec::new();
-            let mut loop_control: Option<Control> = None;
+            let mut stopped = None;
             for bound_val in bound_values {
                 let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
                 let body_result = eval_pipe_with_path_context_internal::<W, S>(
@@ -25814,40 +25818,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     current_path,
                     optional,
                 );
-                match body_result {
-                    QueryResult::Owned(v) => all_results.push(v),
-                    QueryResult::ManyOwned(vs) => all_results.extend(vs),
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => {
-                        loop_control = Some(Control::Error(e));
-                        break;
-                    }
-                    QueryResult::Break(label) => {
-                        loop_control = Some(Control::Break(label));
-                        break;
-                    }
-                    QueryResult::Halt(code) => {
-                        loop_control = Some(Control::Halt(code));
-                        break;
-                    }
-                    QueryResult::Partial(vs, control) => {
-                        all_results.extend(vs);
-                        loop_control = Some(control);
-                        break;
-                    }
-                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                        unreachable!(
-                            "eval_pipe_with_path_context_internal only ever produces \
-                             Owned/ManyOwned/None/Error/Break/Partial"
-                        )
-                    }
+                if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
+                    stopped = Some(stop);
+                    break;
                 }
             }
 
-            let combined = match loop_control.or(bound_control) {
+            let combined = stopped.unwrap_or_else(|| match bound_control {
                 Some(control) => partial(all_results, control),
                 None => owned_vec_to_result(all_results),
-            };
+            });
             continue_rest_with_context::<W, S>(
                 combined,
                 rest,
