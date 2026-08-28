@@ -725,29 +725,35 @@ fn ascii_key_hash(key: &[u8]) -> Option<u64> {
 /// reliable identity: a JSON escape that will not decode, or -- since
 /// #1678 -- a YAML scalar key with the same problem.
 ///
-/// Must check [`DocumentValue::string_decode_error`] first, not
-/// [`key_string`](DocumentValue::key_string): YAML's `key_string()`
+/// Tries the raw span first (see [`ascii_key_hash`]) -- the #1514 fast path
+/// that skips decoding entirely for the common escape-free ASCII key, which
+/// [`DocumentValue::string_decode_error`] cannot answer for cheaply: its
+/// only implementation (`StandardJson`) resolves through the same full
+/// `as_str()` decode `key_string()` does, so checking it *before* the raw
+/// span would pay that decode on every key regardless of whether the fast
+/// path could have answered for free -- confirmed by CI's perf guard on
+/// `wide_keys_unsorted` (+10-12%) when this was tried in that order.
+///
+/// Once off that fast path (an escape, non-ASCII bytes, or no raw span at
+/// all -- YAML never has one), checks `string_decode_error` before falling
+/// to [`key_string`](DocumentValue::key_string): YAML's `key_string()`
 /// override never returns `None` at all (#222 -- a complex or undecodable
 /// key stringifies to `""` rather than being dropped), so a YAML
 /// decode-failure key would otherwise hash its `""` fallback like a real
 /// key and silently collapse with any other undecodable key in the same
 /// object under `collapse: true` (#1385's "never a duplicate" rule exists
-/// precisely to prevent that). JSON's two checks are redundant with each
-/// other (both resolve via `as_str`), so this changes nothing there --
-/// same mirroring [`key_display_string_kind`] already does for the
-/// display-string case.
-///
-/// Otherwise prefers the raw span (see [`ascii_key_hash`]) and falls back
-/// to the decoded key, which is what every exact resolution downstream
-/// uses.
+/// precisely to prevent that) -- the same ordering
+/// [`key_display_string_kind`] already uses for the display-string case.
+/// A no-op for JSON off the fast path: its two checks are redundant with
+/// each other (both resolve via `as_str`), just no longer free to reach.
 fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
-    if key.string_decode_error().is_some() {
-        return None;
-    }
     if let Some(raw) = key.key_raw_unescaped() {
         if let Some(hash) = ascii_key_hash(raw) {
             return Some(hash);
         }
+    }
+    if key.string_decode_error().is_some() {
+        return None;
     }
     key.key_string().map(|key| key_hash(key.as_bytes()))
 }
