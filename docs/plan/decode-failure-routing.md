@@ -582,9 +582,9 @@ otherwise already correct, and it can be reverted independently if the perf gate
 - Our `Utf8Error` offsets were checked against yq's for all six error kinds (invalid lead,
   bad continuation, overlong, surrogate, out-of-range, truncated) and agree exactly.
 
-**Measured cost of the always-on pass.** Interleaved A/B of the Stage 4 binary against the
-Stage 5 one, alternating order every repetition, min-of-9, gated first on byte-identical
-stdout and exit code for every case (all five identical):
+**Superseded — laptop numbers, kept for context only.** Interleaved A/B of the Stage 4
+binary against the Stage 5 one, alternating order every repetition, min-of-9, gated first
+on byte-identical stdout and exit code for every case (all five identical):
 
 | case | before | after | delta |
 |------|--------|-------|-------|
@@ -594,16 +594,52 @@ stdout and exit code for every case (all five identical):
 | `yq -o json '.'` 1 MB | 16.62 ms | 16.65 ms | +0.2% |
 | `yq -o json '.'` 10 MB | 126.19 ms | 126.80 ms | +0.5% |
 
-Worst case is +4.2%, on the cheapest query at the largest size — where a roughly fixed
-~1 ms pass is the largest fraction of the work. That is inside the +8% ceiling this
-document set before implementing. The −4.5% row is noise: the pass cannot make anything
-faster.
+This ran on an Apple M5 Max laptop under a load average near 10, which CLAUDE.md's
+benchmarking discipline explicitly disqualifies for a final number — kept here only to
+show the pinned run below (which found roughly 2–4× this cost) is not a contradiction of
+this table, just a more sensitive instrument.
 
-**Still outstanding:** this ran on an Apple M5 Max laptop under a load average near 10,
-which CLAUDE.md's benchmarking discipline explicitly disqualifies for a final number. It
-is enough to show the cost is in the expected band and no worse; the formal interleaved
-A/B on the pinned bench machines (`johns-mac-mini` ARM, `terminus` x86_64) has **not**
-been run and should be before this is treated as settled.
+**The formal interleaved A/B, on both pinned machines — run, and it found a real
+regression this table missed.** Method per
+[docs/guides/benchmarking.md](../guides/benchmarking.md#ab-benchmarking-method):
+alternating order every repetition, reps=9, output identity gated before any timing is
+read, a `--control` noise floor measured per group per machine. Full detail in PR #1391's
+review thread.
+
+*As Stage 5 first landed* (pair `201c3db14` → `c97c66d7f`, later renumbered to
+`4713aa7cb` → `ea735849c` by an unrelated rebase — source patch verified byte-identical
+across the rename):
+
+| group | Apple M4 Pro | AMD Ryzen 9 7950X |
+|---|---|---|
+| `jq` on JSON | +0.94% | **+9.47%** (worst +17.9%) |
+| `yq -o json` on ASCII YAML | −0.43% | +0.46% |
+| `yq -o json` on 45%-non-ASCII YAML | **+3.57%** (worst +4.8%) | +0.06% |
+
+This breached the document's own +8% ceiling on x86_64 — a real result the laptop run
+above could not have found (the two architectures fail in *opposite* places: x86 on `jq`,
+ARM on non-ASCII `yq`). Attribution (7950X, `jq` group, validation pass isolated by
+rebuilding with it disabled): the UTF-8 pass itself costs **~1%**; the other ~6 points
+came from an unrelated change in the same commit — `read_stdin`/`read_file` moving to
+`String::from_utf8_lossy(&bytes).into_owned()`, which allocates and copies the *entire*
+document even when it is already valid UTF-8 (`.into_owned()` still clones a
+`Cow::Borrowed`).
+
+**Fixed** by commit
+[`03069c6a9`](https://github.com/rust-works/succinctly/commit/03069c6a9d5fc2782af20cb5d1ee50be706863ab)
+(taking ownership of the existing buffer on the valid path instead of re-copying it),
+measured before landing:
+
+| comparison | AMD Ryzen 9 7950X | Apple M4 Pro |
+|---|---|---|
+| Stage 5 → Stage 5+fix | **−7.04%** (worst −13.2%) | +0.45% (neutral) |
+| Stage 4 → Stage 5+fix | **+0.48%** — inside the control floor | +0.83% |
+
+Post-fix, the always-on pass costs under 1% on both pinned machines — comfortably inside
+the +8% ceiling Open Risk 5 below names as "the ceiling to defend." The one real
+remaining cost is non-ASCII YAML on ARM (no NEON arm for `validate_utf8`, +4.8%/+5.8%
+net of control on a 45%-non-ASCII 10 MB document) — still under the ceiling, ARM-only,
+and a targeted NEON fix if it ever matters, not blocking.
 
 **Stage 6 — make the YAML streaming path loud (new, split out of Stage 2).** After
 Stages 2 and 3, `succinctly yq -o=json '.'` on a document with a bad *escape* still emits
@@ -756,9 +792,10 @@ what Stage 6 is left with is bad escapes only.
 
 ## Follow-up issues
 
-Not yet filed. Once this document is reviewed:
-
-1. One implementation issue per stage above, linking back here.
+1. ~~One implementation issue per stage above, linking back here.~~ Stage 6 (the streaming
+   YAML-output gap this document's own text names) filed as
+   [#1615](https://github.com/rust-works/succinctly/issues/1615). The other stages landed
+   directly rather than through a separate tracking issue each.
 2. ~~**`JsonFields::uncons` cannot represent a malformed field** — #1194's headline repro
    (`{invalid} → {}`), see Correction 3.~~ Filed and fixed for the two routes that
    materialize nothing today as
@@ -768,6 +805,8 @@ Not yet filed. Once this document is reviewed:
    (`LazySource::Values` in `eval_generic.rs`) has the identical gap and was deliberately
    left unfixed there — see
    [jq Limitations](../compliance/jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input).
+   [#1194](https://github.com/rust-works/succinctly/issues/1194) itself (the original
+   headline repro this design doc grew out of) is closed.
 3. ~~**Decide catchability of decode errors** — Open Risk 1, if it is not settled during
    Stage 3's review.~~ Filed as [#1620](https://github.com/rust-works/succinctly/issues/1620),
    resolved there -- see Open Risk 1 above.
