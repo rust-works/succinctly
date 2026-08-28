@@ -6941,6 +6941,60 @@ fn builtin_ascii_upcase<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Which edge of a string `trim_edge`/`check_edge` (#1538) operate on --
+/// `ltrimstr`/`startswith` trim/check the front, `rtrimstr`/`endswith` the
+/// back. Shared by both function pairs rather than each carrying its own
+/// prefix-vs-suffix duplicate, since the two pairs' bodies are otherwise
+/// mirror images of each other (`starts_with`/`ends_with`,
+/// `cow[prefix.len()..]`/`cow[..len - suffix.len()]`).
+enum StringEdge {
+    Prefix,
+    Suffix,
+}
+
+/// Shared body of [`builtin_ltrimstr`]/[`builtin_rtrimstr`] (#1538): both are
+/// *total* -- a non-string pattern argument or a non-string input value
+/// passes through unchanged, never an error -- differing only in which edge
+/// they trim.
+fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    pattern_owned: OwnedValue,
+    edge: StringEdge,
+) -> QueryResult<'a, W> {
+    // `to_owned` stays inside the closure rather than being hoisted -- it is
+    // only reached on these two cold paths, so hoisting would pay for a
+    // whole-document copy on the hot one.
+    let OwnedValue::String(pattern) = pattern_owned else {
+        return QueryResult::Owned(to_owned(value));
+    };
+    let result = match value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
+                let matched = match edge {
+                    StringEdge::Prefix => cow.starts_with(&pattern),
+                    StringEdge::Suffix => cow.ends_with(&pattern),
+                };
+                if matched {
+                    let trimmed = match edge {
+                        StringEdge::Prefix => &cow[pattern.len()..],
+                        StringEdge::Suffix => &cow[..cow.len() - pattern.len()],
+                    };
+                    OwnedValue::String(trimmed.to_string())
+                } else {
+                    OwnedValue::String(cow.into_owned())
+                }
+            }
+            // #1620/#1660: an undecodable string must raise, not silently
+            // substitute an empty string.
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        // jq's ltrimstr/rtrimstr are total: a non-string input passes
+        // through unchanged.
+        _ => to_owned(value),
+    };
+    QueryResult::Owned(result)
+}
+
 /// Builtin: ltrimstr(s) - remove prefix s
 fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     prefix_expr: &Expr,
@@ -6958,33 +7012,7 @@ fn builtin_ltrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (ADR-0018), not a divergence. Same for every other `ArgFanout::All`
         // in this family.
         ArgFanout::All,
-        |prefix_owned| {
-            // jq's ltrimstr is total: a non-string argument leaves input
-            // unchanged. `to_owned` stays inside the loop rather than being
-            // hoisted -- it is only reached on these two cold paths, so
-            // hoisting would pay for a whole-document copy on the hot one.
-            let OwnedValue::String(prefix) = prefix_owned else {
-                return QueryResult::Owned(to_owned(&value));
-            };
-            let result = match &value {
-                StandardJson::String(s) => match s.as_str() {
-                    Ok(cow) => {
-                        if cow.starts_with(&prefix) {
-                            OwnedValue::String(cow[prefix.len()..].to_string())
-                        } else {
-                            OwnedValue::String(cow.into_owned())
-                        }
-                    }
-                    // #1620/#1660: an undecodable string must raise, not
-                    // silently substitute an empty string.
-                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
-                },
-                // jq's ltrimstr is total: a non-string input passes through
-                // unchanged.
-                _ => to_owned(&value),
-            };
-            QueryResult::Owned(result)
-        },
+        |prefix_owned| trim_edge(&value, prefix_owned, StringEdge::Prefix),
     )
 }
 
@@ -7000,32 +7028,45 @@ fn builtin_rtrimstr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         // Real yq has no `rtrimstr` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
-        |suffix_owned| {
-            // jq's rtrimstr is total: a non-string argument leaves input
-            // unchanged.
-            let OwnedValue::String(suffix) = suffix_owned else {
-                return QueryResult::Owned(to_owned(&value));
-            };
-            let result = match &value {
-                StandardJson::String(s) => match s.as_str() {
-                    Ok(cow) => {
-                        if cow.ends_with(&suffix) {
-                            OwnedValue::String(cow[..cow.len() - suffix.len()].to_string())
-                        } else {
-                            OwnedValue::String(cow.into_owned())
-                        }
-                    }
-                    // #1620/#1660: same decode-failure exclusion as
-                    // `ltrimstr`.
-                    Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
-                },
-                // jq's rtrimstr is total: a non-string input passes through
-                // unchanged.
-                _ => to_owned(&value),
-            };
-            QueryResult::Owned(result)
-        },
+        |suffix_owned| trim_edge(&value, suffix_owned, StringEdge::Suffix),
     )
+}
+
+/// Shared body of [`builtin_startswith`]/[`builtin_endswith`] (#1538): both
+/// check one edge of a string against a pattern, erroring (or, if
+/// `optional`, answering `None`) on a non-string pattern or non-string
+/// input -- unlike [`trim_edge`]'s total pair, these two are partial.
+fn check_edge<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    pattern_owned: OwnedValue,
+    optional: bool,
+    edge: StringEdge,
+) -> QueryResult<'a, W> {
+    let builtin_name = match edge {
+        StringEdge::Prefix => "startswith",
+        StringEdge::Suffix => "endswith",
+    };
+    let type_error = || EvalError::new(format!("{builtin_name}() requires string inputs"));
+    let OwnedValue::String(pattern) = pattern_owned else {
+        return QueryResult::Error(type_error());
+    };
+    match value {
+        // #1620/#1660: `.is_ok_and(...)` used to treat a decode `Err` the
+        // same as "no match", silently returning `false` instead of
+        // raising.
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => {
+                let matched = match edge {
+                    StringEdge::Prefix => cow.starts_with(&pattern),
+                    StringEdge::Suffix => cow.ends_with(&pattern),
+                };
+                QueryResult::Owned(OwnedValue::Bool(matched))
+            }
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(type_error()),
+    }
 }
 
 /// Builtin: startswith(s) - check if string starts with s
@@ -7040,22 +7081,7 @@ fn builtin_startswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         // Real yq has no `startswith` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
-        |prefix_owned| {
-            let OwnedValue::String(prefix) = prefix_owned else {
-                return QueryResult::Error(EvalError::new("startswith() requires string inputs"));
-            };
-            match &value {
-                // #1620/#1660: `.is_ok_and(...)` treated a decode `Err` the
-                // same as "no match", silently returning `false` instead of
-                // raising.
-                StandardJson::String(s) => match s.as_str() {
-                    Ok(cow) => QueryResult::Owned(OwnedValue::Bool(cow.starts_with(&prefix))),
-                    Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
-                },
-                _ if optional => QueryResult::None,
-                _ => QueryResult::Error(EvalError::new("startswith() requires string inputs")),
-            }
-        },
+        |prefix_owned| check_edge(&value, prefix_owned, optional, StringEdge::Prefix),
     )
 }
 
@@ -7071,21 +7097,7 @@ fn builtin_endswith<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         // Real yq has no `endswith` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
-        |suffix_owned| {
-            let OwnedValue::String(suffix) = suffix_owned else {
-                return QueryResult::Error(EvalError::new("endswith() requires string inputs"));
-            };
-            match &value {
-                // #1620/#1660: same decode-failure exclusion as
-                // `startswith`.
-                StandardJson::String(s) => match s.as_str() {
-                    Ok(cow) => QueryResult::Owned(OwnedValue::Bool(cow.ends_with(&suffix))),
-                    Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
-                },
-                _ if optional => QueryResult::None,
-                _ => QueryResult::Error(EvalError::new("endswith() requires string inputs")),
-            }
-        },
+        |suffix_owned| check_edge(&value, suffix_owned, optional, StringEdge::Suffix),
     )
 }
 
@@ -10630,28 +10642,55 @@ fn builtin_indices<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
-/// `indices`'s search for one already-resolved pattern -- the body of
-/// [`builtin_indices`], run once per output of its pattern generator (#1279).
+/// Which occurrence(s) [`search_pattern`] (#1538) reports -- `indices`
+/// collects every match, `index`/`rindex` report only the first/last (and,
+/// for a string input, differ from `indices` in what an object pattern --
+/// jq's slice -- means: `indices` answers the sliced *substring* directly,
+/// `index`/`rindex` treat that substring as a type-mismatch, matching jq's
+/// own `.[0]`/`.[-1:][0]`-of-`indices` definition for those two).
+enum SearchOccurrence {
+    All,
+    First,
+    Last,
+}
+
+/// Shared search body of [`builtin_indices`]/[`builtin_index`]/[`builtin_rindex`]
+/// (#1538) -- the three differ only in [`SearchOccurrence`], both for a
+/// string input's substring search and an array input's element scan.
 ///
-/// Split out rather than inlined into the closure because the search returns
-/// from several places inside a nested `match`, and each of those must end the
-/// *search*, not the fan-out loop. That scattered-return shape is exactly what
-/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
-/// the body solves it and the fan-out together.
-fn indices_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// Split out rather than inlined into each builtin's `fanout_arg` closure
+/// because the search returns from several places inside a nested `match`,
+/// and each of those must end the *search*, not the fan-out loop. That
+/// scattered-return shape is exactly what #1277's cluster 1 named as the
+/// obstacle to fixing these three; extracting the body solved it (#1279),
+/// and this merge folds the three near-identical bodies that extraction
+/// left behind into one.
+fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     pattern: &OwnedValue,
     optional: bool,
+    occurrence: SearchOccurrence,
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::String(s) => {
-            // An object pattern is jq's slice, which answers a *substring*
-            // rather than a list of positions — see `string_slice_pattern`.
+            // An object pattern is jq's slice. For `indices` that answers a
+            // *substring* directly; `index`/`rindex` instead report the
+            // type mismatch of indexing that substring with a number (see
+            // `SearchOccurrence`'s own doc comment).
             if let Some(sliced) = string_slice_pattern(value, pattern) {
-                return match sliced {
-                    Ok(v) => QueryResult::Owned(v),
-                    Err(_) if optional => QueryResult::None,
-                    Err(e) => e.into(),
+                return match occurrence {
+                    SearchOccurrence::All => match sliced {
+                        Ok(v) => QueryResult::Owned(v),
+                        Err(_) if optional => QueryResult::None,
+                        Err(e) => e.into(),
+                    },
+                    SearchOccurrence::First | SearchOccurrence::Last => match sliced {
+                        _ if optional => QueryResult::None,
+                        Err(e) => e.into(),
+                        Ok(_) => QueryResult::Error(EvalError::cannot_index_with_type(
+                            "string", "number",
+                        )),
+                    },
                 };
             }
             // For strings, pattern must be a string
@@ -10661,36 +10700,79 @@ fn indices_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => return QueryResult::Error(non_string_pattern(value, pattern)),
             };
             match s.as_str() {
-                Ok(cow) => {
-                    let mut indices = Vec::new();
-                    let mut start = 0;
-                    while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
-                        indices.push(OwnedValue::Int((start + pos) as i64));
-                        start += pos + 1;
-                        if start >= cow.len() {
-                            break;
+                Ok(cow) => match occurrence {
+                    SearchOccurrence::All => {
+                        let mut indices = Vec::new();
+                        let mut start = 0;
+                        while let Some(pos) = cow[start..].find(pattern_str.as_str()) {
+                            indices.push(OwnedValue::Int((start + pos) as i64));
+                            start += pos + 1;
+                            if start >= cow.len() {
+                                break;
+                            }
                         }
+                        QueryResult::Owned(OwnedValue::Array(indices))
                     }
-                    QueryResult::Owned(OwnedValue::Array(indices))
-                }
+                    SearchOccurrence::First => match cow.find(pattern_str.as_str()) {
+                        Some(pos) => QueryResult::Owned(OwnedValue::Int(pos as i64)),
+                        None => QueryResult::Owned(OwnedValue::Null),
+                    },
+                    SearchOccurrence::Last => match cow.rfind(pattern_str.as_str()) {
+                        Some(pos) => QueryResult::Owned(OwnedValue::Int(pos as i64)),
+                        None => QueryResult::Owned(OwnedValue::Null),
+                    },
+                },
                 Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
             }
         }
-        StandardJson::Array(elements) => {
+        StandardJson::Array(elements) => match occurrence {
             // For arrays, find indices where element equals the pattern
             // (any type). `owned_value_eq::<S>`, not plain `==`, so this
             // agrees with `==`'s own yq-mode strict Int/Float distinction
             // (#950 review).
-            let mut indices = Vec::new();
-            for (i, elem) in (*elements).enumerate() {
-                if owned_value_eq::<S>(&to_owned(&elem), pattern) {
-                    indices.push(OwnedValue::Int(i as i64));
+            SearchOccurrence::All => {
+                let mut indices = Vec::new();
+                for (i, elem) in (*elements).enumerate() {
+                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                        indices.push(OwnedValue::Int(i as i64));
+                    }
                 }
+                QueryResult::Owned(OwnedValue::Array(indices))
             }
-            QueryResult::Owned(OwnedValue::Array(indices))
-        }
+            SearchOccurrence::First => {
+                for (i, elem) in (*elements).enumerate() {
+                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                        return QueryResult::Owned(OwnedValue::Int(i as i64));
+                    }
+                }
+                QueryResult::Owned(OwnedValue::Null)
+            }
+            // Unlike `First`, this has to walk the whole array before it
+            // knows the answer -- collected into a `Vec` first (rather than
+            // e.g. `DoubleEndedIterator::rev`) because `DocumentElements`'s
+            // cursor walk is forward-only, same as `First`/`All` above.
+            SearchOccurrence::Last => {
+                let items: Vec<_> = (*elements).collect();
+                for (i, elem) in items.iter().enumerate().rev() {
+                    if owned_value_eq::<S>(&to_owned(elem), pattern) {
+                        return QueryResult::Owned(OwnedValue::Int(i as i64));
+                    }
+                }
+                QueryResult::Owned(OwnedValue::Null)
+            }
+        },
         _ => unsearchable_input(value, pattern, optional),
     }
+}
+
+/// `indices`'s search for one already-resolved pattern -- the body of
+/// [`builtin_indices`], run once per output of its pattern generator (#1279).
+fn indices_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    pattern: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    search_pattern::<W, S>(value, pattern, optional, SearchOccurrence::All)
 }
 
 /// Builtin: index(s) - first index of substring/element s, or null
@@ -10713,61 +10795,12 @@ fn builtin_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// `index`'s search for one already-resolved pattern -- the body of
 /// [`builtin_index`], run once per output of its pattern generator (#1279).
-///
-/// Split out rather than inlined into the closure because the search returns
-/// from several places inside a nested `match`, and each of those must end the
-/// *search*, not the fan-out loop. That scattered-return shape is exactly what
-/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
-/// the body solves it and the fan-out together.
 fn index_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     pattern: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match value {
-        StandardJson::String(s) => {
-            // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
-            // `indices` answers, so an object pattern — jq's slice — leaves a
-            // *substring* to be indexed with a number, and reports that.
-            if let Some(sliced) = string_slice_pattern(value, pattern) {
-                return match sliced {
-                    _ if optional => QueryResult::None,
-                    Err(e) => e.into(),
-                    Ok(_) => {
-                        QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
-                    }
-                };
-            }
-            // For strings, pattern must be a string
-            let pattern_str = match pattern {
-                OwnedValue::String(p) => p,
-                _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(non_string_pattern(value, pattern)),
-            };
-            match s.as_str() {
-                Ok(cow) => {
-                    if let Some(pos) = cow.find(pattern_str.as_str()) {
-                        QueryResult::Owned(OwnedValue::Int(pos as i64))
-                    } else {
-                        QueryResult::Owned(OwnedValue::Null)
-                    }
-                }
-                Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
-            }
-        }
-        StandardJson::Array(elements) => {
-            // For arrays, pattern can be any type. `owned_value_eq::<S>`,
-            // not plain `==` (#950 review, same reasoning as `indices`
-            // above).
-            for (i, elem) in (*elements).enumerate() {
-                if owned_value_eq::<S>(&to_owned(&elem), pattern) {
-                    return QueryResult::Owned(OwnedValue::Int(i as i64));
-                }
-            }
-            QueryResult::Owned(OwnedValue::Null)
-        }
-        _ => unsearchable_input(value, pattern, optional),
-    }
+    search_pattern::<W, S>(value, pattern, optional, SearchOccurrence::First)
 }
 
 /// Builtin: `INDEX(idx_expr)` - build an object keyed by `idx_expr` from
@@ -10842,62 +10875,12 @@ fn builtin_rindex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// `rindex`'s search for one already-resolved pattern -- the body of
 /// [`builtin_rindex`], run once per output of its pattern generator (#1279).
-///
-/// Split out rather than inlined into the closure because the search returns
-/// from several places inside a nested `match`, and each of those must end the
-/// *search*, not the fan-out loop. That scattered-return shape is exactly what
-/// #1277's cluster 1 named as the obstacle to fixing these three; extracting
-/// the body solves it and the fan-out together.
 fn rindex_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: &StandardJson<'a, W>,
     pattern: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match value {
-        StandardJson::String(s) => {
-            // jq defines `index`/`rindex` as `.[0]`/`.[-1:][0]` of what
-            // `indices` answers, so an object pattern — jq's slice — leaves a
-            // *substring* to be indexed with a number, and reports that.
-            if let Some(sliced) = string_slice_pattern(value, pattern) {
-                return match sliced {
-                    _ if optional => QueryResult::None,
-                    Err(e) => e.into(),
-                    Ok(_) => {
-                        QueryResult::Error(EvalError::cannot_index_with_type("string", "number"))
-                    }
-                };
-            }
-            // For strings, pattern must be a string
-            let pattern_str = match pattern {
-                OwnedValue::String(p) => p,
-                _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(non_string_pattern(value, pattern)),
-            };
-            match s.as_str() {
-                Ok(cow) => {
-                    if let Some(pos) = cow.rfind(pattern_str.as_str()) {
-                        QueryResult::Owned(OwnedValue::Int(pos as i64))
-                    } else {
-                        QueryResult::Owned(OwnedValue::Null)
-                    }
-                }
-                Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
-            }
-        }
-        StandardJson::Array(elements) => {
-            // For arrays, pattern can be any type. `owned_value_eq::<S>`,
-            // not plain `==` (#950 review, same reasoning as `indices`
-            // above).
-            let items: Vec<_> = (*elements).collect();
-            for (i, elem) in items.iter().enumerate().rev() {
-                if owned_value_eq::<S>(&to_owned(elem), pattern) {
-                    return QueryResult::Owned(OwnedValue::Int(i as i64));
-                }
-            }
-            QueryResult::Owned(OwnedValue::Null)
-        }
-        _ => unsearchable_input(value, pattern, optional),
-    }
+    search_pattern::<W, S>(value, pattern, optional, SearchOccurrence::Last)
 }
 
 /// Builtin: tojsonstream - convert to JSON text stream format (simplified)
