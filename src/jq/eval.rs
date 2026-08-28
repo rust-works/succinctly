@@ -570,13 +570,15 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
 ///
 /// Used only at this file's primary result-value materialization points
 /// (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
+/// `builtin_setpath`, `builtin_del`, `delpaths_one`,
 /// `map_over`/`builtin_map_values`, `builtin_to_entries`) rather than
-/// replacing [`to_owned`] everywhere: this file has on the order of 200
-/// other `to_owned` call sites (mostly `QueryResult` collector boilerplate
-/// and error-message rendering), and changing the infallible function's own
-/// signature would force a Result-threading edit at every one of them in a
-/// single change. Left as a documented gap for a follow-up rather than
-/// attempted here (#1746's own comment thread).
+/// replacing [`to_owned`] everywhere: this file has on the order of 150
+/// other `to_owned` call sites, roughly 50 of them a real instance of the
+/// same #1746 bug shape (filed as #1755) and the rest `QueryResult`
+/// collector boilerplate or error-message rendering -- changing the
+/// infallible function's own signature would force a Result-threading edit
+/// at every one of them in a single change. Left as a documented gap for a
+/// follow-up rather than attempted here (#1746's own comment thread).
 ///
 /// Key handling is intentionally unchanged from [`to_owned`]: an object
 /// field whose key fails to decode is still silently dropped (a distinct,
@@ -6257,14 +6259,14 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             },
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Owned(v) => results.push(v),
-            QueryResult::Many(vs) => match vs
-                .iter()
-                .map(to_owned_checked)
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(owned) => results.extend(owned),
-                Err(e) => return QueryResult::Error(e),
-            },
+            QueryResult::Many(vs) => {
+                for v in &vs {
+                    match to_owned_checked(v) {
+                        Ok(owned) => results.push(owned),
+                        Err(e) => return QueryResult::Error(e),
+                    }
+                }
+            }
             QueryResult::ManyOwned(vs) => results.extend(vs),
             QueryResult::None => {}
             QueryResult::Error(e) => return QueryResult::Error(e),
@@ -31648,7 +31650,13 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     match result {
         Ok(v) => QueryResult::Owned(v),
-        Err(_) if optional => QueryResult::None,
+        // #1746 review: a decode failure from `to_owned_checked` must bypass
+        // `optional` the same way every other converted call site does
+        // (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
+        // `builtin_del` all `return QueryResult::Error(e)` unconditionally
+        // for it) -- `delete_paths_sorted`'s own ordinary errors are
+        // unaffected, since `is_uncatchable()` is `false` for those.
+        Err(e) if optional && !e.is_uncatchable() => QueryResult::None,
         Err(e) => e.into(),
     }
 }
@@ -56872,6 +56880,56 @@ mod tests {
                 assert_eq!(m.get("b"), Some(&OwnedValue::Int(2)));
             }
             other => panic!("delpaths: unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1746 review: `resolve_node`'s `Expr::Optional` guard widening
+    /// (`is_invalid_path_expression()` -> `is_uncatchable()`) is *not* dead
+    /// code, contrary to this fix's own original claim -- it's reachable
+    /// through any pre-existing decode-failure-raising builtin used inside a
+    /// path expression's own bare `?`, entirely independent of
+    /// `to_owned_checked`. Confirmed live (review): before this fix,
+    /// `path(.a | tonumber?)` on `{"a": "\ud800"}` silently suppressed
+    /// `tonumber`'s own decode-failure raise (`QueryResult::None`); after,
+    /// it correctly propagates uncaught, matching the sibling `Expr::Try`
+    /// arm's already-existing behavior for the identical shape.
+    #[test]
+    fn eval_rs_resolve_node_optional_does_not_suppress_decode_failure_1746() {
+        let json: &[u8] = br#"{"a":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("path(.a | tonumber?)").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!(
+                "expected the decode failure to survive path-context `?` uncaught, got: {other:?}"
+            ),
+        }
+    }
+
+    /// #1746 review: `delpaths_one` must bypass `optional` for a decode
+    /// failure from `to_owned_checked`, matching every other converted call
+    /// site (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
+    /// `builtin_del` all propagate it unconditionally). Live-unreachable
+    /// today via any real jq/yq syntax (found by review, not a live repro),
+    /// but pinned directly against the function's own contract regardless.
+    #[test]
+    fn eval_rs_delpaths_decode_failure_bypasses_optional_1746() {
+        let json: &[u8] = br#"{"a":"\ud800"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("delpaths([[\"a\"]])?").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => {
+                panic!("expected the decode failure to bypass `optional` uncaught, got: {other:?}")
+            }
         }
     }
 
