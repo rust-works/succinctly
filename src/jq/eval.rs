@@ -6970,13 +6970,14 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
     let result = match value {
         StandardJson::String(s) => match s.as_str() {
             Ok(cow) => {
-                // Slicing is only ever reached once `matched` is confirmed
-                // true -- `pattern.len() <= cow.len()` follows from
-                // `starts_with`/`ends_with` succeeding, which is what makes
-                // the slice sound. Computing the slice unconditionally
-                // (matched or not) would let a pattern longer than `cow`
-                // panic on the subtraction, so the two stay in one `match`
-                // per edge rather than being split into an eager pair.
+                // Each arm's guard (`starts_with`/`ends_with`) must confirm
+                // the match before its body slices -- that's what makes
+                // `pattern.len() <= cow.len()` hold, and the slice sound.
+                // Computing the slice unconditionally, match or not, would
+                // let a pattern longer than `cow` panic on the subtraction
+                // (caught in review, #1538), so match and slice stay in one
+                // guarded arm per edge rather than being split into an
+                // eager pair.
                 match edge {
                     StringEdge::Prefix if cow.starts_with(&pattern) => {
                         OwnedValue::String(cow[pattern.len()..].to_string())
@@ -40097,6 +40098,15 @@ mod tests {
                 assert_eq!(s, "");
             }
         );
+
+        // #1538 review: a pattern strictly longer than the input must not
+        // panic (`cow[pattern.len()..]` would be out of bounds) -- it's
+        // simply not a prefix, so the input passes through unchanged.
+        query!(br#""ab""#, r#"ltrimstr("abcdef")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ab");
+            }
+        );
     }
 
     #[test]
@@ -40133,6 +40143,15 @@ mod tests {
         query!(br#""foobar""#, r#"rtrimstr("foobar")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "");
+            }
+        );
+
+        // #1538 review: a pattern strictly longer than the input must not
+        // panic (`cow.len() - pattern.len()` would underflow) -- it's
+        // simply not a suffix, so the input passes through unchanged.
+        query!(br#""ab""#, r#"rtrimstr("abcdef")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ab");
             }
         );
     }
