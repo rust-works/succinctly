@@ -1721,7 +1721,29 @@ fn get_inputs(
                     let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
                     validate_json_input(e.as_bytes(), filename.as_deref())?;
                 }
-                succinctly::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
+                if args.raw_input && !args.slurp {
+                    // #1742: real jq's non-slurp `-R` applies this
+                    // end-of-buffer-relative fixup (#1717) per *line*, not
+                    // once over the whole document -- splitting the raw
+                    // bytes on `b'\n'` first, before substituting, is safe
+                    // even amid invalid UTF-8: `\n` (0x0A) can never appear
+                    // as a multi-byte sequence's own continuation byte, so
+                    // this never risks splitting one mid-sequence. Joining
+                    // back on `"\n"` reproduces the original byte layout
+                    // exactly (including a trailing newline, which
+                    // `split`'s own trailing-empty-segment already accounts
+                    // for) -- `raw.lines()` further down re-splits this
+                    // same way, so it sees corrected content at unchanged
+                    // line boundaries. Slurp mode (`-s`) keeps whole-buffer
+                    // substitution below, matching real jq there too.
+                    e.into_bytes()
+                        .split(|&b| b == b'\n')
+                        .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    succinctly::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
+                }
             }
         };
         raw_inputs.push((file_idx, raw));
