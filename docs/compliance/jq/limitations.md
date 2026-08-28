@@ -634,16 +634,35 @@ $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted | last' # exit 5 now (was: "b"
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[-1]'    # exit 5 now (was: "b",           exit 0)
 ```
 
-**Still not fixed, and deliberately so: `first`, `[0]`, and a *positive* `[n]`.** These three
-answer from one `uncons_key`/a short early-exit walk (collapsing keeps every key at its first
-position, so a small positive index never needs to look past it) — restoring the check here means
-restoring exactly the walk #1514/#1599 removed, on the one arm shape built to avoid it entirely:
+**Still not fixed: `first`, `[0]`, and a *positive* `[n]`.** These three answer from one
+`uncons_key`/a short early-exit walk (collapsing keeps every key at its first position, so a small
+positive index never needs to look past it) — restoring the check here means restoring exactly the
+walk #1514/#1599 removed, on the one arm shape built to avoid it entirely. #1629 left this part of
+#1514/#1599's original tradeoff as it found it rather than widening its own scope to relitigate it:
 
 ```
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[0]'      # 123, exit 0 -- unfixed
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted | first' # 123, exit 0 -- unfixed
 $ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[1]'      # "b",  exit 0 -- unfixed
 ```
+
+**Also not fixed: any of the four raising arms above, once wrapped in an early-exit demand
+combinator** (`first(keys_unsorted[])`, `limit(1; keys_unsorted[])`). `fold_pipe_stages_sink`
+routes `Expr::Iterate` through a separate demand-driven `each_lazy_keys_iterate_sink`, not
+`fold_lazy_keys_stage`'s arm #1629 fixed, and that sink still streams the raw, unchecked
+`DistinctKeyCursors` iterator directly:
+
+```
+$ echo '{123: 1, "b": 2}' | sjq -c 'keys_unsorted[]'              # exit 5 (fixed above)
+$ echo '{123: 1, "b": 2}' | sjq -c 'first(keys_unsorted[])'       # 123, exit 0 -- unfixed
+```
+
+Found during #1629's own review. Unlike the early-exit arms above, this isn't obviously the same
+tradeoff: whether an early-exit *consumer* should pay to validate object shape it may never finish
+reading is a real, separate design question — the same one #725/#1565 already answered "no" to for
+a `map(f)` error under `first` (`docs/compliance/jq/limitations.md`, `each_lazy_seq_iterate_sink`'s
+own doc comment) — so resolving it here, one way or the other, is left to its own issue (#1770)
+rather than folded into #1629's own scope.
 
 `keys_unsorted | length` is not in this set at all — it reaches `effective_len`, which walks, and
 so has carried the check for free since #1628.

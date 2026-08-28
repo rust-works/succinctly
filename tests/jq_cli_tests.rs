@@ -16896,6 +16896,29 @@ fn test_jq_keys_unsorted_positional_walked_arms_raise_1629() -> Result<()> {
     let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[-1]"], Some(input))?;
     assert_eq!((out.trim(), code), ("\"c\"", 0));
 
+    // A genuine duplicate key ("a" repeats), combined with a malformed
+    // member, must still raise on `last`/`[-1]` -- an earlier version of
+    // this fix hand-rolled `Last`'s two branches separately and only
+    // checked the uncollapsed one, missing exactly this shape: jq mode
+    // with a real duplicate routes through `collapsed_fields_if`'s `Some`
+    // branch, which materialized via `all_fields()`/`collapse_repeated`
+    // without ever checking `key_is_malformed`/`ends_unpaired`. Caught by
+    // code review before merge; verified live that a genuine duplicate
+    // alone still answers normally (the second assertion below).
+    let malformed_with_duplicate = r#"{"a":1,"a":2,"b"}"#;
+    for filter in [
+        "keys_unsorted | last",
+        "keys_unsorted[-1]",
+        "keys_unsorted[]",
+    ] {
+        let (out, _stderr, code) = run_jq_full(&["-c", filter], Some(malformed_with_duplicate))?;
+        assert_eq!(code, 5, "{filter}: out: {out:?}");
+        assert!(out.trim().is_empty(), "{filter}: out: {out:?}");
+    }
+    let duplicate_only = r#"{"a":1,"a":2,"b":3}"#;
+    let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(duplicate_only))?;
+    assert_eq!((out.trim(), code), ("\"b\"", 0));
+
     Ok(())
 }
 
