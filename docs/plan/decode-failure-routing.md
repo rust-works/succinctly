@@ -627,12 +627,22 @@ what Stage 6 is left with is bad escapes only.
   this work touches four of them — but consolidating them is a refactor with its own risk
   profile and should follow, not accompany, a behaviour change. Sequenced after this per
   #1283's cluster E.
-- **`eval.rs`'s private copy of the `to_owned` family.** #1247 correctly notes it is not
-  live-reachable for this scenario: `eval.rs`'s evaluator only processes JSON
-  re-serialized from an already-decoded `OwnedValue`, which by construction cannot contain
-  invalid UTF-8. Site 19 (`eval.rs:427`) is included anyway, as a cheap consistency fix,
-  but no behaviour change is expected from it and none should be asserted in a test that
-  claims to exercise it end-to-end.
+- **`eval.rs`'s private copy of the `to_owned` family** — corrected by #1746 (this premise
+  was false). #1247's "not live-reachable" claim held for the shipped CLI (`jq_runner.rs`/
+  `yq_runner.rs` route reads through `eval_generic::eval_with_cursor`, and every write path
+  eagerly, strictly materializes upfront), but the crate's public library API
+  (`succinctly::jq::eval`/`eval_using`) feeds raw, untrusted bytes straight into
+  `JsonIndex::build` and this evaluator, with no re-serialization step and no upstream
+  decode-failure check to have already caught it. #1746 fixed the primary result-value
+  materialization points (`builtin_path`, `eval_assign`, `eval_update`,
+  `yq_assign_noop_check`, `map`/`map_values`, `to_entries`) via a new fallible
+  `to_owned_checked`/`to_owned_checked_at_depth` sibling, mirroring
+  `eval_generic::to_owned_at_depth`'s already-fixed shape. The plain, infallible
+  `to_owned`/`to_owned_at_depth` remains in place for this file's ~200 other call sites
+  (mostly `QueryResult` collector boilerplate and error-message rendering) — deliberately
+  out of scope for #1746, since changing that function's own signature would force a
+  Result-threading edit at every one of them in a single change; left as a documented
+  follow-up rather than attempted there.
 - **Buffering the whole record so the streaming path can reject cleanly.** That would
   reverse P9 (direct YAML-to-JSON streaming, a 2.3× win) for a malformed-input edge case.
 
