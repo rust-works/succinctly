@@ -3981,7 +3981,11 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 // `String` can, so transcode into a scratch buffer and commit
                 // only once it succeeds (#1247). Only this branch pays the
                 // allocation: the fast path above decodes before it writes.
-                let mut committed = String::new();
+                // `bytes.len()` is a tight lower bound on the transcoded
+                // length (escapes shrink; JSON escaping can grow it a
+                // little), so reserving it up front avoids the realloc
+                // chain `String::new()` would pay for (#1622).
+                let mut committed = String::with_capacity(bytes.len() + 2);
                 stream_transcode_double_quoted_to_json(&mut committed, bytes)?;
                 out.write_str(&committed)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
@@ -3997,8 +4001,8 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
             } else {
                 // Same commit-on-success rollback as the double-quoted arm
-                // above (#1247).
-                let mut committed = String::new();
+                // above (#1247), with the same capacity hint (#1622).
+                let mut committed = String::with_capacity(bytes.len() + 2);
                 stream_transcode_single_quoted_to_json(&mut committed, bytes)?;
                 out.write_str(&committed)
                     .map_err(|_| YamlStringError::InvalidUtf8)?;
