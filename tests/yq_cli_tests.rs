@@ -3528,6 +3528,61 @@ fn test_color_terminator_ordering_multi_result_1708() -> Result<()> {
     Ok(())
 }
 
+/// #1708 code review: a value whose text contains a literal, unescaped
+/// quote character (an apostrophe inside an already-double-quoted string,
+/// e.g. "it's here") desyncs `colorize_yaml`'s naive quote-toggle tracking
+/// -- without closing *every* open span (not just an open key) at each
+/// result boundary, that desync left a later result's terminator with no
+/// preceding reset at all, the exact bug this issue was filed for.
+#[test]
+fn test_color_terminator_ordering_survives_unbalanced_quote_in_value_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a[]", "a: [\"it's here\", \"second\"]\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
+    assert_eq!(
+        terminator_positions.len(),
+        2,
+        "expected two NUL terminators, got: {output:?}"
+    );
+    let mut search_from = 0;
+    for &term_pos in &terminator_positions {
+        let reset_pos = output[search_from..term_pos]
+            .rfind("\x1b[0m")
+            .map(|p| p + search_from);
+        assert!(
+            reset_pos.is_some_and(|p| p < term_pos),
+            "expected a reset code immediately before terminator at {term_pos}, got: {output:?}"
+        );
+        search_from = term_pos + 1;
+    }
+    Ok(())
+}
+
+/// #1708 code review: a value containing a literal `\u{1}` byte -- the
+/// original fix's own marker character -- must not be misread as a
+/// terminator boundary and split one result into two. Recording boundaries
+/// out-of-band (`ColorSink::record_boundary`) rather than via an in-band
+/// marker character removes this collision entirely, regardless of what
+/// byte value the source data happens to contain.
+#[test]
+fn test_color_terminator_ordering_survives_embedded_control_char_in_value_1708() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: \"x\x01y\"\n", &["-C", "-0"])?;
+    assert_eq!(code, 0);
+    let terminator_positions: Vec<usize> = output.match_indices('\0').map(|(i, _)| i).collect();
+    assert_eq!(
+        terminator_positions.len(),
+        1,
+        "a single result must produce exactly one NUL terminator, got: {output:?}"
+    );
+    let term_pos = terminator_positions[0];
+    let reset_pos = output[..term_pos].rfind("\x1b[0m");
+    assert!(
+        reset_pos.is_some_and(|p| p < term_pos),
+        "expected a reset code before the terminator, got: {output:?}"
+    );
+    Ok(())
+}
+
 /// Same fix, `-0`/`--nul-output` (#1701 code review). Unlike `--join-output`
 /// above, `-0`'s own glued-`---` case was confirmed byte-identical to real
 /// yq's own multi-doc `-0` output -- but real yq can't reparse that output
