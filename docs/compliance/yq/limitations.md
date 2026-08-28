@@ -683,6 +683,50 @@ $ printf 'a: [1, 2]\n' | yq            -o=json '.a[].b = error("boom")'   # {"a"
 $ printf 'a: [1, 2]\n' | succinctly yq -o=json '.a[].b = error("boom")'   # Error: boom
 ```
 
+### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
+
+[#1430](https://github.com/rust-works/succinctly/issues/1430) started as a narrower report
+("a self-referencing multi-path assignment prints one extra document") whose own claimed
+expected output turned out not to match live yq at all. Re-verified against v4.53.3: `=`'s
+RHS is not special to self-reference — a multi-output RHS of *any* shape collapses to its
+**last** output, applied once to every resolved path, producing exactly one document. Real
+jq's own `=`, by contrast, genuinely forks — one whole document per RHS output (#392,
+unaffected by this fix):
+
+```bash
+$ echo '{"a":[1,2]}' | yq            -o=json -I0 '.a[] = .a[] + 1'   # {"a":[3,3]}
+$ echo '{"a":[1,2]}' | succinctly yq -o=json -I0 '.a[] = .a[] + 1'   # {"a":[3,3]}  (fixed)
+
+$ echo '{"x":0}'     | yq            -o=json -I0 '.x = (10,20,30)'   # {"x":30}
+$ echo '{"x":0}'     | succinctly yq -o=json -I0 '.x = (10,20,30)'   # {"x":30}  (fixed)
+```
+
+Fixed in `eval_assign` (`src/jq/eval.rs`) by collapsing `rhs_values` to its last element
+before the fan-out loop, gated on `S::TAG == EvalTag::Yq` — the loop itself, and every other
+mode, is untouched.
+
+**Deliberately still open:** the collapse only applies when the RHS stream completes
+cleanly (`terminal.is_none()`). A RHS that *itself* errors partway through
+(`.x = (1, error("boom"), 3)`) still uses jq's pre-existing partial-fan-out behavior in yq
+mode too, which has not been verified against real yq (live-checked only that real yq
+raises the error with no document printed at all — not the shape needed to characterize
+what succinctly should do instead). Not folded into this fix, since redefining an
+unverified error-interaction shape risked a second, differently-wrong divergence rather than
+fixing one — filed as [#1779](https://github.com/rust-works/succinctly/issues/1779).
+
+**Separately, not part of this fix:** live-probing this also surfaced that real jq's own
+`+=`/`-=`/`*=`/`/=`/`%=` (unlike `|=`) genuinely fork over a multi-output RHS the same way
+`=` does (`.x += (10,20,30)` on `{"x":1}` is three documents, `{"x":11}`/`{"x":21}`/
+`{"x":31}`) — succinctly's `eval_rhs_once` (shared by all of `eval_compound_assign` and
+`eval_alternative_assign`) instead always collapses to the *first* output, a pre-existing,
+already-documented gap in that function's own doc comment (referencing #392) that predates
+and is unrelated to #1430's yq-mode scope. Real yq's own answer for these operators under a
+multi-output RHS also isn't "first" — live-verified `.x += (10,20,30)` on `{"x":1}` is
+`{"x":31}` (last value, matching `=`'s own rule above), not `{"x":11}`. Both the jq-mode
+fork gap and the yq-mode wrong-value gap are real, separate from each other and from #1430,
+and neither is fixed here — filed as
+[#1778](https://github.com/rust-works/succinctly/issues/1778).
+
 ### `-o=auto` on a genuinely mixed-format multi-source run doesn't match per-element
 
 [#1493](https://github.com/rust-works/succinctly/issues/1493) made `-o=auto` resolve
