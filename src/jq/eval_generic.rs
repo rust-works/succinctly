@@ -839,7 +839,10 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// [`effective_keys`] already checks during its own single
 /// [`DistinctKeyCursors`] walk -- one pass, not a second one bolted on top,
 /// which on a wide object would double the walk this arm already pays for
-/// (the exact mistake #1678's own perf-guard catch was about).
+/// (the exact mistake PR #1768's own perf-guard catch was about, earlier
+/// this same session -- a different check, `string_decode_error`, but the
+/// identical shape of mistake: a validation pass added ahead of an
+/// already-cheap path instead of folded into it).
 fn distinct_key_cursors_checked<V: DocumentValue>(
     fields: &V::Fields,
     collapse: bool,
@@ -3101,20 +3104,22 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         }
         // #1629: a negative index always has to walk the whole object
         // anyway (to normalize against its length), so the #1194 check
-        // (`effective_fields_checked`, in place of the unchecked
-        // `collapsed_fields_if`/`fields.len()` pair) rides along for free
-        // -- same reasoning as `Expr::Iterate` above. This mirrors real
-        // jq's own rule: it can't even *parse* an object with a malformed
-        // member, so every access into it raises, not just the ones that
-        // happen to touch the bad member (verified live against pinned jq
-        // 1.7.1: `{"a":1,"b":2,123:3} | keys_unsorted[0]` raises the same
-        // parse error as `keys_unsorted[2]` would).
+        // rides along for free -- same reasoning as `Expr::Iterate` above,
+        // and indeed the same helper: `distinct_key_cursors_checked` needs
+        // no value decoding (unlike `effective_fields_checked`, an earlier
+        // version of this arm's choice -- this arm only ever reads a
+        // cursor, never a field's value). This mirrors real jq's own rule:
+        // it can't even *parse* an object with a malformed member, so every
+        // access into it raises, not just the ones that happen to touch the
+        // bad member (verified live against pinned jq 1.7.1:
+        // `{"a":1,"b":2,123:3} | keys_unsorted[0]` raises the same parse
+        // error as `keys_unsorted[2]` would).
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted && *idx < 0 => {
-            match effective_fields_checked(&fields, collapse) {
-                Ok(eff) => {
-                    let target = usize::try_from(eff.len() as i64 + idx).ok();
-                    match target.and_then(|t| eff.into_iter().nth(t)) {
-                        Some(field) => GenericResult::OneCursor(field.key_cursor),
+            match distinct_key_cursors_checked::<V>(&fields, collapse) {
+                Ok(cursors) => {
+                    let target = usize::try_from(cursors.len() as i64 + idx).ok();
+                    match target.and_then(|t| cursors.into_iter().nth(t)) {
+                        Some(cursor) => GenericResult::OneCursor(cursor),
                         None => GenericResult::Owned(OwnedValue::Null),
                     }
                 }
@@ -3173,34 +3178,21 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // droppable — if its key repeats an earlier one it
         // collapses away and some other field ends up last.
         //
-        // #1629: unlike `First`/`.[0]` above, *both* branches here already
-        // walk the whole object (there is no way to find "the last field"
-        // without reaching the end), so the #1194 check rides along for
-        // free either way.
+        // #1629: unlike `First`/`.[0]` above, this arm already walks the
+        // whole object regardless (there is no way to find "the last
+        // field" without reaching the end), so the #1194 check rides along
+        // for free -- same helper as the negative-index arm above. An
+        // earlier version of this arm hand-rolled the walk separately per
+        // branch and missed the check entirely on the collapsed one
+        // (`collapsed_fields_if` returning `Some`, i.e. jq mode with a
+        // genuine duplicate key) -- caught by code review before merge.
         Expr::Builtin(Builtin::Last) if !sorted => {
-            let collapsed = collapsed_fields_if(&fields, collapse);
-            if let Some(eff) = collapsed {
-                match eff.into_iter().next_back() {
-                    Some(field) => GenericResult::OneCursor(field.key_cursor),
+            match distinct_key_cursors_checked::<V>(&fields, collapse) {
+                Ok(cursors) => match cursors.into_iter().next_back() {
+                    Some(cursor) => GenericResult::OneCursor(cursor),
                     None => GenericResult::Owned(OwnedValue::Null),
-                }
-            } else {
-                let mut current = fields;
-                let mut last_cursor = None;
-                while let Some((field, rest)) = current.uncons() {
-                    if key_is_malformed(&field.key) {
-                        return GenericResult::Error(current.malformed_member_error());
-                    }
-                    last_cursor = Some(field.key_cursor);
-                    current = rest;
-                }
-                if current.ends_unpaired() {
-                    return GenericResult::Error(current.malformed_member_error());
-                }
-                match last_cursor {
-                    Some(c) => GenericResult::OneCursor(c),
-                    None => GenericResult::Owned(OwnedValue::Null),
-                }
+                },
+                Err(err) => GenericResult::Error(err),
             }
         }
         // Slice 1 (#724): stay lazy instead of falling
