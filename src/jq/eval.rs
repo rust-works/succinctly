@@ -15201,7 +15201,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // other multi-output combinator here uses (#400, #494), so the
     // zero-prefix case (a bare `Error`/`Break`) and the nonzero-prefix case
     // (`Partial`) share one code path below instead of two.
-    let (rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
+    let (mut rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
         match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => match to_owned_checked(&v) {
                 Ok(owned) => (vec![owned], None),
@@ -15232,6 +15232,23 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(Control::Error(_)) if optional => QueryResult::None,
             Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
         };
+    }
+
+    // Real yq's `=` never forks over a multi-output RHS the way jq's does
+    // (#392): it applies only the *last* output, once, to every resolved
+    // path -- confirmed live (v4.53.3): `.x = (1,2,3)` on `{"x":0}` is
+    // `{"x":3}`, one document, not three; `.a[] = .a[] + 1` on `{"a":[1,2]}`
+    // is `{"a":[3,3]}`, not two documents (#1430's own claimed expected
+    // output, `{"a":[2,3]}`, does not match live yq at all). Only collapsed
+    // on a *clean* completion (`terminal.is_none()`): a mid-stream error/
+    // break/halt keeps jq's existing partial-prefix fan-out below, since
+    // real yq's error-interaction behavior here hasn't been verified and
+    // this fix doesn't attempt to redefine it (#1430 was filed as, and this
+    // stays scoped to, the successful-completion case -- the error-
+    // interaction shape is tracked separately as #1779).
+    if S::TAG == EvalTag::Yq && terminal.is_none() && rhs_values.len() > 1 {
+        let last = rhs_values.pop().expect("len > 1 checked above");
+        rhs_values = vec![last];
     }
 
     // Resolve computed keys against the *original* document, before any
@@ -49980,6 +49997,56 @@ mod tests {
                 assert_eq!(prefix_json(&vs), ["[8,8,3,4]"]);
                 assert_eq!(e.message, "A slice of an array can only be assigned another array");
             }
+        );
+    }
+
+    #[test]
+    fn test_yq_assign_self_referencing_iterate_collapses_to_one_document_1430() {
+        // Real yq's `=` never forks over a multi-output RHS the way jq's
+        // does (#392): it applies only the *last* output, once, to every
+        // resolved path. Confirmed live (v4.53.3): `.a[] = .a[] + 1` on
+        // `{"a":[1,2]}` is `{"a":[3,3]}`, one document -- not
+        // `{"a":[2,3]}` (#1430's own originally-claimed expected output,
+        // which does not match live yq) and not two documents (succinctly's
+        // pre-fix behavior, which matched jq's fan-out instead).
+        assert_eq!(
+            outputs_yq(br#"{"a":[1,2]}"#, ".a[] = .a[] + 1"),
+            vec![r#"{"a":[3,3]}"#],
+        );
+        // Same collapse through a nested field under the self-referencing
+        // Iterate (live-verified: `{"a":[{"b":3},{"b":3}]}`, one document).
+        assert_eq!(
+            outputs_yq(br#"{"a":[{"b":1},{"b":2}]}"#, ".a[].b = .a[].b + 1"),
+            vec![r#"{"a":[{"b":3},{"b":3}]}"#],
+        );
+    }
+
+    #[test]
+    fn test_yq_assign_multi_output_rhs_takes_last_value_not_self_referencing_1430() {
+        // The collapse isn't specific to a self-referencing RHS -- any
+        // multi-output RHS collapses to its last value in yq mode.
+        // Live-verified: `.x = (10,20,30)` on `{"x":0}` is `{"x":30}`.
+        assert_eq!(
+            outputs_yq(br#"{"x":0}"#, ".x = (10,20,30)"),
+            vec![r#"{"x":30}"#],
+        );
+    }
+
+    #[test]
+    fn test_yq_assign_single_output_rhs_unaffected_1430() {
+        // The common case (`.x = 5`) never had more than one RHS output to
+        // collapse, so it's untouched by the fix.
+        assert_eq!(outputs_yq(br#"{"x":0}"#, ".x = 5"), vec![r#"{"x":5}"#]);
+    }
+
+    #[test]
+    fn test_jq_assign_multi_output_rhs_still_forks_unaffected_by_1430() {
+        // The yq-only collapse must not leak into jq mode, whose `.x =
+        // (1,2,3)` fan-out (#392) is separately tested elsewhere and stays
+        // exactly as it was.
+        assert_eq!(
+            outputs(b"{\"x\":0}", ".x = (1,2,3)"),
+            vec![r#"{"x":1}"#, r#"{"x":2}"#, r#"{"x":3}"#],
         );
     }
 
