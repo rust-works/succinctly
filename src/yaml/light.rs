@@ -6152,19 +6152,43 @@ impl<'a, W: AsRef<[u64]>> YamlValue<'a, W> {
     ///
     /// Never fails; returns `""` rather than erroring so keys are never lost.
     pub fn key_string(&self) -> Cow<'a, str> {
+        self.key_string_kind().0
+    }
+
+    /// [`key_string`](Self::key_string), plus whether the `""` returned is
+    /// the **fallback** spelling (`true`) rather than a genuine decode
+    /// (`false`) -- mirrors JSON's own `key_display_string_kind` (#1642),
+    /// which this format can't share a definition with: JSON's fallback
+    /// case is specifically a *decode failure*, distinguished from a
+    /// successful decode by checking `string_decode_error()` before
+    /// `key_string()`; YAML's `key_string()` above never returns `None` at
+    /// all (#222 -- a complex/undecodable key stringifies to `""` rather
+    /// than being dropped), so there is no separate decode-failure signal
+    /// to check first. This walks the same branches `key_string()` does,
+    /// just keeping track of *which* one produced the `""`, so a caller
+    /// building a display-keyed map (#1749) can tell a complex/undecodable
+    /// key's fallback `""` apart from a genuine empty-string key `""`
+    /// (which is `false` here) or an ordinary non-empty key (also `false`).
+    pub fn key_string_kind(&self) -> (Cow<'a, str>, bool) {
         match self {
-            YamlValue::String(s) => s.as_str().unwrap_or(Cow::Borrowed("")),
+            YamlValue::String(s) => match s.as_str() {
+                Ok(text) => (text, false),
+                Err(_) => (Cow::Borrowed(""), true),
+            },
             YamlValue::Alias {
                 target: Some(target),
                 ..
             } => {
                 if let YamlValue::String(s) = target.value() {
-                    s.as_str().unwrap_or(Cow::Borrowed(""))
+                    match s.as_str() {
+                        Ok(text) => (text, false),
+                        Err(_) => (Cow::Borrowed(""), true),
+                    }
                 } else {
-                    Cow::Borrowed("")
+                    (Cow::Borrowed(""), true)
                 }
             }
-            _ => Cow::Borrowed(""),
+            _ => (Cow::Borrowed(""), true),
         }
     }
 }

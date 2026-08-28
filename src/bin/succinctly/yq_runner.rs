@@ -318,11 +318,27 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
         }
         YamlValue::Mapping(fields) => {
             let mut map = IndexMap::new();
+            // #1749: two complex/undecodable keys (e.g. two different
+            // sequence keys) both stringify to "" per #222 -- real yq's own
+            // streaming/DOM paths keep both entries (its underlying
+            // representation isn't a plain map), but `OwnedValue::Object`'s
+            // `IndexMap<String, _>` cannot hold two values under one key.
+            // Guarding against that silent overwrite the same way
+            // #1642/#1738 guard a JSON decode-failure collision: an
+            // *ordinary* repeated genuine key still overwrites without
+            // complaint (matching jq's own last-key-wins), only a
+            // fallback-spelling collision raises.
+            let mut guard = DisplayKeyGuard::default();
             for field in fields {
-                // Keys follow yq semantics (#222): alias-to-scalar resolves to
-                // its content, any other complex key stringifies to "", and the
-                // entry is always kept — matching the streaming/DOM emit paths.
-                let key = field.key().key_string().into_owned();
+                let (key, is_fallback) = field.key().key_string_kind();
+                let key = key.into_owned();
+                if !guard.check(&map, &key, is_fallback) {
+                    anyhow::bail!(
+                        "mapping key \"{key}\" is ambiguous: a complex or undecodable \
+                         key's display form collides with another key of the same name \
+                         and cannot be represented"
+                    );
+                }
                 let value = yaml_to_owned_value(field.value_cursor())?;
                 map.insert(key, value);
             }
