@@ -6683,6 +6683,79 @@ fn test_as_path_context_builtin_prefix_preserving_not_atomic_1663() -> Result<()
     assert_eq!(code, 9);
     assert_eq!(stdout.trim(), r#""a""#);
 
+    // A bare `halt_error` from the *bind* expression, with no successful
+    // output preceding it -- the bind match's own bare-`Halt` arm, sibling
+    // to the bare-`Error`/bare-`Break` cases already exercised above.
+    // `key`'s value ("a") never becomes a bound value here -- it's
+    // `halt_error`'s own input (piped straight into it), so it prints to
+    // *stderr* as `halt_error`'s own message, not stdout (confirmed live,
+    // and matching real jq's own identically-shaped behavior).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | (key | halt_error(9)) as $x | $x"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim(), "a");
+
+    Ok(())
+}
+
+/// #1663: exercises the *body*-loop's own match arms specifically (as
+/// opposed to the bind-expression match the previous test already covers)
+/// -- a single bound value whose *body* evaluation produces multiple
+/// outputs, zero outputs, a bare break, a bare halt, or its own
+/// prefix-plus-control `Partial`, none of which the previous test's
+/// single-output bodies reach.
+#[test]
+fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
+    // Body produces more than one output for its single bound value --
+    // `ManyOwned`, not `Owned`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | . as $x | (key, key)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"a\"\n\"a\"\n");
+
+    // Body produces zero outputs for its single bound value (`select`
+    // filters it out) -- `None`, not an error.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | . as $x | select(key == \"z\")"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // A bare `break` from the *body* itself (no prior output from this
+    // body), unwinding to the enclosing label.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | (.a | . as $x | (key | break $out))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "", "break from the body must discard, not emit");
+
+    // A bare `halt_error` from the *body* itself. Same reasoning as the
+    // sibling bind-expression case above: `key`'s value ("a") is
+    // `halt_error`'s own input, printed to stderr as its message, not
+    // through the body's own normal stdout output path.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | . as $x | (key | halt_error(9))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 9);
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim(), "a");
+
+    // The body itself produces a real prefix before erroring -- the body
+    // loop's own `Partial(_, Control::Error(_))` arm, distinct from the
+    // bind-expression's identically-shaped arm the previous test covers.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | . as $x | (key, error(\"boom\"))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout.trim(), r#""a""#);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
     Ok(())
 }
 
