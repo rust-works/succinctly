@@ -2026,6 +2026,32 @@ impl Terminator {
             Self::None => Ok(()),
         }
     }
+
+    /// A marker character `colorize_yaml` recognizes and substitutes for
+    /// the real terminator, closing any color span still open at that exact
+    /// position first (#1708). Distinct from either real terminator value
+    /// (`\0`, `\n`) so a colored NUL-output result can't be confused with
+    /// this marker; a C0 control character no valid, correctly-escaped
+    /// YAML/JSON string scalar can contain raw (real ones are written as
+    /// `\0`/`\uXXXX` escapes by this crate's own writers), so it can't
+    /// collide with ordinary rendered content either.
+    const SENTINEL: char = '\u{1}';
+
+    /// Writes [`Self::SENTINEL`] instead of the real terminator, for the
+    /// evaluated-and-colored M2 path only (#1708) -- `colorize_yaml`
+    /// recognizes the marker and substitutes the real terminator itself,
+    /// correctly placed relative to whatever color span is open at that
+    /// point in the buffer. Every other caller (the identity path's direct
+    /// `write_io`, and the non-colored evaluated path, neither of which
+    /// buffers through a re-lexing colorizer) keeps using [`Self::write_fmt`]
+    /// unchanged.
+    fn write_sentinel<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
+        if matches!(self, Self::None) {
+            Ok(())
+        } else {
+            writer.write_char(Self::SENTINEL)
+        }
+    }
 }
 
 /// Write the appropriate line terminator based on output config.
@@ -2131,7 +2157,9 @@ fn output_value<W: Write>(
             body
         };
         if config.use_color {
-            write!(writer, "{}", colorize_yaml(&output))?;
+            // No sentinel appears here -- `write_terminator` below writes
+            // directly to `writer`, outside this buffer (#1708).
+            write!(writer, "{}", colorize_yaml(&output, Terminator::None))?;
         } else {
             write!(writer, "{output}")?;
         }
@@ -2806,7 +2834,10 @@ fn compact_item_opens_with_key(rest_of_line: &str) -> bool {
 }
 
 /// Colorize YAML output (basic ANSI colors).
-fn colorize_yaml(yaml: &str) -> String {
+///
+/// `terminator` is only consulted at a [`Terminator::SENTINEL`] marker
+/// (#1708) -- everywhere else in `yaml` is colorized exactly as before.
+fn colorize_yaml(yaml: &str, terminator: Terminator) -> String {
     let mut result = String::with_capacity(yaml.len() * 2);
     let mut in_string = false;
     let mut escape_next = false;
@@ -2828,6 +2859,21 @@ fn colorize_yaml(yaml: &str) -> String {
         }
 
         match c {
+            Terminator::SENTINEL => {
+                // Close whatever span is open at this exact position before
+                // writing the real terminator, rather than leaving it for
+                // the unconditional trailing reset below to close -- which
+                // is what put the terminator *inside* the color span in the
+                // first place (#1708). One marker per streamed result, so
+                // this also correctly places every terminator in a
+                // multi-result stream, not just the last one.
+                if in_key {
+                    result.push_str("\x1b[0m");
+                    in_key = false;
+                }
+                let _ = terminator.write_fmt(&mut result);
+                at_key_start = true;
+            }
             '"' | '\'' => {
                 if in_string {
                     result.push(c);
@@ -3576,9 +3622,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $output_config.no_doc,
                         terminator,
                     )?;
-                    stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
-                        $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys)
-                    })?;
+                    // No sentinel here -- the terminator is written directly
+                    // to `$writer` below, outside this buffer (#1708).
+                    stream_maybe_colored(
+                        $writer,
+                        $use_color,
+                        |s| colorize_yaml(s, Terminator::None),
+                        |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
+                    )?;
                     terminator.write_io($writer)?;
                     // Streaming skips evaluation, so inspect the document
                     // value directly to keep `-e` falsy tracking (#178).
@@ -3601,9 +3652,29 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $output_config.no_doc,
                         terminator,
                     )?;
-                    let stats = stream_maybe_colored($writer, $use_color, colorize_yaml, |out| {
-                        result.stream_yaml(out, yaml_indent, sort_keys, |w| terminator.write_fmt(w))
-                    })?;
+                    // #1708: the per-result terminator write runs *inside*
+                    // this buffered render callback, so a real terminator
+                    // byte here would become part of what gets colorized --
+                    // write the sentinel marker instead when colorizing, so
+                    // `colorize_yaml` can place the real terminator itself,
+                    // correctly relative to whatever color span is open at
+                    // each result boundary. The non-colored path (`$writer`
+                    // written directly, no buffering) is unaffected and
+                    // still writes the real terminator either way.
+                    let stats = stream_maybe_colored(
+                        $writer,
+                        $use_color,
+                        |s| colorize_yaml(s, terminator),
+                        |out| {
+                            result.stream_yaml(out, yaml_indent, sort_keys, |w| {
+                                if $use_color {
+                                    terminator.write_sentinel(w)
+                                } else {
+                                    terminator.write_fmt(w)
+                                }
+                            })
+                        },
+                    )?;
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
                 }
@@ -3699,10 +3770,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         if is_identity {
                             // P9 path for identity on single doc
                             if can_yaml_fast_path {
+                                // No sentinel here -- `write_terminator`
+                                // below writes directly, outside this
+                                // buffer (#1708).
                                 stream_maybe_colored(
                                     &mut writer,
                                     output_config.use_color,
-                                    colorize_yaml,
+                                    |s| colorize_yaml(s, Terminator::None),
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
                                 )?;
                             } else {
@@ -3822,10 +3896,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if is_identity {
                                 // P9 path for identity on single doc
                                 if can_yaml_fast_path {
+                                    // No sentinel here -- `write_terminator`
+                                    // below writes directly, outside this
+                                    // buffer (#1708).
                                     stream_maybe_colored(
                                         &mut writer,
                                         output_config.use_color,
-                                        colorize_yaml,
+                                        |s| colorize_yaml(s, Terminator::None),
                                         |out| {
                                             root.stream_yaml_document(out, yaml_indent, sort_keys)
                                         },
@@ -4254,16 +4331,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     },
                 )?;
             } else {
-                stream_maybe_colored(&mut writer, output_config.use_color, colorize_yaml, |out| {
-                    stream_yaml_sequence(
-                        cursors.iter().copied(),
-                        out,
-                        0,
-                        yaml_indent_spaces,
-                        indent_unit,
-                        sort_keys,
-                    )
-                })?;
+                // No sentinel here -- `write_terminator` below writes
+                // directly, outside this buffer (#1708).
+                stream_maybe_colored(
+                    &mut writer,
+                    output_config.use_color,
+                    |s| colorize_yaml(s, Terminator::None),
+                    |out| {
+                        stream_yaml_sequence(
+                            cursors.iter().copied(),
+                            out,
+                            0,
+                            yaml_indent_spaces,
+                            indent_unit,
+                            sort_keys,
+                        )
+                    },
+                )?;
             }
             // #1701: this fast path streams straight to `&mut writer`
             // (like `stream_cursor!`'s own identity branch), so it needs
