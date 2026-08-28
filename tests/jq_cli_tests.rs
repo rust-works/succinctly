@@ -23492,6 +23492,77 @@ fn test_utf8_wide_sequence_collapses_raw_input_1617() -> Result<()> {
     Ok(())
 }
 
+/// #1742: non-slurp `-R` applies #1717's end-of-buffer-relative substitution
+/// fixup per *line*, not once over the whole document -- `get_inputs`
+/// substitutes the whole raw buffer up front, but real jq's own non-slurp
+/// `-R` reader is per-line for this exact quirk. Live-verified against
+/// pinned jq 1.7.1: a malformed multi-byte sequence at a line's own end,
+/// not just the whole file's end, must drop its extra trailing byte.
+#[test]
+fn test_raw_input_utf8_substitution_is_per_line_not_whole_buffer_1742() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a\xe1\x41\nsecond\nthird\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "\"a\u{fffd}\"\n\"second\"\n\"third\"\n");
+    Ok(())
+}
+
+/// #1742: the single-line case (no trailing content after the malformed
+/// sequence besides the final newline) is the same bug at its simplest --
+/// still per-line, not "whole buffer happens to equal one line".
+#[test]
+fn test_raw_input_utf8_substitution_single_line_1742() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a\xe1\x41\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"a\u{fffd}\"");
+    Ok(())
+}
+
+/// #1742: a malformed sequence in a *later* line (not just the first) is
+/// independently corrected at that line's own end -- confirms the fix
+/// applies to every line, not just the buffer's overall last line.
+#[test]
+fn test_raw_input_utf8_substitution_multiple_malformed_lines_1742() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a\xe1\x41\nb\xe1\x42\nthird\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "\"a\u{fffd}\"\n\"b\u{fffd}\"\n\"third\"\n");
+    Ok(())
+}
+
+/// #1742: `-R -s` (slurp) keeps whole-buffer substitution, matching real jq
+/// there too -- the fix must not touch this mode. Regression guard against
+/// the per-line change accidentally reaching the slurp branch.
+#[test]
+fn test_raw_input_slurp_still_whole_buffer_substitution_1742() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a\xe1\x41\nsecond\nthird\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-s", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"a\u{fffd}A\\nsecond\\nthird\\n\"");
+    Ok(())
+}
+
 /// #1247 guard: the substitution pass must leave valid multi-byte content
 /// byte-for-byte alone -- it runs on every document, so a false positive
 /// would corrupt ordinary files.
