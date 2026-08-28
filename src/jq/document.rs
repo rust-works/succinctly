@@ -855,11 +855,21 @@ impl DisplayKeyGuard {
 }
 
 /// The error for two keys that collide only because a decode-failure key's
-/// display fallback (#1642) matches another key's spelling. #1385 forbids
-/// treating them as the same key, but a display-keyed map has no way to
-/// hold both, so this is what `to_owned`/`materialize` raise instead of
-/// silently dropping one of them -- see [`DisplayKeyGuard`].
-pub(crate) fn colliding_display_key_error(key: &str) -> EvalError {
+/// display fallback (#1642) matches another key's spelling.
+///
+/// #1385 forbids treating them as the same key, but a display-keyed map has
+/// no way to hold both, so this is what `to_owned`/`materialize` raise
+/// instead of silently dropping one of them -- see [`DisplayKeyGuard`].
+///
+/// `pub`, not `pub(crate)`: `succinctly-cli`'s `yq_runner.rs`
+/// (`yaml_to_owned_value`, #1749) reuses this directly rather than
+/// hand-writing a second, wording-drift-prone copy of the same message --
+/// same reasoning [`DisplayKeyGuard::check`] itself is `pub` for. The
+/// wording says "object key", which still reads correctly for a YAML
+/// mapping key (a YAML document *is* the object/mapping distinction JSON
+/// doesn't have, but "object" is the neutral term this message already
+/// uses for JSON's own object keys).
+pub fn colliding_display_key_error(key: &str) -> EvalError {
     EvalError::decode_failure(alloc::format!(
         "object key \"{key}\" is ambiguous: an undecodable key's display form \
          collides with another key of the same name and cannot be represented"
