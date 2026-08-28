@@ -10752,22 +10752,23 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(OwnedValue::Null)
             }
             // Unlike `First`, this has to walk the whole array before it
-            // knows the answer. Carried over verbatim from the pre-merge
-            // `rindex_with_pattern` (#1538 is a pure consolidation, not a
-            // perf change): collects into a `Vec` and walks it in reverse,
-            // which costs an O(n) allocation + element clones a plain
-            // forward pass with a running "last match" accumulator would
-            // avoid -- `DocumentElements`'s cursor being forward-only rules
-            // out `DoubleEndedIterator::rev` directly, but does not require
-            // collecting first. Left as-is here; tracked as a follow-up.
+            // knows the answer. `DocumentElements`'s cursor being
+            // forward-only rules out `DoubleEndedIterator::rev` directly,
+            // but a plain forward pass with a running "last match"
+            // accumulator answers the same question without the O(n)
+            // collect-into-Vec + element clones the pre-#1773 version paid
+            // for just to walk backwards (#1773).
             SearchOccurrence::Last => {
-                let items: Vec<_> = (*elements).collect();
-                for (i, elem) in items.iter().enumerate().rev() {
-                    if owned_value_eq::<S>(&to_owned(elem), pattern) {
-                        return QueryResult::Owned(OwnedValue::Int(i as i64));
+                let mut last = None;
+                for (i, elem) in (*elements).enumerate() {
+                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                        last = Some(i);
                     }
                 }
-                QueryResult::Owned(OwnedValue::Null)
+                match last {
+                    Some(i) => QueryResult::Owned(OwnedValue::Int(i as i64)),
+                    None => QueryResult::Owned(OwnedValue::Null),
+                }
             }
         },
         _ => unsearchable_input(value, pattern, optional),
