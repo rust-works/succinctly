@@ -21211,6 +21211,37 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         Ok(kept)
     }
 
+    /// Same terminal check as [`reject_untracked_at_terminal`], but also run
+    /// over whatever a *later* sibling's own escape stopped resolution with.
+    ///
+    /// jq validates each `Expr::Comma` sibling's path-validity the instant it
+    /// is produced, before the next sibling ever runs (confirmed live:
+    /// `path(.a | (1, error("boom")))` raises "Invalid path expression with
+    /// result 1" -- the first branch's own violation -- and never reaches
+    /// `error("boom")` at all; jq prints nothing to stdout). `resolve_node`'s
+    /// `Expr::Comma` arm cannot replicate that ordering on its own (#986
+    /// Stage 2's reasoning still holds: mid-pipe, it does not yet know
+    /// whether it is terminal), so it always resolves every sibling before
+    /// returning. When a *later* sibling's own escape is what stopped that
+    /// resolution, the branches collected before it still carry whatever an
+    /// earlier, terminal-but-untracked sibling produced -- and without this,
+    /// that branch skips the terminal check an all-`Ok` result gets, both
+    /// surfacing the later sibling's error instead of jq's real one and
+    /// leaking that untracked branch's stale path into the assembled prefix
+    /// (#1560).
+    fn reject_untracked_prefix_too<'a>(
+        result: Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>,
+        near_iterate: bool,
+    ) -> Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)> {
+        match result {
+            Ok(branches) => reject_untracked_at_terminal(branches, near_iterate),
+            Err((prefix, e)) => match reject_untracked_at_terminal(prefix, near_iterate) {
+                Ok(prefix) => Err((prefix, e)),
+                terminal_violation => terminal_violation,
+            },
+        }
+    }
+
     /// Is this a bare trailing iterate — `Expr::Iterate` or
     /// `Expr::Optional(Iterate)` (`.foo[]?`) — the shape `resolve_seq`'s
     /// fan-out loop would otherwise fully enumerate one static `Index`
@@ -21277,8 +21308,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // frozen `$x` snapshot, so ambient `snapshot` starts `false` here,
         // same as it does at this function's other top-level entry point
         // below (#1591).
-        return match resolve_node::<S>(expr, input, true, false)
-            .and_then(|branches| reject_untracked_at_terminal(branches, false))
+        return match reject_untracked_prefix_too(resolve_node::<S>(expr, input, true, false), false)
         {
             Ok(branches) => {
                 if short_circuit_del_root && branches.iter().any(|b| b.path.depth() == 0) {
@@ -21295,9 +21325,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    match resolve_node::<S>(&reduced_expr, input, true, false)
-        .and_then(|branches| reject_untracked_at_terminal(branches, true))
-    {
+    match reject_untracked_prefix_too(resolve_node::<S>(&reduced_expr, input, true, false), true) {
         Ok(branches) => Ok(assemble(branches)
             .into_iter()
             .map(|e| append_trailing(e, &trailing))
@@ -47686,6 +47714,53 @@ mod tests {
                 QueryResult::Error(e) => assert_eq!(e.message, message, "{filter}")
             );
         }
+    }
+
+    /// #1560: `resolve_dynamic_indexes` only ran its terminal
+    /// untracked-branch check (`reject_untracked_at_terminal`) on
+    /// `resolve_node`'s *Ok* result. When a later `Expr::Comma` sibling's own
+    /// escape stopped resolution first, an earlier sibling's own terminal
+    /// violation -- already sitting in the `Err` prefix -- skipped that check
+    /// entirely: `error("boom")`'s message surfaced instead of jq's real
+    /// "Invalid path expression with result 1", and the untracked branch's
+    /// stale path leaked into the assembled (would-be) prefix.
+    ///
+    /// jq evaluates each comma sibling's path-validity the instant it is
+    /// produced and never reaches a later sibling once an earlier one is
+    /// found invalid -- confirmed live against jq 1.7.1: every filter below
+    /// produces zero stdout lines, only the terminal-check error, regardless
+    /// of which side of the comma the later escape sits on.
+    #[test]
+    fn test_path_comma_terminal_check_wins_over_a_later_siblings_escape_1560() {
+        for filter in [
+            r#"path(.a | (1, error("boom")))"#,
+            r#"path((1, error("boom")))"#,
+            r#"del(.a | (1, error("boom")))"#,
+        ] {
+            query!(br#"{"a":[1,2]}"#, filter,
+                QueryResult::Error(e) => assert_eq!(
+                    e.message, "Invalid path expression with result 1", "{filter}"
+                )
+            );
+        }
+    }
+
+    /// Sibling of the test above: when the *earlier* comma branch is itself
+    /// trackable (a real navigation, not a computed value), the terminal
+    /// check has nothing to object to, and a later sibling's own escape
+    /// surfaces normally -- with whatever resolved before it still kept, per
+    /// #1560's own doc comment on `resolve_dynamic_indexes` ("never un-emit
+    /// an output already produced before a later one errors"). This is the
+    /// existing #986/#1440 behavior `reject_untracked_prefix_too` must not
+    /// disturb.
+    #[test]
+    fn test_path_comma_valid_prefix_keeps_a_later_siblings_own_error_1560() {
+        query!(br#"{"a":1,"b":2}"#, r#"path(.a, error("z"), .b)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
+                assert_eq!(e.message, "z");
+            }
+        );
     }
 
     /// #861: `path(paths(node_filter))` checks each of `paths(node_filter)`'s

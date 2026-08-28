@@ -10390,6 +10390,51 @@ fn test_path_try_catch_handler_halt_keeps_prefix_832() -> Result<()> {
     Ok(())
 }
 
+/// #1560: `resolve_dynamic_indexes`'s terminal untracked-branch check
+/// (`reject_untracked_at_terminal`) used to run only over `resolve_node`'s
+/// *Ok* result. When a later `Expr::Comma` sibling's own escape stopped
+/// resolution first, an earlier sibling's terminal violation — sitting right
+/// there in the `Err` prefix — skipped that check, so `error("boom")`'s
+/// message surfaced instead of jq's real "Invalid path expression with
+/// result 1", with a stale `["a"]` leaking onto stdout besides. Confirmed
+/// against jq 1.7.1: this filter prints nothing and raises the terminal
+/// check's error, never reaching `error("boom")` at all.
+#[test]
+fn test_path_comma_terminal_check_wins_over_a_later_siblings_escape_1560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a | (1, error("boom")))"#],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "must not leak the untracked branch's stale path"
+    );
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("boom"), "{stderr}");
+    Ok(())
+}
+
+/// Sibling of the test above: when the *earlier* comma branch is trackable
+/// (a real navigation), the terminal check has nothing to object to, and a
+/// later sibling's own error surfaces normally with whatever resolved
+/// before it kept — the existing #986/#1440 behavior the fix above must not
+/// disturb.
+#[test]
+fn test_path_comma_valid_prefix_keeps_a_later_siblings_own_error_1560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.a, error("z"), .b)"#],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains(": z"), "{stderr}");
+    Ok(())
+}
+
 #[test]
 fn test_limit_n_bound_break_inside_a_path_call_reaches_an_outer_label_824() -> Result<()> {
     // `resolve_limit`'s own `n_expr` evaluation (`limit(n; f)`'s count) sits
