@@ -3686,6 +3686,87 @@ fn test_nul_output_eval_all_does_not_corrupt_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1709: real yq (pinned v4.53.3) refuses `-0`/`--nul-output` when a
+/// scalar's own value contains an embedded NUL character -- succinctly used
+/// to silently emit it inline, making the record boundary ambiguous to any
+/// NUL-delimited consumer (e.g. `xargs -0`). Live-verified against the
+/// oracle: `printf 'a: "hello\x00world"\n' | yq -0 '.a'` exits 1 with
+/// `Error: can't serialise value because it contains NUL char and you are
+/// using NUL separated output`.
+#[test]
+fn test_nul_output_rejects_embedded_nul_in_value_1709() -> Result<()> {
+    let input = "a: \"hello\\x00world\"\n";
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a", input, &["-0"])?;
+    assert_ne!(code, 0, "expected a failure, stderr: {stderr}");
+    assert!(
+        stderr.contains("contains NUL char"),
+        "expected the NUL-content error, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Same value, but the default newline terminator has no such ambiguity --
+/// real yq accepts it there (live-verified: exits 0, emits the raw NUL
+/// byte). The #1709 check is specifically `-0`-mode-only.
+#[test]
+fn test_default_terminator_accepts_embedded_nul_in_value_1709() -> Result<()> {
+    let input = "a: \"hello\\x00world\"\n";
+    let (output, code) = run_yq_stdin(".a", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "hello\0world\n");
+    Ok(())
+}
+
+/// JSON output escapes a NUL rather than emitting it raw, so
+/// there's no ambiguity for `-0` to guard against -- real yq accepts this
+/// (live-verified: exits 0, prints the escaped form), unlike the same
+/// value under YAML output above.
+#[test]
+fn test_nul_output_json_accepts_embedded_nul_in_value_1709() -> Result<()> {
+    let input = "a: \"hello\\x00world\"\n";
+    let (output, code) = run_yq_stdin(".a", input, &["-0", "-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "\"hello\\u0000world\"\0");
+    Ok(())
+}
+
+/// The #1709 check must also fire on the colored path, which already
+/// buffered per-result (#748) before this fix added buffering for the
+/// non-colored `-0` case too.
+#[test]
+fn test_nul_output_color_rejects_embedded_nul_in_value_1709() -> Result<()> {
+    let input = "a: \"hello\\x00world\"\n";
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a", input, &["-C", "-0"])?;
+    assert_ne!(code, 0, "expected a failure, stderr: {stderr}");
+    assert!(
+        stderr.contains("contains NUL char"),
+        "expected the NUL-content error, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// The identity path (no evaluation) re-emits a scalar's source spelling
+/// verbatim rather than decoding it, so an escaped `\x00` stays the four
+/// printable characters backslash-x-0-0, never becoming a raw NUL byte --
+/// the #1709 check correctly does not fire here. Real yq agrees
+/// (live-verified: exits 0, re-emits the same escape -- normalized to
+/// `\0`, a cosmetic difference unrelated to this issue).
+#[test]
+fn test_nul_output_identity_accepts_embedded_nul_escape_1709() -> Result<()> {
+    let input = "a: \"hello\\x00world\"\n";
+    let (output, code) = run_yq_stdin(".", input, &["-0"])?;
+    assert_eq!(code, 0);
+    // Exactly one NUL byte total: the `-0` terminator itself. The escaped
+    // `\x00`/`\0` in the re-emitted scalar stays literal, printable
+    // characters, never decoding into a second, embedded NUL.
+    assert_eq!(
+        output.matches('\0').count(),
+        1,
+        "expected exactly one NUL byte (the terminator), got: {output:?}"
+    );
+    Ok(())
+}
+
 /// Same fix, `--inplace` on the DOM path (#1701 code review round 2).
 #[test]
 fn test_join_output_inplace_dom_path_does_not_corrupt_1701() -> Result<()> {

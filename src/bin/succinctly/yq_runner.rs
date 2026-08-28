@@ -121,28 +121,72 @@ impl<W: Write> ColorSink<'_, W> {
     }
 }
 
-/// Streams through `render` directly when `use_color` is false. When true,
-/// renders into a buffer instead (still via the duplicate-key-safe cursor
-/// streamer passed in as `render`), then runs the buffer through `colorize`
-/// before writing the colorized result (#748).
+/// Streams through `render` directly when neither buffering condition below
+/// applies. Buffers into a single in-memory string first when `use_color`
+/// (so `colorize` can re-lex the whole rendered result, #748) or when
+/// `terminator` is [`Terminator::Nul`] (so the buffer can be scanned for an
+/// embedded NUL byte before any of it reaches `writer`, #1709) -- YAML's raw
+/// scalar rendering can contain a literal NUL from the source document,
+/// unlike JSON output, which always escapes one as the six-character
+/// sequence backslash-u-0-0-0-0; pass `Terminator::None` at a JSON call
+/// site to skip this check, since it can never apply there and buffering
+/// the whole result for nothing would be pure cost.
 fn stream_maybe_colored<W: Write, T>(
     writer: &mut W,
     use_color: bool,
+    terminator: Terminator,
     colorize: impl FnOnce(&str, &[usize]) -> String,
     render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, core::fmt::Error>,
 ) -> anyhow::Result<T> {
-    if use_color {
+    if use_color || matches!(terminator, Terminator::Nul) {
         let mut sink = ColorSink::Buffered(String::new(), Vec::new());
         let value = render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))?;
         let ColorSink::Buffered(buf, boundaries) = sink else {
             unreachable!("stream_maybe_colored always constructs ColorSink::Buffered here")
         };
-        write!(writer, "{}", colorize(&buf, &boundaries))?;
+        // Real yq refuses this rather than emit an ambiguous NUL-delimited
+        // stream (#1709) -- `buf` never contains the terminator's own NUL
+        // byte itself (boundaries are tracked out-of-band, #1708), so any
+        // NUL found here came from the rendered content.
+        if matches!(terminator, Terminator::Nul) && buf.contains('\0') {
+            anyhow::bail!(
+                "can't serialise value because it contains NUL char and you are using NUL separated output"
+            );
+        }
+        let out = if use_color {
+            colorize(&buf, &boundaries)
+        } else {
+            insert_terminators_at_boundaries(&buf, terminator, &boundaries)
+        };
+        write!(writer, "{out}")?;
         Ok(value)
     } else {
         let mut sink = ColorSink::Direct(FmtWriter(writer));
         render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))
     }
+}
+
+/// Splices `terminator` into `text` at each recorded boundary offset,
+/// without any coloring -- the non-colored counterpart to `colorize_yaml`'s
+/// own boundary handling, needed because [`stream_maybe_colored`] now also
+/// buffers (for the #1709 NUL check) when `use_color` is false.
+fn insert_terminators_at_boundaries(
+    text: &str,
+    terminator: Terminator,
+    boundaries: &[usize],
+) -> String {
+    if boundaries.is_empty() {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len() + boundaries.len() * 2);
+    let mut last = 0;
+    for &pos in boundaries {
+        result.push_str(&text[last..pos]);
+        let _ = terminator.write_fmt(&mut result);
+        last = pos;
+    }
+    result.push_str(&text[last..]);
+    result
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -3697,9 +3741,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     // No boundary recorded here -- the terminator is written
                     // directly to `$writer` below, outside this buffer (#1708).
+                    // `terminator` is still passed through so a NUL-output
+                    // result with an embedded NUL byte is caught (#1709).
                     stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
                         |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                         |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
                     )?;
@@ -3738,6 +3785,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     let stats = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
                             result.stream_yaml(out, yaml_indent, sort_keys, |w| {
@@ -3752,9 +3800,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // M2 path: JSON output streaming
                 if is_identity {
                     // P9 path: stream directly without evaluation
+                    // `Terminator::None` here (not the real `terminator`):
+                    // JSON output always escapes a NUL, so the #1709 check
+                    // can never fire for it, and buffering the whole result
+                    // to run it anyway would be pure cost.
                     stream_maybe_colored(
                         $writer,
                         $use_color,
+                        Terminator::None,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |out| $cursor.stream_json(out, json_indent, sort_keys),
                     )?;
@@ -3767,9 +3820,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 } else {
                     // M2 path: evaluate and stream results
                     let result = eval_with_cursor_using::<YqSemantics, _>(&program.expr, $cursor);
+                    // `Terminator::None` (#1709): JSON output always escapes
+                    // a NUL, so the check can never fire here.
                     let stats = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        Terminator::None,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |out| {
                             result.stream_json(out, json_indent, sort_keys, |w| {
@@ -3842,17 +3898,24 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             if can_yaml_fast_path {
                                 // No boundary recorded here --
                                 // `write_terminator` below writes directly,
-                                // outside this buffer (#1708).
+                                // outside this buffer (#1708). Still passed
+                                // through so a NUL-output result with an
+                                // embedded NUL byte is caught (#1709).
                                 stream_maybe_colored(
                                     &mut writer,
                                     output_config.use_color,
+                                    Terminator::from_config(&output_config),
                                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
                                 )?;
                             } else {
+                                // `Terminator::None` (#1709): JSON output
+                                // always escapes a NUL, so the check can
+                                // never fire here.
                                 stream_maybe_colored(
                                     &mut writer,
                                     output_config.use_color,
+                                    Terminator::None,
                                     |s, _boundaries| {
                                         output::colorize_json(s, &ColorScheme::default())
                                     },
@@ -3971,9 +4034,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     // No boundary recorded here --
                                     // `write_terminator` below writes
                                     // directly, outside this buffer (#1708).
+                                    // Still passed through so a NUL-output
+                                    // result with an embedded NUL byte is
+                                    // caught (#1709).
                                     stream_maybe_colored(
                                         &mut writer,
                                         output_config.use_color,
+                                        Terminator::from_config(&output_config),
                                         |s, boundaries| {
                                             colorize_yaml(s, Terminator::None, boundaries)
                                         },
@@ -3982,9 +4049,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         },
                                     )?;
                                 } else {
+                                    // `Terminator::None` (#1709): JSON
+                                    // output always escapes a NUL, so the
+                                    // check can never fire here.
                                     stream_maybe_colored(
                                         &mut writer,
                                         output_config.use_color,
+                                        Terminator::None,
                                         |s, _boundaries| {
                                             output::colorize_json(s, &ColorScheme::default())
                                         },
@@ -4391,9 +4462,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `stream_json_sequence` are both generic over `core::fmt::Write`,
             // so each slots into `stream_maybe_colored` unmodified.
             if output_config.output_format == OutputFormat::Json {
+                // `Terminator::None` (#1709): JSON output always escapes a
+                // NUL, so the check can never fire here.
                 stream_maybe_colored(
                     &mut writer,
                     output_config.use_color,
+                    Terminator::None,
                     |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                     |out| {
                         stream_json_sequence(
@@ -4408,10 +4482,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 )?;
             } else {
                 // No boundary recorded here -- `write_terminator` below
-                // writes directly, outside this buffer (#1708).
+                // writes directly, outside this buffer (#1708). Still
+                // passed through so a NUL-output result with an embedded
+                // NUL byte is caught (#1709).
                 stream_maybe_colored(
                     &mut writer,
                     output_config.use_color,
+                    Terminator::from_config(&output_config),
                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                     |out| {
                         stream_yaml_sequence(
