@@ -102,6 +102,20 @@ impl<W: Write> ColorSink<'_, W> {
             boundaries.push(buf.len());
         }
     }
+
+    /// Writes a streamed result's terminator through whichever mode `self`
+    /// is in: records a boundary for `colorize_yaml` to place later when
+    /// `Buffered`, or writes it immediately when `Direct` -- so a caller
+    /// never needs its own `use_color` check to pick between the two, only
+    /// `ColorSink`'s own variant (which already reflects it).
+    fn write_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
+        if matches!(self, ColorSink::Buffered(..)) {
+            self.record_boundary();
+            Ok(())
+        } else {
+            terminator.write_fmt(self)
+        }
+    }
 }
 
 /// Streams through `render` directly when `use_color` is false. When true,
@@ -2841,24 +2855,37 @@ fn compact_item_opens_with_key(rest_of_line: &str) -> bool {
 /// (the identity/DOM paths, which write their terminator directly outside
 /// any buffer) passes an empty slice, and `yaml` is colorized exactly as
 /// before.
+// `close_and_terminate!`'s state resets are dead in its post-loop drain call
+// (nothing reads `at_key_start`/`escape_next` after the function returns,
+// and only the drain's *last* iteration's `trailing_reset_needed` write
+// matters) but live in its main-loop call -- sharing one macro definition
+// between both call sites is worth the otherwise-harmless dead stores.
+#[allow(unused_assignments)]
 fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> String {
-    let mut result = String::with_capacity(yaml.len() * 2 + boundaries.len() * 4);
+    let mut result = String::with_capacity(yaml.len() * 2 + boundaries.len() * 5);
     let mut in_string = false;
     let mut escape_next = false;
     let mut at_key_start = true;
     let mut in_key = false;
     let mut boundary_idx = 0;
     let mut byte_pos = 0usize;
+    // Whether the unconditional trailing reset below is still needed.
+    // `close_and_terminate!` (a boundary was just closed) clears it; any
+    // subsequently pushed content sets it again. Stays `true` throughout
+    // when `boundaries` is empty (the identity/DOM callers), so behaves
+    // exactly as before this mechanism existed for them.
+    let mut trailing_reset_needed = true;
 
-    let mut chars = yaml.chars();
-    while let Some(c) = chars.next() {
-        while boundary_idx < boundaries.len() && boundaries[boundary_idx] <= byte_pos {
-            // One recorded boundary per streamed result, so this correctly
-            // places every terminator in a multi-result stream, not just
-            // the last one -- and closes both spans a boundary can land
-            // inside (a still-open key *or* string color), not just
-            // `in_key`, so a leftover open span from one result can never
-            // bleed its missing reset into the next.
+    // One recorded boundary per streamed result, so this correctly places
+    // every terminator in a multi-result stream, not just the last one --
+    // and closes both spans a boundary can land inside (a still-open key
+    // *or* string color), not just `in_key`, so a leftover open span from
+    // one result can never bleed its missing reset into the next. A single
+    // definition (rather than duplicating this at both call sites below)
+    // keeps the in-loop and post-loop drains from drifting apart on a
+    // future edit.
+    macro_rules! close_and_terminate {
+        () => {
             if in_key || in_string {
                 result.push_str("\x1b[0m");
                 in_key = false;
@@ -2867,8 +2894,20 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
             let _ = terminator.write_fmt(&mut result);
             at_key_start = true;
             escape_next = false;
+            trailing_reset_needed = false;
+        };
+    }
+
+    let mut chars = yaml.chars();
+    while let Some(c) = chars.next() {
+        while boundary_idx < boundaries.len() && boundaries[boundary_idx] <= byte_pos {
+            close_and_terminate!();
             boundary_idx += 1;
         }
+        // Real content follows -- if a boundary just fired above, its
+        // terminator is no longer the buffer's final byte, so the trailing
+        // safety-net reset is needed again.
+        trailing_reset_needed = true;
 
         if escape_next {
             result.push(c);
@@ -2945,15 +2984,17 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
     while boundary_idx < boundaries.len() {
         // A boundary at (or past) the very end of `yaml` -- e.g. the last
         // streamed result's terminator, with no further content after it.
-        if in_key || in_string {
-            result.push_str("\x1b[0m");
-            in_key = false;
-            in_string = false;
-        }
-        let _ = terminator.write_fmt(&mut result);
+        close_and_terminate!();
         boundary_idx += 1;
     }
-    result.push_str("\x1b[0m");
+    // Skipped when the buffer's last write was already a boundary's own
+    // terminator (the ordinary case for every M2 evaluated-color result) --
+    // otherwise this would place a redundant reset *after* that terminator,
+    // the same "reset must precede terminator" defect #1708 was filed for,
+    // just relocated to the tail of the buffer instead of the middle.
+    if trailing_reset_needed {
+        result.push_str("\x1b[0m");
+    }
     result
 }
 
@@ -3691,12 +3732,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
                             result.stream_yaml(out, yaml_indent, sort_keys, |w| {
-                                if $use_color {
-                                    w.record_boundary();
-                                    Ok(())
-                                } else {
-                                    terminator.write_fmt(w)
-                                }
+                                w.write_terminator(terminator)
                             })
                         },
                     )?;
