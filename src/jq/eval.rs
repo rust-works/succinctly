@@ -22428,23 +22428,19 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         state = update_vals.into_iter().last().unwrap_or(OwnedValue::Null);
         match update_control {
             None => return (state, None),
-            // #1620/#1660: a decode failure always propagates, `is_last` or
-            // not -- mirroring `try_pattern_alternatives`'s own exclusion.
-            // Not currently reachable through any live input: `update` only
-            // ever sees fully-materialized `OwnedValue`s here -- `state`
-            // (round-tripped through `to_json_for_reindex`/`JsonIndex`, but
-            // only ever re-encoding an already-valid Rust `String`) and every
-            // pattern-bound `$var` (spliced in as an already-materialized
-            // literal by `substitute_vars`, built from `input_val: &OwnedValue`
-            // one level up in `eval_reduce`) -- so `.as_str()` can never fail
-            // on anything UPDATE evaluates. Kept for parity with the sibling
-            // functions and as a guard against a future change (e.g. lazy
-            // `$var` binding) reopening a path to a live decode failure here.
-            Some(Control::Error(e)) if e.is_decode_failure() => {
-                return (state, Some(Control::Error(e)));
+            // #1570: routed through the shared predicate instead of a
+            // hand-rolled copy of the same match (also used by
+            // `try_foreach_step_alternatives`'s two retries and
+            // `try_pattern_alternatives`'s own `Partial` arm) -- see its own
+            // doc comment for the #1620/#1660 decode-failure exclusion this
+            // absorbs unchanged (not currently reachable through any live
+            // input here, kept for parity with the sibling functions).
+            Some(control) => {
+                if is_retryable_control(&control, is_last) {
+                    continue;
+                }
+                return (state, Some(control));
             }
-            Some(Control::Error(_) | Control::Break(_)) if !is_last => {}
-            Some(control) => return (state, Some(control)),
         }
     }
 
@@ -22885,16 +22881,14 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// since there's nothing left to fall through to.
 ///
 /// Shared by both of [`try_foreach_step_alternatives`]'s retry decisions
-/// (UPDATE's own, and EXTRACT's -- #1458), and by [`try_pattern_alternatives`]'s
+/// (UPDATE's own, and EXTRACT's -- #1458), by [`try_pattern_alternatives`]'s
 /// own `Partial` arm (#1660 code review -- that arm used to hand-roll an
 /// identical copy of this exact match, the same drift risk #1457 already
-/// found once in this function's *other* caller before this helper existed)
-/// so none of these call sites can independently drift on what counts as
-/// retryable. [`try_reduce_step_alternatives`] hand-rolls an equivalent
-/// match rather than calling this, since its single UPDATE-only retry
-/// predates this helper; consolidating it too is tracked separately (#1570)
-/// rather than attempted here, to keep this fix scoped to the bug it's
-/// actually fixing.
+/// found once in this function's *other* caller before this helper existed),
+/// and by [`try_reduce_step_alternatives`]'s own single UPDATE-only retry
+/// (#1570 -- that call site predated this helper and hand-rolled an
+/// equivalent match until then) so none of these call sites can
+/// independently drift on what counts as retryable.
 ///
 /// #1620/#1660: a decode failure is never retryable, `is_last` or not --
 /// same exclusion as `try_pattern_alternatives`/`eval_try`, applied here
