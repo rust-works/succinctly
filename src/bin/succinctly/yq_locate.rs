@@ -48,6 +48,17 @@ pub fn run_yq_locate(args: YqLocateArgs) -> Result<i32> {
     let text = std::fs::read(&args.file)
         .with_context(|| format!("Failed to read file: {}", args.file.display()))?;
 
+    // Unlike `yq`/`yq --validate`/`at_offset` (which all reject invalid UTF-8
+    // at the input boundary, #1391/#1242), `yq-locate` keeps answering on an
+    // encoding-invalid document instead of refusing outright (#1627): asking
+    // "what's at byte N" of a file a parser just rejected is the normal case
+    // for a diagnostic tool, not an edge case, so the tool stays useful right
+    // where it's needed most. A stderr warning stops the silent
+    // self-disagreement with the rest of the yq surface without losing that.
+    if let Err(err) = succinctly::text::utf8::validate_utf8(&text) {
+        eprintln!("Warning: input is not valid UTF-8: {err}");
+    }
+
     // Determine the byte offset
     let offset = match (args.offset, args.line, args.column) {
         (Some(off), None, None) => off,
