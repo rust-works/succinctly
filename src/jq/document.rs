@@ -20,10 +20,7 @@ use super::error::EvalError;
 /// `width` is the number of `unit` characters written per nesting level;
 /// `width == 0` means compact/flow style (no newlines, no indentation).
 /// `unit` is `' '` for ordinary space-indented output and `'\t'` for
-/// `--tab` — mirroring `OutputConfig::indent_str` in
-/// `src/bin/succinctly/yq_runner.rs`, which the `OwnedValue` DOM path
-/// already builds this way (`if args.tab { "\t" } else { "
-/// ".repeat(args.indent) }`).
+/// `--tab`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndentSpec {
     /// Number of `unit` characters per indentation level.
@@ -44,10 +41,80 @@ impl IndentSpec {
         Self { width, unit: ' ' }
     }
 
+    /// The `-I`/`--tab` CLI flags' shared YAML-output rule (#1486, #1575,
+    /// #1685): `--tab` means exactly one tab per level regardless of
+    /// `indent`'s value; otherwise `-I0`/`-I1` both clamp to width 2 --
+    /// real yq's YAML output at `-I1` is byte-identical to its own `-I2`
+    /// output at every level (live-verified against v4.53.3), and `-I0`
+    /// reuses that same clamp rather than modeling real yq's own irregular
+    /// `-I0`-behaves-like-`-I4` quirk (out of scope, see
+    /// `docs/compliance/yq/limitations.md`). `-I2` and above thread through
+    /// unchanged.
+    ///
+    /// Takes primitive `indent`/`tab` rather than a whole CLI-args struct:
+    /// this is a library-crate (`src/jq/`) type, and the parsed args live in
+    /// the `succinctly-cli` binary crate (`src/bin/succinctly/yq_runner.rs`),
+    /// which cannot be depended on here. Shared by that binary's own
+    /// `OutputConfig::compute_indent_str` (DOM output path) and its M2
+    /// streaming fast path's indent setup -- previously two independently
+    /// hand-encoded copies of this exact rule (#1685), the third recurrence
+    /// of the same duplication in that file's history.
+    ///
+    /// JSON has no such clamp (`-I1 -o=json` genuinely indents 1 space per
+    /// level in real yq, and `-I0 -o=json` means compact/flow, handled
+    /// separately) -- this constructor is YAML-specific, not a general
+    /// `-I`-flag-to-`IndentSpec` conversion.
+    pub fn for_yaml(indent: u8, tab: bool) -> Self {
+        if tab {
+            return Self {
+                width: 1,
+                unit: '\t',
+            };
+        }
+        Self::spaces((indent as usize).max(2))
+    }
+
     /// Whether this spec requests compact/flow-style output (no newlines).
     #[inline]
     pub fn is_compact(&self) -> bool {
         self.width == 0
+    }
+}
+
+#[cfg(test)]
+mod indent_spec_tests {
+    use super::IndentSpec;
+
+    /// #1685: `-I0`/`-I1` both clamp to width 2, `-I2` and above thread
+    /// through unchanged -- the rule the DOM path's `compute_indent_str`
+    /// and the M2 fast path's indent setup previously hand-encoded twice.
+    #[test]
+    fn for_yaml_clamps_zero_and_one_to_two_1685() {
+        for indent in [0u8, 1, 2] {
+            assert_eq!(
+                IndentSpec::for_yaml(indent, false),
+                IndentSpec::spaces(2),
+                "indent={indent}"
+            );
+        }
+        assert_eq!(IndentSpec::for_yaml(4, false), IndentSpec::spaces(4));
+        assert_eq!(IndentSpec::for_yaml(6, false), IndentSpec::spaces(6));
+    }
+
+    /// `--tab` means exactly one tab per level regardless of `-I`'s value,
+    /// including the values that would otherwise clamp.
+    #[test]
+    fn for_yaml_tab_ignores_indent_value_1685() {
+        for indent in [0u8, 1, 2, 4] {
+            assert_eq!(
+                IndentSpec::for_yaml(indent, true),
+                IndentSpec {
+                    width: 1,
+                    unit: '\t'
+                },
+                "indent={indent}"
+            );
+        }
     }
 }
 
