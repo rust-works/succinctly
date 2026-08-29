@@ -43,13 +43,6 @@
 
 // Use no_std unless std feature is enabled or we're in test mode
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
-// `with_capacity` crate-wide so it can be re-enabled just in
-// `src/jq/eval.rs`/`eval_generic.rs`, where every known instance of the
-// unguarded-product-allocation bug shape (#1017/#1612/#1634/#1669) has
-// recurred -- everywhere else sizes from a single collection's own length
-// and was never part of that pattern.
-#![allow(clippy::disallowed_methods)]
 
 // When using no_std, we need to explicitly link the alloc crate
 #[cfg(not(any(test, feature = "std")))]

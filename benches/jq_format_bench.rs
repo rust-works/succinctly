@@ -28,13 +28,6 @@
 //! and lost end-to-end (P2.6, P2.8, P3, P5, P6, P7, P8). The `scan` tier is
 //! diagnostic only; adoption decisions are made on `e2e`.
 
-// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
-// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
-// `eval_generic`) -- every call site here sizes from a single collection's
-// own length (or a length-times-constant) and was never part of that bug
-// shape.
-#![allow(clippy::disallowed_methods)]
-
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use succinctly::jq::{eval, eval_generic, parse, Expr, JqSemantics, QueryResult};
