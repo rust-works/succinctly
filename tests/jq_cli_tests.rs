@@ -20784,6 +20784,43 @@ fn test_jq_seq_value_reassembled_across_file_boundary_1571() -> Result<()> {
     Ok(())
 }
 
+/// #1808 code review on #1571's own fix: an earlier version computed
+/// `--seq`'s per-value locations by scanning end offsets separately from
+/// parsing values, then reconciling the two lists by comparing counts --
+/// when a record anywhere in the multi-file stream was genuinely
+/// malformed, that reconciliation misattributed *every* value across the
+/// *whole* stream to the last file, not just the dropped record's own.
+/// This pins the correct, precise per-file attribution instead: a
+/// malformed record in one file must not corrupt error locations for a
+/// well-formed value living in a *different* file. Every expectation here
+/// is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_malformed_record_does_not_misattribute_other_files_error_location_1808() -> Result<()>
+{
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "if . == 1 then error(\"boom\") else . end"],
+        &["\x1e1\n\x1e{bad\n", "\x1e2\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): boom", paths[0])),
+        "the error on value `1` must report its own file (paths[0]), not paths[1]: {stderr}"
+    );
+
+    let (_, stderr, code, paths) = run_jq_over_files(
+        &["--seq", "-c", "if . == 2 then error(\"boom\") else . end"],
+        &["\x1e1\n\x1e{bad\n", "\x1e2\n"],
+    )?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): boom", paths[1])),
+        "the error on value `2` (which lives in the second file) must report \
+         its own file, not silently fall back to the first: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///

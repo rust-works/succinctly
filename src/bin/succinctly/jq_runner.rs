@@ -1828,12 +1828,18 @@ fn get_inputs(
     // passed: `-s` only changes what happens to the *values* afterward, not
     // how records are delimited), so this handles the whole file list at
     // once via [`build_seq_values`] rather than per file inside the loop
-    // below. The other three modes keep the per-file loop unchanged: DSV
-    // and raw-input are line-oriented (no multi-byte record to split across
-    // a boundary), and plain JSON's `find_json_values`/`parse_json_stream`
-    // never had a record delimiter to lose in the first place -- multiple
-    // JSON files are just independent value streams concatenated in the
-    // output, with no boundary-spanning-record concept to get wrong.
+    // below. The other three modes keep the per-file loop unchanged for now:
+    // plain JSON's `find_json_values`/`parse_json_stream` never had a
+    // record delimiter to lose in the first place (multiple JSON files are
+    // just independent value streams concatenated in the output, with no
+    // boundary-spanning-record concept to get wrong), and DSV rows are
+    // line-oriented and unverified either way. Raw-input (`-R`) is NOT
+    // actually safe from this class of bug -- confirmed live against
+    // pinned jq 1.7.1 that `-R`'s reader joins a file's own unterminated
+    // trailing line with the next file's first line the same way `--seq`
+    // joins a boundary-split record, which succinctly's own per-file
+    // `raw.lines()` loop below does not (#1809, filed rather than fixed
+    // here to keep this PR scoped to `--seq`).
     if args.seq && !args.raw_input && args.input_dsv.is_none() {
         values = build_seq_values(&raw_inputs, &mut locations, args.slurp);
         if !args.slurp {
@@ -1961,31 +1967,6 @@ fn content_lines(raw: &str) -> usize {
     raw.lines().count().max(1)
 }
 
-/// Exclusive end offsets of the RS-delimited records in a `--seq` stream.
-///
-/// Trailing whitespace is trimmed so the line lands on the record itself rather
-/// than on the separator that follows it, matching jq.
-fn json_seq_ends(raw: &[u8]) -> Vec<usize> {
-    const RS: u8 = 0x1e;
-    let starts: Vec<usize> = raw
-        .iter()
-        .enumerate()
-        .filter(|(_, &b)| b == RS)
-        .map(|(i, _)| i)
-        .collect();
-
-    (0..starts.len())
-        .map(|i| {
-            // A record runs up to the next separator, or to end of input.
-            let mut end = starts.get(i + 1).copied().unwrap_or(raw.len());
-            while end > 0 && raw[end - 1].is_ascii_whitespace() {
-                end -= 1;
-            }
-            end
-        })
-        .collect()
-}
-
 /// Sentinel `per_value` line meaning "no real position" (#1542 -- a
 /// `--seq` trailing record real jq itself never resolves). Never a real
 /// line number: every genuine line comes from an actual newline count or
@@ -2070,10 +2051,14 @@ impl InputLocations {
     /// disagree — modes that skip unparsable records can produce fewer values
     /// than the scan found offsets, and a wrong line is worse than a vague one.
     ///
-    /// `ends` is already non-decreasing (both of this crate's own callers --
-    /// `find_json_values`/`json_seq_ends` -- are single left-to-right scans),
-    /// so one shared `LineCounter` keeps this whole loop O(n) rather than the
-    /// O(n^2) a per-value `line_at` rescan from byte 0 produced (#1213).
+    /// `ends` is already non-decreasing (this crate's own caller,
+    /// `find_json_values`, is a single left-to-right scan), so one shared
+    /// `LineCounter` keeps this whole loop O(n) rather than the O(n^2) a
+    /// per-value `line_at` rescan from byte 0 produced (#1213). `--seq`'s
+    /// own per-value locations no longer go through this helper at all
+    /// (#1808): a boundary-spanning record's own file can't be recovered
+    /// from an isolated `raw`, so `build_seq_values`/`parse_json_seq_with_ends`
+    /// track offsets across the whole multi-file stream directly instead.
     fn extend_from_ends(&mut self, src: usize, raw: &str, ends: &[usize], values: usize) {
         if ends.len() == values {
             let mut line_counter = LineCounter::new(raw.as_bytes());
@@ -2280,8 +2265,8 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
 /// remembering how far the previous call already counted.
 ///
 /// `advance_to` must be called with non-decreasing `end` values -- the same
-/// order [`find_json_values`]/`json_seq_ends` already produce their offsets
-/// in, since both are themselves single left-to-right scans.
+/// order [`find_json_values`]/[`parse_json_seq_with_ends`] already produce
+/// their offsets in, since both are themselves single left-to-right scans.
 struct LineCounter<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -2883,26 +2868,28 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// value) for `--seq` input across the whole file list at once (#1571).
 ///
 /// Concatenates every file's raw content, in order, into one string and
-/// runs the ordinary [`parse_json_seq`] over it exactly once -- matching
-/// real jq's own `-s` reader, which treats the entire multi-file input as
-/// one continuous RFC 7464 byte stream and doesn't stop scanning a record
-/// at a file boundary. This is what makes `seq_trailing_record_is_dropped`'s
-/// own ambiguous-bare-number-at-EOF check (inside [`parse_json_seq`]) come
-/// out correct too: run against the *true* full stream, it can only ever
-/// see genuine end-of-input, never a false EOF at some earlier file's own
-/// end -- no separate per-file special-casing needed for that interaction.
+/// runs [`parse_json_seq_with_ends`] over it exactly once -- matching real
+/// jq's own `-s` reader, which treats the entire multi-file input as one
+/// continuous RFC 7464 byte stream and doesn't stop scanning a record at a
+/// file boundary. This is what makes `seq_trailing_record_is_dropped`'s own
+/// ambiguous-bare-number-at-EOF check come out correct too: run against the
+/// *true* full stream, it can only ever see genuine end-of-input, never a
+/// false EOF at some earlier file's own end -- no separate per-file
+/// special-casing needed for that interaction.
 ///
 /// `!slurp` locations still need each value's own *file* and *file-local*
 /// line, not the byte offset's raw position in the throwaway `combined`
-/// string, so [`json_seq_ends`] runs once against `combined` and each
-/// resulting end offset is mapped back to whichever file's own byte range
-/// contains it (a boundary-spanning record is attributed to the file its
-/// *end* falls in -- matching #1568's own precedent for the stream's
-/// trailing record, which uses the same rule). One [`LineCounter`] per file,
-/// created only when an end offset first crosses into that file's range:
-/// `ends` is non-decreasing (`json_seq_ends` is a single left-to-right
-/// scan) and files are laid out in `combined` in file order, so this walks
-/// forward through `raw_inputs` at most once, never backtracking.
+/// string, so each value's own end offset (computed by
+/// `parse_json_seq_with_ends` in the same pass as the value itself -- never
+/// a separately-scanned list to fall out of sync with) is mapped back to
+/// whichever file's own byte range contains it via `partition_point`, since
+/// both `file_ends` and each value's own `end` are non-decreasing (a
+/// boundary-spanning record is attributed to the file its *end* falls in --
+/// matching #1568's own precedent for the stream's trailing record, which
+/// uses the same rule). `current` caches the one `LineCounter` in use,
+/// replaced only when `partition_point` reports a new file index -- since
+/// `end` values are non-decreasing, that index is too, so this never
+/// backtracks to a file already passed.
 fn build_seq_values(
     raw_inputs: &[(Option<usize>, String)],
     locations: &mut InputLocations,
@@ -2915,48 +2902,70 @@ fn build_seq_values(
         file_ends.push(combined.len());
     }
 
-    let values = parse_json_seq(&combined);
+    let parsed = parse_json_seq_with_ends(&combined);
 
     if !slurp {
-        let ends = json_seq_ends(combined.as_bytes());
-        if ends.len() == values.len() {
-            let mut file_idx = 0;
-            let mut file_start = 0usize;
-            let mut counter = LineCounter::new(
-                raw_inputs
-                    .first()
-                    .map_or(&[][..], |(_, raw)| raw.as_bytes()),
-            );
-            for &end in &ends {
-                while file_idx + 1 < file_ends.len() && end > file_ends[file_idx] {
-                    file_start = file_ends[file_idx];
-                    file_idx += 1;
-                    counter = LineCounter::new(raw_inputs[file_idx].1.as_bytes());
-                }
-                let src = raw_inputs[file_idx].0.unwrap_or(0);
-                let line = counter.advance_to(end.saturating_sub(file_start));
-                locations.push(src, line);
+        let mut current: Option<(usize, LineCounter<'_>)> = None;
+        for &(_, end) in &parsed {
+            let file_idx = file_ends
+                .partition_point(|&fe| fe < end)
+                .min(file_ends.len().saturating_sub(1));
+            if current.as_ref().map(|(idx, _)| *idx) != Some(file_idx) {
+                current = Some((
+                    file_idx,
+                    LineCounter::new(raw_inputs[file_idx].1.as_bytes()),
+                ));
             }
-        } else {
-            // Counts disagree (a malformed/dropped record somewhere) --
-            // fall back the same way `extend_from_ends` does per-file: the
-            // last content line of the last file involved, for every
-            // value. Matches that helper's own established tolerance for
-            // imprecision here rather than inventing a new rule.
-            let (src, line) = raw_inputs
-                .last()
-                .map_or((0, 1), |(idx, raw)| (idx.unwrap_or(0), content_lines(raw)));
-            for _ in 0..values.len() {
-                locations.push(src, line);
-            }
+            let file_start = if file_idx == 0 {
+                0
+            } else {
+                file_ends[file_idx - 1]
+            };
+            let src = raw_inputs[file_idx].0.unwrap_or(0);
+            let line = current
+                .as_mut()
+                .expect("just set above")
+                .1
+                .advance_to(end.saturating_sub(file_start));
+            locations.push(src, line);
         }
     }
 
-    values
+    parsed.into_iter().map(|(v, _)| v).collect()
 }
 
-fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
-    let mut values = Vec::new();
+/// Parse `--seq` content into values paired with each surviving segment's
+/// own trimmed end byte offset, both computed in the same pass so they can
+/// never fall out of sync (#1808 code review, following #1571's own
+/// cross-file fix: an earlier version scanned end offsets separately via a
+/// now-removed `json_seq_ends` helper and reconciled the two lists by comparing lengths
+/// afterward -- when a record anywhere in a multi-file stream was
+/// genuinely malformed, that reconciliation's "counts disagree" fallback
+/// attributed *every* value across the *whole* stream to the last file's
+/// last line, not just the dropped record's own, silently misreporting the
+/// filename in an error message for records that had nothing to do with
+/// the drop). [`build_seq_values`] is this function's only remaining
+/// caller; a `parse_json_seq(s) -> Vec<OwnedValue>` values-only wrapper
+/// existed here too until its own last caller (this function's own
+/// predecessor) was replaced -- removed rather than kept unused, per its
+/// own three unit tests now calling this function directly instead.
+fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
+    let bytes = s.as_bytes();
+    const RS: u8 = 0x1e;
+
+    // Byte offset where each `s.split('\x1E')` segment begins: 0, then one
+    // past each RS byte -- enumerates the identical segments, in the
+    // identical order, `s.split('\x1E')` always has (segment 0, anything
+    // before the very first RS byte and ordinarily empty, included).
+    let mut segment_starts = vec![0usize];
+    segment_starts.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b == RS)
+            .map(|(i, _)| i + 1),
+    );
+    let last_idx = segment_starts.len() - 1;
 
     // The stream's own trailing record, when real jq's incremental reader
     // never resolves it (malformed, or an ambiguous bare number at true
@@ -2964,18 +2973,32 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     // from the *output* too, not just from the error-location computation
     // (#1542): `printf '\x1e1\n\x1e2' | jq --seq -s '.'` gives `[1]` on
     // real jq, not `[1,2]`, even though "2" alone is perfectly valid JSON.
-    // Computed once, up front, and checked only against the split's last
-    // element below -- the already-malformed case is caught either way
-    // (this check, or `seq_record_parses` failing on its own a few lines
-    // down), but the ambiguous-number case parses just fine on its own and
-    // needs this explicit exclusion to be dropped at all.
+    // Computed once, up front, and checked only against the last segment
+    // below -- the already-malformed case is caught either way (this
+    // check, or `seq_record_parses` failing on its own a few lines down),
+    // but the ambiguous-number case parses just fine on its own and needs
+    // this explicit exclusion to be dropped at all.
     let drop_trailing = seq_trailing_record_is_dropped(s);
-    let segments: Vec<&str> = s.split('\x1E').collect();
-    let last_idx = segments.len().saturating_sub(1);
 
-    // Split on RS character (0x1E)
-    for (i, segment) in segments.into_iter().enumerate() {
-        let segment = segment.trim();
+    let mut results = Vec::new();
+    for (i, &start) in segment_starts.iter().enumerate() {
+        let raw_end = segment_starts
+            .get(i + 1)
+            .map_or(bytes.len(), |&next| next - 1);
+
+        // Trailing-whitespace-only trim for the *reported* end offset, so a
+        // value's line lands on the record itself, not the separator/
+        // whitespace after it -- matches `json_seq_ends`'s own rule. Can't
+        // walk past `start`: the byte immediately before it is either the
+        // string start or an RS byte, and neither is whitespace.
+        let mut end = raw_end;
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+
+        // Full (both-sides) trim to decide parse-eligibility -- matches
+        // the original per-segment `segment.trim()` check exactly.
+        let segment = s[start..raw_end].trim();
         if segment.is_empty() {
             continue;
         }
@@ -2990,17 +3013,17 @@ fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
             // is the same answer for a segment that parses but won't decode
             // (#1247).
             if let Ok(v) = crate::output::json_bytes_to_owned_value(segment.as_bytes()) {
-                values.push(v);
+                results.push((v, end));
             }
         }
         // Genuine parse failures are silently ignored per RFC 7464
     }
 
-    values
+    results
 }
 
 /// Whether a trimmed, non-empty `--seq` record segment parses as JSON --
-/// [`parse_json_seq`]'s own per-segment success check, factored out so
+/// [`parse_json_seq_with_ends`]'s own per-segment success check, factored out so
 /// [`seq_trailing_record_is_dropped`] can ask the identical question about
 /// one specific segment without duplicating the leading-zero retry logic.
 fn seq_record_parses(segment: &str) -> bool {
@@ -3022,8 +3045,8 @@ fn seq_record_parses(segment: &str) -> bool {
 ///
 /// - **Genuinely malformed/truncated** -- [`seq_record_parses`] fails on it
 ///   (an unterminated string/object, e.g.), matching
-///   [`parse_json_seq`]'s own silent-drop rule (RFC 7464's recommended
-///   failure mode, #1243).
+///   [`parse_json_seq_with_ends`]'s own silent-drop rule (RFC 7464's
+///   recommended failure mode, #1243).
 /// - **A bare number with nothing at all after it before EOF** -- valid
 ///   JSON on its own, but jq's streaming number scanner can't rule out more
 ///   digits still arriving without seeing a terminating byte (whitespace,
@@ -5319,7 +5342,10 @@ mod tests {
     /// of accepting it the way real jq does.
     #[test]
     fn test_parse_json_seq_tolerates_leading_zero_1243() {
-        let values = parse_json_seq("\x1E007e5\n");
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E007e5\n")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "7E+5");
     }
@@ -5329,7 +5355,10 @@ mod tests {
     /// leading-zero retry.
     #[test]
     fn test_parse_json_seq_still_drops_genuine_malformed_record_1243() {
-        let values = parse_json_seq("\x1E{invalid\n\x1E5\n");
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E{invalid\n\x1E5\n")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "5");
     }
@@ -5342,7 +5371,10 @@ mod tests {
     /// primary document input already produces for it.
     #[test]
     fn test_parse_json_seq_accepts_magnitude_overflowing_number_1267() {
-        let values = parse_json_seq("\x1E1e400\n");
+        let values: Vec<OwnedValue> = parse_json_seq_with_ends("\x1E1e400\n")
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "1E+400");
     }
@@ -5365,6 +5397,50 @@ mod tests {
         assert_eq!(values[0].to_json(), "1");
         assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
         assert_eq!(locations.len(), 2, "one location per value, non-slurp");
+        // `1` lives entirely in f1, on its own line 1 (matches real jq
+        // 1.7.1's own `input_line_number` for this exact byte layout,
+        // verified live); the reassembled record's own *end* falls in f2,
+        // so it's attributed there -- matching #1568's own file-
+        // attribution rule for a boundary-spanning record. Not just a
+        // location count -- the actual file and line each value reports
+        // (#1808 code review: a prior version only checked
+        // `locations.len()`, missing that both values were silently
+        // misattributed to the *last* file whenever a mismatch fired
+        // anywhere in the whole stream).
+        assert_eq!(locations.get(0).file.as_deref(), Some("f1"));
+        assert_eq!(locations.get(0).line, Some(1));
+        assert_eq!(locations.get(1).file.as_deref(), Some("f2"));
+        assert_eq!(locations.get(1).line, Some(1));
+    }
+
+    /// #1808 code review: a malformed record anywhere in the multi-file
+    /// stream must not degrade *other* files' own precise locations --
+    /// only the earlier design (reconciling two separately-scanned
+    /// end/value lists by comparing counts) had this failure mode, and it
+    /// applied to the *whole* stream on any single drop, not just the
+    /// offending file. `f1` has a real value followed by a malformed
+    /// record; `f2`'s own value must still resolve to `f2`'s own line, not
+    /// silently fall back to `f1`'s.
+    #[test]
+    fn test_build_seq_values_malformed_record_does_not_misattribute_other_files_1808() {
+        let raw_inputs = vec![
+            (Some(0), "\x1E1\n\x1E{bad\n".to_string()),
+            (Some(1), "\x1E2\n".to_string()),
+        ];
+        let mut locations =
+            InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
+        let values = build_seq_values(&raw_inputs, &mut locations, false);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].to_json(), "1");
+        assert_eq!(values[1].to_json(), "2");
+        assert_eq!(locations.get(0).file.as_deref(), Some("f1"));
+        assert_eq!(locations.get(0).line, Some(1));
+        assert_eq!(
+            locations.get(1).file.as_deref(),
+            Some("f2"),
+            "f2's own value must not be misattributed to f1 just because f1 dropped a record"
+        );
+        assert_eq!(locations.get(1).line, Some(1));
     }
 
     /// A record spanning three files, not just two.
