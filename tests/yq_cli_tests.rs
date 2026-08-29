@@ -18134,6 +18134,80 @@ fn test_yq_untracked_comma_branch_path_noop_1764() -> Result<()> {
     Ok(())
 }
 
+/// #1764: unlike `=`/`|=`/compound-assign (whose trailing-iterate gap is
+/// #1868), `path()`'s own trailing-iterate case *is* covered by this fix
+/// -- `path()` strips a trailing bare iterate off its path expression
+/// before the terminal check runs and re-splices it after, so the
+/// untracked value still reaches `reject_untracked_at_terminal` (with
+/// `near_iterate = true`) rather than `resolve_node`'s own unconditional
+/// `Expr::Iterate` raise. Confirmed live: this used to raise jq's "near
+/// attempt to iterate through 1" wording; now no-ops, matching the same
+/// general rule as every other shape in this file.
+#[test]
+fn test_yq_untracked_branch_path_trailing_iterate_noop_1764() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "[path(1 | .[])]",
+        "a: 1\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// #1764: the skip is not specific to a bare-literal *origin* for the
+/// untracked value -- one produced by a `try`/`catch` handler run on a
+/// caught error's payload (the #843/#1297 write-corruption-prevention
+/// mechanism) is computationally identical by the time it reaches
+/// `reject_untracked_at_terminal`, and gets the same "write the
+/// trackable branch, skip the untracked one" result rather than
+/// aborting the whole write the way it did (and, in jq mode, still
+/// does) before this fix. `del()` is unaffected -- still raises, since
+/// it's excluded from the skip entirely (`skip_untracked == false`).
+#[test]
+fn test_yq_untracked_branch_via_try_catch_noop_1764() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"try (.a, error({"y":99})) catch select(true) = "X""#,
+        "a: 10\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": "X"}));
+
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        r#"del(try (.a, error({"y":99})) catch select(true))"#,
+        "a: 10\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Invalid path expression"), "err={err}");
+    Ok(())
+}
+
+/// #1764: succinctly's own `/=`/`%=`/`//=` extension forms (yq has no
+/// such syntax at all -- see `docs/compliance/yq/limitations.md`) inherit
+/// the same skip as `+=`/`-=`/`*=`, for internal consistency rather than
+/// an external-compat claim.
+#[test]
+fn test_yq_untracked_comma_branch_extension_compound_assign_noop_1764() -> Result<()> {
+    let (out, code) = run_yq_stdin("(.a, 1) /= 2", "a: 4\nb: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": 2.0, "b": 2}));
+
+    let (out, code) = run_yq_stdin("(.a, 1) %= 3", "a: 4\nb: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": 1, "b": 2}));
+
+    let (out, code) = run_yq_stdin("(.a, 1) //= 5", "a: null\nb: 2\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": 5, "b": 2}));
+    Ok(())
+}
+
 /// #1764 negative control: `succinctly jq`'s own path-expression check is
 /// unaffected -- real jq raises for every untracked comma branch
 /// regardless of the surrounding operation, and still must.
