@@ -17696,8 +17696,10 @@ fn test_yq_iterate_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
 /// shape verified live against yq v4.53.3.
 #[test]
 fn test_yq_scalar_target_noop_discards_rhs_1233() -> Result<()> {
-    // The issue's own root-scalar repro, plus every operator that shares
-    // eval_rhs_once's eager-evaluation mechanism.
+    // The issue's own root-scalar repro, plus every assignment operator
+    // whose RHS is evaluated eagerly, before the no-op check discards it
+    // (`=` via `eval_assign`, the rest via `collect_rhs_outputs` since
+    // #1778 -- `eval_rhs_once` at the time this test was written).
     for op in ["=", "+=", "-=", "*=", "//="] {
         let (out, err, code) =
             run_yq_stdin_with_stderr(&format!(".a {op} error(\"boom\")"), "5\n", &["-o", "json"])?;

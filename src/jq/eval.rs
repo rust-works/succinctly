@@ -16190,10 +16190,12 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Evaluate `value_expr` once, keeping every output instead of collapsing
 /// to the first -- shared RHS-collection prologue for
 /// `eval_compound_assign`/`eval_alternative_assign` (#1778). A near-copy
-/// of `eval_assign`'s own inlined #392 prologue one function up;
-/// consolidating the two is `#1826`'s own tracked scope (extracting the
-/// shared isolate-and-atomically-catch-optional helper), not attempted
-/// here.
+/// of `eval_assign`'s own inlined #392 prologue one function up (and this
+/// function's own fork loop below duplicates `eval_assign`'s in turn) --
+/// consolidating the two is `#1844`'s own tracked scope, not attempted
+/// here to keep this fix reviewable at a similar size to prior slices in
+/// the decode-failure series it followed, and because unifying them means
+/// also touching `eval_assign` itself.
 fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value_expr: &Expr,
     input: &StandardJson<'a, W>,
@@ -52850,11 +52852,16 @@ mod tests {
 
     /// #1778: `collect_rhs_outputs`'s bare `Error`/`Break`/`Halt` arms
     /// (zero RHS output, not a `Partial` with some output first). The
-    /// outer `?` on `(.x += error("boom"))?` swallows the error at the
-    /// `Expr::Optional` dispatch layer, not through
-    /// `eval_update_multi`'s own `optional` parameter -- that parameter
-    /// means "an *inline* `?` on a path component", the same distinction
-    /// `eval_assign`'s own identical branch already documents.
+    /// outer `?` on `(.x += error("boom"))?` swallows the error before
+    /// `eval_compound_assign` is ever called with `optional: true` --
+    /// confirmed live (temporarily instrumented both this function and
+    /// `eval_assign`'s identical branch): both always see `optional:
+    /// false` here even under an outer `?`. What exactly drives this
+    /// parameter to `true` at this specific call site is not
+    /// characterized by either function's own existing comments and is
+    /// unrelated to this PR's fork/last-value fix -- this test only pins
+    /// the bare `Error`/`Break`/`Halt` match arms themselves, not the
+    /// `if optional` guard beside them.
     #[test]
     fn test_compound_assign_bare_rhs_error_break_and_halt_1778() {
         query!(br#"{"x":1}"#, r#".x += error("boom")"#,

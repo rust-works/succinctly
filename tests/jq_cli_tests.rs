@@ -10198,8 +10198,9 @@ fn test_eval_slice_expr_target_partial_halt_discards_prefix() -> Result<()> {
 
 #[test]
 fn test_eval_rhs_once_propagates_direct_halt() -> Result<()> {
-    // `eval_rhs_once` (the RHS evaluator shared by `+=`/`-=`/`*=`/`/=`/`%=`)
-    // has a direct `QueryResult::Halt` arm for when the RHS halts outright,
+    // #1778: `eval_rhs_once` was replaced by `collect_rhs_outputs` (the
+    // RHS evaluator shared by `+=`/`-=`/`*=`/`/=`/`%=`/`//=`), which has
+    // a direct `QueryResult::Halt` arm for when the RHS halts outright,
     // distinct from the `Partial(_, Control::Halt(code))` arm right below
     // it (a RHS that outputs a value *before* halting -- see
     // `test_compound_assign_propagates_halt_after_partial_rhs_output`).
@@ -10214,9 +10215,10 @@ fn test_eval_rhs_once_propagates_direct_halt() -> Result<()> {
 
 #[test]
 fn test_eval_assign_rhs_propagates_direct_halt() -> Result<()> {
-    // `eval_assign`'s own RHS-collecting match (distinct from
-    // `eval_rhs_once`, which `+=`/`|=`/etc. use -- plain `=` forks over
-    // every RHS output instead, #392) has its own `QueryResult::Halt` arm:
+    // `eval_assign`'s own RHS-collecting match (a near-copy of
+    // `collect_rhs_outputs`, which `+=`/`|=`/etc. use -- plain `=` forks
+    // over every RHS output instead, #392) has its own `QueryResult::Halt`
+    // arm:
     // a RHS that halts outright collects zero `rhs_values` with
     // `terminal = Some(Control::Halt(code))`, so `eval_assign` returns a
     // bare halt without ever resolving or writing to any path. Verified
@@ -19556,8 +19558,9 @@ fn test_limit_value_mode_zero_output_bound_produces_no_output_1313() -> Result<(
     Ok(())
 }
 
-/// #1313: `eval_rhs_once` (backing `+=`/`-=`/`*=`/`/=`/`%=`/`//=`) collapsed
-/// a genuinely zero-output RHS to `Null` and spliced it into the update
+/// #1313: `eval_rhs_once` (replaced by `collect_rhs_outputs` in #1778,
+/// backing `+=`/`-=`/`*=`/`/=`/`%=`/`//=`) collapsed a genuinely
+/// zero-output RHS to `Null` and spliced it into the update
 /// filter (`. op null`), instead of real jq's `value as $value | ...`
 /// desugaring, where `value` producing zero outputs makes the whole
 /// assignment produce zero output. Covers every compound operator, plus
@@ -19587,10 +19590,12 @@ fn test_compound_assign_empty_rhs_produces_no_output_1313() -> Result<()> {
 
 /// #1313 (code review): an `optional`-swallowed RHS error is a distinct
 /// shape from a genuinely zero-output generator (`empty`, covered above),
-/// but reaches `eval_rhs_once` the same way -- `.a += (1/0)?` swallows the
-/// division error to zero output at `eval_single`'s own `?` handling, then
-/// `eval_rhs_once` sees `QueryResult::None` exactly as it would for `empty`,
-/// and the whole assignment correctly produces zero output rather than
+/// but reaches `collect_rhs_outputs` (`eval_rhs_once` at the time this was
+/// written, since replaced by #1778) the same way -- `.a += (1/0)?`
+/// swallows the division error to zero output at `eval_single`'s own `?`
+/// handling, then `collect_rhs_outputs` sees `QueryResult::None` exactly
+/// as it would for `empty`, and the whole assignment correctly produces
+/// zero output rather than
 /// splicing `null` in and evaluating `. + null` (which used to be a type
 /// error, not a silent no-op -- this is a case where the old bug produced a
 /// hard error instead of a wrong value, but still diverged from jq).
