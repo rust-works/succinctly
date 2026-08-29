@@ -3363,14 +3363,31 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError>
         | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
         | OwnedValue::Null
         | OwnedValue::Bool(_) => Ok(LimitN::Unlimited),
-        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f < 0.0 => {
-            Ok(LimitN::Unlimited)
+        // jq's own `limit($n; f)` is `if $n > 0 then <take, decrementing $n
+        // by 1 per output, stop once the decremented count is <= 0> elif
+        // $n == 0 then empty else f end` -- a positive `$n` therefore takes
+        // `ceil($n)` outputs (each iteration consumes one whole unit of
+        // `$n`, and a fractional remainder still needs one more output to
+        // cross zero), not the integer-only count this function used to
+        // require. `$n == 0.0` (including `-0.0`, which compares equal to
+        // `0.0` under IEEE 754) takes the `$n == 0` branch; NaN satisfies
+        // neither `> 0` nor `== 0`, so it falls to the same unlimited `else
+        // f` branch as a negative `$n` (#1825 -- confirmed live against jq
+        // 1.7.1: `limit(nan; 1,2,3)` passes everything through, same as
+        // `limit(-1; 1,2,3)`).
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+            if f > 0.0 {
+                Ok(LimitN::Take(f.ceil() as usize))
+            } else if f == 0.0 {
+                Ok(LimitN::Take(0))
+            } else {
+                Ok(LimitN::Unlimited)
+            }
         }
-        // A *positive* non-integer float (e.g. `1.9`) is a separate,
-        // pre-existing gap (jq's own fractional foreach-decrement loop
-        // bounds it to 2 outputs; succinctly errors instead) left untouched
-        // here -- out of #983's scope, which is specifically the
-        // negative/null/bool "no limit" branch.
+        // Unchanged from before this fix: a non-numeric `$n` (a string,
+        // array, or object) isn't part of #1825's scope, so its message
+        // stays whatever it already was rather than being swapped for a
+        // differently-worded, equally-unverified-against-jq alternative.
         _ => Err(EvalError::new("limit requires non-negative integer")),
     }
 }
@@ -3389,10 +3406,30 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
         ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
             let f = owned.as_f64().unwrap_or(0.0);
-            if f < 0.0 {
+            // `f.is_nan() || f < 0.0`, not just `f < 0.0`: the two only
+            // differ for NaN, where `f < 0.0` is `false` (silently
+            // accepting NaN as index `0`) but jq's own guard -- `nth($n;
+            // g) = last(limit($n + 1; g))`, and `limit`'s `if $n > 0 ...
+            // elif $n == 0 ... else` falls to the unlimited-passthrough
+            // `else` for a NaN `$n + 1`, so `last` never terminates and jq
+            // raises before ever reaching that -- rejects it (#1825).
+            if f.is_nan() || f < 0.0 {
                 return Err(EvalError::new("nth doesn't support negative indices"));
             }
-            Ok(owned.as_i64().map_or(f as usize, |i| i as usize))
+            // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` (see
+            // `classify_limit_n`'s own `Take(f.ceil() as usize)` for a
+            // positive `$n`) and returns the last one -- a 0-based stop
+            // index of `ceil($n + 1) - 1`, which is `ceil($n)` by the
+            // identity `ceil(x + 1) == ceil(x) + 1` for any real `x`.
+            // Truncating (the previous `f as usize`) instead of ceiling
+            // silently answered from one element earlier than jq for any
+            // positive non-integer `n` (#1825): `nth(0.4; 1,2,3)` is `2` in
+            // jq, not `1`. `as_i64()` is still preferred over `f.ceil()`
+            // for an exact integer: past f64's 53-bit mantissa, converting
+            // to `f64` at all would already have lost precision.
+            Ok(owned
+                .as_i64()
+                .map_or_else(|| f.ceil() as usize, |i| i as usize))
         }
         ref other => Err(EvalError::type_error("number", other.type_name())),
     }
@@ -58486,6 +58523,13 @@ mod tests {
         // `builtin_limit` is parser-unreachable today (see
         // `builtin_limit_propagates_halt_from_expr_argument` above), so this
         // is exercised directly rather than via the CLI.
+        //
+        // #1825 replaced `classify_limit_n`'s own error for this shape with
+        // jq's real `ceil($n)`-take semantics (`limit(2.9; ...)` matches jq
+        // 1.7.1's `[1,2,3]`, confirmed live) -- this test's own assertion
+        // moved with it: it now checks `builtin_limit` still *delegates* to
+        // `classify_limit_n` (getting the corrected 3-element take), not
+        // that the old, incorrect error path fires.
         let n_expr = parse(".n").unwrap();
         let items_expr = parse(".items[]").unwrap();
 
@@ -58493,8 +58537,13 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         match builtin_limit::<Vec<u64>, JqSemantics>(&n_expr, &items_expr, cursor.value(), false) {
-            QueryResult::Error(_) => {}
-            other => panic!("expected a classify_limit_n-style error, got {other:?}"),
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+                );
+            }
+            other => panic!("expected ManyOwned([1,2,3]) via ceil(2.9)=3, got {other:?}"),
         }
     }
 

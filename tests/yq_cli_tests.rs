@@ -24936,3 +24936,43 @@ fn test_streamed_decode_failure_in_fanout_arms_1615() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1825: `classify_nth_n`/`classify_limit_n` are shared by both evaluators
+/// (#1313) -- confirms the jq-mode fix (see `jq_cli_tests.rs`'s own
+/// `test_nth_nan_raises_like_negative_1825`/`test_nth_non_integer_n_takes_
+/// ceil_1825`/`test_limit_float_count_takes_ceil_1825`) applies identically
+/// in yq mode, gated behind `--jq-extensions` since `nth`/`limit` aren't
+/// part of real yq's own grammar.
+#[test]
+fn test_nth_limit_float_classification_matches_jq_mode_1825() -> Result<()> {
+    let args = &["--jq-extensions", "-o=json", "-I=0"];
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr("nth(nan; 1,2,3)", "null\n", args)?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("nth doesn't support negative indices"),
+        "stderr: {stderr}"
+    );
+
+    let (out, code) = run_yq_stdin("nth(0.4; 1,2,3)", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    let (out, code) = run_yq_stdin("nth(1.7; 1,2,3)", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3");
+
+    let (out, code) = run_yq_stdin("[limit(0.4; 1,2,3)]", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1]");
+
+    let (out, code) = run_yq_stdin("[limit(1.4; 1,2,3)]", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2]");
+
+    let (out, code) = run_yq_stdin("[limit(nan; 1,2,3)]", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    Ok(())
+}

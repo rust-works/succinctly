@@ -15457,21 +15457,121 @@ fn test_limit_bool_count_is_unlimited_not_error_983() -> Result<()> {
     Ok(())
 }
 
-/// A *positive* non-integer float count is a separate, pre-existing gap
-/// (real jq bounds `limit(1.9; ...)` to 2 outputs via its fractional
-/// foreach-decrement loop; succinctly errors) deliberately left untouched
-/// by #983, which is scoped to the negative/null/bool "no limit" branch
-/// specifically. Pinned here so a future change doesn't accidentally
-/// widen #983's fix to also swallow this case silently.
+/// #1825 fixed the gap #983 deliberately left open: a *positive*
+/// non-integer float count used to error ("limit requires non-negative
+/// integer") where real jq's own fractional foreach-decrement loop bounds
+/// `limit(1.9; ...)` to 2 outputs (`ceil(1.9)`), confirmed live against jq
+/// 1.7.1. This test used to pin the error as deliberate; #1825 replaced it
+/// with the matching behavior instead -- see
+/// `test_limit_float_count_takes_ceil_1825` for the full table.
 #[test]
-fn test_limit_positive_float_count_still_errors_983() -> Result<()> {
+fn test_limit_positive_float_count_takes_ceil_983() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-cn", "[limit(1.9; 1,2,3)]"], None)?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("limit requires non-negative integer"),
-        "unexpected stderr: {stderr}"
-    );
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2]\n");
+    assert_eq!(stderr, "");
+    Ok(())
+}
+
+/// #1825: `classify_nth_n` tested `f < 0.0`, which NaN fails (all IEEE 754
+/// comparisons against NaN are `false`), so NaN silently fell through to
+/// the success path and classified as index `0` instead of raising. jq's
+/// own guard (`nth($n; g) = last(limit($n + 1; g))`, and `limit`'s `if $n >
+/// 0 ... elif $n == 0 ... else` falls to the unlimited `else` branch for a
+/// NaN `$n + 1`, so `last` never terminates and jq raises) is effectively
+/// `!(n >= 0)`, which also catches NaN. Confirmed live against jq 1.7.1 for
+/// every row below.
+#[test]
+fn test_nth_nan_raises_like_negative_1825() -> Result<()> {
+    for filter in ["[nth(nan; 1,2,3)]", "[nth(-nan; 1,2,3)]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("nth doesn't support negative indices"),
+            "{filter}: stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #1825 companion: the pre-existing negative/infinite/zero/large/infinite
+/// controls this fix must not disturb -- confirmed live against jq 1.7.1.
+#[test]
+fn test_nth_nan_fix_does_not_disturb_existing_controls_1825() -> Result<()> {
+    for (filter, expected) in [
+        ("[nth(-0.5; 1,2,3)]", None),
+        ("[nth(-infinite; 1,2,3)]", None),
+        ("[nth(-0.0; 1,2,3)]", Some("[1]")),
+        ("[nth(0; 1,2,3)]", Some("[1]")),
+        ("[nth(3.0; 1,2,3)]", Some("[]")),
+        ("[nth(infinite; 1,2,3)]", Some("[]")),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        match expected {
+            Some(out) => {
+                assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+                assert_eq!(stdout.trim_end(), out, "{filter}");
+            }
+            None => {
+                assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+                assert!(
+                    stderr.contains("nth doesn't support negative indices"),
+                    "{filter}: stderr: {stderr}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// #1825: `nth($n; g)` for a positive non-integer `$n` picked the wrong
+/// element -- `classify_nth_n` truncated `$n` to an integer index instead
+/// of the 0-based stop index jq's own `last(limit($n + 1; g))` definition
+/// implies (`ceil($n + 1) - 1`, i.e. `ceil($n)`). Confirmed live against jq
+/// 1.7.1: `nth(0.4; 1,2,3)` is `2`, not `1`; `nth(1.7; 1,2,3)` is `3`, not
+/// `2`.
+#[test]
+fn test_nth_non_integer_n_takes_ceil_1825() -> Result<()> {
+    for (filter, expected) in [("[nth(0.4; 1,2,3)]", "[2]"), ("[nth(1.7; 1,2,3)]", "[3]")] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #1825 companion: `nth/1` (the plain array-index form) is unrelated to
+/// `classify_nth_n` and must stay unaffected by this fix.
+#[test]
+fn test_nth_1_array_form_unaffected_by_1825() -> Result<()> {
+    for (filter, expected) in [("nth(1.7)", "2"), ("nth(0.4)", "1"), ("nth(nan)", "null")] {
+        let (stdout, code) = run_jq_stdin(filter, "[1,2,3]", &["-r"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #1825: `limit($n; g)` rejected any non-integer count with "limit
+/// requires non-negative integer" -- jq's own definition (`if $n > 0 then
+/// <take, decrementing $n by 1 per output, stop once decremented count <=
+/// 0> elif $n == 0 then empty else f end`) accepts a fractional `$n`,
+/// taking `ceil($n)` outputs. Confirmed live against jq 1.7.1 for every row
+/// below (see also `test_limit_positive_float_count_takes_ceil_983` for
+/// the original #983-adjacent repro this generalizes).
+#[test]
+fn test_limit_float_count_takes_ceil_1825() -> Result<()> {
+    for (filter, expected) in [
+        ("[limit(0.4; 1,2,3)]", "[1]"),
+        ("[limit(1.4; 1,2,3)]", "[1,2]"),
+        ("[limit(2.7; 1,2,3)]", "[1,2,3]"),
+        ("[limit(nan; 1,2,3)]", "[1,2,3]"),
+        ("[limit(-1; 1,2,3)]", "[1,2,3]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "{filter}");
+    }
     Ok(())
 }
 
