@@ -36439,6 +36439,36 @@ mod tests {
         );
     }
 
+    /// #1755: `/code-review` found the new decode-failure raise in
+    /// `in`/`IN`/`contains`/`inside` fires before `optional`/`?` is ever
+    /// consulted (the input/operand fails to decode before the fanout
+    /// argument even runs) -- matching this file's established rule that a
+    /// decode failure is never suppressed, but untested for these four
+    /// specific builtins until now.
+    #[test]
+    fn test_comparison_key_family_optional_does_not_suppress_decode_failure_1755() {
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "in({\"a\":1})?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "IN(\"a\",\"b\")?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "contains([1])?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "inside([1,2])?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
     /// site checked `optional` before the decode check and silently
     /// swallowed the failure as `QueryResult::None`.
