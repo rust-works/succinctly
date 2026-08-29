@@ -37499,7 +37499,10 @@ mod tests {
             (&b"\"\xff\xfe\""[..], "halt_error"),
             (&b"[[\"\xff\xfe\"]]"[..], "transpose"),
             (&b"[\"\xff\xfe\"]"[..], "transpose"),
-            (&b"[\"\xff\xfe\"]"[..], "shuffle"),
+            // `shuffle` needs the `cli` feature (a `cfg(not(feature =
+            // "cli"))` stub errors with an unrelated message otherwise,
+            // and CI's default `Test` job runs `cargo test` with no
+            // features) -- covered separately below.
             (&b"[[\"\xff\xfe\"]]"[..], "pivot"),
         ] {
             query!(
@@ -37688,9 +37691,9 @@ mod tests {
         query!(br"[[1,2],[3,4]]", "transpose",
             QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
         );
-        query!(br"[1,2,3]", "shuffle",
-            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 3); }
-        );
+        // `shuffle`'s own decode-failure/valid-data coverage lives in
+        // `test_shuffle_raises_on_decode_failure_1755` below (`cli`-gated
+        // -- see that test's own comment for why).
         query!(br"[[1,2],[3,4]]", "pivot",
             QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
         );
@@ -56401,6 +56404,26 @@ mod tests {
         // shuffle can be used in a pipeline
         query!(br"[3, 1, 2]", "shuffle | length",
             QueryResult::Owned(OwnedValue::Int(3)) => {}
+        );
+    }
+
+    /// #1755: `builtin_shuffle`'s own decode-failure/valid-data coverage,
+    /// split out of `test_misc_bucket_raises_on_decode_failure_1755`/
+    /// `test_misc_bucket_valid_data_unaffected_1755` and `cli`-gated like
+    /// every other `shuffle` test in this module -- the `cfg(not(feature
+    /// = "cli"))` stub errors with an unrelated "requires the 'cli'
+    /// feature" message, and CI's default `Test` job runs `cargo test`
+    /// with no explicit features.
+    #[test]
+    #[cfg(feature = "cli")]
+    fn test_shuffle_raises_on_decode_failure_1755() {
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "shuffle",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(br"[1,2,3]", "shuffle",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 3); }
         );
     }
 
