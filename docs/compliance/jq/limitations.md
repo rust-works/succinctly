@@ -943,6 +943,32 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
+## A too-deeply-nested document is caught at a different stage, with different wording
+
+Real jq refuses a document nested past 256 levels at *parse* time: `jq -c sort` on a
+260-level-deep array gives `jq: parse error: Exceeds depth limit for parsing at line 1,
+column 257` (exit 5) before evaluation ever starts, regardless of which filter is applied
+— confirmed live against the pinned 1.7.1 binary. Succinctly's semi-indexing accepts the
+same document at parse/index time (its own architectural point, #1793's own investigation
+confirmed: `succinctly jq -c length`/`.[1]` on the identical document already succeed,
+since navigating to or measuring a value doesn't require materializing it), so the
+equivalent guard only fires later, when a builtin with no native lazy fast path (`sort`,
+`join`) or one that still has to materialize its result before printing (`map(.)`) forces
+a full `to_owned_cursor` conversion of the value it's handed — `nesting depth exceeds
+limit of 256` (also exit 5, matching jq's own exit code by coincidence of both picking the
+same conventional "filter failed" code, not by design). succinctly's own wording, since
+there is no equivalent jq sentence to copy for an evaluation-time guard jq has no
+counterpart to (its own check never gets this far). See #1793 for the fix that turned this
+from an uncaught process panic into a clean, catchable diagnostic.
+
+This fix is scoped to the CLI's default (lazy) per-document dispatch, matching #1793's own
+repro — the same panic remains uncaught via a CLI flag that forces whole-batch
+materialization up front (`--slurp`, `-S`/`--sort-keys`, `-C`/`--color-output`,
+`--ascii-output`, `--slurpfile`) or via `-e`/`--exit-status`'s own separate materializer
+(`src/jq/lazy.rs`, already pinned uncaught by `test_exit_status_query_rejects_adversarial_
+nesting_998`), and `succinctly yq` has no equivalent guard on either its default or
+materializing path at all. Tracked separately, not fixed here.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

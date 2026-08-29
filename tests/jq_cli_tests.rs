@@ -16550,6 +16550,31 @@ fn test_sort_on_non_array_is_unaffected_by_1793_fix() -> Result<()> {
     Ok(())
 }
 
+/// #1793 review: `assert_value_tree_depth`'s `MAX_VALUE_TREE_DEPTH` (384)
+/// guard shares `to_owned_cursor_at_depth`'s `MAX_NESTING_DEPTH` (256)
+/// guard's exact message template via the same underlying `assert_depth`
+/// call (`src/jq/value.rs`) -- byte-identical apart from the interpolated
+/// number. An earlier version of this fix matched on that shared substring
+/// and silently swallowed this *different* guard's panic (filter-driven
+/// value growth, not document nesting) as if it were #1793's own condition.
+/// This must still crash uncaught -- absorbing it silently would mask a
+/// genuinely different failure class behind #1793's message.
+#[test]
+fn test_unrelated_value_tree_depth_panic_is_not_caught_by_1793_fix() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "reduce range(400) as $i (null; [.])"], Some("null"))
+            .unwrap_or_else(|e| panic!("run failed: {e}"));
+    assert_eq!(
+        code, 101,
+        "an unrelated MAX_VALUE_TREE_DEPTH panic must still crash uncaught, not be silently absorbed as #1793's own guard\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1008 (yq PR) code review: `format_number_jq_compat`'s `value == 0.0`/
 /// `value as i64` checks don't distinguish -0.0 from 0.0 (IEEE 754), so a
 /// negative-zero exponent literal silently lost its sign across all three
