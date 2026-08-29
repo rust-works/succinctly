@@ -58047,6 +58047,35 @@ mod tests {
         assert_eq!(err.message, "Cannot index number with number");
     }
 
+    /// #1827: the sibling of `test_delete_expr_array_paths_reports_index_number_like_plain_index_1326`
+    /// for the `Slice`/`SliceNumber` pair -- the same match's two `Slice { .. }
+    /// | Expr::SliceNumber { .. }` arms (one `if`-gated on a `String` value, one
+    /// not) had no direct test coverage at all before this, for either sibling.
+    /// Same reachability caveat as #1326's own test: called directly, since a
+    /// parsed `del(.[1.0:3], .[3])`-shaped query exits through a different,
+    /// higher-level dispatch before ever reaching this specific match (verified
+    /// live: it reports a plain "Cannot index X with number", not either message
+    /// asserted here).
+    #[test]
+    fn test_delete_expr_array_paths_reports_slice_number_like_plain_slice_1827() {
+        let steps = [DeleteStep {
+            component: Expr::SliceNumber {
+                start: Some(1),
+                end: Some(3),
+                start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+                end_key: None,
+            },
+            optional: false,
+        }];
+        let err = delete_expr_array_paths(OwnedValue::String("hi".into()), &[&steps], 0)
+            .expect_err("not an array");
+        assert_eq!(err.message, "Cannot delete fields from string");
+
+        let err = delete_expr_array_paths(OwnedValue::Bool(true), &[&steps], 0)
+            .expect_err("not an array");
+        assert_eq!(err.message, "Cannot index boolean with object");
+    }
+
     // #694: `collect_owned()`/`eval_owned_multi` silently dropped a
     // `Partial`'s trailing `Control::Error`/`Control::Break`, keeping only
     // its prefix as if evaluation had completed normally -- so a mid-stream
