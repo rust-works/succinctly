@@ -3601,7 +3601,7 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
 /// own `--unbuffered` flush has no yq-mode equivalent at this call site,
 /// so it stays local rather than folding into the shared type.
 fn write_terminator<W: Write>(out: &mut W, config: &OutputConfig) -> Result<()> {
-    Terminator::new(config.raw_output0, config.join_output).write_io(out)?;
+    Terminator::from_flags(config.raw_output0, config.join_output).write_io(out)?;
     if config.unbuffered {
         out.flush()?;
     }
