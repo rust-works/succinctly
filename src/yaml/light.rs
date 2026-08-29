@@ -6139,6 +6139,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                         ResolvedScalar::Null | ResolvedScalar::Bool(false)
                     )
             }
+            // Resolve the whole chain first, exactly as `string_decode_error`
+            // above does and for the same reason (#1191): a 2+-hop alias to
+            // `null`/`false` is still `null`/`false`, and answering from the
+            // unresolved `Alias` node itself would report "not falsy" for a
+            // target that genuinely is (#1645 code review) --
+            // `resolve_alias_target_cursor` already guarantees its result is
+            // never itself an `Alias`, so this recurses at most once.
+            YamlValue::Alias { .. } => self
+                .resolve_alias_target_cursor()
+                .is_some_and(|target| target.is_falsy()),
             _ => false,
         }
     }

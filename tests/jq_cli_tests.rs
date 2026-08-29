@@ -1938,9 +1938,9 @@ fn test_select_raises_on_decode_failure_instead_of_silently_truthy_1645() -> Res
     // its bytes don't decode (#1247's own trigger shape).
     let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some(r#"["\x"]"#))
         .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
-    assert_ne!(
-        code, 0,
-        "an undecodable value must not be silently treated as truthy\nstdout: {stdout:?}"
+    assert_eq!(
+        code, 5,
+        "an undecodable value must not be silently treated as truthy\nstdout: {stdout:?}\nstderr: {stderr:?}"
     );
     assert!(
         stderr.contains("invalid escape sequence"),
@@ -1956,11 +1956,59 @@ fn test_select_raises_on_decode_failure_instead_of_silently_truthy_1645() -> Res
 fn test_select_raises_on_structural_error_instead_of_silently_truthy_1645() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some("[xyz123]"))
         .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
-    assert_ne!(
-        code, 0,
-        "a structurally malformed value must not be silently treated as truthy\nstdout: {stdout:?}"
+    assert_eq!(
+        code, 5,
+        "a structurally malformed value must not be silently treated as truthy\nstdout: {stdout:?}\nstderr: {stderr:?}"
     );
-    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
+    assert!(
+        stderr.contains("unexpected character"),
+        "expected the #1194 structural-error message on stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1645: the same decode failure, but nested a level below the value
+/// `select`'s condition actually resolves to -- `.bad` resolves to the
+/// *array*, not the bad string directly, so this only passes if the
+/// truthiness check recurses into container contents rather than checking
+/// only the condition's own top-level cursor (an earlier version of this
+/// fix did exactly that and silently missed this shape -- caught by
+/// review).
+#[test]
+fn test_select_raises_on_decode_failure_nested_in_container_1645() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["select(.bad) | .keep"],
+        Some(r#"{"bad": ["\x"], "keep": 5}"#),
+    )
+    .unwrap_or_else(|e| panic!("`select(.bad)` failed to run: {e}"));
+    assert_eq!(
+        code, 5,
+        "a decode failure nested inside the condition's container must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1645 sibling case: a #1194 structural error nested a level below the
+/// condition's own top-level cursor.
+#[test]
+fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["select(.bad) | .keep"],
+        Some(r#"{"bad": [xyz123], "keep": 5}"#),
+    )
+    .unwrap_or_else(|e| panic!("`select(.bad)` failed to run: {e}"));
+    assert_eq!(
+        code, 5,
+        "a structural error nested inside the condition's container must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("unexpected character"),
+        "expected the #1194 structural-error message on stderr: {stderr:?}"
+    );
     Ok(())
 }
 
