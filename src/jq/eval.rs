@@ -1242,33 +1242,47 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for expr in exprs {
         match eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => match owned.as_mut() {
-                Some(acc) => acc.push(to_owned(&v)),
-                None => borrowed.push(v),
-            },
+            // #1790: to_owned_checked, not to_owned -- a heterogeneous
+            // comma (a navigable branch alongside an already-owned one,
+            // e.g. `[.a, 1]`) used to promote the borrowed branch's
+            // undecodable string to `""` here, silently, the moment the
+            // owned sibling forced the promotion. `push_promoted`/
+            // `promote_borrowed_checked` are the same helpers
+            // `eval_pipe`'s identical `Many`-branch promotion uses
+            // (#1755/#1843's own instance of this exact bug shape).
+            QueryResult::One(v) => {
+                if let Err(e) = push_promoted(core::iter::once(v), &mut borrowed, &mut owned) {
+                    let merged = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                    return partial(merged, Control::Error(e));
+                }
+            }
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
-            QueryResult::Many(vs) => match owned.as_mut() {
-                Some(acc) => acc.extend(vs.iter().map(to_owned)),
-                None => borrowed.extend(vs),
-            },
-            QueryResult::Owned(v) => owned
-                .get_or_insert_with(|| {
-                    core::mem::take(&mut borrowed)
-                        .iter()
-                        .map(to_owned)
-                        .collect()
-                })
-                .push(v),
-            QueryResult::ManyOwned(vs) => owned
-                .get_or_insert_with(|| {
-                    core::mem::take(&mut borrowed)
-                        .iter()
-                        .map(to_owned)
-                        .collect()
-                })
-                .extend(vs),
+            QueryResult::Many(vs) => {
+                if let Err(e) = push_promoted(vs, &mut borrowed, &mut owned) {
+                    let merged = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                    return partial(merged, Control::Error(e));
+                }
+            }
+            QueryResult::Owned(v) => {
+                if owned.is_none() {
+                    match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                        Ok(acc) => owned = Some(acc),
+                        Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                    }
+                }
+                owned.as_mut().unwrap().push(v);
+            }
+            QueryResult::ManyOwned(vs) => {
+                if owned.is_none() {
+                    match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                        Ok(acc) => owned = Some(acc),
+                        Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                    }
+                }
+                owned.as_mut().unwrap().extend(vs);
+            }
             QueryResult::None => {}
             // A sibling that errors or breaks no longer discards the outputs
             // the earlier siblings already produced (#400): `(1,error("x"))`
@@ -13994,18 +14008,21 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Push one already-produced cursor result into `eval_pipe`'s `Many`-branch
-/// element loop's promotion state: still lazily borrowed if promotion
-/// hasn't started, checked-converted into `owned` if it has.
+/// Push one already-produced cursor result into a "still lazily borrowed
+/// until a sibling forces promotion to owned" accumulator's promotion
+/// state -- shared by `eval_pipe`'s `Many`-branch element loop and
+/// `eval_comma`'s own identical shape.
 ///
-/// #1755 review: an earlier version of this slice's fix left this specific
-/// promotion path on unchecked `to_owned`, silently corrupting an
+/// #1755 review: an earlier version of `eval_pipe`'s own fix left this
+/// specific promotion path on unchecked `to_owned`, silently corrupting an
 /// already-borrowed undecodable element the moment any sibling forced
 /// promotion to owned -- `.[] | (if type == "string" then . else . + 0
 /// end)` on `["\xff\xfe", 1]` returned `ManyOwned([String(""), Int(1)])`
-/// instead of raising. On failure, `owned` is left holding whatever
-/// pushed successfully before the failing element, matching the #400
-/// "keep the prefix" policy every other control arm in that loop follows.
+/// instead of raising. `eval_comma` had the identical bug shape for a
+/// heterogeneous comma (`[.a, 1]`, #1790). On failure, `owned` is left
+/// holding whatever pushed successfully before the failing element,
+/// matching the #400 "keep the prefix" policy every other control arm in
+/// both loops follows.
 fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
     rs: impl IntoIterator<Item = StandardJson<'a, W>>,
     borrowed: &mut Vec<StandardJson<'a, W>>,
@@ -14026,10 +14043,11 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
 }
 
 /// Promote `borrowed` into a checked `Vec<OwnedValue>`, used the moment an
-/// `Owned`/`ManyOwned` sibling in `eval_pipe`'s `Many`-branch loop forces
-/// the whole batch out of its lazy borrowed state for the first time
-/// (see [`push_promoted`]'s identical #1755 reasoning). Returns whatever
-/// converted successfully so far as the `Err` payload's own prefix.
+/// `Owned`/`ManyOwned` sibling in `eval_pipe`'s `Many`-branch loop (or
+/// `eval_comma`'s identical shape, #1790) forces the whole batch out of
+/// its lazy borrowed state for the first time (see [`push_promoted`]'s
+/// identical #1755 reasoning). Returns whatever converted successfully so
+/// far as the `Err` payload's own prefix.
 fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
     borrowed: Vec<StandardJson<'_, W>>,
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
@@ -37148,6 +37166,61 @@ mod tests {
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid unicode escape"), "message: {}", e.message);
             }
+        );
+    }
+
+    /// #1790: a *heterogeneous* comma -- mixing a navigable branch (still
+    /// lazily borrowed as a cursor) with an already-owned one (a literal,
+    /// or any other branch that materializes eagerly) -- used to silently
+    /// corrupt the borrowed branch's undecodable string to `""` the
+    /// moment the owned sibling forced `eval_comma`'s own accumulator to
+    /// promote from borrowed to owned. A *homogeneous* comma (`[.a, .a]`,
+    /// both branches navigable) was already correct, since it never
+    /// leaves the borrowed fast path at all -- confirmed unaffected by
+    /// `test_eval_array_construction_raises_on_decode_failure_1755` above.
+    #[test]
+    fn test_eval_comma_heterogeneous_raises_on_decode_failure_1790() {
+        // Array construction (this issue's own repro): the owned literal
+        // `1` forces `eval_comma`'s promotion inside `[.a, 1]`.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[.a, 1]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // The same shape without array construction wrapping it -- a bare
+        // top-level comma forcing the same promotion.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a, 1",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Order matters for the #400 "keep the prefix" policy: the
+        // borrowed (bad) branch is the *first* operand above (nothing yet
+        // to keep), but here the owned branch comes first, so the
+        // already-produced `1` must survive as the `Partial` prefix once
+        // the second (borrowed, bad) operand is reached and forces the
+        // promotion to fail.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "1, .a",
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
+        );
+    }
+
+    /// #1790 positive control: a heterogeneous comma with valid data is
+    /// unaffected by routing through `push_promoted`/
+    /// `promote_borrowed_checked`.
+    #[test]
+    fn test_eval_comma_heterogeneous_valid_data_unaffected_1790() {
+        query!(br#"{"a":"x"}"#, "[.a, 1]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::String("x".to_string()), OwnedValue::Int(1)]);
+            }
+        );
+        query!(br#"{"a":"x"}"#, "1, .a",
+            QueryResult::Many(_) | QueryResult::ManyOwned(_) => {}
         );
     }
 
