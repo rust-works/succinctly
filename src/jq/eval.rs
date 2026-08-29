@@ -3334,17 +3334,20 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// ordering places all three below every positive number -- means unlimited
 /// passthrough, not an error.
 ///
-/// Shared by [`eval_limit`], [`resolve_limit`], and [`each_limit`] (code
-/// review, #1462) -- previously three independent copies of this exact
-/// ~20-line match, one per evaluator context (plain, path-tracking,
-/// demand-forwarding). That drifted once already: `resolve_limit`'s copy
-/// was missing the negative-float arm relative to `eval_limit`'s until a
-/// code-review pass caught it (#1313). Factoring out only the
-/// classification switch -- not `n_expr`'s own evaluation, which
-/// legitimately differs across borrowed/owned/path-tracking contexts, or
-/// what each caller does with the answer -- removes that drift risk
-/// categorically instead of relying on a differential test to catch the
-/// next divergence.
+/// Shared by every `limit`-shaped call site in both evaluators -- plain,
+/// path-tracking, demand-forwarding, and the generic evaluator's own
+/// fast-path twins (code review, #1462/#1607) -- previously independent
+/// copies of this exact ~20-line match, one per context. That drifted once
+/// already: `resolve_limit`'s copy was missing the negative-float arm
+/// relative to `eval_limit`'s until a code-review pass caught it (#1313).
+/// This doc comment deliberately doesn't enumerate the call sites by name
+/// (an earlier version did, undercounted them, and went stale the moment a
+/// new one was added, #1825 review) -- grep for this function's name
+/// instead of trusting a list here. Factoring out only the classification
+/// switch -- not `n_expr`'s own evaluation, which legitimately differs
+/// across borrowed/owned/path-tracking contexts, or what each caller does
+/// with the answer -- removes that drift risk categorically instead of
+/// relying on a differential test to catch the next divergence.
 #[derive(Debug)]
 pub(crate) enum LimitN {
     /// Unlimited passthrough: run the caller's own `expr`/`resolve_node`
@@ -3419,17 +3422,31 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
             // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` (see
             // `classify_limit_n`'s own `Take(f.ceil() as usize)` for a
             // positive `$n`) and returns the last one -- a 0-based stop
-            // index of `ceil($n + 1) - 1`, which is `ceil($n)` by the
-            // identity `ceil(x + 1) == ceil(x) + 1` for any real `x`.
-            // Truncating (the previous `f as usize`) instead of ceiling
-            // silently answered from one element earlier than jq for any
-            // positive non-integer `n` (#1825): `nth(0.4; 1,2,3)` is `2` in
-            // jq, not `1`. `as_i64()` is still preferred over `f.ceil()`
-            // for an exact integer: past f64's 53-bit mantissa, converting
-            // to `f64` at all would already have lost precision.
-            Ok(owned
-                .as_i64()
-                .map_or_else(|| f.ceil() as usize, |i| i as usize))
+            // index of `ceil($n + 1) - 1`. An earlier version of this fix
+            // computed that as `ceil($n)` instead, reasoning from the real-
+            // number identity `ceil(x + 1) == ceil(x) + 1` -- true for
+            // exact reals, but not for the rounded `f64` addition jq's own
+            // `$n + 1` actually performs: review found and confirmed live
+            // against jq 1.7.1 that the two diverge by one whenever `f`'s
+            // fractional part is small enough to be rounded away as
+            // `f + 1.0` crosses a power-of-two ULP-doubling boundary
+            // (`nth(1.0000000000000002; range(1;30))` is `2` in jq, but
+            // `ceil(f) as usize` computes `2` where the correct 0-based
+            // index is `1` -- every `f` that is the smallest `f64` greater
+            // than `k` for `k = 2^m - 1` reproduces this). Computing
+            // `f + 1.0` explicitly, the same rounding jq's own arithmetic
+            // performs, before ceiling avoids the gap between the two
+            // formulas entirely. Truncating (the original pre-#1825 `f as
+            // usize`) instead of this `+1`-then-ceil shape silently
+            // answered from one element earlier than jq for any positive
+            // non-integer `n`: `nth(0.4; 1,2,3)` is `2` in jq, not `1`.
+            // `as_i64()` is still preferred for an exact integer: past
+            // f64's 53-bit mantissa, converting to `f64` at all would
+            // already have lost precision.
+            Ok(owned.as_i64().map_or_else(
+                || ((f + 1.0).ceil() as usize).saturating_sub(1),
+                |i| i as usize,
+            ))
         }
         ref other => Err(EvalError::type_error("number", other.type_name())),
     }
@@ -24259,19 +24276,20 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Real yq has no `nth` (lexer-rejected); see `builtin_ltrimstr`.
         ArgFanout::All,
         |n_value| {
-            // `NumberLiteral(Int)` alongside `Int` (#1408 review, 769b80583):
-            // a document-sourced integer materializes as the former, and
-            // `stream_outputs` hands this closure exactly that shape, so
-            // matching only `Int` would reject `nth` on any `n` read from the
-            // input. `builtin_nth_stream` -- the arity-2 form real queries
-            // actually reach -- accepts both for the same reason.
-            let n = match n_value {
-                OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
-                    i as usize
-                }
-                _ => {
-                    return QueryResult::Error(EvalError::new("nth requires non-negative integer"));
-                }
+            // Delegates to the same `classify_nth_n` every other `nth`
+            // context uses (#1313/#1607), rather than a fifth hand-rolled
+            // copy: this function's own inline classification (integer-only,
+            // no float/NaN handling, a different error message) was never
+            // updated alongside #1825's fix, exactly the kind of drift
+            // #1313 already had to fix once for `classify_limit_n`. Latent
+            // rather than live -- `Expr::NthExpr` is never constructed by
+            // the parser (see this function's own doc comment) -- but a
+            // hand-copied classification left to rot here would silently
+            // reintroduce #1825's bugs the moment anything ever does
+            // construct one.
+            let n = match classify_nth_n(n_value) {
+                Ok(n) => n,
+                Err(e) => return QueryResult::Error(e),
             };
 
             // Pull only as far as index `n`, then stop -- jq defines `nth` as

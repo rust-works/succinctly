@@ -15540,6 +15540,25 @@ fn test_nth_non_integer_n_takes_ceil_1825() -> Result<()> {
     Ok(())
 }
 
+/// #1825 review: an earlier version of this fix computed the 0-based stop
+/// index as `ceil($n)`, reasoning from the real-number identity
+/// `ceil(x + 1) == ceil(x) + 1` -- true for exact reals, but not for the
+/// rounded `f64` addition jq's own `$n + 1` actually performs. The two
+/// diverge by one whenever `f`'s fractional part is small enough to be
+/// rounded away as `f + 1.0` crosses a power-of-two ULP-doubling boundary.
+/// Confirmed live against jq 1.7.1 for the smallest `f64` greater than
+/// `k`, for every `k = 2^m - 1` up to `511`.
+#[test]
+fn test_nth_ulp_boundary_matches_jq_addition_order_1825() -> Result<()> {
+    for k in [1, 3, 7, 15, 31, 63, 127, 255, 511] {
+        let filter = format!("nth(({k} | tonumber) + 0.0000000000000002; range(1;2000))");
+        let (stdout, stderr, code) = run_jq_full(&["-n", &filter], None)?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), (k + 1).to_string(), "{filter}");
+    }
+    Ok(())
+}
+
 /// #1825 companion: `nth/1` (the plain array-index form) is unrelated to
 /// `classify_nth_n` and must stay unaffected by this fix.
 #[test]
