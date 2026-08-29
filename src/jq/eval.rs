@@ -672,11 +672,18 @@ fn scalar_decode_failure<W: Clone + AsRef<[u64]>>(
 /// reason: `.. | .[.k]?` visits every node in a tree, and on a
 /// linear-nesting document `.k`'s value at depth *i* is the entire
 /// remaining subtree (#626).
-fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
+///
+/// #1755: `to_owned_checked`, not `to_owned`, on the scalar fallback -- an
+/// undecodable string candidate (a computed index/slice-bound key) must
+/// raise, not silently become `""` and get indexed/compared as though
+/// that were the real key.
+fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
     match value {
-        StandardJson::Array(_) => OwnedValue::Array(Vec::new()),
-        StandardJson::Object(_) => OwnedValue::Object(IndexMap::new()),
-        other => to_owned(other),
+        StandardJson::Array(_) => Ok(OwnedValue::Array(Vec::new())),
+        StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new())),
+        other => to_owned_checked(other),
     }
 }
 
@@ -6087,7 +6094,13 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The input is a key (string or number) to check against every output
     // of `xs`; `xs` itself also receives this same input (`. as $x | xs`
     // doesn't change `.`).
-    let key_owned = to_owned(&value);
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable key must
+    // raise, not silently compare as "".
+    let key_owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
     // once rather than once per candidate (#909 review). Semantics-aware --
@@ -6198,7 +6211,13 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // own doc comment states it matches jq's `any(s == .; .)`, so it must
     // agree with `==`'s own yq-mode strict Int/Float distinction (#950
     // review) rather than silently falling back to widening equality.
-    let current = to_owned(&value);
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // raise, not silently compare as "".
+    let current = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut found = false;
     let flow = eval_each_owned::<S>(s, &current, false, &mut |candidate| {
         if owned_value_eq::<S>(&candidate, &current) {
@@ -7535,12 +7554,16 @@ fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // collapse can't distinguish "genuinely empty" from
                 // "collapsed, contents unread" (a non-empty object would
                 // wrongly render as `{}` too).
-                let parts: Vec<String> = elements
+                let parts: Result<Vec<String>, EvalError> = elements
                     .map(|e| match &e {
-                        StandardJson::Object(fields) if fields.is_empty() => "{}".to_string(),
-                        _ => yq_join_element_part(to_owned_key_shape(&e)),
+                        StandardJson::Object(fields) if fields.is_empty() => Ok("{}".to_string()),
+                        _ => to_owned_key_shape(&e).map(yq_join_element_part),
                     })
                     .collect();
+                let parts = match parts {
+                    Ok(parts) => parts,
+                    Err(e) => return QueryResult::Error(e),
+                };
                 QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
             }
             other => QueryResult::Error(EvalError::new(format!(
@@ -7587,7 +7610,13 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Hoisted out of the fan-out: the input does not vary with `b`, and
     // `to_owned` deep-copies the whole document — inside the loop, an N-output
     // argument would pay for it N times.
-    let input = to_owned(&value);
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // raise, not silently be checked for containment as "".
+    let input = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -7690,7 +7719,13 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Hoisted out of the fan-out: the input does not vary with `b`, and
     // `to_owned` deep-copies the whole document. Same reasoning as
     // `builtin_contains`, of which this is the inverse.
-    let input = to_owned(&value);
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // raise, not silently be checked for containment as "".
+    let input = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -10945,10 +10980,16 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // (any type). `owned_value_eq::<S>`, not plain `==`, so this
             // agrees with `==`'s own yq-mode strict Int/Float distinction
             // (#950 review).
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // element must raise, not silently compare as "".
             SearchOccurrence::All => {
                 let mut indices = Vec::new();
                 for (i, elem) in (*elements).enumerate() {
-                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                    let owned = match to_owned_checked(&elem) {
+                        Ok(v) => v,
+                        Err(e) => return QueryResult::Error(e),
+                    };
+                    if owned_value_eq::<S>(&owned, pattern) {
                         indices.push(OwnedValue::Int(i as i64));
                     }
                 }
@@ -10956,7 +10997,11 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             SearchOccurrence::First => {
                 for (i, elem) in (*elements).enumerate() {
-                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                    let owned = match to_owned_checked(&elem) {
+                        Ok(v) => v,
+                        Err(e) => return QueryResult::Error(e),
+                    };
+                    if owned_value_eq::<S>(&owned, pattern) {
                         return QueryResult::Owned(OwnedValue::Int(i as i64));
                     }
                 }
@@ -10972,7 +11017,11 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             SearchOccurrence::Last => {
                 let mut last = None;
                 for (i, elem) in (*elements).enumerate() {
-                    if owned_value_eq::<S>(&to_owned(&elem), pattern) {
+                    let owned = match to_owned_checked(&elem) {
+                        Ok(v) => v,
+                        Err(e) => return QueryResult::Error(e),
+                    };
+                    if owned_value_eq::<S>(&owned, pattern) {
                         last = Some(i);
                     }
                 }
@@ -14196,8 +14245,18 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // output must still reach stdout (#791).
     let mut pending_halt = None;
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned_key_shape(&v)],
-        QueryResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
+        QueryResult::One(v) => match to_owned_key_shape(&v) {
+            Ok(v) => vec![v],
+            Err(e) => return QueryResult::Error(e),
+        },
+        QueryResult::Many(vs) => {
+            let keys: Result<Vec<OwnedValue>, EvalError> =
+                vs.iter().map(to_owned_key_shape).collect();
+            match keys {
+                Ok(keys) => keys,
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => return QueryResult::None,
@@ -14507,8 +14566,18 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let (raw, escape): (Vec<OwnedValue>, Option<Control>) =
         match eval_single::<W, S>(expr, value, false).materialize_cursor() {
-            QueryResult::One(v) => (vec![to_owned_key_shape(&v)], None),
-            QueryResult::Many(vs) => (vs.iter().map(to_owned_key_shape).collect(), None),
+            QueryResult::One(v) => match to_owned_key_shape(&v) {
+                Ok(v) => (vec![v], None),
+                Err(e) => return Err(Control::Error(e)),
+            },
+            QueryResult::Many(vs) => {
+                let keys: Result<Vec<OwnedValue>, EvalError> =
+                    vs.iter().map(to_owned_key_shape).collect();
+                match keys {
+                    Ok(keys) => (keys, None),
+                    Err(e) => return Err(Control::Error(e)),
+                }
+            }
             QueryResult::Owned(v) => (vec![v], None),
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => (Vec::new(), None),
@@ -33188,8 +33257,16 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
         _ => return QueryResult::Error(EvalError::new("bsearch requires array")),
     };
 
-    // Collect array elements
-    let elements: Vec<OwnedValue> = elements_iter.map(|v| to_owned(&v)).collect();
+    // Collect array elements.
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable element
+    // must raise, not silently compare as "" against the search target.
+    let elements: Result<Vec<OwnedValue>, EvalError> =
+        elements_iter.map(|v| to_owned_checked(&v)).collect();
+    let elements = match elements {
+        Ok(elements) => elements,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // jq's search from `builtin.jq`: an inclusive `hi` and a
     // `floor((lo + hi) / 2)` midpoint, so the probe sequence — and with it which
@@ -36235,6 +36312,118 @@ mod tests {
     /// (the public `succinctly::jq::eval` library API, not the CLI's
     /// `eval_generic.rs` bridge) must not be suppressed by `?` -- same rule,
     /// same reasoning, as `eval_generic.rs`'s `Expr::Optional` arm. Exercises
+    /// #1755: the "indirect comparison-key" family -- a decode failure in a
+    /// value used only to compute a comparison/lookup/index key, not
+    /// returned directly, must still raise rather than silently comparing
+    /// as `""`. Covers `in`/`IN` (the input is the key), `contains`/
+    /// `inside` (the whole input is the containment operand),
+    /// `index`/`indices`/`rindex` (an array element compared against the
+    /// pattern), `bsearch` (every array element, compared during the
+    /// search), a computed-index key (`eval_index_expr`), a slice bound
+    /// (`eval_slice_bound`), and yq-mode `join`'s per-element collapse --
+    /// the last three all share `to_owned_key_shape`, made fallible for
+    /// this slice.
+    #[test]
+    fn test_comparison_key_family_raises_on_decode_failure_1755() {
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "in({\"a\":1})",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "IN(\"a\",\"b\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "contains([1])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "inside([1,2])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1, \"\xff\xfe\"]"[..],
+            "index(9)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1, \"\xff\xfe\"]"[..],
+            "indices(9)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1, \"\xff\xfe\"]"[..],
+            "rindex(9)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1, \"\xff\xfe\", 3]"[..],
+            "bsearch(2)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":1,\"bad\":\"\xff\xfe\"}"[..],
+            ".[.bad]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":[1,2,3],\"bad\":\"\xff\xfe\"}"[..],
+            ".a[(.bad):]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        yq_query!(
+            &b"[\"\xff\xfe\",\"b\"]"[..],
+            "join(\",\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1755 positive control: valid data through each of the comparison-key
+    /// family's dispatch points is unaffected by routing through
+    /// `to_owned_checked`.
+    #[test]
+    fn test_comparison_key_family_valid_data_unaffected_1755() {
+        query!(br#""a""#, "in({\"a\":1})",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(b); }
+        );
+        query!(br#""a""#, "IN(\"a\",\"b\")",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(b); }
+        );
+        query!(br"[1]", "contains([1])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(b); }
+        );
+        query!(br"[1]", "inside([1,2])",
+            QueryResult::Owned(OwnedValue::Bool(b)) => { assert!(b); }
+        );
+        query!(br"[1, 2]", "index(2)",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(1)); }
+        );
+        query!(br"[1, 2]", "indices(2)",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v, vec![OwnedValue::Int(1)]); }
+        );
+        query!(br"[1, 2, 2]", "rindex(2)",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(2)); }
+        );
+        query!(br"[1, 2, 3]", "bsearch(2)",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(1)); }
+        );
+        query!(br#"{"a":1,"k":"a"}"#, ".[.k]",
+            QueryResult::One(v) => { assert_eq!(to_owned(&v), OwnedValue::Int(1)); }
+        );
+        query!(br#"{"a":[1,2,3],"n":1}"#, ".a[(.n):]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        yq_query!(br#"["x","y"]"#, "join(\",\")",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "x,y"); }
+        );
+    }
+
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
     /// site checked `optional` before the decode check and silently
     /// swallowed the failure as `QueryResult::None`.
