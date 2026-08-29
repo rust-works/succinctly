@@ -24722,3 +24722,130 @@ fn test_streamed_key_decode_failure_still_preserved_1615() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1615 review follow-up: `--inplace` must leave the file byte-identical when
+/// a streamed decode failure fires.
+///
+/// Making the streaming writers raise (#1615) also made them stop part-way
+/// through a document, and `-i` would otherwise commit that truncated buffer
+/// -- turning `a: 1\nb: "bad \q escape"\n` into the 8-byte fragment `a: 1\nb: `
+/// and, on a multi-document file, into `a: 1\nb: ---\nc: 3\n`: a *valid* YAML
+/// file whose `b` is a fabricated value, with the corruption invisible from
+/// the file itself. That is strictly worse than the silent `b: ""` #1615
+/// replaces, because it destroys the user's own data rather than misreporting
+/// it.
+///
+/// Not a new policy: `-i` on a *materializing* filter (`.a = 5`) already left
+/// the file untouched on the same input, and real yq v4.53.3 leaves it
+/// byte-identical on every filter (verified live -- same md5 before and after,
+/// exit 1). This makes the streamed path agree with both.
+#[test]
+fn test_inplace_leaves_file_untouched_on_decode_failure_1615() -> Result<()> {
+    for original in [
+        "a: 1\nb: \"bad \\q escape\"\n",
+        // The multi-document shape, where a committed buffer would have been
+        // valid-looking rather than obviously truncated.
+        "a: 1\nb: \"bad \\q escape\"\n---\nc: 3\n",
+    ] {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "{original}")?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(".")
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "must fail rather than silently rewrite: {original:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(input_file.path())?,
+            original,
+            "file must survive byte-identical: {original:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1615 review follow-up: a streamed identity render cut off mid-document
+/// must not be followed by the next document's `---`.
+///
+/// The identity/P9 branches stream a container's structure directly, so
+/// `a: 1\nb: ` is already written by the time the bad scalar is reached, with
+/// no newline closing it. Continuing the document loop welded the separator
+/// onto that line and produced `a: 1\nb: ---\nc: 3` -- output that reads back
+/// as valid YAML with a fabricated `b`, and invalid JSON under `-o=json`.
+/// Real yq aborts the whole run on this input anyway.
+///
+/// The *evaluated* path is deliberately unaffected and still continues to the
+/// next document (#355): `GenericResult`'s streamers report through
+/// `StreamStats` without emitting a partial scalar, so nothing is left
+/// unterminated for a separator to collide with.
+#[test]
+fn test_streamed_truncation_does_not_weld_doc_separator_1615() -> Result<()> {
+    let input = "a: 1\nb: \"bad \\q escape\"\n---\nc: 3\n";
+
+    for extra in [&[][..], &["-o", "json"][..]] {
+        let (output, stderr, exit_code) = run_yq_split(".", input, extra)?;
+        assert_eq!(exit_code, 1, "args {extra:?}: {stderr}");
+        assert!(
+            !output.contains("---"),
+            "a truncated document must not be followed by a separator, \
+             args {extra:?}, output: {output:?}"
+        );
+        assert!(
+            !output.contains("c: 3") && !output.contains("\"c\""),
+            "the run must stop rather than emit later documents onto a \
+             truncated line, args {extra:?}, output: {output:?}"
+        );
+    }
+
+    // The evaluated route keeps #355's continue-past-a-bad-document behaviour,
+    // because it never leaves a document half-written.
+    let (output, _, exit_code) = run_yq_split(".b", input, &[])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        output.contains("null"),
+        "evaluated route should still reach the second document: {output:?}"
+    );
+    Ok(())
+}
+
+/// #1615 self-review: `--inplace` keeps editing the remaining files after one
+/// fails, so the truncation flag must reset per file.
+///
+/// Left set across the loop, it broke the *next* file's document loop on its
+/// first iteration -- committing a buffer holding only that file's first
+/// document and silently dropping the rest. Caught by re-reading the fix
+/// rather than by any existing test: a single-document second file hides it
+/// entirely, because the flag is checked *after* the document streams.
+#[test]
+fn test_inplace_truncation_flag_does_not_leak_across_files_1615() -> Result<()> {
+    let mut bad = NamedTempFile::new()?;
+    write!(bad, "a: 1\nb: \"bad \\q escape\"\n")?;
+    let good_original = "first: 1\n---\nsecond: 2\n---\nthird: 3\n";
+    let mut good = NamedTempFile::new()?;
+    write!(good, "{good_original}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".")
+        .arg(bad.path())
+        .arg(good.path())
+        .stdin(Stdio::null())
+        .output()?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(good.path())?,
+        good_original,
+        "a later, perfectly valid file must keep every document"
+    );
+    Ok(())
+}

@@ -2074,7 +2074,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                         Err(e) => Err(decode_failure(e)),
                     },
-                    Err(e) => Err(decode_failure(e)),
+                    // Already a `StreamFailure`: a writer failure stays `Fmt`
+                    // rather than being reported as a decode failure (#1615).
+                    Err(e) => Err(e),
                 }
             }
             YamlValue::Mapping(fields) => {
@@ -3994,18 +3996,29 @@ fn stream_transcode_fold_line_break<Out: core::fmt::Write>(
 
 /// Stream YAML string to JSON output.
 /// Returns true if written as a quoted string, false if type detection needed.
+/// #1615: returns [`StreamFailure`], not `YamlStringError`, so a failure of
+/// the real `out` writer stays [`StreamFailure::Fmt`] instead of being
+/// laundered into a data diagnostic. Every `out.write_*` here used to
+/// `map_err(|_| YamlStringError::InvalidUtf8)`, which was harmless while both
+/// ends collapsed to `fmt::Error` -- but once a `YamlStringError` began
+/// carrying a *message* to the user, that mapping turned a broken pipe into
+/// `Error: invalid UTF-8 in string`, blaming the document for the reader
+/// hanging up. The `stream_transcode_*` calls keep mapping to `Decode`: their
+/// `out` is a local `String`, so their own write arms are unreachable and any
+/// error they return is genuinely about the scalar.
 fn stream_yaml_string_to_json<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
-) -> Result<bool, YamlStringError> {
+) -> Result<bool, StreamFailure> {
     match s {
         YamlString::DoubleQuoted { text, start } => {
             let end = YamlString::find_double_quote_end(text, *start);
             let bytes = &text[*start + 1..end - 1];
 
             if !bytes.contains(&b'\\') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
-                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
-                stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
+                let s = core::str::from_utf8(bytes)
+                    .map_err(|_| decode_failure(YamlStringError::InvalidUtf8))?;
+                stream_json_string(out, s)?;
             } else {
                 // `Out` cannot be rewound the way `write_yaml_string_to_json`'s
                 // `String` can, so transcode into a scratch buffer and commit
@@ -4016,9 +4029,9 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
                 // little), so reserving it up front avoids the realloc
                 // chain `String::new()` would pay for (#1622).
                 let mut committed = String::with_capacity(bytes.len() + 2);
-                stream_transcode_double_quoted_to_json(&mut committed, bytes)?;
-                out.write_str(&committed)
-                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                stream_transcode_double_quoted_to_json(&mut committed, bytes)
+                    .map_err(decode_failure)?;
+                out.write_str(&committed)?;
             }
             Ok(true)
         }
@@ -4027,23 +4040,24 @@ fn stream_yaml_string_to_json<Out: core::fmt::Write>(
             let bytes = &text[*start + 1..end - 1];
 
             if !bytes.contains(&b'\'') && !bytes.contains(&b'\n') && !bytes.contains(&b'\r') {
-                let s = core::str::from_utf8(bytes).map_err(|_| YamlStringError::InvalidUtf8)?;
-                stream_json_string(out, s).map_err(|_| YamlStringError::InvalidUtf8)?;
+                let s = core::str::from_utf8(bytes)
+                    .map_err(|_| decode_failure(YamlStringError::InvalidUtf8))?;
+                stream_json_string(out, s)?;
             } else {
                 // Same commit-on-success rollback as the double-quoted arm
                 // above (#1247), with the same capacity hint (#1622).
                 let mut committed = String::with_capacity(bytes.len() + 2);
-                stream_transcode_single_quoted_to_json(&mut committed, bytes)?;
-                out.write_str(&committed)
-                    .map_err(|_| YamlStringError::InvalidUtf8)?;
+                stream_transcode_single_quoted_to_json(&mut committed, bytes)
+                    .map_err(decode_failure)?;
+                out.write_str(&committed)?;
             }
             Ok(true)
         }
         YamlString::BlockLiteral { .. } | YamlString::BlockFolded { .. } => {
             // Block scalars are always strings (yq/JSON semantics): no type
             // detection, and empty content is "" rather than null (#222)
-            let decoded = s.as_str()?;
-            stream_json_string(out, &decoded).map_err(|_| YamlStringError::InvalidUtf8)?;
+            let decoded = s.as_str().map_err(decode_failure)?;
+            stream_json_string(out, &decoded)?;
             Ok(true)
         }
         YamlString::Unquoted { .. } => Ok(false),
@@ -5935,11 +5949,6 @@ use crate::jq::document::{
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::EvalError;
 
-/// A [`YamlStringError`] as the uncatchable decode failure (#1620) every
-/// *materializing* route already raises for the same scalar, so a document
-/// with a bad escape gets one answer whether it is streamed or materialized
-/// (#1615). The message is `YamlStringError`'s own, matching the wording the
-/// non-streaming paths already print.
 /// What a streaming writer does with a scalar that will not decode.
 ///
 /// The two answers are both deliberate and both tested; which one applies is a
@@ -5962,6 +5971,11 @@ enum Undecodable {
     PreserveEmpty,
 }
 
+/// A [`YamlStringError`] as the uncatchable decode failure (#1620) every
+/// *materializing* route already raises for the same scalar, so a document
+/// with a bad escape gets one answer whether it is streamed or materialized
+/// (#1615). The message is `YamlStringError`'s own, matching the wording the
+/// non-streaming paths already print.
 fn decode_failure(e: YamlStringError) -> StreamFailure {
     StreamFailure::Decode(EvalError::decode_failure(e.message()))
 }
@@ -13198,6 +13212,51 @@ mod tests {
             .stream_yaml_document(&mut out, IndentSpec::spaces(2), false)
             .unwrap();
         assert_eq!(out, "item:\n  \"<<\": 5\n  b: 2");
+    }
+
+    /// #1615 review follow-up: a failure of the *writer* must surface as
+    /// [`StreamFailure::Fmt`], never as a decode failure.
+    ///
+    /// Every `out.write_*` inside `stream_yaml_string_to_json` used to
+    /// `map_err(|_| YamlStringError::InvalidUtf8)`. That was harmless while
+    /// both ends collapsed into a message-less `fmt::Error` -- but once #1615
+    /// gave the error a user-visible message, the same mapping turned a broken
+    /// pipe into `Error: invalid UTF-8 in string`, blaming a perfectly valid
+    /// document for the reader hanging up.
+    ///
+    /// Uses a writer that fails after a fixed prefix rather than a real pipe,
+    /// so the failure lands *inside* a quoted scalar deterministically.
+    #[test]
+    fn test_writer_failure_is_not_a_decode_failure_1615() {
+        struct FailsAfter(usize);
+        impl core::fmt::Write for FailsAfter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                if s.len() > self.0 {
+                    return Err(core::fmt::Error);
+                }
+                self.0 -= s.len();
+                Ok(())
+            }
+        }
+
+        // Every scalar decodes fine, so any `Decode` here is fabricated.
+        let yaml = b"a: \"a quoted value\"\nb: \"another \\t quoted value\"\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+
+        // Sweep the cutoff so the failure lands at many different points,
+        // including inside both the plain and the escape-bearing scalar.
+        let mut saw_fmt = false;
+        for budget in 0..40 {
+            match cursor.stream_json(&mut FailsAfter(budget), IndentSpec::COMPACT, false) {
+                Err(StreamFailure::Fmt) => saw_fmt = true,
+                Err(StreamFailure::Decode(e)) => {
+                    panic!("writer failure at budget {budget} reported as a decode failure: {e:?}")
+                }
+                Ok(()) => {}
+            }
+        }
+        assert!(saw_fmt, "the sweep must actually exercise a writer failure");
     }
 
     #[test]
