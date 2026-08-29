@@ -33436,6 +33436,10 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         },
+        // Defensive only: `eval_single` (unlike top-level `eval`'s own
+        // `Expr::Identity` special case) never actually produces
+        // `OneCursor`, so this arm is unreachable in practice today --
+        // kept fallible anyway rather than assuming that stays true.
         QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
@@ -33567,6 +33571,10 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         },
+        // Defensive only: `eval_single` (unlike top-level `eval`'s own
+        // `Expr::Identity` special case) never actually produces
+        // `OneCursor`, so this arm is unreachable in practice today --
+        // kept fallible anyway rather than assuming that stays true.
         QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
@@ -36832,6 +36840,17 @@ mod tests {
         query!(
             &b"{\"a\":1,\"k\":[\"\xff\xfe\"]}"[..],
             "omit(.k)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // A multi-output keys expression (`(.k1, .k2)`) reaches
+        // `keys_owned`'s `QueryResult::Many` arm -- distinct from the
+        // `QueryResult::One` case above -- and `pick`/`omit` take only the
+        // *first* output (`v.into_iter().next()`), so a malformed field
+        // must be the first of the two to actually reach that arm's own
+        // `to_owned_checked` call.
+        query!(
+            &b"{\"a\":1,\"k1\":[\"\xff\xfe\"],\"k2\":[\"b\"]}"[..],
+            "pick((.k1,.k2))",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
     }
