@@ -1216,10 +1216,26 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Collect all outputs from the inner expression into an array
     let result = eval_single::<W, S>(inner, value, optional);
 
+    // #1755: to_owned_checked, not to_owned -- an undecodable string among
+    // the constructed elements must raise, not silently become "". Not
+    // named in #1755's own site audit (this helper backs both literal `[
+    // ...]` construction, Expr::Array below, and every `min_by`/`max_by`/
+    // `sort_by`/`group_by`/`unique_by` key computation -- `[f]`, jq's own
+    // desugaring), found while fixing this file's sort-family siblings:
+    // their own fix alone left this shared helper's key computation
+    // unguarded, so a decode failure on a *non-winning* comparison element
+    // was silently swallowed entirely rather than merely corrupting the
+    // eventual output value.
     let items: Vec<OwnedValue> = match result.materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned(&v)],
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => vec![v],
+            Err(e) => return QueryResult::Error(e),
+        },
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+        QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect::<Result<_, _>>() {
+            Ok(items) => items,
+            Err(e) => return QueryResult::Error(e),
+        },
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => vec![],
@@ -6689,7 +6705,14 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string element must raise, not silently sort in as "".
+            let items: Result<Vec<OwnedValue>, EvalError> =
+                elements.map(|e| to_owned_checked(&e)).collect();
+            let items = match items {
+                Ok(items) => items,
+                Err(e) => return QueryResult::Error(e),
+            };
             if items.is_empty() {
                 return QueryResult::Owned(OwnedValue::Null);
             }
@@ -6712,7 +6735,14 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string element must raise, not silently sort in as "".
+            let items: Result<Vec<OwnedValue>, EvalError> =
+                elements.map(|e| to_owned_checked(&e)).collect();
+            let items = match items {
+                Ok(items) => items,
+                Err(e) => return QueryResult::Error(e),
+            };
             if items.is_empty() {
                 return QueryResult::Owned(OwnedValue::Null);
             }
@@ -6821,11 +6851,16 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
 
-            let min = keyed
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string result must raise, not silently return "".
+            let (_, v) = keyed
                 .into_iter()
                 .min_by(|(a, _), (b, _)| compare_values(a, b))
-                .map(|(_, v)| to_owned(&v))
                 .unwrap();
+            let min = match to_owned_checked(&v) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
             QueryResult::Owned(min)
         }
         // #929: see `object_pair_type_error` -- confirmed live:
@@ -6873,11 +6908,16 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
 
-            let max = keyed
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string result must raise, not silently return "".
+            let (_, v) = keyed
                 .into_iter()
                 .max_by(|(a, _), (b, _)| compare_values(a, b))
-                .map(|(_, v)| to_owned(&v))
                 .unwrap();
+            let max = match to_owned_checked(&v) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
             QueryResult::Owned(max)
         }
         // #929: same operand-pairing as min_by's own Object arm above --
@@ -7821,7 +7861,13 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                keyed.push((key, to_owned(&item)));
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // string element must raise, not silently sort in as "".
+                let owned_item = match to_owned_checked(&item) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                keyed.push((key, owned_item));
             }
 
             // Sort by key
@@ -7883,7 +7929,14 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string element must raise, not silently sort in as "".
+            let items: Result<Vec<OwnedValue>, EvalError> =
+                elements.map(|e| to_owned_checked(&e)).collect();
+            let mut items = match items {
+                Ok(items) => items,
+                Err(e) => return QueryResult::Error(e),
+            };
 
             // Sort first (jq's unique returns sorted unique values)
             items.sort_by(compare_values);
@@ -7938,7 +7991,13 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                keyed.push((key, to_owned(&item)));
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // string element must raise, not silently sort in as "".
+                let owned_item = match to_owned_checked(&item) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                keyed.push((key, owned_item));
             }
 
             // Sort by key
@@ -7975,7 +8034,14 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // string element must raise, not silently sort in as "".
+            let items: Result<Vec<OwnedValue>, EvalError> =
+                elements.map(|e| to_owned_checked(&e)).collect();
+            let mut items = match items {
+                Ok(items) => items,
+                Err(e) => return QueryResult::Error(e),
+            };
             items.sort_by(compare_values);
             QueryResult::Owned(OwnedValue::Array(items))
         }
@@ -8009,7 +8075,13 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                keyed.push((key, to_owned(&item)));
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // string element must raise, not silently sort in as "".
+                let owned_item = match to_owned_checked(&item) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                keyed.push((key, owned_item));
             }
 
             // Sort by key
@@ -35701,6 +35773,85 @@ mod tests {
                 other => panic!("unexpected result: {:?}", other),
             }
         }};
+    }
+
+    /// #1755: the sort/unique/group_by/min/max family of builtins
+    /// (`eval.rs`'s own `to_owned`-based materialization, reachable only
+    /// through the public `succinctly::jq::eval` library API, not the
+    /// CLI's `eval_generic.rs` bridge, same as #1746's original finding)
+    /// silently substituted an empty string for an undecodable element
+    /// instead of raising. Covers both "the corrupted element itself
+    /// wins the comparison" (the direct #1746-shaped bug) and "the
+    /// corrupted element loses the comparison" (only exercisable once
+    /// the sort key is content-comparable against something that isn't
+    /// automatically smaller/larger by type alone, e.g. two strings) --
+    /// `min`/`max`/`min_by`/`max_by` need a same-type comparison to
+    /// actually touch the corrupted element's own key.
+    #[test]
+    fn test_sort_family_raises_on_decode_failure_1755() {
+        for expr in [
+            "sort",
+            "unique",
+            "min",
+            "max",
+            "sort_by(.)",
+            "group_by(.)",
+            "unique_by(.)",
+            "min_by(.)",
+            "max_by(.)",
+        ] {
+            for json in [&b"[1, \"\xff\xfe\"]"[..], &b"[\"b\", \"\xff\xfe\"]"[..]] {
+                query!(
+                    json,
+                    expr,
+                    QueryResult::Error(e) if e.is_decode_failure() => {
+                        assert!(
+                            e.message.contains("invalid UTF-8"),
+                            "expr={expr} json={json:?} message: {}",
+                            e.message
+                        );
+                    }
+                );
+            }
+        }
+    }
+
+    /// #1755: `eval_array_construction` (backs literal `[...]` array
+    /// construction's homogeneous-comma case, and every `min_by`/
+    /// `max_by`/`sort_by`/`group_by`/`unique_by` key computation via jq's
+    /// own `[f]` desugaring) shared the same unguarded `to_owned` bug,
+    /// found while fixing this file's sort-family siblings above --
+    /// their own fix alone left this shared helper's key computation
+    /// unguarded, so a decode failure on a *non-winning* comparison
+    /// element was silently swallowed entirely (no error at all) rather
+    /// than merely corrupting the eventual output value. Not named in
+    /// #1755's own site audit.
+    #[test]
+    fn test_eval_array_construction_raises_on_decode_failure_1755() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[.a]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[.a, .a]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // A multi-key sort/comparison actually exercises this shared
+        // helper's own Many-output arm (unlike the single-key `sort_by(.)`
+        // case above, which only ever produces one output per key).
+        query!(
+            br#"[{"a": "\ud83d", "b":1}, {"a":2, "b":2}]"#,
+            "sort_by(.a, .b)",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid unicode escape"), "message: {}", e.message);
+            }
+        );
     }
 
     /// #1620: a decode failure reached through this module's own dispatch
