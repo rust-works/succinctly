@@ -24805,13 +24805,56 @@ fn test_streamed_truncation_does_not_weld_doc_separator_1615() -> Result<()> {
         );
     }
 
-    // The evaluated route keeps #355's continue-past-a-bad-document behaviour,
-    // because it never leaves a document half-written.
+    // An *evaluated* filter truncates too whenever its result is a container
+    // holding the undecodable scalar -- the container's structure is already
+    // written by the time the scalar is reached. The first review round missed
+    // this because `.b` selects the bad scalar *directly*, so nothing is
+    // written before it fails; `.a` selects its parent and does write.
+    let nested = "a:\n  x: 1\n  y: \"bad \\q escape\"\n---\nz: 9\n";
+    for extra in [&[][..], &["-o", "json", "-I", "0"][..]] {
+        let (output, stderr, exit_code) = run_yq_split(".a", nested, extra)?;
+        assert_eq!(exit_code, 1, "args {extra:?}: {stderr}");
+        assert!(
+            !output.contains("---") && !output.contains('z'),
+            "an evaluated container render must not weld the next document \
+             onto its truncated line, args {extra:?}, output: {output:?}"
+        );
+    }
+
+    // A *streamed* decode failure stops the run uniformly, whether or not this
+    // particular result had already written a partial value. Distinguishing
+    // the two would mean counting bytes through the P9 streaming fast path (a
+    // 2.3x win) to serve a malformed-input edge case, and stopping is the
+    // closer answer anyway: real yq rejects the whole file for any of these
+    // inputs, so nothing reaches its stdout either.
     let (output, _, exit_code) = run_yq_split(".b", input, &[])?;
     assert_eq!(exit_code, 1);
     assert!(
-        output.contains("null"),
-        "evaluated route should still reach the second document: {output:?}"
+        !output.contains("null"),
+        "a streamed decode failure stops the run, matching real yq: {output:?}"
+    );
+
+    // #355 is untouched where it was designed. Its guarantee -- a bad value
+    // does not cost you the good documents around it -- lives on the
+    // *materializing* route, which writes nothing partial and still continues:
+    let (output, _, exit_code) = run_yq_split(".", input, &["--arg", "z", "y"])?;
+    assert_eq!(exit_code, 1);
+    assert!(
+        output.contains("c: 3"),
+        "the materializing route must still reach the second document: {output:?}"
+    );
+
+    // ...and an ordinary uncaught evaluation error still attempts every
+    // document on the streamed route too, because it writes nothing to stdout.
+    // That is the case `StreamStats::truncated` exists to keep separate from a
+    // decode failure: gating on `stats.error` instead would have stopped here.
+    let (_, stderr, exit_code) =
+        run_yq_split(".missing // error(\"boom\")", "a: 1\n---\nb: 2\n", &[])?;
+    assert_eq!(exit_code, 1);
+    assert_eq!(
+        stderr.matches("boom").count(),
+        2,
+        "an ordinary eval error must not stop the document loop: {stderr}"
     );
     Ok(())
 }

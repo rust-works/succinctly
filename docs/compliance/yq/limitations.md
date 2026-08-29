@@ -831,6 +831,20 @@ streaming sites. Buffering the whole record instead would reverse P9 (direct YAM
 streaming, a 2.3x win) for a malformed-input edge case, and is an explicit non-goal of the
 design doc.
 
+Because that prefix can be left unterminated mid-value, a decode failure on a *streamed*
+route **stops the run** rather than continuing to the next document: the alternative welds
+the following document's `---` onto the truncated line, yielding output that re-reads as
+valid YAML with a fabricated value. Real yq rejects the whole file for these inputs too,
+so this is also the closer answer. `--inplace` leaves the file byte-identical, matching
+both real yq and succinctly's own materializing `-i` path.
+
+This does **not** narrow [#355](https://github.com/rust-works/succinctly/issues/355)'s
+divergence — that a malformed value does not cost you the good documents around it. #355
+lives on the *materializing* routes, which write nothing partial and still process every
+document (`--arg z y '.'` on the file above still prints the later documents after the
+diagnostic). An ordinary uncaught *evaluation* error continues on the streamed route too,
+for the same reason: it reaches stderr without having written anything to stdout.
+
 A bad *key* is a different story, on both routes, since [#1642](https://github.com/rust-works/succinctly/issues/1642):
 `to_entries`/`keys`/`length` all preserve it (as `""`, `YamlValue::key_string`'s existing
 convention for a mapping key with no scalar form -- issue #222) rather than raising, on
