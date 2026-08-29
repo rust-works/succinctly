@@ -981,7 +981,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // re-deriving key/value-pair iteration against the cursor's own
             // field type.
             StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-                let OwnedValue::Object(map) = to_owned(&value) else {
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // field value must raise, not silently become "" and get
+                // sliced as if it were the real value.
+                let owned = match to_owned_checked(&value) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                let OwnedValue::Object(map) = owned else {
                     unreachable!("StandardJson::Object always materializes to OwnedValue::Object")
                 };
                 QueryResult::Owned(slice_object_as_yq_children(&map, *start, *end))
@@ -6599,13 +6606,15 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
     elements: impl Iterator<Item = StandardJson<'a, W>>,
     target_truthy: bool,
-) -> bool {
+) -> Result<bool, EvalError> {
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently become "" (truthy) and decide the answer.
     for elem in elements {
-        if to_owned(&elem).is_truthy() == target_truthy {
-            return target_truthy;
+        if to_owned_checked(&elem)?.is_truthy() == target_truthy {
+            return Ok(target_truthy);
         }
     }
-    !target_truthy
+    Ok(!target_truthy)
 }
 
 /// Builtin: any
@@ -6618,13 +6627,14 @@ fn builtin_any<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
-        StandardJson::Array(elements) => {
-            QueryResult::Owned(OwnedValue::Bool(any_all_over(elements, true)))
-        }
-        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Bool(any_all_over(
-            fields.map(|f| f.value()),
-            true,
-        ))),
+        StandardJson::Array(elements) => match any_all_over(elements, true) {
+            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
+            Err(e) => QueryResult::Error(e),
+        },
+        StandardJson::Object(fields) => match any_all_over(fields.map(|f| f.value()), true) {
+            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
+            Err(e) => QueryResult::Error(e),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -6638,13 +6648,14 @@ fn builtin_all<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
-        StandardJson::Array(elements) => {
-            QueryResult::Owned(OwnedValue::Bool(any_all_over(elements, false)))
-        }
-        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Bool(any_all_over(
-            fields.map(|f| f.value()),
-            false,
-        ))),
+        StandardJson::Array(elements) => match any_all_over(elements, false) {
+            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
+            Err(e) => QueryResult::Error(e),
+        },
+        StandardJson::Object(fields) => match any_all_over(fields.map(|f| f.value()), false) {
+            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
+            Err(e) => QueryResult::Error(e),
+        },
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -6690,9 +6701,20 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently become "" and get probed as if it were the real
+    // value.
     let elements: Vec<OwnedValue> = match value {
-        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
+        StandardJson::Array(elements) => match elements.map(|e| to_owned_checked(&e)).collect() {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
+        StandardJson::Object(fields) => {
+            match fields.map(|f| to_owned_checked(&f.value())).collect() {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     };
@@ -6752,7 +6774,16 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // decided the answer yet. Confirmed against jq 1.7.1:
     // `all(2, (5|stderr); .==2)` writes `5` there too, and is pinned by
     // `test_short_circuit_side_effect_shapes_already_match_jq_820`.
-    let owned = to_owned(&value);
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable root value
+    // must raise, not silently become "" and get fed to `gen` as if it
+    // were the real value. Unconditional regardless of `optional`: that
+    // flag governs `gen`'s own generator errors below, never a decode
+    // failure at this entry point.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     let mut matched = false;
     // `cond`'s own escape is not `gen`'s, so it travels out-of-band rather
@@ -8716,13 +8747,28 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let index = crate::json::JsonIndex::build(&entry_json);
         let cursor = index.root(&entry_json);
 
+        // #1755: to_owned_checked, not to_owned -- an undecodable output
+        // of `f` must raise, not silently become "" and get folded into
+        // the object as if it were the real value. Not reachable via any
+        // query today: `entry_json` comes from `owned_to_json_bytes`,
+        // which serializes into a Rust `String` (always valid UTF-8 by
+        // the type system) before ever building the cursor `f` evaluates
+        // against, so `v` can never carry an undecodable string here --
+        // fixed anyway for the same structural-consistency reason as
+        // `eval_rhs_once`'s masked fix.
         match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
-            QueryResult::One(v) => transformed.push(to_owned(&v)),
+            QueryResult::One(v) => match to_owned_checked(&v) {
+                Ok(v) => transformed.push(v),
+                Err(e) => return QueryResult::Error(e),
+            },
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Owned(v) => transformed.push(v),
             QueryResult::Many(vs) => {
                 for v in vs {
-                    transformed.push(to_owned(&v));
+                    match to_owned_checked(&v) {
+                        Ok(v) => transformed.push(v),
+                        Err(e) => return QueryResult::Error(e),
+                    }
                 }
             }
             QueryResult::ManyOwned(vs) => transformed.extend(vs),
@@ -11326,7 +11372,12 @@ fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    let current = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // raise, not silently seed the fold with "" in its place.
+    let current = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     match eval_owned_multi::<S>(&Expr::Iterate, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
         Err(e) => e.into(),
@@ -11342,7 +11393,11 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    let current = to_owned(&value);
+    // #1755: see `builtin_upper_index`'s identical reasoning.
+    let current = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     match eval_owned_multi::<S>(stream, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
         Err(e) => e.into(),
@@ -11505,7 +11560,14 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     };
 
-    let mut current = to_owned(value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable root value
+    // must raise, not silently become "" and get walked as if it were the
+    // real value. Unconditional regardless of `optional`: that flag only
+    // governs the path-shape check above, never a decode failure.
+    let mut current = match to_owned_checked(value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     for segment in path {
         match (&current, &segment) {
@@ -13862,7 +13924,12 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Check if any expression in the pipe needs path context (PathNoArg, Parent)
     if exprs.iter().any(needs_path_context) {
-        let owned = to_owned(&value);
+        // #1755: to_owned_checked, not to_owned -- an undecodable input
+        // must raise, not silently become "" for the path-context walk.
+        let owned = match to_owned_checked(&value) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        };
         return eval_pipe_with_path_context::<W, S>(exprs, &owned, &[], optional);
     }
 
@@ -15616,7 +15683,16 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> Result<OwnedValue, QueryResult<'a, W>> {
     match eval_single::<W, S>(expr, value, optional).materialize_cursor() {
-        QueryResult::One(v) => Ok(to_owned(&v)),
+        // #1755: to_owned_checked, not to_owned -- an undecodable RHS
+        // value must raise, not silently become "" and get spliced into
+        // the update filter. Both callers (`eval_compound_assign`/
+        // `eval_alternative_assign`) immediately re-materialize the
+        // *whole* document via `eval_update`'s own already-fixed
+        // `to_owned_checked`, which happens to catch a bad RHS value
+        // today since it's necessarily part of that same document --
+        // fixed here too so correctness doesn't rest on that coincidence
+        // surviving a future refactor of either caller.
+        QueryResult::One(v) => to_owned_checked(&v).map_err(QueryResult::Error),
         QueryResult::Owned(v) => Ok(v),
         // #1313: a genuinely zero-output RHS (`.a += empty`) makes the
         // *whole* compound/alternative assignment produce zero output in
@@ -15642,7 +15718,10 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // stream (`(1,2) | select(false)`, `(empty, empty)`) -- all
         // correctly arrive as the `None` arm above instead, confirming the
         // invariant holds for every reachable path today.
-        QueryResult::Many(vs) => Ok(vs.first().map_or(OwnedValue::Null, to_owned)),
+        QueryResult::Many(vs) => match vs.first() {
+            Some(v) => to_owned_checked(v).map_err(QueryResult::Error),
+            None => Ok(OwnedValue::Null),
+        },
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Break(label) => Err(QueryResult::Break(label)),
@@ -31506,7 +31585,13 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // Parse as JSON
                 let index = crate::json::JsonIndex::build(&file_bytes);
                 let cursor = index.root(&file_bytes);
-                QueryResult::Owned(to_owned(&cursor.value()))
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // value in the loaded file must raise, not silently
+                // become "".
+                match to_owned_checked(&cursor.value()) {
+                    Ok(v) => QueryResult::Owned(v),
+                    Err(e) => QueryResult::Error(e),
+                }
             } else {
                 // Parse as YAML (default)
                 match crate::yaml::YamlIndex::build(&file_bytes) {
@@ -31693,7 +31778,14 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
             for elem in *elements {
                 match elem {
                     StandardJson::Array(inner) => {
-                        let inner_values: Vec<OwnedValue> = inner.map(|v| to_owned(&v)).collect();
+                        // #1755: to_owned_checked, not to_owned -- an
+                        // undecodable element must raise, not silently
+                        // become "" and take part in the product.
+                        let inner_values: Vec<OwnedValue> =
+                            match inner.map(|v| to_owned_checked(&v)).collect() {
+                                Ok(v) => v,
+                                Err(e) => return QueryResult::Error(e),
+                            };
                         arrays.push(inner_values);
                     }
                     _ if optional => return QueryResult::None,
@@ -31799,8 +31891,15 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // Input must be an array
-    let base_array = match &value {
-        StandardJson::Array(elements) => (*elements).map(|v| to_owned(&v)).collect::<Vec<_>>(),
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently become "" and take part in the product.
+    let base_array: Vec<OwnedValue> = match &value {
+        StandardJson::Array(elements) => {
+            match (*elements).map(|v| to_owned_checked(&v)).collect() {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
     };
@@ -33167,7 +33266,12 @@ fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise, not silently print/pass through "" in its place.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     write_debug_line::<S>(&owned);
     QueryResult::Owned(owned)
 }
@@ -33208,7 +33312,11 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = to_owned(&value);
+    // #1755: see `builtin_debug`'s identical reasoning.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let flow = eval_each_owned::<S>(msg, &owned, false, &mut |msg_value| {
         write_debug_line::<S>(&msg_value);
         Demand::Continue
@@ -33278,7 +33386,12 @@ fn builtin_stderr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise, not silently print/pass through "" in its place.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     match &owned {
         OwnedValue::String(s) => write_stderr(s),
         other => write_stderr(&owned_value_to_json::<S>(other)),
@@ -33360,7 +33473,13 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         None => S::DEFAULT_HALT_ERROR_CODE,
     };
 
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise a normal, catchable error rather than halting the process with
+    // a corrupted "" message in its place.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     match &owned {
         OwnedValue::Null => {}
         OwnedValue::String(s) => write_stderr(s),
@@ -33577,15 +33696,25 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     };
 
     // Collect all inner arrays
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently become "" and take part in the transpose.
     let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
     for item in elements {
         match item {
             StandardJson::Array(inner) => {
-                inner_arrays.push(inner.map(|v| to_owned(&v)).collect());
+                let row = match inner.map(|v| to_owned_checked(&v)).collect() {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                inner_arrays.push(row);
             }
             _ => {
                 // Non-array elements are treated as single-element arrays
-                inner_arrays.push(vec![to_owned(&item)]);
+                let owned = match to_owned_checked(&item) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                inner_arrays.push(vec![owned]);
             }
         }
     }
@@ -34120,7 +34249,14 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
 
     match value {
         StandardJson::Array(elements) => {
-            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // element must raise, not silently become "" and get shuffled
+            // in as if it were the real value.
+            let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned_checked(&e)).collect()
+            {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
             // Use a seeded RNG for reproducibility in tests if needed,
             // but seed from system entropy for actual randomness
             let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
@@ -34159,7 +34295,13 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // element must raise, not silently become "" and get pivoted
+            // in as if it were the real value.
+            let items: Vec<OwnedValue> = match elements.map(|e| to_owned_checked(&e)).collect() {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            };
 
             if items.is_empty() {
                 // Empty array pivots to empty array
@@ -37265,6 +37407,150 @@ mod tests {
         query!(br"[1]", "[tostream]",
             QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
         );
+    }
+
+    /// #1755: the "misc bucket" slice -- `INDEX`/`INDEX(stream;...)`,
+    /// `getpath`, `any`/`all` (bare and `(cond)`/`(gen;cond)` forms),
+    /// `eval_pipe`'s path-context entry, `combinations`/`combinations(n)`,
+    /// `debug`/`debug(msg)`/`stderr`/`halt_error`, `transpose`, `shuffle`,
+    /// and `pivot` all convert their starting value (or an element of it)
+    /// via a single `to_owned` call -- an undecodable value must raise
+    /// there, not silently become `""` and feed the rest of the builtin as
+    /// if it were the real value.
+    #[test]
+    fn test_misc_bucket_raises_on_decode_failure_1755() {
+        for (json, expr) in [
+            (&b"[\"\xff\xfe\"]"[..], "INDEX(.)"),
+            (&b"[\"\xff\xfe\"]"[..], "INDEX(.[]; .)"),
+            (&b"\"\xff\xfe\""[..], "getpath([])"),
+            (&b"[\"\xff\xfe\"]"[..], "any"),
+            (&b"[\"\xff\xfe\"]"[..], "all"),
+            (&b"[\"\xff\xfe\"]"[..], "any(.>0)"),
+            (&b"[\"\xff\xfe\"]"[..], "all(.>0)"),
+            (&b"[\"\xff\xfe\"]"[..], "any(.[]; true)"),
+            (&b"[\"\xff\xfe\"]"[..], "all(.[]; true)"),
+            (&b"[\"\xff\xfe\"]"[..], ".[] | key"),
+            (&b"[[\"\xff\xfe\"]]"[..], "combinations"),
+            (&b"[\"\xff\xfe\"]"[..], "combinations(2)"),
+            (&b"\"\xff\xfe\""[..], "debug"),
+            (&b"\"\xff\xfe\""[..], "debug(1)"),
+            (&b"\"\xff\xfe\""[..], "stderr"),
+            (&b"\"\xff\xfe\""[..], "halt_error"),
+            (&b"[[\"\xff\xfe\"]]"[..], "transpose"),
+            (&b"[\"\xff\xfe\"]"[..], "transpose"),
+            (&b"[\"\xff\xfe\"]"[..], "shuffle"),
+            (&b"[[\"\xff\xfe\"]]"[..], "pivot"),
+        ] {
+            query!(
+                json,
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+        }
+
+        // `eval_single`'s yq-mode object slice arm is gated on
+        // `S::TAG == EvalTag::Yq`, so `yq_query!`'s error pattern (which
+        // panics with `unexpected result` on anything but the exact given
+        // pattern) can't express "any decode-failure error" as directly as
+        // a manual `match` -- written out below instead.
+        let json_bytes: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse_with_mode_and_extensions(".[0:1]", ParserMode::Yq, true).unwrap();
+        match eval::<Vec<u64>, YqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1755 positive control: valid data through each of the misc
+    /// bucket's dispatch points is unaffected by routing through
+    /// `to_owned_checked`.
+    #[test]
+    fn test_misc_bucket_valid_data_unaffected_1755() {
+        query!(br#"[{"a":1},{"a":2}]"#, "INDEX(.a)",
+            QueryResult::Owned(OwnedValue::Object(m)) => { assert_eq!(m.len(), 2); }
+        );
+        query!(br#"[{"a":1},{"a":2}]"#, "INDEX(.[]; .a)",
+            QueryResult::Owned(OwnedValue::Object(m)) => { assert_eq!(m.len(), 2); }
+        );
+        query!(br#"{"a":{"b":1}}"#, "getpath([\"a\",\"b\"])",
+            QueryResult::One(_) | QueryResult::Owned(_) => {}
+        );
+        query!(br"[1,2]", "any",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[0,false]", "all",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br"[1,2]", "any(.>1)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1,2]", "all(.>0)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1,2]", "any(.[]; .>1)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1,2]", "all(.[]; .>0)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(br"[1,2]", "[.[] | key]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(0), OwnedValue::Int(1)]);
+            }
+        );
+        query!(br"[[1,2],[3,4]]", "combinations",
+            QueryResult::ManyOwned(v) => { assert_eq!(v.len(), 4); }
+        );
+        query!(br"[1,2]", "combinations(2)",
+            QueryResult::ManyOwned(v) => { assert_eq!(v.len(), 4); }
+        );
+        query!(br"1", "debug",
+            QueryResult::Owned(v) => { assert!(v.is_truthy()); }
+        );
+        query!(br"1", "debug(2)",
+            QueryResult::Owned(v) => { assert!(v.is_truthy()); }
+        );
+        query!(br"1", "stderr",
+            QueryResult::Owned(v) => { assert!(v.is_truthy()); }
+        );
+        query!(br"[[1,2],[3,4]]", "transpose",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
+        );
+        query!(br"[1,2,3]", "shuffle",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 3); }
+        );
+        query!(br"[[1,2],[3,4]]", "pivot",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
+        );
+        yq_query!(
+            br#"{"a": 1, "b": 2}"#,
+            ".[0:1]",
+            QueryResult::Owned(_) => {}
+        );
+    }
+
+    /// #1755: `eval_rhs_once`'s own fix, pinned directly against the
+    /// private function rather than through `+=`/etc, since both real
+    /// callers (`eval_compound_assign`/`eval_alternative_assign`)
+    /// immediately re-materialize the whole document via `eval_update`'s
+    /// own already-fixed `to_owned_checked` right after, masking this
+    /// fix at the integration level whenever the RHS value comes from the
+    /// same document (the only way it *can* come from a `StandardJson`
+    /// cursor at all). This test is what actually exercises the fixed
+    /// line -- a `+=`-based integration test would only prove
+    /// `eval_update`'s pre-existing fix, not this one.
+    #[test]
+    fn test_eval_rhs_once_raises_on_decode_failure_1755() {
+        let json_bytes: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse(".").unwrap();
+        match eval_rhs_once::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
@@ -56149,6 +56435,29 @@ mod tests {
                     }
                 },
             );
+        }
+
+        /// #1755: `builtin_load`'s JSON branch had the same silent-`""`
+        /// shape as the rest of this file's `to_owned` sites -- an
+        /// undecodable value in the loaded file must raise, not silently
+        /// substitute `""`. Uses raw bytes (not `with_temp_file`'s `&str`
+        /// helper, which can't hold invalid UTF-8) written directly to a
+        /// temp path.
+        #[test]
+        fn test_load_json_file_raises_on_decode_failure_1755() {
+            let path = "/tmp/succinctly_test_load_decode_failure_1755.json";
+            fs::write(path, b"{\"a\": \"\xff\xfe\"}").unwrap();
+            let json_bytes: &[u8] = b"null";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let query = format!(r#"load("{path}")"#);
+            let expr = parse(&query).unwrap();
+            let result = eval::<Vec<u64>, JqSemantics>(&expr, cursor);
+            let _ = fs::remove_file(path);
+            match result {
+                QueryResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
+                other => panic!("unexpected result: {other:?}"),
+            }
         }
 
         #[test]
