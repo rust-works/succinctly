@@ -52848,16 +52848,22 @@ mod tests {
         );
     }
 
-    /// #1778: `collect_rhs_outputs`'s bare `Error`/`Halt` arms (zero RHS
-    /// output, not a `Partial` with some output first) -- and `optional`
-    /// swallowing that zero-output error via `eval_update_multi`'s own
-    /// early return.
+    /// #1778: `collect_rhs_outputs`'s bare `Error`/`Break`/`Halt` arms
+    /// (zero RHS output, not a `Partial` with some output first). The
+    /// outer `?` on `(.x += error("boom"))?` swallows the error at the
+    /// `Expr::Optional` dispatch layer, not through
+    /// `eval_update_multi`'s own `optional` parameter -- that parameter
+    /// means "an *inline* `?` on a path component", the same distinction
+    /// `eval_assign`'s own identical branch already documents.
     #[test]
-    fn test_compound_assign_bare_rhs_error_and_halt_1778() {
+    fn test_compound_assign_bare_rhs_error_break_and_halt_1778() {
         query!(br#"{"x":1}"#, r#".x += error("boom")"#,
             QueryResult::Error(e) => { assert_eq!(e.message, "boom"); }
         );
         query!(br#"{"x":1}"#, r#"(.x += error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        query!(br#"{"x":1}"#, "label $out | .x += (break $out)",
             QueryResult::None => {}
         );
         query!(br#"{"x":1}"#, ".x += halt_error(3)",
