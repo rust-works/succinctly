@@ -42310,6 +42310,41 @@ mod tests {
         );
     }
 
+    /// #1755: `eval_format`'s `to_owned_checked` runs *before* any
+    /// format-specific type/shape check, so a decode failure now preempts
+    /// an error that would have fired regardless of the string's content
+    /// (`@csv` on an object always errors; yq's `@uri`/`@base64`/`@html`
+    /// always reject a container) -- matching the established rule that a
+    /// decode failure is never suppressed, here extended to "never
+    /// outranked by an unrelated type error" (`scalar_decode_failure`'s
+    /// own doc comment states the same precedence for the sort family).
+    /// Pinned in both modes since `format_owned`'s yq-specific container
+    /// rejection (`stringify_for_format`) is the one dispatch arm that
+    /// could plausibly have raced with this ordering.
+    #[test]
+    fn test_format_decode_failure_outranks_shape_error_1755() {
+        // jq: `{"a": ...} | @csv` always errors -- @csv never accepts an
+        // object, content aside. With a decode failure inside it, that
+        // decode failure now fires first, not the "not both arrays" shape
+        // error.
+        query!(
+            &b"{\"a\": \"\xff\xfe\"}"[..],
+            "@csv",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+
+        // yq: `[...] | @uri` on a container always errors (yq rejects
+        // encoding a !!seq as URI outright, real-yq-verified per #1096's
+        // own divergence note) -- with a decode failure inside it, that
+        // decode failure now fires first, not yq's container-rejection
+        // type error.
+        yq_query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "@uri",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
     // =========================================================================
     // Phase 6: Type Conversion Builtins
     // =========================================================================
