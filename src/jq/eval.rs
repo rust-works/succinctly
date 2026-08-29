@@ -26843,10 +26843,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             let map_result = match stopped {
                 // Only `Error` is gated on this arm's own ambient
-                // `optional` -- matches `Expr::Array`'s identical
-                // `Err(EvalEscape::Error(_)) if optional` catch and
-                // `eval_try`'s own "never catches Break/Halt" rule just
-                // below.
+                // `optional` -- matches the path-context `Expr::Array`
+                // arm's identical `QueryResult::Error(_) |
+                // QueryResult::Partial(_, Control::Error(_)) if optional`
+                // catch a few hundred lines below, and `eval_try`'s own
+                // "never catches Break/Halt" rule just below here.
                 //
                 // Both patterns are needed, not just `Partial`: `partial()`
                 // (#400/#494) collapses an *empty* prefix to the bare
