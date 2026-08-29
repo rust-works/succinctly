@@ -1778,8 +1778,12 @@ fn push_generic_truthiness<V: DocumentValue>(
 ) -> Option<Control> {
     match result {
         GenericResult::One(v) => out.push(push_or_control!(to_owned(&v)).is_truthy()),
+        // `DocumentCursor::is_falsy` answers this in O(1) without
+        // materializing the value at all -- an arbitrarily deep object/
+        // array previously paid a full recursive `to_owned_cursor` copy
+        // just to learn it isn't `null`/`false` (#1645).
         GenericResult::OneCursor(c) => {
-            out.push(push_or_control!(to_owned_cursor(&c)).is_truthy());
+            out.push(!c.is_falsy());
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -1788,7 +1792,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                out.push(push_or_control!(to_owned_cursor(c)).is_truthy());
+                out.push(!c.is_falsy());
             }
         }
         // A lazy keys array, materialized or not, sorted or not, is
