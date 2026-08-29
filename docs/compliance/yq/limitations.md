@@ -801,49 +801,41 @@ Live-verified against yq v4.53.3. Pinned as known gaps (current, not the desired
 state) by `test_yq_auto_output_mixed_format_multi_file_known_gap_1493` and
 `test_yq_auto_output_slurp_mixed_format_known_gap_1493` in `tests/yq_cli_tests.rs`.
 
-### A bad escape in a streamed scalar still degrades silently instead of raising
+### A key that will not decode is preserved as `""` rather than raising
 
-[#1247](https://github.com/rust-works/succinctly/issues/1247) routed almost every
-decode-failure materialization path through a real `EvalError` — but two streaming output
-writers were left as a deliberately-deferred gap ("Stage 6" in
-[`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)): their only
-error channel is `core::fmt::Result`, which carries no message, so a mid-stream failure
-there can only be silently absorbed or cause a bare, undiagnosed abort. Both still emit a
-substituted `null`/`""` at exit 0 for a value or key with a bad escape, live-verified
-against the same build that fixed every other #1247 site:
+Real yq rejects a document containing an undecodable scalar outright (`found unknown
+escape character`, exit 1), whatever the scalar's position. succinctly matches that for a
+**value**, on every route, and deliberately does not for a mapping **key**.
+
+For values this was once a route-dependent split — the *materializing* routes (`--arg`,
+`-P`, `to_entries`, `length`) raised via
+[#1247](https://github.com/rust-works/succinctly/issues/1247), while the *streaming*
+writers silently substituted `null`/`""` at exit 0, because their only error channel was
+`core::fmt::Result`, which carries no message. That was the design's deferred "Stage 6"
+(`docs/plan/decode-failure-routing.md`) and is **closed** by
+[#1615](https://github.com/rust-works/succinctly/issues/1615), which gave those writers a
+real error type (`StreamFailure`). Both spellings of one document now give one answer:
 
 ```console
 $ printf 'a: 1\nb: "bad \q escape"\n' | succinctly yq -o=json '.'
-{
-  "a": 1,
-  "b": null
-}
-$ printf 'a: 1\nb: "bad \q escape"\n' | yq -o=json '.'
-Error: bad file '-': yaml: while scanning a quoted scalar at line 2, column 4: line 2, column 9: found unknown escape character
-
+Error: invalid escape sequence                    # exit 1, matching yq's own rejection
 $ printf 'double: "quoted \q scalar"\n' | succinctly yq '.'
-double: ""
-$ printf '"a\qb": 1\nb: 2\n' | succinctly yq '.'
-"": 1
-b: 2
+Error: invalid escape sequence                    # exit 1
 ```
 
-The first pair (`-o=json`, `stream_json_value`/the YAML→JSON transcoders) is the case the
-design doc names. The second and third (default YAML→YAML output, no `-o` flag —
-`stream_yaml_string_value`/`write_yaml_field_key`, the single most common `yq`
-invocation) are the same gap on its YAML-target sibling, not previously recorded anywhere.
-Every *materializing* route (a `--arg`-forced DOM, a multi-result filter, `to_entries`,
-`length`) already raises correctly for a bad *value* like the one above; only these two
-purely-streamed writers do not. Fixing either needs `stream_json_value`/`stream_yaml_value`
-and their callers to carry a richer error than `fmt::Error` — the design doc's own stated
-reason Stage 6 was split out and deferred rather than attempted alongside the rest of
-#1247's landed stages.
+Whatever prefix had already been written before the failure is left on stdout rather than
+buffered and discarded — the same truncate-then-diagnose trade
+[#1641](https://github.com/rust-works/succinctly/issues/1641) and
+[#1679](https://github.com/rust-works/succinctly/issues/1679) settled for their own
+streaming sites. Buffering the whole record instead would reverse P9 (direct YAML-to-JSON
+streaming, a 2.3x win) for a malformed-input edge case, and is an explicit non-goal of the
+design doc.
 
 A bad *key* is a different story, on both routes, since [#1642](https://github.com/rust-works/succinctly/issues/1642):
 `to_entries`/`keys`/`length` all preserve it (as `""`, `YamlValue::key_string`'s existing
 convention for a mapping key with no scalar form -- issue #222) rather than raising, on
-*every* route, streamed or materialized alike -- matching the third example above
-(`"a\qb": 1` → `"": 1`) and jq mode's own analogous fix for a JSON key (see the "A key
+*every* route, streamed or materialized alike (`"a\qb": 1` → `"": 1`), and jq mode's own
+analogous fix for a JSON key (see the "A key
 that will not decode is never a duplicate" note under [jq Limitations § Duplicate object
 keys collapse, except under `--preserve-input`](../jq/limitations.md#duplicate-object-keys-collapse-except-under---preserve-input)).
 `has`/`in` agree too, for the same reason as jq mode: neither has native handling and both

@@ -14,6 +14,7 @@ use indexmap::IndexMap;
 use std::borrow::Cow;
 
 use super::error::EvalError;
+use super::stream::{StreamFailure, StreamResult};
 
 /// Indentation configuration for cursor/lazy streaming output.
 ///
@@ -358,8 +359,8 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
-    ) -> core::fmt::Result {
-        Err(core::fmt::Error)
+    ) -> StreamResult {
+        Err(StreamFailure::Fmt)
     }
 
     /// Stream this cursor's value as YAML to the output.
@@ -376,8 +377,8 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
-    ) -> core::fmt::Result {
-        Err(core::fmt::Error)
+    ) -> StreamResult {
+        Err(StreamFailure::Fmt)
     }
 
     /// Like [`stream_yaml`](Self::stream_yaml), but also appends this
@@ -396,7 +397,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         out: &mut W,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         self.stream_yaml(out, indent, sort_keys)
     }
 
@@ -432,8 +433,8 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
-    ) -> core::fmt::Result {
-        Err(core::fmt::Error)
+    ) -> StreamResult {
+        Err(StreamFailure::Fmt)
     }
 
     /// The YAML counterpart of
@@ -444,8 +445,8 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
-    ) -> core::fmt::Result {
-        Err(core::fmt::Error)
+    ) -> StreamResult {
+        Err(StreamFailure::Fmt)
     }
 
     /// Check if the value at this cursor is falsy (null or false).

@@ -115,6 +115,51 @@ pub struct StreamError {
     pub not_a_string: bool,
 }
 
+/// A failure raised while *streaming* a document to output.
+///
+/// The streaming writers (`YamlCursor::stream_json`/`stream_yaml`,
+/// `stream_json_as_yaml`) are built on [`core::fmt::Write`], whose only error
+/// type is [`core::fmt::Error`] — it carries no message, so before #1615 a
+/// scalar that would not decode could only be silently absorbed into a
+/// substituted `null`/`""` (the design doc's deferred "Stage 6",
+/// `docs/plan/decode-failure-routing.md`). This is that missing channel: a
+/// write failure stays a write failure, and a decode failure carries the same
+/// diagnosable [`EvalError`] every *materializing* route already raises, so
+/// both spellings of one document give one answer.
+///
+/// Every existing `?` inside those writers keeps working unchanged via the
+/// [`From<core::fmt::Error>`] impl below — that is the reason this is an
+/// error *type* rather than an out-of-band slot threaded through each of the
+/// family's recursive call sites.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamFailure {
+    /// The underlying writer failed (a real I/O error, or a full buffer).
+    Fmt,
+    /// A scalar could not be decoded (an invalid escape, invalid UTF-8).
+    ///
+    /// Uncatchable by `?`/`try`/`catch`, like every other decode failure
+    /// (#1620) — see [`EvalError::decode_failure`].
+    Decode(EvalError),
+}
+
+impl From<core::fmt::Error> for StreamFailure {
+    fn from(_: core::fmt::Error) -> Self {
+        Self::Fmt
+    }
+}
+
+// Deliberately no `From<StreamFailure> for core::fmt::Error`. That impl would
+// let a plain `?` silently collapse a decode failure back into the
+// message-less error this type exists to escape — reintroducing the exact
+// swallow #1615 closes, implicitly, at any call site that happens to sit in a
+// `core::fmt::Result` function. Without it, every such site is a compile
+// error until someone decides what the diagnostic should do, which is the
+// point.
+
+/// The result of a streaming write that can distinguish a decode failure from
+/// a writer failure. See [`StreamFailure`].
+pub type StreamResult = Result<(), StreamFailure>;
+
 impl StreamableValue for OwnedValue {
     fn stream_json<W: core::fmt::Write>(
         &self,

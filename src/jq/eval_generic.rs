@@ -2332,7 +2332,10 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
-                c.stream_json(out, indent, sort_keys)?;
+                if let Err(e) = c.stream_json(out, indent, sort_keys) {
+                    absorb_stream_failure(e, &mut stats)?;
+                    return Ok(stats);
+                }
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -2436,7 +2439,12 @@ impl<V: DocumentValue> GenericResult<V> {
                 Ok(items) => {
                     let owned = match sequence_streamable_cursors(&items) {
                         Some(cursors) => {
-                            V::Cursor::stream_sequence_json(&cursors, out, indent, sort_keys)?;
+                            if let Err(e) =
+                                V::Cursor::stream_sequence_json(&cursors, out, indent, sort_keys)
+                            {
+                                absorb_stream_failure(e, &mut stats)?;
+                                return Ok(stats);
+                            }
                             true
                         }
                         None => match items
@@ -2473,8 +2481,15 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
             },
             Self::ManyCursor(cs) => {
-                for c in cs {
-                    c.stream_json(out, indent, sort_keys)?;
+                for (i, c) in cs.iter().enumerate() {
+                    // `count` is how many results actually reached `out`, not
+                    // how many were asked for -- same contract as `Many`'s own
+                    // mid-stream failure above (#400/#494, #1247, #1615).
+                    if let Err(e) = c.stream_json(out, indent, sort_keys) {
+                        absorb_stream_failure(e, &mut stats)?;
+                        stats.count = i;
+                        return Ok(stats);
+                    }
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2577,7 +2592,10 @@ impl<V: DocumentValue> GenericResult<V> {
                 // navigated container result keeps its own trailing comment
                 // just like the whole document does, unlike a navigated
                 // scalar (#793a).
-                c.stream_yaml_as_document(out, indent, sort_keys)?;
+                if let Err(e) = c.stream_yaml_as_document(out, indent, sort_keys) {
+                    absorb_stream_failure(e, &mut stats)?;
+                    return Ok(stats);
+                }
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = c.is_falsy();
@@ -2601,10 +2619,15 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.count = vs.len();
             }
             Self::ManyCursor(cs) => {
-                for c in cs {
+                for (i, c) in cs.iter().enumerate() {
                     // See `OneCursor` above: each streamed result keeps its
-                    // own trailing comment if it's a container (#793a).
-                    c.stream_yaml_as_document(out, indent, sort_keys)?;
+                    // own trailing comment if it's a container (#793a). See
+                    // the JSON twin on why `count` is set to `i` here (#1615).
+                    if let Err(e) = c.stream_yaml_as_document(out, indent, sort_keys) {
+                        absorb_stream_failure(e, &mut stats)?;
+                        stats.count = i;
+                        return Ok(stats);
+                    }
                     on_value(out)?;
                     stats.last_was_falsy = c.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2664,7 +2687,12 @@ impl<V: DocumentValue> GenericResult<V> {
                 Ok(items) => {
                     let owned = match sequence_streamable_cursors(&items) {
                         Some(cursors) => {
-                            V::Cursor::stream_sequence_yaml(&cursors, out, indent, sort_keys)?;
+                            if let Err(e) =
+                                V::Cursor::stream_sequence_yaml(&cursors, out, indent, sort_keys)
+                            {
+                                absorb_stream_failure(e, &mut stats)?;
+                                return Ok(stats);
+                            }
                             true
                         }
                         None => match items
@@ -2832,6 +2860,28 @@ fn owned_or_stream_error(
             stats.error = Some(stream_error(&e));
             None
         }
+    }
+}
+
+/// Route a [`StreamFailure`](crate::jq::stream::StreamFailure) from a cursor
+/// streamer into `stats`, the way #1679's `LazyKeys` arm routes a malformed
+/// key (#1615).
+///
+/// A decode failure is a *data* diagnostic: it belongs on stderr with an exit
+/// code, so it goes back through `stats.error` and whatever already reached
+/// `out` stays written (the `Partial` idiom). A genuine writer failure is not
+/// diagnosable and propagates as before. Returns `true` when the caller should
+/// stop and hand `stats` back immediately.
+fn absorb_stream_failure(
+    e: crate::jq::stream::StreamFailure,
+    stats: &mut crate::jq::stream::StreamStats,
+) -> Result<bool, core::fmt::Error> {
+    match e {
+        crate::jq::stream::StreamFailure::Decode(err) => {
+            stats.error = Some(stream_error(&err));
+            Ok(true)
+        }
+        crate::jq::stream::StreamFailure::Fmt => Err(core::fmt::Error),
     }
 }
 

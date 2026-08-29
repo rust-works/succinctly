@@ -1836,7 +1836,16 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
+use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{nonfinite_display_string, EvalError, YqSemantics};
+
+/// A [`JsonError`] as the uncatchable decode failure (#1620) every
+/// *materializing* route already raises for the same scalar, so a document
+/// with a bad escape gets one answer whether it is streamed or materialized
+/// (#1615). The YAML-side twin is `yaml::light::decode_failure`.
+fn json_decode_failure(e: JsonError) -> StreamFailure {
+    StreamFailure::Decode(EvalError::decode_failure(e.message()))
+}
 
 /// Whether the child starting at `child_start` is preceded by `expected`
 /// (`,`/`:`), skipping whitespace, with nothing else in between.
@@ -2006,7 +2015,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // Compact only: echo the raw bytes verbatim, since they're already
         // valid JSON. Indented (pretty) JSON->JSON streaming isn't
         // implemented here — callers fall back to the DOM path (#442 only
@@ -2017,14 +2026,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         // Guard it explicitly so a future gate relaxation fails safe (falls
         // back to the DOM path) instead of silently emitting unsorted keys.
         if !indent.is_compact() || sort_keys {
-            return Err(core::fmt::Error);
+            return Err(StreamFailure::Fmt);
         }
         if let Some(bytes) = self.raw_bytes() {
             // SAFETY: JSON input is valid UTF-8 (checked during indexing)
             let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
-            out.write_str(s)
+            Ok(out.write_str(s)?)
         } else {
-            Err(core::fmt::Error)
+            Err(StreamFailure::Fmt)
         }
     }
 
@@ -2034,14 +2043,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // For JSON->YAML conversion, we need to format as YAML. `sort_keys`
         // (and `indent.unit`, e.g. `--tab`) aren't implemented here for the
         // same reason as `stream_json` above; guard explicitly so a future
         // caller fails safe instead of silently getting unsorted,
         // always-space-indented output.
         if sort_keys {
-            return Err(core::fmt::Error);
+            return Err(StreamFailure::Fmt);
         }
         stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
@@ -2358,34 +2367,39 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
     value: StandardJson<'_, W>,
     current_indent: usize,
     indent_spaces: usize,
-) -> core::fmt::Result {
+) -> StreamResult {
     match value {
-        StandardJson::Null => out.write_str("null"),
-        StandardJson::Bool(b) => out.write_str(if b { "true" } else { "false" }),
+        StandardJson::Null => Ok(out.write_str("null")?),
+        StandardJson::Bool(b) => Ok(out.write_str(if b { "true" } else { "false" })?),
         StandardJson::Number(n) => {
             // Try integer first, then float
             if let Ok(i) = n.as_i64() {
-                write!(out, "{i}")
+                Ok(write!(out, "{i}")?)
             } else if let Ok(f) = n.as_f64() {
                 if f.is_nan() || f.is_infinite() {
-                    out.write_str(nonfinite_display_string::<YqSemantics>(f))
+                    Ok(out.write_str(nonfinite_display_string::<YqSemantics>(f))?)
                 } else {
-                    write!(out, "{f}")
+                    Ok(write!(out, "{f}")?)
                 }
             } else {
-                out.write_str("null")
+                Ok(out.write_str("null")?)
             }
         }
         StandardJson::String(s) => {
             // Decoded content, not `raw_bytes()` -- the latter includes the
             // source's surrounding quotes and escape sequences verbatim,
             // which would then get YAML-quoted a second time on top.
-            let str_val = s.as_str().map_err(|_| core::fmt::Error)?;
-            stream_json_string_as_yaml(out, &str_val)
+            // #1615: a scalar that will not decode raises a *diagnosable*
+            // decode failure here. Before, this was a bare `core::fmt::Error`
+            // -- which the CLI could only report as a generic write failure,
+            // the "bare, undiagnosed abort" the design doc named as the reason
+            // Stage 6 was deferred rather than attempted.
+            let str_val = s.as_str().map_err(json_decode_failure)?;
+            Ok(stream_json_string_as_yaml(out, &str_val)?)
         }
         StandardJson::Array(elements) => {
             if elements.is_empty() {
-                return out.write_str("[]");
+                return Ok(out.write_str("[]")?);
             }
             if indent_spaces == 0 {
                 // Flow style
@@ -2398,7 +2412,7 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     first = false;
                     stream_json_as_yaml(out, elem, 0, 0)?;
                 }
-                out.write_char(']')
+                Ok(out.write_char(']')?)
             } else {
                 // Block style
                 let mut first = true;
@@ -2432,7 +2446,7 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         }
         StandardJson::Object(fields) => {
             if fields.is_empty() {
-                return out.write_str("{}");
+                return Ok(out.write_str("{}")?);
             }
             if indent_spaces == 0 {
                 // Flow style
@@ -2454,7 +2468,7 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     out.write_str(": ")?;
                     stream_json_as_yaml(out, field.value(), 0, 0)?;
                 }
-                out.write_char('}')
+                Ok(out.write_char('}')?)
             } else {
                 // Block style
                 let mut first = true;
@@ -2496,7 +2510,13 @@ fn stream_json_as_yaml<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                 Ok(())
             }
         }
-        StandardJson::Error(_) => out.write_str("null"),
+        // A *structural* malformation (#1194's class), not a decode failure:
+        // left writing `null` exactly as before. #1615 is scoped to scalars
+        // that fail to *decode*; whether this arm should raise too is the same
+        // open question #1194 tracks for every other `StandardJson::Error`
+        // site, and answering it here alone would split that decision across
+        // two issues.
+        StandardJson::Error(_) => Ok(out.write_str("null")?),
     }
 }
 

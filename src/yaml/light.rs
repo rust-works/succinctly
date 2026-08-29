@@ -1296,7 +1296,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         self.stream_json_value(out, 0, indent.width, indent.unit, sort_keys)
     }
 
@@ -1312,7 +1312,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
             if let YamlValue::Sequence(elements) = self.value() {
@@ -1351,7 +1351,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // `self` is a navigated query result here (see this method's own
         // doc comment) and so can itself be an unresolved bare-`-`
         // sequence-item wrapper (e.g. `.[0]` on a document whose item 0
@@ -1410,7 +1410,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // See `stream_yaml` (#835): resolve once, reuse throughout, rather
         // than relying on each downstream read to notice a bare-dash
         // wrapper on its own.
@@ -1418,7 +1418,15 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self_.write_leading_anchor(out)?;
         let value = self_.value();
         if let YamlValue::String(s) = &value {
-            let str_val = s.as_str().unwrap_or(Cow::Borrowed("\"\""));
+            // #1615: this root-scalar shortcut bypasses `stream_yaml_value`/
+            // `stream_yaml_string_value` entirely (see this function's own doc
+            // comment), so it needs its own copy of their decode-failure
+            // check too -- otherwise the single most common navigated shape,
+            // `yq '.b'` on an undecodable scalar, keeps printing `""` at exit
+            // 0 while `yq -o=json '.b'` on the same document raises. This is a
+            // *value* position (the whole output is this scalar), so it
+            // raises; the mapping-key convention (#1642) does not apply.
+            let str_val = s.as_str().map_err(decode_failure)?;
             // #996: this root-scalar shortcut bypasses `stream_yaml_value`/
             // `stream_yaml_string_value` entirely (see this function's own
             // doc comment on why -- #852's "a scalar root drops its own
@@ -1439,7 +1447,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     resolve_plain(&str_val),
                     self_.index.canonicalize_numbers(),
                 ) {
-                    return write!(out, "{f}");
+                    return Ok(write!(out, "{f}")?);
                 }
             }
             out.write_str(&str_val)?;
@@ -1460,7 +1468,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         // Check if this is the root document array with a single document
         if self.bp_pos == 0 {
             if let YamlValue::Sequence(elements) = self.value() {
@@ -1566,9 +1574,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         unit: char,
         sort_keys: bool,
         known_not_flow: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         match self.value() {
-            YamlValue::Null => out.write_str("null"),
+            YamlValue::Null => Ok(out.write_str("null")?),
             YamlValue::String(s) => {
                 // YAML output (unlike JSON) has tag syntax, so an explicit
                 // tag is preserved verbatim rather than dropped - matching
@@ -1683,24 +1691,35 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             };
                             if let Some(explicit_indent) = explicit_indent {
                                 if !decoded.is_empty() && !has_trailing_space && !has_astral {
-                                    return stream_yaml_block_scalar(
+                                    return Ok(stream_yaml_block_scalar(
                                         out,
                                         &decoded,
                                         indent,
                                         explicit_indent,
                                         folded,
-                                    );
+                                    )?);
                                 }
                             }
                             // Disqualified, but already decoded above -
                             // avoid decoding `s` a second time inside
                             // `stream_yaml_string_value` below for exactly
                             // the same result.
-                            return stream_yaml_block_scalar_quoted(out, &decoded);
+                            return Ok(stream_yaml_block_scalar_quoted(out, &decoded)?);
                         }
                     }
                 }
-                stream_yaml_string_value(out, &s, self.index.canonicalize_numbers())
+                // #1615: value position, so an undecodable scalar raises
+                // rather than degrading to `""`. Contrast the *key* call site
+                // in `write_yaml_field_key`, which passes
+                // `Undecodable::PreserveEmpty` because a key that will not
+                // decode is deliberately kept as `""` on every route,
+                // streamed or materialized alike (#1642/#222).
+                stream_yaml_string_value(
+                    out,
+                    &s,
+                    self.index.canonicalize_numbers(),
+                    Undecodable::Raise,
+                )
             }
             YamlValue::Mapping(_) => {
                 // A bare `-` sequence-item wrapper (dash-alone-then-indented
@@ -1731,7 +1750,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // `keys()`, ...), which still goes through `from_mapping_cursor`.
                 let fields = YamlFields::raw(self.first_child());
                 if fields.is_empty() {
-                    return out.write_str("{}");
+                    return Ok(out.write_str("{}")?);
                 }
                 if indent_spaces == 0 || (!known_not_flow && self.style() == "flow") {
                     // Flow style
@@ -1759,7 +1778,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             write_flow_last_item_comment(out, comment, indent)?;
                         }
                     }
-                    out.write_char('}')
+                    Ok(out.write_char('}')?)
                 } else {
                     // Block style
                     let mut first = true;
@@ -1857,7 +1876,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             YamlValue::Sequence(elements) => {
                 if elements.is_empty() {
-                    return out.write_str("[]");
+                    return Ok(out.write_str("[]")?);
                 }
                 // `style()` (#835) resolves through a bare `-` wrapper
                 // itself, so `self.style()` here already sees a flow-style
@@ -1879,7 +1898,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         }
                         elems = rest;
                     }
-                    out.write_char(']')
+                    Ok(out.write_char(']')?)
                 } else {
                     // Block style
                     let mut first = true;
@@ -1982,9 +2001,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // target's value — an unmodified/re-serialized document must
                 // keep `*name` verbatim, matching real yq (issue #712).
                 out.write_char('*')?;
-                out.write_str(anchor_name)
+                Ok(out.write_str(anchor_name)?)
             }
-            YamlValue::Error(_) => out.write_str("null"),
+            YamlValue::Error(_) => Ok(out.write_str("null")?),
         }
     }
 
@@ -2003,9 +2022,9 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         indent_spaces: usize,
         unit: char,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         match self.value() {
-            YamlValue::Null => out.write_str("null"),
+            YamlValue::Null => Ok(out.write_str("null")?),
             YamlValue::String(s) => {
                 // An explicit core-schema tag (`!!str`, `!!int`, …) forces
                 // resolution regardless of quoting style - `!!int "5"` is the
@@ -2015,41 +2034,52 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 if let Some(explicit) = self.explicit_tag() {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
-                            return stream_resolved_scalar_as_json(
+                            return Ok(stream_resolved_scalar_as_json(
                                 out,
                                 resolved,
                                 &str_val,
                                 self.index.canonicalize_numbers(),
-                            );
+                            )?);
                         }
                     }
                 }
                 // Direct transcoding optimization
+                // #1615: a scalar that will not decode raises here rather
+                // than degrading to a silent `null`, matching what every
+                // *materializing* route (`--arg`, `-P`, `to_entries`,
+                // `length`) has already done since #1247. Reported after the
+                // transcode attempt rather than before it, deliberately:
+                // pre-checking would mean decoding every string twice on the
+                // P9 streaming fast path (a 2.3x win) to serve an input shape
+                // that is almost always absent. The cost is that a partial
+                // prefix of *this* scalar may already have reached `out` --
+                // the same truncate-then-diagnose trade #1641 and #1679
+                // settled for their own streaming sites, and strictly better
+                // than the well-formed-but-wrong document it replaces.
                 match stream_yaml_string_to_json(out, &s) {
                     Ok(true) => Ok(()), // Written directly as JSON string
-                    Ok(false) => {
-                        if let Ok(str_val) = s.as_str() {
+                    Ok(false) => match s.as_str() {
+                        Ok(str_val) => {
                             if s.is_unquoted() {
                                 // Plain scalar - resolve per the core schema
-                                stream_yaml_scalar_as_json(
+                                Ok(stream_yaml_scalar_as_json(
                                     out,
                                     &str_val,
                                     self.index.canonicalize_numbers(),
-                                )
+                                )?)
                             } else {
                                 // Block scalars are always strings
-                                stream_json_string(out, &str_val)
+                                Ok(stream_json_string(out, &str_val)?)
                             }
-                        } else {
-                            out.write_str("null")
                         }
-                    }
-                    Err(_) => out.write_str("null"),
+                        Err(e) => Err(decode_failure(e)),
+                    },
+                    Err(e) => Err(decode_failure(e)),
                 }
             }
             YamlValue::Mapping(fields) => {
                 if fields.is_empty() {
-                    return out.write_str("{}");
+                    return Ok(out.write_str("{}")?);
                 }
                 out.write_char('{')?;
                 let next_indent = current_indent + indent_spaces;
@@ -2104,11 +2134,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     out.write_char('\n')?;
                     write_yaml_indent(out, current_indent, unit)?;
                 }
-                out.write_char('}')
+                Ok(out.write_char('}')?)
             }
             YamlValue::Sequence(elements) => {
                 if elements.is_empty() {
-                    return out.write_str("[]");
+                    return Ok(out.write_str("[]")?);
                 }
                 out.write_char('[')?;
                 let next_indent = current_indent + indent_spaces;
@@ -2139,7 +2169,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     out.write_char('\n')?;
                     write_yaml_indent(out, current_indent, unit)?;
                 }
-                out.write_char(']')
+                Ok(out.write_char(']')?)
             }
             YamlValue::Alias { target, .. } => {
                 // Resolve the *entire* chain first (#1193), not just this
@@ -2154,10 +2184,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         unit,
                         sort_keys,
                     ),
-                    None => out.write_str("null"),
+                    None => Ok(out.write_str("null")?),
                 }
             }
-            YamlValue::Error(_) => out.write_str("null"),
+            YamlValue::Error(_) => Ok(out.write_str("null")?),
         }
     }
 
@@ -5902,7 +5932,39 @@ use crate::jq::assert_depth;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
+use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::EvalError;
+
+/// A [`YamlStringError`] as the uncatchable decode failure (#1620) every
+/// *materializing* route already raises for the same scalar, so a document
+/// with a bad escape gets one answer whether it is streamed or materialized
+/// (#1615). The message is `YamlStringError`'s own, matching the wording the
+/// non-streaming paths already print.
+/// What a streaming writer does with a scalar that will not decode.
+///
+/// The two answers are both deliberate and both tested; which one applies is a
+/// property of the *position*, not of the failure:
+///
+/// - [`Self::Raise`] — a **value**. Every materializing route (`--arg`, `-P`,
+///   `to_entries`, `length`) has raised here since #1247; #1615 makes the
+///   streamed routes agree instead of emitting a silent `null`/`""`.
+/// - [`Self::PreserveEmpty`] — a **mapping key**. A key that will not decode is
+///   kept as `""` (`YamlValue::key_string`'s convention, #222) on *every*
+///   route, streamed or materialized, rather than raising or vanishing —
+///   settled by #1642, and load-bearing: `keys`/`to_entries`/`length` all
+///   report such a key, so a streamed identity that raised on it would
+///   re-open the one-document-many-answers split #1642 closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Undecodable {
+    /// Raise a decode failure (#1615). Value positions.
+    Raise,
+    /// Write `""` and continue (#1642/#222). Mapping-key positions.
+    PreserveEmpty,
+}
+
+fn decode_failure(e: YamlStringError) -> StreamFailure {
+    StreamFailure::Decode(EvalError::decode_failure(e.message()))
+}
 
 /// Caps the number of alias hops `YamlCursor::resolve_alias_chain` will
 /// follow (#1191 code review) -- the single place this rule's rationale is
@@ -6050,7 +6112,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         YamlCursor::stream_json(self, out, indent, sort_keys)
     }
 
@@ -6060,7 +6122,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         YamlCursor::stream_yaml(self, out, indent, sort_keys)
     }
 
@@ -6070,7 +6132,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         YamlCursor::stream_yaml_as_document(self, out, indent, sort_keys)
     }
 
@@ -6088,7 +6150,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         stream_json_sequence(
             resolved_sequence_cursors(cursors),
             out,
@@ -6105,7 +6167,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
-    ) -> core::fmt::Result {
+    ) -> StreamResult {
         stream_yaml_sequence(
             resolved_sequence_cursors(cursors),
             out,
@@ -6720,7 +6782,7 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
-) -> core::fmt::Result {
+) -> StreamResult {
     let absent = is_deferred_value_absent(value);
     let anchor = value.anchor();
     let tag = if absent { value.explicit_tag() } else { None };
@@ -6795,7 +6857,7 @@ fn compact_yaml_indent(indent: &str) -> String {
 fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     out: &mut Out,
     field: YamlField<'_, W>,
-) -> core::fmt::Result {
+) -> StreamResult {
     let key = field.key();
     if let YamlValue::String(s) = &key {
         if let Some(tag) = field.key_cursor().explicit_tag() {
@@ -6814,9 +6876,9 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
         // provable no-op here. Hardcoding `false` documents that as an
         // invariant of the call site rather than leaving a live (if inert)
         // flag read to explain.
-        stream_yaml_string_value(out, s, false)
+        stream_yaml_string_value(out, s, false, Undecodable::PreserveEmpty)
     } else {
-        stream_yaml_nonstring_key(out, &key)
+        Ok(stream_yaml_nonstring_key(out, &key)?)
     }
 }
 
@@ -6827,7 +6889,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     value: YamlCursor<'_, W>,
     unit: char,
     sort_keys: bool,
-) -> core::fmt::Result {
+) -> StreamResult {
     if let Some(anchor) = value.anchor() {
         out.write_char('&')?;
         out.write_str(anchor)?;
@@ -6872,7 +6934,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // position -- block value, flow/block sequence item, flow mapping key
     // -- already matches real yq's `""`), just this one synthesized case.
     if absent {
-        return out.write_str("''");
+        return Ok(out.write_str("''")?);
     }
     value.stream_yaml_value(out, "", 0, unit, sort_keys, false)
 }
@@ -6963,7 +7025,7 @@ pub fn stream_json_sequence<'a, W, I, Out>(
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
-) -> core::fmt::Result
+) -> StreamResult
 where
     W: AsRef<[u64]> + 'a,
     I: IntoIterator<Item = YamlCursor<'a, W>>,
@@ -6971,7 +7033,7 @@ where
 {
     let mut iter = cursors.into_iter().peekable();
     if iter.peek().is_none() {
-        return out.write_str("[]");
+        return Ok(out.write_str("[]")?);
     }
     out.write_char('[')?;
     let next_indent = current_indent + indent_spaces;
@@ -6991,7 +7053,7 @@ where
         out.write_char('\n')?;
         write_yaml_indent(out, current_indent, unit)?;
     }
-    out.write_char(']')
+    Ok(out.write_char(']')?)
 }
 
 /// Stream independent document cursors as a single YAML sequence (block or
@@ -7027,7 +7089,7 @@ pub fn stream_yaml_sequence<'a, W, I, Out>(
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
-) -> core::fmt::Result
+) -> StreamResult
 where
     W: AsRef<[u64]> + 'a,
     I: IntoIterator<Item = YamlCursor<'a, W>>,
@@ -7035,7 +7097,7 @@ where
 {
     let mut iter = cursors.into_iter().peekable();
     if iter.peek().is_none() {
-        return out.write_str("[]");
+        return Ok(out.write_str("[]")?);
     }
     if indent_spaces == 0 {
         // Flow style
@@ -7048,7 +7110,7 @@ where
             first = false;
             write_yaml_child_inline(out, cursor, unit, sort_keys)?;
         }
-        out.write_char(']')
+        Ok(out.write_char(']')?)
     } else {
         // Block style. `current_indent`/`unit` never vary across the loop
         // below (this function is never itself called recursively -- it's
@@ -7412,17 +7474,26 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
     out: &mut Out,
     s: &YamlString<'_>,
     canonicalize: bool,
-) -> core::fmt::Result {
-    // Try to get the string value
+    undecodable: Undecodable,
+) -> StreamResult {
+    // Try to get the string value. Decoded exactly once, whichever policy
+    // applies: the `Err` arm below is the *only* decode-failure check on this
+    // path, deliberately, so neither policy costs the P9 streaming fast path
+    // a second pass over a scalar that decodes fine.
     let str_val = match s.as_str() {
         Ok(v) => v,
-        Err(_) => return out.write_str("\"\""),
+        Err(e) => {
+            return match undecodable {
+                Undecodable::Raise => Err(decode_failure(e)),
+                Undecodable::PreserveEmpty => Ok(out.write_str("\"\"")?),
+            }
+        }
     };
 
     // For quoted strings, preserve the quoting style
     match s {
-        YamlString::DoubleQuoted { .. } => stream_yaml_double_quoted(out, &str_val),
-        YamlString::SingleQuoted { .. } => stream_yaml_single_quoted(out, &str_val),
+        YamlString::DoubleQuoted { .. } => Ok(stream_yaml_double_quoted(out, &str_val)?),
+        YamlString::SingleQuoted { .. } => Ok(stream_yaml_single_quoted(out, &str_val)?),
         YamlString::Unquoted { .. } => {
             // #996: checked before the verbatim-echo fallback below,
             // which is for genuine YAML source text only. A non-finite
@@ -7433,7 +7504,7 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
             // than fabricating a YAML-specific non-finite spelling this
             // function has never needed before.
             if let Some(f) = json_sourced_canonical_float(resolve_plain(&str_val), canonicalize) {
-                return write!(out, "{f}");
+                return Ok(write!(out, "{f}")?);
             }
             // Source plain scalar: re-emit verbatim so both the scalar type and
             // its representation survive (`1`, `true`, `1.0`, `.5`, `yes`),
@@ -7446,9 +7517,9 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
                 || str_val.bytes().any(|b| b < 0x20)
                 || starts_seq_entry(str_val.as_bytes(), 0)
             {
-                stream_yaml_double_quoted(out, &str_val)
+                Ok(stream_yaml_double_quoted(out, &str_val)?)
             } else {
-                out.write_str(&str_val)
+                Ok(out.write_str(&str_val)?)
             }
         }
         // Block scalar reached here either because `stream_yaml_value`'s
@@ -7457,7 +7528,7 @@ fn stream_yaml_string_value<Out: core::fmt::Write>(
         // needed (#836), or via `write_yaml_field_key` for an explicit-key
         // block scalar (`? |\n  key\n: value`), which never attempts block
         // style for a *key* at all - both want the same smart quoting.
-        _ => stream_yaml_block_scalar_quoted(out, &str_val),
+        _ => Ok(stream_yaml_block_scalar_quoted(out, &str_val)?),
     }
 }
 
