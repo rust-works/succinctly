@@ -21715,9 +21715,9 @@ fn test_yq_regex_flag_grammar_jq_mode_unaffected_1426() -> Result<()> {
 }
 
 /// #1443: yq mode coerces a scalar (non-container) regex pattern argument to
-/// its string form and matches literally, instead of raising -- live-
-/// verified against yq v4.53.3 across `test`/`match`/`capture`/2-arg `sub`/
-/// 3-arg `sub`.
+/// its string form and compiles *that* as an ordinary regex, instead of
+/// raising -- live-verified against yq v4.53.3 across `test`/`match`/
+/// `capture`/2-arg `sub`/3-arg `sub`.
 #[test]
 fn test_yq_regex_pattern_coercion_scalar_1443() -> Result<()> {
     let (out, code) = run_yq_stdin("test(1)", "a1c", &["-o", "json"])?;
@@ -21733,6 +21733,16 @@ fn test_yq_regex_pattern_coercion_scalar_1443() -> Result<()> {
     assert_eq!(out.trim(), "true");
 
     let (out, code) = run_yq_stdin("test(1.5)", "a1.5c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
+    assert_eq!(out.trim(), "true");
+
+    // The coerced pattern is compiled as an ordinary regex, not matched as
+    // literal text -- the "." in "1.5" is a wildcard, so this matches
+    // "1X5" too, not just a literal "1.5" substring. Distinguishes
+    // "compiled as regex" from "matched literally" (the input above alone
+    // can't: a literal "1.5" substring also satisfies the wildcard-dot
+    // regex, so it doesn't rule out either interpretation on its own).
+    let (out, code) = run_yq_stdin("test(1.5)", "a1X5c", &["-o", "json"])?;
     assert_eq!(code, 0, "out={out}");
     assert_eq!(out.trim(), "true");
 
@@ -21770,6 +21780,23 @@ fn test_yq_regex_pattern_coercion_container_known_gap_1443() -> Result<()> {
     let (out, code) = run_yq_stdin("sub({};\"X\";\"g\")", "a1c", &["-o", "json"])?;
     assert_ne!(code, 0, "out={out}");
 
+    Ok(())
+}
+
+/// #1443: `split(re; flags)` -- a real yq builtin, unlike `gsub`/`scan`/
+/// `splits` which share this same helper but are succinctly's own
+/// extensions -- also coerces a numeric pattern instead of erroring.
+/// Asserts only that it no longer errors, not the exact output shape:
+/// `split`'s own output already diverges from real yq for an unrelated,
+/// already-tracked reason (#1439 -- succinctly does a real regex split,
+/// real yq's own `split(re;flags)` doesn't remove the matched delimiter
+/// at all), live-verified independently of this fix
+/// (`split("[0-9]";"g")` on `"a1b2c"` is `["a","1","b","2","c"]` in real
+/// yq, `["a","b","c"]` in succinctly, both before and after this change).
+#[test]
+fn test_yq_split_regex_pattern_coerces_1443() -> Result<()> {
+    let (out, code) = run_yq_stdin("split(1;\"g\")", "a1c", &["-o", "json"])?;
+    assert_eq!(code, 0, "out={out}");
     Ok(())
 }
 

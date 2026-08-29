@@ -588,6 +588,47 @@ Deliberately **not** extended to:
   scalar case works; its actual behavior for a container flags value is unconfirmed and
   left as a known, undocumented-elsewhere gap rather than guessed at.
 
+### Regex pattern coercion — scalars fixed, containers still open
+
+**Fixed by [#1443](https://github.com/rust-works/succinctly/issues/1443):** real yq
+silently coerces a non-string *pattern* argument to its string representation and
+compiles *that* as an ordinary regex — not a literal-text match: the coerced
+string's own characters still act as regex metacharacters (a coerced `Float`'s `.`
+is a wildcard, not an escaped decimal point). Where succinctly raised
+`is_not_a_string`/`not_string_or_array` in both jq and yq mode, it now coerces too
+— live-verified against yq v4.53.3 across `test`/`match`/`capture`/2-arg `sub`/
+3-arg `sub`/`split` (a real yq builtin, unlike `gsub`/`scan`/`splits`, which share
+the same coercion helper but have no real yq behavior to diverge from):
+
+```bash
+$ echo '"a1c"' | yq            'test(1)'          # true (1 stringified to "1")
+$ echo '"a1c"' | succinctly yq 'test(1)'          # was: Error: number not a string or array; now: true
+$ echo '"a1c"' | yq            'sub(1;"X")'       # "aXc"
+$ echo '"a1c"' | succinctly yq 'sub(1;"X")'       # was: Error: number (1) is not a string; now: "aXc"
+$ echo '"a1X5c"' | yq            'test(1.5)'      # true -- "." is a wildcard, not a literal dot
+$ echo '"a1X5c"' | succinctly yq 'test(1.5)'      # was: Error: number (1.5) is not a string; now: true
+```
+
+`Null`/`Bool`/`Int`/`Float`/`NumberLiteral` now coerce (`owned_to_string`-equivalent)
+before the existing type-check runs; jq mode is unaffected (real jq 1.7.1 keeps
+strict typing here too, matching ADR-0018 rule 2). `split(re;flags)`'s own output
+still diverges from real yq for an unrelated, already-tracked reason regardless of
+this fix (below: "3-argument `sub`" section's sibling gap, tracked as
+[#1439](https://github.com/rust-works/succinctly/issues/1439) — succinctly performs
+a real regex split, real yq's own `split` doesn't remove the matched delimiter at
+all) — this fix only closes the pattern-type gap, not #1439's separate one.
+
+Deliberately **not** extended to a container (`Array`/`Object`) pattern — this fix's
+own live probes showed real yq doesn't simply error there either, but its exact
+stringification rule is a separate, unverified question:
+
+```bash
+$ echo '"a1c"' | yq            'sub([1];"X";"g")'   # "a1c" (no match, no error)
+$ echo '"a1c"' | succinctly yq 'sub([1];"X";"g")'   # Error: array ([1]) is not a string -- unchanged, known gap
+$ echo '"a{}c"' | yq            'sub({};"X";"g")'   # "ac" (coerces to "{}", also compiled as an ordinary regex)
+$ echo '"a{}c"' | succinctly yq 'sub({};"X";"g")'   # Error: object ({}) is not a string -- unchanged, known gap
+```
+
 ### Presentation metadata lost on two whole output routes
 
 Neither route builds a `CommentTree`, so both drop comments, style **and** anchors together:

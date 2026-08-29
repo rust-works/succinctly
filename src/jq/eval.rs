@@ -11514,35 +11514,32 @@ fn resolve_regex_args<S: EvalSemantics>(
     // live even for a 1-element array with no explicit flags slot at all:
     // `test([1])` -> "number (1) is not a string", not the bare "not a
     // string or array" `test(1)` alone would give.
-    // yq mode coerces a scalar (non-container) pattern to its string form
-    // and matches literally, instead of raising -- live-verified against
-    // v4.53.3 across the whole family (#1443): `test(1)` => `true` on
-    // `"a1c"`, `sub(1;"X")` => `"aXc"`, `match(true)`/`capture(null)` behave
-    // the same way. jq mode is unaffected -- real jq 1.7.1 errors on all of
-    // these, matching its general strict-typing philosophy elsewhere.
-    // `Array`/`Object` are deliberately excluded, mirroring the same
-    // exclusion in the flags-coercion check above: this fix's own live
-    // probes showed a container pattern doesn't simply error in yq either,
-    // but nailing down its exact stringification rule needs more
-    // verification than #1443 itself scoped (its repro was numbers) --
-    // left to fall through to the existing unpack-or-error handling below
-    // rather than guessed at.
-    if S::TAG == EvalTag::Yq
-        && matches!(
-            raw_pattern,
-            OwnedValue::Null
-                | OwnedValue::Bool(_)
-                | OwnedValue::Int(_)
-                | OwnedValue::Float(_)
-                | OwnedValue::NumberLiteral(..)
-        )
-    {
-        let pattern = owned_to_string::<S>(&raw_pattern);
-        let flags = validate_regex_flags(raw_flags)?;
-        return Ok((pattern, flags));
-    }
-
     let pattern = match raw_pattern {
+        // #1443: yq mode coerces a scalar (non-container) pattern to its
+        // string form and compiles *that* as an ordinary regex, instead
+        // of raising -- not a literal-text match: the coerced string's
+        // own characters (e.g. `.` in a `Float`'s `"1.5"`) still act as
+        // regex metacharacters, live-verified against v4.53.3
+        // (`test(1.5)` on `"a1X5c"` is `true` in both real yq and here --
+        // the `.` matches any character, not just a literal dot). Also
+        // verified across the rest of the family: `test(1)` => `true` on
+        // `"a1c"`, `sub(1;"X")` => `"aXc"`, `match(true)`/`capture(null)`
+        // behave the same way. jq mode is unaffected -- real jq 1.7.1
+        // errors on all of these, matching its general strict-typing
+        // philosophy elsewhere. `Array`/`Object` are deliberately
+        // excluded (via `is_owned_container`), mirroring the same
+        // exclusion in the flags-coercion check above: this fix's own
+        // live probes showed a container pattern doesn't simply error in
+        // yq either, but nailing down its exact stringification rule
+        // needs more verification than #1443 itself scoped (its repro
+        // was numbers) -- left to fall through to the existing
+        // unpack-or-error handling below rather than guessed at.
+        v if S::TAG == EvalTag::Yq
+            && !is_owned_container(&v)
+            && !matches!(v, OwnedValue::String(_)) =>
+        {
+            owned_to_string::<S>(&v)
+        }
         OwnedValue::String(s) => s,
         v if array_unpacked || flags_present || matches!(family, RegexArgFamily::Sub) => {
             return Err(EvalError::is_not_a_string(&v));
@@ -12598,10 +12595,9 @@ fn builtin_sub_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// propagate `error(...)`), it's "never reached." Only `re_expr` is
 /// evaluated, so `sub("[";"X";"g")` still raises the genuine
 /// regex-compile error real yq gives for an invalid pattern. A
-/// *non-string* pattern (e.g. `sub(1;"X";"g")`) is a separate, pre-existing
-/// divergence shared by `test`/`match`/`capture`/2-arg `sub` in yq mode
-/// (real yq coerces it to a string; succinctly errors) -- not specific to
-/// this arity-3 path and not fixed here, see #1443.
+/// *non-string* pattern (e.g. `sub(1;"X";"g")`) coerces to a string and
+/// matches, same as `test`/`match`/`capture`/2-arg `sub` in yq mode --
+/// oracle-verified rule (#1443), via `resolve_regex_args` below.
 ///
 /// The result is a genuine global replace with a constant `""`, not
 /// "always returns `""`" -- confirmed live: `"abc" | sub("b";"X";"g")`
@@ -12634,26 +12630,19 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         ArgFanout::yq_native::<S>(),
         move |raw_pattern| {
-            // #1443: yq mode coerces a scalar pattern to its string form
-            // instead of raising, same as the arity-2 family above (which
-            // this arity-3 form otherwise diverged from -- see this
-            // function's own doc comment, previously left unfixed here).
-            let pattern = if S::TAG == EvalTag::Yq
-                && matches!(
-                    raw_pattern,
-                    OwnedValue::Null
-                        | OwnedValue::Bool(_)
-                        | OwnedValue::Int(_)
-                        | OwnedValue::Float(_)
-                        | OwnedValue::NumberLiteral(..)
-                ) {
-                owned_to_string::<S>(&raw_pattern)
-            } else {
-                match raw_pattern {
-                    OwnedValue::String(s) => s,
-                    v => return QueryResult::Error(EvalError::is_not_a_string(&v)),
-                }
-            };
+            // #1443: reuses `resolve_regex_args`'s own yq-mode scalar-pattern
+            // coercion (RegexArgFamily::Sub gives the identical
+            // `is_not_a_string` wording this arity-3 form already used) --
+            // this arity-3 path otherwise diverged from the arity-2 family
+            // above, previously left unfixed here. `flags_present: false`,
+            // `raw_flags: None`: arity-3 `sub` ignores flags entirely (see
+            // this function's own doc comment), so the returned flags half
+            // is simply discarded rather than validated.
+            let pattern =
+                match resolve_regex_args::<S>(raw_pattern, None, false, RegexArgFamily::Sub) {
+                    Ok((pattern, _flags)) => pattern,
+                    Err(e) => return QueryResult::Error(e),
+                };
 
             // The three `if optional` guards below mirror every sibling
             // builtin's own `_ if optional => QueryResult::None` arm (see
@@ -12853,7 +12842,19 @@ fn resolve_concat_flags<S: EvalSemantics>(
         Err(e) => return Err(e),
     };
 
+    // #1443: same yq-mode scalar-pattern coercion as `resolve_regex_args`
+    // -- `split(re; flags)` is real yq surface (unlike `gsub`/`scan`/
+    // `splits`, which also route through here but are succinctly's own
+    // extensions with no real yq behavior to diverge from), live-verified
+    // to coerce a numeric pattern the same way: `split(1;"g")` on `"a1c"`
+    // is `["a","1","c"]` in both real yq v4.53.3 and here.
     let pattern = match raw_pattern {
+        v if S::TAG == EvalTag::Yq
+            && !is_owned_container(&v)
+            && !matches!(v, OwnedValue::String(_)) =>
+        {
+            owned_to_string::<S>(&v)
+        }
         OwnedValue::String(s) => s,
         v => return Err(EvalError::is_not_a_string(&v)),
     };
