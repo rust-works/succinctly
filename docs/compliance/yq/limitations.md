@@ -755,18 +755,33 @@ what succinctly should do instead). Not folded into this fix, since redefining a
 unverified error-interaction shape risked a second, differently-wrong divergence rather than
 fixing one — filed as [#1779](https://github.com/rust-works/succinctly/issues/1779).
 
-**Separately, not part of this fix:** live-probing this also surfaced that real jq's own
-`+=`/`-=`/`*=`/`/=`/`%=` (unlike `|=`) genuinely fork over a multi-output RHS the same way
-`=` does (`.x += (10,20,30)` on `{"x":1}` is three documents, `{"x":11}`/`{"x":21}`/
-`{"x":31}`) — succinctly's `eval_rhs_once` (shared by all of `eval_compound_assign` and
-`eval_alternative_assign`) instead always collapses to the *first* output, a pre-existing,
-already-documented gap in that function's own doc comment (referencing #392) that predates
-and is unrelated to #1430's yq-mode scope. Real yq's own answer for these operators under a
-multi-output RHS also isn't "first" — live-verified `.x += (10,20,30)` on `{"x":1}` is
-`{"x":31}` (last value, matching `=`'s own rule above), not `{"x":11}`. Both the jq-mode
-fork gap and the yq-mode wrong-value gap are real, separate from each other and from #1430,
-and neither is fixed here — filed as
-[#1778](https://github.com/rust-works/succinctly/issues/1778).
+### `+=`/`-=`/`*=`/`/=`/`%=`/`//=`'s multi-output RHS: same jq-forks/yq-takes-last split as `=`
+
+Live-probing #1430 also surfaced that real jq's own `+=`/`-=`/`*=`/`/=`/`%=` (unlike `|=`)
+genuinely fork over a multi-output RHS the same way `=` does, and real yq's own answer for
+these operators isn't "first" either — it takes only the **last** output, exactly like
+`=`'s own rule above:
+
+```bash
+$ echo '{"x":1}' | jq            -c '.x += (10,20,30)'          # {"x":11} {"x":21} {"x":31}
+$ echo '{"x":1}' | succinctly jq -c '.x += (10,20,30)'          # {"x":11} {"x":21} {"x":31}  (fixed)
+
+$ echo '{"x":1}' | yq            -o=json -I0 '.x += (10,20,30)' # {"x":31}
+$ echo '{"x":1}' | succinctly yq -o=json -I0 '.x += (10,20,30)' # {"x":31}  (fixed)
+```
+
+`succinctly`'s `eval_rhs_once` (shared by all of `eval_compound_assign` and
+`eval_alternative_assign`) used to always collapse to the *first* output in both modes — a
+pre-existing gap in that function's own doc comment (referencing #392), separate from and
+predating #1430's yq-mode scope for `=`. Fixed in
+[#1778](https://github.com/rust-works/succinctly/issues/1778) by replacing
+`eval_rhs_once` with `collect_rhs_outputs`/`eval_update_multi`, mirroring `eval_assign`'s
+own #392/#1430 shape: jq mode forks, yq mode collapses to the last output on a clean
+completion, gated on `S::TAG == EvalTag::Yq` — the same "deliberately still open" carve-out
+above (an RHS that itself errors partway through) applies here too, for the same reason
+(#1779). `/=`/`%=`/`//=` have no real yq syntax at all (confirmed live, `'/'`/`'//'` expect
+2 args but there is 1), so their yq-mode "take the last value" answer is judged by internal
+consistency with `|=` rather than an external-compat claim.
 
 ### `-o=auto` on a genuinely mixed-format multi-source run doesn't match per-element
 
