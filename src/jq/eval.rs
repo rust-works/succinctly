@@ -22409,13 +22409,47 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     ///
     /// Branches already produced ahead of the offending one are kept and
     /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
-    fn reject_untracked_at_terminal(
+    ///
+    /// yq mode does not raise here for `path()`/`=`/`|=` (`is_del == false`,
+    /// #1764): a computed/untracked `Expr::Comma` branch is real yq's own
+    /// silent no-op there, not an error -- confirmed live against yq
+    /// v4.53.3, position-independent (`(.a, 1) = 5`, `(1, .a, .c) = 5`,
+    /// `(.a, .c, 1) = 5`, all-branches-untracked, and a computed value
+    /// produced by an arbitrary expression rather than a bare literal all
+    /// leave every trackable branch written normally and the untracked one
+    /// contributing nothing). `near_iterate`'s own wording distinction is
+    /// moot for those contexts: there is no error to word either way.
+    ///
+    /// `del()` (`is_del == true`) is deliberately **excluded** from that
+    /// skip and keeps raising here, unlike its three siblings: real yq's
+    /// `del()` turns out not to share their simple per-branch-independent
+    /// model at all. Confirmed live: `del(.a, 1)` on `{a: 1, b: 2}` deletes
+    /// *nothing* (`a: 1\nb: 2`, both keys survive) where `del(1, .a)` -- the
+    /// same two arguments, reversed -- deletes `.a` (`b: 2`), and
+    /// `del(.a, .c, 1)` on a 3-key document deletes only `.c`, not `.a`,
+    /// even though `.a` comes *before* the untracked `1` in the argument
+    /// list. The pattern (verified across argument-order permutations) is
+    /// consistent with real yq's `del()` processing its targets in
+    /// *reverse* of the given order and aborting the remaining ones --
+    /// without undoing whatever already completed -- the moment it hits an
+    /// untracked one; simply mirroring the other three operations' skip
+    /// here would make `del()` delete *more* than real yq does for some
+    /// orderings (e.g. `del(.a, 1)` would delete `.a`, which real yq
+    /// leaves alone) -- a data-loss-shaped divergence in the wrong
+    /// direction, not merely a cosmetic one. Left on the pre-existing raise
+    /// until that ordering is implemented for real; tracked as a follow-up
+    /// rather than guessed at here.
+    fn reject_untracked_at_terminal<S: EvalSemantics>(
         branches: Vec<PathBranch<'_>>,
         near_iterate: bool,
+        is_del: bool,
     ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
         let mut kept = vec_with_capacity(branches.len());
         for branch in branches {
             if !branch.trackable {
+                if S::TAG == EvalTag::Yq && !is_del {
+                    continue;
+                }
                 let error = if near_iterate {
                     EvalError::invalid_path_expression_near_iterate(&branch.value).into()
                 } else {
@@ -22446,9 +22480,10 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// surfacing the later sibling's error instead of jq's real one and
     /// leaking that untracked branch's stale path into the assembled prefix
     /// (#1560).
-    fn reject_untracked_prefix_too(
+    fn reject_untracked_prefix_too<S: EvalSemantics>(
         result: PathResolveResult<'_>,
         near_iterate: bool,
+        is_del: bool,
     ) -> PathResolveResult<'_> {
         let (prefix, escape) = match result {
             Ok(branches) => (branches, None),
@@ -22458,8 +22493,13 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // `prefix` propagates immediately, discarding `escape` (a later
         // sibling's own error/break/halt that never got the chance to run
         // in real jq either) -- exactly `path_result`'s own `Some`/`None`
-        // combine once a violation-free `prefix` reaches it.
-        let checked = reject_untracked_at_terminal(prefix, near_iterate)?;
+        // combine once a violation-free `prefix` reaches it. In yq mode,
+        // for every context but `del()`, `reject_untracked_at_terminal`
+        // never returns `Err` at all (#1764), so this `?` is a no-op there
+        // and `escape` -- a genuine error/break/halt, never just an
+        // untracked value -- still always propagates through `path_result`
+        // below unchanged.
+        let checked = reject_untracked_at_terminal::<S>(prefix, near_iterate, is_del)?;
         path_result(checked, escape)
     }
 
@@ -22529,8 +22569,11 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // frozen `$x` snapshot, so ambient `snapshot` starts `false` here,
         // same as it does at this function's other top-level entry point
         // below (#1591).
-        return match reject_untracked_prefix_too(resolve_node::<S>(expr, input, true, false), false)
-        {
+        return match reject_untracked_prefix_too::<S>(
+            resolve_node::<S>(expr, input, true, false),
+            false,
+            short_circuit_del_root,
+        ) {
             Ok(branches) => {
                 if short_circuit_del_root && branches.iter().any(|b| b.path.depth() == 0) {
                     return Ok(vec![Expr::Identity]);
@@ -22546,7 +22589,11 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    match reject_untracked_prefix_too(resolve_node::<S>(&reduced_expr, input, true, false), true) {
+    match reject_untracked_prefix_too::<S>(
+        resolve_node::<S>(&reduced_expr, input, true, false),
+        true,
+        short_circuit_del_root,
+    ) {
         Ok(branches) => Ok(assemble(branches)
             .into_iter()
             .map(|e| append_trailing(e, &trailing))

@@ -667,6 +667,58 @@ its M2 fast path shares `stream_cursor!` with stdout, so an M2-eligible `map` ke
 and style through `-i` too — #1349 is about the `--inplace` **DOM fallback**, which a
 non-M2-eligible filter still reaches.
 
+### An untracked `Expr::Comma` branch — resolved for `path()`/`=`/`|=`, still open for `del()`
+
+[#1764](https://github.com/rust-works/succinctly/issues/1764): `reject_untracked_at_terminal`
+(`eval.rs`) is the shared check answering "is a `path()`/`del()`/`=`/`|=` branch that resolved
+to a *computed* value, rather than a real navigation, actually an error" — jq's answer is
+always yes (`Invalid path expression with result <v>`), and this check used to raise
+unconditionally for both modes.
+
+Real yq's answer for `path()`/`=`/`|=` is no: an untracked comma branch is a silent no-op,
+and every *other* branch is still written normally, regardless of the untracked branch's
+position or how it was produced:
+
+```bash
+$ echo 'a: 1
+b: 2' | yq            '(.a, 1) = 5'   # a: 5\nb: 2 -- untracked "1" contributes nothing
+$ echo 'a: 1
+b: 2' | succinctly yq '(.a, 1) = 5'   # matches, was: Error: Invalid path expression with result 1
+```
+
+Confirmed position-independent (untracked first, middle, or last; all-branches-untracked;
+a computed value from an arbitrary expression rather than a bare literal) — every case gives
+the same "skip the untracked branch, write every other one" result.
+
+**`del()` does not share this model and is deliberately excluded from the fix.** Its real
+behaviour, confirmed live across argument-order permutations, is order-*dependent* in a way
+none of its three siblings are:
+
+```bash
+$ echo 'a: 1
+b: 2' | yq 'del(.a, 1)'      # a: 1\nb: 2  -- nothing deleted
+$ echo 'a: 1
+b: 2' | yq 'del(1, .a)'      # b: 2       -- .a IS deleted (same two arguments, reversed)
+$ echo 'a: 1
+b: 2
+c: 3' | yq 'del(.a, .c, 1)'  # a: 1\nb: 2\nc: 3 -- nothing deleted, even though .a/.c precede "1"
+$ echo 'a: 1
+b: 2
+c: 3' | yq 'del(.a, 1, .c)'  # a: 1\nb: 2       -- only .c deleted, not .a
+```
+
+The pattern across all four is consistent with `del()` processing its targets in *reverse*
+of the given argument order and aborting every remaining one — without undoing whatever
+already completed — the instant it hits an untracked target. Simply extending the other
+three operations' "skip and continue in given order" fix to `del()` would make it delete
+*more* than real yq does for some orderings (`del(.a, 1)` would delete `.a`, which real yq
+leaves untouched) — a data-loss-shaped divergence in the wrong direction, not a cosmetic
+one. `del()` therefore keeps raising `reject_untracked_at_terminal`'s pre-existing error
+(via the same `short_circuit_del_root` flag `resolve_dynamic_indexes` already uses to
+distinguish `del()`'s call shape from its three siblings) until the real reverse-order/
+abort-without-rollback algorithm is implemented, tracked as
+[#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
+
 ### Comma-grouped scalar-target assignment no-op
 
 [#1233](https://github.com/rust-works/succinctly/issues/1233) taught `=`/`+=`/`-=`/`*=`/`//=`

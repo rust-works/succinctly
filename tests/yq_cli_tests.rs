@@ -17999,6 +17999,91 @@ fn test_yq_comma_lhs_mixed_noop_and_real_write_still_evaluates_rhs_1233() -> Res
     Ok(())
 }
 
+/// #1764: an untracked (computed, non-navigable) `Expr::Comma` branch is
+/// real yq's own silent no-op for `=`/`|=`, not an error -- confirmed
+/// position-independent against yq v4.53.3: untracked first, middle, or
+/// last all give the same "skip it, write every other branch normally"
+/// result. `succinctly jq` is unaffected -- real jq raises
+/// "Invalid path expression" here and still must.
+#[test]
+fn test_yq_untracked_comma_branch_assignment_noop_1764() -> Result<()> {
+    for filter in ["(.a, 1) = 5", "(1, .a) = 5"] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\nb: 2\n", &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, serde_json::json!({"a": 5, "b": 2}), "{filter}");
+    }
+    Ok(())
+}
+
+/// #1764: position-independence across a 3-way comma, and `|=` (not just
+/// `=`) taking the same no-op path.
+#[test]
+fn test_yq_untracked_comma_branch_three_way_and_compound_assign_1764() -> Result<()> {
+    let doc = "a: 1\nb: 2\nc: 3\n";
+    for filter in ["(.a, 1, .c) = 5", "(1, .a, .c) = 5", "(.a, .c, 1) = 5"] {
+        let (out, code) = run_yq_stdin(filter, doc, &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, serde_json::json!({"a": 5, "b": 2, "c": 5}), "{filter}");
+    }
+
+    let (out, code) = run_yq_stdin("(.a, 1) |= . + 100", "a: 1\nb: 2\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": 101, "b": 2}));
+    Ok(())
+}
+
+/// #1764: every branch untracked is a complete no-op, not an error.
+#[test]
+fn test_yq_untracked_comma_branch_all_untracked_noop_1764() -> Result<()> {
+    let (out, code) = run_yq_stdin("(1, 2) = 5", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!({"a": 1}));
+    Ok(())
+}
+
+/// #1764: a genuine error inside an untracked comma branch still
+/// propagates normally -- only a *successfully computed* untracked value
+/// is a no-op, not an escape (error/break/halt) that happened to occur
+/// while producing one.
+#[test]
+fn test_yq_untracked_comma_branch_genuine_error_still_propagates_1764() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("(.a, error(\"boom\")) = 5", "a: 1\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1764: `del()` is deliberately *excluded* from the no-op fix and keeps
+/// raising -- real yq's own `del()` has order-dependent reverse/abort
+/// semantics unlike its three siblings (tracked separately as #1865); the
+/// safe default (an error) is kept rather than guessing at that algorithm,
+/// since naively extending the no-op fix to `del()` would delete more than
+/// real yq does for some argument orderings.
+#[test]
+fn test_yq_untracked_comma_branch_del_still_raises_1764() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("del(.a, 1)", "a: 1\nb: 2\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Invalid path expression"), "err={err}");
+    Ok(())
+}
+
+/// #1764 negative control: `succinctly jq`'s own path-expression check is
+/// unaffected -- real jq raises for every untracked comma branch
+/// regardless of the surrounding operation, and still must.
+#[test]
+fn test_jq_untracked_comma_branch_still_raises_1764() -> Result<()> {
+    let (_out, err, code) = run_jq_stdin_with_stderr("(.a, 1) = 5", "{\"a\":1,\"b\":2}", &["-c"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Invalid path expression"), "err={err}");
+    Ok(())
+}
+
 // ============================================================================
 // @urid / @base64d scalar-stringification (#1109)
 // ============================================================================
