@@ -2503,6 +2503,121 @@ fn test_raw_output0_multiple() -> Result<()> {
     Ok(())
 }
 
+/// #1830: `--raw-output0` uses NUL as its own record terminator, so a
+/// string whose own content contains a raw NUL byte is ambiguous to any
+/// NUL-delimited consumer downstream. Real jq refuses rather than emit
+/// it -- confirmed live against jq 1.7.1:
+/// `jq -r --raw-output0 '.'` on `"b\u0000c"` raises `jq: error (at
+/// <stdin>:0): Cannot dump a string containing NUL with --raw-output0
+/// option`, exit 5. succinctly used to silently emit the raw byte, exit
+/// 0. Verified this fires only under `--raw-output0` specifically
+/// (`-r`/`-j` alone use newline/no separator, no comparable ambiguity),
+/// and only for raw-output strings (JSON's own quoted output always
+/// escapes a NUL to `\u0000`, six ASCII bytes, never a raw byte -- never
+/// reaches this check).
+#[test]
+fn test_raw_output0_rejects_embedded_nul() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-r", "--raw-output0", "."], Some(r#""b\u0000c""#))?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert!(
+        out.is_empty(),
+        "must not write the offending value's content: {out:?}"
+    );
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
+/// #1830: plain `-r` or `-j` (join-output), without `--raw-output0`, must
+/// keep emitting an embedded NUL unchanged -- confirmed live against jq
+/// 1.7.1, neither flag alone triggers the check (only `--raw-output0`'s
+/// own NUL-as-delimiter conflict does). A regression here would mean the
+/// new check fired too broadly.
+#[test]
+fn test_raw_output0_nul_check_does_not_fire_without_the_flag() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-r", "."], Some(r#""b\u0000c""#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.as_bytes(), b"b\0c\n");
+
+    let (out, _, code) = run_jq_full(&["-j", "."], Some(r#""b\u0000c""#))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.as_bytes(), b"b\0c");
+    Ok(())
+}
+
+/// #1830: JSON's own quoted output always escapes a NUL to \u0000 --
+/// six printable ASCII bytes, never a raw byte -- so the new check must
+/// never fire for it. `--raw-output0` itself always implies `-r`
+/// (confirmed via `jq --help`: "implies -r"; this codebase's own
+/// `OutputConfig` construction mirrors that -- `raw_output` is set
+/// whenever `raw_output0` is), so JSON-quoted output combined with `-0`
+/// isn't a reachable flag combination to test directly; this pins the
+/// same JSON-escapes-NUL guarantee via plain default (non-raw) output
+/// instead, without `--raw-output0` at all. Confirmed live against jq
+/// 1.7.1: exit 0, the escape sequence printed verbatim.
+#[test]
+fn test_default_json_output_escapes_nul_and_does_not_error() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["."], Some(r#""b\u0000c""#))?;
+    assert_eq!(code, 0);
+    assert!(out.contains(r"b\u0000c"), "stdout: {out:?}");
+    Ok(())
+}
+
+/// #1830: real jq flushes each result as it's produced and errors on
+/// first sighting a NUL, rather than buffering the whole multi-result
+/// stream before writing anything -- confirmed live against jq 1.7.1:
+/// `.[]` over `["a","b\u0000c","d"]` under `--raw-output0` writes `a`
+/// (with its own NUL terminator) to stdout, *then* errors on the second
+/// value without writing any of its content or reaching the third. This
+/// is the exact design constraint #1830's yq-mode sibling (#1709) found
+/// the naive "buffer the whole rendered result, then scan" approach
+/// violates (PR #1767, closed without merging after three confirmed
+/// regressions from that shape) -- this test pins that succinctly's own
+/// jq-mode fix does not repeat it.
+#[test]
+fn test_raw_output0_flushes_earlier_results_before_erroring() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-r", "--raw-output0", ".[]"],
+        Some(r#"["a","b\u0000c","d"]"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert_eq!(
+        out.as_bytes(),
+        b"a\0",
+        "must flush the good first result, exactly, before erroring; stdout: {out:?}"
+    );
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
+/// #1830: the same flush-then-error and correct-exit-code/message
+/// behavior, but through the CLI's *other* output writer
+/// (`write_output`, the "materializing" path reached via `-n`/`inputs`)
+/// -- a distinct code path from the default "lazy" one the tests above
+/// exercise (`write_output_jq_value`). Both writers needed the fix
+/// independently; this test would have caught the materializing path
+/// being missed (it originally propagated a generic, unformatted
+/// `anyhow` error at exit 1 instead of jq's own exit 5/message).
+#[test]
+fn test_raw_output0_rejects_embedded_nul_via_materializing_path() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-n", "-r", "--raw-output0", "inputs"],
+        Some("\"a\"\n\"b\\u0000c\"\n\"d\"\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert_eq!(out.as_bytes(), b"a\0", "stdout: {out:?}");
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_unbuffered_flag() -> Result<()> {
     // Test that --unbuffered flag works (just verify it parses correctly)
