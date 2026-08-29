@@ -36853,6 +36853,11 @@ mod tests {
             "pick((.k1,.k2))",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
+        query!(
+            &b"{\"a\":1,\"k1\":[\"\xff\xfe\"],\"k2\":[\"b\"]}"[..],
+            "omit((.k1,.k2))",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
         // A fully-valid multi-output keys expression (`(.k1, .k2)`) still
         // reaches `keys_owned`'s `QueryResult::Many` arm and its own
         // `to_owned_checked` success path -- distinct from the
