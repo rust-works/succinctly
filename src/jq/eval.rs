@@ -31120,40 +31120,71 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if results.try_reserve_exact(total).is_err() {
         return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     }
-    let mut indices: Vec<usize> = vec![0; n];
+
+    mixed_radix_combinations(
+        n,
+        &mut results,
+        |_| base_array.len(),
+        |_, idx| base_array[idx].clone(),
+    );
+
+    QueryResult::ManyOwned(results)
+}
+
+/// The mixed-radix counting walk shared by [`cartesian_product`] and
+/// `builtin_combinations_n` (#1721): both build every combination of `width`
+/// positions by treating `indices` as a mixed-radix counter and carrying
+/// into the next position once the current one wraps, differing only in
+/// whether a position's own length is looked up per-position (independent
+/// arrays) or is one constant repeated `width` times (`combinations(n)`'s
+/// single array raised to itself). `len_at`/`value_at` abstract over that
+/// one difference; everything else -- the counter, the carry propagation,
+/// the termination check -- was previously hand-duplicated in both
+/// callers, ~30 lines apart, and had to be kept in sync by eye.
+///
+/// `results` must already be reserved for the caller's own already-guarded
+/// total capacity -- this only walks and pushes, it never sizes or grows
+/// the backing allocation itself, so it carries none of either caller's
+/// crash-prevention guards and must not be called before them.
+fn mixed_radix_combinations(
+    width: usize,
+    results: &mut Vec<OwnedValue>,
+    len_at: impl Fn(usize) -> usize,
+    value_at: impl Fn(usize, usize) -> OwnedValue,
+) {
+    let mut indices = vec![0usize; width];
 
     loop {
-        let combination: Vec<OwnedValue> =
-            indices.iter().map(|&idx| base_array[idx].clone()).collect();
+        let combination: Vec<OwnedValue> = (0..width).map(|i| value_at(i, indices[i])).collect();
         results.push(OwnedValue::Array(combination));
 
-        // Increment indices (like counting in mixed radix), same as
-        // cartesian_product's own loop below.
+        // Increment indices (like counting in mixed radix).
         let mut carry = true;
-        for idx in indices.iter_mut().rev() {
+        for i in (0..width).rev() {
             if carry {
-                *idx += 1;
-                if *idx >= base_array.len() {
-                    *idx = 0;
+                indices[i] += 1;
+                if indices[i] >= len_at(i) {
+                    indices[i] = 0;
                 } else {
                     carry = false;
                 }
             }
         }
+
+        // If we carried all the way through, we're done.
         if carry {
             break;
         }
     }
-    QueryResult::ManyOwned(results)
 }
 
 /// Compute the Cartesian product of a list of arrays.
 ///
 /// The result has one entry per combination -- `arrays.iter().map(Vec::len)`'s
-/// product -- so that product is exactly what [`try_reserve_product`] guards
-/// before the loop below grows `results` one push at a time: without this,
-/// `results` grows via ordinary `Vec` doubling with no upfront size check at
-/// all, the identical missed guard #1612/#1634 already closed for other
+/// product -- so that product is exactly what the guard below checks before
+/// the walk grows `results` one push at a time: without this, `results`
+/// grows via ordinary `Vec` doubling with no upfront size check at all, the
+/// identical missed guard #1612/#1634 already closed for other
 /// generator-controlled cross products (#1669).
 fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
     if arrays.is_empty() {
@@ -31162,12 +31193,11 @@ fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, Eval
 
     // Guard the row width (arrays.len()) against the heaviest type that
     // recurs at that length -- OwnedValue, not usize -- before building
-    // anything: `lens`/`indices` below are also arrays.len() elements
-    // long, but of the smaller `usize`, so this subsumes their own
-    // allocation cost. Independent of `results`' own length-*product*
-    // guard just below: many length-1 factor arrays keep that product tiny
-    // while the row width (arrays.len() itself) stays unbounded (#1669
-    // review).
+    // anything: `lens` below is also arrays.len() elements long, but of
+    // the smaller `usize`, so this subsumes its own allocation cost.
+    // Independent of `results`' own length-*product* guard just below:
+    // many length-1 factor arrays keep that product tiny while the row
+    // width (arrays.len() itself) stays unbounded (#1669 review).
     if Vec::<OwnedValue>::new()
         .try_reserve_exact(arrays.len())
         .is_err()
@@ -31176,38 +31206,41 @@ fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, Eval
     }
 
     let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
-    let mut results = try_reserve_product(&lens)?;
-    let mut indices = vec![0usize; arrays.len()];
-
-    loop {
-        // Build current combination
-        let combination: Vec<OwnedValue> = indices
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| arrays[i][idx].clone())
-            .collect();
-        results.push(OwnedValue::Array(combination));
-
-        // Increment indices (like counting in mixed radix)
-        let mut carry = true;
-        for i in (0..arrays.len()).rev() {
-            if carry {
-                indices[i] += 1;
-                if indices[i] >= arrays[i].len() {
-                    indices[i] = 0;
-                } else {
-                    carry = false;
-                }
-            }
-        }
-
-        // If we carried all the way through, we're done
-        if carry {
-            break;
-        }
+    // Not `try_reserve_product`, despite computing the identical guarded
+    // product: that helper's own message names ".[$keys]"-style computed
+    // indexing, which describes none of this builtin's own call sites
+    // (#1721) -- `combinations` never indexes anything.
+    let mut len: usize = 1;
+    for &l in &lens {
+        let Some(next) = len.checked_mul(l) else {
+            return Err(cannot_allocate_cartesian_product(&lens));
+        };
+        len = next;
+    }
+    let mut results = Vec::new();
+    if results.try_reserve_exact(len).is_err() {
+        return Err(cannot_allocate_cartesian_product(&lens));
     }
 
+    mixed_radix_combinations(
+        arrays.len(),
+        &mut results,
+        |i| arrays[i].len(),
+        |i, idx| arrays[i][idx].clone(),
+    );
+
     Ok(results)
+}
+
+fn cannot_allocate_cartesian_product(lens: &[usize]) -> EvalError {
+    let product = lens
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(" * ");
+    EvalError::new(format!(
+        "Cannot allocate {product} elements for combinations"
+    ))
 }
 
 /// Builtin: builtins - list all builtin function names
