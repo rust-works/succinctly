@@ -1768,28 +1768,73 @@ fn push_generic_owned_values<V: DocumentValue>(
     None
 }
 
-/// Whether `c`'s value cannot be honestly answered "truthy or falsy" at
-/// all -- a decode failure (a string token whose bytes don't decode) or a
-/// structural error (a token the semi-index accepted as a span but
-/// couldn't classify, #1194) -- and if so, the `Control::Error` a caller
-/// should raise instead of falling through to
+/// Whether `c`'s subtree, at any depth, contains a value that cannot be
+/// honestly answered "truthy or falsy" at all -- a decode failure (a
+/// string token whose bytes don't decode), a structural error (a token
+/// the semi-index accepted as a span but couldn't classify, #1194), or a
+/// #1642 colliding-decode-failure-key -- and if so, the `Control::Error`
+/// a caller should raise instead of falling through to
 /// [`DocumentCursor::is_falsy`]'s own silent "not falsy" default for
-/// exactly these two cases. Mirrors [`to_owned_at_depth`]'s identical pair
-/// of checks (same order, same messages), which `is_falsy` bypasses since
-/// it never inspects either (#1645 review).
-fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C) -> Option<Control> {
-    let v = c.value();
-    if let Some(reason) = v.string_decode_error() {
-        return Some(Control::Error(EvalError::decode_failure(reason)));
-    }
-    if v.is_error() {
-        return Some(Control::Error(EvalError::new(
-            v.error_message()
+/// exactly these cases.
+///
+/// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
+/// (same object/array unconsing, same key-collision guard, same checks
+/// in the same order once a scalar is reached) -- but it builds no
+/// `OwnedValue` anywhere, only walking and checking, so `select`'s
+/// truthiness check keeps its #1645 performance win (no `String`/`Vec`
+/// value allocation) for the overwhelmingly common case where nothing is
+/// corrupted, while still raising on a value corrupted at *any* depth
+/// below `c`'s own top level -- not just when `c` itself is the bad
+/// scalar (an earlier version of this fix only checked `c.value()`
+/// directly, silently missing anything nested inside a well-formed
+/// container; caught by review, #1645).
+fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
+    assert_nesting_depth(depth);
+    let value = c.value();
+    if let Some(fields) = value.as_object() {
+        let mut map: IndexMap<String, ()> = IndexMap::new();
+        let mut guard = DisplayKeyGuard::default();
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            match resolve_display_key(&field.key, &map, &mut guard) {
+                Ok(Some(key)) => {
+                    map.insert(key, ());
+                }
+                Ok(None) => return Some(Control::Error(f.malformed_member_error())),
+                Err(e) => return Some(Control::Error(e)),
+            }
+            if let Some(control) =
+                push_generic_truthiness_cursor_error(&field.value_cursor, depth + 1)
+            {
+                return Some(control);
+            }
+            f = rest;
+        }
+        if f.ends_unpaired() {
+            return Some(Control::Error(f.malformed_member_error()));
+        }
+        None
+    } else if let Some(elements) = value.as_array() {
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            if let Some(control) = push_generic_truthiness_cursor_error(&elem_cursor, depth + 1) {
+                return Some(control);
+            }
+            elems = rest;
+        }
+        None
+    } else if let Some(reason) = value.string_decode_error() {
+        Some(Control::Error(EvalError::decode_failure(reason)))
+    } else if value.is_error() {
+        Some(Control::Error(EvalError::new(
+            value
+                .error_message()
                 .unwrap_or("malformed value in document")
                 .to_string(),
-        )));
+        )))
+    } else {
+        None
     }
-    None
 }
 
 /// Append one truthiness bit per output of a `GenericResult` stream to
@@ -1813,7 +1858,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         // first, same as `to_owned_at_depth`'s own two checks in the same
         // order, just without materializing on the ordinary-value path.
         GenericResult::OneCursor(c) => {
-            if let Some(control) = push_generic_truthiness_cursor_error(&c) {
+            if let Some(control) = push_generic_truthiness_cursor_error(&c, 0) {
                 return Some(control);
             }
             out.push(!c.is_falsy());
@@ -1825,7 +1870,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                if let Some(control) = push_generic_truthiness_cursor_error(c) {
+                if let Some(control) = push_generic_truthiness_cursor_error(c, 0) {
                     return Some(control);
                 }
                 out.push(!c.is_falsy());

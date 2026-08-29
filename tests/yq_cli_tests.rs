@@ -24394,3 +24394,50 @@ fn test_yq_string_repeat_cap_compound_assign_does_not_abort_1612() -> Result<()>
     assert_eq!(code, 1, "stderr: {stderr:?}");
     Ok(())
 }
+
+/// #1645 code review: `push_generic_truthiness`'s `OneCursor`/`ManyCursor`
+/// arms swapped a materializing `is_truthy()` for `DocumentCursor::is_falsy`
+/// -- `is_falsy`'s YAML impl had no `Alias` arm at all (falling into its
+/// `_ => false` default), so an alias resolving to `false`/`null` was
+/// silently reported as truthy regardless of what it pointed at. This is a
+/// pre-existing gap in `is_falsy` itself, newly load-bearing once `select`
+/// started relying on it. Covers a direct alias and a 2-hop chain.
+#[test]
+fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
+    let (stdout, _stderr, code) =
+        run_yq_stdin_with_stderr("select(.b) | .keep", "a: &x false\nb: *x\nkeep: 5\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "an alias to `false` must be filtered out, not passed through"
+    );
+
+    let (stdout, _stderr, code) =
+        run_yq_stdin_with_stderr("select(.b) | .keep", "a: &x null\nb: *x\nkeep: 5\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "an alias to `null` must be filtered out, not passed through"
+    );
+
+    let (stdout, _stderr, code) = run_yq_stdin_with_stderr(
+        "select(.b) | .keep",
+        "orig: &x false\na: &y *x\nb: *y\nkeep: 5\n",
+        &[],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "",
+        "a 2-hop alias chain to `false` must be filtered out"
+    );
+
+    let (stdout, _stderr, code) =
+        run_yq_stdin_with_stderr("select(.b) | .keep", "a: &x true\nb: *x\nkeep: 5\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "5",
+        "an alias to `true` must still pass through"
+    );
+    Ok(())
+}
