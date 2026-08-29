@@ -15411,18 +15411,22 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
 ///
 /// Deliberately excludes `Null`: real yq's `.a[].b = v` on `a: null`
 /// autovivifies `null` to `[]` as part of the write itself (confirmed live
-/// against a safe, non-erroring RHS: `yq '.a[].b = 5'` on `a: null`
-/// produces `a: []`), so it is not a *total* no-op the way an empty or
-/// all-scalar container is -- the document still changes. Checked
-/// independently of this fix (same safe-RHS probe against this codebase's
-/// unmodified write path) and found that autovivification currently
-/// doesn't happen there at all -- `a: null` stays `a: null` -- a
-/// pre-existing write-correctness bug this predicate can't fix (it only
-/// ever decides whether to skip evaluating the RHS, and the existing
-/// caller's `Skip(pristine)` short-circuit returns the *unmodified*
-/// original when this returns `true`, which would make the missing
-/// autovivification permanent instead of merely already-wrong). Filed
-/// separately as #1857 rather than folded into this predicate.
+/// -- and confirmed already correct on this codebase's own write path
+/// too, independent of this predicate: a safe, non-erroring RHS,
+/// `yq '.a[].b = 5'` on `a: null`, already produces `a: []` here exactly
+/// like the oracle). So `Null` is not a *total* no-op the way an empty or
+/// all-scalar container is -- the document still changes -- but the
+/// reason this predicate can't simply report it as one isn't a write bug:
+/// it's that this predicate's only caller (`yq_assign_noop_check`) has an
+/// all-or-nothing `Skip`/`Continue` split, and `Skip` means "return the
+/// *unmodified* pristine document, evaluate nothing at all." Reporting
+/// `Null` as a no-op here would route through `Skip` and discard the
+/// legitimate `null` -> `[]` write that already happens correctly on the
+/// normal `Continue` path -- there is no way to express "skip the RHS,
+/// but still perform the write" through this predicate's boolean answer
+/// alone. That narrower gap (the RHS still evaluates eagerly for `Null`,
+/// where real yq's own equivalent write never needs it) is real but out
+/// of this predicate's reach -- filed separately as #1857.
 fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
     let (step, rest) = match steps.split_first() {
         None => return is_yq_field_index_noop_scalar(current),
@@ -15454,7 +15458,9 @@ fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
         Expr::Iterate => match current {
             OwnedValue::Array(arr) => arr.iter().all(|elem| assign_path_all_noop(elem, rest)),
             OwnedValue::Object(map) => map.values().all(|elem| assign_path_all_noop(elem, rest)),
-            // Not `Null` -- see this function's own doc comment (#1857).
+            // Not `Null` -- reporting a no-op here would route through
+            // `Skip` and discard `Null`'s own legitimate autovivify write
+            // (see this function's own doc comment, #1857).
             _ if is_yq_field_index_noop_scalar(current) => true,
             _ => false,
         },

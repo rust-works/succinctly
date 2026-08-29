@@ -21746,21 +21746,37 @@ fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
 /// ends up empty and real yq discards the RHS too (`a: null` becomes
 /// `a: []` there, with the RHS never running -- live-verified against yq
 /// v4.53.3). #1432 deliberately leaves this excluded rather than folding it
-/// in: probing further (with a safe, always-evaluated RHS, independent of
-/// this predicate entirely) found that succinctly's write path doesn't even
-/// perform the `null` -> `[]` autovivification here at all (`a: null`
-/// stays `a: null` for `.a[].b = 5`, where real yq still produces
-/// `a: []`) -- a separate, pre-existing write-correctness bug that
-/// `yq_assign_is_total_noop`'s all-or-nothing `Skip(pristine)` short-circuit
-/// would make *permanent* rather than merely already-wrong if `Null` were
-/// folded into the no-op predicate. Filed as #1857; pinned here as a
-/// known-divergent case, not a regression to fix in this PR.
+/// in: this predicate's only caller has an all-or-nothing `Skip`/`Continue`
+/// split, and `Skip` means "return the document completely unchanged" --
+/// reporting `Null` as a no-op would discard the legitimate `null` -> `[]`
+/// write, which this codebase's own write path already performs correctly
+/// (confirmed live with a safe RHS, independent of this predicate: `.a[].b
+/// = 5` on `a: null` already produces `a: []` here, matching the oracle --
+/// an earlier version of this comment wrongly claimed that autovivification
+/// was itself broken; it isn't, see #1857's correction). The real, narrower
+/// gap this leaves is exactly what this test pins: the RHS still evaluates
+/// eagerly for `Null`, where real yq's own equivalent write never needs it
+/// at all. Filed as #1857; pinned here as a known-divergent case, not a
+/// regression to fix in this PR. The second case below shows the same gap
+/// reached through #1432's own new recursion (a `Null` nested inside a
+/// fanned-into array), not just a bare top-level target.
 #[test]
 fn test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298() -> Result<()> {
     let (_out, err, code) =
         run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: null\n", &["-o", "json"])?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
+
+    // Same gap, reached through #1432's recursive fan-out rather than as
+    // the direct top-level target.
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        ".a[][].b = error(\"boom\")",
+        "a:\n  - null\n  - [1]\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
     Ok(())
 }
 

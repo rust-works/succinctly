@@ -732,17 +732,24 @@ pre-check, #1232's `PrefixNavOutcome`) an `Expr::Iterate` arm too — but only f
 narrowest case, `.a` itself being a genuine scalar (`.a[].b = error("boom")` on `a: 5` now
 no-ops silently, RHS never evaluated, matching real yq).
 
-**Still open ([#1432](https://github.com/rust-works/succinctly/issues/1432)):** real yq's
-actual RHS-discard rule for a mid-chain `Iterate` is broader — a real container whose own
-elements *all* individually no-op also discards the RHS, and so does an empty or
-null-autovivified container (vacuously). The underlying *write* already gets all of these
-right (verified against real yq); only the RHS-discard optimization is narrower than real
-yq's own rule:
+**Fixed by [#1432](https://github.com/rust-works/succinctly/issues/1432):** real yq's actual
+RHS-discard rule for a mid-chain `Iterate` is broader than #1298's own narrowest case — a real
+container whose own elements *all* individually no-op also discards the RHS, and so does an
+empty container (vacuously). New `assign_path_all_noop` recurses into
+`.iter().all(...)`/`.values().all(...)` at such an `Iterate` instead of unconditionally
+deferring, a read-only dry run of `set_path_through_iterate`'s own per-element recursion:
 
 ```bash
 $ printf 'a: [1, 2]\n' | yq            -o=json '.a[].b = error("boom")'   # {"a":[1,2]}, no-op
-$ printf 'a: [1, 2]\n' | succinctly yq -o=json '.a[].b = error("boom")'   # Error: boom
+$ printf 'a: [1, 2]\n' | succinctly yq -o=json '.a[].b = error("boom")'   # {"a":[1,2]} (fixed)
 ```
+
+A `null` target is deliberately excluded from this fix — real yq autovivifies `null` to `[]`
+as part of the write itself (already correct on both sides before and after this fix), so it
+is not a *total* no-op the way an empty/all-scalar container is, and this predicate's
+all-or-nothing `Skip`/`Continue` caller has no way to express "skip the RHS, but still
+perform the write." That narrower, still-open gap is tracked separately by
+[#1857](https://github.com/rust-works/succinctly/issues/1857).
 
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
