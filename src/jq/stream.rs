@@ -1293,6 +1293,22 @@ mod tests {
                 .unwrap();
             err.expect("an unpaired member is not JSON");
             assert_eq!(yaml_flow, "[]");
+
+            let mut yaml_block = String::new();
+            let mut err = None;
+            stream_lazy_keys_yaml(
+                &fields,
+                true,
+                &mut yaml_block,
+                IndentSpec {
+                    width: 2,
+                    unit: ' ',
+                },
+                &mut err,
+            )
+            .unwrap();
+            err.expect("an unpaired member is not JSON");
+            assert_eq!(yaml_block, "");
         }
     }
 
