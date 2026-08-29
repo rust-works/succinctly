@@ -694,6 +694,19 @@ pub trait DocumentFields: Sized + Clone {
     /// [`DocumentCursor::preceding_delimiter_ok`]'s own no-op default.
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError>;
 
+    /// Whether any field has this key -- existence only, no particular
+    /// occurrence's value.
+    ///
+    /// The default delegates to [`find`](Self::find), which is correct but
+    /// not early-exiting: `find` must walk every field to honour
+    /// last-duplicate-key-wins for the *value* it returns, where existence
+    /// alone can stop at the first match (#1739). Costs a format nothing to
+    /// leave unoverridden; JSON and YAML both override it with an
+    /// early-exiting walk.
+    fn contains(&self, name: &str) -> bool {
+        self.find(name).is_some()
+    }
+
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 
