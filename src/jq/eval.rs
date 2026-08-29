@@ -37292,6 +37292,35 @@ mod tests {
         );
     }
 
+    /// #1790: `push_promoted`'s `Many(vs)` call site inside `eval_comma`
+    /// (a batch of several cursor-backed outputs arriving after promotion
+    /// has already happened, the first of which is undecodable) --
+    /// `.a[]`'s own iteration produces `Many`, unlike a comma of owned
+    /// literals which materializes straight to `ManyOwned`.
+    #[test]
+    fn test_eval_comma_many_arm_raises_on_decode_failure_1790() {
+        query!(
+            b"{\"a\": [\"\xff\xfe\"]}",
+            "1, .a[]",
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
+        );
+    }
+
+    /// #1790: `promote_borrowed_checked`'s failure path via the
+    /// `ManyOwned` arm specifically (not `Owned`) -- a comma of two owned
+    /// literals (`(1,2)`) forces the *first* promotion of an
+    /// already-borrowed, undecodable branch.
+    #[test]
+    fn test_eval_comma_manyowned_arm_raises_on_decode_failure_1790() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a, (1,2)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
     /// #1620: a decode failure reached through this module's own dispatch
     /// (the public `succinctly::jq::eval` library API, not the CLI's
     /// `eval_generic.rs` bridge) must not be suppressed by `?` -- same rule,
