@@ -3,22 +3,22 @@
 //! These tests use snapshot testing to ensure CLI outputs remain stable.
 //! Run with: cargo test --features cli --test cli_golden_tests
 
-// #1847 review: `run`/`run_cli_bin` spawn `CARGO_BIN_EXE_succinctly`
-// directly rather than building it on demand via an inner `cargo run
-// --features cli` the way this file's helpers used to -- that on-demand
-// build was what let a plain `cargo test` (no `--features cli`) still
-// pass. `CARGO_BIN_EXE_succinctly` only exists (and only builds the bin
-// target at all) when the *outer* invocation already has `--features
-// cli` active, matching every other CLI-invoking test file's own guard
+// #1847 review: `run`/`run_cli_bin` spawn `succinctly_bin()` directly
+// rather than building it on demand via an inner `cargo run --features
+// cli` the way this file's helpers used to -- that on-demand build was
+// what let a plain `cargo test` (no `--features cli`) still pass.
+// `succinctly_bin()` only exists (and only builds the bin target at all)
+// when the *outer* invocation already has `--features cli` active,
+// matching every other CLI-invoking test file's own guard
 // (`yq_cli_tests.rs`, `json_validate_tests.rs`, ...).
 #![cfg(feature = "cli")]
 
 use anyhow::Result;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::signal_death_error;
+use cargo_run_exit::{spawn_with_signal_retry, succinctly_bin};
 
 /// Helper to run a CLI command and capture its output. A thin wrapper over
 /// `run_cli_bin`'s own already-correct approach (#1847): this used to spawn
@@ -26,11 +26,6 @@ use cargo_run_exit::signal_death_error;
 /// grandchild -- reparented to init, blocked forever on its now-unreadable
 /// stdout pipe -- the moment anything kills the outer `cargo test` process
 /// group (`cargo-guard.sh` does this by design on a detected stall, #935).
-/// `CARGO_BIN_EXE_succinctly` needs no retry loop either: it's a
-/// compile-time path to the binary this very test binary's own build
-/// already produced, not a second cargo invocation that can hit lock
-/// contention (`MAX_CARGO_RETRIES`/`classify_cargo_run_exit` accordingly
-/// dropped, not just unused).
 fn run_cli(args: &[&str]) -> Result<String> {
     let (stdout, stderr, exit_code) = run_cli_bin(args)?;
     if exit_code != 0 {
@@ -358,19 +353,25 @@ fn test_json_generate_reproducible() -> Result<()> {
 /// since its `validate_generated_json` consolidation and both call sites
 /// were otherwise unexercised by any existing test in this file.
 fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let output = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(args);
+            command
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // #1546: `.code().unwrap_or(-1)` would coerce a signal-killed child to a
-    // fake exit code -1 rather than reporting the death.
-    let Some(exit_code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
+    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
+    // itself; a real exit code is therefore always present here (#1546:
+    // `.code().unwrap_or(-1)` would otherwise coerce a signal-killed child
+    // to a fake exit code -1 rather than reporting the death).
+    let exit_code = output
+        .status
+        .code()
+        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     Ok((stdout, stderr, exit_code))
 }
 
