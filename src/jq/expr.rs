@@ -1629,6 +1629,47 @@ mod tests {
         );
     }
 
+    /// #1827: pins the three shared predicates' own classification of each
+    /// paired family's two members, so a future edit to `is_slice()`/
+    /// `index_number_key()`/`slice_number_keys()` cannot silently start
+    /// treating a plain/`*Number` pair differently. This alone does not
+    /// catch a *third* future paired variant, or a dispatch site elsewhere
+    /// that skips these predicates and pattern-matches the pair by hand
+    /// (most sites do, via the `Expr::Index(idx) | Expr::IndexNumber {
+    /// idx, .. }` or-pattern) — see
+    /// `test_index_and_slice_number_siblings_behave_identically_1827` in
+    /// `tests/jq_index_number_invariant_tests.rs` for the end-to-end
+    /// behavioral check that covers those sites instead.
+    #[test]
+    fn test_index_and_slice_number_pairs_share_predicate_classification_1827() {
+        let index = Expr::Index(1);
+        let index_number = Expr::IndexNumber {
+            idx: 1,
+            key: NumberKey::Literal(1.0, "1.0".into()),
+        };
+        assert_eq!(index.index_number_key(), None);
+        assert!(matches!(index_number.index_number_key(), Some(k) if k.value() == 1.0));
+        assert!(!index.is_slice());
+        assert!(!index_number.is_slice());
+
+        let slice = Expr::Slice {
+            start: Some(1),
+            end: Some(3),
+        };
+        let slice_number = Expr::SliceNumber {
+            start: Some(1),
+            end: Some(3),
+            start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+            end_key: None,
+        };
+        assert_eq!(slice.slice_number_keys(), (None, None));
+        let (start_key, end_key) = slice_number.slice_number_keys();
+        assert!(matches!(start_key, Some(k) if k.value() == 1.0));
+        assert_eq!(end_key, None);
+        assert!(slice.is_slice());
+        assert!(slice_number.is_slice());
+    }
+
     #[test]
     fn test_pipe_simplification() {
         // Single element pipe simplifies to the element itself
