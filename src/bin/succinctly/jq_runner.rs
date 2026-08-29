@@ -1272,6 +1272,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             // not be silently absorbed as if it were #1793.
                             std::panic::resume_unwind(payload);
                         };
+                        // Reported through the same channel, and so with
+                        // the same exit code (5), as any other uncaught
+                        // EvalError on this loop -- deliberately: this is an
+                        // internal architectural ceiling, not a jq-level
+                        // type/arity error, but the alternative (keeping the
+                        // panic's own exit 101) would still be a hard,
+                        // uncontrolled process exit for what #1793 exists to
+                        // turn into an ordinary, recoverable diagnostic.
                         sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
                         // Mirrors the same check a few lines below, after the
                         // ordinary per-result loop -- halt/halt_error (#791)
