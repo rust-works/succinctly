@@ -1924,6 +1924,46 @@ fn test_builtin_select() -> Result<()> {
     Ok(())
 }
 
+/// #1645: `push_generic_truthiness`'s `OneCursor`/`ManyCursor` arms swapped a
+/// full materializing `to_owned_cursor(&c).is_truthy()` for the O(1)
+/// `DocumentCursor::is_falsy()` -- caught by review that `is_falsy()` itself
+/// is deliberately silent on a decode failure or a #1194 structural error
+/// (its own doc comment: "conservative assumption", matching
+/// `--exit-status`'s existing best-effort use of it), where the removed
+/// materializing path used to raise. `select` must still raise here rather
+/// than silently treating the value as truthy and passing it through.
+#[test]
+fn test_select_raises_on_decode_failure_instead_of_silently_truthy_1645() -> Result<()> {
+    // `\x` is not a valid JSON escape -- structurally a string token, but
+    // its bytes don't decode (#1247's own trigger shape).
+    let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some(r#"["\x"]"#))
+        .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
+    assert_ne!(
+        code, 0,
+        "an undecodable value must not be silently treated as truthy\nstdout: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1645 sibling case: a *structurally* malformed value (#1194 -- a token
+/// the semi-index accepted as a span but couldn't classify) must also still
+/// raise through `select`'s truthiness check, not silently pass through.
+#[test]
+fn test_select_raises_on_structural_error_instead_of_silently_truthy_1645() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some("[xyz123]"))
+        .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
+    assert_ne!(
+        code, 0,
+        "a structurally malformed value must not be silently treated as truthy\nstdout: {stdout:?}"
+    );
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
+    Ok(())
+}
+
 #[test]
 fn test_builtin_type() -> Result<()> {
     let (output, code) = run_jq_stdin("type", r#"{"a":1}"#, &["-r"])?;

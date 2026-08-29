@@ -1768,6 +1768,30 @@ fn push_generic_owned_values<V: DocumentValue>(
     None
 }
 
+/// Whether `c`'s value cannot be honestly answered "truthy or falsy" at
+/// all -- a decode failure (a string token whose bytes don't decode) or a
+/// structural error (a token the semi-index accepted as a span but
+/// couldn't classify, #1194) -- and if so, the `Control::Error` a caller
+/// should raise instead of falling through to
+/// [`DocumentCursor::is_falsy`]'s own silent "not falsy" default for
+/// exactly these two cases. Mirrors [`to_owned_at_depth`]'s identical pair
+/// of checks (same order, same messages), which `is_falsy` bypasses since
+/// it never inspects either (#1645 review).
+fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C) -> Option<Control> {
+    let v = c.value();
+    if let Some(reason) = v.string_decode_error() {
+        return Some(Control::Error(EvalError::decode_failure(reason)));
+    }
+    if v.is_error() {
+        return Some(Control::Error(EvalError::new(
+            v.error_message()
+                .unwrap_or("malformed value in document")
+                .to_string(),
+        )));
+    }
+    None
+}
+
 /// Append one truthiness bit per output of a `GenericResult` stream to
 /// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
 /// evaluator's cursor-aware result type — used to fan `select`'s condition
@@ -1781,8 +1805,17 @@ fn push_generic_truthiness<V: DocumentValue>(
         // `DocumentCursor::is_falsy` answers this in O(1) without
         // materializing the value at all -- an arbitrarily deep object/
         // array previously paid a full recursive `to_owned_cursor` copy
-        // just to learn it isn't `null`/`false` (#1645).
+        // just to learn it isn't `null`/`false` (#1645). `is_falsy` itself
+        // is deliberately silent on a value that fails to decode (its own
+        // doc comment: "conservative assumption", matching `--exit-status`'s
+        // pre-existing, best-effort use of it) -- `select`'s own filtering
+        // needs the real #1247/#1194 raise instead, so that check runs
+        // first, same as `to_owned_at_depth`'s own two checks in the same
+        // order, just without materializing on the ordinary-value path.
         GenericResult::OneCursor(c) => {
+            if let Some(control) = push_generic_truthiness_cursor_error(&c) {
+                return Some(control);
+            }
             out.push(!c.is_falsy());
         }
         GenericResult::Many(vs) => {
@@ -1792,6 +1825,9 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
+                if let Some(control) = push_generic_truthiness_cursor_error(c) {
+                    return Some(control);
+                }
                 out.push(!c.is_falsy());
             }
         }
