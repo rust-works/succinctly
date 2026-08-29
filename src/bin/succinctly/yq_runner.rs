@@ -972,24 +972,34 @@ fn query_result_to_owned_values(
     // (search "defense-in-depth" there). Kept as `Result` rather than
     // `.unwrap()` so a real failure, if this invariant is ever violated,
     // surfaces as a normal `EvalError` instead of a panic.
-    macro_rules! materialized {
-        ($e:expr) => {
-            match $e {
-                Ok(v) => v,
-                Err(e) => {
-                    sink.report(DiagStyle::Yq, &e, &no_location());
-                    return Vec::new();
-                }
-            }
-        };
-    }
     match result {
-        QueryResult::One(v) => vec![materialized!(generic_to_owned(&v))],
-        QueryResult::OneCursor(c) => vec![materialized!(generic_to_owned(&c.value()))],
-        QueryResult::Many(vs) => materialized!(vs
-            .iter()
-            .map(generic_to_owned)
-            .collect::<core::result::Result<Vec<_>, _>>()),
+        QueryResult::One(v) => {
+            let Some(v) = sink.materialize(DiagStyle::Yq, generic_to_owned(&v), &no_location())
+            else {
+                return Vec::new();
+            };
+            vec![v]
+        }
+        QueryResult::OneCursor(c) => {
+            let Some(v) =
+                sink.materialize(DiagStyle::Yq, generic_to_owned(&c.value()), &no_location())
+            else {
+                return Vec::new();
+            };
+            vec![v]
+        }
+        QueryResult::Many(vs) => {
+            let Some(vs) = sink.materialize(
+                DiagStyle::Yq,
+                vs.iter()
+                    .map(generic_to_owned)
+                    .collect::<core::result::Result<Vec<_>, _>>(),
+                &no_location(),
+            ) else {
+                return Vec::new();
+            };
+            vs
+        }
         QueryResult::None => vec![],
         QueryResult::Error(e) => {
             sink.report(DiagStyle::Yq, &e, &no_location());
@@ -1595,23 +1605,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // A decode failure anywhere in this function is an uncaught error like
     // any other (#1247): report it and yield no documents, exactly as the
     // `GenericResult::Error` arm below does.
-    macro_rules! materialized {
-        ($e:expr) => {
-            match $e {
-                Ok(v) => v,
-                Err(e) => {
-                    sink.report(DiagStyle::Yq, &e, &no_location());
-                    return Ok(Vec::new());
-                }
-            }
-        };
-    }
-
     let has_aliases = cursor.index().has_aliases();
     let alias_sync_ctx = match (is_alias_sensitive_assign(expr) && has_aliases)
         .then(|| generic_to_owned(&cursor.value()))
     {
-        Some(pristine) => Some((materialized!(pristine), collect_alias_groups(cursor))),
+        Some(pristine) => {
+            let Some(pristine) = sink.materialize(DiagStyle::Yq, pristine, &no_location()) else {
+                return Ok(Vec::new());
+            };
+            Some((pristine, collect_alias_groups(cursor)))
+        }
         None => None,
     };
 
@@ -1625,7 +1628,12 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     let presentation_sync_ctx = match (need_comments && is_alias_sensitive_assign(expr))
         .then(|| to_owned_with_comments(&cursor.value(), Some(&cursor)))
     {
-        Some(snapshot) => Some(materialized!(snapshot)),
+        Some(snapshot) => {
+            let Some(snapshot) = sink.materialize(DiagStyle::Yq, snapshot, &no_location()) else {
+                return Ok(Vec::new());
+            };
+            Some(snapshot)
+        }
         None => None,
     };
 
@@ -1665,20 +1673,44 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // arms are defensive/unreachable here today, kept for exhaustiveness
     // over the shared `GenericResult` enum.
     let mut docs = match result {
-        GenericResult::One(v) => Ok(vec![no_comments(materialized!(generic_to_owned(&v)))]),
-        GenericResult::OneCursor(c) => Ok(vec![materialized!(owned_with_comments(&c))]),
-        GenericResult::Many(vs) => Ok(materialized!(vs
-            .iter()
-            .map(generic_to_owned)
-            .collect::<core::result::Result<Vec<_>, _>>())
-        .into_iter()
-        .map(&no_comments)
-        .collect()),
-        GenericResult::ManyCursor(cs) => Ok(materialized!(cs
-            .iter()
-            .map(owned_with_comments)
-            .collect::<core::result::Result<Vec<_>, _>>(
-        ))),
+        GenericResult::One(v) => {
+            let Some(v) = sink.materialize(DiagStyle::Yq, generic_to_owned(&v), &no_location())
+            else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![no_comments(v)])
+        }
+        GenericResult::OneCursor(c) => {
+            let Some(v) = sink.materialize(DiagStyle::Yq, owned_with_comments(&c), &no_location())
+            else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![v])
+        }
+        GenericResult::Many(vs) => {
+            let Some(vs) = sink.materialize(
+                DiagStyle::Yq,
+                vs.iter()
+                    .map(generic_to_owned)
+                    .collect::<core::result::Result<Vec<_>, _>>(),
+                &no_location(),
+            ) else {
+                return Ok(Vec::new());
+            };
+            Ok(vs.into_iter().map(&no_comments).collect())
+        }
+        GenericResult::ManyCursor(cs) => {
+            let Some(vs) = sink.materialize(
+                DiagStyle::Yq,
+                cs.iter()
+                    .map(owned_with_comments)
+                    .collect::<core::result::Result<Vec<_>, _>>(),
+                &no_location(),
+            ) else {
+                return Ok(Vec::new());
+            };
+            Ok(vs)
+        }
         // This is the DOM/slow path (`evaluate_yaml_direct_filtered`'s
         // fallback), reached only when `can_use_m2_streaming` rejects the
         // expression or a flag (`--sort-keys`, color, `--tab`, `--slurp`,
@@ -1701,7 +1733,13 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             sorted,
             collapse,
         } => {
-            let mut keys = materialized!(effective_keys(&fields, collapse));
+            let Some(mut keys) = sink.materialize(
+                DiagStyle::Yq,
+                effective_keys(&fields, collapse),
+                &no_location(),
+            ) else {
+                return Ok(Vec::new());
+            };
             if sorted {
                 keys.sort();
             }
