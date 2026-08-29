@@ -1129,3 +1129,47 @@ fn test_path_context_builtins_survive_pipe_parity_554() {
         );
     }
 }
+
+/// #1739: `Builtin::Has`'s new native arm in `eval_generic.rs` must agree
+/// with `eval.rs`'s pre-existing `builtin_has`/`has_one_key` for every case
+/// its own doc comment claims to cover -- a single-valued key against an
+/// object, array, or `null` receiver. Expected values are jq-1.7.1-verified
+/// (see this issue and #909's own array-key doc comment).
+#[test]
+fn test_parity_has_native_arm_1739() {
+    for (json, filter, expected) in [
+        (br#"{"a":1,"b":2}"#.as_slice(), r#"has("a")"#, "true"),
+        (br#"{"a":1,"b":2}"#, r#"has("z")"#, "false"),
+        (br"[1,2,3]", "has(1)", "true"),
+        (br"[1,2,3]", "has(3)", "false"),
+        (br"[1,2,3]", "has(-1)", "false"),
+        (br"null", r#"has("a")"#, "false"),
+        (br"[1,2,3]", "has(nan)", "false"),
+        // A computed key sourced from the document itself, not a literal.
+        (br#"{"a":1,"k":"a"}"#, "has(.k)", "true"),
+        // A sibling key that fails to decode must not stop `has` from
+        // answering about an unrelated, well-formed key (#1642 precedent --
+        // `find`/`find_cursor` already skip it silently, same as `.foo`).
+        (
+            b"{\"\xff\xfe\": 1, \"a\": 2}".as_slice(),
+            r#"has("a")"#,
+            "true",
+        ),
+        // A repeated key: presence alone doesn't depend on which occurrence
+        // `find` resolves to.
+        (br#"{"a":1,"a":2}"#, r#"has("a")"#, "true"),
+    ] {
+        assert_eq!(
+            as_strs(&full_outputs(json, filter)),
+            [expected],
+            "full evaluator disagrees with jq for `{filter}` on `{}`",
+            String::from_utf8_lossy(json)
+        );
+        assert_parity(json, filter);
+    }
+
+    // A generator key still fans out one output per key (jq's rule, #1279)
+    // -- this shape isn't handled by the new native arm and must keep
+    // falling back to the existing round-trip path.
+    assert_parity(br#"{"a":1,"b":2}"#, r#"[has(("a","z"))]"#);
+}

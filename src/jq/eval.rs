@@ -14126,7 +14126,7 @@ pub(crate) fn numeric_key_to_index(key: &OwnedValue) -> Option<i64> {
 /// (`numeric_key_to_index`'s own contract). #909's own review caught this:
 /// the fix that added Float/NaN support here originally routed both
 /// semantics through the same jq-style truncation uniformly.
-fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64> {
+pub(crate) fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64> {
     if S::NEGATIVE_INDEX_IN_HAS {
         // yq: only a genuine integer key resolves.
         match key {
@@ -14155,7 +14155,7 @@ fn numeric_key_to_array_index<S: EvalSemantics>(key: &OwnedValue) -> Option<i64>
 /// indices are valid if abs(idx) <= len") was itself wrong, not just this
 /// function's implementation of it -- #880/#908's own tests asserting the
 /// bounded version were written without checking the real binary.
-fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
+pub(crate) fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
     if S::NEGATIVE_INDEX_IN_HAS {
         // yq behavior: any negative index is valid, unconditionally; a
         // non-negative index still obeys the ordinary bound. `len` (an
@@ -14184,7 +14184,7 @@ fn index_in_array_bounds<S: EvalSemantics>(idx: i64, len: i64) -> bool {
 /// bounds-check logic already did twice before its own extraction (see
 /// that function's doc comment, and CLAUDE.md's "Duplicated predicates
 /// diverge silently" insight from #106).
-fn has_type_mismatch_is_permissive<S: EvalSemantics>() -> bool {
+pub(crate) fn has_type_mismatch_is_permissive<S: EvalSemantics>() -> bool {
     S::NEGATIVE_INDEX_IN_HAS
 }
 
