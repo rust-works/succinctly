@@ -18763,13 +18763,16 @@ fn test_load_yaml_raises_on_undecodable_string_1801() -> Result<()> {
     Ok(())
 }
 
-/// #1801: a `Mapping` field whose *key* fails to decode stays a silent
-/// drop, unchanged -- the same #1194-shaped structural gap the
-/// `StandardJson` family's own `to_owned_checked` also leaves alone
-/// (distinct from this issue's own scope, an undecodable *value*). Other
-/// fields in the same mapping still load correctly.
+/// #1801 (review): a `Mapping` field whose *key* fails to decode keeps
+/// both the key (under #1642's own display fallback, `""`) and its value,
+/// rather than silently dropping the whole field -- matches
+/// `yaml_to_owned_value`'s identical handling (`yq_runner.rs`) for this
+/// same YamlCursor-native shape. An earlier draft of this fix left the
+/// field dropped, incorrectly citing the `StandardJson` family's own
+/// #1194 structural carve-out as precedent for what is actually #1642's
+/// decode-failure-preservation territory.
 #[test]
-fn test_load_yaml_key_decode_failure_still_silently_dropped_1801() -> Result<()> {
+fn test_load_yaml_key_decode_failure_preserves_field_under_fallback_key_1801() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     file.write_all(b"\"b\xe1\x41c\": 1\nokkey: 2\n")?;
     file.flush()?;
@@ -18778,7 +18781,27 @@ fn test_load_yaml_key_decode_failure_still_silently_dropped_1801() -> Result<()>
     let expr = format!("load({path:?})");
     let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out.trim(), r#"{"okkey":2}"#);
+    assert_eq!(out.trim(), r#"{"":1,"okkey":2}"#);
+
+    Ok(())
+}
+
+/// #1801 (review): two distinct undecodable keys both collapse to the same
+/// `""` display fallback -- `DisplayKeyGuard` refuses to silently let the
+/// second overwrite the first, raising `colliding_display_key_error`
+/// instead (#1642), same as the `StandardJson` family's own collision
+/// guard.
+#[test]
+fn test_load_yaml_two_undecodable_keys_collide_1801() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"\"b\xe1\x41c\": 1\n\"d\xe1\x41e\": 2\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let expr = format!("load({path:?})");
+    let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
+    assert_eq!(code, 5, "out={out:?}");
+    assert!(err.contains("is ambiguous"), "err={err}");
 
     Ok(())
 }

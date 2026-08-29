@@ -40,6 +40,12 @@ use indexmap::{IndexMap, IndexSet};
 use super::document::{
     effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
 };
+// Only consumed by `yaml_value_to_owned_checked`, which is itself
+// `#[cfg(feature = "std")]`-gated (`load()`'s YAML path) -- gated
+// separately from the block above so a `--no-default-features` build
+// doesn't warn on an unused import.
+#[cfg(feature = "std")]
+use super::document::colliding_display_key_error;
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
 
@@ -31556,11 +31562,16 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// #1801: raises `EvalError::decode_failure` on an undecodable string scalar
 /// instead of silently substituting `Null`, mirroring the `StandardJson`
 /// family's own `to_owned_checked`/`owned_from_standard_json_at_depth`
-/// (#1746/#1755/#1620). A `Mapping` field whose *key* fails to decode is
-/// left as a silent drop, unchanged from before — the same #1194-shaped
-/// structural gap `to_owned_checked_at_depth`'s own doc comment carves out
-/// as a distinct, not-this-function's-scope issue, not attempted here
-/// either.
+/// (#1746/#1755/#1620). A `Mapping` field whose *key* fails to decode now
+/// keeps both the key (via its `#1642` display fallback) and its value
+/// instead of dropping the whole field — the same pattern
+/// `yaml_to_owned_value` (`yq_runner.rs`) already uses for this identical
+/// YamlCursor-native shape, driving `DisplayKeyGuard` by hand since this
+/// function doesn't go through the `DocumentFields`/`resolve_display_key`
+/// path the `StandardJson` family uses (review: an earlier draft of this
+/// fix left the drop in place, incorrectly citing that family's own
+/// structural-#1194 carve-out as precedent for a case that is actually
+/// #1642's decode-failure-preservation territory instead).
 #[cfg(feature = "std")]
 fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
     cursor: crate::yaml::YamlCursor<'_, W>,
@@ -31606,12 +31617,25 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
         }
         YamlValue::Mapping(fields) => {
             let mut map = indexmap::IndexMap::new();
+            let mut guard = DisplayKeyGuard::default();
             for field in fields {
                 let key = match field.key() {
-                    YamlValue::String(s) => match s.as_str() {
-                        Ok(cow) => cow.into_owned(),
-                        Err(_) => continue,
-                    },
+                    YamlValue::String(s) => {
+                        let (key, is_fallback) = match s.as_str() {
+                            Ok(cow) => (cow.into_owned(), false),
+                            // #1642's own fallback spelling, matching
+                            // `yaml_to_owned_value`'s identical handling:
+                            // the field is kept (key and value both),
+                            // guarded against colliding with another
+                            // key of the same display spelling rather
+                            // than silently overwriting one.
+                            Err(_) => (String::new(), true),
+                        };
+                        if !guard.check(&map, &key, is_fallback) {
+                            return Err(colliding_display_key_error(&key));
+                        }
+                        key
+                    }
                     _ => {
                         // Non-string keys - convert to string representation
                         let v = yaml_value_to_owned_checked(field.key_cursor())?;
