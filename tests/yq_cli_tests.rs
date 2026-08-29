@@ -4875,6 +4875,25 @@ fn test_yaml_explicit_tag_resolves_in_to_entries_reverse_pivot_shuffle_903() -> 
     Ok(())
 }
 
+/// `pivot`'s array-of-objects transpose (as opposed to its array-of-arrays
+/// transpose, already covered above) has no CLI-level coverage anywhere in
+/// this suite -- only `eval.rs`'s own unit tests exercise it, and the CLI
+/// dispatches through `eval_generic.rs`'s independent copy instead (#1670
+/// review, found while renaming this branch's `Vec::with_capacity` call).
+/// A key present in only some objects fills in `null` for the rest.
+#[test]
+fn test_pivot_array_of_objects_via_cli() -> Result<()> {
+    let (pivoted, code) = run_yq_stdin(
+        ".a | pivot",
+        "a:\n  - x: 1\n  - x: 2\n    y: 3\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(pivoted.trim(), r#"{"x":[1,2],"y":[null,3]}"#);
+
+    Ok(())
+}
+
 /// #903 review round: the `is*` family (`isnull`/`isboolean`/`isnumber`/
 /// `isstring`/`isarray`/`isobject`) called `DocumentValue::is_null`/
 /// `is_bool`/etc. directly — the exact same tag-blind gap `type` had before
