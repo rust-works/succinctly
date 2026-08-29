@@ -31512,7 +31512,12 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // If single document, return it directly; otherwise return array
                                 let mut doc_values = Vec::new();
                                 while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                                    doc_values.push(yaml_value_to_owned(doc_cursor));
+                                    match yaml_value_to_owned_checked(doc_cursor) {
+                                        Ok(v) => doc_values.push(v),
+                                        // #1620: a decode failure is never
+                                        // suppressed, `optional` or not.
+                                        Err(e) => return QueryResult::Error(e),
+                                    }
                                     docs = rest;
                                 }
                                 if doc_values.len() == 1 {
@@ -31524,7 +31529,10 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // Documents are always wrapped in a virtual root sequence,
                             // so this is defensive; `root` itself is this single
                             // document's cursor either way.
-                            _ => QueryResult::Owned(yaml_value_to_owned(root)),
+                            _ => match yaml_value_to_owned_checked(root) {
+                                Ok(v) => QueryResult::Owned(v),
+                                Err(e) => QueryResult::Error(e),
+                            },
                         }
                     }
                     Err(_) if optional => QueryResult::None,
@@ -31544,30 +31552,39 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `!!int`, …) lives on the cursor's `bp_pos` (`YamlCursor::explicit_tag`),
 /// not on the extracted value, and forces resolution regardless of quoting
 /// style — mirrors `yq_runner.rs`'s `yaml_to_owned_value` (#224).
+///
+/// #1801: raises `EvalError::decode_failure` on an undecodable string scalar
+/// instead of silently substituting `Null`, mirroring the `StandardJson`
+/// family's own `to_owned_checked`/`owned_from_standard_json_at_depth`
+/// (#1746/#1755/#1620). A `Mapping` field whose *key* fails to decode is
+/// left as a silent drop, unchanged from before — the same #1194-shaped
+/// structural gap `to_owned_checked_at_depth`'s own doc comment carves out
+/// as a distinct, not-this-function's-scope issue, not attempted here
+/// either.
 #[cfg(feature = "std")]
-fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
+fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
     cursor: crate::yaml::YamlCursor<'_, W>,
-) -> OwnedValue {
+) -> Result<OwnedValue, EvalError> {
     use crate::yaml::{resolve_plain, resolve_tagged, YamlValue};
 
-    match cursor.value() {
+    Ok(match cursor.value() {
         YamlValue::Null => OwnedValue::Null,
         YamlValue::String(s) => {
             // Get the string value
             let str_value = match s.as_str() {
                 Ok(cow) => cow,
-                Err(_) => return OwnedValue::Null,
+                Err(e) => return Err(EvalError::decode_failure(e.message())),
             };
 
             if let Some(explicit) = cursor.explicit_tag() {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
-                    return resolved.to_owned_value(str_value);
+                    return Ok(resolved.to_owned_value(str_value));
                 }
             }
 
             // Quoted strings are kept as strings
             if !s.is_unquoted() {
-                return OwnedValue::String(str_value.into_owned());
+                return Ok(OwnedValue::String(str_value.into_owned()));
             }
 
             // Resolve plain scalars per the YAML 1.2 core schema
@@ -31582,7 +31599,7 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
             // bare-dash-deferred scalar loaded via the `load()` builtin
             // (#835).
             while let Some((elem_cursor, rest)) = elements.uncons_resolved_cursor() {
-                items.push(yaml_value_to_owned(elem_cursor));
+                items.push(yaml_value_to_owned_checked(elem_cursor)?);
                 elements = rest;
             }
             OwnedValue::Array(items)
@@ -31597,11 +31614,11 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
                     },
                     _ => {
                         // Non-string keys - convert to string representation
-                        let v = yaml_value_to_owned(field.key_cursor());
+                        let v = yaml_value_to_owned_checked(field.key_cursor())?;
                         v.to_json()
                     }
                 };
-                let value = yaml_value_to_owned(field.value_cursor());
+                let value = yaml_value_to_owned_checked(field.value_cursor())?;
                 map.insert(key, value);
             }
             OwnedValue::Object(map)
@@ -31612,13 +31629,13 @@ fn yaml_value_to_owned<W: Clone + AsRef<[u64]>>(
             // non-`Alias`, so this recursive call terminates in exactly one
             // more step regardless of chain length.
             match target.and_then(|t| t.resolve_alias_target_cursor()) {
-                Some(resolved) => yaml_value_to_owned(resolved),
+                Some(resolved) => yaml_value_to_owned_checked(resolved)?,
                 // Unresolved (dangling) target - treat as null
                 None => OwnedValue::Null,
             }
         }
         YamlValue::Error(_) => OwnedValue::Null,
-    }
+    })
 }
 
 /// Builtin: load(file) - stub for no_std builds (returns error)

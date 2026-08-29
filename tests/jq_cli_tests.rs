@@ -18736,6 +18736,70 @@ fn test_argument_type_mismatch_optional_arms_produce_no_output_1164() -> Result<
     Ok(())
 }
 
+/// #1801: `load()`'s YAML path (`yaml_value_to_owned_checked`) raises on an
+/// undecodable string scalar instead of silently substituting `null`,
+/// mirroring the `StandardJson` family's own `to_owned_checked` (#1746/
+/// #1755/#1620). Not suppressed by `?` -- a decode failure is never
+/// catchable, same convention as every other `decode_failure`-constructed
+/// error in this codebase.
+#[test]
+fn test_load_yaml_raises_on_undecodable_string_1801() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a: \"b\xe1\x41c\"\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let expr = format!("load({path:?})");
+    let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
+    assert_eq!(code, 5, "out={out:?}");
+    assert!(err.contains("invalid UTF-8"), "err={err}");
+
+    // Not suppressed by `?`.
+    let expr_optional = format!("load({path:?})?");
+    let (out, err, code) = run_jq_full(&["-cn", &expr_optional], None)?;
+    assert_eq!(code, 5, "out={out:?} err={err}");
+    assert!(err.contains("invalid UTF-8"), "err={err}");
+
+    Ok(())
+}
+
+/// #1801: a `Mapping` field whose *key* fails to decode stays a silent
+/// drop, unchanged -- the same #1194-shaped structural gap the
+/// `StandardJson` family's own `to_owned_checked` also leaves alone
+/// (distinct from this issue's own scope, an undecodable *value*). Other
+/// fields in the same mapping still load correctly.
+#[test]
+fn test_load_yaml_key_decode_failure_still_silently_dropped_1801() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"\"b\xe1\x41c\": 1\nokkey: 2\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let expr = format!("load({path:?})");
+    let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"{"okkey":2}"#);
+
+    Ok(())
+}
+
+/// #1801: a multi-document YAML file raises as soon as any one document
+/// contains an undecodable string, not just the last/first.
+#[test]
+fn test_load_yaml_multi_document_raises_on_any_bad_document_1801() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"a: 1\n---\nb: \"c\xe1\x41d\"\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let expr = format!("load({path:?})");
+    let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
+    assert_eq!(code, 5, "out={out:?}");
+    assert!(err.contains("invalid UTF-8"), "err={err}");
+
+    Ok(())
+}
+
 /// #1164 coverage: a negative `flatten` depth still errors even when the
 /// argument generator that produced it also has a trailing break -- the
 /// error arm wins outright (own-error-supersedes-argument's-escape, same
