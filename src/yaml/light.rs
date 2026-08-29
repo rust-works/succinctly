@@ -463,16 +463,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// reason in reverse -- there is no cursor left to map from by the
     /// time that method returns.
     ///
-    /// This method's own 5 call sites still pay a version of that same
-    /// cost: each calls `resolved.<method>(...)`, and every one of those
-    /// methods opens with its own `match self.value() {...}` -- so
-    /// `.value()` on the terminal cursor is computed once by this loop's
-    /// exit check (and discarded) and once more by the method the caller
-    /// invokes. Unlike `resolve_alias_chain`'s callers, there is no way to
-    /// avoid this without threading an already-computed `YamlValue`
-    /// through 5 otherwise-cursor-only method signatures -- accepted as a
-    /// real but small (non-chain-scaling) cost, not benchmarked separately
-    /// from the fix as a whole.
+    /// This method's own call sites (6 as of #1645's `is_falsy`) still pay
+    /// a version of that same cost: each calls `resolved.<method>(...)`,
+    /// and every one of those methods opens with its own
+    /// `match self.value() {...}` -- so `.value()` on the terminal cursor
+    /// is computed once by this loop's exit check (and discarded) and once
+    /// more by the method the caller invokes. Unlike `resolve_alias_chain`'s
+    /// callers, there is no way to avoid this without threading an
+    /// already-computed `YamlValue` through otherwise-cursor-only method
+    /// signatures -- accepted as a real but small (non-chain-scaling) cost,
+    /// not benchmarked separately from the fix as a whole.
     ///
     /// A `pub`, not `pub(crate)`, visibility (unlike its sibling):
     /// `yaml_to_owned_value` (`src/bin/succinctly/yq_runner.rs`) is a
@@ -6474,10 +6474,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             // review caught (latent today: neither of this type's two
             // construction sites is reachable behind a real alias, since
             // `YamlIndex::build` already refuses to build an alias it
-            // can't resolve, #372).
-            YamlValue::Alias { target, .. } => {
-                target.is_some_and(|t| t.resolve_alias_chain().is_some_and(|v| v.is_error()))
-            }
+            // can't resolve, #372). The dangling-target case defaults to
+            // `true`, matching `is_null`'s own convention for the same
+            // unreachable case, not `false` -- so every accessor in this
+            // impl agrees on how a dangling alias is treated.
+            YamlValue::Alias { target, .. } => target.map_or(true, |t| {
+                t.resolve_alias_chain().map_or(true, |v| v.is_error())
+            }),
             _ => false,
         }
     }
@@ -6487,7 +6490,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             YamlValue::Error(msg) => Some(msg),
             // Kept in sync with `is_error`'s own `Alias` arm just above --
             // a caller that finds `is_error() == true` behind an alias must
-            // also be able to read the resolved target's message.
+            // also be able to read the resolved target's message. The one
+            // exception is the same dangling-target case `is_error`
+            // documents: `is_error()` reports `true` there (matching
+            // `is_null`'s convention) but there is no real message to
+            // return, so this falls to `None` -- every caller of this pair
+            // already has its own fallback wording for a missing message
+            // (e.g. `push_generic_truthiness_cursor_error`'s
+            // `unwrap_or("malformed value in document")`).
             YamlValue::Alias { target, .. } => {
                 target.and_then(|t| t.resolve_alias_chain()?.error_message())
             }

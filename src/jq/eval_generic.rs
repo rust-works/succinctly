@@ -1778,14 +1778,20 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// exactly these cases.
 ///
 /// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
-/// (same object/array unconsing, same key-collision guard, same checks
-/// in the same order once a scalar is reached) -- but it builds no
-/// `OwnedValue` container or scalar payload anywhere, only walking and
-/// checking, raising on a value corrupted at *any* depth below `c`'s own
-/// top level -- not just when `c` itself is the bad scalar (an earlier
-/// version of this fix only checked `c.value()` directly, silently
-/// missing anything nested inside a well-formed container; caught by
-/// review, #1645).
+/// (same object/array unconsing, same key-collision guard) -- but it
+/// builds no `OwnedValue` container or scalar payload anywhere, only
+/// walking and checking, raising on a value corrupted at *any* depth
+/// below `c`'s own top level -- not just when `c` itself is the bad
+/// scalar (an earlier version of this fix only checked `c.value()`
+/// directly, silently missing anything nested inside a well-formed
+/// container; caught by review, #1645). Once a scalar is reached, this
+/// runs only the two checks that can actually raise
+/// (`string_decode_error`/`is_error`) -- not `to_owned_cursor_at_depth`'s
+/// preceding `explicit_tag`/`canonicalize_numbers` attempt, since tag
+/// resolution only ever changes a successfully-decoded value's inferred
+/// *type*, never turns a decode failure or structural error into success
+/// or vice versa (`tagged_scalar_to_owned` requires `as_str()` to already
+/// have succeeded), so skipping it here cannot skip a real raise.
 ///
 /// For a scalar condition this keeps #1645's O(1) win in full: neither
 /// this walk nor `is_falsy()` afterward materializes anything. For a

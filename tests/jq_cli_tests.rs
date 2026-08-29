@@ -2043,6 +2043,10 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             r#"{"bad": [xyz123], "keep": 5}"#,
         ),
         (
+            "structural error, nested in object",
+            r#"{"bad": {"x": xyz123}, "keep": 5}"#,
+        ),
+        (
             "#1642 colliding decode-failure keys",
             r#"{"bad": {"\ud800":1,"\ud800":2}, "keep": 5}"#,
         ),
