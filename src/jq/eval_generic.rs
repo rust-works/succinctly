@@ -6771,6 +6771,20 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
 /// the fallback below re-evaluates the whole, unmodified `key_expr` from
 /// scratch -- detecting the shape statically, without ever calling
 /// `eval_single` on it, keeps the fallback's own evaluation the only one.
+///
+/// This check is deliberately shallow, same as `eval_limit_generic`'s own
+/// (see its doc comment): it only recognizes `key_expr` itself being an
+/// (optionally parenthesized) top-level `Comma`, not one buried inside some
+/// other construct (`if true then ("a"|stderr),"z" else "q" end`, or any
+/// `key_expr` that raises an error rather than yielding a plain value). Such
+/// a shape still gets probed once here, discovers it isn't a single value,
+/// and falls back to a second full evaluation -- a known, already-shipped
+/// residual gap for `limit`/`nth` (#1607, tracked further in #1687 item 3),
+/// not attempted to be closed generally here either. A shared "materialize
+/// N outputs losslessly, without double-evaluating a probe" primitive is
+/// #1687's own suggested direction for actually closing this class; adding
+/// a third one-off native arm with the identical shallow guard isn't that
+/// fix (code review, #1739).
 fn eval_has_generic<S: EvalSemantics, V: DocumentValue>(
     key_expr: &Expr,
     value: V,
