@@ -846,19 +846,30 @@ coverage differs:
 
 A library caller who follows the documented `eval()` example and evaluates straight off a
 fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`/`to_entries`; every other
-builtin in this file, checked or not on the decode-failure/#1194 axis, still misses it. The CLI
-itself never reaches this path except through the reindex bridge, which only ever feeds it an
-already-validated `OwnedValue`, so `sjq`/`syq` are unaffected. The remaining #1677 call sites
-(`with_entries`'s own post-`to_entries` reassembly step, `map_values`, `paths`, `leaf_paths`, and
-the `pick`/`omit` pair review surfaced alongside this issue) are tracked as a follow-up (#1829)
-rather than folded into #1677 itself, which scoped itself to `eval_generic.rs`.
+builtin in this file, checked or not on the decode-failure/#1194 axis, still misses it.
 
-Only `with_entries` routes through `to_entries` internally (it calls `builtin_to_entries`
-directly), so it inherits this fix's #1194/#1642/#1677 coverage for free on the decode step --
-though it still needs its own audit for whatever it does with the *reconstructed* object
-afterward before this issue can consider it closed. `map_values` is a separate, independent
-hand-rolled walk with the identical silent-`continue` shape `keys`/`to_entries` had before their
-own fixes -- unrelated to `to_entries` and not covered by this change at all.
+**#1829 closed the remaining gap** (`map_values` via #1835/#1848/#1854; `with_entries`
+confirmed to inherit `to_entries`'s fix for free, needing no separate change; `paths`,
+`leaf_paths`, and the `pick`/`omit` pair via #1862) -- but not uniformly through this file's own
+`to_owned`/`effective_fields` family. `map_values`/`pick`/`omit` did route through this file's
+own `effective_fields_checked`, matching the paragraph above. `paths`/`leaf_paths` did not: their
+*actual* fix landed in `eval_generic.rs`'s `collect_paths_generic`, the CLI's own native
+`Builtin::Paths`/`Builtin::LeafPaths` dispatch -- **the "CLI unaffected" claim this paragraph
+used to make here was wrong for those two.** `sjq`/`syq paths`/`leaf_paths` do *not* reach this
+file at all; they bypass the reindex bridge entirely via their own `eval_generic.rs` arm, which
+carried the identical #1194 silent-drop bug independently (confirmed live against a built
+release binary: `printf '{"a":1,"b"}' | succinctly jq paths` returned `["a"]` at exit 0 even
+after this file's own `builtin_paths`/`builtin_leaf_paths` were fixed, until `collect_paths_generic`
+was fixed too). `pick`/`omit` have no native `eval_generic.rs` arm, so the "CLI unaffected" claim
+does hold for them -- the reindex bridge they fall through to already fed them an
+already-validated `OwnedValue` before this file's own fix, making that fix real for the library
+API but largely redundant for `sjq`/`syq`.
+
+**The durable lesson**: a unit test against `succinctly::jq::eval` (this file's own entry point)
+proves a fix reaches library callers, never that it reaches the CLI -- only a build-and-run
+check against the actual binary proves that, and is worth doing for any future builtin that has
+(or might grow) its own native `eval_generic.rs` implementation rather than falling through to
+this file via the bridge.
 
 ## Refusing an allocation jq does not survive
 
