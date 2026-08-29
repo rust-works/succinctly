@@ -18442,6 +18442,35 @@ fn test_join_uses_first_separator_value_then_propagates_trailing_break_1164() ->
     Ok(())
 }
 
+/// #1535: `join`'s element walk/decode is hoisted above the separator
+/// fan-out (computed once, not once per separator output) -- correctness
+/// check that every separator still gets the correct, independently-joined
+/// result from the shared, cached element parts. Live-verified against jq
+/// 1.7.1: `["a","b"] | [join((",","-"))]` is `["a,b","a-b"]`.
+#[test]
+fn test_join_multi_separator_fanout_reuses_cached_parts_1535() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", r#"[join((",","-"))]"#], Some(r#"["a","b"]"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), r#"["a,b","a-b"]"#);
+    Ok(())
+}
+
+/// #1535: an element that fails to join (an array/object element, whose
+/// `+` fails naturally) errors identically on every separator output, not
+/// just the first -- the cached parts must carry the same raw (unconverted)
+/// array/object element through to each fold, not silently succeed after
+/// the first attempt. Live-verified against jq 1.7.1.
+#[test]
+fn test_join_element_error_reproduces_on_every_separator_output_1535() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", r#"[join((",","-"))]"#], Some(r"[[1,2]]"))?;
+    assert_eq!(code, 5, "out={out:?}");
+    assert!(
+        err.contains("string (\"\") and array ([1,2]) cannot be added"),
+        "err={err}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_contains_inside_propagate_trailing_break_1164() -> Result<()> {
     let (out, err, code) = run_jq_full(
