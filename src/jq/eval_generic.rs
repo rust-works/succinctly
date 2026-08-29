@@ -35,11 +35,12 @@ use super::document::{
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
     collect_pattern_var_names, eval as full_eval, eval_each_owned, expand_func_calls,
-    extract_pattern_bindings, format_owned, index_one_owned as index_owned_by_key,
-    literal_to_owned, needs_path_context, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
-    substitute_vars, tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
+    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
+    slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var, substitute_vars,
+    tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -6740,6 +6741,74 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Native `Builtin::Has` arm for the generic evaluator (#1739): checks
+/// membership directly against `value`'s existing object/array structure
+/// instead of paying for the `_` fallback's full materialize + re-serialize +
+/// re-index round trip. Same match shape as `eval::has_one_key`, ported to
+/// `V: DocumentValue` rather than reused directly since that function is
+/// `StandardJson`-specific.
+///
+/// Returns `None` when `key_expr` doesn't evaluate to a single plain value
+/// (a generator key, `empty`, a decode failure, ...) -- the caller falls back
+/// to the pre-existing round-trip path, which already implements jq's
+/// per-output fan-out and yq's first-only truncation correctly (see this
+/// function's own call site for why that shape isn't reproduced here).
+fn eval_has_generic<S: EvalSemantics, V: DocumentValue>(
+    key_expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    let key_owned = match eval_single::<S, V>(key_expr, value.clone(), false, cursor) {
+        GenericResult::One(v) => to_owned(&v).ok()?,
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
+        GenericResult::Owned(v) => v,
+        _ => return None,
+    };
+    Some(eval_has_one_key::<S, V>(
+        &value, cursor, key_owned, optional,
+    ))
+}
+
+/// `has(key)`'s check for one already-resolved key -- the body of
+/// [`eval_has_generic`]. Mirrors `eval::has_one_key`'s match order exactly
+/// (null receiver, then object+string key, then array+numeric key, then
+/// yq's permissive type-mismatch fallback, then `optional`, then error).
+fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+    cursor: Option<V::Cursor>,
+    key_owned: OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    if value.is_null() {
+        return GenericResult::Owned(OwnedValue::Bool(false));
+    }
+    match (&key_owned, value.as_object(), value.as_array()) {
+        (OwnedValue::String(key), Some(fields), _) => {
+            GenericResult::Owned(OwnedValue::Bool(fields.find(key).is_some()))
+        }
+        (
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            _,
+            Some(elements),
+        ) => {
+            let in_bounds = match numeric_key_to_array_index::<S>(&key_owned) {
+                None => false,
+                Some(idx) => index_in_array_bounds::<S>(idx, elements.len() as i64),
+            };
+            GenericResult::Owned(OwnedValue::Bool(in_bounds))
+        }
+        _ if has_type_mismatch_is_permissive::<S>() => {
+            GenericResult::Owned(OwnedValue::Bool(false))
+        }
+        _ if optional => GenericResult::None,
+        _ => GenericResult::Error(EvalError::cannot_check_has(
+            tagged_type_name(value, cursor),
+            key_owned.type_name(),
+        )),
+    }
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -7383,6 +7452,28 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     tagged_type_name(&value, cursor),
                     "number",
                 ))
+            }
+        }
+
+        // #1739: the `_` fallback below pays for a full materialize +
+        // re-serialize + re-index round trip of `value` on every call, just
+        // to answer a single-key membership check. Native only when
+        // `key_expr` evaluates to one plain value -- mirrors
+        // `eval_limit_generic`'s own established precedent (#1607): a
+        // generator key (`has(("a","b"))`) needs jq's per-output fan-out and
+        // `ArgFanout::yq_native`'s yq-mode first-only truncation, both
+        // already correctly implemented by `eval::fanout_arg`/`builtin_has`,
+        // so that shape is left on the existing round-trip path rather than
+        // re-implemented here. `Builtin::In` is not covered by this slice:
+        // its own receiver (`.`) is the *key*, not the container, so it
+        // rarely carries the large-document cost this fixes for `has`.
+        Builtin::Has(key_expr) => {
+            match eval_has_generic::<S, _>(key_expr, value.clone(), optional, cursor) {
+                Some(result) => result,
+                None => {
+                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                    eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
+                }
             }
         }
 
