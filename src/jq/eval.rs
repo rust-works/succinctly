@@ -6470,21 +6470,35 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     match value {
         StandardJson::Object(fields) => {
+            // #1829: preserve a decode-failure key via its raw source span
+            // (#1642), and raise on a #1194 structural/unpaired key or a
+            // #1677 malformed delimiter, matching keys/keys_unsorted (#1835)
+            // and to_entries (#1848). resolve_display_key/DisplayKeyGuard,
+            // not plain key_display_string: map_values builds a real
+            // IndexMap, so two decode-failure keys sharing the same
+            // fallback spelling must raise rather than silently overwrite
+            // one another, unlike keys/to_entries's Vec output.
+            let checked = match effective_fields_checked(&fields, false) {
+                Ok(f) => f,
+                Err(e) => return QueryResult::Error(e),
+            };
             let mut result_map = IndexMap::new();
-            for field in fields {
-                // Get the key
-                let key = if let StandardJson::String(k) = field.key() {
-                    if let Ok(cow) = k.as_str() {
-                        cow.into_owned()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
+            let mut guard = DisplayKeyGuard::default();
+            for field in checked {
+                // `effective_fields_checked` already refused every key
+                // `key_display_string`/`resolve_display_key` would answer
+                // `None` for (#1194), so that arm is unreachable here --
+                // kept as a real branch (not `.unwrap()`) so a future change
+                // to either function's refusal condition fails loudly
+                // instead of panicking.
+                let key = match resolve_display_key(&field.key, &result_map, &mut guard) {
+                    Ok(Some(k)) => k,
+                    Ok(None) => return QueryResult::Error(fields.malformed_member_error()),
+                    Err(e) => return QueryResult::Error(e),
                 };
 
                 // Apply f to the value
-                let field_val = field.value();
+                let field_val = field.value;
                 match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
                     QueryResult::One(v) => match to_owned_checked(&v) {
                         Ok(owned) => {
@@ -6530,9 +6544,18 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(OwnedValue::Object(result_map))
         }
         StandardJson::Array(elements) => {
-            // map_values on array applies to each element
+            // map_values on array applies to each element. #1829:
+            // collect_cursors_checked, not a bare `for elem in elements` --
+            // the same #1677 gap to_entries's array arm had (found in
+            // #1848's review): a plain iterator can't see a malformed `,`
+            // between elements.
+            let cursors = match elements.collect_cursors_checked() {
+                Ok(c) => c,
+                Err(e) => return QueryResult::Error(e),
+            };
             let mut results = Vec::new();
-            for elem in elements {
+            for cursor in cursors {
+                let elem = cursor.value();
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => match to_owned_checked(&v) {
                         Ok(owned) => results.push(owned),
@@ -42158,6 +42181,68 @@ mod tests {
                 assert_eq!(arr[2], OwnedValue::Int(4));
             }
         );
+    }
+
+    /// #1829: `map_values` used to silently drop a decode-failure or #1194
+    /// structurally malformed key, disagreeing with `length`/`keys`/
+    /// `to_entries` (fixed in #1835/#1848). `resolve_display_key`/
+    /// `DisplayKeyGuard`, not plain `key_display_string`: `map_values`
+    /// builds a real `IndexMap`, unlike `keys`/`to_entries`'s `Vec` output.
+    #[test]
+    fn test_builtin_map_values_preserves_decode_failure_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+
+        query!(doc, "length",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
+        );
+        query!(doc, "map_values(.+1)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(
+                    obj.get("\u{FFFD}\u{FFFD}"),
+                    Some(&OwnedValue::Int(2))
+                );
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
+            }
+        );
+    }
+
+    /// #1829's other axis: a structurally non-string/unpaired key (#1194,
+    /// `{"a":1,"b"}`) must raise for `map_values` too, matching
+    /// `keys`/`to_entries`/`path(.[])`/`tojson` -- previously silently
+    /// dropped instead (a 1-entry object, not an error).
+    #[test]
+    fn test_builtin_map_values_raises_on_structurally_malformed_key_1829() {
+        query!(br#"{"a":1,"b"}"#, "map_values(.+1)",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1677: a malformed `,`/`:` delimiter now raises for `map_values` too,
+    /// on both the object and array arms -- the array arm's own gap mirrors
+    /// the one `to_entries`'s array arm had before its own #1677 fix
+    /// (#1848).
+    #[test]
+    fn test_builtin_map_values_raises_on_malformed_delimiter_1677() {
+        query!(br#"{"a" 1, "b": 2}"#, "map_values(.+1)",
+            QueryResult::Error(_) => {}
+        );
+        query!(br"[1 2, 3]", "map_values(.+1)",
+            QueryResult::Error(_) => {}
+        );
+        // Positive control: a well-formed array is unaffected.
+        query!(br"[1, 2, 3]", "map_values(.+1)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 3)
+        );
+    }
+
+    /// Code review precedent from #1835/#1848/#1829: `map_values?` must
+    /// still suppress both error axes via the outer `Expr::Optional` catch.
+    #[test]
+    fn test_builtin_map_values_optional_suppresses_malformed_key_errors_1829() {
+        query!(br#"{"a":1,"b"}"#, "map_values(.+1)?", QueryResult::None => {});
+        query!(br#"{"a" 1, "b": 2}"#, "map_values(.+1)?", QueryResult::None => {});
+        query!(br"[1 2, 3]", "map_values(.+1)?", QueryResult::None => {});
     }
 
     #[test]
