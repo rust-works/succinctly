@@ -38,8 +38,7 @@ use core::cell::Cell;
 use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
-    effective_fields, effective_len, key_display_string, resolve_display_key, DisplayKeyGuard,
-    DocumentFields,
+    effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
 };
 // Only consumed by `yaml_value_to_owned_checked`, which is itself
 // `#[cfg(feature = "std")]`-gated (`load()`'s YAML path) -- gated
@@ -5986,38 +5985,24 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Object(fields) => {
-            let mut keys: Vec<String> = Vec::new();
-            // `uncons`/`rest`, not `for field in fields`: a `for` loop
-            // consumes the `Iterator` impl, whose `next()` reports `None`
-            // both on genuine exhaustion *and* on a trailing unpaired
-            // member (#1194, e.g. `{"a":1,"b"}`) -- indistinguishable
-            // through that protocol, so only a walk that can inspect the
-            // list state it *finished* on can ask `ends_unpaired`
-            // afterward. Mirrors `to_owned_checked_at_depth`'s own shape
-            // (#1734).
-            let mut f = fields;
-            while let Some((field, rest)) = f.uncons() {
-                let key_val = field.key();
-                // #1829: preserve a decode-failure key via its raw source
-                // span (#1642), matching `to_owned_checked`/`path()`/
-                // `tojson`'s policy -- this used to silently skip both a
-                // decode-failure key and a structurally non-string one
-                // (#1194), disagreeing with those and with `length`, which
-                // counts every field regardless. Plain `key_display_string`,
-                // not `resolve_display_key`: `keys` builds a `Vec`, not a
-                // map, so two decode-failure keys sharing the same fallback
-                // spelling are simply two list entries, not the ambiguous
-                // overwrite `DisplayKeyGuard` exists to prevent for a real
-                // `IndexMap`.
-                let Some(key) = key_display_string(&key_val) else {
-                    return QueryResult::Error(f.malformed_member_error());
-                };
-                keys.push(key.into_owned());
-                f = rest;
-            }
-            if f.ends_unpaired() {
-                return QueryResult::Error(f.malformed_member_error());
-            }
+            // #1829: delegates to `DocumentFields::keys()` (`document.rs`,
+            // already implemented for `JsonFields`) rather than a fourth
+            // hand-rolled copy of the same uncons/key_display_string/
+            // ends_unpaired walk (`document.rs`'s own default, this file's
+            // `to_owned_checked_at_depth`, and an earlier draft of this very
+            // function). Closes two gaps this function used to have on its
+            // own: a decode-failure key is now preserved via its raw source
+            // span (#1642, matching `to_owned_checked`/`path()`/`tojson`'s
+            // policy, not silently dropped), a #1194 structurally malformed
+            // key now raises, and -- as a consequence of reusing the shared
+            // walk rather than re-deriving a narrower one -- a malformed
+            // `,`/`:` delimiter (#1677) now raises too, closing a gap that
+            // `to_owned_checked_at_depth` still has (out of scope for this
+            // fix to touch there; noted, not silently left stale).
+            let mut keys = match DocumentFields::keys(&fields) {
+                Ok(keys) => keys,
+                Err(e) => return QueryResult::Error(e),
+            };
             if sorted {
                 keys.sort();
             }
@@ -41136,6 +41121,30 @@ mod tests {
             QueryResult::Error(e) => {
                 assert!(!e.is_decode_failure(), "message: {}", e.message);
             }
+        );
+        query!(doc, "keys",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829 review: delegating to `DocumentFields::keys()` (`document.rs`)
+    /// rather than hand-rolling a narrower walk closes a third axis this
+    /// function never explicitly set out to fix -- a malformed `,`/`:`
+    /// delimiter (#1677). JSON's semi-index treats the two as interchangeable
+    /// gap bytes, so a missing colon leaves an even sibling count and
+    /// `ends_unpaired()` alone can't see it; only `key_delimiter_ok`/
+    /// `value_delimiter_ok` (both inside `DocumentFields::keys()`) can. Real
+    /// jq rejects this document outright at parse time; succinctly's own
+    /// CLI path (`eval_generic.rs`) already raises here too
+    /// (`test_nonreserializing_builtins_raise_on_missing_delimiter_1677`) --
+    /// this pins the library `eval()` entry point catching up to it for
+    /// `keys`/`keys_unsorted` specifically.
+    #[test]
+    fn test_builtin_keys_raises_on_malformed_delimiter_1677() {
+        let doc: &[u8] = br#"{"a" 1, "b": 2}"#;
+
+        query!(doc, "keys_unsorted",
+            QueryResult::Error(_) => {}
         );
         query!(doc, "keys",
             QueryResult::Error(_) => {}
