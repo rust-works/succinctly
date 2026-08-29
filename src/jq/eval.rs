@@ -28005,11 +28005,25 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: paths - all paths to values (excluding empty paths)
 /// Returns each path as a separate output (streaming), matching jq behavior
+///
+/// #1829: `to_owned_checked`, not `to_owned` -- an undecodable object key
+/// was previously dropped silently (a shrunk object, not an error), where
+/// `path(.[])`/`tojson`/`keys`/`to_entries`/`map_values` all raise or
+/// preserve it via `resolve_display_key`'s #1642 fallback spelling.
+/// `_optional` stays unused, matching `builtin_path`'s own root
+/// `to_owned_checked` call: catchability is handled uniformly one level up
+/// by `eval_try`, which passes the *same* `optional` this function received
+/// down through `eval_single` already -- so a wrapping `paths?` suppresses
+/// a catchable result here without this function needing to consult it
+/// itself, and `is_decode_failure()` errors stay uncatchable regardless.
 fn builtin_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    let owned = match to_owned_checked(&value) {
+        Ok(owned) => owned,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut paths = Vec::new();
     collect_paths(&owned, &mut Vec::new(), &mut paths);
     // Stream individual paths instead of wrapping in array
@@ -28088,7 +28102,16 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let owned = to_owned(&value);
+    // #1829: `to_owned_checked`, not `to_owned` -- shares `builtin_paths`'s
+    // own fix (an undecodable key was previously dropped silently instead
+    // of raising or preserving its #1642 fallback spelling). Same
+    // "eager and unconditional" placement as the root node_filter pre-check
+    // just below: nothing has been pushed to `sink` yet, so this is always
+    // a bare `Error`, never a `Partial`.
+    let owned = match to_owned_checked(&value) {
+        Ok(owned) => owned,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
 
     if let Err(control) = eval_owned_expr_ctrl::<S>(filter, &owned, optional) {
         return Flow::Escaped(control);
@@ -28235,11 +28258,18 @@ fn collect_leaf_paths(
 /// also yields paths to `null` values and empty `{}`/`[]`, which that
 /// recipe's `scalars` filter excludes. See `collect_leaf_paths` and #771.
 /// Returns each path as a separate output (streaming).
+///
+/// #1829: `to_owned_checked`, not `to_owned` -- shares `builtin_paths`'s own
+/// fix and its reasoning for leaving `_optional` unused (see that function's
+/// doc comment).
 fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    let owned = match to_owned_checked(&value) {
+        Ok(owned) => owned,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut paths = Vec::new();
     collect_leaf_paths(&owned, &mut Vec::new(), &mut paths);
     // Stream individual paths instead of wrapping in array
@@ -34405,26 +34435,43 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match &value {
         StandardJson::Object(fields) => {
+            // #1829: route through `effective_fields_checked` (matching
+            // `map_values`/`to_entries`'s established Object-arm pattern)
+            // instead of a raw `for field in *fields` scan -- the raw scan
+            // silently skipped any field whose key failed to decode (#1642)
+            // or was structurally malformed/unpaired (#1194/#1677) rather
+            // than raising or making it reachable via its #1642 fallback
+            // spelling, so `pick(["<undecodable key's fallback
+            // spelling>"])` could never find it, and a malformed document
+            // pick'd from without any indication.
+            let checked = match effective_fields_checked(fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                Ok(f) => f,
+                Err(e) => return QueryResult::Error(e),
+            };
             // For objects, pick specified string keys
             let mut result = IndexMap::new();
             for key in keys {
                 if let OwnedValue::String(k) = key {
                     // Find the field in the object
-                    for field in *fields {
-                        if let StandardJson::String(key_str) = field.key() {
-                            if let Ok(cow) = key_str.as_str() {
-                                if cow.as_ref() == k.as_str() {
-                                    // #1755: to_owned_checked, not to_owned
-                                    // -- an undecodable picked value must
-                                    // raise, not silently become "".
-                                    let owned = match to_owned_checked(&field.value()) {
-                                        Ok(v) => v,
-                                        Err(e) => return QueryResult::Error(e),
-                                    };
-                                    result.insert(k.clone(), owned);
-                                    break;
-                                }
-                            }
+                    for field in &checked {
+                        // `effective_fields_checked` already rejected a
+                        // structurally malformed key (#1194), so `None`
+                        // here is unreachable in practice -- checked
+                        // anyway, matching `effective_keys`'s own
+                        // defensive style rather than assuming.
+                        let Some(resolved) = key_display_string(&field.key) else {
+                            return QueryResult::Error(fields.malformed_member_error());
+                        };
+                        if resolved.as_ref() == k.as_str() {
+                            // #1755: to_owned_checked, not to_owned
+                            // -- an undecodable picked value must
+                            // raise, not silently become "".
+                            let owned = match to_owned_checked(&field.value) {
+                                Ok(v) => v,
+                                Err(e) => return QueryResult::Error(e),
+                            };
+                            result.insert(k.clone(), owned);
+                            break;
                         }
                     }
                     // If key not found, yq silently skips it
@@ -34552,22 +34599,46 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 })
                 .collect();
 
+            // #1829: route through `effective_fields_checked` (matching
+            // `map_values`/`to_entries`'s established Object-arm pattern)
+            // instead of a raw `for field in *fields` scan. Unlike `pick`'s
+            // identical fix above, this was the more severe axis: `omit`
+            // *keeps* everything not named, so the raw scan's silent skip
+            // on a decode-failure or structurally malformed key (#1642/
+            // #1194) silently **dropped** that field from the output --
+            // the opposite of what an unmatched key should do -- rather
+            // than raising or preserving it via its #1642 fallback
+            // spelling the way `keys`/`to_entries`/`map_values` do.
+            let checked = match effective_fields_checked(fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                Ok(f) => f,
+                Err(e) => return QueryResult::Error(e),
+            };
             let mut result = IndexMap::new();
-            for field in *fields {
-                if let StandardJson::String(key_str) = field.key() {
-                    if let Ok(cow) = key_str.as_str() {
-                        let key = cow.as_ref();
-                        if !omit_keys.contains(&key) {
-                            // #1755: to_owned_checked, not to_owned -- an
-                            // undecodable kept value must raise, not
-                            // silently become "".
-                            let owned = match to_owned_checked(&field.value()) {
-                                Ok(v) => v,
-                                Err(e) => return QueryResult::Error(e),
-                            };
-                            result.insert(key.to_string(), owned);
-                        }
+            // Two distinct undecodable keys whose #1642 fallback spellings
+            // collide must raise rather than silently overwrite one
+            // another in `result` -- same `DisplayKeyGuard` `map_values`
+            // uses for its own real `IndexMap` build.
+            let mut guard = DisplayKeyGuard::default();
+            for field in &checked {
+                // Unreachable in practice -- `effective_fields_checked`
+                // already rejected a structurally malformed key (#1194) --
+                // checked anyway, matching `effective_keys`'s own
+                // defensive style rather than assuming.
+                let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+                    return QueryResult::Error(fields.malformed_member_error());
+                };
+                if !omit_keys.contains(key.as_ref()) {
+                    if !guard.check(&result, &key, is_fallback) {
+                        return QueryResult::Error(EvalError::colliding_display_key(&key));
                     }
+                    // #1755: to_owned_checked, not to_owned -- an
+                    // undecodable kept value must raise, not
+                    // silently become "".
+                    let owned = match to_owned_checked(&field.value) {
+                        Ok(v) => v,
+                        Err(e) => return QueryResult::Error(e),
+                    };
+                    result.insert(key.into_owned(), owned);
                 }
             }
             QueryResult::Owned(OwnedValue::Object(result))
@@ -37916,6 +37987,124 @@ mod tests {
                 assert!(!o.contains_key("a"));
                 assert_eq!(o.get("b"), Some(&OwnedValue::Int(2)));
             }
+        );
+    }
+
+    /// #1829: `pick`/`omit`'s *own field walk* (as opposed to the
+    /// keys-expression resolution #1755 above already fixed) used a raw
+    /// `for field in *fields` scan that silently skipped a field whose key
+    /// failed to decode -- `pick` could never locate it by its #1642
+    /// fallback spelling, and `omit` (the more severe direction, since it
+    /// *keeps* everything not named) silently dropped it from the output
+    /// entirely. `\xff\xfe`'s fallback spelling lossy-decodes to two
+    /// U+FFFD replacement characters (confirmed via `String::from_utf8_lossy`).
+    #[test]
+    fn test_builtin_pick_finds_undecodable_key_via_fallback_spelling_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+        query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.len(), 1);
+                assert_eq!(o.get("\u{fffd}\u{fffd}"), Some(&OwnedValue::Int(1)));
+            }
+        );
+    }
+
+    #[test]
+    fn test_builtin_omit_preserves_undecodable_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+        // Omitting an unrelated key must keep the undecodable one, not
+        // silently drop it.
+        query!(doc, "omit([\"a\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.len(), 1);
+                assert_eq!(o.get("\u{fffd}\u{fffd}"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        // Omitting it by its own fallback spelling removes it.
+        query!(doc, "omit([\"\u{fffd}\u{fffd}\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.len(), 1);
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    /// #1829: a structurally non-string/unpaired key (#1194,
+    /// `{"a":1,"b"}`) must raise for `pick`/`omit` too, matching
+    /// `keys`/`to_entries`/`map_values` -- previously silently ignored
+    /// (a shrunk or unaffected object, not an error).
+    #[test]
+    fn test_builtin_pick_omit_raise_on_structurally_malformed_key_1829() {
+        query!(br#"{"a":1,"b"}"#, "pick([\"a\"])",
+            QueryResult::Error(_) => {}
+        );
+        query!(br#"{"a":1,"b"}"#, "omit([\"c\"])",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829: a malformed `,`/`:` delimiter (#1677) now raises for
+    /// `pick`/`omit` too.
+    #[test]
+    fn test_builtin_pick_omit_raise_on_malformed_delimiter_1829() {
+        query!(br#"{"a" 1, "b": 2}"#, "pick([\"b\"])",
+            QueryResult::Error(_) => {}
+        );
+        query!(br#"{"a" 1, "b": 2}"#, "omit([\"b\"])",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829: two decode-failure keys whose fallback spellings collide
+    /// must raise for `omit` too, matching `map_values`'s own
+    /// `DisplayKeyGuard` fix -- `omit` builds a real `IndexMap` the same
+    /// way, so silently overwriting one with the other would lose data.
+    #[test]
+    fn test_builtin_omit_raises_on_colliding_fallback_keys_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}";
+        query!(doc, "omit([\"nonexistent\"])",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829: `leaf_paths` shares `paths`'s own #1642/#1194 fix (both call
+    /// through the same `to_owned`-vs-`to_owned_checked` fix at their root
+    /// materialization step) -- previously silently dropped an undecodable
+    /// key's path instead of raising or preserving it via its fallback
+    /// spelling.
+    #[test]
+    fn test_builtin_leaf_paths_preserves_undecodable_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+        query!(doc, "[leaf_paths] | length",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
+        );
+        query!(br#"{"a":1,"b"}"#, "leaf_paths",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829: bare `paths` (not `paths(filter)`) previously silently
+    /// dropped an undecodable object key's path entirely instead of
+    /// raising or preserving it -- disagreeing with `path(.[])`/`tojson`/
+    /// `keys`/`to_entries`/`map_values` on the same document.
+    #[test]
+    fn test_builtin_paths_preserves_undecodable_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+        query!(doc, "[paths] | length",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
+        );
+        query!(br#"{"a":1,"b"}"#, "paths",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829: `paths(filter)` (`Builtin::PathsFilter`, the lazy generator
+    /// `each_paths_filter`) shares `paths`'s own root-materialization fix
+    /// -- a separate call site from bare `paths` above.
+    #[test]
+    fn test_builtin_paths_filter_raises_on_structurally_malformed_key_1829() {
+        query!(br#"{"a":1,"b"}"#, "paths(true)",
+            QueryResult::Error(_) => {}
         );
     }
 
