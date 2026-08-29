@@ -85,18 +85,29 @@ fn test_index_number_navigation_matches_plain_index_1827() {
     }
 }
 
-/// #1827's own trigger case: `del` with more than one target routes through
-/// `delete_expr_paths_at`/`delete_expr_array_paths` (`src/jq/eval.rs`), a
-/// *different* function from single-target `del`'s fast path -- the one
-/// whose `Expr::IndexNumber`/`Expr::SliceNumber` match arms were genuinely
-/// missing from #1088 until #1326 added them. Confirmed this reaches (and
-/// previously would have panicked in) that exact function by reverting its
-/// or-pattern arms to plain `Expr::Index`/`Expr::Slice` locally and
-/// re-running this test, which then failed with
+/// `del` with more than one target routes through `delete_expr_array_paths`
+/// (`src/jq/eval.rs`), a *different* function from single-target `del`'s
+/// fast path -- confirmed by local experimentation that this test suite's
+/// single-target cases above do not reach it at all (reverting its
+/// `ArrayStep`-classification match's or-pattern arms locally left every
+/// test above green; only a multi-target `del` here panicked with
 /// `unreachable!("delete_expr_paths_at only dispatches Index/Slice paths
-/// here")` -- the single-target cases above did not reproduce that panic.
+/// here")`).
+///
+/// This is a *different* match inside the same function from the one
+/// #1088/#1326's own history is about (`delete_expr_array_paths`'s
+/// *error-construction* match, for a non-array target) -- that one has no
+/// real parsed-filter reproduction at all, per its own existing direct-call
+/// regression tests' doc comments
+/// (`test_delete_expr_array_paths_reports_index_number_like_plain_index_1326`/
+/// `test_delete_expr_array_paths_reports_slice_number_like_plain_slice_1827`
+/// in `src/jq/eval.rs`, both of which explicitly note a parsed
+/// `del(.[2.0])`-shaped query exits through a different, higher-level
+/// dispatch first). This test still earns its place: the `ArrayStep` match
+/// is a real, independent dispatch site among the ~30 the issue is about,
+/// and CLI-reachable, unlike the error-construction one.
 #[test]
-fn test_multi_target_del_reaches_index_number_dispatch_1827() {
+fn test_multi_target_del_reaches_array_step_dispatch_1827() {
     for filter in [
         "del(.[1.0], .[3])",
         "del(.[1], .[3])",
