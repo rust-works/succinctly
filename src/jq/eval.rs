@@ -43,7 +43,7 @@ use super::document::{
     DocumentFields,
 };
 use super::slice::{self, SliceBounds};
-use super::walk::map_builtin_subexprs;
+use super::walk::{any_subexpr, map_builtin_subexprs};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
 ///
@@ -20414,6 +20414,28 @@ impl FoldRegister {
 /// routing the source through it here reuses that logic rather than
 /// re-deriving it.
 ///
+/// **Gated on `any_subexpr` finding an actual navigation step
+/// (`Field`/`Index`/`IndexNumber`/`Slice`/`SliceNumber`/`Iterate`)
+/// anywhere in `source`** -- only such a step can ever reach one of
+/// `resolve_node`'s own raising arms in the first place, so a source with
+/// none (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
+/// skips this function's own re-evaluation of `source` entirely. This
+/// isn't just an optimization: an earlier, ungated version of this check
+/// evaluated `input`/`inputs`-sourced folds *twice* -- once here (via
+/// `resolve_leaf`'s stop-after-first sink, which still fully evaluates
+/// the source's first output to answer the check), once more in
+/// `eval_owned_expr_fork` below for the real value -- silently
+/// desynchronizing the two evaluations' shared input-reader position, so
+/// the fold ran against the *second* input document while reporting an
+/// error that named the first (`reduce input as $x (0; $x)` over
+/// `10\n20\n30\n`: real jq names `10`, the ungated version named `20`).
+/// A source containing real navigation has no such stateful-generator
+/// risk baked into this fix specifically -- it can still double-fire an
+/// ordinary side effect (see below) -- but a *reader position* is exactly
+/// the kind of state where "fire twice" isn't cosmetic, it's silent data
+/// corruption, so gating out every source that doesn't need the check at
+/// all removes the entire class for the common case.
+///
 /// `resolve_node`'s own branches are discarded -- only the escape
 /// matters, and only `Halt` and `EvalError::is_untracked_navigation_error`
 /// (the "near attempt to access/iterate" family this check exists to
@@ -20433,27 +20455,50 @@ impl FoldRegister {
 /// source like `range(3)` to its first value alone, which would silently
 /// truncate the fold to one iteration if taken as the real source.
 ///
-/// **Documented cost, not fixed here**: narrowing to the first value
-/// means `resolve_leaf`'s stop-after-first sink never asks the source for
-/// a second output, but it does fully evaluate the first one -- so a
-/// source whose first output has a side effect (`stderr`, a consumed
-/// `input`) fires that side effect twice: once here, once more in
-/// `eval_owned_expr_fork` below for the real value. Real jq's own single
-/// tracked evaluation fires it once. Measured live against jq 1.7.1
-/// (`path(. as $x | reduce (stderr) as $i (0; $x))` writes one `stderr`
-/// line; this fix's approach writes two) -- accepted here as this
-/// approach's own stated trade-off rather than the alternative (threading
-/// a new "keep every output while tracking" mode through `resolve_node`'s
-/// entire ~20-call-site dispatch graph so the fold's real values could be
-/// taken from this same evaluation), which is a materially larger, more
-/// invasive change to a widely-shared traversal. See
-/// docs/compliance/jq/limitations.md.
+/// **Documented cost, not fixed here**: for a *navigating* source, the
+/// stop-after-first sink above still fully evaluates the first output
+/// twice -- so a navigating source whose first output has a side effect
+/// (`stderr`) fires it twice where jq's own single tracked evaluation
+/// fires it once. Measured live against jq 1.7.1
+/// (`path(. as $x | reduce (.[range(1)] | stderr) as $i (0; $x))` writes
+/// one `stderr` line in jq, two here) -- accepted as this approach's own
+/// stated trade-off rather than the alternative (threading a new "keep
+/// every output while tracking" mode through `resolve_node`'s entire
+/// ~20-call-site dispatch graph so the fold's real values could be taken
+/// from this same evaluation), which is a materially larger, more
+/// invasive change to a widely-shared traversal.
+///
+/// **Also not fixed here** (filed as a follow-up rather than expanded
+/// into this already-corrected fix): `foreach`'s own per-element
+/// streaming means a *navigating* source that legitimately emits some
+/// elements before the one that raises loses that earlier output --
+/// `path(foreach (1,2,keys[]) as $k (.; .))` on `{"a":1}` streams `[]`
+/// twice before raising in jq, prints nothing here -- because this
+/// function checks the *whole* source expression before
+/// `eval_owned_expr_fork` gets to stream anything. Fixing this needs the
+/// same "single interleaved evaluation" architecture the side-effect
+/// trade-off above already declined for a materially larger change. See
+/// docs/compliance/jq/limitations.md for both remaining gaps.
 fn path_check_fold_source<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
     snapshot: bool,
 ) -> Option<EvalEscape> {
+    let has_navigation = any_subexpr(source, &mut |e| {
+        matches!(
+            e,
+            Expr::Field(_)
+                | Expr::Index(_)
+                | Expr::IndexNumber { .. }
+                | Expr::Slice { .. }
+                | Expr::SliceNumber { .. }
+                | Expr::Iterate
+        )
+    });
+    if !has_navigation {
+        return None;
+    }
     match resolve_node::<S>(source, value, trackable, snapshot) {
         Ok(_) => None,
         Err((_, EvalEscape::Halt(code))) => Some(EvalEscape::Halt(code)),

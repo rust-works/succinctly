@@ -1,0 +1,1 @@
+. as $x | path(reduce (.[] | stderr) as $i (0; $x))

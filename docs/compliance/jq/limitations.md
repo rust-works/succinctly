@@ -555,28 +555,50 @@ differs: falling through to `resolve_leaf`'s catch-all names the whole fold's ow
 ("Invalid path expression with result `{"a":1}`") rather than the destructuring step jq
 blames. That is the same catch-all wording every unresolvable filter already gets here, and
 is the general message-fidelity gap covered above, not a fold-specific one.
+
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467):** the fold's
 **source expression** is now path-checked the same way jq checks it — `resolve_reduce`/
 `resolve_foreach` route the source through `resolve_node` (discarding its branches, keeping
-only the escape) before taking the actual values from the untracked evaluator. jq evaluates
-the source "with tracking on" and fails only where it navigates *through* an untrackable
-value, so `reduce (1,2) / (.a) / (.[]) / (keys) / (range(2)) as $i (0; $x)` all resolve in
-both, and `reduce (keys[]) as $k (.; .)` now raises "near attempt to iterate through" in
-both too (live-verified against jq 1.7.1, both the `path(...)` read side and the `(reduce
-...) = 9` write side).
+only the escape) before taking the actual values from the untracked evaluator, but only when
+the source's own AST contains a real navigation step (`Field`/`Index`/`Slice`/`Iterate`)
+anywhere — checked via `any_subexpr` — since only those can ever reach one of
+`resolve_node`'s raising arms in the first place. jq evaluates the source "with tracking on"
+and fails only where it navigates *through* an untrackable value, so `reduce (1,2) / (.a) /
+(.[]) / (keys) / (range(2)) as $i (0; $x)` all resolve in both, and `reduce (keys[]) as $k
+(.; .)` now raises "near attempt to iterate through" in both too (live-verified against jq
+1.7.1, both the `path(...)` read side and the `(reduce ...) = 9` write side).
 
-That fix has one accepted cost: `resolve_node`'s general, non-primitive leaf (`resolve_leaf`,
-#986's deliberate defer-not-raise case) narrows a multi-output source to its first value
-alone, so its branches can't be reused as the fold's real values — the source's first output
-is therefore evaluated *twice*, once for the path-check, once more for the real value. A
-source whose first output has a side effect fires it twice where jq's single tracked
-evaluation fires it once: `. as $x | path(reduce (stderr) as $i (0; $x))` writes `{}` once
-to stderr in jq, `{}{}` in succinctly (measured directly, not by line count — `stderr`
-writes no trailing newline). The alternative — threading a new "keep every output while
-tracking" mode through `resolve_node`'s entire recursive dispatch so the fold's real values
-could be taken from the same single evaluation — was judged a materially larger, more
-invasive change to a widely-shared traversal for a narrow, side-effect-only divergence, and
-left as a documented trade-off rather than attempted.
+That fix has two accepted costs, both confined to a source that actually contains
+navigation — a non-navigating source (`range(n)`, `keys`, a literal, or critically
+`input`/`inputs`) skips the check entirely and pays neither:
+
+1. `resolve_node`'s general, non-primitive leaf (`resolve_leaf`, #986's deliberate
+   defer-not-raise case) narrows a multi-output source to its first value alone, so its
+   branches can't be reused as the fold's real values — the source's first output is
+   therefore evaluated *twice*, once for the path-check, once more for the real value. A
+   navigating source whose first output has a side effect fires it twice where jq's single
+   tracked evaluation fires it once: `. as $x | path(reduce (.[] | stderr) as $i (0; $x))`
+   on `[1]` writes `1` once to stderr in jq, twice in succinctly (measured directly, not by
+   line count — `stderr` writes no trailing newline). The alternative — threading a new
+   "keep every output while tracking" mode through `resolve_node`'s entire recursive
+   dispatch so the fold's real values could be taken from the same single evaluation — was
+   judged a materially larger, more invasive change to a widely-shared traversal for a
+   narrow, side-effect-only divergence, and left as a documented trade-off rather than
+   attempted. The `any_subexpr` gate above was *not* part of the original fix — an earlier
+   version ran this check unconditionally, which corrupted an `input`/`inputs`-sourced fold
+   (not merely double-firing a cosmetic side effect): the check's own re-evaluation consumed
+   one document, then `eval_owned_expr_fork`'s real evaluation consumed the *next* one,
+   silently desynchronizing which document the fold actually ran against. Caught in code
+   review before merging.
+2. `foreach`'s own per-element streaming loses a legitimate pre-error prefix when the
+   *navigating* source itself is a multi-element comma list: `path(foreach (1,2,keys[]) as
+   $k (.; .))` on `{"a":1}` streams `[]` twice before raising in jq (elements `1`, `2`
+   succeed; `keys[]` fails third), prints nothing in succinctly — the whole-source check runs
+   to completion (or failure) before `eval_owned_expr_fork` ever gets a chance to stream
+   anything. Same underlying cause as cost 1 (two separate evaluations instead of one
+   interleaved one) and the same fix would close it; tracked separately as
+   [#1872](https://github.com/rust-works/succinctly/issues/1872) rather than folded into
+   #1467's own fix.
 
 ## Duplicate object keys collapse, except under `--preserve-input`
 
