@@ -37582,6 +37582,45 @@ mod tests {
                 assert_eq!(v, vec![OwnedValue::String("a".to_string()), OwnedValue::Int(1)]);
             }
         );
+        // `push_promoted`'s own `Some(acc)` branch: a `One` result arrives
+        // *after* promotion has already happened (a prior sibling forced
+        // `owned` to `Some`), so the undecodable third element is checked
+        // there, not in `promote_borrowed_checked`. `Partial` (not a bare
+        // `Error`) because two valid outputs already reached the caller
+        // before the third element's failure -- matching #400's "keep
+        // what already piped through" policy.
+        query!(
+            &b"[1, 2, \"\xff\xfe\"]"[..],
+            ".[] | (if . == 1 then (.+10, .+20) elif . == 2 then . else . end)",
+            QueryResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(
+                    prefix,
+                    vec![
+                        OwnedValue::Int(11),
+                        OwnedValue::Int(21),
+                        OwnedValue::NumberLiteral(NumberRepr::Int(2), "2".into()),
+                    ]
+                );
+            }
+        );
+        // Positive control for the same shape: valid data reaches both
+        // `promote_borrowed_checked`'s `Ok` arm (owned = Some(acc)) and
+        // the subsequent `ManyOwned`/`push_promoted` extends.
+        query!(
+            &b"[1, 2, 3]"[..],
+            ".[] | (if . == 1 then (.+10, .+20) elif . == 2 then . else . end)",
+            QueryResult::ManyOwned(v) => {
+                assert_eq!(
+                    v,
+                    vec![
+                        OwnedValue::Int(11),
+                        OwnedValue::Int(21),
+                        OwnedValue::NumberLiteral(NumberRepr::Int(2), "2".into()),
+                        OwnedValue::NumberLiteral(NumberRepr::Int(3), "3".into()),
+                    ]
+                );
+            }
+        );
     }
 
     /// #1755 positive control: valid data through each of the misc
