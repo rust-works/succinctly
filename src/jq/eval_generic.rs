@@ -6753,13 +6753,37 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
 /// to the pre-existing round-trip path, which already implements jq's
 /// per-output fan-out and yq's first-only truncation correctly (see this
 /// function's own call site for why that shape isn't reproduced here).
+///
+/// Guards `key_expr` against a live `input`/`inputs` queue before ever
+/// probing it, mirroring `eval_limit_generic`/`eval_first_or_last_generic`'s
+/// own #1309 guard (`limit_or_nth_uses_live_input_queue`) rather than a new
+/// copy of the same check: `has(inputs)` must fan out over the *rest* of the
+/// queue as a generator key on the round-trip path below, exactly like a
+/// bare `inputs` does elsewhere -- probing it here first via `eval_single`
+/// would drain the whole queue as a side effect before this function ever
+/// discovers it isn't a single value, leaving the fallback to run against an
+/// already-empty queue (code review, #1739).
+///
+/// Also mirrors `eval_limit_generic`'s bare-top-level-`Comma` static check
+/// (same doc comment, same reasoning): `has(("a","b"))`'s key is a generator
+/// by construction, so probing it here would run any side effect inside it
+/// (`has(("a"|stderr),"z")`) once during the probe and a second time when
+/// the fallback below re-evaluates the whole, unmodified `key_expr` from
+/// scratch -- detecting the shape statically, without ever calling
+/// `eval_single` on it, keeps the fallback's own evaluation the only one.
 fn eval_has_generic<S: EvalSemantics, V: DocumentValue>(
     key_expr: &Expr,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> Option<GenericResult<V>> {
-    let key_owned = match eval_single::<S, V>(key_expr, value.clone(), false, cursor) {
+    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(key_expr) {
+        return None;
+    }
+    if matches!(unwrap_paren(key_expr), Expr::Comma(_)) {
+        return None;
+    }
+    let key_owned = match eval_single::<S, V>(key_expr, value.clone(), optional, cursor) {
         GenericResult::One(v) => to_owned(&v).ok()?,
         GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
         GenericResult::Owned(v) => v,
@@ -6785,7 +6809,7 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     }
     match (&key_owned, value.as_object(), value.as_array()) {
         (OwnedValue::String(key), Some(fields), _) => {
-            GenericResult::Owned(OwnedValue::Bool(fields.find(key).is_some()))
+            GenericResult::Owned(OwnedValue::Bool(fields.contains(key)))
         }
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),

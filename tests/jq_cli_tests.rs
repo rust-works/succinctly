@@ -19916,6 +19916,44 @@ fn test_jq_truncating_combinators_do_not_drain_inputs_1309() -> Result<()> {
     Ok(())
 }
 
+/// #1739: `Builtin::Has`'s new native single-key arm in `eval_generic.rs`
+/// must not probe `key_expr` via a discarded `eval_single` call before
+/// checking whether it reaches the live `input`/`inputs` queue (the same
+/// #1309 class this file's `test_jq_truncating_combinators_do_not_drain_inputs_1309`
+/// pins for other builtins) -- an un-guarded probe would drain the whole
+/// queue as a side effect, then defer to the round-trip fallback, which
+/// finds nothing left. `has` doesn't truncate (it fans out over every
+/// remaining input, like `last`), so the queue must still end up fully
+/// consumed -- but exactly once, with every fanned-out result surviving.
+#[test]
+fn test_jq_has_generator_key_does_not_drain_inputs_via_the_native_probe_1739() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "has(inputs)"],
+        Some("{\"a\":1}\n\"a\"\n\"z\"\n\"q\"\n"),
+    )
+    .expect("has(inputs) repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "true\nfalse\nfalse\n");
+    Ok(())
+}
+
+/// #1739's other guard: a bare top-level `Comma` key (`has(("a","b"))`) must
+/// not be probed either, for a narrower reason than the queue guard above --
+/// probing it would run any side effect inside it once, and the fallback's
+/// full re-evaluation of the same, unmodified `key_expr` would run it a
+/// second time. Mirrors `eval_limit_generic`'s identical, already-shipped
+/// static check for `n_expr` (#1607).
+#[test]
+fn test_jq_has_generator_key_side_effect_runs_once_not_twice_1739() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[has((\"a\"|stderr),\"z\")]"], Some("{\"a\":1}\n"))
+            .expect("has generator-key side-effect repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "[true,false]\n");
+    assert_eq!(stderr, "a", "stderr side effect must fire exactly once");
+    Ok(())
+}
+
 /// The line-number half of the same fix: `input_line_number` reports the last
 /// document actually read, so a truncated `inputs` must leave it pointing at
 /// the document the consumer kept rather than at the end of the stream.

@@ -1113,6 +1113,23 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         result
     }
 
+    /// Whether any field has this key -- same undecodable-key skip as
+    /// [`find`](Self::find), but stops at the first match instead of
+    /// walking to the end to resolve last-duplicate-key-wins for a value
+    /// existence alone doesn't need (#1739).
+    pub fn contains(&self, name: &str) -> bool {
+        let mut fields = *self;
+        while let Some((field, rest)) = fields.uncons() {
+            if let StandardJson::String(key) = field.key() {
+                if key.as_str().is_ok_and(|k| k == name) {
+                    return true;
+                }
+            }
+            fields = rest;
+        }
+        false
+    }
+
     /// Find a field by name and return a cursor to its value.
     ///
     /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
@@ -2111,6 +2128,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
 
     fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
         JsonFields::find_cursor(self, name)
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        JsonFields::contains(self, name)
     }
 
     fn is_empty(&self) -> bool {
