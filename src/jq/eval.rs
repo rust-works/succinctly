@@ -35881,6 +35881,44 @@ mod tests {
         );
     }
 
+    /// #1755: the `_by` variants convert twice per item -- once for the
+    /// key filter's own output (`eval_array_construction`), once for the
+    /// item itself (whole-value `to_owned_checked`). A key filter that
+    /// avoids the malformed field (`.a` on `{"a":1,"b":"\xff\xfe"}`)
+    /// decodes fine, so this only reaches the *second* conversion's own
+    /// `Err` arm -- distinct coverage from
+    /// `test_sort_family_raises_on_decode_failure_1755` above, whose `.`
+    /// key filter always fails at the *first* conversion instead (the
+    /// whole item IS the key there), never reaching the second.
+    #[test]
+    fn test_by_variants_raise_on_item_decode_failure_after_valid_key_1755() {
+        for (json, expr) in [
+            (&b"[{\"a\":1,\"b\":\"\xff\xfe\"}]"[..], "sort_by(.a)"),
+            (&b"[{\"a\":1,\"b\":\"\xff\xfe\"}]"[..], "group_by(.a)"),
+            (&b"[{\"a\":1,\"b\":\"\xff\xfe\"}]"[..], "unique_by(.a)"),
+            (
+                &b"[{\"a\":1,\"b\":\"\xff\xfe\"},{\"a\":2,\"b\":\"ok\"}]"[..],
+                "min_by(.a)",
+            ),
+            (
+                &b"[{\"a\":1,\"b\":\"ok\"},{\"a\":2,\"b\":\"\xff\xfe\"}]"[..],
+                "max_by(.a)",
+            ),
+        ] {
+            query!(
+                json,
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "expr={expr} json={json:?} message: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+    }
+
     /// #1755: `eval_array_construction` (backs literal `[...]` array
     /// construction's homogeneous-comma case, and every `min_by`/
     /// `max_by`/`sort_by`/`group_by`/`unique_by` key computation via jq's
