@@ -46,7 +46,7 @@ const VALID_DEPTH: usize = 100;
 /// outer `cargo test` process group (`cargo-guard.sh` does this by design
 /// on a detected stall, #935/#1847).
 fn run(args: &[&str], stdin: &str) -> Result<(String, i32)> {
-    let output = spawn_with_signal_retry(
+    let (output, exit_code) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
             command.args(args);
@@ -55,12 +55,6 @@ fn run(args: &[&str], stdin: &str) -> Result<(String, i32)> {
         Some(stdin.as_bytes()),
     )?;
 
-    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
-    // itself; a real exit code is therefore always present here.
-    let exit_code = output
-        .status
-        .code()
-        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     let stdout = String::from_utf8(output.stdout)?;
     Ok((stdout, exit_code))
 }

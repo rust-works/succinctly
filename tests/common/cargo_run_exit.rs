@@ -160,22 +160,47 @@ pub fn succinctly_bin() -> &'static str {
 ///
 /// `build` is called fresh on each retry attempt, since a spawned
 /// `std::process::Command` cannot be reused. `stdout`/`stderr` are always
-/// piped; `stdin` is piped and `stdin_input` written to it only when
-/// `Some`, otherwise left at `Command`'s own default (`Stdio::null()` for
-/// `.output()`-style calls), matching every existing call site's prior
-/// behavior exactly.
+/// piped. `stdin` is piped and `stdin_input` written to it when `Some`;
+/// when `None`, `stdin` is explicitly set to `Stdio::null()` -- **not**
+/// left unconfigured, which would default to inheriting this test
+/// process's own stdin under `.spawn()` (unlike `.output()`, whose
+/// documented default *is* `Stdio::null()`; an earlier version of this
+/// function relied on that same default by simply never calling
+/// `.stdin(...)` in the `None` case, silently inheriting instead once
+/// converted to `.spawn()`/`.wait_with_output()` -- confirmed live: a
+/// spawned child with only stdout/stderr piped echoes back whatever this
+/// process's own stdin contains, where the old `.output()` calls it
+/// replaced saw immediate EOF). Getting this wrong reintroduces exactly
+/// the class of hang this whole conversion exists to eliminate, just
+/// relocated to stdin instead of an orphaned grandchild.
+///
+/// Retries sleep `100 * (attempt + 1)` ms between attempts, matching
+/// every pre-conversion call site's own backoff -- an immediate retry
+/// under the same sustained load that caused the first signal death (an
+/// OOM condition that hasn't cleared, a stall-guard still killing the
+/// process group) is more likely to be killed again in the same narrow
+/// window, burning through the retry budget faster than a short backoff
+/// would.
+///
+/// Returns the real exit code alongside the `Output` so callers never
+/// need their own `output.status.code().expect(...)` -- that invariant
+/// (a real code is always present in an `Ok` result) is asserted here
+/// exactly once, via [`exit_code_or_signal_death`], rather than
+/// re-asserted independently at every call site.
 pub fn spawn_with_signal_retry(
     mut build: impl FnMut() -> std::process::Command,
     stdin_input: Option<&[u8]>,
-) -> Result<std::process::Output> {
+) -> Result<(std::process::Output, i32)> {
     for attempt in 0..MAX_CARGO_RETRIES {
         let mut command = build();
         command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if stdin_input.is_some() {
-            command.stdin(std::process::Stdio::piped());
-        }
+            .stderr(std::process::Stdio::piped())
+            .stdin(if stdin_input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
         let mut child = command.spawn()?;
         if let Some(input) = stdin_input {
             use std::io::Write;
@@ -184,8 +209,8 @@ pub fn spawn_with_signal_retry(
             }
         }
         let output = child.wait_with_output()?;
-        if output.status.code().is_some() {
-            return Ok(output);
+        if let Some(code) = output.status.code() {
+            return Ok((output, code));
         }
         if attempt + 1 >= MAX_CARGO_RETRIES {
             // #1691: raw bytes, not a `String::from_utf8` decode of
@@ -195,6 +220,7 @@ pub fn spawn_with_signal_retry(
             exit_code_or_signal_death(output.status, &output.stderr)?;
             unreachable!("exit_code_or_signal_death errors whenever status.code() is None");
         }
+        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
     }
     unreachable!()
 }
