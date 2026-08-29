@@ -1,0 +1,1 @@
+. as $x | [path(reduce (keys) as $i (0; $x)), path(reduce (range(2)) as $i (0; $x)), path(reduce (1,2) as $i (0; $x))]

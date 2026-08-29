@@ -555,12 +555,28 @@ differs: falling through to `resolve_leaf`'s catch-all names the whole fold's ow
 ("Invalid path expression with result `{"a":1}`") rather than the destructuring step jq
 blames. That is the same catch-all wording every unresolvable filter already gets here, and
 is the general message-fidelity gap covered above, not a fold-specific one.
-The fold's **source expression** likewise matches jq for every shape tested but one: jq
-evaluates it with tracking on and fails only where it navigates *through* an untrackable
+**Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467):** the fold's
+**source expression** is now path-checked the same way jq checks it — `resolve_reduce`/
+`resolve_foreach` route the source through `resolve_node` (discarding its branches, keeping
+only the escape) before taking the actual values from the untracked evaluator. jq evaluates
+the source "with tracking on" and fails only where it navigates *through* an untrackable
 value, so `reduce (1,2) / (.a) / (.[]) / (keys) / (range(2)) as $i (0; $x)` all resolve in
-both, and only `reduce (keys[]) as $k (.; .)` diverges (jq raises "near attempt to iterate
-through [\"a\"]", succinctly accepts) — tracked as
-[#1467](https://github.com/rust-works/succinctly/issues/1467).
+both, and `reduce (keys[]) as $k (.; .)` now raises "near attempt to iterate through" in
+both too (live-verified against jq 1.7.1, both the `path(...)` read side and the `(reduce
+...) = 9` write side).
+
+That fix has one accepted cost: `resolve_node`'s general, non-primitive leaf (`resolve_leaf`,
+#986's deliberate defer-not-raise case) narrows a multi-output source to its first value
+alone, so its branches can't be reused as the fold's real values — the source's first output
+is therefore evaluated *twice*, once for the path-check, once more for the real value. A
+source whose first output has a side effect fires it twice where jq's single tracked
+evaluation fires it once: `. as $x | path(reduce (stderr) as $i (0; $x))` writes `{}` once
+to stderr in jq, `{}{}` in succinctly (measured directly, not by line count — `stderr`
+writes no trailing newline). The alternative — threading a new "keep every output while
+tracking" mode through `resolve_node`'s entire recursive dispatch so the fold's real values
+could be taken from the same single evaluation — was judged a materially larger, more
+invasive change to a widely-shared traversal for a narrow, side-effect-only divergence, and
+left as a documented trade-off rather than attempted.
 
 ## Duplicate object keys collapse, except under `--preserve-input`
 
