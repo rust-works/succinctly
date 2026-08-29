@@ -36708,6 +36708,26 @@ mod tests {
         );
     }
 
+    /// #1755: `add`/`flatten`/`from_entries`'s scalar (non-array,
+    /// non-object) fallback arm checks `scalar_decode_failure` before
+    /// consulting `optional`, matching the sort family's own precedent
+    /// (`scalar_decode_failure`'s doc comment) -- exercised here since the
+    /// two tests above only reach these three functions' array/object
+    /// arms, never their scalar fallback.
+    #[test]
+    fn test_direct_misc_family_scalar_fallback_1755() {
+        for expr in ["add", "flatten", "from_entries"] {
+            query!(
+                &b"\"\xff\xfe\""[..],
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+            query!(br"5", &format!("{expr}?"),
+                QueryResult::None => {}
+            );
+        }
+    }
+
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
     /// site checked `optional` before the decode check and silently
     /// swallowed the failure as `QueryResult::None`.
