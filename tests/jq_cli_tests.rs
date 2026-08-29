@@ -2618,6 +2618,50 @@ fn test_raw_output0_rejects_embedded_nul_via_materializing_path() -> Result<()> 
     Ok(())
 }
 
+/// #1830: `--input-dsv`'s own streaming loop (`jq_runner.rs`'s DSV branch)
+/// is a *third*, independently-wired call site of `write_output` -- code
+/// review found the PR's other tests never exercised it, so a copy-paste
+/// mistake specific to that site (wrong `at` variable, or breaking the
+/// wrong loop) would have gone completely undetected.
+#[test]
+fn test_raw_output0_rejects_embedded_nul_via_dsv_input() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["--input-dsv", ",", "-r", "--raw-output0", ".[1]"],
+        Some("a,b\0c,d\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
+/// #1830 code review: the pre-existing `--seq` RS-separator write ran
+/// *before* the new NUL check, so a rejected record still left a
+/// dangling, unterminated RS byte on stdout despite the process exiting
+/// 5 -- contradicting the check's own "no partial write" design.
+/// Reproduced against the built binary before the fix; pinned here so a
+/// future refactor doesn't reorder the two writes back apart.
+#[test]
+fn test_raw_output0_seq_leaves_no_dangling_separator_on_rejection() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-r", "--raw-output0", "--seq", "."],
+        Some("\x1e\"b\\u0000c\"\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert!(
+        out.is_empty(),
+        "must not leave a dangling RS byte (or anything else) on a rejected record: {out:?}"
+    );
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_unbuffered_flag() -> Result<()> {
     // Test that --unbuffered flag works (just verify it parses correctly)

@@ -860,6 +860,50 @@ impl std::fmt::Display for MalformedJsonError {
 
 impl std::error::Error for MalformedJsonError {}
 
+/// Route a `write_output`/`write_output_jq_value` error into jq's own
+/// diagnostic channel, or propagate it as a genuine I/O/internal failure
+/// -- the same `MalformedJsonError`-downcast dance `run_jq`'s own
+/// result-emission loops each used to hand-copy independently (code
+/// review, #1830: this PR took that copy from 1 site to 5, so it earned
+/// the extraction it didn't have before).
+///
+/// A malformed-document error (`#1194`, and now `#1830`'s NUL-content
+/// check) is a data error, not an I/O one: it belongs in jq's diagnostic
+/// channel (exit 5) rather than aborting the process through `anyhow`.
+/// Returns `Ok(true)` when the caller's per-document loop should `break`
+/// (stop emitting results for *this* document, but fall through to the
+/// halt check and carry on with the rest of the stream, #355) -- takes
+/// the already-produced `Result` rather than the write call itself
+/// (`fn(...) -> Result<()>`) because passing `&mut out` twice in one call
+/// expression (once for the write, once for this function's own
+/// `flush_then_err`) doesn't borrow-check; callers evaluate the write
+/// first, then hand the `Result` here.
+fn route_write_error<W: Write>(
+    sink: &mut ErrorSink,
+    out: &mut W,
+    at: &InputLocation,
+    write_result: Result<()>,
+) -> Result<bool> {
+    match write_result {
+        Ok(()) => Ok(false),
+        Err(e) => match e.downcast_ref::<MalformedJsonError>() {
+            Some(MalformedJsonError(err)) => {
+                sink.report(DiagStyle::Jq, err, at);
+                Ok(true)
+            }
+            // Same reasoning as the `--validate` early return elsewhere
+            // in this file (#1563): `out` can already hold buffered
+            // output from earlier documents/files in this same run, and
+            // a genuine (non-malformed-document) error here shouldn't
+            // leave that relying on `Drop`'s own best-effort,
+            // error-swallowing flush. `flush_then_err` (review of #1673)
+            // keeps `e` as the reported error even if the flush also
+            // fails, instead of the flush error silently displacing it.
+            None => flush_then_err(out, e),
+        },
+    }
+}
+
 /// Validate JSON bytes and print a formatted error message if invalid.
 /// Returns Ok(()) if valid, Err with exit code if invalid.
 fn validate_json_input(input: &[u8], filename: Option<&str>) -> Result<(), i32> {
@@ -1092,19 +1136,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         if args.exit_status {
                             last_output = Some(result.clone());
                         }
-                        // #1830: a `--raw-output0` NUL-content violation is
-                        // a data error belonging in jq's diagnostic channel
-                        // (exit 5), not a generic `anyhow` abort -- same
-                        // reasoning as `write_output_jq_value`'s own
-                        // `MalformedJsonError` handling below.
-                        if let Err(e) = write_output(&mut out, &result, &output_config) {
-                            match e.downcast_ref::<MalformedJsonError>() {
-                                Some(MalformedJsonError(err)) => {
-                                    sink.report(DiagStyle::Jq, err, &at.resolve());
-                                    break;
-                                }
-                                None => return flush_then_err(&mut out, e),
-                            }
+                        let write_result = write_output(&mut out, &result, &output_config);
+                        if route_write_error(&mut sink, &mut out, &at.resolve(), write_result)? {
+                            break;
                         }
                     }
                     // halt/halt_error (#791) outranks everything else,
@@ -1335,24 +1369,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     // the stream (#355) -- real jq stops at the first parse
                     // error instead, a divergence recorded in
                     // `docs/compliance/jq/limitations.md`.
-                    if let Err(e) = write_output_jq_value(&mut out, &result, &output_config) {
-                        match e.downcast_ref::<MalformedJsonError>() {
-                            Some(MalformedJsonError(err)) => {
-                                sink.report(DiagStyle::Jq, err, &at);
-                                break;
-                            }
-                            // Same reasoning as the `--validate` early
-                            // return above (#1563): `out` can already hold
-                            // buffered output from earlier documents/files
-                            // in this same run, and a genuine (non-malformed-
-                            // document) error here shouldn't leave that
-                            // relying on `Drop`'s own best-effort,
-                            // error-swallowing flush. `flush_then_err`
-                            // (review of #1673) keeps `e` as the reported
-                            // error even if the flush also fails, instead of
-                            // the flush error silently displacing it.
-                            None => return flush_then_err(&mut out, e),
-                        }
+                    let write_result = write_output_jq_value(&mut out, &result, &output_config);
+                    if route_write_error(&mut sink, &mut out, &at, write_result)? {
+                        break;
                     }
                     // result is dropped here, freeing its memory immediately
                 }
@@ -1487,22 +1506,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    // #1830: same `MalformedJsonError` routing as the
-                    // DSV/lazy-path writers above -- a NUL-content
-                    // violation is jq's own diagnostic-channel error
-                    // (exit 5), not a generic `anyhow` abort.
-                    if let Err(e) = write_output(&mut out, &result, &output_config) {
-                        match e.downcast_ref::<MalformedJsonError>() {
-                            Some(MalformedJsonError(err)) => {
-                                sink.report(
-                                    DiagStyle::Jq,
-                                    err,
-                                    &ErrorAt::Live(&locations).resolve(),
-                                );
-                                break;
-                            }
-                            None => return flush_then_err(&mut out, e),
-                        }
+                    let write_result = write_output(&mut out, &result, &output_config);
+                    if route_write_error(
+                        &mut sink,
+                        &mut out,
+                        &ErrorAt::Live(&locations).resolve(),
+                        write_result,
+                    )? {
+                        break;
                     }
                 }
                 if let Some(code) = sink.halted() {
@@ -1532,20 +1543,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     for result in results {
                         had_output = true;
                         last_output = Some(result.clone());
-                        // #1830: same `MalformedJsonError` routing as the
-                        // sibling loops above.
-                        if let Err(e) = write_output(&mut out, &result, &output_config) {
-                            match e.downcast_ref::<MalformedJsonError>() {
-                                Some(MalformedJsonError(err)) => {
-                                    sink.report(
-                                        DiagStyle::Jq,
-                                        err,
-                                        &ErrorAt::Live(&locations).resolve(),
-                                    );
-                                    break;
-                                }
-                                None => return flush_then_err(&mut out, e),
-                            }
+                        let write_result = write_output(&mut out, &result, &output_config);
+                        if route_write_error(
+                            &mut sink,
+                            &mut out,
+                            &ErrorAt::Live(&locations).resolve(),
+                            write_result,
+                        )? {
+                            break;
                         }
                     }
                     if let Some(code) = sink.halted() {
@@ -1564,16 +1569,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    // #1830: same `MalformedJsonError` routing as the
-                    // sibling loops above.
-                    if let Err(e) = write_output(&mut out, &result, &output_config) {
-                        match e.downcast_ref::<MalformedJsonError>() {
-                            Some(MalformedJsonError(err)) => {
-                                sink.report(DiagStyle::Jq, err, &at.resolve());
-                                break;
-                            }
-                            None => return flush_then_err(&mut out, e),
-                        }
+                    let write_result = write_output(&mut out, &result, &output_config);
+                    if route_write_error(&mut sink, &mut out, &at.resolve(), write_result)? {
+                        break;
                     }
                 }
                 if let Some(code) = sink.halted() {
@@ -3955,19 +3953,30 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
 ) -> Result<()> {
-    // In seq mode, prepend RS (Record Separator) before each value
-    if config.seq {
-        out.write_all(&[ASCII_RS])?;
-    }
-
     // Handle raw output for strings
     if config.raw_output {
         if let Some(s) = value.as_str() {
+            // #1830: checked before *any* byte of this record reaches
+            // the writer, including the `--seq` RS separator below --
+            // code review found the check placed after that write left
+            // a dangling, unterminated RS byte on stdout for a rejected
+            // record (`--seq --raw-output0` on a NUL-containing value),
+            // which is exactly the kind of partial write this function's
+            // own design is meant to avoid.
             reject_raw_output0_nul(&s, config)?;
+            // In seq mode, prepend RS (Record Separator) before each value
+            if config.seq {
+                out.write_all(&[ASCII_RS])?;
+            }
             out.write_all(s.as_bytes())?;
             write_terminator(out, config)?;
             return Ok(());
         }
+    }
+
+    // In seq mode, prepend RS (Record Separator) before each value
+    if config.seq {
+        out.write_all(&[ASCII_RS])?;
     }
 
     // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
@@ -4016,23 +4025,35 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 const ASCII_RS: u8 = 0x1E;
 
 fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
-    // In seq mode, prepend RS (Record Separator) before each value
-    if config.seq {
-        out.write_all(&[ASCII_RS])?;
-    }
-
-    let output = format_json(value, config);
-
     // Handle raw output for strings
     if config.raw_output {
         if let OwnedValue::String(s) = value {
+            // #1830: checked before *any* byte of this record reaches
+            // the writer, including the `--seq` RS separator below --
+            // same "no partial write on a rejected record" reasoning as
+            // `write_output_jq_value`'s sibling fix.
             reject_raw_output0_nul(s, config)?;
+            // In seq mode, prepend RS (Record Separator) before each value
+            if config.seq {
+                out.write_all(&[ASCII_RS])?;
+            }
             out.write_all(s.as_bytes())?;
             write_terminator(out, config)?;
             return Ok(());
         }
     }
 
+    // In seq mode, prepend RS (Record Separator) before each value
+    if config.seq {
+        out.write_all(&[ASCII_RS])?;
+    }
+
+    // Not computed until this non-raw fallthrough path actually needs it
+    // (code review, #1830) -- the raw-output early return above never
+    // touches it, so computing it unconditionally wasted a full
+    // JSON-formatting pass on every raw-output string reaching this
+    // writer (the "materializing path", `-n`/`inputs`/DSV input).
+    let output = format_json(value, config);
     out.write_all(output.as_bytes())?;
     write_terminator(out, config)?;
 
