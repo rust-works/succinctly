@@ -37621,6 +37621,16 @@ mod tests {
                 );
             }
         );
+        // `push_promoted`'s `Many(rs)` call site (not `One`): a batch of
+        // several cursor-backed outputs arrives after promotion has
+        // already happened, and the first one is undecodable.
+        query!(
+            &b"[1, [\"\xff\xfe\", \"b\"]]"[..],
+            ".[] | (if type == \"number\" then .+0 else .[] end)",
+            QueryResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(prefix, vec![OwnedValue::Int(1)]);
+            }
+        );
     }
 
     /// #1755 positive control: valid data through each of the misc
