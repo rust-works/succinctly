@@ -349,51 +349,59 @@ pub fn flush_then_err<W: std::io::Write, T>(
 /// properly instead of merely reporting it, but that is the larger
 /// refactor of both functions' control flow this issue itself deferred.
 ///
-/// Tracks whether an explicit `.flush()` call (`flush_then_err`'s own, or
-/// `--unbuffered`'s per-value flush) already observed and reported a
-/// failure, so `Drop`'s own flush attempt -- which always runs regardless
-/// of which path got the writer here -- doesn't print a second, redundant
-/// diagnostic for the exact same underlying failure the caller's own
-/// `Result` already carries.
-pub struct LoudFlushWriter<W: Write> {
-    inner: BufWriter<W>,
-    flush_already_failed: std::cell::Cell<bool>,
-}
+/// Deliberately does **not** try to suppress a redundant report when an
+/// explicit `.flush()` call (`flush_then_err`'s own, or `--unbuffered`'s
+/// per-value flush) already observed and reported the same failure: an
+/// earlier version tracked that case with a "already failed" flag, but the
+/// flag only fired on an explicit `flush()` call, not on `write`/
+/// `write_all` -- and `BufWriter`'s own `write`/`write_all` can trigger a
+/// real inner flush whenever an incoming write doesn't fit the remaining
+/// buffer capacity (the common case once the buffer fills during
+/// streaming, e.g. a broken pipe from `| head`). Extending the flag to
+/// also cover writes would make one transient failure permanently disable
+/// `Drop`'s own backstop for the rest of the process's life, silently
+/// reintroducing exactly the data-loss risk this type exists to close, on
+/// every later flush regardless of whether it might have actually
+/// succeeded. An occasional cosmetic second diagnostic line for the same
+/// underlying I/O condition is a much smaller cost than that, so `Drop`
+/// always attempts its own flush and always reports a failure, full stop.
+pub struct LoudFlushWriter<W: Write>(BufWriter<W>);
 
 impl<W: Write> LoudFlushWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self {
-            inner: BufWriter::new(inner),
-            flush_already_failed: std::cell::Cell::new(false),
-        }
+        Self(BufWriter::new(inner))
     }
 }
 
 impl<W: Write> Write for LoudFlushWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        self.0.write(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.inner.write_all(buf)
+        self.0.write_all(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let result = self.inner.flush();
-        if result.is_err() {
-            self.flush_already_failed.set(true);
-        }
-        result
+        self.0.flush()
     }
 }
 
 impl<W: Write> Drop for LoudFlushWriter<W> {
     fn drop(&mut self) {
-        if self.flush_already_failed.get() {
-            return;
-        }
-        if let Err(e) = self.inner.flush() {
-            eprintln!("succinctly: failed to flush output: {e}");
+        if let Err(e) = self.0.flush() {
+            // Not `eprintln!`, which panics if the write to stderr itself
+            // fails (its own documented behavior): if stdout is broken
+            // because the process's whole stdio is being torn down, a
+            // closing pipe often takes stderr down with it, and a
+            // panicking diagnostic here would turn what is supposed to be
+            // a graceful report into an abort -- or, if this fires while
+            // already unwinding from an unrelated panic elsewhere in the
+            // ~5,000-line eval call graph this writer is passed through,
+            // a double-panic process abort (SIGABRT) that skips any
+            // further cleanup or exit-code reporting entirely. Writing
+            // directly and discarding the result can't do either.
+            let _ = writeln!(std::io::stderr(), "succinctly: failed to flush output: {e}");
         }
     }
 }
@@ -1017,9 +1025,8 @@ mod tests {
 
     /// A `Write` mock whose `flush()` always fails while `write`/`write_all`
     /// always succeed, counting how many times the inner `flush()` was
-    /// actually invoked -- used to verify `LoudFlushWriter` (#1680) attempts
-    /// it exactly once, regardless of whether that one attempt happens via
-    /// an explicit caller flush or `Drop`'s own backstop.
+    /// actually invoked -- used to verify `LoudFlushWriter` (#1680) always
+    /// gives `Drop` a real, independent flush attempt of its own.
     struct FlushFailsWriter {
         flush_calls: std::rc::Rc<std::cell::Cell<usize>>,
     }
@@ -1038,14 +1045,16 @@ mod tests {
         }
     }
 
-    /// The redundancy this guards against: `flush_then_err` (or
-    /// `--unbuffered`'s per-value flush) already observed and will report
-    /// this exact failure through its own `Result` -- `Drop`'s own flush
-    /// attempt, which always runs regardless of how the writer's scope
-    /// ends, must not attempt (and therefore not separately report) the
-    /// same failure a second time.
+    /// `Drop` always attempts its own flush, even after an explicit caller
+    /// flush already failed -- deliberately not deduplicated (see the type's
+    /// own doc comment for why: a dedup flag keyed only on explicit
+    /// `.flush()` calls would miss the equally-common case where the
+    /// failure is only ever observed through a plain `write`/`write_all`
+    /// call, silently disabling the backstop for the rest of the writer's
+    /// life). The accepted cost is this occasional second, cosmetic
+    /// diagnostic line for the same underlying failure.
     #[test]
-    fn loud_flush_writer_skips_a_redundant_drop_flush_after_an_explicit_failure_1680() {
+    fn loud_flush_writer_drop_always_attempts_its_own_flush_1680() {
         let flush_calls = std::rc::Rc::new(std::cell::Cell::new(0));
         {
             let mut w = LoudFlushWriter::new(FlushFailsWriter {
@@ -1057,8 +1066,8 @@ mod tests {
         }
         assert_eq!(
             flush_calls.get(),
-            1,
-            "Drop must not re-flush after an already-observed failure"
+            2,
+            "Drop's own attempt runs regardless of an earlier explicit flush"
         );
     }
 
@@ -1067,7 +1076,7 @@ mod tests {
     /// attempt, from `Drop` -- unlike `std::io::BufWriter`'s own `Drop`,
     /// which would also attempt this but silently discard the result.
     #[test]
-    fn loud_flush_writer_flushes_exactly_once_on_drop_when_never_flushed_explicitly_1680() {
+    fn loud_flush_writer_flushes_on_drop_when_never_flushed_explicitly_1680() {
         let flush_calls = std::rc::Rc::new(std::cell::Cell::new(0));
         {
             let mut w = LoudFlushWriter::new(FlushFailsWriter {
@@ -1079,6 +1088,50 @@ mod tests {
             flush_calls.get(),
             1,
             "Drop's own attempt is the only one, and it must happen"
+        );
+    }
+
+    /// A `write`/`write_all` failure doesn't leave `LoudFlushWriter` in a
+    /// state where `Drop` skips its own flush attempt -- there is no
+    /// tracked "already failed" state to leave stale, unlike an earlier
+    /// version of this type that tracked explicit-flush failures only and
+    /// risked exactly this once extended to writes (see the type's own doc
+    /// comment).
+    #[test]
+    fn loud_flush_writer_drop_still_flushes_after_a_write_failure_1680() {
+        struct WriteFailsWriter {
+            flush_calls: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl std::io::Write for WriteFailsWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mock broken pipe",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flush_calls.set(self.flush_calls.get() + 1);
+                Ok(())
+            }
+        }
+
+        let flush_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let mut w = LoudFlushWriter::new(WriteFailsWriter {
+                flush_calls: flush_calls.clone(),
+            });
+            // A small `write_all` just lands in `BufWriter`'s own internal
+            // buffer without ever reaching the inner writer at all -- write
+            // past its default capacity so this actually exercises the
+            // inner `write()` call the real bug (#1680 review) is about.
+            assert!(w.write_all(&vec![0u8; 64 * 1024]).is_err());
+        }
+        assert_eq!(
+            flush_calls.get(),
+            1,
+            "a write failure must not suppress Drop's own flush attempt"
         );
     }
 
