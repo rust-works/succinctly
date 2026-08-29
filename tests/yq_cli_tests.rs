@@ -24144,7 +24144,7 @@ fn test_limit_and_nth_control_flow_1607() -> Result<()> {
 
     // A negative `n` is instead an error for `nth`, not unlimited --
     // `eval_nth_generic` must reproduce `builtin_nth_stream`'s classification
-    // (and its exact message), not `eval_nth_expr`'s different one.
+    // (and its exact message) via the same shared `classify_nth_n` (#1825).
     let (_, stderr, code) = run_yq_stdin_with_stderr(
         "nth(-1; keys|.[])",
         "a: 1\n",

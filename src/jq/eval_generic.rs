@@ -6040,12 +6040,12 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
 /// stops, mirroring `eval.rs`'s own `each_take_nth`.
 ///
 /// `n`'s classification ([`classify_nth_n`], shared with `builtin_nth_stream`
-/// so the two can't silently drift apart the way `classify_limit_n` was
-/// extracted to prevent, #1313) matches `Builtin::NthStream` exactly, not
-/// `eval_nth_expr`'s narrower integer-only rule — `Builtin::NthStream` is
-/// the arm real `nth(n; expr)` calls actually reach (see this function's
-/// call sites), so its classification is the one this native path must
-/// reproduce bug-for-bug.
+/// and `eval_nth_expr` so none of the three can silently drift apart the
+/// way `classify_limit_n` was extracted to prevent, #1313) matches
+/// `Builtin::NthStream` exactly — `Builtin::NthStream` is the arm real
+/// `nth(n; expr)` calls actually reach (see this function's call sites),
+/// so its classification is the one this native path must reproduce
+/// bug-for-bug.
 fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
     n_expr: &Expr,
     expr: &Expr,
