@@ -2991,6 +2991,64 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
     Ok(())
 }
 
+/// #1813: `colliding_display_key_error` (#1642) is built via
+/// `EvalError::decode_failure`, whose contract says the result "must never
+/// be suppressed by `?` or caught by `try`/`catch`" -- but `is_decode_failure`
+/// classified purely by matching `message` against a fixed literal list that
+/// didn't include this error's dynamic ("object key \"<key>\" is
+/// ambiguous: ...") text, so both `?` and `try`/`catch` treated it as an
+/// ordinary catchable error. Confirmed live before this fix: `sort?`
+/// silently produced no output at exit 0, and `try sort catch .` returned
+/// the message as a caught value instead of letting it escape.
+#[test]
+fn test_colliding_display_key_error_is_uncatchable_1813() -> Result<()> {
+    let dup_doc = r#"[{"\ud800":1,"\ud800":2}]"#;
+
+    let (out, err, code) = run_jq_full(&["sort?"], Some(dup_doc))?;
+    assert_ne!(
+        code, 0,
+        "`?` must not silently suppress a colliding-key error, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    let (out, err, code) = run_jq_full(&["try sort catch ."], Some(dup_doc))?;
+    assert_ne!(
+        code, 0,
+        "try/catch must not catch a colliding-key error, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    // `delpaths(...)?` specifically, called out by the issue: #1746 review
+    // added an `is_uncatchable()`-gated suppression bypass there.
+    let dup_obj = r#"{"\ud800":1,"\ud800":2}"#;
+    let (out, err, code) = run_jq_full(&["delpaths([[\"a\"]])?"], Some(dup_obj))?;
+    assert_ne!(
+        code, 0,
+        "delpaths(...)? must not silently suppress a colliding-key error, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    Ok(())
+}
+
+/// #1813 companion: a user's own `error(...)` call, even with the exact
+/// fixed suffix text `is_decode_failure` now also matches on, must stay
+/// ordinarily catchable -- the same `self.value.is_some()` guard #1660
+/// already established for the other decode-failure message literals
+/// covers this new one too, since `error(v)` is the only constructor that
+/// ever sets `value`.
+#[test]
+fn test_user_error_matching_colliding_key_suffix_stays_catchable_1813() -> Result<()> {
+    let filter = r#"try error("object key \"x\" is ambiguous: an undecodable key's display form collides with another key of the same name and cannot be represented") catch ("caught: " + .)"#;
+    let (out, err, code) = run_jq_full(&[filter], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        out.trim(),
+        "\"caught: object key \\\"x\\\" is ambiguous: an undecodable key's display form collides with another key of the same name and cannot be represented\""
+    );
+    Ok(())
+}
+
 /// #1642 follow-up: `-e`/`--exit-status` forces `JqValue::materialize()` on
 /// every result before `jq_runner.rs`'s own guarded `print_json` path ever
 /// runs (see `cursor_to_owned`'s doc comment in `src/jq/lazy.rs`) -- a

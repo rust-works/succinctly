@@ -1113,10 +1113,7 @@ impl DisplayKeyGuard {
 /// doesn't have, but "object" is the neutral term this message already
 /// uses for JSON's own object keys).
 pub fn colliding_display_key_error(key: &str) -> EvalError {
-    EvalError::decode_failure(alloc::format!(
-        "object key \"{key}\" is ambiguous: an undecodable key's display form \
-         collides with another key of the same name and cannot be represented"
-    ))
+    EvalError::colliding_display_key(key)
 }
 
 /// The full display-key resolution sequence a `to_owned`-shaped materializer

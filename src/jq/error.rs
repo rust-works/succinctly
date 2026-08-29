@@ -965,6 +965,28 @@ impl EvalError {
         Self::new(reason)
     }
 
+    /// `object key "<key>" is ambiguous: ...` (#1642) — a #1620-class
+    /// decode failure in its own right: two distinct undecodable keys
+    /// whose display fallback collides, so keeping the second silently
+    /// overwrites the first. [`Self::is_decode_failure`] recognizes the
+    /// fixed suffix this constructor always appends, the same way
+    /// [`Self::invalid_path_expression`] and its own `is_*` check share a
+    /// prefix constant, so the two can never independently drift out of
+    /// sync (confirmed live before this fix, #1813: this previously built
+    /// its message ad hoc via `format!` at its one call site in
+    /// `document.rs`, and `is_decode_failure`'s fixed literal list didn't
+    /// include it — `try sort catch .` and `sort?` both wrongly treated
+    /// this as an ordinary catchable error).
+    pub fn colliding_display_key(key: &str) -> Self {
+        Self::new(format!(
+            "object key \"{key}\" is ambiguous{}",
+            Self::COLLIDING_DISPLAY_KEY_SUFFIX
+        ))
+    }
+
+    const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": an undecodable key's display form \
+         collides with another key of the same name and cannot be represented";
+
     /// Whether this is a [`Self::decode_failure`] — see #1620/#1660. Every
     /// `?`/`try`/`catch` boundary consults this so a decode failure passes
     /// through unmatched instead of being suppressed, the same way
@@ -1004,7 +1026,7 @@ impl EvalError {
                 | "invalid escape sequence in string"
                 | "invalid unicode escape sequence"
                 | "invalid escape sequence"
-        )
+        ) || self.message.ends_with(Self::COLLIDING_DISPLAY_KEY_SUFFIX)
     }
 
     /// Whether this error class is *always* uncatchable, with no positional
