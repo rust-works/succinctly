@@ -23950,16 +23950,17 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1755: to_owned_checked, not to_owned -- an undecodable starting
+    // value must raise unconditionally, before it ever reaches
+    // `finish_fork`'s own `Some(Control::Error(_)) if optional` arm,
+    // which would otherwise silently suppress it.
+    let initial = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
-    let result = until_step::<S>(
-        cond,
-        update,
-        to_owned(&value),
-        optional,
-        &mut outputs,
-        &mut budget,
-    );
+    let result = until_step::<S>(cond, update, initial, optional, &mut outputs, &mut budget);
     finish_fork(outputs, result.err(), optional)
 }
 
@@ -24054,16 +24055,15 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1755: to_owned_checked, not to_owned -- see `eval_until`'s
+    // identical reasoning.
+    let initial = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut budget = WHILE_UNTIL_MAX_STEPS;
-    let result = while_step::<S>(
-        cond,
-        update,
-        to_owned(&value),
-        optional,
-        &mut outputs,
-        &mut budget,
-    );
+    let result = while_step::<S>(cond, update, initial, optional, &mut outputs, &mut budget);
     finish_fork(outputs, result.err(), optional)
 }
 
@@ -24145,7 +24145,12 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- see `eval_until`'s
+    // identical reasoning.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut outputs: Vec<OwnedValue> = Vec::new();
     // Bounds the round count for the one case a per-value budget can't
     // reach: an `expr` that produces zero outputs every round (e.g.
@@ -24345,8 +24350,15 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1755: to_owned_checked, not to_owned -- an undecodable root value
+    // must raise, not silently become "" and get visited/output as if it
+    // were the real value.
+    let root = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
+    let mut stack: Vec<OwnedValue> = vec![root];
     // Set by `queue_recurse_children` once `f`'s own evaluation at some node
     // ends in an error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
@@ -24414,8 +24426,14 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1755: to_owned_checked, not to_owned -- see `builtin_recurse_f`'s
+    // identical reasoning.
+    let root = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut outputs: Vec<OwnedValue> = Vec::new();
-    let mut stack: Vec<OwnedValue> = vec![to_owned(&value)];
+    let mut stack: Vec<OwnedValue> = vec![root];
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
@@ -24482,7 +24500,12 @@ fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- see `eval_until`'s
+    // identical reasoning (this function also finishes via `finish_fork`).
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let (vals, control) = walk_impl::<S>(f, owned, optional);
     finish_fork(vals, control, optional)
 }
@@ -27014,7 +27037,12 @@ fn builtin_tostream<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise, not silently stream events for "" in its place.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let mut events = Vec::new();
     collect_tostream_events(&owned, &mut Vec::new(), &mut events);
     // Always non-empty: every value (including an empty container or a
@@ -36893,6 +36921,72 @@ mod tests {
                 assert!(!o.contains_key("a"));
                 assert_eq!(o.get("b"), Some(&OwnedValue::Int(2)));
             }
+        );
+    }
+
+    /// #1755: `until`/`while`/`repeat`/`recurse(f)`/`recurse(f;cond)`/
+    /// `walk`/`tostream` all convert their starting value once, upfront,
+    /// via a single `to_owned` call feeding the whole traversal -- an
+    /// undecodable value must raise there, not silently become `""` and
+    /// get visited/output/streamed as if it were the real value. `until`/
+    /// `while`/`walk` also route through `finish_fork`, whose own
+    /// `Some(Control::Error(_)) if optional` arm would otherwise silently
+    /// suppress this exact failure -- checked unconditionally before that
+    /// arm is ever reached.
+    #[test]
+    fn test_recurse_walk_family_raises_on_decode_failure_1755() {
+        for expr in [
+            "until(true; .)",
+            "while(false; .)",
+            "[limit(1; repeat(.))]",
+            "[recurse(empty)]",
+            "[recurse(empty; true)]",
+            "walk(.)",
+            "tostream",
+        ] {
+            query!(
+                &b"\"\xff\xfe\""[..],
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+        }
+    }
+
+    /// #1755 positive control: valid data through each of the recurse/walk
+    /// family's dispatch points is unaffected by routing through
+    /// `to_owned_checked`.
+    #[test]
+    fn test_recurse_walk_family_valid_data_unaffected_1755() {
+        query!(br"1", "until(.>=3; .+1)",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(3)); }
+        );
+        query!(br"1", "[while(.<3; .+1)]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        query!(br"1", "[limit(2; repeat(.+1))]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(2), OwnedValue::Int(2)]);
+            }
+        );
+        query!(br"[1,[2]]", "[recurse]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v.len(), 4); // [1,[2]], 1, [2], 2
+            }
+        );
+        query!(br"[1,2]", "[recurse(.[]?; . < 2)]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v[0], OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]));
+            }
+        );
+        query!(br"[1,2]", "walk(if type == \"number\" then .+1 else . end)",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        query!(br"[1]", "[tostream]",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
         );
     }
 
