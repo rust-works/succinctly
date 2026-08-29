@@ -25560,3 +25560,115 @@ fn test_jq_mode_root_del_still_null_after_1702() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// #1428: autovivification must not outlive a write that never happens
+// =============================================================================
+
+/// Walking to a write target autovivifies every missing step on the way, but
+/// an `Iterate` over the `Null` that creates has no elements to assign to, so
+/// the write never happens and the fabricated chain was left behind. jq treats
+/// path collection as read-only until a write is confirmed.
+///
+/// Every expectation here is the pinned jq 1.7.1's own output.
+#[test]
+fn test_suppressed_write_leaves_no_autovivified_chain_1428() -> Result<()> {
+    for (input, filter, expected) in [
+        // The issue's own repros.
+        ("null", ".a[]? = 9", "null\n"),
+        ("[1,2,3]", ".[5][]?[0] = 9", "[1,2,3]\n"),
+        ("null", ".a.b[]?[0] = 9", "null\n"),
+        // An *existing* object must not gain the key either.
+        ("{}", ".a[]? = 9", "{}\n"),
+        // Depth is not special: nothing at any level survives.
+        ("null", ".a.b.c[]? = 9", "null\n"),
+        // A tail after the iterate behaves the same.
+        ("null", ".a[]?.b = 9", "null\n"),
+        ("null", ".a[]?.b[]? = 9", "null\n"),
+        // `|=` shares the walker and the bug.
+        ("null", ".a[]? |= .+1", "null\n"),
+        ("{}", ".a[]? |= .+1", "{}\n"),
+        ("null", ".a[]?.b |= 9", "null\n"),
+        // ...and so do the compound operators built on it.
+        ("null", ".a[]? += 1", "null\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+    Ok(())
+}
+
+/// The other half of #1428, and the reason a naive "never autovivify" fix is
+/// wrong: a `?`-suppressed write that *does* happen still creates its chain.
+#[test]
+fn test_confirmed_write_still_autovivifies_1428() -> Result<()> {
+    for (input, filter, expected) in [
+        // `?` on a step that resolves: the write lands, so the chain stays.
+        ("null", ".a[0]? = 9", "{\"a\":[9]}\n"),
+        ("null", ".a?.b = 9", "{\"a\":{\"b\":9}}\n"),
+        // No `?` at all -- ordinary autovivification, untouched.
+        ("null", ".a = 9", "{\"a\":9}\n"),
+        ("null", ".a.b = 9", "{\"a\":{\"b\":9}}\n"),
+        ("null", ".a[2] |= 9", "{\"a\":[null,null,9]}\n"),
+        // A real iterate target writes to every element.
+        ("{\"a\":[1,2]}", ".a[]? = 9", "{\"a\":[9,9]}\n"),
+        ("{\"a\":{\"k\":1}}", ".a[]? = 9", "{\"a\":{\"k\":9}}\n"),
+        // An empty container is a legitimate zero-element write, and the key
+        // already exists, so the document is unchanged either way.
+        ("{\"a\":[]}", ".a[]? = 9", "{\"a\":[]}\n"),
+        // A slice write on a missing parent genuinely writes -- it must not be
+        // skipped along with the iterate cases.
+        ("null", ".a[0:1]? = [9]", "{\"a\":[9]}\n"),
+        // One path writing and another not, in a single assignment.
+        ("null", "(.a[]?, .b) = 9", "{\"b\":9}\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+    Ok(())
+}
+
+/// #1428 must not turn a genuine error into a silent no-op. The first version
+/// of the fix did exactly that -- reporting "absent" for a wrong-type
+/// container let the walker skip errors jq still raises, 59 of them across a
+/// differential sweep.
+///
+/// The distinction that matters: a `?` binds to the component it is written
+/// on. In `[] | .a[]? = 9` it is on the *iterate*, so the `.a`-on-an-array
+/// type error is still raised.
+#[test]
+fn test_suppressed_write_still_raises_real_type_errors_1428() -> Result<()> {
+    for (input, filter, needle) in [
+        ("[]", ".a[]? = 9", "Cannot index array with string"),
+        ("5", ".a[]? = 9", "Cannot index number with string"),
+        ("\"s\"", ".a.b[]? = 9", "Cannot index string with string"),
+        ("true", ".a[]?[0] = 9", "Cannot index boolean with string"),
+        (
+            "{\"a\":1}",
+            ".a.b[]? = 9",
+            "Cannot index number with string",
+        ),
+        ("{}", ".[5][]?[0] = 9", "Cannot index object with number"),
+        // No `?` anywhere: iterating a null still raises, and the document is
+        // never emitted, so nothing can be left fabricated in it.
+        ("null", ".a[] = 9", "Cannot iterate over null"),
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_ne!(code, 0, "{input} | {filter} must fail");
+        assert!(
+            stderr.contains(needle),
+            "{input} | {filter} -- want {needle:?}, got {stderr}"
+        );
+    }
+
+    // A `?` on an *earlier* component cancels the whole write, and must not be
+    // mistaken for "the parent is missing, go probe the tail" -- doing so
+    // manufactured a `Cannot iterate over null` that jq never raises (this is
+    // #1298's own case, which caught the second wrong version of this fix).
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a?.b[].c = 9"], Some("5"))?;
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(stdout, "5\n");
+    Ok(())
+}

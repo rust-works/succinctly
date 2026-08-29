@@ -16827,6 +16827,38 @@ fn write_index(arr: &mut Vec<OwnedValue>, idx: i64) -> Result<&mut OwnedValue, E
     Ok(&mut arr[actual_idx])
 }
 
+/// #1428: does reaching `tail` from a *freshly created* parent actually write
+/// anything?
+///
+/// Walking to a write target autovivifies every missing step on the way, but
+/// some tails then write nothing at all -- an `Iterate` over the `Null` that
+/// autovivification just produced has no elements to assign to. jq treats path
+/// collection as read-only until a write is confirmed, so it leaves the
+/// document alone; succinctly used to leave the fabricated chain behind
+/// (`null | .a[]? = 9` gave `{"a":null}` instead of `null`).
+///
+/// Running the real tail against a detached `Null` answers the question
+/// without touching the document, and without a second copy of the walking
+/// rules that could drift from the one that does the writing:
+///
+/// * it raises -> the error propagates and the document stays pristine
+///   (matching jq, which emits no document for `null | .a[] = 9` either);
+/// * it leaves the probe `Null` -> nothing would be written, so the caller
+///   must not create anything;
+/// * it leaves a value behind -> something genuinely wants that parent. yq's
+///   own `null`-to-`[]` autovivify (#1181: `null | .a[] = 99` is `{"a": []}`
+///   in real yq) lands here, so the caller goes on to build the chain.
+///
+/// Only called when the parent is known to be missing, so the common case
+/// pays nothing.
+fn tail_writes_from_fresh_parent(
+    run: impl FnOnce(&mut OwnedValue) -> Result<(), EvalError>,
+) -> Result<bool, EvalError> {
+    let mut probe = OwnedValue::Null;
+    run(&mut probe)?;
+    Ok(!matches!(probe, OwnedValue::Null))
+}
+
 /// Set a value at a path in an owned value.
 fn set_path(
     root: &mut OwnedValue,
@@ -16873,7 +16905,55 @@ fn set_path(
             if exprs.len() == 1 {
                 set_path(root, &exprs[0], new_value, scalar_noop, container_noop)
             } else if let Some(split) = split_at_iterate(exprs) {
-                match get_path_mut(root, &split.before, scalar_noop)? {
+                // #1428: walking to `split.before` autovivifies every missing
+                // step along the way, but an `Iterate` over the `Null` that
+                // creates yields *no* elements, so the tail writes nothing and
+                // the fabricated chain is stranded -- `null | .a[]? = 9` gave
+                // `{"a":null}` where jq leaves `null` untouched. jq treats path
+                // collection as read-only until a write is confirmed.
+                //
+                // Ask first whether `before` already resolves. If it does, no
+                // creation can happen and this is the pre-existing path,
+                // unchanged. If it does not, run the *same* tail against a
+                // detached `Null` to learn what reaching it would actually do,
+                // without touching `root`:
+                //
+                // * it raises (`.a[] = 9`, no `?`) -> propagate, `root` still
+                //   pristine, matching jq, which also emits no document;
+                // * it writes nothing -> return without creating anything;
+                // * it leaves a value behind -> yq's own `null`-to-`[]`
+                //   autovivify (#1181, `null | .a[] = 99` is `{"a": []}` in
+                //   real yq) genuinely wants the chain, so fall through and
+                //   build it for real.
+                //
+                // Probing costs one extra walk only when `before` is missing,
+                // and `new_value` is an already-computed value, so evaluating
+                // the tail twice cannot double any side effect.
+                let mut would_create = false;
+                if get_path_mut(root, &split.before, scalar_noop, false, &mut would_create)?
+                    .is_none()
+                    // Only when the parent is genuinely *missing*. A `None`
+                    // because an earlier component was `?`-suppressed
+                    // (`5 | .a?.b[].c = 9`) means the write is already
+                    // cancelled, and probing the tail from a `Null` would
+                    // manufacture a "Cannot iterate over null" that jq never
+                    // raises -- the creating walk below returns `Ok(())` for
+                    // that case on its own, exactly as it did before #1428.
+                    && would_create
+                    && !tail_writes_from_fresh_parent(|probe| {
+                        set_path_through_iterate(
+                            probe,
+                            split.optional,
+                            &split.tail,
+                            new_value.clone(),
+                            scalar_noop,
+                            container_noop,
+                        )
+                    })?
+                {
+                    return Ok(());
+                }
+                match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
                     None => Ok(()),
                     Some(target) => set_path_through_iterate(
                         target,
@@ -16885,7 +16965,7 @@ fn set_path(
                     ),
                 }
             } else if let Some(split) = split_at_slice(exprs) {
-                match get_path_mut(root, &split.before, scalar_noop)? {
+                match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
                     None => Ok(()),
                     Some(parent) => through_slice(
                         parent,
@@ -16911,7 +16991,31 @@ fn set_path(
                 let parent_path = &exprs[..exprs.len() - 1];
                 let last_path = &exprs[exprs.len() - 1];
 
-                match get_path_mut(root, parent_path, scalar_noop)? {
+                // #1428, same guard as the `split_at_iterate` arm above --
+                // needed separately because a *terminal* `Iterate`
+                // (`.a[]? = 9`) is explicitly not `split_at_iterate`'s case
+                // and lands here instead. A terminal `Field`/`Index` probe
+                // writes into the detached `Null` and so falls straight
+                // through, leaving `null | .a = 9` and friends untouched.
+                let mut would_create = false;
+                if get_path_mut(root, parent_path, scalar_noop, false, &mut would_create)?
+                    .is_none()
+                    // See the `split_at_iterate` arm above.
+                    && would_create
+                    && !tail_writes_from_fresh_parent(|probe| {
+                        set_path(
+                            probe,
+                            last_path,
+                            new_value.clone(),
+                            scalar_noop,
+                            container_noop,
+                        )
+                    })?
+                {
+                    return Ok(());
+                }
+
+                match get_path_mut(root, parent_path, scalar_noop, true, &mut false)? {
                     None => Ok(()),
                     Some(parent) => {
                         set_path(parent, last_path, new_value, scalar_noop, container_noop)
@@ -17558,6 +17662,8 @@ fn get_path_mut<'a>(
     root: &'a mut OwnedValue,
     path_parts: &[Expr],
     scalar_noop: bool,
+    create: bool,
+    would_create: &mut bool,
 ) -> Result<Option<&'a mut OwnedValue>, EvalError> {
     let mut current = root;
     // A working copy, not a plain slice iteration: `resolve_node`'s `?` arm
@@ -17613,12 +17719,37 @@ fn get_path_mut<'a>(
         current = match part {
             Expr::Identity => current,
             Expr::Field(name) => {
-                autovivify_object(current);
+                if create {
+                    autovivify_object(current);
+                } else if matches!(current, OwnedValue::Null) {
+                    // #1428 probe mode: a `Null` here is exactly what the
+                    // creating walk would autovivify, so report "absent".
+                    *would_create = true;
+                    return Ok(None);
+                }
                 if let OwnedValue::Object(map) = current {
-                    map.entry(name.clone()).or_insert(OwnedValue::Null)
+                    if create {
+                        map.entry(name.clone()).or_insert(OwnedValue::Null)
+                    } else {
+                        // Probe mode: a missing key is likewise something the
+                        // creating walk would add.
+                        match map.get_mut(name) {
+                            Some(existing) => existing,
+                            None => {
+                                *would_create = true;
+                                return Ok(None);
+                            }
+                        }
+                    }
                 } else if optional || noop_here {
                     return Ok(None);
                 } else {
+                    // Probe mode falls through to the *same* error the
+                    // creating walk raises. Reporting "absent" here instead
+                    // would let the caller skip a genuine type error --
+                    // `[] | .a[]? = 9` must still raise `Cannot index array
+                    // with string "a"`, because the `?` is on the iterate,
+                    // not on the field.
                     return Err(EvalError::cannot_index_with_field(
                         owned_type_name(current),
                         name,
@@ -17626,15 +17757,37 @@ fn get_path_mut<'a>(
                 }
             }
             Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
-                autovivify_array(current);
+                if create {
+                    autovivify_array(current);
+                } else if matches!(current, OwnedValue::Null) {
+                    // Probe mode, as in the `Field` arm above.
+                    *would_create = true;
+                    return Ok(None);
+                }
                 if let OwnedValue::Array(arr) = current {
-                    // A still-negative index is the write-time bounds check,
-                    // not a walking failure, so `?` never covers it here
-                    // either — same reasoning as `set_path`'s `Expr::Optional`
-                    // arm, just with nothing to catch: `write_index` never
-                    // returns that error for a component this function can
-                    // itself elect to suppress.
-                    write_index(arr, *idx)?
+                    if !create {
+                        // Probe mode. `resolve_setpath_index` is shared with
+                        // `write_index`, so the index arithmetic (negative
+                        // indices in particular) cannot drift between the
+                        // probing and the creating walk; an index past the end
+                        // is what `write_index` would pad to, i.e. absent.
+                        let actual = resolve_setpath_index(&OwnedValue::Int(*idx), arr.len())?;
+                        match arr.get_mut(actual) {
+                            Some(existing) => existing,
+                            None => {
+                                *would_create = true;
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        // A still-negative index is the write-time bounds check,
+                        // not a walking failure, so `?` never covers it here
+                        // either — same reasoning as `set_path`'s `Expr::Optional`
+                        // arm, just with nothing to catch: `write_index` never
+                        // returns that error for a component this function can
+                        // itself elect to suppress.
+                        write_index(arr, *idx)?
+                    }
                 } else if optional || noop_here {
                     return Ok(None);
                 } else {
@@ -17670,6 +17823,13 @@ fn update_path<S: EvalSemantics>(
     optional: bool,
     scalar_noop: bool,
 ) -> Result<(), EvalEscape> {
+    // #1428 is a jq-mode divergence, and deliberately stays one: real yq
+    // *wants* the chain a suppressed write leaves behind (`null | .a[] = 99`
+    // is `{"a": []}` there, #1181), so undoing it in yq mode would trade one
+    // divergence for another. `set_path`'s sibling guard needs no such flag --
+    // it probes the real tail, and yq's own `null`-to-`[]` autovivify makes
+    // that probe come back non-`Null`, so it falls through on its own.
+    let undo_stranded = S::TAG != EvalTag::Yq;
     // yq's slice-write container no-op (#1142) is unconditional on the
     // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
     // `-=`/`*=`) -- so it only needs `S::TAG`, not threading through every
@@ -17809,10 +17969,50 @@ fn update_path<S: EvalSemantics>(
 
                 match first {
                     Expr::Field(name) => {
+                        // #1428: mirror of the guard in `set_path`'s own
+                        // chain arms, in the shape this recursive walker
+                        // allows. `set_path` probes a detached `Null` up
+                        // front because its parent chain is built inside
+                        // `get_path_mut`'s loop, which cannot be walked back
+                        // up; here the frame that creates the slot is still
+                        // live when the recursion returns, so it can simply
+                        // undo it. Probing would be wrong on this side
+                        // anyway: `filter_expr` is a *filter*, and running it
+                        // once to decide and again for real would double any
+                        // side effect it has.
+                        //
+                        // A mid-chain slot left `Null` by the recursion was
+                        // never written: every component that can follow one
+                        // (`Field`/`Index`/`Iterate`/`Slice`) leaves a
+                        // container behind when it does write, and a bare
+                        // `.a |= null` is a *terminal* `Field`, handled by
+                        // the arm below rather than here.
+                        let root_was_null = matches!(root, OwnedValue::Null);
                         autovivify_object(root);
                         if let OwnedValue::Object(map) = root {
-                            let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                            update_path::<S>(current, &rest, filter_expr, optional, scalar_noop)
+                            let created = !map.contains_key(name);
+                            let (result, stranded) = {
+                                let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
+                                let result = update_path::<S>(
+                                    current,
+                                    &rest,
+                                    filter_expr,
+                                    optional,
+                                    scalar_noop,
+                                );
+                                let stranded = created
+                                    && result.is_ok()
+                                    && undo_stranded
+                                    && matches!(*current, OwnedValue::Null);
+                                (result, stranded)
+                            };
+                            if stranded {
+                                map.shift_remove(name);
+                                if root_was_null && map.is_empty() {
+                                    *root = OwnedValue::Null;
+                                }
+                            }
+                            result
                         } else if here
                             // #1232: this mid-chain arm is a separately-
                             // maintained copy of the terminal `Expr::Field`
@@ -17831,15 +18031,35 @@ fn update_path<S: EvalSemantics>(
                         }
                     }
                     Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+                        // #1428: see the `Field` arm above. `write_index` pads
+                        // with `Null`s to reach a positive out-of-range index,
+                        // so the undo restores the original length rather than
+                        // removing a single slot.
+                        let root_was_null = matches!(root, OwnedValue::Null);
                         autovivify_array(root);
                         if let OwnedValue::Array(arr) = root {
-                            update_path::<S>(
-                                write_index(arr, *idx)?,
-                                &rest,
-                                filter_expr,
-                                optional,
-                                scalar_noop,
-                            )
+                            let original_len = arr.len();
+                            let (result, stranded) = {
+                                let current = write_index(arr, *idx)?;
+                                let result = update_path::<S>(
+                                    current,
+                                    &rest,
+                                    filter_expr,
+                                    optional,
+                                    scalar_noop,
+                                );
+                                let stranded = result.is_ok()
+                                    && undo_stranded
+                                    && matches!(*current, OwnedValue::Null);
+                                (result, stranded)
+                            };
+                            if stranded && arr.len() > original_len {
+                                arr.truncate(original_len);
+                                if root_was_null && arr.is_empty() {
+                                    *root = OwnedValue::Null;
+                                }
+                            }
+                            result
                         } else if here || noop_scalar {
                             Ok(())
                         } else {
@@ -55003,6 +55223,8 @@ mod tests {
             &mut root,
             &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
             false,
+            true,
+            &mut false,
         )
         .unwrap()
         .unwrap();
@@ -58808,7 +59030,8 @@ mod tests {
         #[test]
         fn test_get_path_mut_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = get_path_mut(&mut root, &[unresolved()], false).unwrap_err();
+            let err =
+                get_path_mut(&mut root, &[unresolved()], false, true, &mut false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in path component"
@@ -58905,7 +59128,8 @@ mod tests {
         #[test]
         fn test_get_path_mut_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = get_path_mut(&mut root, &[unresolved()], false).unwrap_err();
+            let err =
+                get_path_mut(&mut root, &[unresolved()], false, true, &mut false).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in path component"
