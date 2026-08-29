@@ -21917,20 +21917,20 @@ fn test_yq_regex_pattern_coercion_container_known_gap_1443() -> Result<()> {
     Ok(())
 }
 
-/// #1443: `split(re; flags)` -- a real yq builtin, unlike `gsub`/`scan`/
-/// `splits` which share this same helper but are succinctly's own
-/// extensions -- also coerces a numeric pattern instead of erroring.
-/// Asserts only that it no longer errors, not the exact output shape:
-/// `split`'s own output already diverges from real yq for an unrelated,
-/// already-tracked reason (#1439 -- succinctly does a real regex split,
-/// real yq's own `split(re;flags)` doesn't remove the matched delimiter
-/// at all), live-verified independently of this fix
-/// (`split("[0-9]";"g")` on `"a1b2c"` is `["a","1","b","2","c"]` in real
-/// yq, `["a","b","c"]` in succinctly, both before and after this change).
+/// #1443's own pattern-coercion fix is now moot for `split` specifically
+/// (superseded by #1439, not just "still not erroring"): once arity
+/// reaches 2, yq mode never evaluates the pattern at all, so a numeric
+/// pattern was never actually "coerced" here in the first place -- it's
+/// simply ignored, the same as any other pattern would be. This test used
+/// to assert only `code == 0` (not the exact output), since #1439 hadn't
+/// resolved `split`'s output shape yet at the time; now that it has, this
+/// checks the real, oracle-matched output too.
 #[test]
 fn test_yq_split_regex_pattern_coerces_1443() -> Result<()> {
     let (out, code) = run_yq_stdin("split(1;\"g\")", "a1c", &["-o", "json"])?;
     assert_eq!(code, 0, "out={out}");
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!(["a", "1", "c"]));
     Ok(())
 }
 
@@ -22194,15 +22194,137 @@ fn test_yq_scan_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
     Ok(())
 }
 
-/// `split(re;flags)` *is* a real yq builtin, but has its own separate,
-/// unresolved algorithm mismatch (#1439) -- #1255 deliberately doesn't
-/// touch it. Guards `builtin_split_regex`'s hardcoded `JqSemantics` call.
+/// `split(re;flags)`'s hardcoded `JqSemantics` zero-width-match call
+/// (#1255) is guarded here in **jq mode**, not yq: #1439 resolved yq
+/// mode's own separate mystery by finding it never reaches
+/// `split_regex_resolved`/`global_captures` at all once arity reaches 2
+/// (it dispatches to a plain char-split, ignoring the pattern
+/// completely) -- so `run_yq_stdin` on this exact filter no longer
+/// exercises the code this test exists to pin, and jq mode is now the
+/// only spelling that does. `run_jq_stdin`, not `run_yq_stdin`, is
+/// therefore the fix, not a substitution of convenience.
 #[test]
-fn test_yq_split_regex_keeps_jq_style_zero_width_1255() -> Result<()> {
-    let (output, code) = run_yq_stdin(r#"split("a*"; "g")"#, "\"bab\"\n", &["-o", "json"])?;
+fn test_jq_split_regex_keeps_zero_width_1255() -> Result<()> {
+    let (output, _stderr, code) =
+        run_jq_stdin_with_stderr(r#"split("a*"; "g")"#, "\"bab\"\n", &["-c"])?;
     assert_eq!(code, 0, "output: {output:?}");
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v, serde_json::json!(["", "b", "", "b", ""]));
+    Ok(())
+}
+
+/// #1439: real yq's `split(re; flags)` ignores every argument once arity
+/// exceeds 1 and behaves exactly as `split("")` -- splitting into
+/// individual Unicode characters, not a regex split. This is the yq-mode
+/// counterpart the test above no longer covers: the same `"a*"` pattern
+/// that means "zero-width match, keep splitting" in jq mode is inert
+/// here, and the full input's own characters are what's produced instead.
+#[test]
+fn test_yq_split_regex_ignores_pattern_and_flags_1439() -> Result<()> {
+    let (output, code) = run_yq_stdin(r#"split("a*"; "g")"#, "\"bab\"\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v, serde_json::json!(["b", "a", "b"]));
+    Ok(())
+}
+
+/// #1439's full oracle-verified probe table (issue body), condensed into
+/// one table-driven test: a present, absent, or matching-but-irrelevant
+/// pattern all produce the identical char-split output, including a
+/// multi-byte (rune, not byte) input.
+#[test]
+fn test_yq_split_regex_probe_table_1439() -> Result<()> {
+    for (filter, input, expected) in [
+        (
+            r#"split("[0-9]";"g")"#,
+            "\"a1b2c\"",
+            serde_json::json!(["a", "1", "b", "2", "c"]),
+        ),
+        (
+            r#"split("[0-9]";"x")"#,
+            "\"a1b2c\"",
+            serde_json::json!(["a", "1", "b", "2", "c"]),
+        ),
+        (
+            r#"split("[0-9]";"")"#,
+            "\"a1b2c\"",
+            serde_json::json!(["a", "1", "b", "2", "c"]),
+        ),
+        (
+            r#"split("XX";"g")"#,
+            "\"aXXbXXc\"",
+            serde_json::json!(["a", "X", "X", "b", "X", "X", "c"]),
+        ),
+        (
+            r#"split(",";"g")"#,
+            "\"a,b,c\"",
+            serde_json::json!(["a", ",", "b", ",", "c"]),
+        ),
+        (
+            r#"split("Z";"g")"#,
+            "\"abc\"",
+            serde_json::json!(["a", "b", "c"]),
+        ),
+        (r#"split("x";"y")"#, "\"\"", serde_json::json!([])),
+        (
+            r#"split("x";"y")"#,
+            "\"aé日b\"",
+            serde_json::json!(["a", "é", "日", "b"]),
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter} on {input}: out={out}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, expected, "{filter} on {input}");
+    }
+    Ok(())
+}
+
+/// #1439: neither argument is evaluated once arity reaches 2 -- not just
+/// "the result doesn't reflect them," but genuinely never touched, so an
+/// `error(...)` in either position never fires. The arity-1 form is the
+/// contrast case: its one argument really is evaluated and used.
+#[test]
+fn test_yq_split_regex_arguments_never_evaluated_1439() -> Result<()> {
+    for filter in [
+        r#"split(error("boom1");"y")"#,
+        r#"split("x";error("boom2"))"#,
+    ] {
+        let (out, code) = run_yq_stdin(filter, "\"abc\"", &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}: out={out}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, serde_json::json!(["a", "b", "c"]), "{filter}");
+    }
+    // Contrast: the 1-arg form's own argument really is evaluated.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(r#"split(error("boom"))"#, "\"abc\"\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("boom"), "stderr={stderr}");
+    Ok(())
+}
+
+/// #1439: arity 3+ is accepted (parser leniency) and every extra argument
+/// is discarded without evaluation, matching `sub`'s own arity 4+
+/// handling (#1122) -- confirmed live against yq v4.53.3.
+#[test]
+fn test_yq_split_regex_arity_three_plus_accepted_1439() -> Result<()> {
+    for filter in [r#"split("x";"y";"z")"#, "split(1;2)"] {
+        let (out, code) = run_yq_stdin(filter, "\"abc\"", &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}: out={out}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, serde_json::json!(["a", "b", "c"]), "{filter}");
+    }
+    Ok(())
+}
+
+/// #1439 negative control: `succinctly jq`'s own `split/2` keeps its real
+/// jq-modeled regex-split behavior unchanged -- this fix is yq-mode only.
+#[test]
+fn test_jq_split_regex_unaffected_by_1439() -> Result<()> {
+    let (out, _stderr, code) =
+        run_jq_stdin_with_stderr(r#"split("[0-9]";"g")"#, "\"a1b2c\"", &["-c"])?;
+    assert_eq!(code, 0, "out={out}");
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    assert_eq!(v, serde_json::json!(["a", "b", "c"]));
     Ok(())
 }
 
