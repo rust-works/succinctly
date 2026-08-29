@@ -52836,6 +52836,35 @@ mod tests {
         );
     }
 
+    /// #1778: `collect_rhs_outputs`'s `Many(vs)` success arm -- a
+    /// genuinely cursor-backed multi-output RHS (`.a[]`'s own iteration,
+    /// not a comma of owned literals, which materializes straight to
+    /// `ManyOwned` instead), all of whose outputs decode cleanly.
+    #[test]
+    fn test_compound_assign_cursor_backed_many_rhs_forks_1778() {
+        assert_eq!(
+            outputs(br#"{"x":1,"a":[10,20]}"#, ".x += .a[]"),
+            vec![r#"{"x":11,"a":[10,20]}"#, r#"{"x":21,"a":[10,20]}"#],
+        );
+    }
+
+    /// #1778: `collect_rhs_outputs`'s bare `Error`/`Halt` arms (zero RHS
+    /// output, not a `Partial` with some output first) -- and `optional`
+    /// swallowing that zero-output error via `eval_update_multi`'s own
+    /// early return.
+    #[test]
+    fn test_compound_assign_bare_rhs_error_and_halt_1778() {
+        query!(br#"{"x":1}"#, r#".x += error("boom")"#,
+            QueryResult::Error(e) => { assert_eq!(e.message, "boom"); }
+        );
+        query!(br#"{"x":1}"#, r#"(.x += error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        query!(br#"{"x":1}"#, ".x += halt_error(3)",
+            QueryResult::Halt(3) => {}
+        );
+    }
+
     /// #1778: a multi-output RHS still forks once *per output*, not once
     /// per (output, resolved path) pair, when the LHS path itself resolves
     /// to more than one location -- matching `eval_assign`'s own
