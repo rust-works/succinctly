@@ -277,6 +277,18 @@ all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery  = { level = "warn", priority = -1 }
 
+# --- Restriction lints, opted in only where the pattern has actually
+# recurred ------------------------------------------------------------------
+# `disallowed_methods` is a restriction lint: allowed crate-wide by default,
+# matching the group priority scheme above, so a module opts back in with a
+# localized `#![warn(clippy::disallowed_methods)]` -- the same "closed by
+# default, reviewed opt-in elsewhere" shape `unsafe_code` uses above in
+# `[lints.rust]`, just inverted (there the group is `deny` and modules opt
+# *out*; here the group is `allow` and modules opt back *in*). See
+# `clippy.toml` for what's disallowed and why (#1670); `src/jq/eval.rs`/
+# `eval_generic.rs` are the only two files that opt back in today.
+disallowed_methods = "allow"
+
 # --- Numeric casts -----------------------------------------------------------
 # Pervasive and intentional in bit-manipulation / SIMD / indexing code, where
 # narrowing and sign reinterpretation are the whole point. These are guarded by

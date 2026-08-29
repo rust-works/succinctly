@@ -1,19 +1,33 @@
-# #1670: a bare `Vec::with_capacity`/`String::with_capacity` sized by a
-# product (or otherwise generator-controlled magnitude) of independently
-# controlled lengths has caused four independent infallible-allocation
-# panics/aborts (#1017, #1612, #1634, #1669) -- each found only by a human
-# or review pass noticing the pattern by eye. Disallowed crate-wide here;
-# `src/lib.rs` and each `src/bin/**/main.rs` opt back out
-# (`#![allow(clippy::disallowed_methods)]`) since the vast majority of
-# `with_capacity` call sites outside `src/jq/eval.rs`/`eval_generic.rs`
-# size from a single collection's own length and were never part of this
-# bug shape; `eval.rs`/`eval_generic.rs` re-enable it
+# #1670: an infallible `Vec`/`String` allocation sized by a product (or
+# otherwise generator-controlled magnitude) of independently controlled
+# lengths has caused four independent panics/aborts (#1017, #1612, #1634,
+# #1669) -- each found only by a human or review pass noticing the pattern
+# by eye. #1017's own panic site was `Vec::resize`, not `with_capacity`, so
+# this bans every infallible sizing method on `Vec`/`String`, not just
+# `with_capacity`, and their `try_`-prefixed fallible counterparts are
+# deliberately left off this list (those are exactly the pattern this
+# lint wants people to use instead). Disallowed crate-wide here; `src/lib.rs`
+# and each crate root under `src/bin/`, plus every `tests/`/`benches/`/
+# `examples/` file that calls one of these methods, opt back out
+# (`#![allow(clippy::disallowed_methods)]`) since the vast majority of call
+# sites size from a single collection's own length and were never part of
+# this bug shape; `src/jq/eval.rs`/`eval_generic.rs` re-enable it
 # (`#![warn(clippy::disallowed_methods)]`) since that is where the pattern
 # has recurred every time. A legitimate single-length site in those two
 # files goes through `vec_with_capacity`/`string_with_capacity`
 # (`src/jq/eval.rs`) instead of the raw method, so only a *product* of
-# lengths (the actual danger) shows up as a disallowed raw call.
+# lengths (the actual danger) shows up as a disallowed raw call; an
+# already-guarded call (reserved via `try_reserve`/`try_reserve_exact`
+# first, so the fallible check already happened) is annotated
+# `#[allow(clippy::disallowed_methods)]` at that one call site with a
+# comment, the same way `vec_with_capacity`'s own definition is.
 disallowed-methods = [
     { path = "alloc::vec::Vec::with_capacity", reason = "use vec_with_capacity (single length) or try_reserve_product (a product of lengths) -- see #1670" },
     { path = "alloc::string::String::with_capacity", reason = "use string_with_capacity (single length) -- a product-sized String::with_capacity is the same #1670 bug shape as Vec's" },
+    { path = "alloc::vec::Vec::resize", reason = "infallible -- #1017's own panic site was here, not with_capacity; reserve capacity fallibly (try_reserve/try_reserve_exact) first, then resize, and allow this call site -- see #1670" },
+    { path = "alloc::vec::Vec::resize_with", reason = "same #1670 reasoning as Vec::resize" },
+    { path = "alloc::vec::Vec::reserve", reason = "infallible -- use try_reserve, or try_reserve_product for a product of lengths -- see #1670" },
+    { path = "alloc::vec::Vec::reserve_exact", reason = "infallible -- use try_reserve_exact, or try_reserve_product for a product of lengths -- see #1670" },
+    { path = "alloc::string::String::reserve", reason = "infallible -- use try_reserve -- see #1670" },
+    { path = "alloc::string::String::reserve_exact", reason = "infallible -- use try_reserve_exact -- see #1670" },
 ]

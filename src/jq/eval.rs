@@ -2,12 +2,13 @@
 //!
 //! Evaluates expressions against JSON using the cursor-based navigation API.
 
-// #1670: re-enable the crate-wide-`allow`d `disallowed_methods` lint here
-// (see `clippy.toml` and `src/lib.rs`) -- every known instance of the
-// unguarded-product-allocation bug shape (#1017/#1612/#1634/#1669) has
-// been in this file. Use `vec_with_capacity`/`string_with_capacity` for a
-// legitimate single-length site, `try_reserve_product`/
-// `try_reserve_product_labeled` for an actual product of lengths.
+// #1670: re-enable the package-wide-`allow`d `disallowed_methods` lint
+// here (see `clippy.toml` and `Cargo.toml`'s `[lints.clippy]` table) --
+// every known instance of the unguarded-product-allocation bug shape
+// (#1017/#1612/#1634/#1669) has been in this file. Use
+// `vec_with_capacity`/`string_with_capacity` for a legitimate
+// single-length site, `try_reserve_product`/`try_reserve_product_labeled`
+// for an actual product of lengths.
 #![warn(clippy::disallowed_methods)]
 
 #[cfg(not(test))]
@@ -27293,6 +27294,10 @@ fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalErr
         .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
+    // #1670: already guarded -- `try_reserve` above already proved the
+    // capacity is reservable, so this can't panic the way an unguarded
+    // `resize` (#1017's own panic site) can.
+    #[allow(clippy::disallowed_methods)]
     arr.resize(len, OwnedValue::Null);
     Ok(())
 }
