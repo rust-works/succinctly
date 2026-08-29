@@ -6500,11 +6500,25 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     // add is [.[] | .] folded with +, and .[] over an object iterates its
     // values, so jq accepts an object here as readily as an array (#422).
-    let items: Vec<OwnedValue> = match value {
-        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently fold in as "".
+    let items: Result<Vec<OwnedValue>, EvalError> = match value {
+        StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+        }
+    };
+    let items = match items {
+        Ok(items) => items,
+        Err(e) => return QueryResult::Error(e),
     };
     if items.is_empty() {
         return QueryResult::Owned(OwnedValue::Null);
@@ -7098,11 +7112,16 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
     pattern_owned: OwnedValue,
     edge: StringEdge,
 ) -> QueryResult<'a, W> {
-    // `to_owned` stays inside this function rather than being hoisted into
-    // its caller -- it is only reached on these two cold paths, so hoisting
-    // would pay for a whole-document copy on the hot one.
+    // `to_owned_checked` stays inside this function rather than being
+    // hoisted into its caller -- it is only reached on these two cold
+    // paths, so hoisting would pay for a whole-document copy on the hot
+    // one. #1755: not to_owned -- a passed-through undecodable value must
+    // raise, not silently become "".
     let OwnedValue::String(pattern) = pattern_owned else {
-        return QueryResult::Owned(to_owned(value));
+        return match to_owned_checked(value) {
+            Ok(v) => QueryResult::Owned(v),
+            Err(e) => QueryResult::Error(e),
+        };
     };
     let result = match value {
         StandardJson::String(s) => match s.as_str() {
@@ -7131,7 +7150,10 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
         },
         // jq's ltrimstr/rtrimstr are total: a non-string input passes
         // through unchanged.
-        _ => to_owned(value),
+        _ => match to_owned_checked(value) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
     };
     QueryResult::Owned(result)
 }
@@ -7585,12 +7607,15 @@ fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `try_fold` over the raw element iterator (not a collected `Vec`) so a
     // type-mismatch error on an early element short-circuits immediately
     // instead of paying to `to_owned` every later element first.
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently join in as "".
     let result = match value {
-        StandardJson::Array(mut elements) => {
-            elements.try_fold(None, |acc, e| join_step::<S>(acc, to_owned(&e), &sep))
-        }
+        StandardJson::Array(mut elements) => elements.try_fold(None, |acc, e| {
+            join_step::<S>(acc, to_owned_checked(&e)?, &sep)
+        }),
         StandardJson::Object(mut fields) => fields.try_fold(None, |acc, f| {
-            join_step::<S>(acc, to_owned(&f.value()), &sep)
+            join_step::<S>(acc, to_owned_checked(&f.value())?, &sep)
         }),
         _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     };
@@ -7787,7 +7812,12 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
                 // jq: [] | last => null
                 QueryResult::Owned(OwnedValue::Null)
             } else {
-                QueryResult::Owned(to_owned(&items[items.len() - 1]))
+                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // element must raise, not silently become "".
+                match to_owned_checked(&items[items.len() - 1]) {
+                    Ok(v) => QueryResult::Owned(v),
+                    Err(e) => QueryResult::Error(e),
+                }
             }
         }
         // jq: null | last => null
@@ -7836,8 +7866,15 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
+        // #1755: to_owned_checked, not to_owned -- an undecodable element
+        // must raise, not silently reverse in as "".
         StandardJson::Array(elements) => {
-            let mut items: Vec<OwnedValue> = elements.map(|e| to_owned(&e)).collect();
+            let items: Result<Vec<OwnedValue>, EvalError> =
+                elements.map(|e| to_owned_checked(&e)).collect();
+            let mut items = match items {
+                Ok(items) => items,
+                Err(e) => return QueryResult::Error(e),
+            };
             items.reverse();
             QueryResult::Owned(OwnedValue::Array(items))
         }
@@ -7869,11 +7906,24 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>>(
     optional: bool,
     depth: usize,
 ) -> QueryResult<'_, W> {
-    let items: Vec<OwnedValue> = match value {
-        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // raise, not silently flatten in as "".
+    let items: Result<Vec<OwnedValue>, EvalError> = match &value {
+        StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value)));
+        }
+    };
+    let items = match items {
+        Ok(items) => items,
+        Err(e) => return QueryResult::Error(e),
     };
     let flattened = flatten_owned(items, depth);
     QueryResult::Owned(OwnedValue::Array(flattened))
@@ -8422,11 +8472,25 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
     // accepts an object of entries as readily as an array of them (#422).
-    let entries: Vec<OwnedValue> = match value {
-        StandardJson::Array(elements) => elements.map(|elem| to_owned(&elem)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable entry must
+    // raise, not silently become "".
+    let entries: Result<Vec<OwnedValue>, EvalError> = match &value {
+        StandardJson::Array(elements) => elements.map(|elem| to_owned_checked(&elem)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value)));
+        }
+    };
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(e) => return QueryResult::Error(e),
     };
     match entries_to_object(entries) {
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
@@ -9974,8 +10038,12 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
-    QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise, not silently stringify as "".
+    match to_owned_checked(&value) {
+        Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned))),
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Builtin: tonumber - convert string to number
@@ -10210,9 +10278,12 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
-    let json_string = owned_value_to_json::<S>(&owned);
-    QueryResult::Owned(OwnedValue::String(json_string))
+    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // raise, not silently serialize with "" in its place.
+    match to_owned_checked(&value) {
+        Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned))),
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Builtin: fromjson - parse JSON string to value
@@ -33370,7 +33441,14 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         if let StandardJson::String(key_str) = field.key() {
                             if let Ok(cow) = key_str.as_str() {
                                 if cow.as_ref() == k.as_str() {
-                                    result.insert(k.clone(), to_owned(&field.value()));
+                                    // #1755: to_owned_checked, not to_owned
+                                    // -- an undecodable picked value must
+                                    // raise, not silently become "".
+                                    let owned = match to_owned_checked(&field.value()) {
+                                        Ok(v) => v,
+                                        Err(e) => return QueryResult::Error(e),
+                                    };
+                                    result.insert(k.clone(), owned);
                                     break;
                                 }
                             }
@@ -33400,7 +33478,14 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let actual_idx = if idx < 0 { len + idx } else { idx };
 
                 if actual_idx >= 0 && actual_idx < len {
-                    result.push(to_owned(&arr[actual_idx as usize]));
+                    // #1755: to_owned_checked, not to_owned -- an
+                    // undecodable picked element must raise, not silently
+                    // become "".
+                    let owned = match to_owned_checked(&arr[actual_idx as usize]) {
+                        Ok(v) => v,
+                        Err(e) => return QueryResult::Error(e),
+                    };
+                    result.push(owned);
                 }
                 // If index out of bounds, yq silently skips it
             }
@@ -33470,7 +33555,14 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if let Ok(cow) = key_str.as_str() {
                         let key = cow.as_ref();
                         if !omit_keys.contains(&key) {
-                            result.insert(key.to_string(), to_owned(&field.value()));
+                            // #1755: to_owned_checked, not to_owned -- an
+                            // undecodable kept value must raise, not
+                            // silently become "".
+                            let owned = match to_owned_checked(&field.value()) {
+                                Ok(v) => v,
+                                Err(e) => return QueryResult::Error(e),
+                            };
+                            result.insert(key.to_string(), owned);
                         }
                     }
                 }
@@ -33494,17 +33586,18 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .filter_map(|k| resolve_read_index(k, arr.len()))
                 .collect();
 
-            let result: Vec<OwnedValue> = arr
+            // #1755: to_owned_checked, not to_owned -- an undecodable kept
+            // element must raise, not silently become "".
+            let result: Result<Vec<OwnedValue>, EvalError> = arr
                 .iter()
                 .enumerate()
-                .filter_map(|(i, v)| {
-                    if omit_indices.contains(&i) {
-                        None
-                    } else {
-                        Some(to_owned(v))
-                    }
-                })
+                .filter(|(i, _)| !omit_indices.contains(i))
+                .map(|(_, v)| to_owned_checked(v))
                 .collect();
+            let result = match result {
+                Ok(result) => result,
+                Err(e) => return QueryResult::Error(e),
+            };
 
             QueryResult::Owned(OwnedValue::Array(result))
         }
@@ -36466,6 +36559,152 @@ mod tests {
             &b"[\"\xff\xfe\"]"[..],
             "inside([1,2])?",
             QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1755: the "direct" bucket -- `add`, `flatten`, `ltrimstr`/
+    /// `rtrimstr` (via `trim_edge`'s two passthrough arms), jq-mode `join`,
+    /// `last`, `reverse`, `from_entries`, `tostring`, `tojson`, and
+    /// `pick`/`omit` (object and array arms) all materialize a value
+    /// they then return directly -- an undecodable string among them must
+    /// raise, not silently substitute `""`. `[1, "\ud800"] | flatten` is
+    /// #1755's own headline repro.
+    #[test]
+    fn test_direct_misc_family_raises_on_decode_failure_1755() {
+        query!(
+            &b"[\"a\",\"\xff\xfe\"]"[..],
+            "add",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1,\"\xff\xfe\"]"[..],
+            "flatten",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // trim_edge's two total-passthrough arms: a non-string pattern
+        // (value passes through unchanged) and a non-string value (also
+        // passes through unchanged).
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "ltrimstr(5)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "ltrimstr(\"x\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"a\",\"\xff\xfe\"]"[..],
+            "join(\",\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1,\"\xff\xfe\"]"[..],
+            "last",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1,\"\xff\xfe\"]"[..],
+            "reverse",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[{\"key\":\"a\",\"value\":\"\xff\xfe\"}]"[..],
+            "from_entries",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "tostring",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            "tojson",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":\"\xff\xfe\",\"b\":2}"[..],
+            "pick([\"a\"])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1,\"\xff\xfe\"]"[..],
+            "pick([1])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":\"\xff\xfe\",\"b\":2}"[..],
+            "omit([\"b\"])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[1,\"\xff\xfe\"]"[..],
+            "omit([0])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1755 positive control: valid data through each of the "direct"
+    /// bucket's dispatch points is unaffected by routing through
+    /// `to_owned_checked`.
+    #[test]
+    fn test_direct_misc_family_valid_data_unaffected_1755() {
+        query!(br#"["a","b"]"#, "add",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "ab"); }
+        );
+        query!(br"[1,[2,3]]", "flatten",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        query!(br#""abc""#, "ltrimstr(5)",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::String("abc".to_string())); }
+        );
+        query!(br"[1,2]", "ltrimstr(\"x\")",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        query!(br#"["a","b"]"#, "join(\",\")",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "a,b"); }
+        );
+        query!(br"[1,2]", "last",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(2)); }
+        );
+        query!(br"[1,2]", "reverse",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(2), OwnedValue::Int(1)]);
+            }
+        );
+        query!(br#"[{"key":"a","value":1}]"#, "from_entries",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        query!(br"[1]", "tostring",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "[1]"); }
+        );
+        query!(br"[1]", "tojson",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "[1]"); }
+        );
+        query!(br#"{"a":1,"b":2}"#, "pick([\"a\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        query!(br"[1,2]", "pick([1])",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v, vec![OwnedValue::Int(2)]); }
+        );
+        query!(br#"{"a":1,"b":2}"#, "omit([\"b\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
+                assert!(!o.contains_key("b"));
+            }
+        );
+        query!(br"[1,2]", "omit([0])",
+            QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v, vec![OwnedValue::Int(2)]); }
         );
     }
 
