@@ -1991,21 +1991,13 @@ impl SplitDocState {
     }
 }
 
-/// [`output::Terminator`] reads its NUL/newline/join precedence off two
-/// plain `bool`s, not `OutputConfig` directly, since jq_runner.rs's own
-/// `OutputConfig` names the same flag `raw_output0` rather than
-/// `nul_output` (#1711) -- this is yq-mode's own thin wrapper reading the
-/// right fields once, so no call site here can transpose them.
-///
-/// NUL wins over join (`-0 -j` still separates on NUL, not nothing) --
-/// verified against real *jq* 1.7.1 (`--raw-output0 -j`, order-independent
-/// either way), not yq: the pinned yq oracle (Homebrew v4.53.3) has no
-/// `--join-output` flag at all (it errors "unknown flag"), and its own
-/// `-j` is an unrelated, deprecated alias for `--tojson`. yq-mode's
-/// `-j`/`--join-output` borrows jq's flag meaning and collides with real
-/// yq's own `-j` — a documented open divergence
-/// (docs/compliance/yq/limitations.md), not a real-yq behavior to match.
-/// A bare newline is the default when neither flag is set.
+/// yq-mode's own thin wrapper onto [`output::Terminator::from_flags`] --
+/// see that function's own doc for the NUL/newline/join precedence rule
+/// and its jq-vs-yq oracle verification. Exists only because
+/// jq_runner.rs's own `OutputConfig` names the same flag `raw_output0`
+/// rather than `nul_output` (#1711), so the two runners can't share one
+/// `from_config`-style call; reading both fields once here means no call
+/// site in this file can transpose them.
 ///
 /// Threaded through `stream_cursor!`'s own `$output_config:expr` (#1701
 /// code review) so the same three-way choice also drives the M2 fast
@@ -2014,7 +2006,7 @@ impl SplitDocState {
 /// path was taken (confirmed live on unmodified `main`, same root cause
 /// and fix shape as #1699's `--no-doc` gap in the same macro).
 fn terminator_from_config(config: &OutputConfig) -> Terminator {
-    Terminator::new(config.nul_output, config.join_output)
+    Terminator::from_flags(config.nul_output, config.join_output)
 }
 
 /// Write the appropriate line terminator based on output config.

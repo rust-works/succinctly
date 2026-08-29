@@ -1,7 +1,8 @@
 //! Output helpers shared by the jq and yq CLI runners.
 //!
 //! Exit codes, JSON string escaping, JSON pretty-printing, ANSI colorization
-//! (including `JQ_COLORS` support), and build-configuration diagnostics.
+//! (including `JQ_COLORS` support), line-terminator selection (`Terminator`),
+//! and build-configuration diagnostics.
 
 // Aliased: this module already has an `escape_json_body` of its own, which
 // picks *which* convention to use; the library's runs a chosen writer.
@@ -56,16 +57,23 @@ pub fn json_bytes_to_owned_value(bytes: &[u8]) -> Result<OwnedValue, EvalError> 
 
 /// Which terminator follows a written value: NUL (`-0`/`--nul-output`),
 /// a bare newline (the default), or nothing (`-j`/`--join-output`). `nul`
-/// wins over `join` in both runners' own precedence, matching real jq/yq:
-/// `-0 -j` together behaves as `-0`.
+/// wins over `join` in both runners' own precedence -- verified against
+/// real *jq* 1.7.1 (`--raw-output0 -j`, order-independent either way), not
+/// yq: the pinned yq oracle (Homebrew v4.53.3) has no `--join-output` flag
+/// at all (it errors "unknown flag"), so `-j` in yq mode is a documented
+/// open divergence (docs/compliance/yq/limitations.md), not a real-yq
+/// behavior this precedence matches.
 ///
 /// Shared by `jq_runner.rs` and `yq_runner.rs` (#1701, #1711) -- both
 /// binaries' own `OutputConfig` agree on this exact three-way rule but
 /// don't share a type (different field names: `raw_output0` vs
-/// `nul_output`), so each keeps a thin local `Terminator::new(nul, join)`
-/// wrapper reading its own config's fields rather than this module taking
-/// either `OutputConfig` directly.
-#[derive(Clone, Copy)]
+/// `nul_output`), so each keeps a thin local `Terminator::from_flags(nul,
+/// join)` wrapper reading its own config's fields rather than this module
+/// taking either `OutputConfig` directly. Named `from_flags` to match
+/// `env_config::ColorChoice::from_flags`'s identical "two mutually
+/// exclusive CLI bools -> precedence-resolved enum" shape, rather than
+/// introducing a second, differently-named idiom for the same pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Terminator {
     Nul,
     Newline,
@@ -73,7 +81,7 @@ pub enum Terminator {
 }
 
 impl Terminator {
-    pub fn new(nul: bool, join: bool) -> Self {
+    pub fn from_flags(nul: bool, join: bool) -> Self {
         if nul {
             Self::Nul
         } else if !join {
@@ -83,18 +91,25 @@ impl Terminator {
         }
     }
 
-    /// Write this terminator to an `io::Write` sink.
+    /// Write this terminator to an `io::Write` sink. `write_all(b"\n")`
+    /// rather than `writeln!(writer)` for the newline case -- this is
+    /// jq_runner.rs's own default-output-path terminator write, not just
+    /// yq's occasional doc-separator one, so it keeps the exact zero-
+    /// formatting-overhead shape jq_runner.rs used before this hoist
+    /// rather than detouring through `fmt::Arguments` machinery on every
+    /// value.
     pub fn write_io<W: std::io::Write>(self, writer: &mut W) -> std::io::Result<()> {
         match self {
             Self::Nul => writer.write_all(&[0]),
-            Self::Newline => writeln!(writer),
+            Self::Newline => writer.write_all(b"\n"),
             Self::None => Ok(()),
         }
     }
 
-    /// Write this terminator to a `core::fmt::Write` sink -- yq's M2 path's
-    /// per-result callbacks, which write into a buffered `fmt::Write`
-    /// target rather than the process's own `io::Write` sink directly.
+    /// Write this terminator to a `core::fmt::Write` sink, for a caller
+    /// writing into a buffered `fmt::Write` target rather than the
+    /// process's own `io::Write` sink directly (yq's M2 fast path's
+    /// per-result callbacks, at the time of writing).
     pub fn write_fmt<W: core::fmt::Write>(self, writer: &mut W) -> core::fmt::Result {
         match self {
             Self::Nul => writer.write_char('\0'),
@@ -1467,5 +1482,18 @@ mod tests {
             result.is_err(),
             "format_json should panic at MAX_VALUE_TREE_DEPTH"
         );
+    }
+
+    /// Pins `Terminator::from_flags`'s precedence table by name (#1711),
+    /// mirroring `env_config::ColorChoice::from_flags`'s own
+    /// `from_flags_maps_each_flag_combination` test for the identical
+    /// "two mutually exclusive CLI bools" shape -- nul wins if both are
+    /// somehow set.
+    #[test]
+    fn terminator_from_flags_maps_each_flag_combination() {
+        assert_eq!(Terminator::from_flags(false, false), Terminator::Newline);
+        assert_eq!(Terminator::from_flags(false, true), Terminator::None);
+        assert_eq!(Terminator::from_flags(true, false), Terminator::Nul);
+        assert_eq!(Terminator::from_flags(true, true), Terminator::Nul);
     }
 }
