@@ -968,15 +968,26 @@ impl EvalError {
     /// `object key "<key>" is ambiguous: ...` (#1642) — a #1620-class
     /// decode failure in its own right: two distinct undecodable keys
     /// whose display fallback collides, so keeping the second silently
-    /// overwrites the first. [`Self::is_decode_failure`] recognizes the
-    /// fixed suffix this constructor always appends, the same way
-    /// [`Self::invalid_path_expression`] and its own `is_*` check share a
-    /// prefix constant, so the two can never independently drift out of
-    /// sync (confirmed live before this fix, #1813: this previously built
-    /// its message ad hoc via `format!` at its one call site in
-    /// `document.rs`, and `is_decode_failure`'s fixed literal list didn't
-    /// include it — `try sort catch .` and `sort?` both wrongly treated
-    /// this as an ordinary catchable error).
+    /// overwrites the first (#1385 forbids treating them as the same key,
+    /// but a display-keyed map has no way to hold both). This is what
+    /// `to_owned`/`materialize` raise instead, via
+    /// [`super::document::resolve_display_key`]/[`super::document::DisplayKeyGuard`].
+    /// [`Self::is_decode_failure`] recognizes the fixed suffix this
+    /// constructor always appends, the same way [`Self::invalid_path_expression`]
+    /// and its own `is_*` check share a prefix constant, so the two can
+    /// never independently drift out of sync (confirmed live before this
+    /// fix, #1813: this previously built its message ad hoc via `format!`
+    /// at its one call site in `document.rs`, and `is_decode_failure`'s
+    /// fixed literal list didn't include it — `try sort catch .` and
+    /// `sort?` both wrongly treated this as an ordinary catchable error).
+    ///
+    /// Called directly (not via a `document.rs`-local wrapper, #1813
+    /// review) from three sites across two crates: `document.rs`'s own
+    /// `resolve_display_key`, `eval.rs`'s `yaml_value_to_owned_checked`
+    /// (`load()`'s YAML path), and `succinctly-cli`'s `yq_runner.rs`
+    /// (`yaml_to_owned_value`, #1749) — `EvalError` is already `pub` from
+    /// `jq::mod`, so a re-exporting wrapper added an extra hop without
+    /// adding any encapsulation.
     pub fn colliding_display_key(key: &str) -> Self {
         Self::new(format!(
             "object key \"{key}\" is ambiguous{}",

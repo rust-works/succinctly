@@ -19013,6 +19013,30 @@ fn test_load_yaml_two_undecodable_keys_collide_1801() -> Result<()> {
     Ok(())
 }
 
+/// #1813 review: the sibling test above only checks the raw, uncaught
+/// route -- `yaml_value_to_owned_checked` (`load()`'s YAML path,
+/// `eval.rs`) is a third call site for `EvalError::colliding_display_key`
+/// besides the two already covered directly by #1813's own tests, and
+/// nothing pinned that `try`/`catch` around `load()` itself still can't
+/// suppress it.
+#[test]
+fn test_load_yaml_colliding_keys_not_caught_by_try_catch_1813() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"\"b\xe1\x41c\": 1\n\"d\xe1\x41e\": 2\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let expr = format!("try load({path:?}) catch .");
+    let (out, err, code) = run_jq_full(&["-cn", &expr], None)?;
+    assert_ne!(
+        code, 0,
+        "try/catch must not catch a colliding-key error from load(), out: {out:?}"
+    );
+    assert!(err.contains("is ambiguous"), "err={err}");
+
+    Ok(())
+}
+
 /// #1801: a multi-document YAML file raises as soon as any one document
 /// contains an undecodable string, not just the last/first.
 #[test]

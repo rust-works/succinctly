@@ -40,12 +40,6 @@ use indexmap::{IndexMap, IndexSet};
 use super::document::{
     effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
 };
-// Only consumed by `yaml_value_to_owned_checked`, which is itself
-// `#[cfg(feature = "std")]`-gated (`load()`'s YAML path) -- gated
-// separately from the block above so a `--no-default-features` build
-// doesn't warn on an unused import.
-#[cfg(feature = "std")]
-use super::document::colliding_display_key_error;
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
 
@@ -31632,7 +31626,7 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
                             Err(_) => (String::new(), true),
                         };
                         if !guard.check(&map, &key, is_fallback) {
-                            return Err(colliding_display_key_error(&key));
+                            return Err(EvalError::colliding_display_key(&key));
                         }
                         key
                     }
