@@ -285,6 +285,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consumes and discards any further `; expr` arguments past the
+    /// arity real yq's evaluator actually reads, in yq mode only -- shared
+    /// by `sub(re; s; flags[, ...])` (#1122) and `split(re; flags[, ...])`
+    /// (#1439), the two builtins confirmed live against yq v4.53.3 to have
+    /// this same fixed-AST-slot-past-arity-N upstream Go bug shape. Each
+    /// caller parses its own required arguments first and calls this only
+    /// once positioned at the (possibly absent) first extra `;`; the
+    /// parsed-and-discarded expressions are never evaluated, matching how
+    /// neither builtin's yq-mode evaluator arm reads past its own last
+    /// used argument either. A no-op in jq mode, and a no-op if there is
+    /// no further `;` to consume -- callers don't need their own mode
+    /// check before calling this.
+    fn parse_yq_arity_leniency_tail(&mut self) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Yq {
+            while self.peek() == Some(';') {
+                self.next();
+                self.skip_ws();
+                self.parse_expr()?;
+                self.skip_ws();
+            }
+        }
+        Ok(())
+    }
+
     /// Check if current position matches a keyword (followed by non-ident char).
     fn matches_keyword(&self, keyword: &str) -> bool {
         if !self.input[self.pos..].starts_with(keyword) {
@@ -2607,23 +2631,13 @@ impl<'a> Parser<'a> {
                 let flags = self.parse_expr()?;
                 self.skip_ws();
                 // yq mode accepts (and ignores) any further `; expr`
-                // arguments at arity 3+, the same fixed-slot-past-arity-1
-                // parser leniency already established for `sub` above
-                // (#1122) -- confirmed live against yq v4.53.3: `split("x";
-                // "y"; "z")` parses and behaves identically to arity 2
-                // (#1439). Parsed and discarded here, not evaluated at all:
-                // `builtin_split_regex`'s yq-mode arm never evaluates `s`/
-                // `flags` either, so a discarded 3rd+ argument is
-                // consistent with that same "every argument past arity 1 is
-                // a dead AST slot" rule, not a separate carve-out for it.
-                if self.mode == ParserMode::Yq {
-                    while self.peek() == Some(';') {
-                        self.next();
-                        self.skip_ws();
-                        self.parse_expr()?;
-                        self.skip_ws();
-                    }
-                }
+                // arguments at arity 3+ -- confirmed live against yq
+                // v4.53.3: `split("x"; "y"; "z")` parses and behaves
+                // identically to arity 2 (#1439). See
+                // `parse_yq_arity_leniency_tail`'s own doc comment for why
+                // this is shared with `sub` below rather than a second
+                // hand-copied loop.
+                self.parse_yq_arity_leniency_tail()?;
                 self.expect(')')?;
                 return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
             }
@@ -2689,19 +2703,10 @@ impl<'a> Parser<'a> {
                 // arguments -- confirmed live against yq v4.53.3: arity 4+
                 // parses and behaves identically to arity 3 (#1122), unlike
                 // jq, where `sub/4` is a hard "not defined" compile error.
-                // Parsed and discarded here, not evaluated at all --
-                // `yq_sub_arity3_empty_replace` already never reads
-                // `replacement`/`flags` either, so a discarded 4th+ argument
-                // is consistent with that same "ignored past the first"
-                // rule, not a separate carve-out for it.
-                if self.mode == ParserMode::Yq {
-                    while self.peek() == Some(';') {
-                        self.next();
-                        self.skip_ws();
-                        self.parse_expr()?;
-                        self.skip_ws();
-                    }
-                }
+                // See `parse_yq_arity_leniency_tail`'s own doc comment for
+                // why this is shared with `split` above rather than a
+                // second hand-copied loop (#1439 review).
+                self.parse_yq_arity_leniency_tail()?;
                 self.expect(')')?;
                 return Ok(Some(Builtin::SubFlags(
                     Box::new(re),
