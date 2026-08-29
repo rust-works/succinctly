@@ -30,7 +30,7 @@ use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
     self, exit_codes, flush_then_err, ColorScheme, ControlEscape, DiagStyle, ErrorSink, FloatStyle,
-    InputLocation, JsonFormatOpts, Terminator,
+    InputLocation, JsonFormatOpts, LoudFlushWriter, Terminator,
 };
 
 /// yq's diagnostics carry no `(at <file>:<line>)` marker, so the yq paths have
@@ -3362,7 +3362,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
     // Set up output
     let stdout = std::io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    let mut writer = LoudFlushWriter::new(stdout.lock());
 
     // yq --exit-status semantics: exit 1 unless some result is truthy.
     // Unlike jq (which inspects only the last output value), yq treats empty

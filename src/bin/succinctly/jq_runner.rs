@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
-use std::io::{BufWriter, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
@@ -27,7 +27,8 @@ use succinctly::json::JsonIndex;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
-    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts, Terminator,
+    ControlEscape, DiagStyle, ErrorSink, FloatStyle, InputLocation, JsonFormatOpts,
+    LoudFlushWriter, Terminator,
 };
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -1018,7 +1019,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     // Set up output writer
     let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
+    let mut out = LoudFlushWriter::new(stdout.lock());
 
     // Track last output for exit status
     let mut last_output: Option<OwnedValue> = None;
