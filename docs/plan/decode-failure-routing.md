@@ -673,6 +673,13 @@ Four value-writer sites, not the three the issue scoped:
    common navigated shape, `yq '.b'`, still printed `""` at exit 0 while `yq -o=json '.b'`
    on the same document raised.
 
+Because the prefix can be left unterminated mid-value, a streamed decode failure stops the
+run rather than continuing to the next document (welding the next `---` onto a truncated
+line produces output that re-reads as valid YAML with a fabricated value), and `--inplace`
+leaves the file byte-identical. `StreamStats::truncated` is what separates this from an
+ordinary uncaught evaluation error, which writes nothing to `out` and so still continues
+per #355 — gating on `stats.error` instead would have silently narrowed that divergence.
+
 Mapping **keys** are excluded on purpose (`Undecodable::PreserveEmpty` in
 `yaml/light.rs`): #1642 settled that a key with no scalar form is preserved as `""` on
 every route, and `keys`/`to_entries`/`length` all report it, so raising in a streamed

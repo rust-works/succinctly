@@ -3838,6 +3838,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     };
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
+                    // #1615: an evaluated result can be a *container* holding
+                    // an undecodable scalar, in which case the cursor stream
+                    // is already part-written when it fails -- same truncation
+                    // the identity branches produce, so it needs the same
+                    // stop. Gated on `truncated`, never on `stats.error`: an
+                    // ordinary uncaught error writes nothing to `out` and must
+                    // still continue to the next document (#355).
+                    if stats.truncated {
+                        stream_truncated.set(true);
+                    }
                 }
             } else {
                 // M2 path: JSON output streaming
@@ -3887,6 +3897,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     };
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
+                    // #1615: an evaluated result can be a *container* holding
+                    // an undecodable scalar, in which case the cursor stream
+                    // is already part-written when it fails -- same truncation
+                    // the identity branches produce, so it needs the same
+                    // stop. Gated on `truncated`, never on `stats.error`: an
+                    // ordinary uncaught error writes nothing to `out` and must
+                    // still continue to the next document (#355).
+                    if stats.truncated {
+                        stream_truncated.set(true);
+                    }
                 }
             }
         }};

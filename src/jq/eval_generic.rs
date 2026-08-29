@@ -2879,6 +2879,9 @@ fn absorb_stream_failure(
     match e {
         crate::jq::stream::StreamFailure::Decode(err) => {
             stats.error = Some(stream_error(&err));
+            // The cursor stream was cut off part-way through a value, unlike
+            // an ordinary evaluation error which writes nothing (#1615).
+            stats.truncated = true;
             Ok(true)
         }
         crate::jq::stream::StreamFailure::Fmt => Err(core::fmt::Error),

@@ -100,6 +100,20 @@ pub struct StreamStats {
     /// ordinary error-diagnostic path — otherwise the real exit code is lost
     /// and a halt is misreported as a generic failure (#791).
     pub halt: Option<i32>,
+
+    /// Whether the failure in `error` left `out` cut off mid-value (#1615).
+    ///
+    /// Distinct from `error.is_some()`, and the distinction is load-bearing:
+    /// an ordinary uncaught evaluation error writes *nothing* to `out` (see
+    /// `error`'s own note), so a caller streaming a multi-document input
+    /// should report it and carry on to the next document (#355). A decode
+    /// failure raised from inside a *cursor* stream is different -- the
+    /// container around it is already partly written, with no newline closing
+    /// it, so continuing would weld the next document's `---` onto the
+    /// truncated line and produce output that reads back as valid YAML with a
+    /// fabricated value. Only the streaming writers set this; a caller that
+    /// ignores it keeps the old, continue-past behaviour for everything else.
+    pub truncated: bool,
 }
 
 /// An uncaught evaluation error surfaced by a streaming operation.
