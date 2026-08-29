@@ -15420,6 +15420,35 @@ fn test_builtin_has_yq_type_mismatch_never_errors_917() -> Result<()> {
     Ok(())
 }
 
+/// #1739 review: `has()`'s new native single-key arm must not regress an
+/// alias-typed mapping key relative to `has()`'s own pre-#1739 behavior.
+/// `has()` used to reach a fully materializing path that resolves an alias
+/// key's target before comparing (same as `keys`/`.` already do for this
+/// document, both pinned alongside this test); the new native arm walks the
+/// raw field list directly, and an earlier draft of it only matched a
+/// literal `String`-variant key, silently excluding `Alias` and reporting
+/// `false` for a key `keys`/`.` both still agree exists. Not a claim this
+/// matches real yq -- real yq keeps an alias-typed key literal (`*k`, not
+/// resolved to its target) for `keys`/`.` on the identical document, a
+/// separate, pre-existing, out-of-scope divergence unrelated to #1739 (this
+/// codebase's own alias *value* resolution, not this key-existence check,
+/// would need to change to close that gap). This test only pins internal
+/// consistency: `has()` must keep agreeing with `keys()`/`.` on this
+/// crate's own resolved spelling, whatever it is.
+#[test]
+fn test_has_yq_alias_typed_key_matches_own_resolved_spelling_1739() -> Result<()> {
+    let doc = "a: &k hello\nb:\n  *k: 1\n";
+
+    let (out, code) = run_yq_stdin(r#".b | has("hello")"#, doc, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(".b | keys", doc, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["hello"]"#);
+    Ok(())
+}
+
 /// Companion to the above for `in(xs)`, using the same real-yq-verified
 /// type-mismatch cases (`in()`'s own definition routes through the same
 /// per-candidate match arm as `has()`, #917).
