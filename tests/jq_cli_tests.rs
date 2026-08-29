@@ -17988,6 +17988,79 @@ fn test_jq_leading_zero_leniency_unaffected_under_sort_keys_and_slurp_1643() -> 
     Ok(())
 }
 
+/// #1677: #1643's delimiter check used to live only in `print_json`, so a
+/// filter that never re-serializes the malformed container whole --
+/// `.[]`, `length`, `keys`/`keys_unsorted`, `add`, `to_entries`, or a plain
+/// field lookup that doesn't reach a leaf -- read straight through it, even
+/// though the identity filter on the same input already raised. Each of
+/// these now raises too, matching real jq.
+#[test]
+fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> Result<()> {
+    for filter in ["keys", "keys_unsorted", "length", "to_entries", "add"] {
+        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a" 1, "b": 2}"#))?;
+        assert_eq!(code, 5, "{filter}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+
+    let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1 2, 3]"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    let (out, stderr, code) = run_jq_full(&["-c", "add"], Some("[1 2, 3]"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1677: a plain field access that doesn't need to reach a leaf's own
+/// container -- `.a` where `.a` is itself a scalar with a malformed
+/// delimiter -- raises too. Unlike the nested case
+/// `test_jq_missing_delimiter_raises_through_field_lookup_1643` pins (which
+/// works "by accident" because printing the extracted sub-object still
+/// goes through `print_json`'s own check), this is a *top-level* scalar
+/// value that never reaches any printer's object/array arm at all --
+/// `find_cursor` itself has to validate it.
+#[test]
+fn test_jq_missing_delimiter_raises_through_top_level_field_lookup_1677() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", ".a"], Some(r#"{"a" 1}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1677: well-formed documents are unaffected by the new checks, run
+/// through the same non-reserializing filters #1643's own well-formedness
+/// test only ever exercised via the identity filter.
+#[test]
+fn test_jq_wellformed_documents_unaffected_by_1677() -> Result<()> {
+    let input = r#"{"a":1,"b":2}"#;
+    for (filter, expected) in [
+        ("keys", r#"["a","b"]"#),
+        ("keys_unsorted", r#"["a","b"]"#),
+        ("length", "2"),
+        ("add", "3"),
+        (".a", "1"),
+        (".[]", "1\n2"),
+        (
+            "to_entries",
+            r#"[{"key":"a","value":1},{"key":"b","value":2}]"#,
+        ),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

@@ -20,7 +20,7 @@ use succinctly::jq::{
     self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
     OwnedValue, Program,
 };
-use succinctly::json::light::{JsonCursor, StandardJson};
+use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
@@ -832,11 +832,18 @@ fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
 /// the walk yielded nothing, and an object that yields no keys *and* ends
 /// unpaired is `{invalid}` -- already refused before the opening bracket by
 /// the `unpaired_tail` check, so this arm cannot be the one to report it.
-fn bail_if_keys_ended_unpaired<F: succinctly::jq::document::DocumentFields>(
+///
+/// Also checks [`DistinctKeyCursors::delimiter_fault`] (#1677), the sibling
+/// fault the same walk can find: a missing/doubled `,`/`:`. Both share the
+/// "ask only once the walk is done" contract -- this writer cannot rewind,
+/// so either fault surfaces only here, potentially behind an
+/// already-written partial `[`/array -- see `JqValue::LazyKeysArray`'s own
+/// doc comment for why that trade is accepted.
+fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
     keys: &DistinctKeyCursors<F>,
     doc_text: Option<&[u8]>,
 ) -> Result<()> {
-    match (keys.ended_unpaired(), doc_text) {
+    match (keys.ended_unpaired() || keys.delimiter_fault(), doc_text) {
         (true, Some(text)) => Err(MalformedJsonError(EvalError::malformed_json_text(text)).into()),
         _ => Ok(()),
     }
@@ -3842,60 +3849,12 @@ impl LiteralFormatter for PreserveFormatter {
 // Generic JSON Printer
 // =============================================================================
 
-/// Whether the byte span immediately before `child_start` is exactly the
-/// delimiter JSON's grammar requires there -- neither missing nor doubled
-/// (#1643).
-///
-/// The semi-index has no signal for this at all: `json::standard::is_delim`
-/// maps `,` and `:` to the same invisible bit as whitespace, so `{"a" 1}`,
-/// `{"a":1 "b":2}`, `{"a":1,,"b":2}` and `[1 2]` all index exactly as if
-/// they were well-formed -- `#1194`'s `ends_unpaired`/`key_is_malformed`
-/// checks can't see any of them either, since every one leaves an even,
-/// well-typed BP child count, the only anomaly those checks test for.
-///
-/// Scans *backward* from `child_start` (a cheap, O(1)-via-rank/select
-/// position every direct child already has) rather than forward from the
-/// previous sibling's own end: finding a sibling's end is O(that
-/// sibling's own subtree) whenever it's a container -- `JsonCursor::
-/// text_range`'s own comment explains why: IB only marks *opening*
-/// positions, so there is no cheap text-position lookup for a closing
-/// bracket. Scanning forward from there at every recursion level would
-/// make a deeply nested document's check cost quadratic in nesting depth.
-/// Walking backward instead touches only the whitespace/delimiter run in
-/// the gap itself, stopping the instant it reaches non-whitespace content
-/// it doesn't need to identify -- bounded by the gap, not by anything
-/// before it.
-///
-/// Deliberately narrower than re-running the strict validator over the
-/// same bytes would be: this only inspects gap bytes between already-
-/// recognized children, never a child's own content, so it can't regress
-/// this crate's own established leniencies beyond strict RFC 8259 --
-/// leading zeros (#1149), a leading-dot number (#1171), a malformed
-/// nested number like `1.2.3` (#1194/#966) -- none of which live in a gap.
-///
-/// Only catches a missing or doubled delimiter between two real children.
-/// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
-/// container (`{,}`) needs the *closing* bracket's text position, which is
-/// exactly the expensive lookup this function exists to avoid -- tracked
-/// as a follow-up rather than folded in here.
-fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -> bool {
-    let mut i = child_start;
-    let mut found = None;
-    while i > 0 {
-        match text[i - 1] {
-            b @ (b',' | b':') => {
-                if found.is_some() {
-                    return false; // doubled delimiter
-                }
-                found = Some(b);
-                i -= 1;
-            }
-            b if b.is_ascii_whitespace() => i -= 1,
-            _ => break, // reached the previous sibling's own content
-        }
-    }
-    found == expected
-}
+// `preceding_gap_ok` (#1643) used to live here as a CLI-only check. #1677
+// relocated it to `succinctly::json::light` so this printer and the
+// evaluator's own object/array walk (`eval_generic.rs`) share one
+// definition instead of drifting into two; see that function's own doc
+// comment for the semi-index background (`json::standard::is_delim`
+// treating `,`/`:` as invisible) and the backward-scan rationale.
 
 /// Forward-scan mirror of [`preceding_gap_ok`], used to catch the trailing
 /// half of #1643's own deferred gap (#1676): a `,`/`:` sitting between a
@@ -4815,7 +4774,7 @@ where
                         out.write_all(raw)?;
                     }
                 }
-                bail_if_keys_ended_unpaired(&keys, doc_text)?;
+                bail_if_keys_malformed(&keys, doc_text)?;
                 out.write_all(b"]")?;
             } else {
                 out.write_all(b"[")?;
@@ -4864,7 +4823,7 @@ where
                         out.write_all(raw)?;
                     }
                 }
-                bail_if_keys_ended_unpaired(&keys, doc_text)?;
+                bail_if_keys_malformed(&keys, doc_text)?;
                 out.write_all(separator.as_bytes())?;
                 out.write_all(current_indent.as_bytes())?;
                 out.write_all(b"]")?;

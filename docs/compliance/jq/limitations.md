@@ -799,6 +799,41 @@ form collides with another key of the same name and cannot be represented
 An *ordinary* repeated key (no decode failure on either side) is unaffected and still
 collapses to its last value, matching jq's normal duplicate-key handling.
 
+**A missing or doubled `,`/`:` is now caught by the same routes as an unpaired member
+(#1677).** #1643 added this check (`preceding_gap_ok`) but placed it only in the CLI's own
+`print_json`, so a filter that never re-serializes the malformed container whole — `.[]`,
+`length`, `keys`/`keys_unsorted`, `add`, `to_entries`, or a plain field lookup that doesn't
+reach a leaf — read straight through it:
+
+```
+$ echo '{"a" 1, "b": 2}' | jq  -c 'keys'    # parse error, exit 5
+$ echo '{"a" 1, "b": 2}' | sjq -c 'keys'    # exit 5 now (was: ["a","b"], exit 0)
+$ echo '[1 2, 3]'        | sjq -c '.[]'     # exit 5 now (was: 1␊2␊3,     exit 0)
+$ echo '{"a" 1}'         | sjq -c '.a'      # exit 5 now (was: 1,         exit 0)
+```
+
+#1677 threaded the same `,`/`:` scan (relocated to `succinctly::json::light::preceding_gap_ok`,
+shared with the CLI printer rather than duplicated) into the object/array walk primitives
+`eval_generic.rs`/`document.rs` already share for the #1194 class above —
+`effective_fields_checked`, `census`/`checked_len`, `DistinctKeyCursors`, `to_owned`/
+`to_owned_cursor`, and `JsonFields::find_cursor` — so a `succinctly::jq::eval_generic` caller
+gets the same protection a CLI user does, not just `sjq -c .`. The residual gaps are exactly
+the ones already named above for the unpaired-member class, since both checks now ride the
+same walks: `obj | map(f)` (`LazySource::Values`, left open by #1641), `keys_unsorted`'s
+positional fast paths (`.[0]`, `first`, `last`, `.[n]`, tracked separately as #1629), and bare
+`keys_unsorted`'s streaming truncation (a partial array can reach stdout beside the exit 5,
+for the same "cannot rewind a byte-at-a-time writer" reason).
+
+**Not covered at all: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs`
+defines a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually
+re-exports, and the one used in `src/jq/mod.rs`'s own module-doc example — with its own
+unchecked `to_owned`/`effective_len`/`effective_fields`/`Builtin::Keys`. It has neither this
+check nor #1194's: a library caller who follows that documented example and evaluates
+straight off a fresh cursor gets no protection from either class. The CLI itself never reaches
+this path except through the reindex bridge, which only ever feeds it an already-validated
+`OwnedValue`, so `sjq`/`syq` are unaffected. Tracked as a follow-up rather than folded into
+#1677, which scoped itself to `eval_generic.rs`.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the

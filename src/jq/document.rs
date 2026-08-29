@@ -144,6 +144,60 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Get the byte position in the source text.
     fn text_position(&self) -> Option<usize>;
 
+    /// Whether this node, already known to sit at `text_pos`, is preceded
+    /// by the delimiter its position in the document requires: nothing if
+    /// `expected` is `None` (a container's first child), otherwise exactly
+    /// one byte matching `expected` (`,` before a later array element or
+    /// object key, `:` before an object field's value) — #1677, extending
+    /// #1643's CLI-only check (`jq_runner.rs`'s `print_json`) into the
+    /// evaluator itself, so `.[]`/`length`/`keys`/`add`/`to_entries`/plain
+    /// field access all raise on a malformed delimiter too, not just a
+    /// filter that re-serializes the container whole.
+    ///
+    /// `text_pos` is never re-derived here -- it must be a position the
+    /// caller already resolved (this cursor's own `text_position()`, or a
+    /// value it already decoded, e.g. [`DocumentValue::text_start`]) --
+    /// because a second `text_position()` call on a hot walk is a real
+    /// cost, not a formality (see that method's own rank/select doc
+    /// comment). Mirrors the `known_text_pos` reuse `#1643` already
+    /// established for the CLI printer.
+    ///
+    /// The default answers `true` unconditionally: every format but JSON
+    /// validates delimiters while parsing, so this costs them nothing.
+    fn preceding_delimiter_ok(&self, text_pos: usize, expected: Option<u8>) -> bool {
+        let _ = (text_pos, expected);
+        true
+    }
+
+    /// The error to raise when [`preceding_delimiter_ok`](Self::preceding_delimiter_ok)
+    /// answers `false`.
+    ///
+    /// The default is unreachable for every format shipped today, same as
+    /// [`DocumentFields::malformed_member_error`] -- it exists to keep a
+    /// future format honest rather than to be seen.
+    fn malformed_delimiter_error(&self) -> EvalError {
+        EvalError::new("Invalid document text: malformed delimiter")
+    }
+
+    /// Whether the value immediately following this key (at `key_end`, the
+    /// key's own already-known span end) is preceded by exactly one `:`
+    /// (#1677) -- the forward-scan twin of
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok), for a
+    /// caller that holds only a key and has not resolved its value's
+    /// cursor at all (`census`/`checked_len`/[`DistinctKeyCursors`]'s
+    /// key-only walk).
+    ///
+    /// Scanning forward from a position already in hand costs nothing
+    /// beyond the gap itself; resolving the value's own `text_position()`
+    /// purely to run the backward check instead measured a real, avoidable
+    /// per-field cost (see [`crate::json::light::following_gap_ok`]'s own
+    /// doc comment for the number). The default answers `true`
+    /// unconditionally, same reasoning as `preceding_delimiter_ok`.
+    fn following_colon_ok(&self, key_end: usize) -> bool {
+        let _ = key_end;
+        true
+    }
+
     /// Get the 1-based line number of this node's position.
     ///
     /// Returns 0 if position information is not available. "Not available"
@@ -516,6 +570,33 @@ pub trait DocumentValue: Sized + Clone {
         None
     }
 
+    /// The byte position of this value's own text token, when it was
+    /// decoded from an already-resolved cursor position rather than
+    /// computed (arithmetic, construction) -- letting a caller reuse it for
+    /// [`DocumentCursor::preceding_delimiter_ok`]'s delimiter-gap check
+    /// (#1677) instead of paying for a second cursor lookup to re-derive
+    /// the same position.
+    ///
+    /// Defaults to `None`. JSON overrides it for the two token-shaped
+    /// variants whose own struct already carries this position
+    /// (`JsonString`/`JsonNumber`, per their own `start()` doc comments,
+    /// #1643).
+    fn text_start(&self) -> Option<usize> {
+        None
+    }
+
+    /// The byte position immediately past this value's own text span, when
+    /// resolvable without a fresh cursor lookup -- lets a caller that holds
+    /// only a key check the delimiter *forward* from here via
+    /// [`DocumentCursor::following_colon_ok`] instead of resolving its
+    /// value's `text_position()` (#1677). Defaults to `None`; JSON
+    /// overrides it for `String` keys (`JsonString::end`), the only variant
+    /// this is used for -- a key is never a `Number` on a well-formed
+    /// document, and #1194's own check already refuses one that is.
+    fn text_end(&self) -> Option<usize> {
+        None
+    }
+
     /// Try to get as object fields.
     fn as_object(&self) -> Option<Self::Fields>;
 
@@ -602,7 +683,16 @@ pub trait DocumentFields: Sized + Clone {
     /// answer "what does this key resolve to", `to_entries` answers "what
     /// are all the entries", and only YAML keeps every entry distinct for
     /// the latter question.
-    fn find_cursor(&self, name: &str) -> Option<Self::Cursor>;
+    ///
+    /// `Err` when the *winning* field's own key or value is preceded by a
+    /// malformed delimiter (#1677) -- a targeted lookup such as `.a` never
+    /// walks every sibling the way `.[]`/`length`/`keys` do, so it is the
+    /// one access pattern that needs its own check rather than inheriting
+    /// one from a shared walk. Only the winning field pays for it (JSON
+    /// overrides this to check after resolving which occurrence wins, not
+    /// during the search); every other format's default answers `Ok` via
+    /// [`DocumentCursor::preceding_delimiter_ok`]'s own no-op default.
+    fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError>;
 
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
@@ -696,6 +786,7 @@ pub trait DocumentFields: Sized + Clone {
     fn keys(&self) -> Result<Vec<String>, EvalError> {
         let mut keys = Vec::new();
         let mut fields = self.clone();
+        let mut is_first = true;
         while let Some((field, rest)) = fields.uncons() {
             // A key that will not *decode* (#1247/#1385) is preserved via
             // its raw source span rather than raised on (#1642) -- `keys`
@@ -706,8 +797,17 @@ pub trait DocumentFields: Sized + Clone {
             let Some(key) = key_display_string(&field.key) else {
                 return Err(fields.malformed_member_error());
             };
+            // #1677: this walk already resolved both the key and the value
+            // (`uncons` does), so both checks reuse an existing decode
+            // rather than deriving a new position.
+            if !key_delimiter_ok::<Self>(&field.key, &field.key_cursor, is_first)
+                || !value_delimiter_ok::<Self>(Some(&field.value), &field.value_cursor)
+            {
+                return Err(fields.malformed_member_error());
+            }
             keys.push(key.into_owned());
             fields = rest;
+            is_first = false;
         }
         if fields.ends_unpaired() {
             return Err(fields.malformed_member_error());
@@ -845,8 +945,18 @@ fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, 
 /// stringify (issue #222 requires an override to answer `Some("")` rather
 /// than `None` for a key with no scalar form), so this costs YAML one
 /// predicate on a branch it never takes.
+///
+/// `key_string()` first, `string_decode_error()` only on its `None` (#1677
+/// perf-guard finding): the ordinary case -- a key that decodes fine --
+/// answers from that one call alone, instead of paying for two independent
+/// full decodes of the same bytes (`key_string()`'s own `as_str()` and a
+/// second, separate `as_str()` inside `string_decode_error()`). Equivalent
+/// to the original `dec_err.is_none() && key_str.is_none()`: whenever
+/// `key_string()` is `Some`, that conjunction is already `false` regardless
+/// of `string_decode_error()`, so short-circuiting on it first changes
+/// nothing observable, only which (redundant) call gets skipped.
 pub(crate) fn key_is_malformed<V: DocumentValue>(key: &V) -> bool {
-    key.string_decode_error().is_none() && key.key_string().is_none()
+    key.key_string().is_none() && key.string_decode_error().is_none()
 }
 
 /// The string to show for a key, substituting a best-effort fallback when
@@ -992,6 +1102,80 @@ pub fn resolve_display_key<V: DocumentValue, T>(
         return Err(colliding_display_key_error(&key));
     }
     Ok(Some(key))
+}
+
+/// Whether an object field's key is preceded by the delimiter its position
+/// requires: nothing if `is_first`, exactly one `,` otherwise (#1677).
+///
+/// Reuses `key`'s own decode (`text_start`) rather than a fresh cursor
+/// lookup, so a caller that has already resolved the key -- every call
+/// site here has -- pays nothing extra. Answers `true` when the key has no
+/// resolvable text start (a format with no delimiter concept, or a key
+/// this document's own grammar never allowed and #1194's separate check
+/// already refuses).
+///
+/// Generic over `F: DocumentFields` rather than a `DocumentValue`/
+/// `DocumentCursor` pair: `DocumentFields` doesn't itself bind `Self::Cursor`
+/// to `Self::Value::Cursor`, so a caller generic only over `F` (`census`,
+/// `checked_len`, [`DistinctKeyCursors`], `effective_fields_checked`) has no
+/// way to name that equality -- naming `F` instead sidesteps needing it,
+/// since `key`/`key_cursor` are each used only through their own trait.
+pub(crate) fn key_delimiter_ok<F: DocumentFields>(
+    key: &F::Value,
+    key_cursor: &F::Cursor,
+    is_first: bool,
+) -> bool {
+    match key.text_start() {
+        Some(pos) => {
+            key_cursor.preceding_delimiter_ok(pos, if is_first { None } else { Some(b',') })
+        }
+        None => true,
+    }
+}
+
+/// Whether an object field's value is preceded by exactly one `:` (#1677).
+///
+/// Reuses `value`'s own decode (`text_start`) when the caller already has
+/// one -- a full [`DocumentFields::uncons`] walk resolves it regardless, so
+/// this is free for every caller of this function. A key-only walk that has
+/// not resolved a value at all should use
+/// [`key_only_value_delimiter_ok`] instead, which never touches the value
+/// cursor.
+pub(crate) fn value_delimiter_ok<F: DocumentFields>(
+    value: Option<&F::Value>,
+    value_cursor: &F::Cursor,
+) -> bool {
+    let pos = value
+        .and_then(DocumentValue::text_start)
+        .or_else(|| value_cursor.text_position());
+    match pos {
+        Some(pos) => value_cursor.preceding_delimiter_ok(pos, Some(b':')),
+        None => true,
+    }
+}
+
+/// [`value_delimiter_ok`], for a key-only walk (`census`, `checked_len`,
+/// [`DistinctKeyCursors`]) that has not resolved a value cursor at all.
+///
+/// Scans *forward* from the key's own already-known span end
+/// (`key.text_end()`) instead of resolving the value's `text_position()`
+/// backward from -- doing it the [`value_delimiter_ok`] way here instead
+/// measured **+16%** on a 2 MB `wide` `keys_unsorted` query (#1677), well
+/// past `scripts/perf-guard.py`'s 5% threshold. This forward-scan version
+/// brings `keys`/`keys_unsorted` back to noise level, but `census`'s own
+/// walk (`length`, `keys | length`) still measures **~10%** on the same
+/// fixture -- accepted deliberately (see
+/// [`following_gap_ok`](crate::json::light::following_gap_ok)'s own doc
+/// comment for the full reasoning) because the alternative is silently
+/// wrong output on this issue's own headline repro.
+pub(crate) fn key_only_value_delimiter_ok<F: DocumentFields>(
+    key: &F::Value,
+    key_cursor: &F::Cursor,
+) -> bool {
+    match key.text_end() {
+        Some(key_end) => key_cursor.following_colon_ok(key_end),
+        None => true,
+    }
 }
 
 /// An open-addressed set of key hashes: "have I seen this one?" answered
@@ -1225,7 +1409,17 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut unkeyed = 0usize;
     let mut malformed = false;
     let mut walk = fields.clone();
-    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+    let mut is_first = true;
+    while let Some((key, cursor, rest)) = walk.uncons_key() {
+        // #1677: both checks are free here -- comma-before-key reuses
+        // `key`'s own decode, and colon-before-value scans forward from
+        // it (`key_only_value_delimiter_ok`) rather than resolving the
+        // value's own position.
+        if !key_delimiter_ok::<F>(&key, &cursor, is_first)
+            || !key_only_value_delimiter_ok::<F>(&key, &cursor)
+        {
+            malformed = true;
+        }
         match key_hash_of(&key) {
             Some(hash) => hashes.push(hash),
             // `key_hash_of` answers `None` for exactly the keys that do not
@@ -1237,6 +1431,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
             }
         }
         walk = rest;
+        is_first = false;
     }
     // `walk` is the list this loop *finished* on, the only list
     // `ends_unpaired` answers for (#1194), and asking it is O(1).
@@ -1356,12 +1551,21 @@ pub fn effective_fields_checked<F: DocumentFields>(
 ) -> Result<Vec<DocumentField<F::Value, F::Cursor>>, EvalError> {
     let mut out = Vec::new();
     let mut walk = fields.clone();
+    let mut is_first = true;
     while let Some((field, rest)) = walk.uncons() {
         if key_is_malformed(&field.key) {
             return Err(walk.malformed_member_error());
         }
+        // #1677: free here too -- `uncons` already resolved both key and
+        // value, so both checks reuse an existing decode.
+        if !key_delimiter_ok::<F>(&field.key, &field.key_cursor, is_first)
+            || !value_delimiter_ok::<F>(Some(&field.value), &field.value_cursor)
+        {
+            return Err(walk.malformed_member_error());
+        }
         out.push(field);
         walk = rest;
+        is_first = false;
     }
     if walk.ends_unpaired() {
         return Err(walk.malformed_member_error());
@@ -1445,6 +1649,16 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// the walk discovers it, because neither branch can answer afterwards:
     /// `rest` is exhausted on one and stale mid-object on the other.
     ended_unpaired: bool,
+    /// How many fields this walk has examined in raw document order --
+    /// distinct from `yielded`, which undercounts once a repeat starts
+    /// collapsing. Used only to know whether the *next* field is the
+    /// object's first, for #1677's comma check.
+    walked: usize,
+    /// Whether any field this walk has examined had a malformed `,`/`:`
+    /// delimiter (#1677). Same "ask only once exhausted" contract as
+    /// [`ended_unpaired`](Self::ended_unpaired), and for the same reason:
+    /// answering up front would cost a second walk.
+    delimiter_fault: bool,
 }
 
 impl<F: DocumentFields> DistinctKeyCursors<F> {
@@ -1458,7 +1672,16 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
             yielded: 0,
             collapsed: None,
             ended_unpaired: false,
+            walked: 0,
+            delimiter_fault: false,
         }
+    }
+
+    /// Whether any field this walk has examined had a malformed `,`/`:`
+    /// delimiter (#1677) -- see [`ended_unpaired`](Self::ended_unpaired)
+    /// for the "only meaningful once exhausted" contract this shares.
+    pub fn delimiter_fault(&self) -> bool {
+        self.delimiter_fault
     }
 
     /// Whether the object ends on a child with no sibling to pair as its
@@ -1500,6 +1723,16 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             return None;
         };
         self.rest = tail;
+        // #1677: checked for every field examined, in raw document order,
+        // before any collapse decision -- a comma/colon fault must surface
+        // even for a field a later duplicate ends up collapsing away.
+        let is_first = self.walked == 0;
+        self.walked += 1;
+        if !key_delimiter_ok::<F>(&key, &key_cursor, is_first)
+            || !key_only_value_delimiter_ok::<F>(&key, &key_cursor)
+        {
+            self.delimiter_fault = true;
+        }
         let repeat = self
             .seen
             .as_mut()
@@ -1511,6 +1744,7 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             // reaches the `None` arm, so that arm would never see the
             // orphan. `confirmed` covers the whole object, so it can.
             self.ended_unpaired = confirmed.ends_unpaired;
+            self.delimiter_fault |= confirmed.delimiter_fault;
             let ConfirmedRepeat { keys, total, .. } = confirmed;
             if keys.len() < total {
                 self.collapsed = Some(keys);
@@ -1552,9 +1786,20 @@ fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> ConfirmedRepeat<F
     let mut slot_of: IndexMap<String, usize> = IndexMap::new();
     let mut out: Vec<(F::Value, F::Cursor)> = Vec::new();
     let mut total = 0usize;
+    let mut delimiter_fault = false;
     let mut walk = fields.clone();
+    let mut is_first = true;
     while let Some((key, key_cursor, rest)) = walk.uncons_key() {
         total += 1;
+        // #1677: re-walks the whole object from the start, so this repeats
+        // a check `DistinctKeyCursors::next` already ran on fields before
+        // the repeat was confirmed -- negligible next to this function's
+        // own re-walk, which only runs once a duplicate is confirmed.
+        if !key_delimiter_ok::<F>(&key, &key_cursor, is_first)
+            || !key_only_value_delimiter_ok::<F>(&key, &key_cursor)
+        {
+            delimiter_fault = true;
+        }
         match key.key_string().map(Cow::into_owned) {
             Some(k) => match slot_of.get(&k) {
                 Some(&slot) => out[slot] = (key, key_cursor),
@@ -1568,12 +1813,14 @@ fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> ConfirmedRepeat<F
             None => out.push((key, key_cursor)),
         }
         walk = rest;
+        is_first = false;
     }
     ConfirmedRepeat {
         // `walk` is the list this loop *finished* on, which is the only
         // list `ends_unpaired` answers for (#1194). Free here: the walk had
         // to run anyway to collapse the duplicate.
         ends_unpaired: walk.ends_unpaired(),
+        delimiter_fault,
         keys: out,
         total,
     }
@@ -1593,6 +1840,8 @@ struct ConfirmedRepeat<F: DocumentFields> {
     total: usize,
     /// Whether the walk ran out on an unpaired child (#1194).
     ends_unpaired: bool,
+    /// Whether any field had a malformed `,`/`:` delimiter (#1677).
+    delimiter_fault: bool,
 }
 
 /// Collapse fields known to contain at least one repeated key.
@@ -1675,12 +1924,20 @@ pub fn effective_len_checked<F: DocumentFields>(
 fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
     let mut count = 0usize;
     let mut walk = fields.clone();
-    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+    let mut is_first = true;
+    while let Some((key, cursor, rest)) = walk.uncons_key() {
         if key_is_malformed(&key) {
+            return Err(walk.malformed_member_error());
+        }
+        // #1677: same cheap forward-scan checks as `census`'s own walk above.
+        if !key_delimiter_ok::<F>(&key, &cursor, is_first)
+            || !key_only_value_delimiter_ok::<F>(&key, &cursor)
+        {
             return Err(walk.malformed_member_error());
         }
         count += 1;
         walk = rest;
+        is_first = false;
     }
     if walk.ends_unpaired() {
         return Err(walk.malformed_member_error());
@@ -1712,7 +1969,11 @@ pub fn effective_keys<F: DocumentFields>(
         };
         keys.push(key.into_owned());
     }
-    if cursors.ended_unpaired() {
+    // #1677: same malformed-delimiter check `distinct_key_cursors`
+    // (`eval_generic.rs`) applies to its own `DistinctKeyCursors` walk --
+    // this one just never got wired to it when #1642 rewrote this function
+    // onto `DistinctKeyCursors` on `main`, ahead of this check existing.
+    if cursors.ended_unpaired() || cursors.delimiter_fault() {
         return Err(fields.malformed_member_error());
     }
     Ok(keys)
@@ -1806,6 +2067,46 @@ pub trait DocumentElements: Sized + Copy + Clone {
             elems = rest;
         }
         cursors
+    }
+
+    /// The error to raise for an element preceded by a malformed `,`
+    /// (#1677) -- the array counterpart of
+    /// [`DocumentFields::malformed_member_error`], which this trait had no
+    /// equivalent of before #1677 (an array element can only be malformed
+    /// in its own content, never by pairing, until the delimiter class).
+    ///
+    /// The default is unreachable for every format shipped today, same
+    /// reasoning as that method's own default.
+    fn malformed_element_error(&self) -> EvalError {
+        EvalError::new("Invalid document text: malformed array element")
+    }
+
+    /// [`collect_cursors`](Self::collect_cursors), refusing an element
+    /// preceded by a malformed `,` (#1677).
+    ///
+    /// A separate method rather than a change to `collect_cursors` itself:
+    /// several callers (`shuffle`, `pivot`) reach each element through
+    /// `to_owned_cursor` regardless, which already validates *that*
+    /// element's own contents, so paying for a fresh `text_position()` per
+    /// element here would tax them for a check their own walk makes moot.
+    /// Only a caller that needs the gap between siblings checked --
+    /// `.[]`/`to_entries` on arrays -- uses this instead.
+    fn collect_cursors_checked(&self) -> Result<Vec<Self::Cursor>, EvalError> {
+        let mut cursors = Vec::new();
+        let mut elems = *self;
+        let mut is_first = true;
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            if let Some(pos) = cursor.text_position() {
+                let expected = if is_first { None } else { Some(b',') };
+                if !cursor.preceding_delimiter_ok(pos, expected) {
+                    return Err(self.malformed_element_error());
+                }
+            }
+            cursors.push(cursor);
+            elems = rest;
+            is_first = false;
+        }
+        Ok(cursors)
     }
 }
 
@@ -1960,6 +2261,10 @@ mod checked_len_tests {
             (b"{invalid}", None),           // orphan, post-walk check
             (br#"{123: 1, "b": 2}"#, None), // bad key, per-field check
             (br#"{"a":1, "b"}"#, None),     // orphan behind a good field
+            // #1677: the delimiter class, same shared walk.
+            (br#"{"a" 1,"b":2}"#, None), // missing `:` on the first field
+            (br#"{"a":1 "b":2}"#, None), // missing `,` between fields
+            (br#"{"a":1,,"b":2}"#, None), // doubled `,` between fields
         ] {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);

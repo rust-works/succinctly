@@ -1118,19 +1118,43 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
     /// as a separate loop rather than reusing `find` so the returned cursor
     /// (needed for `line`/`column`) doesn't require re-navigating.
-    pub fn find_cursor(&self, name: &str) -> Option<JsonCursor<'a, W>> {
+    ///
+    /// `Err` when the *winning* occurrence's own `,`/`:` delimiters are
+    /// malformed (#1677) -- a targeted lookup like `.a` never walks every
+    /// sibling the way `.[]`/`length`/`keys` do, so it needs its own check.
+    /// Deferred to the end rather than checked as each candidate is found:
+    /// only the field that actually wins (the *last* matching occurrence)
+    /// should be validated, since an earlier same-named field's own gap is
+    /// moot once a later one supersedes it.
+    pub fn find_cursor(&self, name: &str) -> Result<Option<JsonCursor<'a, W>>, EvalError> {
         let mut fields = *self;
-        let mut result = None;
+        // (key's own text start, value cursor, is this field the object's
+        // first) for the winning candidate seen so far.
+        let mut winner: Option<(usize, JsonCursor<'a, W>, bool)> = None;
+        let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             if let StandardJson::String(key) = field.key() {
                 // Same undecodable-key skip as `find` above (#1247).
                 if key.as_str().is_ok_and(|k| k == name) {
-                    result = Some(field.value_cursor());
+                    winner = Some((key.start(), field.value_cursor(), index == 0));
                 }
             }
             fields = rest;
+            index += 1;
         }
-        result
+        let Some((key_start, value_cursor, is_first)) = winner else {
+            return Ok(None);
+        };
+        let comma_expected = if is_first { None } else { Some(b',') };
+        if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
+            return Err(EvalError::malformed_json_text(value_cursor.text()));
+        }
+        if let Some(value_start) = value_cursor.text_position() {
+            if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
+                return Err(EvalError::malformed_json_text(value_cursor.text()));
+            }
+        }
+        Ok(Some(value_cursor))
     }
 }
 
@@ -1379,6 +1403,17 @@ impl<'a> JsonString<'a> {
     #[inline]
     pub fn start(&self) -> usize {
         self.start
+    }
+
+    /// The byte offset immediately past the closing quote in the document
+    /// text -- a forward scan bounded by this string's own length, not a
+    /// rank/select lookup. Lets a caller that only has this key (not the
+    /// value that follows it) check the delimiter *forward* from here
+    /// instead of resolving the next sibling's `text_position()`, the
+    /// exact per-field cost `uncons_key()` exists to avoid (#1677/#1514).
+    #[inline]
+    pub fn end(&self) -> usize {
+        self.find_end()
     }
 
     /// Get the raw bytes including quotes.
@@ -1703,6 +1738,14 @@ pub struct JsonNumber<'a> {
 }
 
 impl<'a> JsonNumber<'a> {
+    /// The byte offset of the number's first character in the document
+    /// text. Mirrors [`JsonString::start`] for the same reuse purpose
+    /// (#1643, #1677).
+    #[inline]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
     /// Get the raw bytes of the number.
     pub fn raw_bytes(&self) -> &'a [u8] {
         let end = self.find_end();
@@ -1795,6 +1838,94 @@ use crate::jq::document::{
 };
 use crate::jq::{nonfinite_display_string, EvalError, YqSemantics};
 
+/// Whether the child starting at `child_start` is preceded by `expected`
+/// (`,`/`:`), skipping whitespace, with nothing else in between.
+///
+/// Originally the CLI-only heart of #1643's `print_json` check
+/// (`src/bin/succinctly/jq_runner.rs`); relocated here for #1677 so
+/// [`DocumentCursor::preceding_delimiter_ok`] (below) and the CLI printer
+/// share one definition instead of drifting into two.
+///
+/// Deliberately narrow, matching real jq's own leniency elsewhere in the
+/// same bytes: this only inspects gap bytes between already-recognized
+/// children, never a child's own content, so it can't regress this
+/// crate's own established leniencies beyond strict RFC 8259 -- leading
+/// zeros (#1149), a leading-dot number (#1171), a malformed nested number
+/// like `1.2.3` (#1194/#966) -- none of which live in a gap.
+///
+/// Only catches a missing or doubled delimiter between two real children.
+/// A trailing delimiter (`{"a":1,}`) or a delimiter in an apparently-empty
+/// container (`{,}`) needs the *closing* bracket's text position, which is
+/// exactly the expensive lookup this function exists to avoid -- tracked
+/// as a follow-up rather than folded in here.
+///
+/// `pub`, not `pub(crate)`: the CLI binary (`src/bin/succinctly/`) is a
+/// separate crate that only sees this library's public surface, and it is
+/// the other caller of this exact check (`jq_runner.rs`'s `print_json`).
+/// Not re-exported from the crate root -- an internal detail for this
+/// crate's own two evaluators, not part of the supported library API.
+pub fn preceding_gap_ok(text: &[u8], child_start: usize, expected: Option<u8>) -> bool {
+    let mut i = child_start;
+    let mut found = None;
+    while i > 0 {
+        match text[i - 1] {
+            b @ (b',' | b':') => {
+                if found.is_some() {
+                    return false; // doubled delimiter
+                }
+                found = Some(b);
+                i -= 1;
+            }
+            b if b.is_ascii_whitespace() => i -= 1,
+            _ => break, // reached the previous sibling's own content
+        }
+    }
+    found == expected
+}
+
+/// The forward-scan counterpart of [`preceding_gap_ok`]: whether exactly
+/// one `:` separates `key_end` (a key's own already-known span end) from
+/// the next non-whitespace byte.
+///
+/// Exists so a caller holding only a key (not its value's cursor) can check
+/// the delimiter between them by scanning forward from a position it
+/// already has -- `JsonString::end()` -- bounded by the gap itself, rather
+/// than resolving the value's `text_position()` (a rank/select lookup)
+/// purely to run `preceding_gap_ok` backward from there instead: measured
+/// live, that naive version cost **+16%** on a 2 MB `wide` `keys_unsorted`
+/// query (#1677) -- the exact per-field cost #1514 already measured for
+/// `uncons` vs `uncons_key` in general, reintroduced here for one specific
+/// lookup instead of a whole `DocumentField`.
+///
+/// This forward-scan version brought `keys`/`keys_unsorted` back to
+/// noise-level (~1-4%), but `census`'s own key-only walk (`length`,
+/// `keys | length`) still measured **~10%** on the same 2 MB `wide`
+/// fixture (159K short top-level keys) -- `census` has nothing else to
+/// dilute the cost against, unlike `keys_unsorted`, which also streams
+/// output. Accepted deliberately rather than dropped: it is the
+/// correctness fix for this issue's own headline repro
+/// (`{"a" 1, "b": 2} | length`), and the alternative is silently wrong
+/// output. `scripts/perf-guard.py`'s baseline needs a deliberate
+/// `--update-baseline` run on a pinned bench box to reflect this.
+pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
+    let mut i = key_end;
+    let mut found = false;
+    while i < text.len() {
+        match text[i] {
+            b':' => {
+                if found {
+                    return false; // doubled delimiter
+                }
+                found = true;
+                i += 1;
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            _ => break,
+        }
+    }
+    found
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     type Value = StandardJson<'a, W>;
 
@@ -1826,6 +1957,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn text_position(&self) -> Option<usize> {
         JsonCursor::text_position(self)
+    }
+
+    /// JSON is the one format whose semi-index treats `:`/`,` as
+    /// interchangeable gap bytes (#1643), so it is the one format that
+    /// overrides this (#1677).
+    #[inline]
+    fn preceding_delimiter_ok(&self, text_pos: usize, expected: Option<u8>) -> bool {
+        preceding_gap_ok(self.text, text_pos, expected)
+    }
+
+    /// Re-runs the strict validator over this cursor's own document to name
+    /// the real syntax error, matching [`JsonFields::malformed_member_error`]'s
+    /// own reasoning (#1194) for the sibling delimiter class (#1677).
+    #[inline]
+    fn malformed_delimiter_error(&self) -> EvalError {
+        EvalError::malformed_json_text(self.text)
+    }
+
+    #[inline]
+    fn following_colon_ok(&self, key_end: usize) -> bool {
+        following_gap_ok(self.text, key_end)
     }
 
     #[inline]
@@ -2041,6 +2193,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    /// The two token-shaped variants each already carry their own opening
+    /// position (#1643's `JsonString::start`/`JsonNumber::start`), so a
+    /// caller that has decoded either can reuse it for #1677's delimiter
+    /// check for free.
+    fn text_start(&self) -> Option<usize> {
+        match self {
+            StandardJson::String(s) => Some(s.start()),
+            StandardJson::Number(n) => Some(n.start()),
+            _ => None,
+        }
+    }
+
+    /// Only `String`: a key is never a `Number` on a well-formed document,
+    /// and this is used for nothing else (#1677).
+    fn text_end(&self) -> Option<usize> {
+        match self {
+            StandardJson::String(s) => Some(s.end()),
+            _ => None,
+        }
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             StandardJson::Object(fields) => Some(*fields),
@@ -2109,7 +2282,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
         JsonFields::find(self, name)
     }
 
-    fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
+    fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {
         JsonFields::find_cursor(self, name)
     }
 
@@ -2162,6 +2335,16 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
 
     fn is_empty(&self) -> bool {
         JsonElements::is_empty(self)
+    }
+
+    /// Re-runs the strict validator, mirroring
+    /// [`JsonFields::malformed_member_error`]'s own reasoning (#1194) for
+    /// the array delimiter class (#1677).
+    fn malformed_element_error(&self) -> EvalError {
+        match self.element_cursor {
+            Some(cursor) => EvalError::malformed_json_text(cursor.text()),
+            None => EvalError::new("Invalid JSON text"),
+        }
     }
 }
 
@@ -2681,7 +2864,7 @@ mod tests {
         let StandardJson::Object(fields) = root.value() else {
             panic!("expected object");
         };
-        let b_cursor = fields.find_cursor("b").expect("field b");
+        let b_cursor = fields.find_cursor("b").unwrap().expect("field b");
         assert_eq!(b_cursor.line(), 3);
         assert_eq!(b_cursor.column(), 8);
     }
@@ -2885,7 +3068,10 @@ mod tests {
                     Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 3),
                     other => panic!("expected number 3, got {other:?}"),
                 }
-                let value_cursor = fields.find_cursor("a").expect("should find a cursor");
+                let value_cursor = fields
+                    .find_cursor("a")
+                    .unwrap()
+                    .expect("should find a cursor");
                 match value_cursor.value() {
                     StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 3),
                     other => panic!("expected number 3, got {other:?}"),
@@ -2919,6 +3105,7 @@ mod tests {
             }
             let cursor = fields
                 .find_cursor("b")
+                .unwrap()
                 .expect("find_cursor should reach b past an undecodable key");
             match cursor.value() {
                 StandardJson::Number(n) => assert_eq!(n.as_i64().unwrap(), 2),
