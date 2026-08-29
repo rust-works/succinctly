@@ -838,27 +838,27 @@ coverage differs:
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
-  `keys_unsorted`) is the sole exception, fixed by #1829/#1835 to delegate to `effective_keys`
-  (`document.rs`) — the same `DistinctKeyCursors` walk `eval_generic.rs`'s own `keys_unsorted`
-  writer is built on, not a narrower hand-rolled copy — which gives it #1677 protection
-  alongside #1194/#1642's.
+  `keys_unsorted`, #1829/#1835) and `to_entries` (#1829) are the exceptions so far: `keys`/
+  `keys_unsorted` delegate to `effective_keys` (`document.rs`) — the same `DistinctKeyCursors`
+  walk `eval_generic.rs`'s own `keys_unsorted` writer is built on — and `to_entries` to
+  `effective_fields_checked` (the value-carrying sibling of the same shared walk family), which
+  gives both #1677 protection alongside #1194/#1642's.
 
 A library caller who follows the documented `eval()` example and evaluates straight off a
-fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`; every other builtin in
-this file, checked or not on the decode-failure/#1194 axis, still misses it. The CLI itself
-never reaches this path except through the reindex bridge, which only ever feeds it an
+fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`/`to_entries`; every other
+builtin in this file, checked or not on the decode-failure/#1194 axis, still misses it. The CLI
+itself never reaches this path except through the reindex bridge, which only ever feeds it an
 already-validated `OwnedValue`, so `sjq`/`syq` are unaffected. The remaining #1677 call sites
-are tracked as a follow-up (#1829) rather than folded into #1677 itself, which scoped itself to
-`eval_generic.rs`.
+(`with_entries`'s own post-`to_entries` reassembly step, `map_values`, `paths`, `leaf_paths`, and
+the `pick`/`omit` pair review surfaced alongside this issue) are tracked as a follow-up (#1829)
+rather than folded into #1677 itself, which scoped itself to `eval_generic.rs`.
 
-Fixing `keys`/`keys_unsorted` alone creates a transitional inconsistency worth naming rather
-than leaving implicit: `to_entries` (and `with_entries`/`map_values`, which route through it)
-still silently drops a decode-failure or #1194-malformed key, so `keys_unsorted | length` and
-`to_entries | length` can now disagree with *each other* on the same document, where before
-#1829/#1835 both silently dropped the same key and so happened to agree. Not a new bug in
-either builtin -- `to_entries`'s own gap predates this fix and is #1829's own next-listed
-slice -- but the two builtins' agreement was accidental, not a guarantee, and this fix is the
-first thing to make that visible.
+Only `with_entries` routes through `to_entries` internally (it calls `builtin_to_entries`
+directly), so it inherits this fix's #1194/#1642/#1677 coverage for free on the decode step --
+though it still needs its own audit for whatever it does with the *reconstructed* object
+afterward before this issue can consider it closed. `map_values` is a separate, independent
+hand-rolled walk with the identical silent-`continue` shape `keys`/`to_entries` had before their
+own fixes -- unrelated to `to_entries` and not covered by this change at all.
 
 ## Refusing an allocation jq does not survive
 

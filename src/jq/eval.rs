@@ -38,8 +38,8 @@ use core::cell::Cell;
 use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
-    effective_fields, effective_keys, effective_len, resolve_display_key, DisplayKeyGuard,
-    DocumentFields,
+    effective_fields, effective_fields_checked, effective_keys, effective_len, key_display_string,
+    resolve_display_key, DisplayKeyGuard, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
@@ -8594,24 +8594,43 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             }
         }
         StandardJson::Object(fields) => {
-            let mut entries: Vec<OwnedValue> = Vec::new();
-            for field in fields {
-                let key = if let StandardJson::String(k) = field.key() {
-                    if let Ok(cow) = k.as_str() {
-                        cow.into_owned()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
+            // #1829: `effective_fields_checked` (`document.rs`) raises on a
+            // #1194 structurally malformed/unpaired member or a malformed
+            // `,`/`:` delimiter (#1677) instead of this arm's previous
+            // silent `continue`, matching `keys`/`keys_unsorted`'s own fix
+            // (#1835) for the identical two axes. `collapse: false` for the
+            // same reason that fix used it: this function has no
+            // `S: EvalSemantics` parameter to derive a mode-correct
+            // duplicate-key policy from (a real, separate, pre-existing gap
+            // this doesn't touch). `key_display_string`, not
+            // `resolve_display_key`: `to_entries` builds a `Vec` of
+            // `{key, value}` objects, not one map keyed by `key`, so two
+            // decode-failure keys sharing the same fallback spelling are
+            // simply two separate entries, not the ambiguous-overwrite
+            // `DisplayKeyGuard` exists to prevent for a real `IndexMap`.
+            // `key_display_string` returning `None` here is unreachable --
+            // `effective_fields_checked`'s own `key_is_malformed` check
+            // above already refuses exactly the condition that would cause
+            // it -- so the `else` arm can't observably fire; kept as a real
+            // branch (not `.unwrap()`) so a future change to either
+            // function's refusal condition fails loudly instead of
+            // panicking.
+            let checked = match effective_fields_checked(&fields, false) {
+                Ok(f) => f,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let mut entries: Vec<OwnedValue> = vec_with_capacity(checked.len());
+            for field in checked {
+                let Some(key) = key_display_string(&field.key) else {
+                    return QueryResult::Error(fields.malformed_member_error());
                 };
-                let val = match to_owned_checked(&field.value()) {
+                let val = match to_owned_checked(&field.value) {
                     Ok(val) => val,
                     Err(e) => return QueryResult::Error(e),
                 };
 
                 let mut entry = IndexMap::new();
-                entry.insert("key".to_string(), OwnedValue::String(key));
+                entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
                 entry.insert("value".to_string(), val);
                 entries.push(OwnedValue::Object(entry));
             }
@@ -43247,6 +43266,65 @@ mod tests {
         );
     }
 
+    /// #1829: `to_entries` used to silently drop a decode-failure or #1194
+    /// structurally malformed key, disagreeing with `length` (counts every
+    /// field regardless) and with `keys`/`keys_unsorted` (fixed in #1835 to
+    /// preserve/raise on the identical two axes, via the same
+    /// `effective_fields_checked`/`key_display_string` this fix now shares).
+    #[test]
+    fn test_builtin_to_entries_preserves_decode_failure_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+
+        query!(doc, "length",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
+        );
+        query!(doc, "to_entries",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                let OwnedValue::Object(first) = &arr[0] else {
+                    panic!("entry is not an object: {:?}", arr[0]);
+                };
+                assert_eq!(
+                    first.get("key"),
+                    Some(&OwnedValue::String("\u{FFFD}\u{FFFD}".to_string()))
+                );
+                assert_eq!(first.get("value"), Some(&OwnedValue::Int(1)));
+                let OwnedValue::Object(second) = &arr[1] else {
+                    panic!("entry is not an object: {:?}", arr[1]);
+                };
+                assert_eq!(second.get("key"), Some(&OwnedValue::String("a".to_string())));
+            }
+        );
+    }
+
+    /// #1829's other axis: a structurally non-string/unpaired key (#1194,
+    /// `{"a":1,"b"}`) must raise for `to_entries` too, matching
+    /// `keys`/`keys_unsorted` and `path(.[])`/`tojson` -- previously
+    /// silently dropped instead (a 1-entry array, not an error).
+    #[test]
+    fn test_builtin_to_entries_raises_on_structurally_malformed_key_1829() {
+        query!(br#"{"a":1,"b"}"#, "to_entries",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1677, via the same shared walk `keys`/`keys_unsorted` picked up in
+    /// #1835: a malformed `,`/`:` delimiter now raises for `to_entries` too.
+    #[test]
+    fn test_builtin_to_entries_raises_on_malformed_delimiter_1677() {
+        query!(br#"{"a" 1, "b": 2}"#, "to_entries",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// Code review precedent from #1835/#1829: `to_entries?` must still
+    /// suppress both error axes via the outer `Expr::Optional` catch.
+    #[test]
+    fn test_builtin_to_entries_optional_suppresses_malformed_key_errors_1829() {
+        query!(br#"{"a":1,"b"}"#, "to_entries?", QueryResult::None => {});
+        query!(br#"{"a" 1, "b": 2}"#, "to_entries?", QueryResult::None => {});
+    }
+
     #[test]
     fn test_builtin_from_entries() {
         query!(br#"[{"key": "a", "value": 1}, {"key": "b", "value": 2}]"#, "from_entries",
@@ -43288,6 +43366,22 @@ mod tests {
                 assert_eq!(obj.get("a"), Some(&OwnedValue::Int(1)));
                 assert_eq!(obj.get("b"), Some(&OwnedValue::Int(2)));
             }
+        );
+    }
+
+    /// #1829: `with_entries` calls `builtin_to_entries` directly, so it
+    /// inherits that function's #1194/#1642/#1677 fix for free on the
+    /// decode step -- pinned here so a future refactor that stops routing
+    /// through `to_entries` doesn't silently regress it.
+    #[test]
+    fn test_builtin_with_entries_inherits_to_entries_decode_policy_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+        query!(doc, "with_entries({key: .key, value: .value})",
+            QueryResult::Owned(OwnedValue::Object(obj)) => assert_eq!(obj.len(), 2)
+        );
+
+        query!(br#"{"a":1,"b"}"#, "with_entries({key: .key, value: .value})",
+            QueryResult::Error(_) => {}
         );
     }
 
