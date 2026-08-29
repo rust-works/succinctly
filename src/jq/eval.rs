@@ -627,6 +627,30 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
     })
 }
 
+/// If `value` is an undecodable string, returns its decode-failure error.
+///
+/// Used ahead of the sort family's own "wrong type for this builtin"
+/// fallback arms (`min`/`max`/`min_by`/`max_by`/`group_by`/`unique`/
+/// `unique_by`/`sort`/`sort_by`'s scalar-input case): those arms used to
+/// decide `optional`-suppression vs. a type-error message straight off
+/// `value` without ever checking whether `value` itself was decodable,
+/// so a decode failure on a non-array/non-object scalar was either
+/// silently swallowed by `?` (violating the established #1247/#1620 rule
+/// that a decode failure is never suppressed) or misreported as an
+/// ordinary, catchable type-mismatch error instead of `decode_failure`
+/// (#1755). Call this first and propagate its `Some` unconditionally,
+/// before consulting `optional` at all.
+fn scalar_decode_failure<W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+) -> Option<EvalError> {
+    if let StandardJson::String(s) = value {
+        if let Err(e) = s.as_str() {
+            return Some(EvalError::decode_failure(e.message()));
+        }
+    }
+    None
+}
+
 /// Materialize a key/slice-bound candidate just enough to classify it.
 ///
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
@@ -6720,11 +6744,21 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
             let min = items.into_iter().min_by(compare_values).unwrap();
             QueryResult::Owned(min)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::pair_cannot_be_iterated(
-            &to_owned(&value),
-            &to_owned(&value),
-        )),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, never be suppressed by `optional`/`?` (the
+        // #1247/#1620 rule) or misreported as an ordinary type error.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::pair_cannot_be_iterated(
+                &to_owned(&value),
+                &to_owned(&value),
+            ))
+        }
     }
 }
 
@@ -6750,11 +6784,19 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
             let max = items.into_iter().max_by(compare_values).unwrap();
             QueryResult::Owned(max)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::pair_cannot_be_iterated(
-            &to_owned(&value),
-            &to_owned(&value),
-        )),
+        // #1755: same reasoning as builtin_min's own scalar arm above.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::pair_cannot_be_iterated(
+                &to_owned(&value),
+                &to_owned(&value),
+            ))
+        }
     }
 }
 
@@ -6818,7 +6860,13 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if optional {
         QueryResult::None
     } else {
-        let original = to_owned(&StandardJson::Object(fields));
+        // #1755: to_owned_checked, not to_owned -- a field the key filter
+        // `f` never touches can still be undecodable, and must raise
+        // rather than silently drop out of this error message's operand.
+        let original = match to_owned_checked(&StandardJson::Object(fields)) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        };
         QueryResult::Error(error_ctor(&original, &OwnedValue::Array(computed)))
     }
 }
@@ -6869,13 +6917,24 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_iterated)
         }
-        _ if optional => QueryResult::None,
         // #929: real jq defines min_by(f) via `.[0] as $x | reduce ...` --
         // the eventual failure is the same "Cannot iterate over" a bare
         // `.[]`/`length` on a non-array/non-object gets, not a bespoke
         // "expected array" wording. Confirmed live: `5 | min_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1755: but a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -6927,11 +6986,21 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_iterated)
         }
-        _ if optional => QueryResult::None,
         // #929: same wording as min_by's own scalar arm above -- confirmed
         // live: `5 | max_by(.)` raises "Cannot iterate over number (5)" in
         // jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1755: same decode-failure precedence as min_by's own scalar arm
+        // above.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -7914,11 +7983,22 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
-        _ if optional => QueryResult::None,
         // #995: same "Cannot iterate over" wording min_by/max_by/unique_by's
         // own scalar arm uses -- confirmed live: `5 | group_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1755: but a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -7961,8 +8041,18 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             optional,
             EvalError::pair_cannot_be_sorted,
         ),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -8019,11 +8109,22 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
-        _ if optional => QueryResult::None,
         // #929: same "Cannot iterate over" wording min_by/max_by's own
         // scalar arm uses -- confirmed live: `5 | unique_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1755: but a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -8045,8 +8146,18 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
             items.sort_by(compare_values);
             QueryResult::Owned(OwnedValue::Array(items))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_be_sorted(&to_owned(&value))),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_be_sorted(&to_owned(&value)))
+        }
     }
 }
 
@@ -8099,11 +8210,22 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
-        _ if optional => QueryResult::None,
         // #995: same "Cannot iterate over" wording min_by/max_by/unique_by/
         // group_by's own scalar arm uses -- confirmed live: `5 | sort_by(.)`
         // raises "Cannot iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1755: but a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -35912,6 +36034,117 @@ mod tests {
                     assert!(
                         e.message.contains("invalid UTF-8"),
                         "expr={expr} json={json:?} message: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+    }
+
+    /// #1755: the sort family's scalar-input fallback arm (a non-array,
+    /// non-object value) used to decide `optional`-suppression vs. a type
+    /// error purely off the input's *type*, never checking whether the
+    /// scalar itself was even decodable -- so an undecodable string here
+    /// was either silently swallowed by `?` (violating the established
+    /// #1247/#1620 rule that a decode failure is never suppressed) or
+    /// misreported as an ordinary, catchable type error. `scalar_decode_failure`
+    /// now runs first, unconditionally, in every one of these arms.
+    #[test]
+    fn test_sort_family_scalar_decode_failure_unsuppressed_by_optional_1755() {
+        let json = &b"\"\xff\xfe\""[..];
+        for expr in [
+            "sort",
+            "sort?",
+            "min",
+            "min?",
+            "max",
+            "max?",
+            "unique",
+            "unique?",
+            "sort_by(.)",
+            "sort_by(.)?",
+            "group_by(.)",
+            "group_by(.)?",
+            "unique_by(.)",
+            "unique_by(.)?",
+            "min_by(.)",
+            "min_by(.)?",
+            "max_by(.)",
+            "max_by(.)?",
+        ] {
+            query!(
+                json,
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "expr={expr} message: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+    }
+
+    /// #1755 positive control: a *valid* scalar's existing optional-vs-error
+    /// behavior on the sort family's fallback arm is unchanged by adding
+    /// the `scalar_decode_failure` check ahead of it.
+    #[test]
+    fn test_sort_family_scalar_optional_behavior_unaffected_1755() {
+        for expr in [
+            "sort?",
+            "min?",
+            "max?",
+            "unique?",
+            "sort_by(.)?",
+            "group_by(.)?",
+            "unique_by(.)?",
+            "min_by(.)?",
+            "max_by(.)?",
+        ] {
+            query!(br"5", expr, QueryResult::None => {});
+        }
+        for expr in [
+            "sort",
+            "min",
+            "max",
+            "unique",
+            "sort_by(.)",
+            "group_by(.)",
+            "unique_by(.)",
+            "min_by(.)",
+            "max_by(.)",
+        ] {
+            query!(br"5", expr, QueryResult::Error(e) => {
+                assert!(!e.is_decode_failure(), "expr={expr} wrongly classified as decode failure: {}", e.message);
+            });
+        }
+    }
+
+    /// #1755: `object_pair_type_error` (the shared `StandardJson::Object`
+    /// arm for `min_by`/`max_by`/`group_by`/`unique_by`/`sort_by`) builds
+    /// its type-error operand from the *whole* input object, not just the
+    /// fields the key filter actually touches -- so a malformed field
+    /// outside the key filter's reach (`.y` here, with the filter reading
+    /// only `.x`) used to be silently dropped by unchecked `to_owned`
+    /// instead of raising.
+    #[test]
+    fn test_by_variants_object_input_raises_on_untouched_field_decode_failure_1755() {
+        let json = &b"{\"a\":{\"x\":1,\"y\":\"\xff\xfe\"}}"[..];
+        for expr in [
+            "min_by(.x)",
+            "max_by(.x)",
+            "group_by(.x)",
+            "unique_by(.x)",
+            "sort_by(.x)",
+        ] {
+            query!(
+                json,
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "expr={expr} message: {}",
                         e.message
                     );
                 }
