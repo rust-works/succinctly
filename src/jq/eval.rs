@@ -6626,15 +6626,14 @@ fn builtin_any<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    let owned_bool = |r: Result<bool, EvalError>| {
+        r.map_or_else(QueryResult::Error, |b| {
+            QueryResult::Owned(OwnedValue::Bool(b))
+        })
+    };
     match value {
-        StandardJson::Array(elements) => match any_all_over(elements, true) {
-            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
-            Err(e) => QueryResult::Error(e),
-        },
-        StandardJson::Object(fields) => match any_all_over(fields.map(|f| f.value()), true) {
-            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
-            Err(e) => QueryResult::Error(e),
-        },
+        StandardJson::Array(elements) => owned_bool(any_all_over(elements, true)),
+        StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), true)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -6647,15 +6646,14 @@ fn builtin_all<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
+    let owned_bool = |r: Result<bool, EvalError>| {
+        r.map_or_else(QueryResult::Error, |b| {
+            QueryResult::Owned(OwnedValue::Bool(b))
+        })
+    };
     match value {
-        StandardJson::Array(elements) => match any_all_over(elements, false) {
-            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
-            Err(e) => QueryResult::Error(e),
-        },
-        StandardJson::Object(fields) => match any_all_over(fields.map(|f| f.value()), false) {
-            Ok(b) => QueryResult::Owned(OwnedValue::Bool(b)),
-            Err(e) => QueryResult::Error(e),
-        },
+        StandardJson::Array(elements) => owned_bool(any_all_over(elements, false)),
+        StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), false)),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
     }
@@ -6701,25 +6699,38 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
-    // raise, not silently become "" and get probed as if it were the real
-    // value.
-    let elements: Vec<OwnedValue> = match value {
-        StandardJson::Array(elements) => match elements.map(|e| to_owned_checked(&e)).collect() {
+    match value {
+        StandardJson::Array(elements) => any_all_f_over::<W, S>(cond, elements, target_truthy),
+        StandardJson::Object(fields) => {
+            any_all_f_over::<W, S>(cond, fields.map(|f| f.value()), target_truthy)
+        }
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+    }
+}
+
+/// Shared element loop for [`any_all_f`]'s `Array`/`Object` arms.
+///
+/// #1755 review: an earlier version of this fix `to_owned_checked`-collected
+/// every element into a `Vec` upfront, before `cond` ever ran -- so a
+/// decode failure past the deciding element aborted a call that should
+/// have short-circuited before reaching it. Oracle-verified:
+/// `[1, <bad-string>] | any(.==1)` is `true` in real jq, which never needs
+/// to decode the second element. Each element is now converted right
+/// before its own `cond` probe instead, exactly restoring the pre-#1755
+/// loop's short-circuit timing while still raising on the element that
+/// actually gets reached.
+fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
+    cond: &Expr,
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    target_truthy: bool,
+) -> QueryResult<'a, W> {
+    for cursor_elem in elements {
+        let elem = match to_owned_checked(&cursor_elem) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
-        },
-        StandardJson::Object(fields) => {
-            match fields.map(|f| to_owned_checked(&f.value())).collect() {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            }
-        }
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
-    };
-    for elem in &elements {
-        match any_all_probe_element::<S>(cond, elem, target_truthy) {
+        };
+        match any_all_probe_element::<S>(cond, &elem, target_truthy) {
             Ok(true) => return QueryResult::Owned(OwnedValue::Bool(target_truthy)),
             Ok(false) => {}
             Err(control) => return control_to_result(control),
@@ -13916,6 +13927,55 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Push one already-produced cursor result into `eval_pipe`'s `Many`-branch
+/// element loop's promotion state: still lazily borrowed if promotion
+/// hasn't started, checked-converted into `owned` if it has.
+///
+/// #1755 review: an earlier version of this slice's fix left this specific
+/// promotion path on unchecked `to_owned`, silently corrupting an
+/// already-borrowed undecodable element the moment any sibling forced
+/// promotion to owned -- `.[] | (if type == "string" then . else . + 0
+/// end)` on `["\xff\xfe", 1]` returned `ManyOwned([String(""), Int(1)])`
+/// instead of raising. On failure, `owned` is left holding whatever
+/// pushed successfully before the failing element, matching the #400
+/// "keep the prefix" policy every other control arm in that loop follows.
+fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
+    rs: impl IntoIterator<Item = StandardJson<'a, W>>,
+    borrowed: &mut Vec<StandardJson<'a, W>>,
+    owned: &mut Option<Vec<OwnedValue>>,
+) -> Result<(), EvalError> {
+    match owned {
+        Some(acc) => {
+            for r in rs {
+                acc.push(to_owned_checked(&r)?);
+            }
+            Ok(())
+        }
+        None => {
+            borrowed.extend(rs);
+            Ok(())
+        }
+    }
+}
+
+/// Promote `borrowed` into a checked `Vec<OwnedValue>`, used the moment an
+/// `Owned`/`ManyOwned` sibling in `eval_pipe`'s `Many`-branch loop forces
+/// the whole batch out of its lazy borrowed state for the first time
+/// (see [`push_promoted`]'s identical #1755 reasoning). Returns whatever
+/// converted successfully so far as the `Err` payload's own prefix.
+fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
+    borrowed: Vec<StandardJson<'_, W>>,
+) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
+    let mut acc = vec_with_capacity(borrowed.len());
+    for b in &borrowed {
+        match to_owned_checked(b) {
+            Ok(v) => acc.push(v),
+            Err(e) => return Err((acc, e)),
+        }
+    }
+    Ok(acc)
+}
+
 /// Evaluate a pipe (chain) of expressions.
 fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
@@ -13960,31 +14020,39 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut owned: Option<Vec<OwnedValue>> = None;
             for v in values {
                 match eval_pipe::<W, S>(rest, v, optional).materialize_cursor() {
-                    QueryResult::One(r) => match owned.as_mut() {
-                        Some(acc) => acc.push(to_owned(&r)),
-                        None => borrowed.push(r),
-                    },
+                    QueryResult::One(r) => {
+                        if let Err(e) =
+                            push_promoted(core::iter::once(r), &mut borrowed, &mut owned)
+                        {
+                            let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                            return partial(prefix, Control::Error(e));
+                        }
+                    }
                     QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Many(rs) => match owned.as_mut() {
-                        Some(acc) => acc.extend(rs.iter().map(to_owned)),
-                        None => borrowed.extend(rs),
-                    },
-                    QueryResult::Owned(r) => owned
-                        .get_or_insert_with(|| {
-                            core::mem::take(&mut borrowed)
-                                .iter()
-                                .map(to_owned)
-                                .collect()
-                        })
-                        .push(r),
-                    QueryResult::ManyOwned(rs) => owned
-                        .get_or_insert_with(|| {
-                            core::mem::take(&mut borrowed)
-                                .iter()
-                                .map(to_owned)
-                                .collect()
-                        })
-                        .extend(rs),
+                    QueryResult::Many(rs) => {
+                        if let Err(e) = push_promoted(rs, &mut borrowed, &mut owned) {
+                            let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                            return partial(prefix, Control::Error(e));
+                        }
+                    }
+                    QueryResult::Owned(r) => {
+                        if owned.is_none() {
+                            match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                                Ok(acc) => owned = Some(acc),
+                                Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                            }
+                        }
+                        owned.as_mut().unwrap().push(r);
+                    }
+                    QueryResult::ManyOwned(rs) => {
+                        if owned.is_none() {
+                            match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                                Ok(acc) => owned = Some(acc),
+                                Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                            }
+                        }
+                        owned.as_mut().unwrap().extend(rs);
+                    }
                     QueryResult::None => {}
                     // A downstream error/break no longer discards outputs
                     // already piped through from earlier elements (#400).
@@ -15718,10 +15786,9 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // stream (`(1,2) | select(false)`, `(empty, empty)`) -- all
         // correctly arrive as the `None` arm above instead, confirming the
         // invariant holds for every reachable path today.
-        QueryResult::Many(vs) => match vs.first() {
-            Some(v) => to_owned_checked(v).map_err(QueryResult::Error),
-            None => Ok(OwnedValue::Null),
-        },
+        QueryResult::Many(vs) => vs.first().map_or(Ok(OwnedValue::Null), |v| {
+            to_owned_checked(v).map_err(QueryResult::Error)
+        }),
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
         QueryResult::Break(label) => Err(QueryResult::Break(label)),
@@ -33701,21 +33768,15 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
     for item in elements {
         match item {
-            StandardJson::Array(inner) => {
-                let row = match inner.map(|v| to_owned_checked(&v)).collect() {
-                    Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
-                };
-                inner_arrays.push(row);
-            }
-            _ => {
-                // Non-array elements are treated as single-element arrays
-                let owned = match to_owned_checked(&item) {
-                    Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
-                };
-                inner_arrays.push(vec![owned]);
-            }
+            StandardJson::Array(inner) => match inner.map(|v| to_owned_checked(&v)).collect() {
+                Ok(row) => inner_arrays.push(row),
+                Err(e) => return QueryResult::Error(e),
+            },
+            // Non-array elements are treated as single-element arrays
+            _ => match to_owned_checked(&item) {
+                Ok(owned) => inner_arrays.push(vec![owned]),
+                Err(e) => return QueryResult::Error(e),
+            },
         }
     }
 
@@ -37461,6 +37522,66 @@ mod tests {
             QueryResult::Error(e) if e.is_decode_failure() => {}
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    /// #1755 code review: an earlier version of `any_all_f`'s own fix
+    /// eagerly `to_owned_checked`-collected every element into a `Vec`
+    /// before `cond` ever probed any of them, so a decode failure past
+    /// the deciding element aborted a call that should have
+    /// short-circuited before reaching it. Oracle-verified: `[1,
+    /// <bad-string>] | any(.==1)` is `true` in real jq, which never needs
+    /// to decode the second element.
+    #[test]
+    fn test_any_all_f_short_circuits_before_a_later_decode_failure_1755() {
+        query!(
+            &b"[1, \"\xff\xfe\"]"[..],
+            "any(.==1)",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        query!(
+            &b"[1, \"\xff\xfe\"]"[..],
+            "all(.==2)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // The sibling case: no earlier element decides the answer, so the
+        // walk genuinely reaches the bad element and must still raise.
+        query!(
+            &b"[\"\xff\xfe\", 1]"[..],
+            "any(.==99)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1755 code review: `eval_pipe`'s `Many`-branch element loop
+    /// promotes its whole batch from lazily-borrowed cursors to an owned
+    /// `Vec` the moment any sibling forces an owned result -- an earlier
+    /// version of this slice's fix left that promotion step on unchecked
+    /// `to_owned`, so `.[] | (if type == "string" then . else . + 0 end)`
+    /// on `["\xff\xfe", 1]` silently returned `ManyOwned([String(""),
+    /// Int(1)])` instead of raising.
+    #[test]
+    fn test_eval_pipe_promotion_raises_on_decode_failure_1755() {
+        query!(
+            &b"[\"\xff\xfe\", 1]"[..],
+            ".[] | (if type == \"string\" then . else . + 0 end)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // The `ManyOwned` promotion path (a multi-output owned sibling,
+        // not a single `Owned` one).
+        query!(
+            &b"[\"\xff\xfe\", 1]"[..],
+            ".[] | (if type == \"string\" then . else (.+0, .+1) end)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive control: unaffected on valid data, both promotion
+        // shapes.
+        query!(
+            &b"[\"a\", 1]"[..],
+            "[.[] | (if type == \"string\" then . else . + 0 end)]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::String("a".to_string()), OwnedValue::Int(1)]);
+            }
+        );
     }
 
     /// #1755 positive control: valid data through each of the misc
