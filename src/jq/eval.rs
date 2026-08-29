@@ -631,7 +631,17 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
             let mut guard = DisplayKeyGuard::default();
-            for field in *fields {
+            // `uncons`/`rest`, not `for field in *fields`: a `for` loop
+            // consumes the `Iterator` impl, whose `next()` reports `None`
+            // both on genuine exhaustion *and* on a trailing unpaired
+            // member (#1194, e.g. `{"a":1,"b"}`) -- the two are
+            // indistinguishable through that protocol, so a `for` loop
+            // has no way to ask `ends_unpaired` afterward (it needs the
+            // list state a walk *finished* on, not the one it started
+            // from). Mirrors `eval_generic::to_owned_at_depth`'s own walk
+            // shape for exactly this reason.
+            let mut f = *fields;
+            while let Some((field, rest)) = f.uncons() {
                 let key_val = field.key();
                 // `resolve_display_key` covers both key axes in one call
                 // (#1734): `Ok(None)` is a structurally non-string key
@@ -644,9 +654,13 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
                 // an ordinary key and a decode-failure key preserved via
                 // its lossily-decoded raw source span.
                 let Some(key) = resolve_display_key(&key_val, &map, &mut guard)? else {
-                    return Err(fields.malformed_member_error());
+                    return Err(f.malformed_member_error());
                 };
                 map.insert(key, to_owned_checked_at_depth(&field.value(), depth + 1)?);
+                f = rest;
+            }
+            if f.ends_unpaired() {
+                return Err(f.malformed_member_error());
             }
             OwnedValue::Object(map)
         }
@@ -58792,6 +58806,29 @@ mod tests {
             ),
             other => panic!(
                 "expected the colliding fallback keys to raise instead of one silently overwriting the other, got: {other:?}"
+            ),
+        }
+    }
+
+    /// #1734 second review pass: a `for field in *fields` loop consumes
+    /// `JsonFields`'s `Iterator` impl to exhaustion, which cannot
+    /// distinguish genuine exhaustion from a trailing *unpaired* member
+    /// (#1194, e.g. `{"a":1,"b"}` -- a key with no value) -- both report
+    /// `None`. The fix walks `uncons`/`rest` instead (matching
+    /// `eval_generic::to_owned_at_depth`'s own shape) so `ends_unpaired`
+    /// can be asked of the list state a walk *finished* on, catching this
+    /// exactly where the earlier `for`-loop version silently dropped the
+    /// dangling key instead of raising.
+    #[test]
+    fn eval_rs_to_owned_checked_trailing_unpaired_member_raises_1734() {
+        let json: &[u8] = br#"[{"a":1,"b"}]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("sort").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(_) => {}
+            other => panic!(
+                "expected the trailing unpaired member to raise instead of being silently dropped, got: {other:?}"
             ),
         }
     }
