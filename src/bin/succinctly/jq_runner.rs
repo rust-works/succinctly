@@ -3461,30 +3461,47 @@ fn evaluate_input(
     // "defense-in-depth" there). Kept as `Result` rather than `.unwrap()` so
     // a real failure, if this invariant is ever violated, surfaces as a
     // normal `EvalError` instead of a panic.
-    macro_rules! materialized {
-        ($e:expr) => {
-            match $e {
-                Ok(v) => v,
-                Err(e) => {
-                    sink.report(DiagStyle::Jq, &e, &at.resolve());
-                    return Ok(vec![]);
-                }
-            }
-        };
-    }
-
     // Convert result to Vec<OwnedValue>
     match result {
-        GenericResult::One(v) => Ok(vec![materialized!(generic_to_owned(&v))]),
-        GenericResult::OneCursor(c) => Ok(vec![materialized!(generic_to_owned(&c.value()))]),
-        GenericResult::Many(vs) => Ok(materialized!(vs
-            .iter()
-            .map(generic_to_owned)
-            .collect::<core::result::Result<Vec<_>, _>>())),
-        GenericResult::ManyCursor(cs) => Ok(materialized!(cs
-            .iter()
-            .map(|c| generic_to_owned(&c.value()))
-            .collect::<core::result::Result<Vec<_>, _>>())),
+        GenericResult::One(v) => {
+            let Some(v) = sink.materialize(DiagStyle::Jq, generic_to_owned(&v), &at.resolve())
+            else {
+                return Ok(vec![]);
+            };
+            Ok(vec![v])
+        }
+        GenericResult::OneCursor(c) => {
+            let Some(v) =
+                sink.materialize(DiagStyle::Jq, generic_to_owned(&c.value()), &at.resolve())
+            else {
+                return Ok(vec![]);
+            };
+            Ok(vec![v])
+        }
+        GenericResult::Many(vs) => {
+            let Some(vs) = sink.materialize(
+                DiagStyle::Jq,
+                vs.iter()
+                    .map(generic_to_owned)
+                    .collect::<core::result::Result<Vec<_>, _>>(),
+                &at.resolve(),
+            ) else {
+                return Ok(vec![]);
+            };
+            Ok(vs)
+        }
+        GenericResult::ManyCursor(cs) => {
+            let Some(vs) = sink.materialize(
+                DiagStyle::Jq,
+                cs.iter()
+                    .map(|c| generic_to_owned(&c.value()))
+                    .collect::<core::result::Result<Vec<_>, _>>(),
+                &at.resolve(),
+            ) else {
+                return Ok(vec![]);
+            };
+            Ok(vs)
+        }
         // Fallback: materialize. This runner boundary never sees a
         // fast-pathed `keys`/`keys_unsorted | length`/`.[]`/`.[n]`/`first`/
         // `last` — those are fully resolved inside the evaluator's `Pipe`
@@ -3496,7 +3513,13 @@ fn evaluate_input(
             sorted,
             collapse,
         } => {
-            let mut keys = materialized!(effective_keys(&fields, collapse));
+            let Some(mut keys) = sink.materialize(
+                DiagStyle::Jq,
+                effective_keys(&fields, collapse),
+                &at.resolve(),
+            ) else {
+                return Ok(vec![]);
+            };
             if sorted {
                 keys.sort();
             }

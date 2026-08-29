@@ -233,6 +233,28 @@ impl ErrorSink {
         self.emit(style, &err.message, err.payload_is_not_a_string(), at);
     }
 
+    /// Unwrap `result`, or report it as an uncaught error and return `None`
+    /// -- one shared definition for a report-and-bail step previously
+    /// copy-pasted as three independent `macro_rules! materialized` blocks,
+    /// one per materialization call site (#1822). Callers pair this with
+    /// `let Some(v) = sink.materialize(...) else { return <empty>; };`,
+    /// since each call site's own "no results" shape (`vec![]`,
+    /// `Ok(vec![])`, ...) differs and can't be baked in here.
+    pub fn materialize<T>(
+        &mut self,
+        style: DiagStyle,
+        result: core::result::Result<T, EvalError>,
+        at: &InputLocation,
+    ) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.report(style, &e, at);
+                None
+            }
+        }
+    }
+
     /// Records a `halt`/`halt_error` request with its exit code (#791).
     ///
     /// Unlike `report`/`report_break`, this is not a diagnostic: no message
