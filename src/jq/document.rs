@@ -628,12 +628,19 @@ pub trait DocumentFields: Sized + Clone {
     /// resolution depth by hand).
     ///
     /// A structurally malformed member (#1194, `key_display_string` ->
-    /// `None`) doesn't match here, same as it doesn't appear in `keys`'s own
-    /// output.
+    /// `None`) never matches here -- `keys` itself doesn't silently drop
+    /// such a member either, but raises rather than omitting it, so this
+    /// isn't full behavioral parity with `keys`, just agreement on which
+    /// *spelling* a resolvable key displays as.
+    ///
+    /// Walks via [`uncons_key`](Self::uncons_key), not
+    /// [`uncons`](Self::uncons): the latter also materializes each field's
+    /// *value*, a real, measured cost (#1514) this existence-only check has
+    /// no use for.
     fn contains(&self, name: &str) -> bool {
         let mut fields = self.clone();
-        while let Some((field, rest)) = fields.uncons() {
-            if key_display_string(&field.key).is_some_and(|k| k.as_ref() == name) {
+        while let Some((key, _key_cursor, rest)) = fields.uncons_key() {
+            if key_display_string(&key).is_some_and(|k| k.as_ref() == name) {
                 return true;
             }
             fields = rest;

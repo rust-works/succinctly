@@ -2874,6 +2874,18 @@ fn test_undecodable_key_builtins_agree_1642() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "true");
 
+    // #1739 review: `has()`'s new native arm (`DocumentFields::contains`,
+    // `src/jq/document.rs`) must also match the decode-failure key's own
+    // #1642 fallback spelling, not just an ordinary sibling key -- the
+    // pre-#1739 `JsonFields::contains` this replaced never did (it skipped
+    // any undecodable key outright, matching neither `keys`'s established
+    // fallback-preservation contract nor `has()`'s own eventual fix here).
+    // Queried indirectly via `keys[0]`, not a hand-escaped literal, so this
+    // stays correct regardless of exactly how the fallback re-escapes.
+    let (out, _, code) = run_jq_full(&["-c", "keys[0] as $k | has($k)"], Some(doc))?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "true");
+
     // Two decode-failure keys, byte-identical source: #1385 already pins
     // that they never collapse under `.`/`length`/`[.[]]`; extend that to
     // `keys`/`to_entries`, which used to raise before ever getting the
