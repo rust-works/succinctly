@@ -388,6 +388,16 @@ surface (#1512):
 | `pow(base; exp)`                                     | Exponentiation                                |
 | `bsearch(target)`                                    | Binary search index in a sorted array         |
 | `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
+| `add`                                                | Sum of an array/stream (#1714)                |
+| `min_by(f)`, `max_by(f)`                             | Extremum by a key function (#1714)            |
+| `implode`                                            | Codepoint array to string (#1714)             |
+| `INDEX(idx_expr)`, `INDEX(stream; idx_expr)`         | Build an object keyed by an index expr (#1714)|
+| `walk(f)`                                            | Recursively transform every node (#1714)      |
+| `floor`, `ceil`, `round`, `sqrt`, `fabs`             | Basic math functions (#1714)                  |
+| `log`, `log2`, `log10`                               | Logarithms (#1714)                            |
+| `exp`, `exp2`, `exp10`                               | Exponentials (#1714)                          |
+| `sinh`, `cosh`, `tanh`                               | Hyperbolic trig functions (#1714)             |
+| `atan2(y; x)`                                        | Two-argument arctangent (#1714)               |
 
 ```bash
 echo '{}' | succinctly yq 'paths'

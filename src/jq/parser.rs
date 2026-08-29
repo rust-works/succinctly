@@ -2405,6 +2405,7 @@ impl<'a> Parser<'a> {
         // Reduction functions (no arguments)
         // Note: If followed by '(', these should be parsed as user-defined function calls
         if self.matches_keyword("add") && !self.peek_after_keyword_is_paren("add") {
+            self.reject_unless_jq_extensions("add")?;
             self.consume_keyword("add");
             return Ok(Some(Builtin::Add));
         }
@@ -2454,6 +2455,7 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("min_by") {
             // Check min_by before min
+            self.reject_unless_jq_extensions("min_by")?;
             self.consume_keyword("min_by");
             self.skip_ws();
             self.expect('(')?;
@@ -2469,6 +2471,7 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("max_by") {
             // Check max_by before max
+            self.reject_unless_jq_extensions("max_by")?;
             self.consume_keyword("max_by");
             self.skip_ws();
             self.expect('(')?;
@@ -2878,6 +2881,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Explode));
         }
         if self.matches_keyword("implode") {
+            self.reject_unless_jq_extensions("implode")?;
             self.consume_keyword("implode");
             return Ok(Some(Builtin::Implode));
         }
@@ -2936,6 +2940,7 @@ impl<'a> Parser<'a> {
         // INDEX(idx_expr) - build an object keyed by idx_expr from `.[]`
         // INDEX(stream; idx_expr) - build an object keyed by idx_expr from stream
         if self.matches_keyword("INDEX") {
+            self.reject_unless_jq_extensions("INDEX")?;
             self.consume_keyword("INDEX");
             self.skip_ws();
             self.expect('(')?;
@@ -3029,6 +3034,7 @@ impl<'a> Parser<'a> {
 
         // walk(f)
         if self.matches_keyword("walk") {
+            self.reject_unless_jq_extensions("walk")?;
             self.consume_keyword("walk");
             self.skip_ws();
             self.expect('(')?;
@@ -3147,48 +3153,59 @@ impl<'a> Parser<'a> {
 
         // Phase 10: Math Functions
         if self.matches_keyword("floor") {
+            self.reject_unless_jq_extensions("floor")?;
             self.consume_keyword("floor");
             return Ok(Some(Builtin::Floor));
         }
         if self.matches_keyword("ceil") {
+            self.reject_unless_jq_extensions("ceil")?;
             self.consume_keyword("ceil");
             return Ok(Some(Builtin::Ceil));
         }
         if self.matches_keyword("round") {
+            self.reject_unless_jq_extensions("round")?;
             self.consume_keyword("round");
             return Ok(Some(Builtin::Round));
         }
         if self.matches_keyword("sqrt") {
+            self.reject_unless_jq_extensions("sqrt")?;
             self.consume_keyword("sqrt");
             return Ok(Some(Builtin::Sqrt));
         }
         if self.matches_keyword("fabs") {
+            self.reject_unless_jq_extensions("fabs")?;
             self.consume_keyword("fabs");
             return Ok(Some(Builtin::Fabs));
         }
         // Logarithmic - check log10 and log2 before log
         if self.matches_keyword("log10") {
+            self.reject_unless_jq_extensions("log10")?;
             self.consume_keyword("log10");
             return Ok(Some(Builtin::Log10));
         }
         if self.matches_keyword("log2") {
+            self.reject_unless_jq_extensions("log2")?;
             self.consume_keyword("log2");
             return Ok(Some(Builtin::Log2));
         }
         if self.matches_keyword("log") {
+            self.reject_unless_jq_extensions("log")?;
             self.consume_keyword("log");
             return Ok(Some(Builtin::Log));
         }
         // Exponential - check exp10 and exp2 before exp
         if self.matches_keyword("exp10") {
+            self.reject_unless_jq_extensions("exp10")?;
             self.consume_keyword("exp10");
             return Ok(Some(Builtin::Exp10));
         }
         if self.matches_keyword("exp2") {
+            self.reject_unless_jq_extensions("exp2")?;
             self.consume_keyword("exp2");
             return Ok(Some(Builtin::Exp2));
         }
         if self.matches_keyword("exp") {
+            self.reject_unless_jq_extensions("exp")?;
             self.consume_keyword("exp");
             return Ok(Some(Builtin::Exp));
         }
@@ -3210,14 +3227,17 @@ impl<'a> Parser<'a> {
         }
         // Trigonometric functions - check longer names first
         if self.matches_keyword("sinh") {
+            self.reject_unless_jq_extensions("sinh")?;
             self.consume_keyword("sinh");
             return Ok(Some(Builtin::Sinh));
         }
         if self.matches_keyword("cosh") {
+            self.reject_unless_jq_extensions("cosh")?;
             self.consume_keyword("cosh");
             return Ok(Some(Builtin::Cosh));
         }
         if self.matches_keyword("tanh") {
+            self.reject_unless_jq_extensions("tanh")?;
             self.consume_keyword("tanh");
             return Ok(Some(Builtin::Tanh));
         }
@@ -3235,6 +3255,7 @@ impl<'a> Parser<'a> {
         }
         // atan2(y; x) - must check before atan
         if self.matches_keyword("atan2") {
+            self.reject_unless_jq_extensions("atan2")?;
             self.consume_keyword("atan2");
             self.skip_ws();
             self.expect('(')?;

@@ -1321,15 +1321,19 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
     Ok(())
 }
 
-/// #1512/#1650: `succinctly yq` rejects jq-only builtins real yq's lexer
-/// lacks by default -- a parse error mentioning `--jq-extensions`, not the
-/// CLI silently accepting broader syntax than the reference it's meant to
-/// match. Covers both `try_parse_builtin`'s ordinary gate (`paths`,
-/// `getpath`) and `limit`'s special-cased one in `parse_primary`, plus the
-/// 14 names #1650 added to close the gap `docs/compliance/yq/limitations.md`'s
+/// #1512/#1650/#1714: `succinctly yq` rejects jq-only builtins real yq's
+/// lexer lacks by default -- a parse error mentioning `--jq-extensions`, not
+/// the CLI silently accepting broader syntax than the reference it's meant
+/// to match. Covers both `try_parse_builtin`'s ordinary gate (`paths`,
+/// `getpath`) and `limit`'s special-cased one in `parse_primary`, the 14
+/// names #1650 added to close the gap `docs/compliance/yq/limitations.md`'s
 /// own fan-out table had been documenting as ungated all along (`inside`,
 /// `startswith`, `endswith`, `rtrimstr`, `index`, `rindex`, `indices`,
-/// `range`, `nth`, `combinations`, `pow`, `strftime`, `strptime`, `bsearch`).
+/// `range`, `nth`, `combinations`, `pow`, `strftime`, `strptime`,
+/// `bsearch`), and the 21 names #1714 found still ungated (`add`, `min_by`,
+/// `max_by`, `implode`, `INDEX`, `walk`, `floor`, `ceil`, `round`, `sqrt`,
+/// `fabs`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `sinh`, `cosh`,
+/// `tanh`, `atan2`).
 #[test]
 fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     for filter in [
@@ -1350,6 +1354,27 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "strftime(\"%Y\")",
         "strptime(\"%Y\")",
         "bsearch(1)",
+        "add",
+        "min_by(.)",
+        "max_by(.)",
+        "implode",
+        "INDEX(.a)",
+        "walk(.)",
+        "floor",
+        "ceil",
+        "round",
+        "sqrt",
+        "fabs",
+        "log",
+        "log2",
+        "log10",
+        "exp",
+        "exp2",
+        "exp10",
+        "sinh",
+        "cosh",
+        "tanh",
+        "atan2(1;1)",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -1361,17 +1386,19 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     Ok(())
 }
 
-/// #1512/#1650: the CLI flag actually reaches the parser -- `--jq-extensions`
-/// makes the same filters succeed end to end through the real `succinctly
-/// yq` binary, not just through the parser's own unit tests.
+/// #1512/#1650/#1714: the CLI flag actually reaches the parser --
+/// `--jq-extensions` makes the same filters succeed end to end through the
+/// real `succinctly yq` binary, not just through the parser's own unit
+/// tests.
 #[test]
 fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
-    // The #1650 additions are self-contained (their own literal input via
-    // `X | f`) rather than operating on the shared `.` document below --
+    // The #1650/#1714 additions are self-contained (their own literal input
+    // via `X | f`) rather than operating on the shared `.` document below --
     // several need a specific type (`inside`/`startswith`/... need a
-    // string, `bsearch` a sorted array) that `.` (the object `{a: 1}`)
-    // doesn't satisfy, and the point here is confirming each builtin runs
-    // to completion once gated open, not exercising every input shape.
+    // string, `bsearch` a sorted array, the math functions a number) that
+    // `.` (the object `{a: 1}`) doesn't satisfy, and the point here is
+    // confirming each builtin runs to completion once gated open, not
+    // exercising every input shape.
     for filter in [
         "paths",
         "getpath([])",
@@ -1390,6 +1417,27 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "0 | strftime(\"%Y\")",
         "\"2020\" | strptime(\"%Y\")",
         "[1,2,3] | bsearch(2)",
+        "[1,2,3] | add",
+        "[1,2,3] | min_by(.)",
+        "[1,2,3] | max_by(.)",
+        "[97,98,99] | implode",
+        "[{\"id\":1},{\"id\":2}] | INDEX(.id)",
+        "walk(.)",
+        "1.5 | floor",
+        "1.5 | ceil",
+        "1.5 | round",
+        "4 | sqrt",
+        "(-4) | fabs",
+        "1 | log",
+        "8 | log2",
+        "100 | log10",
+        "1 | exp",
+        "1 | exp2",
+        "1 | exp10",
+        "0 | sinh",
+        "0 | cosh",
+        "0 | tanh",
+        "atan2(1;1)",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
@@ -18145,9 +18193,15 @@ fn test_1119_scalar_slice_assign_noop_covers_array_and_filter_rhs() -> Result<()
 /// this array-append arm -- not a separate scope decision. Real yq has no
 /// `add`/`reduce` syntax at all, so this locks in succinctly's own
 /// consistent-with-`+` behavior rather than verifying against an oracle.
+/// `--jq-extensions` is required since #1714 closed `add`'s gate (it was
+/// unintentionally ungated before then).
 #[test]
 fn test_1119_add_builtin_inherits_array_append_consistently() -> Result<()> {
-    let (output, code) = run_yq_stdin("[[1,2],3,4] | add", "null", &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        "[[1,2],3,4] | add",
+        "null",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[1,2,3,4]");
 
@@ -18164,18 +18218,28 @@ fn test_1119_add_builtin_inherits_array_append_consistently() -> Result<()> {
 /// no `add`/`reduce` syntax at all, so this locks in succinctly's own
 /// consistent-with-`+` behavior rather than verifying against an oracle,
 /// mirroring `test_1119_add_builtin_inherits_array_append_consistently`
-/// above.
+/// above. `--jq-extensions` is required on the yq-mode calls since #1714
+/// closed `add`'s gate (it was unintentionally ungated before then).
 #[test]
 fn test_1197_add_builtin_inherits_right_null_gating_consistently() -> Result<()> {
-    let (_out, err, code) = run_yq_stdin_with_stderr("[7, null] | add", "null", &["-o=json"])?;
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("[7, null] | add", "null", &["-o=json", "--jq-extensions"])?;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("cannot be added"), "{err}");
 
-    let (output, code) = run_yq_stdin("[null, 7] | add", "null", &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        "[null, 7] | add",
+        "null",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "7");
 
-    let (output, code) = run_yq_stdin(r#"["a", null] | add"#, "null", &["-o=json", "-I=0"])?;
+    let (output, code) = run_yq_stdin(
+        r#"["a", null] | add"#,
+        "null",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#""a""#);
 
