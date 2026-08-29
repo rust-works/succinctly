@@ -6601,10 +6601,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // right after resolving, so this is the first one where
                 // that isn't true. The guard check is deferred below,
                 // immediately before the one line that actually inserts.
-                let (key, is_fallback) = match key_display_string_kind(&field.key) {
-                    Some((k, is_fallback)) => (k.into_owned(), is_fallback),
-                    None => return QueryResult::Error(fields.malformed_member_error()),
+                let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
+                    return QueryResult::Error(fields.malformed_member_error());
                 };
+                let key = key.into_owned();
 
                 // Apply f to the value
                 let field_val = field.value;
@@ -42498,6 +42498,24 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(obj)) => {
                 assert_eq!(obj.len(), 1);
                 assert_eq!(obj.get("\u{FFFD}\u{FFFD}"), Some(&OwnedValue::Int(1)));
+            }
+        );
+    }
+
+    /// Code review, #1829: `S::COLLAPSE_DUPLICATE_KEYS` makes the
+    /// `effective_fields_checked` call mode-dependent -- jq mode collapses a
+    /// duplicate key before `f` runs (pinned above), yq mode does not, so
+    /// both occurrences reach `f` and the second's result overwrites the
+    /// first's in `result_map` (`IndexMap`'s own last-write-wins insert),
+    /// matching yq's own last-key-wins convention. Neither prior test nor
+    /// the pre-existing `map_values` coverage exercises this branch under
+    /// `YqSemantics` at all.
+    #[test]
+    fn test_builtin_map_values_yq_mode_does_not_collapse_duplicate_key_1829() {
+        yq_query!(br#"{"a": 10, "a": 2}"#, "map_values(.+1)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 1);
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
             }
         );
     }
