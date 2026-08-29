@@ -16,53 +16,45 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{cargo_run_features, classify_cargo_run_exit, MAX_CARGO_RETRIES};
+use cargo_run_exit::exit_code_or_signal_death;
 
 /// A real-but-deep nesting depth: deeper than typical documents (~30-50 levels),
 /// yet comfortably under the ~128-level DoS cap proposed in #151/#152.
 const VALID_DEPTH: usize = 100;
 
 /// Run `succinctly <args>` with `stdin` piped in; return `(stdout, exit_code)`.
+///
+/// Goes through the real binary directly (`CARGO_BIN_EXE_succinctly`, a
+/// compile-time path to this test binary's own already-built dependency).
+/// Used to go through a second `cargo run` subprocess instead: that orphans
+/// the real `succinctly` grandchild -- reparented to init, blocked forever
+/// on its now-unreadable stdout pipe -- the moment anything kills the
+/// outer `cargo test` process group (`cargo-guard.sh` does this by design
+/// on a detected stall, #935/#1847). No retry loop needed either: a
+/// compile-time path isn't a second cargo invocation that can hit lock
+/// contention (exit 101), unlike the removed `classify_cargo_run_exit`
+/// path this used to need.
 fn run(args: &[&str], stdin: &str) -> Result<(String, i32)> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let mut cmd = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                cargo_run_features(),
-                "--bin",
-                "succinctly",
-                "--",
-            ])
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-        if let Some(mut sin) = cmd.stdin.take() {
-            sin.write_all(stdin.as_bytes())?;
-        }
-
-        let output = cmd.wait_with_output()?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let Some(exit_code) =
-            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
-        else {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        };
-
-        let stdout = String::from_utf8(output.stdout)?;
-        return Ok((stdout, exit_code));
+    if let Some(mut sin) = cmd.stdin.take() {
+        sin.write_all(stdin.as_bytes())?;
     }
-    unreachable!()
+
+    let output = cmd.wait_with_output()?;
+    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok((stdout, exit_code))
 }
 
 /// `[[[ … ]]]` nested `depth` levels deep with an empty innermost array.
