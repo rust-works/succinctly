@@ -5902,6 +5902,7 @@ use crate::jq::assert_depth;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
 };
+use crate::jq::EvalError;
 
 /// Caps the number of alias hops `YamlCursor::resolve_alias_chain` will
 /// follow (#1191 code review) -- the single place this rule's rationale is
@@ -6536,8 +6537,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
         YamlFields::find(self, name)
     }
 
-    fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
-        YamlFields::find_cursor(self, name)
+    fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {
+        Ok(YamlFields::find_cursor(self, name))
     }
 
     fn is_empty(&self) -> bool {

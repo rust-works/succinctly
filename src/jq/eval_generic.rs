@@ -28,9 +28,9 @@ use indexmap::IndexMap;
 
 use super::document::{
     collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
-    effective_keys, effective_len_checked, key_display_string, key_is_malformed,
-    resolve_display_key, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, effective_len_checked, key_delimiter_ok, key_display_string, key_is_malformed,
+    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor,
+    DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
@@ -148,7 +148,8 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
 /// never a bad key.
 fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
     let mut walk = fields.clone();
-    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+    let mut is_first = true;
+    while let Some((key, cursor, rest)) = walk.uncons_key() {
         // `key_is_malformed` rather than a `key_string().is_none()` test
         // written out here: it is the one definition of the distinction
         // between #1194's structurally-impossible key and #1247's merely
@@ -157,7 +158,12 @@ fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
         if key_is_malformed(&key) {
             return Some(walk.malformed_member_error());
         }
+        // #1677: comma-before-key rides this same key-only walk for free.
+        if !key_delimiter_ok::<F>(&key, &cursor, is_first) {
+            return Some(walk.malformed_member_error());
+        }
         walk = rest;
+        is_first = false;
     }
     walk.ends_unpaired().then(|| walk.malformed_member_error())
 }
@@ -169,6 +175,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
+        let mut is_first = true;
         while let Some((field, rest)) = f.uncons() {
             // A key that will not *decode* (#1247/#1385) is preserved via
             // its raw source span rather than raised on (#1642), matching
@@ -182,8 +189,16 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
             let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
+            // #1677: same delimiter class as #1194 above, one layer up --
+            // free here since `uncons` already resolved both key and value.
+            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
+                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
+            {
+                return Err(f.malformed_member_error());
+            }
             map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
             f = rest;
+            is_first = false;
         }
         // The walk ran out -- but on an unpaired child, or genuinely? Only
         // the list it *finished* on can tell those apart, and `uncons`
@@ -196,9 +211,21 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
-        while let Some((elem, rest)) = elems.uncons() {
-            items.push(to_owned_at_depth(&elem, depth + 1)?);
+        let mut is_first = true;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // #1677: no bare-value walk over `DocumentElements` carries a
+            // position, so this switches to the cursor-yielding sibling of
+            // `uncons` -- always available, same navigation underneath --
+            // purely to reach `text_position()` for the gap check.
+            if let Some(pos) = elem_cursor.text_position() {
+                let expected = if is_first { None } else { Some(b',') };
+                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+            }
+            items.push(to_owned_at_depth(&elem_cursor.value(), depth + 1)?);
             elems = rest;
+            is_first = false;
         }
         Ok(OwnedValue::Array(items))
     // Then check scalars in order of specificity
@@ -270,6 +297,7 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
+        let mut is_first = true;
         while let Some((field, rest)) = f.uncons() {
             // Same key handling as `to_owned_at_depth` above, same reasons --
             // these two conversions are copies of each other and a fix that
@@ -278,11 +306,23 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
+            // Same #1677 checks as `to_owned_at_depth` above, same reason.
+            if !key_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
+                &field.key,
+                &field.key_cursor,
+                is_first,
+            ) || !value_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
+                Some(&field.value),
+                &field.value_cursor,
+            ) {
+                return Err(f.malformed_member_error());
+            }
             map.insert(
                 key,
                 to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
             );
             f = rest;
+            is_first = false;
         }
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
@@ -291,9 +331,18 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
+        let mut is_first = true;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // #1677: same gap check as `to_owned_at_depth`'s array loop.
+            if let Some(pos) = elem_cursor.text_position() {
+                let expected = if is_first { None } else { Some(b',') };
+                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+            }
             items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1)?);
             elems = rest;
+            is_first = false;
         }
         Ok(OwnedValue::Array(items))
     } else {
@@ -840,6 +889,7 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// has to hand back every cursor at once, but the dedup still happens during
 /// the single walk that collects them -- where before, the caller ran a
 /// whole separate `document::census` and then walked again to build this.
+///
 /// The #1194 check rides along in that same walk, the same way
 /// [`effective_keys`] already checks during its own single
 /// [`DistinctKeyCursors`] walk -- one pass, not a second one bolted on top,
@@ -847,7 +897,12 @@ fn materialize_lazy_keys<V: DocumentValue>(
 /// (the exact mistake PR #1768's own perf-guard catch was about, earlier
 /// this same session -- a different check, `string_decode_error`, but the
 /// identical shape of mistake: a validation pass added ahead of an
-/// already-cheap path instead of folded into it).
+/// already-cheap path instead of folded into it). A malformed `,`/`:`
+/// delimiter (#1677) rides the same single walk too, via
+/// [`DistinctKeyCursors::delimiter_fault`] -- checked only once the
+/// iterator is exhausted, per its own "ask only at the end" contract,
+/// alongside [`DistinctKeyCursors::ended_unpaired`]'s identical #1194
+/// unpaired-trailing-child check.
 fn distinct_key_cursors_checked<V: DocumentValue>(
     fields: &V::Fields,
     collapse: bool,
@@ -860,7 +915,7 @@ fn distinct_key_cursors_checked<V: DocumentValue>(
         }
         out.push(cursor);
     }
-    if cursors.ended_unpaired() {
+    if cursors.ended_unpaired() || cursors.delimiter_fault() {
         return Err(fields.malformed_member_error());
     }
     Ok(out)
@@ -3185,8 +3240,8 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // re-deriving why document order would still be a
         // correct answer.
         // #1629: unlike `first`/`.[0]` below, this arm already walks the
-        // whole object to collect every cursor, so the #1194 check
-        // (`distinct_key_cursors_checked`) rides along for free -- same
+        // whole object to collect every cursor, so the #1194/#1677 checks
+        // (`distinct_key_cursors_checked`) ride along for free -- same
         // reasoning as `Builtin::Length`'s arm above.
         Expr::Iterate if !sorted => match distinct_key_cursors_checked::<V>(&fields, collapse) {
             Ok(cursors) if cursors.is_empty() => GenericResult::None,
@@ -3877,9 +3932,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Field(name) => {
             if let Some(fields) = value.as_object() {
                 match fields.find_cursor(name) {
-                    Some(c) => GenericResult::OneCursor(c),
+                    Ok(Some(c)) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
-                    None => GenericResult::Owned(OwnedValue::Null),
+                    Ok(None) => GenericResult::Owned(OwnedValue::Null),
+                    // #1677: the field this lookup resolved to has a
+                    // malformed `,`/`:` delimiter.
+                    Err(err) => GenericResult::Error(err),
                 }
             } else if value.is_null() {
                 // jq returns null for field access on null
@@ -3951,11 +4009,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Iterate => {
             if let Some(elements) = value.as_array() {
-                let cursors = elements.collect_cursors();
-                if cursors.is_empty() {
-                    GenericResult::None
-                } else {
-                    GenericResult::ManyCursor(cursors)
+                // #1677: `.[]` over an array reaches into every element
+                // without ever re-serializing the container whole, so it
+                // needs its own gap check between siblings.
+                match elements.collect_cursors_checked() {
+                    Ok(cursors) if cursors.is_empty() => GenericResult::None,
+                    Ok(cursors) => GenericResult::ManyCursor(cursors),
+                    Err(err) => GenericResult::Error(err),
                 }
             } else if let Some(fields) = value.as_object() {
                 // `.[]` collapses a repeated key to its first position but
@@ -6063,8 +6123,10 @@ fn index_one_generic<V: DocumentValue>(
         OwnedValue::String(s) => {
             if let Some(fields) = target.as_object() {
                 match fields.find_cursor(s) {
-                    Some(c) => GenericResult::OneCursor(c),
-                    None => GenericResult::Owned(OwnedValue::Null),
+                    Ok(Some(c)) => GenericResult::OneCursor(c),
+                    Ok(None) => GenericResult::Owned(OwnedValue::Null),
+                    // #1677: same malformed-delimiter check as `Expr::Field`.
+                    Err(err) => GenericResult::Error(err),
                 }
             } else if target.is_null() {
                 GenericResult::Owned(OwnedValue::Null)
@@ -7150,8 +7212,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // A loop, not `.map(...).collect()`: `owned_or_err!` has to
                 // return from *this* function, which it cannot do from inside
                 // a closure (#1247).
+                //
+                // `_checked`: same #1677 gap check as `.[]`'s array arm --
+                // this walk visits every element regardless, so it's free
+                // to ride here too.
+                let cursors = owned_or_err!(elements.collect_cursors_checked());
                 let mut entries: Vec<OwnedValue> = Vec::new();
-                for (i, elem_cursor) in elements.collect_cursors().into_iter().enumerate() {
+                for (i, elem_cursor) in cursors.into_iter().enumerate() {
                     let mut entry = IndexMap::new();
                     entry.insert("key".to_string(), OwnedValue::Int(i as i64));
                     entry.insert(
@@ -7190,6 +7257,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     let Some(key) = key_display_string(&field.key) else {
                         return GenericResult::Error(fields.malformed_member_error());
                     };
+                    // #1677: `malformed_object_member` above only checked
+                    // the comma before each key; this loop already resolves
+                    // every field's value regardless (`to_owned_cursor`
+                    // below), so the colon check rides along for free.
+                    if !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor) {
+                        return GenericResult::Error(fields.malformed_member_error());
+                    }
                     let mut entry = IndexMap::new();
                     entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
                     entry.insert(
@@ -14546,6 +14620,95 @@ mod tests {
         // One document, one cause, however it is reached -- the reason
         // `malformed_member_error` is a method rather than a literal per
         // call site.
+        assert_eq!(value_err.message, cursor_err.message);
+    }
+
+    /// #1677: #1643's missing/doubled `,`/`:` check used to live only in
+    /// the CLI's `print_json`, so a filter that never re-serializes the
+    /// malformed container whole read straight through it. Each of these
+    /// builtins now raises the same way `.` already did.
+    #[test]
+    fn test_nonreserializing_builtins_raise_on_missing_delimiter_1677() {
+        let json: &[u8] = br#"{"a" 1, "b": 2}"#;
+        for filter in ["keys", "keys_unsorted", "length", "to_entries"] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let result = eval_with_cursor(&crate::jq::parse(filter).unwrap(), cursor);
+            // `keys`/`keys_unsorted` stay lazy (`LazyKeys`) until something
+            // forces them -- `materialize_lazy` is the same forcing step
+            // every real consumer (printing, `collect_owned`) applies.
+            let materialized = result.materialize_lazy();
+            let GenericResult::Error(err) = &materialized else {
+                panic!("{filter}: expected an error, got {materialized:?}");
+            };
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{filter}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #1677: same check for array elements, via `.[]` (a bare walk) and
+    /// `add` (falls through to the `to_owned_cursor` bridge). Both go
+    /// through a different code path than the object cases above.
+    #[test]
+    fn test_array_filters_raise_on_missing_delimiter_1677() {
+        let json: &[u8] = b"[1 2, 3]";
+        for filter in [".[]", "add"] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let result = eval_with_cursor(&crate::jq::parse(filter).unwrap(), cursor);
+            let GenericResult::Error(err) = result else {
+                panic!("{filter}: expected an error, got {result:?}");
+            };
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{filter}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #1677: a targeted field lookup (`.a`) validates the delimiters of
+    /// the field it actually resolves to, even for a top-level scalar that
+    /// never reaches any printer's object/array arm -- `find_cursor` itself
+    /// has to check this, since nothing downstream will.
+    #[test]
+    fn test_field_lookup_raises_on_missing_delimiter_1677() {
+        let json: &[u8] = br#"{"a" 1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse(".a").unwrap(), cursor);
+        let GenericResult::Error(err) = result else {
+            panic!("expected an error, got {result:?}");
+        };
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #1677: both materializing conversions raise on a missing delimiter,
+    /// mirroring `test_both_owned_conversions_raise_on_non_string_key_1194`'s
+    /// same-document, same-cause pattern for the delimiter class instead.
+    #[test]
+    fn test_both_owned_conversions_raise_on_missing_delimiter_1677() {
+        let json: &[u8] = br#"{"a" 1, "b": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let value_err = to_owned(&cursor.value()).expect_err("the value domain must raise");
+        let cursor_err = to_owned_cursor(&cursor).expect_err("the cursor domain must raise");
+
+        for err in [&value_err, &cursor_err] {
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "message: {}",
+                err.message
+            );
+        }
         assert_eq!(value_err.message, cursor_err.message);
     }
 }

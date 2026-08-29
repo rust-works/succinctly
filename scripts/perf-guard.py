@@ -115,6 +115,32 @@ IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")
 
 DEFAULT_THRESHOLD = 5.0
 
+# Per-query threshold overrides for a drift that is real, understood, and
+# accepted as the deliberate cost of a correctness fix -- not a regression
+# this guard should keep failing on every future run. `length`/`census`
+# absorbed a similar ~10% cost for the same reason (#1677's `,`/`:`
+# delimiter check) without ever needing an entry here, simply because it
+# isn't one of `QUERIES` above; `wide_keys_unsorted` doesn't have that
+# option; it's one of the six tracked queries, so its accepted cost needs an
+# explicit, narrower threshold instead of silently failing forever.
+#
+# Measured live on this repo's own CI runners (not a pinned bench box --
+# `--baseline-binary`'s same-run merge-base comparison, #1582, is what makes
+# this number trustworthy despite that): `wide_keys_unsorted` (159K short
+# top-level keys, no nesting) is the one workload with nothing else to
+# dilute #1677's two new per-key checks (`key_delimiter_ok`,
+# `key_only_value_delimiter_ok`) against -- x86_64 measured +4.8%, already
+# under `DEFAULT_THRESHOLD`; ARM64-Linux measured +8.6%, consistently,
+# across a redundant-decode fix that halved `key_is_malformed`'s own cost
+# without moving this number (both delimiter checks were already on their
+# cheapest available scan direction -- see `following_gap_ok`'s own doc
+# comment for the +16%-to-noise fix that predates this). 10% leaves headroom
+# above the observed ARM64 number while still catching a *further*
+# regression on top of this one.
+QUERY_THRESHOLDS = {
+    "wide_keys_unsorted": 10.0,
+}
+
 # argparse wants a plain string for `epilog`; keeping it as a real constant
 # (not a slice of `__doc__`) means reflowing the module docstring above can
 # never silently truncate or misplace `--help` output.
@@ -365,17 +391,18 @@ def main(argv=None):
         base = baseline[query_id]
         cur = measured[query_id]
         drift = (cur / base - 1) * 100 if base else float("inf")
-        flag = "  <-- FAIL" if abs(drift) > args.threshold else ""
+        threshold = QUERY_THRESHOLDS.get(query_id, args.threshold)
+        flag = "  <-- FAIL" if abs(drift) > threshold else ""
         print(f"{query_id:<26} {base:>14,.0f} {cur:>14,.0f} {drift:>+7.1f}%{flag}")
-        if abs(drift) > args.threshold:
-            failed.append((query_id, drift))
+        if abs(drift) > threshold:
+            failed.append((query_id, drift, threshold))
 
     print()
     if failed:
         print(f"FAILED: {len(failed)} quer{'y' if len(failed) == 1 else 'ies'} exceeded "
-              f"the {args.threshold}% threshold:")
-        for query_id, drift in failed:
-            print(f"  {query_id}: {drift:+.1f}%")
+              f"its threshold:")
+        for query_id, drift, threshold in failed:
+            print(f"  {query_id}: {drift:+.1f}% (threshold {threshold}%)")
         print()
         print("A drift in either direction fails: a genuine improvement needs the same "
               "conscious baseline update as a regression, so a stale baseline can't quietly "
