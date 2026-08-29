@@ -1822,104 +1822,115 @@ fn get_inputs(
     // Process based on input mode
     let mut values = Vec::new();
 
-    for (file_idx, raw) in raw_inputs {
-        let src = file_idx.unwrap_or(0);
-
-        if let Some(delimiter) = args.input_dsv {
-            // DSV input: each row becomes a JSON array of strings
-            let parsed = parse_dsv_input(&raw, delimiter);
-            // One row per line (approximate for embedded newlines; jq has no
-            // DSV input mode, so there is no oracle to match here). Skipped
-            // under `--slurp` (#1541): the combined array's own location
-            // comes from `slurp_eof_line` above, not from any of these
-            // per-value entries, which `get_inputs` discards wholesale when
-            // it replaces `locations` with `InputLocations::single` below.
-            if !args.slurp {
-                for line in 1..=parsed.len() {
-                    locations.push(src, line);
-                }
-            }
-            values.extend(parsed);
-        } else if args.raw_input {
-            // Raw input: each line becomes a string. Deliberately ungated by
-            // `!args.slurp` (#1541), unlike its three siblings above/below --
-            // `args.raw_input && args.slurp` can only reach this arm when
-            // `args.input_dsv` is also set (otherwise the dedicated `-R -s`
-            // early return above already handled it), and the DSV check is
-            // tried first in this `if`/`else if` chain, so it always wins:
-            // this arm is unreachable whenever `args.slurp` is true.
-            for (line_idx, line) in raw.lines().enumerate() {
-                values.push(OwnedValue::String(line.to_string()));
-                locations.push(src, line_idx + 1);
-            }
-        } else if args.seq {
-            // JSON sequence input (RFC 7464): split on RS, ignore parse failures
-            let parsed = parse_json_seq(&raw);
-            // Skipped under `--slurp` (#1541) -- see the DSV branch above.
-            if !args.slurp {
-                locations.extend_from_ends(src, &raw, &json_seq_ends(raw.as_bytes()), parsed.len());
-            }
-            values.extend(parsed);
-        } else {
-            // JSON input: validate first if --validate is set
-            if args.validate {
-                let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
-                validate_json_input(raw.as_bytes(), filename.as_deref())?;
-            }
-            // Parse as JSON stream
-            let parsed = match parse_json_stream(&raw) {
-                Ok(p) => p,
-                Err(e) => return Ok(Err(e)),
-            };
-            // Skipped under `--slurp` (#1541) -- see the DSV branch above.
-            // `find_json_values` exists here only to feed
-            // `locations.extend_from_ends`, so slurp mode skips that scan
-            // entirely rather than running it and discarding the result.
-            // Side effect: the divergence check below (`find_json_values`
-            // disagreeing with `parse_json_stream`/`serde_json`) no longer
-            // runs under `--slurp` either -- if the two validators were ever
-            // to disagree on some input, non-slurp mode would still raise
-            // the internal error below, but slurp mode would now silently
-            // proceed. Accepted: the comment above already treats that
-            // divergence as unreachable through this crate's public CLI
-            // surface, so this only narrows *where* an already-believed-dead
-            // safety net runs, not what output a real input can produce.
-            if !args.slurp {
-                // `parse_json_stream` (above) already validated this exact
-                // input successfully via `serde_json`, which is strictly
-                // pickier than `find_json_values`'s own lenient heuristic
-                // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
-                // `find_json_values`'s RFC 8259 plus leading-zero *and*
-                // leading-dot tolerance, #1171) -- so `find_json_values`
-                // should never fail here in practice; unreachable through
-                // this crate's own public CLI surface, not exercised by a
-                // test for that reason (matching this codebase's established
-                // convention for exhaustive-but-dead defensive arms, e.g.
-                // #1064). Surfaced as an internal error rather than silently
-                // reusing a stale/wrong offset list if the two validators
-                // ever do diverge.
-                let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
-                    Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
-                    Err(offset) => {
-                        return Ok(Err(anyhow::anyhow!(
-                            "internal error: find_json_values failed at byte {offset} \
-                             after parse_json_stream already validated this input"
-                        )));
-                    }
-                };
-                locations.extend_from_ends(src, &raw, &ends, parsed.len());
-            }
-            values.extend(parsed);
-        }
-
-        // Scoped to `!args.slurp` (#1541): under slurp, `locations` is left
-        // empty by design (the branches above skip their pushes), so this
-        // invariant no longer holds there and isn't meaningful to check --
-        // the real slurp-mode invariant is `InputLocations::single`'s own
-        // unconditional single push, asserted independently by `run_jq`'s
-        // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
+    // `--seq` (RFC 7464, #1571): a record's bytes can genuinely span a file
+    // boundary -- real jq's own reader treats every file as one continuous
+    // byte stream for parsing purposes (unrelated to whether `-s` is also
+    // passed: `-s` only changes what happens to the *values* afterward, not
+    // how records are delimited), so this handles the whole file list at
+    // once via [`build_seq_values`] rather than per file inside the loop
+    // below. The other three modes keep the per-file loop unchanged: DSV
+    // and raw-input are line-oriented (no multi-byte record to split across
+    // a boundary), and plain JSON's `find_json_values`/`parse_json_stream`
+    // never had a record delimiter to lose in the first place -- multiple
+    // JSON files are just independent value streams concatenated in the
+    // output, with no boundary-spanning-record concept to get wrong.
+    if args.seq && !args.raw_input && args.input_dsv.is_none() {
+        values = build_seq_values(&raw_inputs, &mut locations, args.slurp);
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
+        }
+    } else {
+        for (file_idx, raw) in raw_inputs {
+            let src = file_idx.unwrap_or(0);
+
+            if let Some(delimiter) = args.input_dsv {
+                // DSV input: each row becomes a JSON array of strings
+                let parsed = parse_dsv_input(&raw, delimiter);
+                // One row per line (approximate for embedded newlines; jq has no
+                // DSV input mode, so there is no oracle to match here). Skipped
+                // under `--slurp` (#1541): the combined array's own location
+                // comes from `slurp_eof_line` above, not from any of these
+                // per-value entries, which `get_inputs` discards wholesale when
+                // it replaces `locations` with `InputLocations::single` below.
+                if !args.slurp {
+                    for line in 1..=parsed.len() {
+                        locations.push(src, line);
+                    }
+                }
+                values.extend(parsed);
+            } else if args.raw_input {
+                // Raw input: each line becomes a string. Deliberately ungated by
+                // `!args.slurp` (#1541), unlike its three siblings above/below --
+                // `args.raw_input && args.slurp` can only reach this arm when
+                // `args.input_dsv` is also set (otherwise the dedicated `-R -s`
+                // early return above already handled it), and the DSV check is
+                // tried first in this `if`/`else if` chain, so it always wins:
+                // this arm is unreachable whenever `args.slurp` is true.
+                for (line_idx, line) in raw.lines().enumerate() {
+                    values.push(OwnedValue::String(line.to_string()));
+                    locations.push(src, line_idx + 1);
+                }
+            } else {
+                // JSON input: validate first if --validate is set
+                if args.validate {
+                    let filename = file_idx.map(|idx| files[idx].to_string_lossy().to_string());
+                    validate_json_input(raw.as_bytes(), filename.as_deref())?;
+                }
+                // Parse as JSON stream
+                let parsed = match parse_json_stream(&raw) {
+                    Ok(p) => p,
+                    Err(e) => return Ok(Err(e)),
+                };
+                // Skipped under `--slurp` (#1541) -- see the DSV branch above.
+                // `find_json_values` exists here only to feed
+                // `locations.extend_from_ends`, so slurp mode skips that scan
+                // entirely rather than running it and discarding the result.
+                // Side effect: the divergence check below (`find_json_values`
+                // disagreeing with `parse_json_stream`/`serde_json`) no longer
+                // runs under `--slurp` either -- if the two validators were ever
+                // to disagree on some input, non-slurp mode would still raise
+                // the internal error below, but slurp mode would now silently
+                // proceed. Accepted: the comment above already treats that
+                // divergence as unreachable through this crate's public CLI
+                // surface, so this only narrows *where* an already-believed-dead
+                // safety net runs, not what output a real input can produce.
+                if !args.slurp {
+                    // `parse_json_stream` (above) already validated this exact
+                    // input successfully via `serde_json`, which is strictly
+                    // pickier than `find_json_values`'s own lenient heuristic
+                    // scan (RFC 8259 plus #1094's leading-zero tolerance, vs.
+                    // `find_json_values`'s RFC 8259 plus leading-zero *and*
+                    // leading-dot tolerance, #1171) -- so `find_json_values`
+                    // should never fail here in practice; unreachable through
+                    // this crate's own public CLI surface, not exercised by a
+                    // test for that reason (matching this codebase's established
+                    // convention for exhaustive-but-dead defensive arms, e.g.
+                    // #1064). Surfaced as an internal error rather than silently
+                    // reusing a stale/wrong offset list if the two validators
+                    // ever do diverge.
+                    let ends: Vec<usize> = match find_json_values(raw.as_bytes()) {
+                        Ok(values) => values.into_iter().map(|(_, end)| end).collect(),
+                        Err(offset) => {
+                            return Ok(Err(anyhow::anyhow!(
+                                "internal error: find_json_values failed at byte {offset} \
+                                 after parse_json_stream already validated this input"
+                            )));
+                        }
+                    };
+                    locations.extend_from_ends(src, &raw, &ends, parsed.len());
+                }
+                values.extend(parsed);
+            }
+
+            // Scoped to `!args.slurp` (#1541): under slurp, `locations` is left
+            // empty by design (the branches above skip their pushes), so this
+            // invariant no longer holds there and isn't meaningful to check --
+            // the real slurp-mode invariant is `InputLocations::single`'s own
+            // unconditional single push, asserted independently by `run_jq`'s
+            // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
+            if !args.slurp {
+                debug_assert_eq!(locations.len(), values.len(), "one location per value");
+            }
         }
     }
 
@@ -2868,6 +2879,82 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
 /// failure mode -- but only for content that's actually malformed, not for
 /// a shape jq itself accepts) was a real, jq-observable divergence, not a
 /// spelling nit.
+/// Build the values (and, when `!slurp`, one `(source, line)` location per
+/// value) for `--seq` input across the whole file list at once (#1571).
+///
+/// Concatenates every file's raw content, in order, into one string and
+/// runs the ordinary [`parse_json_seq`] over it exactly once -- matching
+/// real jq's own `-s` reader, which treats the entire multi-file input as
+/// one continuous RFC 7464 byte stream and doesn't stop scanning a record
+/// at a file boundary. This is what makes `seq_trailing_record_is_dropped`'s
+/// own ambiguous-bare-number-at-EOF check (inside [`parse_json_seq`]) come
+/// out correct too: run against the *true* full stream, it can only ever
+/// see genuine end-of-input, never a false EOF at some earlier file's own
+/// end -- no separate per-file special-casing needed for that interaction.
+///
+/// `!slurp` locations still need each value's own *file* and *file-local*
+/// line, not the byte offset's raw position in the throwaway `combined`
+/// string, so [`json_seq_ends`] runs once against `combined` and each
+/// resulting end offset is mapped back to whichever file's own byte range
+/// contains it (a boundary-spanning record is attributed to the file its
+/// *end* falls in -- matching #1568's own precedent for the stream's
+/// trailing record, which uses the same rule). One [`LineCounter`] per file,
+/// created only when an end offset first crosses into that file's range:
+/// `ends` is non-decreasing (`json_seq_ends` is a single left-to-right
+/// scan) and files are laid out in `combined` in file order, so this walks
+/// forward through `raw_inputs` at most once, never backtracking.
+fn build_seq_values(
+    raw_inputs: &[(Option<usize>, String)],
+    locations: &mut InputLocations,
+    slurp: bool,
+) -> Vec<OwnedValue> {
+    let mut combined = String::new();
+    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
+    for (_, raw) in raw_inputs {
+        combined.push_str(raw);
+        file_ends.push(combined.len());
+    }
+
+    let values = parse_json_seq(&combined);
+
+    if !slurp {
+        let ends = json_seq_ends(combined.as_bytes());
+        if ends.len() == values.len() {
+            let mut file_idx = 0;
+            let mut file_start = 0usize;
+            let mut counter = LineCounter::new(
+                raw_inputs
+                    .first()
+                    .map_or(&[][..], |(_, raw)| raw.as_bytes()),
+            );
+            for &end in &ends {
+                while file_idx + 1 < file_ends.len() && end > file_ends[file_idx] {
+                    file_start = file_ends[file_idx];
+                    file_idx += 1;
+                    counter = LineCounter::new(raw_inputs[file_idx].1.as_bytes());
+                }
+                let src = raw_inputs[file_idx].0.unwrap_or(0);
+                let line = counter.advance_to(end.saturating_sub(file_start));
+                locations.push(src, line);
+            }
+        } else {
+            // Counts disagree (a malformed/dropped record somewhere) --
+            // fall back the same way `extend_from_ends` does per-file: the
+            // last content line of the last file involved, for every
+            // value. Matches that helper's own established tolerance for
+            // imprecision here rather than inventing a new rule.
+            let (src, line) = raw_inputs
+                .last()
+                .map_or((0, 1), |(idx, raw)| (idx.unwrap_or(0), content_lines(raw)));
+            for _ in 0..values.len() {
+                locations.push(src, line);
+            }
+        }
+    }
+
+    values
+}
+
 fn parse_json_seq(s: &str) -> Vec<OwnedValue> {
     let mut values = Vec::new();
 
@@ -5258,6 +5345,59 @@ mod tests {
         let values = parse_json_seq("\x1E1e400\n");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].to_json(), "1E+400");
+    }
+
+    /// #1571: a record's opening RS byte and closing bytes can live in
+    /// different files -- `parse_json_seq` running once per file in
+    /// isolation drops both independently-malformed halves. `build_seq_values`
+    /// treats the whole file list as one continuous byte stream instead,
+    /// matching real jq's own `-s`/`--seq` reader.
+    #[test]
+    fn test_build_seq_values_reassembles_across_file_boundary_1571() {
+        let raw_inputs = vec![
+            (Some(0), "\x1E1\n\x1E{\"a\":\"unterminated ".to_string()),
+            (Some(1), "str\"}\n".to_string()),
+        ];
+        let mut locations =
+            InputLocations::new(vec![Some("f1".to_string()), Some("f2".to_string())]);
+        let values = build_seq_values(&raw_inputs, &mut locations, false);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].to_json(), "1");
+        assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
+        assert_eq!(locations.len(), 2, "one location per value, non-slurp");
+    }
+
+    /// A record spanning three files, not just two.
+    #[test]
+    fn test_build_seq_values_reassembles_across_three_files_1571() {
+        let raw_inputs = vec![
+            (Some(0), "\x1E1\n\x1E{\"a\":\"unter".to_string()),
+            (Some(1), "minated ".to_string()),
+            (Some(2), "str\"}\n\x1E9\n".to_string()),
+        ];
+        let mut locations = InputLocations::new(vec![
+            Some("f1".to_string()),
+            Some("f2".to_string()),
+            Some("f3".to_string()),
+        ]);
+        let values = build_seq_values(&raw_inputs, &mut locations, false);
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_json(), "1");
+        assert_eq!(values[1].to_json(), "{\"a\":\"unterminated str\"}");
+        assert_eq!(values[2].to_json(), "9");
+    }
+
+    /// Control: a record genuinely malformed on its own, not at a file
+    /// boundary, must still be dropped -- reassembly must not paper over
+    /// real malformation just because multiple files are involved.
+    #[test]
+    fn test_build_seq_values_still_drops_genuinely_malformed_record_1571() {
+        let raw_inputs = vec![(Some(0), "\x1E1\n\x1E{invalid\n\x1E3\n".to_string())];
+        let mut locations = InputLocations::new(vec![Some("f1".to_string())]);
+        let values = build_seq_values(&raw_inputs, &mut locations, false);
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].to_json(), "1");
+        assert_eq!(values[1].to_json(), "3");
     }
 
     /// #1192: `standard_json_to_jq_value` now surfaces a genuinely

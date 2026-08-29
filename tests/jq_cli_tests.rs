@@ -20727,6 +20727,63 @@ fn test_jq_seq_slurp_truncated_record_across_file_boundary_1550() -> Result<()> 
     Ok(())
 }
 
+/// #1571: #1550/#1568 fixed only the *error-location* half of a `--seq`
+/// record spanning a file boundary -- the *value* itself, produced by
+/// `parse_json_seq` running once per file in isolation, was still silently
+/// dropped: each half is independently malformed JSON, so both are dropped
+/// per RFC 7464's own recommended failure mode, even though the whole
+/// record read as one continuous byte stream (real jq's own `-s`/`--seq`
+/// reader's actual model) is perfectly well-formed. Every expectation here
+/// is jq 1.7.1's own live output.
+#[test]
+fn test_jq_seq_value_reassembled_across_file_boundary_1571() -> Result<()> {
+    // The issue's own repro: an unterminated string split across two files.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", "."],
+        &["\x1e1\n\x1e{\"a\":\"unterminated ", "str\"}\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1e[1,{\"a\":\"unterminated str\"}]\n");
+
+    // Same shape, non-slurp: both records still stream out separately.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "."],
+        &["\x1e1\n\x1e{\"a\":\"unterminated ", "str\"}\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1e1\n\x1e{\"a\":\"unterminated str\"}\n");
+
+    // A record spanning three files, not just two -- the fix must not be
+    // narrowly hard-coded to a single boundary.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", "."],
+        &["\x1e1\n\x1e{\"a\":\"unter", "minated ", "str\"}\n\x1e9\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1e[1,{\"a\":\"unterminated str\"},9]\n");
+
+    // A bare number ambiguous only because its own file ends right after it
+    // (#1542's own trigger) is disambiguated by the next file's content,
+    // exactly as it already was for the error-location-only case #1550
+    // fixed -- but here checking the *value* itself isn't dropped either.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["--seq", "-c", "-s", "."], &["\x1e1\n\x1e2", "\n\x1e3\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1e[1,2,3]\n");
+
+    // Control: a record that's genuinely malformed on its own, NOT at a
+    // file boundary, must still be dropped -- reassembly must not paper
+    // over real malformation just because multiple files are involved.
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["--seq", "-c", "-s", "."],
+        &["\x1e1\n\x1e{invalid\n\x1e3\n", "\x1e4\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\x1e[1,3,4]\n");
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
