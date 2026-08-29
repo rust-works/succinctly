@@ -810,6 +810,16 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // This is the single most common trigger for this whole bug class:
         // `.a.b | . as $x | parent(1)` previously silently stubbed to `{}`.
         Expr::As { expr, body, .. } => needs_path_context(expr) || needs_path_context(body),
+        // `. as PATTERN | body` (#1765): same reasoning as `Expr::As` above,
+        // for destructuring `as`. Deliberately not gated on `patterns.len()`
+        // here -- unlike the dedicated evaluation arm below (which only
+        // handles the single-pattern case), this is just the routing
+        // question "does the whole pipe need path-context evaluation at
+        // all," and a `?//`-chain with a path-context builtin inside still
+        // needs `true` here so the surrounding pipe routes correctly, even
+        // though the chain itself then falls through to the generic
+        // fallback (its pre-existing, unchanged stub behavior) once inside.
+        Expr::AsPattern { expr, body, .. } => needs_path_context(expr) || needs_path_context(body),
         _ => false,
     }
 }
@@ -26242,6 +26252,96 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             let mut stopped = None;
             for bound_val in bound_values {
                 let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+                let body_result = eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(&substituted_body),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+
+            let combined = stopped.unwrap_or_else(|| match bound_control {
+                Some(control) => partial(all_results, control),
+                None => owned_vec_to_result(all_results),
+            });
+            continue_rest_with_context::<W, S>(
+                combined,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `. as PATTERN | body` (#1765, item 1 of #1663's own remaining-gaps
+        // list): the single-pattern case only -- mirrors the `Expr::As` arm
+        // above exactly (neither `expr` nor `body` navigates away from the
+        // caller's own position), substituting the pattern's destructured
+        // bindings into `body` instead of one bound variable.
+        //
+        // `patterns.len() == 1` deliberately excludes a `?//`-chain
+        // (`. as PATTERN1 ?// PATTERN2 | body`): its retry-on-failure
+        // semantics (`try_pattern_alternatives`'s decode-failure/break/halt
+        // classification, carried-prefix-across-alternatives bookkeeping)
+        // are real complexity this fix doesn't attempt to replicate here, per
+        // the issue's own scoping. A `?//`-chain with a `key`/`parent`/
+        // `file_index` inside it still falls through to the generic fallback
+        // below -- its pre-existing (already broken, unchanged) stub
+        // behavior, not a regression.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } if patterns.len() == 1 && (needs_path_context(expr) || needs_path_context(body)) => {
+            let bound_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
+                Ok(pair) => pair,
+                Err(Flow::Exhausted) => return QueryResult::None,
+                Err(Flow::Escaped(Control::Error(e))) => return QueryResult::Error(e),
+                Err(Flow::Escaped(Control::Break(label))) => return QueryResult::Break(label),
+                Err(Flow::Escaped(Control::Halt(code))) => return QueryResult::Halt(code),
+                Err(Flow::Stopped { .. }) => unreachable!(
+                    "materialize_bound_values only ever produces Exhausted/Escaped, \
+                     never Stopped (that variant is sink-driven laziness this eager \
+                     evaluator never uses)"
+                ),
+            };
+
+            let mut all_results: Vec<OwnedValue> = Vec::new();
+            let mut stopped = None;
+            for bound_val in bound_values {
+                // `invert = false`: the duplicate-binding dedup rule
+                // `extract_pattern_bindings` inverts only applies to a real
+                // `?//`-chain (`patterns.len() > 1`, excluded above) -- see
+                // that function's own doc comment for the live-verified
+                // evidence this mirrors.
+                let bindings = match extract_pattern_bindings(&patterns[0], &bound_val, false) {
+                    Ok(b) => b,
+                    // `accumulate_path_context_step` on `QueryResult::Error`
+                    // always yields `Some` (never asks to keep iterating),
+                    // so this always stops the loop -- reused here rather
+                    // than duplicating its exact `partial(..., Control::
+                    // Error(e))` wrapping by hand.
+                    Err(e) => {
+                        stopped =
+                            accumulate_path_context_step(&mut all_results, QueryResult::Error(e));
+                        break;
+                    }
+                };
+                let substituted_body = substitute_vars(body, as_var_refs(&bindings));
                 let body_result = eval_pipe_with_path_context_internal::<W, S>(
                     core::slice::from_ref(&substituted_body),
                     value,

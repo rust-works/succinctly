@@ -6759,31 +6759,34 @@ fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
     Ok(())
 }
 
-/// Documents four deliberate, narrow gaps #1663 leaves open rather than
-/// silently missing: `needs_path_context` still has no arm for
-/// `Expr::AsPattern` (destructuring `as`), `Expr::Reduce`, `Expr::Foreach`,
-/// or `Expr::Limit`, so a path-context builtin inside any of these four
-/// still falls through to the generic fallback and stubs to its zero
-/// default, exactly as before this fix. `Expr::Object` has the identical
-/// gap but is tracked separately as #1332 (already true before #1663, per
-/// the `Array` arm's own doc comment). Only `Expr::As` -- the single most
-/// consequential shape per #1663's own filing (the ordinary
-/// `EXPR as $v | body` idiom) -- was fixed here; the remaining four have
-/// no real-yq oracle to verify a fix against (yq's lexer rejects
-/// destructuring `as`, `reduce`, `foreach`, and `limit` outright) and
-/// `Reduce`/`Foreach` in particular raise a real semantic question (what
-/// should `key` mean while evaluating the fold's own accumulator, which
-/// has no document position?) that #1663's own investigation didn't
-/// settle. Filed as a follow-up rather than guessed at here. Pinned so a
-/// future regression or accidental fix is visible either way, matching
-/// #1306's identical "known gap" precedent
-/// (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
+/// Documents three deliberate, narrow gaps #1663 leaves open rather than
+/// silently missing: `needs_path_context` still has no dedicated evaluation
+/// arm for `Expr::Reduce`, `Expr::Foreach`, or `Expr::Limit`, so a
+/// path-context builtin inside any of these three still falls through to the
+/// generic fallback and stubs to its zero default, exactly as before this
+/// fix. `Expr::Object` has the identical gap but is tracked separately as
+/// #1332 (already true before #1663, per the `Array` arm's own doc comment).
+///
+/// `Expr::As` (#1663) and the single-pattern case of `Expr::AsPattern`
+/// (#1765) -- the two most consequential shapes, since they're the ordinary
+/// `EXPR as $v | body` / `EXPR as PATTERN | body` idioms -- are both fixed;
+/// see `test_as_pattern_single_pattern_path_context_resolves_1765` for that
+/// coverage. A `?//`-chained `AsPattern` (2+ alternatives) is intentionally
+/// still a known gap alongside the three below -- its retry-on-failure
+/// semantics are real complexity #1765 didn't attempt to replicate, per that
+/// issue's own scoping.
+///
+/// None of the remaining four shapes (reduce/foreach/limit, plus `?//`) have
+/// a real-yq oracle to verify a fix against (yq's lexer rejects destructuring
+/// `as`, `reduce`, `foreach`, and `limit` outright), and `Reduce`/`Foreach`
+/// in particular raise a real semantic question (what should `key` mean
+/// while evaluating the fold's own accumulator, which has no document
+/// position?) that #1663's own investigation didn't settle. Filed as a
+/// follow-up rather than guessed at here. Pinned so a future regression or
+/// accidental fix is visible either way, matching #1306's identical "known
+/// gap" precedent (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
 #[test]
-fn test_as_pattern_reduce_foreach_limit_path_context_still_known_gaps_1663() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(&["-c", ".a | . as [$x] | key"], Some(r#"{"a":[1]}"#))?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "null");
-
+fn test_reduce_foreach_limit_path_context_still_known_gaps_1663() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | reduce .[] as $x (key; .)"],
         Some(r#"{"a":[1,2]}"#),
@@ -6801,6 +6804,39 @@ fn test_as_pattern_reduce_foreach_limit_path_context_still_known_gaps_1663() -> 
     let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(1; key)]"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "[null]");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | . as [$x] ?// {b:$x} | key"],
+        Some(r#"{"a":[1]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    Ok(())
+}
+
+/// #1765: `Expr::AsPattern`'s single-pattern case (no `?//` alternatives)
+/// now resolves `key`/`parent`/`file_index` against the caller's own ambient
+/// position, mirroring #1663's `Expr::As` fix -- both array and object
+/// destructuring, and a nested `parent(n)` reaching past the bound position
+/// back toward the document root.
+#[test]
+fn test_as_pattern_single_pattern_path_context_resolves_1765() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | . as [$x] | key"], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | . as {b: $x} | key"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | . as {b: $x} | $x, parent(1)"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1\n{\"a\":{\"b\":1}}");
 
     Ok(())
 }
