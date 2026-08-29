@@ -2915,25 +2915,16 @@ fn write_json_string(output: &mut String, s: &str) {
 /// controls. An earlier version of this function additionally re-escaped
 /// non-ASCII characters as `\u00XX`/`\uXXXX`, which diverged from
 /// `stream_json_escape`/yq for any string reached through this non-streaming
-/// transcode path (#532).
+/// transcode path (#532) -- a divergence that already had to be corrected
+/// twice before this collapsed onto one definition (#1823), the same
+/// pattern #1638 fixed for `write_resolved_scalar_as_json`/
+/// `stream_resolved_scalar_as_json`.
 #[inline]
 fn write_json_escape(output: &mut String, ch: char) {
-    match ch {
-        '"' => output.push_str("\\\""),
-        '\\' => output.push_str("\\\\"),
-        '\n' => output.push_str("\\n"),
-        '\r' => output.push_str("\\r"),
-        '\t' => output.push_str("\\t"),
-        c if (c as u32) < 0x20 => {
-            // Control character - use \uXXXX
-            output.push_str("\\u00");
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let b = c as u8;
-            output.push(HEX[(b >> 4) as usize] as char);
-            output.push(HEX[(b & 0xf) as usize] as char);
-        }
-        c => output.push(c),
-    }
+    // `String`'s `fmt::Write` impl forwards to `push_str`/`push` and always
+    // returns `Ok`, so there is no error to propagate -- the same reasoning
+    // `write_json_string` states for its own generic/buffered split above.
+    let _ = stream_json_escape(output, ch);
 }
 
 /// Scan a run of literal spaces/tabs starting at `i`.
