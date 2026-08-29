@@ -19836,6 +19836,35 @@ fn test_yq_del_slice_outcome_iterate_prefix_real_container_1432() -> Result<()> 
     Ok(())
 }
 
+/// #1432 (coverage, #1863): the same `navigate_read_only` `Iterate` arm's
+/// scalar-hit and `Null`/catch-all branches, reached via `del()`. Both are
+/// pinned as *known-divergent* -- pre-existing bugs unrelated to #1432's
+/// own fix (`navigate_read_only`'s match arms are byte-for-byte unchanged
+/// by that PR), found only while restoring this coverage, not something
+/// this PR fixes. Real yq applies the same #1181/#1232 "a scalar hit
+/// anywhere mid-chain permanently no-ops" rule `=`'s own write path (and
+/// `del()`'s slice-prefix handling elsewhere in this same file) already
+/// get right, and autovivifies `null` the same way `.a[].b = v` does --
+/// `del()`'s own `Iterate`-then-slice path does neither, raising instead.
+/// Live-verified against yq v4.53.3; reported as a follow-up on #1863.
+#[test]
+fn test_yq_del_slice_outcome_iterate_prefix_scalar_and_null_1432() -> Result<()> {
+    // Scalar hit -- real yq no-ops; succinctly raises.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("del(.a[].b[0:1])", "a: 5\n", &["-o=json", "-I=0"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot iterate"), "err={err}");
+
+    // `Null` -- real yq autovivifies to `[]` (nothing to delete);
+    // succinctly raises.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("del(.a[].b[0:1])", "a: null\n", &["-o=json", "-I=0"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot iterate"), "err={err}");
+
+    Ok(())
+}
+
 /// #1223: a comma-grouped multi-path `del()` used to crash when a sibling's
 /// chained-slice target was an `Object`, instead of applying #1162's own
 /// parent-key-drop rule (which the *single-path* form of this exact query
