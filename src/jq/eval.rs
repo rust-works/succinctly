@@ -38,7 +38,8 @@ use core::cell::Cell;
 use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
-    effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
+    effective_fields, effective_len, key_display_string, resolve_display_key, DisplayKeyGuard,
+    DocumentFields,
 };
 // Only consumed by `yaml_value_to_owned_checked`, which is itself
 // `#[cfg(feature = "std")]`-gated (`load()`'s YAML path) -- gated
@@ -5986,12 +5987,36 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Object(fields) => {
             let mut keys: Vec<String> = Vec::new();
-            for field in fields {
-                if let StandardJson::String(k) = field.key() {
-                    if let Ok(cow) = k.as_str() {
-                        keys.push(cow.into_owned());
-                    }
-                }
+            // `uncons`/`rest`, not `for field in fields`: a `for` loop
+            // consumes the `Iterator` impl, whose `next()` reports `None`
+            // both on genuine exhaustion *and* on a trailing unpaired
+            // member (#1194, e.g. `{"a":1,"b"}`) -- indistinguishable
+            // through that protocol, so only a walk that can inspect the
+            // list state it *finished* on can ask `ends_unpaired`
+            // afterward. Mirrors `to_owned_checked_at_depth`'s own shape
+            // (#1734).
+            let mut f = fields;
+            while let Some((field, rest)) = f.uncons() {
+                let key_val = field.key();
+                // #1829: preserve a decode-failure key via its raw source
+                // span (#1642), matching `to_owned_checked`/`path()`/
+                // `tojson`'s policy -- this used to silently skip both a
+                // decode-failure key and a structurally non-string one
+                // (#1194), disagreeing with those and with `length`, which
+                // counts every field regardless. Plain `key_display_string`,
+                // not `resolve_display_key`: `keys` builds a `Vec`, not a
+                // map, so two decode-failure keys sharing the same fallback
+                // spelling are simply two list entries, not the ambiguous
+                // overwrite `DisplayKeyGuard` exists to prevent for a real
+                // `IndexMap`.
+                let Some(key) = key_display_string(&key_val) else {
+                    return QueryResult::Error(f.malformed_member_error());
+                };
+                keys.push(key.into_owned());
+                f = rest;
+            }
+            if f.ends_unpaired() {
+                return QueryResult::Error(f.malformed_member_error());
             }
             if sorted {
                 keys.sort();
@@ -41076,6 +41101,44 @@ mod tests {
                 assert_eq!(arr.len(), 2);
                 // Note: Order depends on how JSON was parsed
             }
+        );
+    }
+
+    /// #1829: `keys`/`keys_unsorted` used to silently drop a decode-failure
+    /// key, disagreeing with `length` (which counts every field regardless)
+    /// and with `path(.[])`/`tojson` (which already preserve it via its raw
+    /// source span, #1642/#1734). Both builtins must now agree: the key is
+    /// present, at its raw-source-span spelling.
+    #[test]
+    fn test_builtin_keys_preserves_decode_failure_key_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"a\": 2}";
+
+        query!(doc, "length",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
+        );
+        query!(doc, "keys_unsorted",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 2)
+        );
+        query!(doc, "keys",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 2)
+        );
+    }
+
+    /// #1829's other axis: a structurally non-string/unpaired key (#1194,
+    /// `{"a":1,"b"}`) must raise for `keys`/`keys_unsorted` too, matching
+    /// `path(.[])`/`tojson` -- previously silently dropped instead (`["a"]`
+    /// rather than an error).
+    #[test]
+    fn test_builtin_keys_raises_on_structurally_malformed_key_1829() {
+        let doc: &[u8] = br#"{"a":1,"b"}"#;
+
+        query!(doc, "keys_unsorted",
+            QueryResult::Error(e) => {
+                assert!(!e.is_decode_failure(), "message: {}", e.message);
+            }
+        );
+        query!(doc, "keys",
+            QueryResult::Error(_) => {}
         );
     }
 
