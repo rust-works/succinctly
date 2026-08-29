@@ -24594,3 +24594,30 @@ fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Resul
     );
     Ok(())
 }
+
+/// #1813: `colliding_display_key_error`'s uncatchability fix lives in
+/// shared `src/jq/error.rs`/`document.rs` code, reached identically by
+/// both evaluators -- confirms the fix applies to yq mode too, not just
+/// jq's own CLI tests. Uses `\q` (an invalid YAML escape, not raw invalid
+/// UTF-8 bytes) since a genuinely invalid UTF-8 byte sequence is rejected
+/// by YAML's own parser before the evaluator ever sees it, unlike JSON.
+#[test]
+fn test_colliding_display_key_error_is_uncatchable_yq_1813() -> Result<()> {
+    let doc = "\"b\\qc\": 1\n\"b\\qc\": 2\n";
+
+    let (out, err, code) = run_yq_stdin_with_stderr("sort?", doc, &[])?;
+    assert_ne!(
+        code, 0,
+        "`?` must not silently suppress a colliding-key error, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    let (out, err, code) = run_yq_stdin_with_stderr("try sort catch .", doc, &[])?;
+    assert_ne!(
+        code, 0,
+        "try/catch must not catch a colliding-key error, out: {out:?}"
+    );
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    Ok(())
+}
