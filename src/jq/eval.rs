@@ -1252,7 +1252,9 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // (#1755/#1843's own instance of this exact bug shape).
             QueryResult::One(v) => {
                 if let Err(e) = push_promoted(core::iter::once(v), &mut borrowed, &mut owned) {
-                    let merged = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                    // push_promoted only errors from its `Some(acc)` arm, so
+                    // `owned` is always `Some` here.
+                    let merged = owned.expect("push_promoted only errors when owned is Some");
                     return partial(merged, Control::Error(e));
                 }
             }
@@ -1261,7 +1263,7 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Many(vs) => {
                 if let Err(e) = push_promoted(vs, &mut borrowed, &mut owned) {
-                    let merged = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
+                    let merged = owned.expect("push_promoted only errors when owned is Some");
                     return partial(merged, Control::Error(e));
                 }
             }
