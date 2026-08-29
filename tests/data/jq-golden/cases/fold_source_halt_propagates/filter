@@ -1,0 +1,1 @@
+path(reduce (halt_error(3)) as $i (0; .))
