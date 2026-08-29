@@ -37,7 +37,9 @@ use core::cell::Cell;
 
 use indexmap::{IndexMap, IndexSet};
 
-use super::document::{effective_fields, effective_len};
+use super::document::{
+    effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
+};
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
 
@@ -589,9 +591,18 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
 /// at every one of them in a single change. Left as a documented gap for a
 /// follow-up rather than attempted here (#1746's own comment thread).
 ///
-/// Key handling is intentionally unchanged from [`to_owned`]: an object
-/// field whose key fails to decode is still silently dropped (a distinct,
-/// #1194-shaped structural gap, not this function's #1247-shaped one).
+/// A field's key is resolved through [`resolve_display_key`] (#1734), the
+/// same shared sequence `eval_generic::to_owned_at_depth` uses: a key that
+/// fails to *decode* is preserved via its lossily-decoded raw source span
+/// rather than dropped or raised on (#1642 relaxed #1247's original raise
+/// here specifically, to match `length`/`keys_unsorted`/`.`), a key that
+/// does not *stringify* at all raises (#1194's distinct structural axis),
+/// and two decode-failure keys whose fallback spellings collide also raise
+/// rather than silently overwriting one another in `map` (#1642's own
+/// `DisplayKeyGuard`). Was hand-rolled here as silent-drop-on-either-axis
+/// before this fix, `StandardJson`'s own
+/// [`DocumentValue`](super::document::DocumentValue) impl making the shared
+/// helper directly usable.
 fn to_owned_checked<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
 ) -> Result<OwnedValue, EvalError> {
@@ -619,23 +630,23 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
+            let mut guard = DisplayKeyGuard::default();
             for field in *fields {
-                // A structurally non-string key (#1194) stays silently
-                // skipped here, matching #1642's established
-                // preserve-not-raise convention for that axis -- only a
-                // *string* key that fails to *decode* raises, mirroring
-                // the value arm just above.
-                if let StandardJson::String(key_str_val) = field.key() {
-                    match key_str_val.as_str() {
-                        Ok(cow) => {
-                            map.insert(
-                                cow.into_owned(),
-                                to_owned_checked_at_depth(&field.value(), depth + 1)?,
-                            );
-                        }
-                        Err(e) => return Err(EvalError::decode_failure(e.message())),
-                    }
-                }
+                let key_val = field.key();
+                // `resolve_display_key` covers both key axes in one call
+                // (#1734): `Ok(None)` is a structurally non-string key
+                // (#1194) and raises here, matching
+                // `eval_generic::to_owned_at_depth`'s own handling of the
+                // identical case; `Err` is a collision between two
+                // decode-failure fallback spellings, which also raises
+                // rather than silently overwriting an entry in `map`
+                // (#1642's `DisplayKeyGuard`); `Ok(Some(key))` covers both
+                // an ordinary key and a decode-failure key preserved via
+                // its lossily-decoded raw source span.
+                let Some(key) = resolve_display_key(&key_val, &map, &mut guard)? else {
+                    return Err(fields.malformed_member_error());
+                };
+                map.insert(key, to_owned_checked_at_depth(&field.value(), depth + 1)?);
             }
             OwnedValue::Object(map)
         }
@@ -58699,30 +58710,88 @@ mod tests {
         }
     }
 
-    /// #1734: `to_owned_checked_at_depth`'s `Object` arm guarded a field's
-    /// *value* against decode failure (the string-value arm just above)
-    /// but not its *key* -- an undecodable key was silently dropped from
-    /// the materialized map instead of raising, unlike every other
-    /// #1620/#1247 decode-failure site. Live-reachable via `sort` alone
-    /// (`builtin_sort` was already migrated to `to_owned_checked` by
-    /// #1755's own prior work): confirmed via the library API that
-    /// `[{<undecodable key>: 1}] | sort` used to return
-    /// `Owned(Array([Object({})]))` -- the whole field silently vanished,
-    /// no error -- rather than raising like the sibling string-value case
-    /// already did.
+    /// #1734: `to_owned_checked_at_depth`'s `Object` arm dropped an
+    /// undecodable key's whole field from the materialized map instead of
+    /// preserving it -- live-reachable via `sort` alone (`builtin_sort`
+    /// was already migrated to `to_owned_checked` by #1755's own prior
+    /// work): confirmed via the library API that `[{<undecodable key>:
+    /// 1}] | sort` used to return `Owned(Array([Object({})]))`, silently
+    /// losing the field.
+    ///
+    /// The fix is preserve-via-lossy-decode, *not* raise: `eval_generic.rs`'s
+    /// sibling `to_owned` established (#1642, `key_display_string_kind`)
+    /// that an undecodable *key* is preserved through its raw source span,
+    /// matching `length`/`keys_unsorted`/`.` -- #1247 originally raised
+    /// here too, and #1642 deliberately relaxed that. Only an undecodable
+    /// *value* still raises (the arm just above this one, unchanged).
     #[test]
-    fn eval_rs_to_owned_checked_object_key_decode_failure_raises_1734() {
-        let json: &[u8] = br#"[{"\ud800":1}]"#;
+    fn eval_rs_to_owned_checked_object_key_decode_failure_preserved_1734() {
+        let json: &[u8] = b"[{\"\xff\xfe\": 1}]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("sort").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::Array(items)) => {
+                assert_eq!(items.len(), 1, "expected the field to survive: {items:?}");
+                match &items[0] {
+                    OwnedValue::Object(map) => {
+                        assert_eq!(
+                            map.get("\u{FFFD}\u{FFFD}"),
+                            Some(&OwnedValue::from_number_literal("1")),
+                            "expected the undecodable key preserved as its lossy-decoded \
+                             source span, matching eval_generic.rs's own #1642 convention, \
+                             got: {map:?}"
+                        );
+                    }
+                    other => panic!("expected an object, got: {other:?}"),
+                }
+            }
+            other => panic!(
+                "expected the field to survive with a lossy-decoded key, not raise or drop, got: {other:?}"
+            ),
+        }
+    }
+
+    /// #1734, the other key axis `resolve_display_key` covers in the same
+    /// call: a *structurally* non-string key (#1194 -- JSON's grammar
+    /// never allows a bare number as a key, e.g. `{123: 1}`) must raise,
+    /// not silently drop the field, matching
+    /// `eval_generic::to_owned_at_depth`'s own handling of the identical
+    /// case. Distinct from the *decode-failure* axis above: this key is a
+    /// valid JSON token, just not a string at all.
+    #[test]
+    fn eval_rs_to_owned_checked_structural_key_raises_1734() {
+        let json: &[u8] = b"[{123:1}]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("sort").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(_) => {}
+            other => panic!(
+                "expected the structurally non-string key to raise instead of being silently dropped, got: {other:?}"
+            ),
+        }
+    }
+
+    /// #1734: two different decode-failure keys in the same object whose
+    /// lossy-decoded fallback spellings collide must raise, not let the
+    /// second silently overwrite the first in `map` -- `resolve_display_key`'s
+    /// `DisplayKeyGuard` (#1642) exists specifically for this, and this
+    /// fix is the first thing to give `to_owned_checked_at_depth` a guard
+    /// instance to actually engage it with.
+    #[test]
+    fn eval_rs_to_owned_checked_object_key_collision_raises_1734() {
+        let json: &[u8] = b"[{\"\xff\xfe\": 1, \"\xff\xff\": 2}]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let expr = parse("sort").unwrap();
         match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
             QueryResult::Error(e) => assert!(
-                e.is_decode_failure(),
-                "expected a decode-failure error, got: {e:?}"
+                e.message.contains("ambiguous"),
+                "expected a colliding-key error, got: {e:?}"
             ),
             other => panic!(
-                "expected the undecodable object key to raise instead of being silently dropped, got: {other:?}"
+                "expected the colliding fallback keys to raise instead of one silently overwriting the other, got: {other:?}"
             ),
         }
     }
