@@ -39,7 +39,8 @@ use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
     effective_fields, effective_fields_checked, effective_keys, effective_len, key_display_string,
-    resolve_display_key, DisplayKeyGuard, DocumentElements, DocumentFields,
+    key_display_string_kind, resolve_display_key, DisplayKeyGuard, DocumentElements,
+    DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
@@ -6561,67 +6562,88 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // IndexMap, so two decode-failure keys sharing the same
             // fallback spelling must raise rather than silently overwrite
             // one another, unlike keys/to_entries's Vec output.
-            let checked = match effective_fields_checked(&fields, false) {
+            // `S::COLLAPSE_DUPLICATE_KEYS`, not a hardcoded `false` like
+            // keys/to_entries use: those two lack an `S: EvalSemantics`
+            // parameter entirely, but this function already has one (used
+            // for `S::TAG` above and for the `eval_single::<W, S>` call
+            // below), and real jq collapses a duplicate object key to its
+            // last occurrence *before* evaluating the filter -- walking
+            // every raw duplicate and applying `f` to each (including the
+            // one about to be discarded) can raise an error real jq never
+            // reaches (code review, #1829): `{"a":"x","a":2} |
+            // map_values(.+1)` must give `{"a":3}` like jq does, not error
+            // on `"x"+1` for a value collapse would have already dropped.
+            let checked = match effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
-            let mut result_map = IndexMap::new();
+            let mut result_map = IndexMap::with_capacity(checked.len());
             let mut guard = DisplayKeyGuard::default();
             for field in checked {
                 // `effective_fields_checked` already refused every key
-                // `key_display_string`/`resolve_display_key` would answer
-                // `None` for (#1194), so that arm is unreachable here --
-                // kept as a real branch (not `.unwrap()`) so a future change
-                // to either function's refusal condition fails loudly
-                // instead of panicking.
-                let key = match resolve_display_key(&field.key, &result_map, &mut guard) {
-                    Ok(Some(k)) => k,
-                    Ok(None) => return QueryResult::Error(fields.malformed_member_error()),
-                    Err(e) => return QueryResult::Error(e),
+                // `key_display_string_kind` would answer `None` for
+                // (#1194), so that arm is unreachable here -- kept as a
+                // real branch (not `.unwrap()`) so a future change to
+                // either function's refusal condition fails loudly instead
+                // of panicking.
+                //
+                // `key_display_string_kind`, not `resolve_display_key`: the
+                // latter checks the `DisplayKeyGuard` collision (and
+                // registers the key in it) unconditionally, before `f` is
+                // evaluated below -- but `f` can produce no output at all
+                // (`QueryResult::None`), in which case this field's key is
+                // never actually inserted into `result_map`. Checking the
+                // guard that early raised a false-positive collision
+                // against a *later* field sharing the same #1642 fallback
+                // spelling even when the earlier field's own value never
+                // made it into the map (code review, #1829): every other
+                // `resolve_display_key` call site inserts unconditionally
+                // right after resolving, so this is the first one where
+                // that isn't true. The guard check is deferred below,
+                // immediately before the one line that actually inserts.
+                let (key, is_fallback) = match key_display_string_kind(&field.key) {
+                    Some((k, is_fallback)) => (k.into_owned(), is_fallback),
+                    None => return QueryResult::Error(fields.malformed_member_error()),
                 };
 
                 // Apply f to the value
                 let field_val = field.value;
-                match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
-                    QueryResult::One(v) => match to_owned_checked(&v) {
-                        Ok(owned) => {
-                            result_map.insert(key, owned);
-                        }
-                        Err(e) => return QueryResult::Error(e),
-                    },
-                    QueryResult::OneCursor(_) => unreachable!(),
-                    QueryResult::Owned(v) => {
-                        result_map.insert(key, v);
-                    }
-                    QueryResult::Many(vs) => {
-                        if let Some(v) = vs.first() {
-                            match to_owned_checked(v) {
-                                Ok(owned) => {
-                                    result_map.insert(key, owned);
-                                }
+                let value_to_insert =
+                    match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
+                        QueryResult::One(v) => match to_owned_checked(&v) {
+                            Ok(owned) => Some(owned),
+                            Err(e) => return QueryResult::Error(e),
+                        },
+                        QueryResult::OneCursor(_) => unreachable!(),
+                        QueryResult::Owned(v) => Some(v),
+                        QueryResult::Many(vs) => match vs.first() {
+                            Some(v) => match to_owned_checked(v) {
+                                Ok(owned) => Some(owned),
                                 Err(e) => return QueryResult::Error(e),
-                            }
+                            },
+                            None => None,
+                        },
+                        QueryResult::ManyOwned(vs) => vs.into_iter().next(),
+                        QueryResult::None => None,
+                        QueryResult::Error(e) => return QueryResult::Error(e),
+                        QueryResult::Break(label) => return QueryResult::Break(label),
+                        QueryResult::Halt(code) => return QueryResult::Halt(code),
+                        // Object construction is atomic in jq (see
+                        // `eval_object_construction`) — a `Partial` field value
+                        // just surfaces its control, same as a bare one.
+                        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+                        QueryResult::Partial(_, Control::Break(label)) => {
+                            return QueryResult::Break(label);
                         }
-                    }
-                    QueryResult::ManyOwned(vs) => {
-                        if let Some(v) = vs.into_iter().next() {
-                            result_map.insert(key, v);
+                        QueryResult::Partial(_, Control::Halt(code)) => {
+                            return QueryResult::Halt(code);
                         }
+                    };
+                if let Some(value) = value_to_insert {
+                    if !guard.check(&result_map, &key, is_fallback) {
+                        return QueryResult::Error(EvalError::colliding_display_key(&key));
                     }
-                    QueryResult::None => {}
-                    QueryResult::Error(e) => return QueryResult::Error(e),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    // Object construction is atomic in jq (see
-                    // `eval_object_construction`) — a `Partial` field value
-                    // just surfaces its control, same as a bare one.
-                    QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-                    QueryResult::Partial(_, Control::Break(label)) => {
-                        return QueryResult::Break(label);
-                    }
-                    QueryResult::Partial(_, Control::Halt(code)) => {
-                        return QueryResult::Halt(code);
-                    }
+                    result_map.insert(key, value);
                 }
             }
             QueryResult::Owned(OwnedValue::Object(result_map))
@@ -6636,8 +6658,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(c) => c,
                 Err(e) => return QueryResult::Error(e),
             };
-            let mut results = Vec::new();
+            let mut results: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for cursor in cursors {
+                // `cursor.value()` re-resolves `text_position()` a second
+                // time here -- the same known, documented, not-fixed-here
+                // cost `to_entries`'s own array arm carries (its own doc
+                // comment has the full rationale): `collect_cursors_checked`
+                // already resolved each element's position once internally
+                // to run its delimiter check, then discards it.
                 let elem = cursor.value();
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => match to_owned_checked(&v) {
@@ -42415,6 +42443,63 @@ mod tests {
         query!(br#"{"a":1,"b"}"#, "map_values(.+1)?", QueryResult::None => {});
         query!(br#"{"a" 1, "b": 2}"#, "map_values(.+1)?", QueryResult::None => {});
         query!(br"[1 2, 3]", "map_values(.+1)?", QueryResult::None => {});
+    }
+
+    /// Code review, #1829: a duplicate object key must be collapsed to its
+    /// last occurrence *before* `f` runs, matching real jq -- an earlier
+    /// draft of this fix hardcoded `collapse: false` (correct for
+    /// `keys`/`to_entries`, which lack an `S: EvalSemantics` parameter to
+    /// derive a mode-correct flag from, but `map_values` has one) and so
+    /// walked every raw duplicate, applying `f` to a value real jq would
+    /// have already discarded. `"x" + 1` would raise here if the collapse
+    /// didn't happen before `f` ran; real jq (`{"a":"x","a":2} |
+    /// map_values(.+1)`, confirmed live) gives `{"a":3}`, never evaluating
+    /// `f` against `"x"` at all.
+    #[test]
+    fn test_builtin_map_values_collapses_duplicate_key_before_evaluating_f_1829() {
+        query!(br#"{"a": "x", "a": 2}"#, "map_values(.+1)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 1);
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(3)));
+            }
+        );
+    }
+
+    /// Code review, #1829: two decode-failure keys that lossy-decode to the
+    /// identical #1642 fallback spelling must raise via `DisplayKeyGuard`
+    /// (the reason a key-resolution + collision-guard pair was chosen over
+    /// plain `key_display_string` for this function) once both survive `f`
+    /// and would genuinely land in `result_map` together.
+    #[test]
+    fn test_builtin_map_values_raises_on_colliding_fallback_keys_1829() {
+        // `\xff\xfe` and `\xff\xfd` are both 2-byte invalid UTF-8 sequences
+        // that lossy-decode to the same fallback, `"\u{FFFD}\u{FFFD}"`.
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}";
+        query!(doc, "map_values(.+1)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("ambiguous"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// Code review, #1829: the collision guard's check must be deferred
+    /// until a field's own `f`-output is known to actually land in
+    /// `result_map` -- checking (and registering the key in the guard)
+    /// eagerly, before `f` runs, previously raised a false-positive
+    /// collision even when the earlier field's own value was filtered out
+    /// by `select` and never inserted at all. The two keys here share the
+    /// same #1642 fallback spelling as the collision test above, but only
+    /// one field's value survives `select(. > 0)`, so this must succeed
+    /// with a single entry, not raise.
+    #[test]
+    fn test_builtin_map_values_no_false_positive_collision_when_value_dropped_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"\xff\xfd\": -1}";
+        query!(doc, "map_values(select(.>0))",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.len(), 1);
+                assert_eq!(obj.get("\u{FFFD}\u{FFFD}"), Some(&OwnedValue::Int(1)));
+            }
+        );
     }
 
     #[test]
