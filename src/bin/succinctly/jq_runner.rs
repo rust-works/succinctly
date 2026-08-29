@@ -1034,6 +1034,21 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Uncaught evaluation errors. Evaluation continues past one (as jq does),
     // so the failure is remembered here and turned into exit 5 below (#355).
     let mut sink = ErrorSink::default();
+    // Whether the most recently processed top-level input document's own
+    // evaluation reported an error -- real jq's exit code (#1855) reflects
+    // only this, not `sink.hit()`'s whole-run "any error ever" state:
+    // confirmed live against jq 1.7.1, an earlier document erroring does not
+    // force a non-zero exit if a later document evaluates cleanly
+    // (`printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | jq '.a / .b'` exits 0), but
+    // the reverse ordering exits 5. `sink.hit()` itself is intentionally left
+    // untouched -- `yq_runner.rs`'s own final exit-code check reuses the same
+    // `ErrorSink` type and real yq's multi-document exit code genuinely is
+    // sticky-any-error, verified separately (ADR-0018: mode decides, never
+    // the shared type). Updated via `sink.report_count()` diffing (the exact
+    // primitive #715 already added `report_count()` for) around every
+    // document-processing loop below, then read instead of `sink.hit()` at
+    // each loop's own final exit-code decision.
+    let mut last_document_errored = false;
 
     // Validate DSV delimiter if provided
     if let Some(delim) = args.input_dsv {
@@ -1085,6 +1100,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     let row_value = OwnedValue::Array(fields);
 
                     // Evaluate expression on this row
+                    let error_count_before_row = sink.report_count();
                     let results = evaluate_input(&row_value, &expr, &context, &at, &mut sink)?;
 
                     for result in results {
@@ -1100,6 +1116,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         out.flush()?;
                         return Ok(code);
                     }
+                    last_document_errored = sink.report_count() > error_count_before_row;
                     // row_value is dropped here, freeing memory for this row
                 }
             }
@@ -1109,7 +1126,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // Determine exit code. An uncaught error outranks -e: jq's 5 says
             // the filter failed, -e's 1/4 describe an otherwise-successful
             // result that happened to be falsy (#355 vs #178).
-            if sink.hit() {
+            if last_document_errored {
                 return Ok(DiagStyle::Jq.error_exit_code());
             }
             if args.exit_status {
@@ -1175,6 +1192,22 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
 
+        // Checkpoint for `last_document_errored`'s report_count diffing
+        // (#1855): read at the start of each value's iteration below rather
+        // than at the value's own many exit points (a value's iteration body
+        // has several -- the identity fast path, a clean result, a decode
+        // failure, a caught panic, a malformed-document break -- and every
+        // one of them needs the same finalization). Finalizing lazily at the
+        // *next* iteration's start, plus once more after the loop for the
+        // last value, covers all of them without duplicating that
+        // finalization at each individual exit point. A whole-file parse
+        // failure (the `Err(offset)` arm below) reports and `continue`s the
+        // *outer* loop without ever reaching the inner per-value loop for
+        // that file; it still gets picked up correctly, since the next
+        // value's own start-of-iteration diff (or the final post-loop one,
+        // if no further value ever comes) reads the accumulated
+        // `report_count()` regardless of which loop iteration produced it.
+        let mut doc_error_checkpoint = sink.report_count();
         for (idx, raw) in raw_inputs.iter().enumerate() {
             let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
             // Validate JSON if --validate flag is set
@@ -1210,6 +1243,13 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
             // every value in this file keeps the whole loop O(n) (#1213).
             let mut line_counter = LineCounter::new(raw);
             for (start, end) in values {
+                // Checkpoints the count *before* this value (#1855) -- see
+                // this loop's own checkpoint declaration above. Read once,
+                // after the whole (files x values) loop nest ends, against
+                // whatever `report_count()` is by then: only the last
+                // iteration's checkpoint survives to be read, so nothing
+                // needs finalizing per-iteration here.
+                doc_error_checkpoint = sink.report_count();
                 let json_bytes = &raw[start..end];
 
                 // Fast path for identity query: output raw bytes directly without materialization.
@@ -1351,6 +1391,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 }
             }
         }
+        // Finalizes the *last* value's error state (#1855) -- every earlier
+        // value already got finalized at the start of the iteration after
+        // it; nothing runs after the very last one to do the same, so it's
+        // repeated here once the whole (files x values) loop nest is done.
+        last_document_errored = sink.report_count() > doc_error_checkpoint;
     } else {
         // The materializing path: reads every document up front into a
         // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
@@ -1464,6 +1509,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // moves it -- and once it does, jq names where the parser
                 // ended up. `printf '' | jq -n 'input'` reports `<stdin>:0`,
                 // not `<unknown>` (#1309, item 5).
+                let error_count_before = sink.report_count();
                 let results = evaluate_input(
                     &OwnedValue::Null,
                     &expr,
@@ -1480,6 +1526,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     out.flush()?;
                     return Ok(code);
                 }
+                last_document_errored = sink.report_count() > error_count_before;
             } else {
                 // The outer loop and `input`/`inputs` draw from the exact
                 // same queue (#723): a document a filter's own `input` call
@@ -1493,6 +1540,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // names where the parser ended up, not where this document
                 // started (#1309, item 4).
                 while let Some(input) = jq::pop_remaining_input() {
+                    let error_count_before = sink.report_count();
                     let results = evaluate_input(
                         &input,
                         &expr,
@@ -1509,6 +1557,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         out.flush()?;
                         return Ok(code);
                     }
+                    last_document_errored = sink.report_count() > error_count_before;
                 }
             }
         } else {
@@ -1516,6 +1565,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
                 let at = ErrorAt::Fixed(locations.get(idx));
+                let error_count_before = sink.report_count();
                 let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
 
                 for result in results {
@@ -1527,6 +1577,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     out.flush()?;
                     return Ok(code);
                 }
+                last_document_errored = sink.report_count() > error_count_before;
             }
         }
     }
@@ -1535,8 +1586,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
     // Determine exit code. An uncaught error outranks -e: jq's 5 says the
     // filter failed, -e's 1/4 describe an otherwise-successful result that
-    // happened to be falsy (#355 vs #178).
-    if sink.hit() {
+    // happened to be falsy (#355 vs #178). `last_document_errored`, not
+    // `sink.hit()`: see this function's own declaration of it above (#1855).
+    if last_document_errored {
         return Ok(DiagStyle::Jq.error_exit_code());
     }
     if args.exit_status {
