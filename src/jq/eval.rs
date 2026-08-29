@@ -37551,6 +37551,18 @@ mod tests {
             Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("unexpected result: {other:?}"),
         }
+
+        // The `QueryResult::Many(vs)` arm (not `One`, above): `.[]` on an
+        // array materializes straight to `Many` (`Expr::Iterate`'s own
+        // arm), so its first cursor can carry an undecodable string too.
+        let json_bytes: &[u8] = b"[\"\xff\xfe\", 2]";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse(".[]").unwrap();
+        match eval_rhs_once::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
