@@ -21834,6 +21834,76 @@ fn test_yq_nonterminal_iterate_container_fanout_noop_1432() -> Result<()> {
     Ok(())
 }
 
+/// #1432 (coverage): `assign_path_all_noop`'s `Field`/`Index` arms each
+/// have their own catch-all(s) for a *mid-prefix* step (one with more
+/// prefix still remaining after it, as opposed to the terminal
+/// component) that neither matches its expected container type nor hits
+/// a genuine scalar. Needs at least two real path components before the
+/// fan-out `Iterate` to actually reach these arms mid-recursion --
+/// `.a[].c`-shaped queries (a single `Field` immediately followed by the
+/// `Iterate`) only ever reach this predicate's *base case*, since the
+/// terminal component is checked there, never fed back into the
+/// recursion. Pins succinctly's current behavior rather than asserting
+/// yq parity: real yq's own semantics for three of these four shapes
+/// diverge from succinctly's in ways well outside #1432's own RHS-discard
+/// scope (live-verified against v4.53.3) --
+/// - a `Field` step hitting a real `Array` raises yq's own structural
+///   "cannot index array" error *before* the RHS ever evaluates, where
+///   succinctly evaluates the RHS first (`boom`);
+/// - a genuinely out-of-range `Index` step *autovivifies* the array out
+///   to that length in real yq (writing `null` padding, then fanning the
+///   `Iterate` into the newly-created empty tail -- no error, no RHS
+///   evaluation at all), where succinctly has no such padding and
+///   evaluates the RHS instead;
+/// - an `Index` step hitting a real `Object` coerces the index to a
+///   string key and inserts it in real yq (`{"0": []}`), where
+///   succinctly has no such coercion and evaluates the RHS instead.
+///
+/// All three are pre-existing, unrelated write-path gaps (this exact
+/// catch-all replaces `navigate_read_only`'s own pre-existing `_ =>
+/// Absent` for the identical shapes) -- out of scope here, not
+/// introduced or worsened by this fix. The fourth shape (`Index` hitting
+/// a genuine scalar) is the one case that *does* already match yq: a
+/// scalar hit anywhere mid-chain permanently no-ops the whole write
+/// (#1232), regardless of position.
+#[test]
+fn test_yq_assign_all_noop_mismatched_element_type_1432() -> Result<()> {
+    // `Field` mid-prefix hits a real `Array` (wrong container type),
+    // with a `Field` still ahead of it in the prefix.
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        ".a.b[].c = error(\"boom\")",
+        "a:\n  - 1\n  - 2\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    // `Index` mid-prefix is out of range on a real `Array`, with an
+    // `Index` still ahead of it in the prefix.
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        ".a[5][].b = error(\"boom\")",
+        "a:\n  - 1\n  - 2\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    // `Index` mid-prefix hits a genuine scalar -- permanently no-ops,
+    // matching real yq exactly (#1232).
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a[0][].b = error(\"boom\")", "a: 5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": 5\n}");
+
+    // `Index` mid-prefix hits a real `Object` (wrong container type).
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a[0][].b = error(\"boom\")", "a: {}\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    Ok(())
+}
+
 /// #1426: real yq's flag grammar for `test`/`match`/`capture` is much
 /// narrower than jq's -- only `g` is a real flag, live-verified against
 /// yq v4.53.3. Every case here is a direct transcription of a live probe
