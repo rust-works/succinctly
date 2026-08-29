@@ -6991,6 +6991,39 @@ fn test_as_pattern_single_pattern_path_context_resolves_1765() -> Result<()> {
     Ok(())
 }
 
+/// #1765 code review: an earlier version of this fix's `needs_path_context`
+/// arm answered `true` for a `?//`-chained `AsPattern` too, not just the
+/// single-pattern case the dedicated eval arm actually handles. That routed
+/// a `?//`-chain into the eager path-context evaluator whenever it sat
+/// inside `Arithmetic`/`Compare`/a non-terminal `Pipe` position, where its
+/// generic fallback (`eval_owned_expr_full`) collapses a multi-output
+/// `Many`/`Partial` result into a single `OwnedValue::Array` instead of
+/// streaming it -- silently changing both output count and value shape for
+/// something never even the (broken) `key`/`parent` stub was meant to
+/// affect. Confirmed live against pre-#1765 `main`: both filters below give
+/// two separate `"null"`/`"0"` outputs there, not one collapsed
+/// `"[null,null]"` or a type error. `needs_path_context`'s `AsPattern` arm
+/// now carries the identical `patterns.len() == 1` gate the eval arm does,
+/// closing this before it ever shipped.
+#[test]
+fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a[] as {x:$v} ?// [$v] | key) | tostring"],
+        Some(r#"{"a":[{"x":1},{"x":2}]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"null\"\n\"null\"\n");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a[] as {x:$v} ?// [$v] | key) + 0 | tostring"],
+        Some(r#"{"a":[{"x":1},{"x":2}]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"0\"\n\"0\"\n");
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::Array` arm (#1302), so `[key]` --
 /// semantically equivalent to `(key,key)`'s single-branch case, just
 /// array-wrapped instead of comma-joined -- silently lost path context and

@@ -811,15 +811,24 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `.a.b | . as $x | parent(1)` previously silently stubbed to `{}`.
         Expr::As { expr, body, .. } => needs_path_context(expr) || needs_path_context(body),
         // `. as PATTERN | body` (#1765): same reasoning as `Expr::As` above,
-        // for destructuring `as`. Deliberately not gated on `patterns.len()`
-        // here -- unlike the dedicated evaluation arm below (which only
-        // handles the single-pattern case), this is just the routing
-        // question "does the whole pipe need path-context evaluation at
-        // all," and a `?//`-chain with a path-context builtin inside still
-        // needs `true` here so the surrounding pipe routes correctly, even
-        // though the chain itself then falls through to the generic
-        // fallback (its pre-existing, unchanged stub behavior) once inside.
-        Expr::AsPattern { expr, body, .. } => needs_path_context(expr) || needs_path_context(body),
+        // for destructuring `as` -- but gated to the single-pattern case,
+        // matching the dedicated evaluation arm below exactly (code review:
+        // an earlier version answered `true` here for a `?//`-chain too,
+        // since that's "just" the routing question. It wasn't free: the
+        // dedicated eval arm still only handles `patterns.len() == 1`, so a
+        // `?//`-chain routed into path-context evaluation on this arm's say-
+        // so just fell through to the generic fallback there anyway --
+        // paying `eval_pipe_with_path_context_internal`'s full eager-
+        // materialization cost, and losing whatever lazy/demand-driven
+        // interleaving the caller's own cheaper path would otherwise give
+        // it, for byte-identical output. Same reasoning `Expr::Object`'s own
+        // doc comment above gives for staying out of this function
+        // entirely despite having the identical #1332 known-gap status).
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => patterns.len() == 1 && (needs_path_context(expr) || needs_path_context(body)),
         _ => false,
     }
 }
@@ -25349,6 +25358,97 @@ fn eval_boolean_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     )
 }
 
+/// Shared "bind `expr`'s outputs, then per bound value derive a substituted
+/// `body` and evaluate that too" skeleton for `Expr::As`/`Expr::AsPattern`'s
+/// path-context arms (#1765 code review). Both arms bind `expr` through this
+/// same path-context evaluator identically -- neither `expr` nor `body`
+/// navigates away from the caller's own position, so `key`/`parent`/
+/// `file_index` inside either sees the caller's ambient position unchanged
+/// -- and only differ in how one bound value becomes a substituted `body`
+/// (one bound variable vs. a pattern's destructured bindings), which
+/// `substitute` supplies. Previously two byte-for-byte-identical ~65-line
+/// blocks around that one differing step -- exactly the kind of duplicated
+/// skeleton this file's own established practice avoids (`materialize_bound_values`/
+/// `accumulate_path_context_step`, cited by the `Expr::As` arm's own comment,
+/// were extracted for the identical reason: past copies of this exact
+/// unpacking and accumulate-or-stop shape drifted out of sync, e.g. #1457/
+/// #1660 correcting `try_pattern_alternatives` independently of its sibling
+/// `each_pattern_alternatives`).
+///
+/// `optional` is *not* forced to `false` for either bind or body evaluation:
+/// `eval_as`'s own doc comment establishes that `as` (and, identically,
+/// destructuring `as`) is deliberately non-atomic under `?` --
+/// `(1,2,error("x")) as $v | $v + 10` keeps `11`, `12` as a real prefix,
+/// unlike `[...]`'s atomicity -- so it's passed straight through to both
+/// evaluations here, exactly as `eval_as`/`eval_as_pattern` do.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors eval_pipe_with_path_context_internal's
+                                     // own parameter set (this function is a thin wrapper around
+                                     // it), plus `rest` and `substitute` -- both call sites are the
+                                     // only ones, so a bundling struct would just move these fields
+                                     // one level out rather than reduce the real parameter count.
+fn eval_bind_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    rest: &[Expr],
+    optional: bool,
+    mut substitute: impl FnMut(&OwnedValue) -> Result<Expr, EvalError>,
+) -> QueryResult<'a, W> {
+    let bound_result = eval_pipe_with_path_context_internal::<W, S>(
+        core::slice::from_ref(expr),
+        value,
+        root,
+        file_origin,
+        current_path,
+        optional,
+    );
+    let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
+        Ok(pair) => pair,
+        Err(Flow::Exhausted) => return QueryResult::None,
+        Err(Flow::Escaped(Control::Error(e))) => return QueryResult::Error(e),
+        Err(Flow::Escaped(Control::Break(label))) => return QueryResult::Break(label),
+        Err(Flow::Escaped(Control::Halt(code))) => return QueryResult::Halt(code),
+        Err(Flow::Stopped { .. }) => unreachable!(
+            "materialize_bound_values only ever produces Exhausted/Escaped, \
+             never Stopped (that variant is sink-driven laziness this eager \
+             evaluator never uses)"
+        ),
+    };
+
+    let mut all_results: Vec<OwnedValue> = Vec::new();
+    let mut stopped = None;
+    for bound_val in bound_values {
+        // `accumulate_path_context_step` on `QueryResult::Error` always
+        // yields `Some` (never asks to keep iterating), so a `substitute`
+        // failure (e.g. a pattern-match failure) always stops the loop here
+        // too -- reused rather than duplicating its exact `partial(...,
+        // Control::Error(e))` wrapping by hand.
+        let body_result = match substitute(&bound_val) {
+            Ok(substituted_body) => eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(&substituted_body),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            ),
+            Err(e) => QueryResult::Error(e),
+        };
+        if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
+            stopped = Some(stop);
+            break;
+        }
+    }
+
+    let combined = stopped.unwrap_or_else(|| match bound_control {
+        Some(control) => partial(all_results, control),
+        None => owned_vec_to_result(all_results),
+    });
+    continue_rest_with_context::<W, S>(combined, rest, root, file_origin, current_path, optional)
+}
+
 /// Internal helper that also tracks the root value for parent navigation,
 /// and (for `--eval-all`, #715) an optional origin-file-index side table
 /// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
@@ -26318,63 +26418,24 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // prefix, unlike `[...]`'s atomicity -- so it's passed straight
             // through to both evaluations, exactly as `eval_as` does.
             //
-            // #1663 code review: uses `materialize_bound_values` (shared
-            // with `each_as`/`each_as_pattern`, #1462) and
-            // `accumulate_path_context_step` (shared with every other
-            // fan-out loop in this function, #715 follow-up) rather than
-            // hand-rolling a 5th/7th copy of either -- both were built
-            // specifically because past copies of this exact unpacking and
-            // accumulate-or-stop shape drifted out of sync with each other.
-            let bound_result = eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(expr),
+            // #1765 code review: shares `eval_bind_with_path_context` with
+            // the `Expr::AsPattern` arm below -- both bind `expr` the same
+            // way and only differ in how one bound value becomes a
+            // substituted `body`, which used to be two hand-copied ~85-line
+            // arms around that one differing step (exactly the kind of
+            // "past copies of this exact shape drifted apart" #1663's own
+            // comment here already warned about for the pieces it *did*
+            // dedupe, e.g. #1457/#1660 correcting `try_pattern_alternatives`
+            // independently of its sibling `each_pattern_alternatives`).
+            eval_bind_with_path_context::<W, S>(
+                expr,
                 value,
                 root,
                 file_origin,
                 current_path,
-                optional,
-            );
-            let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
-                Ok(pair) => pair,
-                Err(Flow::Exhausted) => return QueryResult::None,
-                Err(Flow::Escaped(Control::Error(e))) => return QueryResult::Error(e),
-                Err(Flow::Escaped(Control::Break(label))) => return QueryResult::Break(label),
-                Err(Flow::Escaped(Control::Halt(code))) => return QueryResult::Halt(code),
-                Err(Flow::Stopped { .. }) => unreachable!(
-                    "materialize_bound_values only ever produces Exhausted/Escaped, \
-                     never Stopped (that variant is sink-driven laziness this eager \
-                     evaluator never uses)"
-                ),
-            };
-
-            let mut all_results: Vec<OwnedValue> = Vec::new();
-            let mut stopped = None;
-            for bound_val in bound_values {
-                let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
-                let body_result = eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(&substituted_body),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                );
-                if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
-                    stopped = Some(stop);
-                    break;
-                }
-            }
-
-            let combined = stopped.unwrap_or_else(|| match bound_control {
-                Some(control) => partial(all_results, control),
-                None => owned_vec_to_result(all_results),
-            });
-            continue_rest_with_context::<W, S>(
-                combined,
                 rest,
-                root,
-                file_origin,
-                current_path,
                 optional,
+                |bound_val| Ok(substitute_bound_var(expr, body, var, bound_val)),
             )
         }
         // `. as PATTERN | body` (#1765, item 1 of #1663's own remaining-gaps
@@ -26391,80 +26452,32 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // the issue's own scoping. A `?//`-chain with a `key`/`parent`/
         // `file_index` inside it still falls through to the generic fallback
         // below -- its pre-existing (already broken, unchanged) stub
-        // behavior, not a regression.
+        // behavior, not a regression. `needs_path_context`'s own
+        // `Expr::AsPattern` arm carries the identical `patterns.len() == 1`
+        // gate, so a `?//`-chain doesn't even route into this eager
+        // evaluator on this arm's account in the first place.
         Expr::AsPattern {
             expr,
             patterns,
             body,
         } if patterns.len() == 1 && (needs_path_context(expr) || needs_path_context(body)) => {
-            let bound_result = eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(expr),
+            eval_bind_with_path_context::<W, S>(
+                expr,
                 value,
                 root,
                 file_origin,
                 current_path,
-                optional,
-            );
-            let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
-                Ok(pair) => pair,
-                Err(Flow::Exhausted) => return QueryResult::None,
-                Err(Flow::Escaped(Control::Error(e))) => return QueryResult::Error(e),
-                Err(Flow::Escaped(Control::Break(label))) => return QueryResult::Break(label),
-                Err(Flow::Escaped(Control::Halt(code))) => return QueryResult::Halt(code),
-                Err(Flow::Stopped { .. }) => unreachable!(
-                    "materialize_bound_values only ever produces Exhausted/Escaped, \
-                     never Stopped (that variant is sink-driven laziness this eager \
-                     evaluator never uses)"
-                ),
-            };
-
-            let mut all_results: Vec<OwnedValue> = Vec::new();
-            let mut stopped = None;
-            for bound_val in bound_values {
-                // `invert = false`: the duplicate-binding dedup rule
-                // `extract_pattern_bindings` inverts only applies to a real
-                // `?//`-chain (`patterns.len() > 1`, excluded above) -- see
-                // that function's own doc comment for the live-verified
-                // evidence this mirrors.
-                let bindings = match extract_pattern_bindings(&patterns[0], &bound_val, false) {
-                    Ok(b) => b,
-                    // `accumulate_path_context_step` on `QueryResult::Error`
-                    // always yields `Some` (never asks to keep iterating),
-                    // so this always stops the loop -- reused here rather
-                    // than duplicating its exact `partial(..., Control::
-                    // Error(e))` wrapping by hand.
-                    Err(e) => {
-                        stopped =
-                            accumulate_path_context_step(&mut all_results, QueryResult::Error(e));
-                        break;
-                    }
-                };
-                let substituted_body = substitute_vars(body, as_var_refs(&bindings));
-                let body_result = eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(&substituted_body),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                );
-                if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
-                    stopped = Some(stop);
-                    break;
-                }
-            }
-
-            let combined = stopped.unwrap_or_else(|| match bound_control {
-                Some(control) => partial(all_results, control),
-                None => owned_vec_to_result(all_results),
-            });
-            continue_rest_with_context::<W, S>(
-                combined,
                 rest,
-                root,
-                file_origin,
-                current_path,
                 optional,
+                |bound_val| {
+                    // `invert = false`: the duplicate-binding dedup rule
+                    // `extract_pattern_bindings` inverts only applies to a
+                    // real `?//`-chain (`patterns.len() > 1`, excluded
+                    // above) -- see that function's own doc comment for the
+                    // live-verified evidence this mirrors.
+                    let bindings = extract_pattern_bindings(&patterns[0], bound_val, false)?;
+                    Ok(substitute_vars(body, as_var_refs(&bindings)))
+                },
             )
         }
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
