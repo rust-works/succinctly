@@ -8593,6 +8593,20 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             };
             let mut entries: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for (i, cursor) in cursors.into_iter().enumerate() {
+                // `cursor.value()` re-resolves `text_position()` here, which
+                // `collect_cursors_checked` already resolved once internally
+                // to run its own delimiter check and then discarded (it only
+                // hands back the bare cursor, per its doc comment's own
+                // "several callers reach each element through `to_owned_cursor`
+                // regardless" rationale for staying general-purpose rather
+                // than threading a position through). `.[]`'s own caller in
+                // `eval_generic.rs` doesn't pay this twice, since it hands
+                // cursors back lazily and only resolves once, on demand --
+                // `to_entries` is the eager case that does pay it, a known,
+                // minor (code review, #1829), not-fixed-here cost: doing so
+                // needs `collect_cursors_checked` to return resolved
+                // positions too, a shared-trait-signature change with a
+                // wider blast radius than this fix's own #1677 scope.
                 let val = match to_owned_checked(&cursor.value()) {
                     Ok(v) => v,
                     Err(e) => return QueryResult::Error(e),
