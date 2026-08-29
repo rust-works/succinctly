@@ -26424,7 +26424,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
                             return stop;
@@ -26440,7 +26440,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
                             return stop;
@@ -26779,6 +26779,24 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // "rest is empty" fast path never fires here -- it degenerates
             // to exactly the `eval_pipe_with_path_context_internal` call
             // `map(f)` needs, no separate helper required.
+            //
+            // Each element's own step is run with `optional` forced to
+            // `false`, not the ambient value this arm itself received --
+            // the exact `Expr::Array` path-context arm's own fix (#1302),
+            // applied here for the first live-reachable repro of the same
+            // bug class (#1826): passing the ambient value straight through
+            // let a genuine per-element error self-swallow into
+            // `QueryResult::None` before `accumulate_path_context_step`
+            // ever saw it as a stop signal, silently *skipping* that one
+            // element instead of aborting the whole array atomically --
+            // confirmed live: `(.a)? | map(if key==1 then error("x") else
+            // key end)` on `{"a":[1,2,3]}` produced `[0,2]`, where the
+            // atomic-construction-equivalent `(.a)? | [.[] | if key==1 then
+            // error("x") else key end]` already correctly produced nothing.
+            // Forcing `false` lets that error surface as a real stop
+            // signal, caught below using *this arm's own* ambient
+            // `optional` instead -- the same evaluate-then-catch shape as
+            // `eval_try`/`Expr::Array`'s arm.
             let mut results = vec_with_capacity(match value {
                 OwnedValue::Array(arr) => arr.len(),
                 OwnedValue::Object(entries) => entries.len(),
@@ -26795,7 +26813,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
                             stopped = Some(stop);
@@ -26812,7 +26830,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
                             stopped = Some(stop);
@@ -26824,7 +26842,18 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
             let map_result = match stopped {
-                Some(QueryResult::Partial(_, Control::Error(e))) => QueryResult::Error(e),
+                // Only `Error` is gated on this arm's own ambient
+                // `optional` -- matches `Expr::Array`'s identical
+                // `Err(EvalEscape::Error(_)) if optional` catch and
+                // `eval_try`'s own "never catches Break/Halt" rule just
+                // below.
+                Some(QueryResult::Partial(_, Control::Error(e))) => {
+                    if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(e)
+                    }
+                }
                 Some(QueryResult::Partial(_, Control::Break(label))) => QueryResult::Break(label),
                 // `map(f)` is array construction, atomic in jq (see
                 // `eval_array_construction`'s matching comment) — a `Halt`
