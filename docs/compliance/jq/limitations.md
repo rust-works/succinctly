@@ -824,15 +824,19 @@ positional fast paths (`.[0]`, `first`, `last`, `.[n]`, tracked separately as #1
 `keys_unsorted`'s streaming truncation (a partial array can reach stdout beside the exit 5,
 for the same "cannot rewind a byte-at-a-time writer" reason).
 
-**Not covered at all: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs`
+**Mostly not covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs`
 defines a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually
 re-exports, and the one used in `src/jq/mod.rs`'s own module-doc example — with its own
-unchecked `to_owned`/`effective_len`/`effective_fields`/`Builtin::Keys`. It has neither this
-check nor #1194's: a library caller who follows that documented example and evaluates
-straight off a fresh cursor gets no protection from either class. The CLI itself never reaches
-this path except through the reindex bridge, which only ever feeds it an already-validated
-`OwnedValue`, so `sjq`/`syq` are unaffected. Tracked as a follow-up rather than folded into
-#1677, which scoped itself to `eval_generic.rs`.
+unchecked `to_owned`/`effective_len`/`effective_fields`. `Builtin::Keys` (`keys`/
+`keys_unsorted`) is the one exception, fixed by #1829/#1835 to delegate to
+`DocumentFields::keys()` (the same shared walk `eval_generic.rs` uses) instead of a
+narrower hand-rolled copy, which gives it both this check and #1194's protection as a side
+effect. Every other builtin in this file has neither check: a library caller who follows the
+documented `eval()` example and evaluates straight off a fresh cursor gets no protection from
+either class outside `keys`/`keys_unsorted`. The CLI itself never reaches this path except
+through the reindex bridge, which only ever feeds it an already-validated `OwnedValue`, so
+`sjq`/`syq` are unaffected. The remaining call sites are tracked as a follow-up (#1829) rather
+than folded into #1677, which scoped itself to `eval_generic.rs`.
 
 ## Refusing an allocation jq does not survive
 
