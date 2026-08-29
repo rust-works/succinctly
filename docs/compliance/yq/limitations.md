@@ -675,9 +675,9 @@ to a *computed* value, rather than a real navigation, actually an error" — jq'
 always yes (`Invalid path expression with result <v>`), and this check used to raise
 unconditionally for both modes.
 
-Real yq's answer for `path()`/`=`/`|=`/the compound-assign operators (`+=`/`-=`/`*=`; yq has
-no `/=`/`%=`/`//=` syntax at all to check against) is no: an untracked terminal branch is a
-silent no-op, and every *other* branch is still written normally, regardless of position:
+Real yq's answer for `path()`/`=`/`|=`/the compound-assign operators (`+=`/`-=`/`*=`) is no:
+an untracked terminal branch is a silent no-op, and every *other* branch is still written
+normally, regardless of position:
 
 ```bash
 $ echo 'a: 1
@@ -686,24 +686,39 @@ $ echo 'a: 1
 b: 2' | succinctly yq '(.a, 1) = 5'   # matches, was: Error: Invalid path expression with result 1
 ```
 
+(Real yq has no `/=`/`%=`/`//=` syntax at all — confirmed live, `'/'`/`'%'`/`'//'` all
+report "expects 2 args but there is 1" rather than being recognized as compound-assign
+operators, the same "no real yq syntax to check against" gap already recorded elsewhere in
+this file. succinctly's own support for those three forms is a pre-existing, unrelated
+extension-surface question — they parse and inherit this same skip in yq mode, but that is
+not itself a divergence claim, since there is nothing in real yq to diverge from.)
+
 Confirmed position-independent (untracked first, middle, or last; all-branches-untracked;
 a computed value from an arbitrary expression rather than a bare literal) — every case gives
 the same "skip the untracked branch, write every other one" result. **Not specific to a
 multi-branch `Expr::Comma` despite the check's own name**: a single bare untracked
-expression with no comma at all is the identical no-op —
-`(1) = 5` on `{a: 1}` leaves it unchanged too. A genuine error/break/halt produced *while
-computing* what would otherwise be an untracked value is not itself untracked and still
-propagates normally: `(.a, error("boom")) = 5` still raises `boom`.
+expression with no comma at all is the identical no-op — `(1) = 5` on `{a: 1}` leaves it
+unchanged too, and neither is it specific to a bare-literal *origin* — an untracked value
+produced by an upstream mechanism like a `try`/`catch` handler run on a caught error's
+payload is computationally identical by the time it reaches the check, and gets the same
+"write every trackable branch, skip this one" result rather than aborting the whole write
+the way it did (and, in jq mode, still does) before this fix. A genuine error/break/halt
+produced *while computing* what would otherwise be an untracked value is not itself
+untracked and still propagates normally: `(.a, error("boom")) = 5` still raises `boom`.
 
-**Only the terminal position is fixed.** An untracked branch followed by *further
-navigation* — `(.a, 1 | .[]) = 5`, still real yq's own no-op — never reaches
-`reject_untracked_at_terminal` at all: `resolve_node`'s own `Expr::Iterate` arm (and
-`resolve_index_expr`'s analogous dynamic-key check) each raise independently and
-unconditionally before a branch gets anywhere near the terminal check. Fixing that needs
-`is_del`-equivalent awareness threaded into `resolve_node`, a 21-call-site function with its
-own scattered, independently jq-mode-verified checks — a materially larger and riskier
-surface than this fix's single terminal-position check, so left open rather than guessed at
-here. Tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868).
+**`path()`'s own trailing-iterate case is covered; `=`/`|=`/compound-assign's is not.**
+`path()` strips a trailing bare iterate off its own path expression before resolving it
+(`defer_trailing_iterate`, #888) and re-splices it after the terminal check runs — so
+`path(1 | .[])` *is* covered by this fix (confirmed live: now no-ops in yq mode, matching
+the same general rule above, where it used to raise jq's "near attempt to iterate through 1"
+wording). `=`/`|=`/compound-assign never defer a trailing iterate at all, so the identical
+shape in *their* context — `(.a, 1 | .[]) = 5`, still real yq's own no-op — never reaches
+the terminal check: `resolve_node`'s own `Expr::Iterate` arm (and `resolve_index_expr`'s
+analogous dynamic-key check) each raise independently and unconditionally first. Fixing that
+needs the same kind of skip-untracked awareness threaded into `resolve_node`, a 21-call-site
+function with its own scattered, independently jq-mode-verified checks — a materially larger
+and riskier surface than this fix's single terminal-position check, so left open rather than
+guessed at here. Tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868).
 
 **`del()` does not share this model and is deliberately excluded from the fix.** Its real
 behaviour, confirmed live across argument-order permutations, is order-*dependent* in a way

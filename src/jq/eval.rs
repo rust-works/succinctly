@@ -22341,16 +22341,17 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// never finds a `depth() == 0` branch here and pays the full flatten
 /// regardless — that shape is tracked separately, not fixed by this flag.
 ///
-/// Reused, unchanged, as `reject_untracked_at_terminal`/
-/// `reject_untracked_prefix_too`'s own `is_del` parameter (#1764 review):
-/// since this flag's own value is already exactly "is this call `del()`'s
-/// call shape," it happens to be the identical condition those two
-/// functions need to gate their own, entirely separate concern (does an
-/// untracked terminal branch raise, or silently no-op) on. The two
-/// concerns are independent -- nothing here requires them to always
-/// travel together -- they simply have not yet needed to diverge, since
-/// `del()` remains the only caller wanting either non-default behavior.
-/// If a future caller needs one without the other, this flag should be
+/// Also feeds `reject_untracked_at_terminal`/`reject_untracked_prefix_too`'s
+/// own `skip_untracked` parameter below (#1764 review), via `skip_untracked
+/// = S::TAG == EvalTag::Yq && !short_circuit_del_root`: since this flag's
+/// own value is already exactly "is this call `del()`'s call shape," it
+/// happens to be the identical condition those two functions need to gate
+/// their own, entirely separate concern (does an untracked terminal branch
+/// raise, or silently no-op) on. The two concerns are independent --
+/// nothing here requires them to always travel together -- they simply
+/// have not yet needed to diverge, since `del()` remains the only caller
+/// wanting either non-default behavior. If a future caller needs one
+/// without the other, this flag should be
 /// split into two.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
@@ -22422,41 +22423,53 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// Branches already produced ahead of the offending one are kept and
     /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
     ///
-    /// yq mode does not raise here for `path()`/`=`/`|=`/compound-assigns
-    /// (`is_del == false`, #1764): an untracked terminal branch is real
-    /// yq's own silent no-op there, not an error. Confirmed live against
+    /// `skip_untracked` (#1764): when set, an untracked terminal branch is
+    /// real yq's own silent no-op, not an error -- confirmed live against
     /// yq v4.53.3, and **not specific to `Expr::Comma`** despite this
     /// function's own name: a single bare untracked expression with no
     /// comma at all is the identical no-op (`(1) = 5` on `{a: 1}` leaves
     /// it unchanged, matching `(.a, 1) = 5`'s "skip only the untracked
     /// one") -- the real rule is "any untracked terminal branch, however
-    /// many others accompany it, however it was produced." Confirmed
+    /// many others accompany it, however it was produced." That also
+    /// covers a branch an *upstream* mechanism (not a bare literal)
+    /// leaves untracked, e.g. `select`/`getpath` run as a `try`/`catch`
+    /// handler on a caught error's payload: `try (.a, error({"y":99}))
+    /// catch select(true) = "X"` writes `.a` and silently drops the
+    /// caught, untracked branch, the same "skip only the untracked one"
+    /// result as the bare-literal case, since by the time either reaches
+    /// this function they are computationally identical -- there is no
+    /// way, or reason, for this check to tell them apart. Confirmed
     /// position-independent for a genuine multi-branch comma too (`(.a,
     /// 1) = 5`, `(1, .a, .c) = 5`, `(.a, .c, 1) = 5`, all-branches-
     /// untracked): every trackable branch is still written normally and
     /// the untracked one(s) contribute nothing. `near_iterate`'s own
-    /// wording distinction is moot for those contexts: there is no error
-    /// to word either way. A genuine error/break/halt produced *while
-    /// computing* what would otherwise be an untracked value is not
-    /// itself untracked and still propagates normally -- confirmed live,
-    /// `(.a, error("boom")) = 5` still raises `boom`, not a no-op.
+    /// wording distinction is moot when `skip_untracked` is set: there is
+    /// no error to word either way. A genuine error/break/halt produced
+    /// *while computing* what would otherwise be an untracked value is
+    /// not itself untracked and still propagates normally -- confirmed
+    /// live, `(.a, error("boom")) = 5` still raises `boom`, not a no-op.
     ///
-    /// **Only the terminal check is patched here.** An untracked branch
-    /// followed by *further navigation* (e.g. `(.a, 1 | .[]) = 5`) never
-    /// reaches this function at all -- `resolve_node`'s own `Expr::
-    /// Iterate` arm (and `resolve_index_expr`'s analogous dynamic-key
-    /// check) each raise independently, unconditionally, before a branch
-    /// gets anywhere near here. That gap is real (confirmed live: real
-    /// yq still no-ops there too) and deliberately not fixed by this
-    /// patch -- tracked as
-    /// [#1868](https://github.com/rust-works/succinctly/issues/1868),
-    /// since fixing it needs `is_del`-equivalent awareness threaded into
-    /// `resolve_node`, a 21-call-site function with its own independent
-    /// jq-mode-verified history at each scattered check, not just this
-    /// one terminal position.
+    /// **Only reachable call shapes are patched.** `path()` passes
+    /// `near_iterate = true` here for a trailing bare iterate stripped
+    /// off its own path expression (`defer_trailing_iterate = true`,
+    /// #888) -- that case *is* covered (confirmed live: `path(1 | .[])`
+    /// in yq mode now no-ops rather than raising jq's "near attempt to
+    /// iterate" wording, matching the same general rule above). `=`/
+    /// `|=`/compound-assigns never defer a trailing iterate at all, so an
+    /// untracked branch followed by further navigation in *those*
+    /// contexts (`(.a, 1 | .[]) = 5`) never reaches this function --
+    /// `resolve_node`'s own `Expr::Iterate` arm (and `resolve_index_expr`'s
+    /// analogous dynamic-key check) each raise independently and
+    /// unconditionally first. That gap is real (confirmed live: real yq
+    /// still no-ops there too) and deliberately not fixed by this patch --
+    /// tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868),
+    /// since fixing it needs `skip_untracked`-equivalent awareness
+    /// threaded into `resolve_node`, a 21-call-site function with its own
+    /// independent jq-mode-verified history at each scattered check, not
+    /// just this one terminal position.
     ///
-    /// `del()` (`is_del == true`) is deliberately **excluded** from that
-    /// skip and keeps raising here, unlike its three siblings: real yq's
+    /// `del()` (`skip_untracked == false`) is deliberately **excluded**
+    /// from the skip and keeps raising here, unlike its three siblings: real yq's
     /// `del()` turns out not to share their simple per-branch-independent
     /// model at all. Confirmed live: `del(.a, 1)` on `{a: 1, b: 2}` deletes
     /// *nothing* (`a: 1\nb: 2`, both keys survive) where `del(1, .a)` -- the
@@ -22474,15 +22487,15 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// direction, not merely a cosmetic one. Left on the pre-existing raise
     /// until that ordering is implemented for real; tracked as a follow-up
     /// rather than guessed at here.
-    fn reject_untracked_at_terminal<S: EvalSemantics>(
+    fn reject_untracked_at_terminal(
         branches: Vec<PathBranch<'_>>,
         near_iterate: bool,
-        is_del: bool,
+        skip_untracked: bool,
     ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
         let mut kept = vec_with_capacity(branches.len());
         for branch in branches {
             if !branch.trackable {
-                if S::TAG == EvalTag::Yq && !is_del {
+                if skip_untracked {
                     continue;
                 }
                 let error = if near_iterate {
@@ -22515,10 +22528,10 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// surfacing the later sibling's error instead of jq's real one and
     /// leaking that untracked branch's stale path into the assembled prefix
     /// (#1560).
-    fn reject_untracked_prefix_too<S: EvalSemantics>(
+    fn reject_untracked_prefix_too(
         result: PathResolveResult<'_>,
         near_iterate: bool,
-        is_del: bool,
+        skip_untracked: bool,
     ) -> PathResolveResult<'_> {
         let (prefix, escape) = match result {
             Ok(branches) => (branches, None),
@@ -22528,13 +22541,13 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // `prefix` propagates immediately, discarding `escape` (a later
         // sibling's own error/break/halt that never got the chance to run
         // in real jq either) -- exactly `path_result`'s own `Some`/`None`
-        // combine once a violation-free `prefix` reaches it. In yq mode,
-        // for every context but `del()`, `reject_untracked_at_terminal`
-        // never returns `Err` at all (#1764), so this `?` is a no-op there
-        // and `escape` -- a genuine error/break/halt, never just an
-        // untracked value -- still always propagates through `path_result`
-        // below unchanged.
-        let checked = reject_untracked_at_terminal::<S>(prefix, near_iterate, is_del)?;
+        // combine once a violation-free `prefix` reaches it. When
+        // `skip_untracked` is set, `reject_untracked_at_terminal` never
+        // returns `Err` at all (#1764), so this `?` is a no-op there and
+        // `escape` -- a genuine error/break/halt, never just an untracked
+        // value -- still always propagates through `path_result` below
+        // unchanged.
+        let checked = reject_untracked_at_terminal(prefix, near_iterate, skip_untracked)?;
         path_result(checked, escape)
     }
 
@@ -22599,15 +22612,25 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         }
     }
 
+    // #1764 review: computed once here, as a plain `bool`, rather than
+    // threading `S: EvalSemantics` itself into `reject_untracked_at_
+    // terminal`/`reject_untracked_prefix_too` -- those two are otherwise
+    // non-generic, so making them generic purely to evaluate one `S::TAG`
+    // comparison would monomorphize (and so duplicate the compiled code
+    // for) both of them per `EvalSemantics` impl, for zero behavioral
+    // benefit over resolving the same fact once, here, where `S` is
+    // already bound.
+    let skip_untracked = S::TAG == EvalTag::Yq && !short_circuit_del_root;
+
     if trailing.is_empty() {
         // `input` is this call's own fresh document root — never itself a
         // frozen `$x` snapshot, so ambient `snapshot` starts `false` here,
         // same as it does at this function's other top-level entry point
         // below (#1591).
-        return match reject_untracked_prefix_too::<S>(
+        return match reject_untracked_prefix_too(
             resolve_node::<S>(expr, input, true, false),
             false,
-            short_circuit_del_root,
+            skip_untracked,
         ) {
             Ok(branches) => {
                 if short_circuit_del_root && branches.iter().any(|b| b.path.depth() == 0) {
@@ -22624,10 +22647,10 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    match reject_untracked_prefix_too::<S>(
+    match reject_untracked_prefix_too(
         resolve_node::<S>(&reduced_expr, input, true, false),
         true,
-        short_circuit_del_root,
+        skip_untracked,
     ) {
         Ok(branches) => Ok(assemble(branches)
             .into_iter()
