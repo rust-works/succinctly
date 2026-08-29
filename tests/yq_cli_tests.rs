@@ -12565,7 +12565,7 @@ fn test_explicit_key_comment_keeps_anchor_and_tag_on_deferred_absent_value_1113(
 // anchor and never consult `value.explicit_tag()`, and unconditionally
 // appended the anchor onto the same line as a floated key comment instead of
 // giving it its own line. Both are now routed through the same
-// `write_deferred_prefix` helper #1077/#1113's branch already used (via
+// `write_anchor_tag` helper #1077/#1113's branch already used (via
 // `write_deferred_value`), extracted so both branches share one ordering
 // rule instead of hand-writing it twice. All four shapes below are pinned
 // against the live real `yq` binary (v4.53.3).
@@ -12614,7 +12614,7 @@ fn test_container_anchor_and_tag_move_to_own_line_after_key_comment_1132() -> Re
     Ok(())
 }
 
-/// Regression guard: the `write_deferred_prefix` extraction must leave the
+/// Regression guard: the `write_anchor_tag` extraction must leave the
 /// scalar/absent-value branch's own #1113 behavior byte-for-byte unchanged.
 #[test]
 fn test_scalar_absent_value_anchor_tag_comment_unchanged_after_1132_extraction() -> Result<()> {
@@ -12762,7 +12762,7 @@ fn test_flow_anchor_keeps_tag_on_empty_container_1115() -> Result<()> {
 }
 
 /// `--slurp`'s container branch (already routed through
-/// `write_deferred_prefix` alongside #1132's fix above) is unaffected by
+/// `write_anchor_tag` alongside #1132's fix above) is unaffected by
 /// the scalar-branch fix below -- an anchored container item renders
 /// identically to before.
 #[test]
