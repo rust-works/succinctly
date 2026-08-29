@@ -35816,6 +35816,71 @@ mod tests {
         }
     }
 
+    /// #1755 positive control: the sort family's normal (no decode
+    /// failure) behavior is unaffected by routing through
+    /// `to_owned_checked` instead of `to_owned` -- exercised directly via
+    /// this module's own library-API dispatch (not the CLI, which never
+    /// reaches these functions at all, only `eval_generic.rs`'s sibling
+    /// implementation) since that's the only reachable path for them.
+    #[test]
+    fn test_sort_family_valid_data_unaffected_1755() {
+        query!(
+            br"[2, 1, 3]",
+            "sort",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+        query!(
+            br"[2, 1, 1]",
+            "unique",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        query!(
+            br"[2, 1, 3]",
+            "min",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(1)); }
+        );
+        query!(
+            br"[2, 1, 3]",
+            "max",
+            QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(3)); }
+        );
+        query!(
+            br#"[{"a":2},{"a":1}]"#,
+            "sort_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v.len(), 2);
+            }
+        );
+        query!(
+            br#"[{"a":1},{"a":1}]"#,
+            "group_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v.len(), 1);
+            }
+        );
+        query!(
+            br#"[{"a":1},{"a":1}]"#,
+            "unique_by(.a)",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(v.len(), 1);
+            }
+        );
+        query!(
+            br#"[{"a":2},{"a":1}]"#,
+            "min_by(.a)",
+            QueryResult::Owned(OwnedValue::Object(_)) => {}
+        );
+        query!(
+            br#"[{"a":2},{"a":1}]"#,
+            "max_by(.a)",
+            QueryResult::Owned(OwnedValue::Object(_)) => {}
+        );
+    }
+
     /// #1755: `eval_array_construction` (backs literal `[...]` array
     /// construction's homogeneous-comma case, and every `min_by`/
     /// `max_by`/`sort_by`/`group_by`/`unique_by` key computation via jq's
