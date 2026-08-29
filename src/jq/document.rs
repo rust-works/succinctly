@@ -697,14 +697,38 @@ pub trait DocumentFields: Sized + Clone {
     /// Whether any field has this key -- existence only, no particular
     /// occurrence's value.
     ///
-    /// The default delegates to [`find`](Self::find), which is correct but
-    /// not early-exiting: `find` must walk every field to honour
-    /// last-duplicate-key-wins for the *value* it returns, where existence
-    /// alone can stop at the first match (#1739). Costs a format nothing to
-    /// leave unoverridden; JSON and YAML both override it with an
-    /// early-exiting walk.
+    /// Deliberately **not** `find(name).is_some()`: `find` must walk every
+    /// field to honour last-duplicate-key-wins for the *value* it returns,
+    /// where existence alone can stop at the first match (#1739). Also
+    /// deliberately **not** a walk matching only a literal string-shaped
+    /// key (`find`'s own JSON/YAML implementations do that, each skipping a
+    /// key that fails to *decode*, #1247, and YAML's skipping an
+    /// `Alias`-typed key entirely, a separate, narrower gap than this
+    /// method needs to share): this method uses
+    /// [`key_display_string`], the exact function [`keys`](Self::keys)'s
+    /// own default is built on, so `contains` and `keys` always agree on
+    /// which spelling a key resolves to -- decode-failure keys included via
+    /// #1642's lossy-fallback substitution, and an alias-typed YAML key
+    /// resolved exactly as far as `keys`/`.` themselves resolve it, no
+    /// further (a code-review round on #1739 shipped a version calling the
+    /// whole-value `as_str()` instead, which fully resolves an alias
+    /// *chain* and so silently disagreed with `keys()`'s own single-hop
+    /// resolution for a 2+-hop alias key -- reusing `key_display_string`
+    /// directly closes that gap structurally rather than chasing each
+    /// resolution depth by hand).
+    ///
+    /// A structurally malformed member (#1194, `key_display_string` ->
+    /// `None`) doesn't match here, same as it doesn't appear in `keys`'s own
+    /// output.
     fn contains(&self, name: &str) -> bool {
-        self.find(name).is_some()
+        let mut fields = self.clone();
+        while let Some((field, rest)) = fields.uncons() {
+            if key_display_string(&field.key).is_some_and(|k| k.as_ref() == name) {
+                return true;
+            }
+            fields = rest;
+        }
+        false
     }
 
     /// Check if there are no fields.
