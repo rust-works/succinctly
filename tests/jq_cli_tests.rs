@@ -16438,6 +16438,118 @@ fn test_exit_status_query_materializes_object_998() -> Result<()> {
     Ok(())
 }
 
+/// #1793: `sort`/`join`/`map(.)` have no native lazy fast path for a
+/// container-shaped condition (`sort`, `join`) or still have to materialize
+/// their `LazySeq` result before printing (`map(.)`), so each falls back to
+/// `to_owned_cursor_at_depth` -- the *same* `MAX_NESTING_DEPTH` guard
+/// `test_identity_query_rejects_adversarial_nesting_998` already covers for
+/// the identity path, but reached with no equivalent guard at this call
+/// site: an uncaught panic (exit 101) rather than a clean diagnostic. Fixed
+/// by isolating the panic with `catch_unwind` at the CLI's per-document
+/// dispatch, matching the exit code (5) and cross-file-tracer-confirmed
+/// clean-diagnostic behavior of every other uncaught-error path in this
+/// same loop (`#1194`, `#355`) -- not `-e`'s separate, still-101
+/// `cursor_to_owned` panic path (`lazy.rs`, untouched by this fix, see
+/// `test_exit_status_query_rejects_adversarial_nesting_998` above).
+#[test]
+fn test_sort_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1793 sibling case: `map(.)`'s panic originates from a different call
+/// site than `sort`'s (its own lazy fast path stays lazy through
+/// evaluation; the panic instead comes from materializing its `LazySeq`
+/// result just before printing) but funnels into the same guard and must
+/// be caught the same way.
+#[test]
+fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1793 sibling case: `join`, like `sort`, has no native lazy fast path in
+/// `eval_builtin` and falls to the same generic materializing bridge.
+#[test]
+fn test_join_reports_clean_error_on_adversarial_nesting_1793() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "join(\",\")"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the three tests above: legitimately-nested input well under
+/// the limit must still succeed, unaffected by the new `catch_unwind` guard.
+#[test]
+fn test_sort_accepts_nesting_under_limit_1793() -> Result<()> {
+    // `nested_arrays(100)` is already a complete, single-element array
+    // literal (`[[[...1...]]]`) -- sorting a 1-element array is a no-op,
+    // returning it unchanged, not wrapping it in another array.
+    let input = nested_arrays(100);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort"], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// #1793's real-world-relevant failure mode: before this fix, one
+/// adversarially-deep document *anywhere* in a multi-document stream
+/// silently discarded every document after it too, since the uncaught
+/// panic aborted the whole process rather than just that one document --
+/// unlike `#1194`'s established "isolate this document, continue the
+/// stream" convention a few lines above this fix's own call site. Uses
+/// `map(.)` (identity via the lazy fast path) so the first and third
+/// records need no builtin-specific behavior to prove they still get
+/// processed.
+#[test]
+fn test_adversarial_nesting_does_not_abort_rest_of_stream_1793() -> Result<()> {
+    let deep = format!("[{}]", nested_arrays(500));
+    let input = format!("[1]\n{deep}\n[2]\n");
+    let (stdout, stderr, code) = run_jq_full(&["-c", "map(.)"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["[1]", "[2]"],
+        "the documents on either side of the adversarial one must still be processed\nstdout: {stdout:?}"
+    );
+    Ok(())
+}
+
+/// #1793 review: an unrelated panic (not the `MAX_NESTING_DEPTH` guard this
+/// fix targets) must still crash the process rather than being silently
+/// absorbed as if it were this specific, known condition. `sort` on a
+/// non-array is an ordinary jq-level type error (reported via `sink`, no
+/// panic involved) — included as a control case confirming the new
+/// `catch_unwind` wrapper doesn't change behavior for the vastly more
+/// common "no panic at all" path.
+#[test]
+fn test_sort_on_non_array_is_unaffected_by_1793_fix() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("cannot be sorted"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1008 (yq PR) code review: `format_number_jq_compat`'s `value == 0.0`/
 /// `value as i64` checks don't distinguish -0.0 from 0.0 (IEEE 754), so a
 /// negative-zero exponent literal silently lost its sign across all three

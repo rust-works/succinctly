@@ -1233,7 +1233,49 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // jq names the line the input value ends on, counted in the
                 // whole file rather than in this value's slice.
                 let at = InputLocation::at(filename.as_deref(), line_counter.advance_to(end));
-                let results = evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink);
+                // A builtin with no native lazy fast path (`sort`, `join`,
+                // ...) falls back to a full `to_owned_cursor` materialization
+                // of whatever value it's handed -- for a bare `sort`/`join`
+                // piped directly off `.`, that's the whole document. Unlike
+                // `#1194`-style malformed-document errors (handled a few
+                // lines below via `sink.report` + `continue`, isolating just
+                // this one document), an adversarially/accidentally deep
+                // document here used to escape as an uncaught panic instead,
+                // aborting the whole run and silently dropping every
+                // subsequent document in the stream (#1793). `catch_unwind`
+                // isolates it the same way #1194's own error already is,
+                // without touching `to_owned_cursor_at_depth`'s panic itself
+                // -- that guard's docs (`eval_generic.rs`, above
+                // `assert_nesting_depth`) explain why threading this through
+                // `EvalError` at its 58+ interior call sites was tried and
+                // reverted (#1021): only the two outermost call sites
+                // reachable from ordinary CLI usage are wrapped here, not
+                // the guard itself.
+                let results = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink)
+                })) {
+                    Ok(results) => results,
+                    Err(payload) => {
+                        // `&*payload`, not `&payload` -- `payload` is a
+                        // `Box<dyn Any + Send>`, and a bare `&payload`
+                        // coerces to `&(dyn Any + Send)` by treating the
+                        // *Box* as the concrete type under test (`Box<T>`
+                        // is itself `Any` via a blanket impl), not the value
+                        // it holds -- so every `downcast_ref` inside the
+                        // helper would silently miss regardless of the
+                        // panic's real payload type. Confirmed live: `&payload`
+                        // here made `nesting_depth_panic_message` return
+                        // `None` even for this exact panic.
+                        let Some(message) = nesting_depth_panic_message(&*payload) else {
+                            // Not the specific guard this catch exists for --
+                            // an unexpected panic must still crash loudly,
+                            // not be silently absorbed as if it were #1793.
+                            std::panic::resume_unwind(payload);
+                        };
+                        sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
+                        continue;
+                    }
+                };
 
                 // Consume results to free memory after each value is written
                 for result in results {
@@ -3387,6 +3429,25 @@ fn evaluate_input(
             Ok(vs)
         }
     }
+}
+
+/// If `payload` (a caught panic's payload) is `to_owned_cursor_at_depth`'s
+/// `MAX_NESTING_DEPTH` guard (#1793), returns its message; `None` for any
+/// other panic, so a caller can `resume_unwind` anything unrelated rather
+/// than silently treating an unexpected panic as this specific, known one.
+///
+/// `assert!`'s formatted message (`"nesting depth exceeds limit of
+/// {MAX_NESTING_DEPTH}"`) panics with a `String` payload, not `&'static
+/// str` -- checked first since it's the only shape this specific guard
+/// actually produces; the `&str` check is defense-in-depth for a future
+/// caller of this same helper against an unformatted `panic!("literal")`.
+fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<String> {
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())?;
+    text.contains("nesting depth exceeds limit of")
+        .then(|| text.to_string())
 }
 
 /// Evaluate expression against raw JSON bytes, returning lazy JqValues.
