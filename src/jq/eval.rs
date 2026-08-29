@@ -7617,7 +7617,12 @@ fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(mut fields) => fields.try_fold(None, |acc, f| {
             join_step::<S>(acc, to_owned_checked(&f.value())?, &sep)
         }),
-        _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+        }
     };
 
     match result {
@@ -7792,11 +7797,23 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
         },
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_index_with_type(
-            type_name(&value),
-            "number",
-        )),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`. Found alongside `last`'s identical
+        // fallback arm, though `first` was not itself in scope for this
+        // sweep (its own Array arm never materializes at all).
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_index_with_type(
+                type_name(&value),
+                "number",
+            ))
+        }
     }
 }
 
@@ -7822,11 +7839,21 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
         }
         // jq: null | last => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_index_with_type(
-            type_name(&value),
-            "number",
-        )),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_index_with_type(
+                type_name(&value),
+                "number",
+            ))
+        }
     }
 }
 
@@ -33398,10 +33425,21 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the keys expression to get the array of keys
+    // Evaluate the keys expression to get the array of keys.
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable keys value
+    // must raise, not silently become "" (and then fail the "must be an
+    // array" check with the wrong message, or worse, silently pick/omit
+    // nothing correctly-named).
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::OneCursor(c) => to_owned(&c.value()),
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
+        QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -33414,7 +33452,12 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
-        QueryResult::Many(v) if !v.is_empty() => to_owned(&v.into_iter().next().unwrap()),
+        QueryResult::Many(v) if !v.is_empty() => {
+            match to_owned_checked(&v.into_iter().next().unwrap()) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
@@ -33491,8 +33534,18 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::Array(result))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("pick: input must be an object or array")),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::new("pick: input must be an object or array"))
+        }
     }
 }
 
@@ -33503,10 +33556,21 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate the keys expression to get the array of keys to omit
+    // Evaluate the keys expression to get the array of keys to omit.
+    //
+    // #1755: to_owned_checked, not to_owned -- an undecodable keys value
+    // must raise, not silently become "" (and then fail the "must be an
+    // array" check with the wrong message, or worse, silently omit
+    // nothing correctly-named).
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned(&v),
-        QueryResult::OneCursor(c) => to_owned(&c.value()),
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
+        QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -33519,7 +33583,12 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::None => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
         }
-        QueryResult::Many(v) if !v.is_empty() => to_owned(&v.into_iter().next().unwrap()),
+        QueryResult::Many(v) if !v.is_empty() => {
+            match to_owned_checked(&v.into_iter().next().unwrap()) {
+                Ok(v) => v,
+                Err(e) => return QueryResult::Error(e),
+            }
+        }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
         }
@@ -33601,8 +33670,18 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             QueryResult::Owned(OwnedValue::Array(result))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("omit: input must be an object or array")),
+        // #1755: a decode failure on the scalar itself must raise
+        // unconditionally, checked ahead of `optional` -- see
+        // `scalar_decode_failure`.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::new("omit: input must be an object or array"))
+        }
     }
 }
 
@@ -36716,7 +36795,16 @@ mod tests {
     /// arms, never their scalar fallback.
     #[test]
     fn test_direct_misc_family_scalar_fallback_1755() {
-        for expr in ["add", "flatten", "from_entries"] {
+        for expr in [
+            "add",
+            "flatten",
+            "from_entries",
+            "first",
+            "last",
+            "pick([\"a\"])",
+            "omit([\"a\"])",
+            "join(\",\")",
+        ] {
             query!(
                 &b"\"\xff\xfe\""[..],
                 expr,
@@ -36726,6 +36814,26 @@ mod tests {
                 QueryResult::None => {}
             );
         }
+    }
+
+    /// #1755: `/code-review` found `pick`/`omit`'s *keys-expression*
+    /// resolution (as opposed to the picked/kept value, already fixed)
+    /// still used unchecked `to_owned` -- an undecodable string inside a
+    /// dynamically-computed keys argument silently became "" instead of
+    /// raising, which could then silently pick/omit the wrong
+    /// (empty-string-named) field entirely rather than erroring.
+    #[test]
+    fn test_pick_omit_keys_expression_raises_on_decode_failure_1755() {
+        query!(
+            &b"{\"a\":1,\"k\":[\"\xff\xfe\"]}"[..],
+            "pick(.k)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":1,\"k\":[\"\xff\xfe\"]}"[..],
+            "omit(.k)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
     }
 
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
