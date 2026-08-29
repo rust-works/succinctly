@@ -956,18 +956,27 @@ equivalent guard only fires later, when a builtin with no native lazy fast path 
 `join`) or one that still has to materialize its result before printing (`map(.)`) forces
 a full `to_owned_cursor` conversion of the value it's handed — `nesting depth exceeds
 limit of 256` (also exit 5, matching jq's own exit code by coincidence of both picking the
-same conventional "filter failed" code, not by design). succinctly's own wording, since
-there is no equivalent jq sentence to copy for an evaluation-time guard jq has no
-counterpart to (its own check never gets this far). See #1793 for the fix that turned this
-from an uncaught process panic into a clean, catchable diagnostic.
+same conventional "filter failed" code, not by design — an internal architectural ceiling
+being reported through the same channel as an ordinary filter/type error, deliberately,
+so a `sort`/`join`/`map(.)` result is never distinguishable-by-exit-code from any other
+uncaught `EvalError` on this path). succinctly's own wording, since there is no equivalent
+jq sentence to copy for an evaluation-time guard jq has no counterpart to (its own check
+never gets this far). Falls under ADR-0018's "would take the host process down" exception
+— the pre-fix behavior was an uncaught panic, not merely different wording. See #1793 for
+the fix that turned this from an uncaught process panic into a clean, catchable
+diagnostic.
 
 This fix is scoped to the CLI's default (lazy) per-document dispatch, matching #1793's own
-repro — the same panic remains uncaught via a CLI flag that forces whole-batch
-materialization up front (`--slurp`, `-S`/`--sort-keys`, `-C`/`--color-output`,
-`--ascii-output`, `--slurpfile`) or via `-e`/`--exit-status`'s own separate materializer
-(`src/jq/lazy.rs`, already pinned uncaught by `test_exit_status_query_rejects_adversarial_
-nesting_998`), and `succinctly yq` has no equivalent guard on either its default or
-materializing path at all. Tracked separately, not fixed here.
+repro — the identical panic remains uncaught via any of: a CLI flag that forces
+whole-batch materialization up front (`--slurp`, `-S`/`--sort-keys`, `-C`/`--color-output`,
+`--ascii-output`, `--slurpfile`); a filter using `input`/`inputs`/`input_line_number`,
+which routes to that same materializing branch with *no flag at all* (#1818); `-e`/
+`--exit-status`'s own separate materializer (`src/jq/lazy.rs`, already pinned uncaught by
+`test_exit_status_query_rejects_adversarial_nesting_998`); and `succinctly yq`, which has
+no equivalent guard on either its default or materializing path at all (#1817). Tracked
+separately, not fixed here. Confirmed live, also pre-existing and unrelated to this fix:
+`print_json`'s own guard can flush corrupted/truncated JSON to stdout before it fires
+(#1819).
 
 ## Regex flags `l` and `n`
 
