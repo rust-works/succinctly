@@ -1,0 +1,1 @@
+path(reduce input as $x (0; $x))
