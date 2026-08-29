@@ -860,35 +860,42 @@ impl std::fmt::Display for MalformedJsonError {
 
 impl std::error::Error for MalformedJsonError {}
 
-/// Route a `write_output`/`write_output_jq_value` error into jq's own
-/// diagnostic channel, or propagate it as a genuine I/O/internal failure
-/// -- the same `MalformedJsonError`-downcast dance `run_jq`'s own
-/// result-emission loops each used to hand-copy independently (code
-/// review, #1830: this PR took that copy from 1 site to 5, so it earned
-/// the extraction it didn't have before).
+/// Write one result and route a failure into jq's own diagnostic
+/// channel, or propagate it as a genuine I/O/internal failure -- the same
+/// `MalformedJsonError`-downcast dance `run_jq`'s own result-emission
+/// loops each used to hand-copy independently (code review, #1830: this
+/// PR took that copy from 1 site to 5, so it earned the extraction it
+/// didn't have before).
 ///
 /// A malformed-document error (`#1194`, and now `#1830`'s NUL-content
 /// check) is a data error, not an I/O one: it belongs in jq's diagnostic
 /// channel (exit 5) rather than aborting the process through `anyhow`.
 /// Returns `Ok(true)` when the caller's per-document loop should `break`
 /// (stop emitting results for *this* document, but fall through to the
-/// halt check and carry on with the rest of the stream, #355) -- takes
-/// the already-produced `Result` rather than the write call itself
-/// (`fn(...) -> Result<()>`) because passing `&mut out` twice in one call
-/// expression (once for the write, once for this function's own
-/// `flush_then_err`) doesn't borrow-check; callers evaluate the write
-/// first, then hand the `Result` here.
+/// halt check and carry on with the rest of the stream, #355).
+///
+/// Both `write` and `at` are closures, not already-produced values (code
+/// review, second pass): `write` receives `out` as its own parameter
+/// rather than capturing it, avoiding the double-`&mut out` borrow a
+/// plain `fn(...) -> Result<()>` argument alongside this function's own
+/// use of `out` in the `flush_then_err` arm would hit; `at` is called at
+/// most once, only in the (rare) error arm, so a caller whose location is
+/// only cheap to resolve lazily (`ErrorAt::Live`'s `current_input_location`
+/// read, or an `InputLocation` clone) no longer pays for it on every
+/// successful write -- confirmed by three independent code-review
+/// passes as a real per-result cost on the success path, not just the
+/// error one.
 fn route_write_error<W: Write>(
     sink: &mut ErrorSink,
     out: &mut W,
-    at: &InputLocation,
-    write_result: Result<()>,
+    at: impl FnOnce() -> InputLocation,
+    write: impl FnOnce(&mut W) -> Result<()>,
 ) -> Result<bool> {
-    match write_result {
+    match write(out) {
         Ok(()) => Ok(false),
         Err(e) => match e.downcast_ref::<MalformedJsonError>() {
             Some(MalformedJsonError(err)) => {
-                sink.report(DiagStyle::Jq, err, at);
+                sink.report(DiagStyle::Jq, err, &at());
                 Ok(true)
             }
             // Same reasoning as the `--validate` early return elsewhere
@@ -1136,8 +1143,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         if args.exit_status {
                             last_output = Some(result.clone());
                         }
-                        let write_result = write_output(&mut out, &result, &output_config);
-                        if route_write_error(&mut sink, &mut out, &at.resolve(), write_result)? {
+                        if route_write_error(
+                            &mut sink,
+                            &mut out,
+                            || at.resolve(),
+                            |o| write_output(o, &result, &output_config),
+                        )? {
                             break;
                         }
                     }
@@ -1369,8 +1380,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     // the stream (#355) -- real jq stops at the first parse
                     // error instead, a divergence recorded in
                     // `docs/compliance/jq/limitations.md`.
-                    let write_result = write_output_jq_value(&mut out, &result, &output_config);
-                    if route_write_error(&mut sink, &mut out, &at, write_result)? {
+                    if route_write_error(
+                        &mut sink,
+                        &mut out,
+                        || at.clone(),
+                        |o| write_output_jq_value(o, &result, &output_config),
+                    )? {
                         break;
                     }
                     // result is dropped here, freeing its memory immediately
@@ -1506,12 +1521,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    let write_result = write_output(&mut out, &result, &output_config);
                     if route_write_error(
                         &mut sink,
                         &mut out,
-                        &ErrorAt::Live(&locations).resolve(),
-                        write_result,
+                        || ErrorAt::Live(&locations).resolve(),
+                        |o| write_output(o, &result, &output_config),
                     )? {
                         break;
                     }
@@ -1543,12 +1557,11 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     for result in results {
                         had_output = true;
                         last_output = Some(result.clone());
-                        let write_result = write_output(&mut out, &result, &output_config);
                         if route_write_error(
                             &mut sink,
                             &mut out,
-                            &ErrorAt::Live(&locations).resolve(),
-                            write_result,
+                            || ErrorAt::Live(&locations).resolve(),
+                            |o| write_output(o, &result, &output_config),
                         )? {
                             break;
                         }
@@ -1569,8 +1582,12 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    let write_result = write_output(&mut out, &result, &output_config);
-                    if route_write_error(&mut sink, &mut out, &at.resolve(), write_result)? {
+                    if route_write_error(
+                        &mut sink,
+                        &mut out,
+                        || at.resolve(),
+                        |o| write_output(o, &result, &output_config),
+                    )? {
                         break;
                     }
                 }
@@ -3953,30 +3970,31 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     value: &JqValue<'_, Wrd>,
     config: &OutputConfig,
 ) -> Result<()> {
-    // Handle raw output for strings
-    if config.raw_output {
-        if let Some(s) = value.as_str() {
-            // #1830: checked before *any* byte of this record reaches
-            // the writer, including the `--seq` RS separator below --
-            // code review found the check placed after that write left
-            // a dangling, unterminated RS byte on stdout for a rejected
-            // record (`--seq --raw-output0` on a NUL-containing value),
-            // which is exactly the kind of partial write this function's
-            // own design is meant to avoid.
-            reject_raw_output0_nul(&s, config)?;
-            // In seq mode, prepend RS (Record Separator) before each value
-            if config.seq {
-                out.write_all(&[ASCII_RS])?;
-            }
-            out.write_all(s.as_bytes())?;
-            write_terminator(out, config)?;
-            return Ok(());
-        }
+    // Raw-output string, if any -- resolved and NUL-checked before
+    // writing *any* byte of this record, including the `--seq` RS
+    // separator below (code review, #1830: checking only after that
+    // write left a dangling, unterminated RS byte on stdout for a
+    // rejected record under `--seq --raw-output0`). A single RS write
+    // below then covers both the raw and non-raw cases, rather than one
+    // copy per branch.
+    let raw_str = if config.raw_output {
+        value.as_str()
+    } else {
+        None
+    };
+    if let Some(s) = &raw_str {
+        reject_raw_output0_nul(s, config)?;
     }
 
     // In seq mode, prepend RS (Record Separator) before each value
     if config.seq {
         out.write_all(&[ASCII_RS])?;
+    }
+
+    if let Some(s) = raw_str {
+        out.write_all(s.as_bytes())?;
+        write_terminator(out, config)?;
+        return Ok(());
     }
 
     // For jq_compat mode, use the jq-compatible formatter (reformats numbers)
@@ -4025,27 +4043,32 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 const ASCII_RS: u8 = 0x1E;
 
 fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
-    // Handle raw output for strings
-    if config.raw_output {
-        if let OwnedValue::String(s) = value {
-            // #1830: checked before *any* byte of this record reaches
-            // the writer, including the `--seq` RS separator below --
-            // same "no partial write on a rejected record" reasoning as
-            // `write_output_jq_value`'s sibling fix.
-            reject_raw_output0_nul(s, config)?;
-            // In seq mode, prepend RS (Record Separator) before each value
-            if config.seq {
-                out.write_all(&[ASCII_RS])?;
-            }
-            out.write_all(s.as_bytes())?;
-            write_terminator(out, config)?;
-            return Ok(());
+    // Raw-output string, if any -- resolved and NUL-checked before
+    // writing *any* byte of this record, including the `--seq` RS
+    // separator below (same reasoning as `write_output_jq_value`'s
+    // sibling fix). A single RS write below then covers both the raw and
+    // non-raw cases, rather than one copy per branch.
+    let raw_str = if config.raw_output {
+        match value {
+            OwnedValue::String(s) => Some(s.as_str()),
+            _ => None,
         }
+    } else {
+        None
+    };
+    if let Some(s) = raw_str {
+        reject_raw_output0_nul(s, config)?;
     }
 
     // In seq mode, prepend RS (Record Separator) before each value
     if config.seq {
         out.write_all(&[ASCII_RS])?;
+    }
+
+    if let Some(s) = raw_str {
+        out.write_all(s.as_bytes())?;
+        write_terminator(out, config)?;
+        return Ok(());
     }
 
     // Not computed until this non-raw fallthrough path actually needs it

@@ -1526,6 +1526,33 @@ it is recorded here as a still-open policy question, matching
 [yq Limitations](../yq/limitations.md)'s "Merge-flag `+` and `d` combined" precedent for a
 divergence accepted on its merits without fitting the letter of rule 4.
 
+### `--raw-output0`'s new NUL-content error (#1830) inherits `ErrorSink`'s pre-existing exit-code stickiness (#1855) — not fixed here
+
+[#1830](https://github.com/rust-works/succinctly/issues/1830) added a check rejecting a
+`--raw-output0` string whose own content contains a NUL byte, matching real jq's own refusal.
+That new error reports through the same `ErrorSink`/`sink.hit()` convention every other jq
+error in this file already uses — which means it also inherits `ErrorSink`'s existing,
+separately-tracked divergence: real jq's own exit code for an uncaught error reflects only the
+*last* top-level document processed, not "was any document rejected", where succinctly's
+`sink.hit()` is sticky for the whole run once set:
+
+```console
+$ printf '"a"\n"b\u0000c"\n"d"\n' | jq -r --raw-output0 '.'
+a␀d␀                                      # stderr: the NUL error, for the middle document
+$ echo $?
+0                                         # the LAST document ("d") succeeded
+$ printf '"a"\n"b\u0000c"\n"d"\n' | succinctly jq -r --raw-output0 '.'
+a␀d␀                                      # identical stdout and stderr
+$ echo $?
+5                                         # sink.hit() stays sticky from the middle document
+```
+
+This is not specific to the NUL check -- it is the general `ErrorSink` stickiness behavior,
+already filed as [#1855](https://github.com/rust-works/succinctly/issues/1855) ("jq: exit code
+is sticky (any-error) across multi-document input; real jq uses only the last document's
+outcome") before #1830 added this particular error class to the set of things that can trigger
+it. #1830 deliberately did not attempt a fix here, to avoid duplicating #1855's own scope.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
