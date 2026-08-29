@@ -21250,6 +21250,70 @@ fn test_jq_seq_malformed_record_does_not_misattribute_other_files_error_location
     Ok(())
 }
 
+/// #1809: `-R` (raw-input) has the same cross-file-boundary bug `--seq` had
+/// (#1571) -- real jq's `-R` reader treats multiple files as one
+/// continuous byte stream for line-splitting, so a file's own unterminated
+/// trailing line joins with the next file's first line. Every expectation
+/// here is jq 1.7.1's own live output for this exact repro.
+#[test]
+fn test_jq_raw_input_line_joined_across_file_boundary_1809() -> Result<()> {
+    // The issue's own repro: file 1 has no trailing newline.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["-R", "-c", "."], &["abc", "def\nghi\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abcdef\"\n\"ghi\"\n");
+
+    // A line spanning three files, not just two.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["-R", "-c", "."], &["ab", "cd", "ef\ngh\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abcdef\"\n\"gh\"\n");
+
+    // Control: every file ends in `\n` -- no join, one line per file,
+    // matching the pre-existing (already-correct) behavior.
+    let (stdout, stderr, code, _paths) =
+        run_jq_over_files(&["-R", "-c", "."], &["abc\n", "def\n"])?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abc\"\n\"def\"\n");
+
+    Ok(())
+}
+
+/// #1809: `input_line_number` for a joined line reports the file it
+/// actually lands in, at that file's own local line count -- not the first
+/// file's count, and not a global cross-file count. Pinned against jq
+/// 1.7.1's own live output.
+#[test]
+fn test_jq_raw_input_line_number_after_cross_file_join_1809() -> Result<()> {
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["-R", "-c", "., input_line_number"],
+        &["abc", "def\nghi\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abcdef\"\n1\n\"ghi\"\n2\n");
+
+    Ok(())
+}
+
+/// #1809: the joined line's error location follows the same rule as its
+/// value/line-number attribution -- the file the line's own terminating
+/// `\n` lives in, not the file the join started in. Pinned against jq
+/// 1.7.1's own live output.
+#[test]
+fn test_jq_raw_input_error_location_after_cross_file_join_1809() -> Result<()> {
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-R", "-c", "error(\"x\")"], &["abc", "def\nghi\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "the joined line `abcdef` must report the SECOND file (where its \
+         own trailing newline lives), not the first: {stderr}"
+    );
+    assert!(!stderr.contains(&paths[0]), "{stderr}");
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
