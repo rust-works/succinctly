@@ -14106,24 +14106,34 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let starts = match eval_slice_bound::<W, S>(start, value.clone(), f64::floor) {
+    // #1528: keeps each bound generator's own partial prefix instead of
+    // discarding it on escape -- see `eval_generic::eval_slice_expr`'s own
+    // (near-identical) doc comment on this exact fix for the full
+    // jq-nesting-order rationale; not repeated here.
+    let (starts, starts_escape) = match eval_slice_bound::<W, S>(start, value.clone(), f64::floor) {
         Ok(v) => v,
-        Err(Control::Error(e)) => return QueryResult::Error(e),
-        Err(Control::Break(label)) => return QueryResult::Break(label),
-        Err(Control::Halt(code)) => return QueryResult::Halt(code),
+        Err(control) => return partial(Vec::new(), control),
     };
     if starts.is_empty() {
-        return QueryResult::None;
+        return match starts_escape {
+            None => QueryResult::None,
+            Some(control) => partial(Vec::new(), control),
+        };
     }
-    let ends = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
+    let (ends, ends_escape) = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
         Ok(v) => v,
-        Err(Control::Error(e)) => return QueryResult::Error(e),
-        Err(Control::Break(label)) => return QueryResult::Break(label),
-        Err(Control::Halt(code)) => return QueryResult::Halt(code),
+        Err(control) => return partial(Vec::new(), control),
     };
+    let ends_escaped = ends_escape.is_some();
+    let bounds_escape = ends_escape.or(starts_escape);
     if ends.is_empty() {
-        return QueryResult::None;
+        return match bounds_escape {
+            None => QueryResult::None,
+            Some(control) => partial(Vec::new(), control),
+        };
     }
+    let starts_len = if ends_escaped { 1 } else { starts.len() };
+    let starts = &starts[..starts_len];
 
     let targets = eval_single::<W, S>(target, value, false).materialize_cursor();
 
@@ -14174,7 +14184,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     match &targets {
         Targets::Borrowed(ts) => {
-            for s in &starts {
+            for s in starts {
                 for e in &ends {
                     let slice_expr = Expr::Slice { start: *s, end: *e };
                     for t in ts {
@@ -14190,7 +14200,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         Targets::Owned(ts) => {
-            for s in &starts {
+            for s in starts {
                 for e in &ends {
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
@@ -14203,7 +14213,13 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
-    owned_vec_to_result(out)
+    // #1528: the bound-escape info threaded through above still has to
+    // reach the final result -- a successful loop doesn't mean `start`/`end`
+    // themselves didn't escape after producing `out`'s own values.
+    match bounds_escape {
+        None => owned_vec_to_result(out),
+        Some(control) => partial(out, control),
+    }
 }
 
 /// Evaluate one slice bound (`start` or `end`) against `value`, collecting
@@ -14221,29 +14237,38 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// error — [`eval_index_expr`]'s key evaluation, which returns `QueryResult`
 /// directly, already gets this right; the narrower `Result<_, EvalError>`
 /// this shares with [`owned_bound_to_i64`] needs `Control` to keep up.
+///
+/// Keeps the bound generator's own partial prefix rather than discarding it
+/// on escape (#1528) -- see `eval_generic::eval_slice_bound`'s own doc
+/// comment for the full rationale, shared verbatim here.
 fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: StandardJson<'_, W>,
     round: fn(f64) -> f64,
-) -> Result<Vec<Option<i64>>, Control> {
+) -> Result<(Vec<Option<i64>>, Option<Control>), Control> {
     let Some(expr) = bound else {
-        return Ok(vec![None]);
+        return Ok((vec![None], None));
     };
-    let raw: Vec<OwnedValue> = match eval_single::<W, S>(expr, value, false).materialize_cursor() {
-        QueryResult::One(v) => vec![to_owned_key_shape(&v)],
-        QueryResult::Many(vs) => vs.iter().map(to_owned_key_shape).collect(),
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => return Ok(Vec::new()),
-        QueryResult::Error(e) => return Err(Control::Error(e)),
-        QueryResult::Break(label) => return Err(Control::Break(label)),
-        QueryResult::Halt(code) => return Err(Control::Halt(code)),
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        QueryResult::Partial(_, control) => return Err(control),
-    };
-    raw.iter()
+    let (raw, escape): (Vec<OwnedValue>, Option<Control>) =
+        match eval_single::<W, S>(expr, value, false).materialize_cursor() {
+            QueryResult::One(v) => (vec![to_owned_key_shape(&v)], None),
+            QueryResult::Many(vs) => (vs.iter().map(to_owned_key_shape).collect(), None),
+            QueryResult::Owned(v) => (vec![v], None),
+            QueryResult::ManyOwned(vs) => (vs, None),
+            QueryResult::None => (Vec::new(), None),
+            QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+            QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+            QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
+            QueryResult::OneCursor(_) => {
+                unreachable!("materialize_cursor should have converted this")
+            }
+            QueryResult::Partial(vs, control) => (vs, Some(control)),
+        };
+    let converted = raw
+        .iter()
         .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((converted, escape))
 }
 
 /// Classify a resolved bound value the way jq's slice descriptor does
@@ -51044,10 +51069,21 @@ mod tests {
             (b"[1,2,3]", "label $out | .[(break $out):(2+0)]", Ok("")),
             (b"[1,2,3]", "label $out | .[(0+0):(break $out)]", Ok("")),
             // A bound whose stream breaks (or errors) after already
-            // producing values: same conservative trade-off as the target
-            // case above, applied to the bound stream instead.
-            (b"[1,2,3]", "label $out | .[(1,2,break $out):(2+0)]", Ok("")),
-            (b"[1,2,3]", r#".[(1,2,error("boom")):(2+0)]"#, Err("boom")),
+            // producing values: unlike the target case above, the bound
+            // stream's own partial prefix is kept, not discarded (#1528) --
+            // confirmed against jq 1.7.1: both cases print `[2]` then `[]`
+            // (from `$s=1`/`$s=2` against the fixed end bound `2`) before the
+            // break/error fires on `$s`'s third candidate. `outcome()`'s own
+            // `Err` arm only matches a zero-prefix `QueryResult::Error`, so a
+            // `Partial` terminating in an error is asserted here as `Ok` of
+            // its already-collected prefix, same as the break case --
+            // this test harness doesn't itself assert the trailing error.
+            (
+                b"[1,2,3]",
+                "label $out | .[(1,2,break $out):(2+0)]",
+                Ok("[2] []"),
+            ),
+            (b"[1,2,3]", r#".[(1,2,error("boom")):(2+0)]"#, Ok("[2] []")),
         ]);
     }
 
