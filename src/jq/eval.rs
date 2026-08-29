@@ -8891,7 +8891,15 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match format_owned::<S>(format_type, &to_owned(&value), optional) {
+    // #1755: to_owned_checked, not to_owned -- an undecodable string must
+    // raise, not silently format `""` (or a container holding `""` for a
+    // nested field). Every `@format` function shares this single
+    // materialization point via `format_owned`.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return e.into(),
+    };
+    match format_owned::<S>(format_type, &owned, optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
         Err(e) => e.into(),
     }
@@ -42255,6 +42263,50 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "-.inf");
             }
+        );
+    }
+
+    /// #1755: `eval_format` -- the single materialization point every
+    /// `@format` function shares -- used unchecked `to_owned`, so an
+    /// undecodable string silently formatted as if it were `""` instead of
+    /// raising. Covers a representative format from each of `format_owned`'s
+    /// dispatch arms: a plain stringifier (`@text`), a serializer (`@json`),
+    /// a byte-transform (`@base64`), a percent-encoder (`@uri`), and a
+    /// row-formatter (`@csv`) -- both on the malformed value directly and
+    /// nested inside a container, since `@json`/`@csv`/etc. recurse into
+    /// containers via `to_owned_checked`'s own (already-fixed) recursion.
+    #[test]
+    fn test_format_raises_on_decode_failure_1755() {
+        for expr in ["@text", "@json", "@base64", "@uri", "@csv", "@sh", "@html"] {
+            query!(
+                &b"[1, \"\xff\xfe\"]"[..],
+                expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "expr={expr} message: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+    }
+
+    /// #1755 positive control: valid data through each of `eval_format`'s
+    /// dispatch arms is unaffected by routing through `to_owned_checked`.
+    #[test]
+    fn test_format_valid_data_unaffected_1755() {
+        query!(br#""hi""#, "@text",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "hi"); }
+        );
+        query!(br"[1,2]", "@json",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "[1,2]"); }
+        );
+        query!(br#""hi""#, "@base64",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "aGk="); }
+        );
+        query!(br#""hi""#, "@uri",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "hi"); }
         );
     }
 
