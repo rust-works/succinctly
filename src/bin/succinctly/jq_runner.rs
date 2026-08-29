@@ -1273,6 +1273,17 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             std::panic::resume_unwind(payload);
                         };
                         sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
+                        // Mirrors the same check a few lines below, after the
+                        // ordinary per-result loop -- halt/halt_error (#791)
+                        // outranks everything else, including remaining
+                        // values/files, and this `continue` would otherwise
+                        // skip straight past that check for this iteration
+                        // (review: every other early-exit in this loop still
+                        // reaches it on the same iteration; this one didn't).
+                        if let Some(code) = sink.halted() {
+                            out.flush()?;
+                            return Ok(code);
+                        }
                         continue;
                     }
                 };
@@ -3431,10 +3442,22 @@ fn evaluate_input(
     }
 }
 
-/// If `payload` (a caught panic's payload) is `to_owned_cursor_at_depth`'s
-/// `MAX_NESTING_DEPTH` guard (#1793), returns its message; `None` for any
-/// other panic, so a caller can `resume_unwind` anything unrelated rather
-/// than silently treating an unexpected panic as this specific, known one.
+/// If `payload` (a caught panic's payload) is exactly
+/// `to_owned_cursor_at_depth`'s `MAX_NESTING_DEPTH` guard (#1793), returns
+/// its message; `None` for any other panic, so a caller can `resume_unwind`
+/// anything unrelated rather than silently treating an unexpected panic as
+/// this specific, known one.
+///
+/// An *exact* match against `assert_depth`'s own message template
+/// (`src/jq/value.rs`), not a substring check -- `assert_value_tree_depth`
+/// (`MAX_VALUE_TREE_DEPTH`, 384) shares that same template via the same
+/// underlying `assert_depth` call and produces byte-identical text apart
+/// from the number, so a substring match here would also silently catch
+/// *that* guard's panic (a different failure class, from filter-driven
+/// value growth rather than document nesting) and report it as if it were
+/// this one. Confirmed live by review: `reduce range(400) as $i (null;
+/// [.])` panics via the 384 guard and was being caught here before this
+/// fix narrowed the match.
 ///
 /// `assert!`'s formatted message (`"nesting depth exceeds limit of
 /// {MAX_NESTING_DEPTH}"`) panics with a `String` payload, not `&'static
@@ -3446,7 +3469,7 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .downcast_ref::<String>()
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())?;
-    text.contains("nesting depth exceeds limit of")
+    (text == format!("nesting depth exceeds limit of {MAX_NESTING_DEPTH}"))
         .then(|| text.to_string())
 }
 
