@@ -622,7 +622,20 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
             JqValue::LazyKeysArray { fields, collapse } => {
                 out.write_char('[')?;
                 let mut first = true;
-                for (key, key_cursor) in DistinctKeyCursors::new(fields, *collapse) {
+                let mut cursors = DistinctKeyCursors::new(fields, *collapse);
+                for (key, key_cursor) in cursors.by_ref() {
+                    // #1679: a key the format's grammar never allowed at all
+                    // (a #1194-shaped key, e.g. a bare numeric JSON key) is
+                    // not an already-quoted JSON string token -- writing its
+                    // raw bytes verbatim would produce invalid JSON
+                    // (`{123:1}` becoming `[123]` instead of raising).
+                    // `write_json` has only `core::fmt::Error` to report
+                    // with (no message), matching `JqValue::Cursor`'s own
+                    // `cursor_to_owned(c).map_err(|_| core::fmt::Error)?`
+                    // above.
+                    if !matches!(key, StandardJson::String(_)) {
+                        return Err(core::fmt::Error);
+                    }
                     if !first {
                         out.write_char(',')?;
                     }
@@ -632,21 +645,25 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                             let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
                             out.write_str(s)?;
                         }
-                        // Defensive fallback; JSON object keys are always
-                        // string tokens with a text range, so this is not
-                        // expected to be reached.
+                        // Defensive fallback; JSON string-token keys are
+                        // always given a text range by the semi-index, so
+                        // this is not expected to be reached. The key is
+                        // already confirmed to be `StandardJson::String`
+                        // above, so this always writes a real key rather
+                        // than the `null` placeholder it used to.
                         None => {
+                            out.write_char('"')?;
                             if let StandardJson::String(k) = key {
-                                out.write_char('"')?;
                                 if let Ok(s) = k.as_str() {
                                     write_json_body_jq(out, &s)?;
                                 }
-                                out.write_char('"')?;
-                            } else {
-                                out.write_str("null")?;
                             }
+                            out.write_char('"')?;
                         }
                     }
+                }
+                if cursors.ended_unpaired() {
+                    return Err(core::fmt::Error);
                 }
                 out.write_char(']')
             }
@@ -1522,6 +1539,60 @@ mod tests {
                 other => panic!("expected object, got {other:?}"),
             };
             lazy_keys_array_to_owned(&fields, true).expect_err("an unpaired member is not JSON");
+        }
+    }
+
+    /// #1679: `write_json_at_depth`'s `LazyKeysArray` arm (`JqValue::write_json`/
+    /// `to_json_string`'s own escape hatch, independent of
+    /// `lazy_keys_array_to_owned`) had the same silent-corruption shape,
+    /// but worse: it wrote a non-string key's *raw, unquoted* bytes
+    /// straight into the array, producing invalid JSON (`{123:1}` ->
+    /// `[123]`) rather than merely dropping the field. Found by code review
+    /// (this PR's own "everywhere" claim didn't hold for this fifth call
+    /// site until this test/fix).
+    #[test]
+    fn test_write_json_lazy_keys_array_raises_on_non_string_key_1679() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+        let mut out = String::new();
+        assert!(
+            val.write_json(&mut out).is_err(),
+            "a bare numeric key must not be written verbatim as invalid JSON: {out:?}"
+        );
+    }
+
+    /// #1679: the unpaired-tail sibling of the test above.
+    #[test]
+    fn test_write_json_lazy_keys_array_raises_on_unpaired_field_1679() {
+        use crate::json::JsonIndex;
+
+        for json in [&b"{invalid}"[..], &b"{\"a\"}"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let fields = match cursor.value() {
+                StandardJson::Object(fields) => fields,
+                other => panic!("expected object, got {other:?}"),
+            };
+            let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+                fields,
+                collapse: true,
+            };
+            let mut out = String::new();
+            assert!(
+                val.write_json(&mut out).is_err(),
+                "an unpaired member must not silently close the array: {out:?}"
+            );
         }
     }
 
