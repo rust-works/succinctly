@@ -1,5 +1,11 @@
 //! Succinctly CLI tool for working with succinct data structures.
 
+// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
+// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
+// `eval_generic`) -- every call site in this binary sizes from a single
+// collection's own length and was never part of that bug shape.
+#![allow(clippy::disallowed_methods)]
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
