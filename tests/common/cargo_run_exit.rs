@@ -26,8 +26,10 @@ use anyhow::Result;
 mod exit_status;
 
 /// The `--features` value a `cargo run`-spawned CLI subprocess should build
-/// with -- always `cli` (needed for the binary itself), plus `bench-runner`
-/// whenever the enclosing `cargo test` invocation also requested it.
+/// with -- always `cli` (needed for the binary itself), or just
+/// `bench-runner` whenever the enclosing `cargo test` invocation also
+/// requested it (`Cargo.toml`'s `bench-runner = ["cli", ...]` already pulls
+/// `cli` in, so naming both would be redundant).
 ///
 /// A hardcoded `"cli"` at each call site used to clobber a shared
 /// `target/debug/succinctly` binary another test target in the same run
@@ -43,7 +45,7 @@ mod exit_status;
 /// out from under a sibling test target.
 pub fn cargo_run_features() -> &'static str {
     if cfg!(feature = "bench-runner") {
-        "cli,bench-runner"
+        "bench-runner"
     } else {
         "cli"
     }
