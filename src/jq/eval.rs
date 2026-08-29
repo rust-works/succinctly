@@ -22340,6 +22340,18 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// include the root (`del(.. | select(cond))` where `cond` rejects `.`)
 /// never finds a `depth() == 0` branch here and pays the full flatten
 /// regardless — that shape is tracked separately, not fixed by this flag.
+///
+/// Reused, unchanged, as `reject_untracked_at_terminal`/
+/// `reject_untracked_prefix_too`'s own `is_del` parameter (#1764 review):
+/// since this flag's own value is already exactly "is this call `del()`'s
+/// call shape," it happens to be the identical condition those two
+/// functions need to gate their own, entirely separate concern (does an
+/// untracked terminal branch raise, or silently no-op) on. The two
+/// concerns are independent -- nothing here requires them to always
+/// travel together -- they simply have not yet needed to diverge, since
+/// `del()` remains the only caller wanting either non-default behavior.
+/// If a future caller needs one without the other, this flag should be
+/// split into two.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -22410,15 +22422,38 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     /// Branches already produced ahead of the offending one are kept and
     /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
     ///
-    /// yq mode does not raise here for `path()`/`=`/`|=` (`is_del == false`,
-    /// #1764): a computed/untracked `Expr::Comma` branch is real yq's own
-    /// silent no-op there, not an error -- confirmed live against yq
-    /// v4.53.3, position-independent (`(.a, 1) = 5`, `(1, .a, .c) = 5`,
-    /// `(.a, .c, 1) = 5`, all-branches-untracked, and a computed value
-    /// produced by an arbitrary expression rather than a bare literal all
-    /// leave every trackable branch written normally and the untracked one
-    /// contributing nothing). `near_iterate`'s own wording distinction is
-    /// moot for those contexts: there is no error to word either way.
+    /// yq mode does not raise here for `path()`/`=`/`|=`/compound-assigns
+    /// (`is_del == false`, #1764): an untracked terminal branch is real
+    /// yq's own silent no-op there, not an error. Confirmed live against
+    /// yq v4.53.3, and **not specific to `Expr::Comma`** despite this
+    /// function's own name: a single bare untracked expression with no
+    /// comma at all is the identical no-op (`(1) = 5` on `{a: 1}` leaves
+    /// it unchanged, matching `(.a, 1) = 5`'s "skip only the untracked
+    /// one") -- the real rule is "any untracked terminal branch, however
+    /// many others accompany it, however it was produced." Confirmed
+    /// position-independent for a genuine multi-branch comma too (`(.a,
+    /// 1) = 5`, `(1, .a, .c) = 5`, `(.a, .c, 1) = 5`, all-branches-
+    /// untracked): every trackable branch is still written normally and
+    /// the untracked one(s) contribute nothing. `near_iterate`'s own
+    /// wording distinction is moot for those contexts: there is no error
+    /// to word either way. A genuine error/break/halt produced *while
+    /// computing* what would otherwise be an untracked value is not
+    /// itself untracked and still propagates normally -- confirmed live,
+    /// `(.a, error("boom")) = 5` still raises `boom`, not a no-op.
+    ///
+    /// **Only the terminal check is patched here.** An untracked branch
+    /// followed by *further navigation* (e.g. `(.a, 1 | .[]) = 5`) never
+    /// reaches this function at all -- `resolve_node`'s own `Expr::
+    /// Iterate` arm (and `resolve_index_expr`'s analogous dynamic-key
+    /// check) each raise independently, unconditionally, before a branch
+    /// gets anywhere near here. That gap is real (confirmed live: real
+    /// yq still no-ops there too) and deliberately not fixed by this
+    /// patch -- tracked as
+    /// [#1868](https://github.com/rust-works/succinctly/issues/1868),
+    /// since fixing it needs `is_del`-equivalent awareness threaded into
+    /// `resolve_node`, a 21-call-site function with its own independent
+    /// jq-mode-verified history at each scattered check, not just this
+    /// one terminal position.
     ///
     /// `del()` (`is_del == true`) is deliberately **excluded** from that
     /// skip and keeps raising here, unlike its three siblings: real yq's

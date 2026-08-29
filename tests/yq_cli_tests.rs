@@ -18073,6 +18073,67 @@ fn test_yq_untracked_comma_branch_del_still_raises_1764() -> Result<()> {
     Ok(())
 }
 
+/// #1764: the no-op is not specific to a multi-branch `Expr::Comma` --
+/// a single bare untracked expression, with no comma at all, is the
+/// identical no-op. Confirmed live against yq v4.53.3: `(1) = 5` on
+/// `{a: 1}` leaves it unchanged, the degenerate case of `(.a, 1) = 5`
+/// skipping only its untracked branch.
+#[test]
+fn test_yq_untracked_bare_noncomma_branch_noop_1764() -> Result<()> {
+    for filter in ["(1) = 5", "1 = 5", "(1+1) = 5"] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\n", &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, serde_json::json!({"a": 1}), "{filter}");
+    }
+    Ok(())
+}
+
+/// #1764: `+=`/`-=`/`*=` share the same no-op skip as `=`/`|=` --
+/// confirmed live against yq v4.53.3. yq has no `/=`/`%=`/`//=` syntax at
+/// all to check against (a pre-existing, unrelated question about
+/// whether succinctly's own support for those three forms corresponds to
+/// any real yq syntax), so they're not exercised here.
+#[test]
+fn test_yq_untracked_comma_branch_compound_assign_noop_1764() -> Result<()> {
+    for (filter, expected) in [
+        ("(.a, 1) += 5", serde_json::json!({"a": 6, "b": 2})),
+        ("(.a, 1) -= 5", serde_json::json!({"a": -4, "b": 2})),
+        ("(.a, 1) *= 5", serde_json::json!({"a": 5, "b": 2})),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\nb: 2\n", &["-o", "json"])?;
+        assert_eq!(code, 0, "{filter}");
+        let v: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(v, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #1764: `path()` (gated behind `--jq-extensions`, so no real yq builtin
+/// to verify against directly) inherits the same terminal-check skip as
+/// its `=`/`|=` siblings -- an untracked branch is simply absent from the
+/// emitted paths, including the all-untracked case yielding no paths at
+/// all, rather than raising.
+#[test]
+fn test_yq_untracked_comma_branch_path_noop_1764() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "[path((.a, 1))]",
+        "a: 1\nb: 2\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[[\"a\"]]");
+
+    let (out, code) = run_yq_stdin(
+        "[path((1, 2))]",
+        "a: 1\n",
+        &["--jq-extensions", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
 /// #1764 negative control: `succinctly jq`'s own path-expression check is
 /// unaffected -- real jq raises for every untracked comma branch
 /// regardless of the surrounding operation, and still must.
