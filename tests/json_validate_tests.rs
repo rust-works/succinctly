@@ -5,39 +5,32 @@
 #![cfg(feature = "cli")]
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::exit_code_or_signal_death;
-
-/// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
-/// bin target (gated `required-features = ["cli"]`) before this test binary
-/// runs, since this file is itself gated on `cli`, and bakes the resulting
-/// path in at compile time — correct under any target-dir layout.
-fn succinctly_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_succinctly")
-}
+use cargo_run_exit::{spawn_with_signal_retry, succinctly_bin};
 
 /// Helper to run `json validate` with input from stdin.
 fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(succinctly_bin())
-        .args(["json", "validate"])
-        .args(extra_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let output = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["json", "validate"]).args(extra_args);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
 
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
+    // itself; a real exit code is therefore always present here.
+    let exit_code = output
+        .status
+        .code()
+        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     Ok((stdout, stderr, exit_code))
@@ -45,15 +38,22 @@ fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, Strin
 
 /// Helper to run `json validate` with file input.
 fn run_validate_file(file_path: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
-    let output = Command::new(succinctly_bin())
-        .args(["json", "validate"])
-        .args(extra_args)
-        .arg(file_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let output = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["json", "validate"])
+                .args(extra_args)
+                .arg(file_path);
+            command
+        },
+        None,
+    )?;
 
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let exit_code = output
+        .status
+        .code()
+        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     Ok((stdout, stderr, exit_code))
@@ -373,19 +373,21 @@ fn test_file_not_found() -> Result<()> {
 /// `succinctly` grandchild (reparented to init, blocked forever on its
 /// now-unreadable stdout pipe) the moment anything kills the outer `cargo
 /// test` process group (`cargo-guard.sh` does this by design on a detected
-/// stall, #935). No retry loop needed either: `succinctly_bin()`'s
-/// compile-time path isn't a second cargo invocation that can hit lock
-/// contention (exit 101), unlike the removed `classify_cargo_run_exit`
-/// path this used to need.
+/// stall, #935).
 fn run_json_validate_multi(files: &[&std::path::Path]) -> Result<i32> {
-    let output = Command::new(succinctly_bin())
-        .args(["json", "validate"])
-        .args(files)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let output = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["json", "validate"]).args(files);
+            command
+        },
+        None,
+    )?;
 
-    exit_code_or_signal_death(output.status, &output.stderr)
+    Ok(output
+        .status
+        .code()
+        .expect("spawn_with_signal_retry only returns Ok with a real exit code"))
 }
 
 #[test]

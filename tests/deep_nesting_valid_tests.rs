@@ -14,24 +14,23 @@
 //!
 //! Run with: cargo test --features cli --test deep_nesting_valid_tests
 
-// #1847 review: `run` spawns `CARGO_BIN_EXE_succinctly` directly rather
-// than building it on demand via an inner `cargo run --features cli` the
-// way this file's helper used to -- that on-demand build was what let a
-// plain `cargo test` (no `--features cli`) still pass. `CARGO_BIN_EXE_
-// succinctly` only exists (and only builds the bin target at all) when
-// the *outer* invocation already has `--features cli` active, matching
-// every other CLI-invoking test file's own guard (`yq_cli_tests.rs`,
+// #1847 review: `run` spawns `succinctly_bin()` directly rather than
+// building it on demand via an inner `cargo run --features cli` the way
+// this file's helper used to -- that on-demand build was what let a plain
+// `cargo test` (no `--features cli`) still pass. `succinctly_bin()` only
+// exists (and only builds the bin target at all) when the *outer*
+// invocation already has `--features cli` active, matching every other
+// CLI-invoking test file's own guard (`yq_cli_tests.rs`,
 // `json_validate_tests.rs`, ...).
 #![cfg(feature = "cli")]
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::Result;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::exit_code_or_signal_death;
+use cargo_run_exit::{spawn_with_signal_retry, succinctly_bin};
 
 /// A real-but-deep nesting depth: deeper than typical documents (~30-50 levels),
 /// yet comfortably under the ~128-level DoS cap proposed in #151/#152.
@@ -39,30 +38,29 @@ const VALID_DEPTH: usize = 100;
 
 /// Run `succinctly <args>` with `stdin` piped in; return `(stdout, exit_code)`.
 ///
-/// Goes through the real binary directly (`CARGO_BIN_EXE_succinctly`, a
+/// Goes through the real binary directly (`succinctly_bin()`, a
 /// compile-time path to this test binary's own already-built dependency).
 /// Used to go through a second `cargo run` subprocess instead: that orphans
 /// the real `succinctly` grandchild -- reparented to init, blocked forever
 /// on its now-unreadable stdout pipe -- the moment anything kills the
 /// outer `cargo test` process group (`cargo-guard.sh` does this by design
-/// on a detected stall, #935/#1847). No retry loop needed either: a
-/// compile-time path isn't a second cargo invocation that can hit lock
-/// contention (exit 101), unlike the removed `classify_cargo_run_exit`
-/// path this used to need.
+/// on a detected stall, #935/#1847).
 fn run(args: &[&str], stdin: &str) -> Result<(String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let output = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(args);
+            command
+        },
+        Some(stdin.as_bytes()),
+    )?;
 
-    if let Some(mut sin) = cmd.stdin.take() {
-        sin.write_all(stdin.as_bytes())?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
+    // itself; a real exit code is therefore always present here.
+    let exit_code = output
+        .status
+        .code()
+        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     let stdout = String::from_utf8(output.stdout)?;
     Ok((stdout, exit_code))
 }

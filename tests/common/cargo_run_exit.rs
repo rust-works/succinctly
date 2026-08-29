@@ -125,3 +125,76 @@ pub fn classify_cargo_run_exit(
     }
     Err(signal_death_error(status, stderr))
 }
+
+/// Path to the pre-built `succinctly` binary this test binary's own build
+/// already produced -- a compile-time constant, not a second cargo
+/// invocation, so callers need `#![cfg(feature = "cli")]` (matching the
+/// `[[bin]] required-features = ["cli"]` this depends on): the outer
+/// `cargo test` invocation has to have `cli` active for the bin target,
+/// and therefore this path, to exist at all.
+pub fn succinctly_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_succinctly")
+}
+
+/// Spawns `build()` (already configured with args), optionally writing
+/// `stdin_input` to it, retrying the whole spawn+wait up to
+/// [`MAX_CARGO_RETRIES`] times if the child was killed by a signal rather
+/// than exiting with a real code -- an OOM kill, another session's
+/// `pkill`, or a stall-guard's process-group kill (`cargo-guard.sh`, by
+/// design, on a detected stall, #935) catching this specific child, all
+/// just as plausible under this repo's routine heavy concurrent
+/// multi-session load as the cargo-lock-contention case
+/// `classify_cargo_run_exit` retries for. Unlike that function, there is
+/// no exit-101 case to also retry on here: a direct `succinctly_bin()`
+/// spawn has no cargo invocation of its own to contend on a lock.
+///
+/// Shared by every direct-spawn CLI test helper (#1847 review) --
+/// `cli_golden_tests.rs`, `cli_characterization_tests.rs`,
+/// `deep_nesting_valid_tests.rs` and `json_validate_tests.rs` each
+/// independently dropped this retry (along with the lock-contention case
+/// that genuinely no longer applies) when first converting away from
+/// `cargo run`; sharing one copy here instead of four independently
+/// drifting ones is the same fix `classify_cargo_run_exit`'s own doc
+/// comment already describes for the exit-code-classification half of
+/// this same problem.
+///
+/// `build` is called fresh on each retry attempt, since a spawned
+/// `std::process::Command` cannot be reused. `stdout`/`stderr` are always
+/// piped; `stdin` is piped and `stdin_input` written to it only when
+/// `Some`, otherwise left at `Command`'s own default (`Stdio::null()` for
+/// `.output()`-style calls), matching every existing call site's prior
+/// behavior exactly.
+pub fn spawn_with_signal_retry(
+    mut build: impl FnMut() -> std::process::Command,
+    stdin_input: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    for attempt in 0..MAX_CARGO_RETRIES {
+        let mut command = build();
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if stdin_input.is_some() {
+            command.stdin(std::process::Stdio::piped());
+        }
+        let mut child = command.spawn()?;
+        if let Some(input) = stdin_input {
+            use std::io::Write;
+            if let Some(mut sin) = child.stdin.take() {
+                sin.write_all(input)?;
+            }
+        }
+        let output = child.wait_with_output()?;
+        if output.status.code().is_some() {
+            return Ok(output);
+        }
+        if attempt + 1 >= MAX_CARGO_RETRIES {
+            // #1691: raw bytes, not a `String::from_utf8` decode of
+            // `output.stderr` first -- a signal-killed child can leave a
+            // truncated multi-byte UTF-8 sequence at the end of a buffer
+            // it was writing when killed.
+            exit_code_or_signal_death(output.status, &output.stderr)?;
+            unreachable!("exit_code_or_signal_death errors whenever status.code() is None");
+        }
+    }
+    unreachable!()
+}
