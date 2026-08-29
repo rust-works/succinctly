@@ -1780,14 +1780,25 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
 /// (same object/array unconsing, same key-collision guard, same checks
 /// in the same order once a scalar is reached) -- but it builds no
-/// `OwnedValue` anywhere, only walking and checking, so `select`'s
-/// truthiness check keeps its #1645 performance win (no `String`/`Vec`
-/// value allocation) for the overwhelmingly common case where nothing is
-/// corrupted, while still raising on a value corrupted at *any* depth
-/// below `c`'s own top level -- not just when `c` itself is the bad
-/// scalar (an earlier version of this fix only checked `c.value()`
-/// directly, silently missing anything nested inside a well-formed
-/// container; caught by review, #1645).
+/// `OwnedValue` container or scalar payload anywhere, only walking and
+/// checking, raising on a value corrupted at *any* depth below `c`'s own
+/// top level -- not just when `c` itself is the bad scalar (an earlier
+/// version of this fix only checked `c.value()` directly, silently
+/// missing anything nested inside a well-formed container; caught by
+/// review, #1645).
+///
+/// For a scalar condition this keeps #1645's O(1) win in full: neither
+/// this walk nor `is_falsy()` afterward materializes anything. For a
+/// container condition, jq's own truthiness rule needs none of this --
+/// any object/array is unconditionally truthy regardless of contents --
+/// but this walk still visits the whole subtree anyway, because a
+/// corrupted value can be anywhere inside it and the #1247/#1194
+/// invariant this function exists to enforce is a property of the whole
+/// subtree, not of the truthiness question alone. That walk still
+/// allocates one `String` per object key (`resolve_display_key`'s own
+/// #1642 guard), so "no allocation" only ever describes the *value*
+/// side (no `OwnedValue`/`Vec` payload) -- not a claim that a
+/// container-shaped condition is free.
 fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
     assert_nesting_depth(depth);
     let value = c.value();

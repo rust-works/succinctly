@@ -6145,10 +6145,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             // unresolved `Alias` node itself would report "not falsy" for a
             // target that genuinely is (#1645 code review) --
             // `resolve_alias_target_cursor` already guarantees its result is
-            // never itself an `Alias`, so this recurses at most once.
+            // never itself an `Alias`, so this recurses at most once. The
+            // dangling-target case (`None`) is unreachable for an index
+            // from `YamlIndex::build`, same as `is_null`'s own `Alias` arm
+            // above -- treated the same way (`true`) for consistency, not
+            // unwrapped, so a hand-built index cannot panic here.
             YamlValue::Alias { .. } => self
                 .resolve_alias_target_cursor()
-                .is_some_and(|target| target.is_falsy()),
+                .map_or(true, |target| target.is_falsy()),
             _ => false,
         }
     }
@@ -6462,12 +6466,31 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     }
 
     fn is_error(&self) -> bool {
-        matches!(self, YamlValue::Error(_))
+        match self {
+            YamlValue::Error(_) => true,
+            // See `is_null`'s `Alias` arm above (#1193/PR #1314) -- every
+            // other typed accessor in this impl resolves the chain before
+            // answering; this one hadn't, an inconsistency #1645 code
+            // review caught (latent today: neither of this type's two
+            // construction sites is reachable behind a real alias, since
+            // `YamlIndex::build` already refuses to build an alias it
+            // can't resolve, #372).
+            YamlValue::Alias { target, .. } => {
+                target.is_some_and(|t| t.resolve_alias_chain().is_some_and(|v| v.is_error()))
+            }
+            _ => false,
+        }
     }
 
     fn error_message(&self) -> Option<&'static str> {
         match self {
             YamlValue::Error(msg) => Some(msg),
+            // Kept in sync with `is_error`'s own `Alias` arm just above --
+            // a caller that finds `is_error() == true` behind an alias must
+            // also be able to read the resolved target's message.
+            YamlValue::Alias { target, .. } => {
+                target.and_then(|t| t.resolve_alias_chain()?.error_message())
+            }
             _ => None,
         }
     }

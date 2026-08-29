@@ -2012,6 +2012,62 @@ fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<(
     Ok(())
 }
 
+/// #1645 code review: `push_generic_truthiness_cursor_error` is a second,
+/// hand-copied implementation of the same "walk and raise on corruption"
+/// predicate `to_owned_cursor_at_depth` already implements for
+/// materialization (`-S`, `-s`, `.,.`) -- the exact "duplicated predicate"
+/// shape this repo's own testing guidance warns diverges silently unless a
+/// test pins that every site agrees, not just that each is individually
+/// correct (see the `testing` skill and CLAUDE.md's "Duplicated predicates
+/// diverge silently" note, #106). For each malformed shape below, checks
+/// that `select(.bad) | .keep` (the new walk) and `-Sc .` on the bare `.bad`
+/// value (the pre-existing materializing walk) raise on the *same* input.
+#[test]
+fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
+    let cases = [
+        ("decode failure, top level", r#"{"bad": "\x", "keep": 5}"#),
+        (
+            "decode failure, nested in array",
+            r#"{"bad": ["\x"], "keep": 5}"#,
+        ),
+        (
+            "decode failure, nested in object",
+            r#"{"bad": {"x": "\x"}, "keep": 5}"#,
+        ),
+        (
+            "structural error, top level",
+            r#"{"bad": xyz123, "keep": 5}"#,
+        ),
+        (
+            "structural error, nested in array",
+            r#"{"bad": [xyz123], "keep": 5}"#,
+        ),
+        (
+            "#1642 colliding decode-failure keys",
+            r#"{"bad": {"\ud800":1,"\ud800":2}, "keep": 5}"#,
+        ),
+    ];
+
+    for (label, doc) in cases {
+        let (select_out, select_err, select_code) =
+            run_jq_full(&["select(.bad) | .keep"], Some(doc))
+                .unwrap_or_else(|e| panic!("[{label}] select run failed: {e}"));
+        assert_eq!(
+            select_code, 5,
+            "[{label}] select(.bad) must raise\nstdout: {select_out:?}\nstderr: {select_err:?}"
+        );
+
+        let (materialize_out, materialize_err, materialize_code) =
+            run_jq_full(&["-Sc", ".bad"], Some(doc))
+                .unwrap_or_else(|e| panic!("[{label}] materialize run failed: {e}"));
+        assert_eq!(
+            materialize_code, 5,
+            "[{label}] -Sc .bad must raise the same way select's condition walk does\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_builtin_type() -> Result<()> {
     let (output, code) = run_jq_stdin("type", r#"{"a":1}"#, &["-r"])?;

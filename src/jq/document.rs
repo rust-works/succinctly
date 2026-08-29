@@ -974,10 +974,11 @@ pub fn colliding_display_key_error(key: &str) -> EvalError {
 /// `colliding_display_key_error` instead of allowing a silent overwrite.
 ///
 /// Shared by `eval_generic.rs`'s three `to_owned*_at_depth` conversions,
+/// its validate-only `push_generic_truthiness_cursor_error` (#1645),
 /// `lazy.rs`'s `cursor_to_owned_at_depth`, and `succinctly-cli`'s
 /// `yq_runner.rs` `--input-format json` bridge (`pub` for that reason,
 /// same as [`DisplayKeyGuard`] and [`key_display_string`] before it) -- one
-/// definition rather than a fifth hand-copied guard-and-raise sequence.
+/// definition rather than a sixth hand-copied guard-and-raise sequence.
 pub fn resolve_display_key<V: DocumentValue, T>(
     key: &V,
     map: &IndexMap<String, T>,
