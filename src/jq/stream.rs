@@ -24,6 +24,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::document::{key_display_string, DistinctKeyCursors, DocumentFields, IndentSpec};
+use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
@@ -537,33 +538,48 @@ fn stream_json_string<W: core::fmt::Write>(
 /// top-level result (never nested inside another container), so unlike the
 /// function it mirrors this has no `current_indent` parameter — it's always
 /// 0.
+///
+/// `error` reports a #1194 key back to the caller (a non-stringifiable key
+/// token, or the field list ending on an unpaired child) without going
+/// through this function's own `core::fmt::Result` -- that channel only
+/// carries `core::fmt::Error`, which has no message. On that path, whatever
+/// keys were already written stay written and no closing bracket is
+/// skipped, matching the `Partial`/`owned_or_stream_error` idiom elsewhere
+/// in this module's callers: some output already reached `out`, the failure
+/// travels back out-of-band instead of as a value on `out` (#355).
 pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
     collapse: bool,
     out: &mut W,
     indent: IndentSpec,
+    error: &mut Option<EvalError>,
 ) -> core::fmt::Result {
     if fields.is_empty() {
         return out.write_str("[]");
     }
     out.write_char('[')?;
-    let mut i = 0usize;
-    for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
         // A key that will not *decode* is preserved via its raw source
         // span rather than silently skipped (#1642), matching
         // `DocumentFields::keys()`. A key with no stringifiable spelling at
-        // all (#1194) has no name to report and is still skipped here.
-        if let Some(key) = key_display_string(&key) {
-            if i > 0 {
-                out.write_char(',')?;
-            }
-            if indent.width > 0 {
-                out.write_char('\n')?;
-                write_indent(out, indent.width, indent.unit)?;
-            }
-            stream_json_string(out, &key, write_json_body_yq)?;
-            i += 1;
+        // all (#1194) now stops the walk and reports via `error` instead of
+        // silently skipping it, matching `effective_keys`.
+        let Some(key) = key_display_string(&key) else {
+            *error = Some(fields.malformed_member_error());
+            break;
+        };
+        if i > 0 {
+            out.write_char(',')?;
         }
+        if indent.width > 0 {
+            out.write_char('\n')?;
+            write_indent(out, indent.width, indent.unit)?;
+        }
+        stream_json_string(out, &key, write_json_body_yq)?;
+    }
+    if error.is_none() && cursors.ended_unpaired() {
+        *error = Some(fields.malformed_member_error());
     }
     if indent.width > 0 {
         out.write_char('\n')?;
@@ -863,42 +879,56 @@ pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fm
 /// the same reason as `stream_lazy_keys_json` (#1514): yq's own
 /// `COLLAPSE_DUPLICATE_KEYS` is always `false`, so this is a no-op today,
 /// but the rule must still hold if a jq-mode caller ever reaches it.
+///
+/// `error` -- see `stream_lazy_keys_json`'s identical parameter.
 pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
     fields: &F,
     collapse: bool,
     out: &mut W,
     indent: IndentSpec,
+    error: &mut Option<EvalError>,
 ) -> core::fmt::Result {
     if fields.is_empty() {
         return out.write_str("[]");
     }
-    let mut i = 0usize;
     if indent.is_compact() {
         // Flow style
         out.write_char('[')?;
-        for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
+        let mut cursors = DistinctKeyCursors::new(fields, collapse);
+        for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
             // Preserved via its raw source span rather than skipped on a
-            // decode failure (#1642), matching `stream_lazy_keys_json`.
-            if let Some(key) = key_display_string(&key) {
-                if i > 0 {
-                    out.write_str(", ")?;
-                }
-                stream_yaml_string(out, &key)?;
-                i += 1;
+            // decode failure (#1642), matching `stream_lazy_keys_json`. A
+            // non-stringifiable key (#1194) stops the walk and reports via
+            // `error` instead of silently skipping it.
+            let Some(key) = key_display_string(&key) else {
+                *error = Some(fields.malformed_member_error());
+                break;
+            };
+            if i > 0 {
+                out.write_str(", ")?;
             }
+            stream_yaml_string(out, &key)?;
+        }
+        if error.is_none() && cursors.ended_unpaired() {
+            *error = Some(fields.malformed_member_error());
         }
         out.write_char(']')
     } else {
         // Block style
-        for (key, _cursor) in DistinctKeyCursors::new(fields, collapse) {
-            if let Some(key) = key_display_string(&key) {
-                if i > 0 {
-                    out.write_char('\n')?;
-                }
-                out.write_str("- ")?;
-                stream_yaml_string(out, &key)?;
-                i += 1;
+        let mut cursors = DistinctKeyCursors::new(fields, collapse);
+        for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
+            let Some(key) = key_display_string(&key) else {
+                *error = Some(fields.malformed_member_error());
+                break;
+            };
+            if i > 0 {
+                out.write_char('\n')?;
             }
+            out.write_str("- ")?;
+            stream_yaml_string(out, &key)?;
+        }
+        if error.is_none() && cursors.ended_unpaired() {
+            *error = Some(fields.malformed_member_error());
         }
         Ok(())
     }
@@ -1127,29 +1157,143 @@ mod tests {
         };
 
         let mut collapsed = String::new();
-        stream_lazy_keys_json(&fields, true, &mut collapsed, IndentSpec::COMPACT).unwrap();
+        let mut err = None;
+        stream_lazy_keys_json(&fields, true, &mut collapsed, IndentSpec::COMPACT, &mut err)
+            .unwrap();
+        assert!(err.is_none(), "{err:?}");
         assert_eq!(
             collapsed, r#"["b","a"]"#,
             "collapse: true drops the repeat of \"b\""
         );
 
         let mut uncollapsed = String::new();
-        stream_lazy_keys_json(&fields, false, &mut uncollapsed, IndentSpec::COMPACT).unwrap();
+        let mut err = None;
+        stream_lazy_keys_json(
+            &fields,
+            false,
+            &mut uncollapsed,
+            IndentSpec::COMPACT,
+            &mut err,
+        )
+        .unwrap();
+        assert!(err.is_none(), "{err:?}");
         assert_eq!(
             uncollapsed, r#"["b","a","b"]"#,
             "collapse: false (yq) keeps every occurrence"
         );
 
         let mut collapsed_yaml = String::new();
-        stream_lazy_keys_yaml(&fields, true, &mut collapsed_yaml, IndentSpec::COMPACT).unwrap();
+        let mut err = None;
+        stream_lazy_keys_yaml(
+            &fields,
+            true,
+            &mut collapsed_yaml,
+            IndentSpec::COMPACT,
+            &mut err,
+        )
+        .unwrap();
+        assert!(err.is_none(), "{err:?}");
         assert_eq!(
             collapsed_yaml, "[b, a]",
             "the YAML writer applies the same rule"
         );
 
         let mut uncollapsed_yaml = String::new();
-        stream_lazy_keys_yaml(&fields, false, &mut uncollapsed_yaml, IndentSpec::COMPACT).unwrap();
+        let mut err = None;
+        stream_lazy_keys_yaml(
+            &fields,
+            false,
+            &mut uncollapsed_yaml,
+            IndentSpec::COMPACT,
+            &mut err,
+        )
+        .unwrap();
+        assert!(err.is_none(), "{err:?}");
         assert_eq!(uncollapsed_yaml, "[b, a, b]");
+    }
+
+    /// #1679: a #1194 key (the format's grammar never allowed it at all, not
+    /// just a decode failure) used to be silently skipped by both writers --
+    /// `keys_unsorted` would come back one entry short with exit 0, while
+    /// `keys`/`length` on the same document raised/counted it. Both writers
+    /// now stop at the offending key and report it via `error`, keeping
+    /// whatever was already written (the same `Partial` idiom
+    /// `owned_or_stream_error`'s callers use) rather than a diagnostic
+    /// reaching `out`.
+    #[test]
+    fn test_stream_lazy_keys_raises_on_non_string_key_1679() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        let json = br#"{"b":2,123:1}"#;
+        let index = JsonIndex::build(json);
+        let StandardJson::Object(fields) = index.root(json).value() else {
+            panic!("expected object");
+        };
+
+        let mut json_out = String::new();
+        let mut err = None;
+        stream_lazy_keys_json(&fields, true, &mut json_out, IndentSpec::COMPACT, &mut err).unwrap();
+        let e = err.expect("a bare numeric key is not JSON");
+        assert!(e.message.contains("expected string key"), "{e:?}");
+        assert_eq!(
+            json_out, r#"["b"]"#,
+            "the key written before the fault stays written"
+        );
+
+        let mut yaml_flow = String::new();
+        let mut err = None;
+        stream_lazy_keys_yaml(&fields, true, &mut yaml_flow, IndentSpec::COMPACT, &mut err)
+            .unwrap();
+        assert!(err.is_some());
+        assert_eq!(yaml_flow, "[b]");
+
+        let mut yaml_block = String::new();
+        let mut err = None;
+        stream_lazy_keys_yaml(
+            &fields,
+            true,
+            &mut yaml_block,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+            &mut err,
+        )
+        .unwrap();
+        assert!(err.is_some());
+        assert_eq!(yaml_block, "- b");
+    }
+
+    /// #1679: the unpaired-tail sibling of the test above -- an object whose
+    /// last child has no value to pair with. Only
+    /// [`DistinctKeyCursors::ended_unpaired`] (meaningful once the walk is
+    /// exhausted) can tell this apart from a clean, shorter object, so the
+    /// offending key is never even yielded to the loop -- both writers must
+    /// check it *after* the loop, not just inside it.
+    #[test]
+    fn test_stream_lazy_keys_raises_on_unpaired_field_1679() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        for json in [&b"{invalid}"[..], &b"{\"a\"}"[..]] {
+            let index = JsonIndex::build(json);
+            let StandardJson::Object(fields) = index.root(json).value() else {
+                panic!("expected object");
+            };
+
+            let mut json_out = String::new();
+            let mut err = None;
+            stream_lazy_keys_json(&fields, true, &mut json_out, IndentSpec::COMPACT, &mut err)
+                .unwrap();
+            err.expect("an unpaired member is not JSON");
+            assert_eq!(json_out, "[]");
+
+            let mut yaml_flow = String::new();
+            let mut err = None;
+            stream_lazy_keys_yaml(&fields, true, &mut yaml_flow, IndentSpec::COMPACT, &mut err)
+                .unwrap();
+            err.expect("an unpaired member is not JSON");
+            assert_eq!(yaml_flow, "[]");
+        }
     }
 
     /// The `yq` JSON convention (what the M2 fast path for `.field`/`.[0]`/

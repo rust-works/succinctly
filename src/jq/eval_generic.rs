@@ -2324,7 +2324,24 @@ impl<V: DocumentValue> GenericResult<V> {
                     // `Builtin::KeysUnsorted`. `sort_keys` (`-S`) is a no-op
                     // here: this is a flat array of key names, not a
                     // mapping, so there's nothing for `-S` to reorder.
-                    crate::jq::stream::stream_lazy_keys_json(fields, *collapse, out, indent)?;
+                    //
+                    // #1679: a #1194 key stops the writer mid-stream rather
+                    // than silently dropping it; whatever keys already
+                    // reached `out` stay written (same `Partial` idiom as
+                    // `owned_or_stream_error` above), and the failure
+                    // travels back via `stats.error` instead.
+                    let mut malformed_key = None;
+                    crate::jq::stream::stream_lazy_keys_json(
+                        fields,
+                        *collapse,
+                        out,
+                        indent,
+                        &mut malformed_key,
+                    )?;
+                    if let Some(e) = malformed_key {
+                        stats.error = Some(stream_error(&e));
+                        return Ok(stats);
+                    }
                 }
                 on_value(out)?;
                 stats.count = 1;
@@ -2556,7 +2573,20 @@ impl<V: DocumentValue> GenericResult<V> {
                 } else {
                     // Genuinely lazy (#685): see `stream_json`'s
                     // `LazyKeys` arm above — same reasoning, YAML target.
-                    crate::jq::stream::stream_lazy_keys_yaml(fields, *collapse, out, indent)?;
+                    // #1679: see `stream_json`'s `LazyKeys` arm above —
+                    // same reasoning.
+                    let mut malformed_key = None;
+                    crate::jq::stream::stream_lazy_keys_yaml(
+                        fields,
+                        *collapse,
+                        out,
+                        indent,
+                        &mut malformed_key,
+                    )?;
+                    if let Some(e) = malformed_key {
+                        stats.error = Some(stream_error(&e));
+                        return Ok(stats);
+                    }
                 }
                 on_value(out)?;
                 stats.count = 1;
