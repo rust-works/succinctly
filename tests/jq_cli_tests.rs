@@ -5233,17 +5233,26 @@ fn test_path_context_optional_does_not_swallow_halt_in_object_literal_arm() -> R
 
 #[test]
 fn test_compound_assign_propagates_halt_after_partial_rhs_output() -> Result<()> {
-    // `eval_rhs_once`'s `Partial(vs, _control)` arm took the RHS stream's
-    // first output and silently dropped a trailing halt, so a compound
-    // assignment whose RHS produced a value and *then* halted finished the
-    // assignment and exited 0. Verified against jq 1.7.1: `{"a":0} | .a +=
-    // (1, halt_error(3))` exits 3 with no output at all -- the halt fires
-    // while still computing the RHS, before `+=` ever produces the modified
-    // document that would otherwise be this input's one output.
+    // #1778 review: this test's own prior claim ("exits 3 with no output
+    // at all") was wrong -- re-verified live against jq 1.7.1: `{"a":0} |
+    // .a += (1, halt_error(3))` exits 3 and DOES print `{"a":1}` to
+    // stdout first (the RHS's `1` already computed a real document before
+    // the halt fired); `halt_error`'s own stderr message is the *input*
+    // to `+=` (`{"a":0}`, since `+=`'s RHS evaluates against the pristine
+    // root, not the sub-value), JSON-encoded since it isn't a string. The
+    // old `eval_rhs_once`-based implementation this test was written
+    // against instead discarded that already-computed document entirely
+    // on a trailing halt (`QueryResult::Partial(_, Control::Halt(code)) =>
+    // Err(QueryResult::Halt(code))`) -- itself a divergence from jq, just
+    // a different one than "finished and exited 0" this comment
+    // originally described. #1778's fork-based rewrite (mirroring
+    // `eval_assign`'s own already-correct partial-then-halt handling)
+    // fixes this as a side effect.
     let (stdout, stderr, code) =
         run_jq_full(&["-c", ".a += (1, halt_error(3))"], Some(r#"{"a":0}"#))?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "{\"a\":1}\n");
+    assert!(stderr.contains("{\"a\":0}"), "stderr: {stderr:?}");
     Ok(())
 }
 
