@@ -9,8 +9,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    colliding_display_key_error, effective_keys, resolve_display_key, DisplayKeyGuard,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, resolve_display_key, DisplayKeyGuard, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec,
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
@@ -358,7 +358,10 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
                 let (key, is_fallback) = field.key().key_string_kind();
                 let key = key.into_owned();
                 if !guard.check(&map, &key, is_fallback) {
-                    return Err(anyhow::anyhow!("{}", colliding_display_key_error(&key)));
+                    return Err(anyhow::anyhow!(
+                        "{}",
+                        EvalError::colliding_display_key(&key)
+                    ));
                 }
                 let value = yaml_to_owned_value(field.value_cursor())?;
                 map.insert(key, value);
