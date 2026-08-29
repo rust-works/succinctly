@@ -29,6 +29,7 @@ use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
     effective_len, key_display_string, resolve_display_key, DisplayKeyGuard, DistinctKeyCursors,
+    DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -685,14 +686,23 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
     collapse: bool,
 ) -> Result<OwnedValue, EvalError> {
     let mut keys = Vec::new();
-    for (key, _) in DistinctKeyCursors::new(fields, collapse) {
+    // #1679: mirrors `effective_keys`'s pattern exactly -- a non-string key
+    // (#1194) now raises instead of silently dropping the field, and the
+    // walk's post-exhaustion `ended_unpaired()` catches the other #1194
+    // shape (a trailing key with no paired value) that a mid-loop check
+    // alone can't see.
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (key, _) in cursors.by_ref() {
         // A key that will not *decode* is preserved via its raw source span
         // rather than raised on (#1247/#1642), matching
-        // `length`/`keys_unsorted`/`.`. A non-string key (#1194) still has
-        // no name to report and is skipped here, same as before this fix.
-        if let Some(s) = key_display_string(&key) {
-            keys.push(OwnedValue::String(s.into_owned()));
-        }
+        // `length`/`keys_unsorted`/`.`.
+        let Some(s) = key_display_string(&key) else {
+            return Err(fields.malformed_member_error());
+        };
+        keys.push(OwnedValue::String(s.into_owned()));
+    }
+    if cursors.ended_unpaired() {
+        return Err(fields.malformed_member_error());
     }
     Ok(OwnedValue::Array(keys))
 }
@@ -751,17 +761,27 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
             let mut guard = DisplayKeyGuard::default();
-            for field in fields {
+            // #1679: restructured from `for field in fields` to `uncons`
+            // so the walk can tell "ran out of fields" apart from "ran out
+            // on an unpaired child" (#1194) -- mirrors
+            // `eval_generic::to_owned_at_depth`'s identical shape.
+            let mut f = fields;
+            while let Some((field, rest)) = f.uncons() {
                 // A key that isn't a `String` token at all is *structurally*
-                // malformed and still drops the field silently -- #1194's
-                // territory, unchanged here. A key that is a string but
+                // malformed (#1194) and now raises, matching
+                // `keys()`/`effective_keys`. A key that is a string but
                 // won't decode is preserved via its raw source span rather
                 // than raised on (#1247/#1642), matching
                 // `length`/`keys_unsorted`/`.`.
-                if let Some(key) = resolve_display_key(&field.key(), &map, &mut guard)? {
-                    let value_cursor = field.value_cursor();
-                    map.insert(key, cursor_to_owned_at_depth(&value_cursor, depth + 1)?);
-                }
+                let Some(key) = resolve_display_key(&field.key(), &map, &mut guard)? else {
+                    return Err(f.malformed_member_error());
+                };
+                let value_cursor = field.value_cursor();
+                map.insert(key, cursor_to_owned_at_depth(&value_cursor, depth + 1)?);
+                f = rest;
+            }
+            if f.ends_unpaired() {
+                return Err(f.malformed_member_error());
             }
             OwnedValue::Object(map)
         }
@@ -1462,6 +1482,93 @@ mod tests {
             lazy_keys_array_to_owned(&fields, true).expect("preserved, not raised (#1642)"),
             OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
         );
+    }
+
+    /// #1679: the #1194 sibling of the #1642 test above -- a key the
+    /// format's grammar never allowed at all (a bare numeric key) has no
+    /// name to report and must raise, not silently drop the field. Before
+    /// this fix, `sjq -c 'keys_unsorted'` on `{123:1,"a":1}` returned
+    /// `["a"]` (one entry short, exit 0) while `keys`/`length` on the same
+    /// document disagreed.
+    #[test]
+    fn test_lazy_keys_array_to_owned_raises_on_non_string_key_1679() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let err =
+            lazy_keys_array_to_owned(&fields, true).expect_err("a bare numeric key is not JSON");
+        assert!(err.message.contains("expected string key"), "{err:?}");
+    }
+
+    /// #1679: the other #1194 shape -- an object whose last child has no
+    /// sibling to pair as its value. Only [`DistinctKeyCursors::ended_unpaired`]
+    /// (checked only once the walk is exhausted) can tell this apart from a
+    /// clean object with fewer keys.
+    #[test]
+    fn test_lazy_keys_array_to_owned_raises_on_unpaired_field_1679() {
+        use crate::json::JsonIndex;
+
+        for json in [&b"{invalid}"[..], &b"{\"a\"}"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let fields = match cursor.value() {
+                StandardJson::Object(fields) => fields,
+                other => panic!("expected object, got {other:?}"),
+            };
+            lazy_keys_array_to_owned(&fields, true).expect_err("an unpaired member is not JSON");
+        }
+    }
+
+    /// #1679: `cursor_to_owned_at_depth`'s `Object` arm had the identical
+    /// silent-drop shape as `lazy_keys_array_to_owned` above, reached via
+    /// `materialize`/`into_owned`'s `JqValue::Cursor` arm (`--sort-keys`/
+    /// `-C` forcing a full materialize).
+    #[test]
+    fn test_cursor_to_owned_object_raises_on_non_string_key_1679() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{123: 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val = JqValue::from_cursor(cursor);
+        let err = val
+            .materialize()
+            .expect_err("a bare numeric key is not JSON");
+        assert!(err.message.contains("expected string key"), "{err:?}");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+        let err = val
+            .into_owned()
+            .expect_err("a bare numeric key is not JSON");
+        assert!(err.message.contains("expected string key"), "{err:?}");
+    }
+
+    /// #1679: the unpaired-tail sibling of the test above.
+    #[test]
+    fn test_cursor_to_owned_object_raises_on_unpaired_field_1679() {
+        use crate::json::JsonIndex;
+
+        for json in [&b"{invalid}"[..], &b"{\"a\"}"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let val = JqValue::from_cursor(cursor);
+            val.materialize()
+                .expect_err("an unpaired member is not JSON");
+
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
+            val.into_owned()
+                .expect_err("an unpaired member is not JSON");
+        }
     }
 
     /// #1247/#1642: the same `LazyKeysArray` arms as above, reached this
