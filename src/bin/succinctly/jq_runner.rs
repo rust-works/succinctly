@@ -2954,40 +2954,16 @@ fn build_seq_values(
     locations: &mut InputLocations,
     slurp: bool,
 ) -> Vec<OwnedValue> {
-    let mut combined = String::new();
-    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
-    for (_, raw) in raw_inputs {
-        combined.push_str(raw);
-        file_ends.push(combined.len());
-    }
-
+    let (combined, file_ends) = concat_with_file_ends(raw_inputs);
     let parsed = parse_json_seq_with_ends(&combined);
 
     if !slurp {
-        let mut current: Option<(usize, LineCounter<'_>)> = None;
-        for &(_, end) in &parsed {
-            let file_idx = file_ends
-                .partition_point(|&fe| fe < end)
-                .min(file_ends.len().saturating_sub(1));
-            if current.as_ref().map(|(idx, _)| *idx) != Some(file_idx) {
-                current = Some((
-                    file_idx,
-                    LineCounter::new(raw_inputs[file_idx].1.as_bytes()),
-                ));
-            }
-            let file_start = if file_idx == 0 {
-                0
-            } else {
-                file_ends[file_idx - 1]
-            };
-            let src = raw_inputs[file_idx].0.unwrap_or(0);
-            let line = current
-                .as_mut()
-                .expect("just set above")
-                .1
-                .advance_to(end.saturating_sub(file_start));
-            locations.push(src, line);
-        }
+        remap_ends_to_locations(
+            parsed.iter().map(|&(_, end)| end),
+            raw_inputs,
+            &file_ends,
+            locations,
+        );
     }
 
     parsed.into_iter().map(|(v, _)| v).collect()
@@ -2996,26 +2972,32 @@ fn build_seq_values(
 /// Build the values and one `(source, line)` location per value for
 /// raw-input (`-R`) mode across the whole file list at once (#1809).
 ///
-/// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern: real jq's
-/// `-R` reader treats multiple files as one continuous byte stream for
-/// line-splitting too -- confirmed live against jq 1.7.1 that a file's own
-/// unterminated trailing line joins with the next file's first line, the
-/// same way `--seq` joins a boundary-split record. This can't reuse
-/// `build_seq_values` directly (RS-delimited/JSON-shaped, not
-/// newline-shaped), but reuses its exact
-/// `file_ends`/`partition_point`/[`LineCounter`] remap loop.
+/// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern (sharing
+/// its [`concat_with_file_ends`]/[`remap_ends_to_locations`] helpers
+/// directly): real jq's `-R` reader treats multiple files as one
+/// continuous byte stream for line-splitting too -- confirmed live against
+/// jq 1.7.1 that a file's own unterminated trailing line joins with the
+/// next file's first line, the same way `--seq` joins a boundary-split
+/// record. This can't reuse `parse_json_seq_with_ends` itself
+/// (RS-delimited/JSON-shaped, not newline-shaped), so it does its own `\n`
+/// scan to find each line's byte range instead.
 ///
-/// Splits on `\n` matching [`str::lines`]'s own rules (a trailing `\r` is
-/// stripped from each line's content; a trailing `\n` does not open an
-/// extra empty final line) rather than calling `str::lines()` itself, since
-/// that discards the byte offsets this needs for the remap. Attributing
-/// each line's *end* offset to a file via `LineCounter::advance_to` also
-/// fixes a real jq 1.7.1 line-number quirk single-file `-R` already had
-/// wrong: a final line with no trailing `\n` reports the *previous*
-/// completed line's number, not one past it (confirmed live: `printf
-/// 'abc\ndef' | jq -R -c '., input_line_number'` reports `1` for both
-/// lines, not `1` then `2`) -- no test previously covered this, since every
-/// existing `-R` fixture's lines were all `\n`-terminated.
+/// Splits on `\n` matching [`str::lines`]'s own rule that a trailing `\n`
+/// does not open an extra empty final line, but -- unlike `str::lines()`
+/// -- keeps a trailing `\r` as part of each line's content rather than
+/// stripping it: real jq's `-R` reader never strips `\r` either (confirmed
+/// live: `printf 'abc\r\n' | jq -R -c '.'` => `"abc\r"`, not `"abc"`). This
+/// needs its own scan rather than calling `str::lines()` regardless, since
+/// that discards the byte offsets this needs for the remap.
+///
+/// Attributing each line's *end* offset to a file via
+/// `remap_ends_to_locations` also fixes a real jq 1.7.1 line-number quirk
+/// single-file `-R` already had wrong: a final line with no trailing `\n`
+/// reports the *previous* completed line's number, not one past it
+/// (confirmed live: `printf 'abc\ndef' | jq -R -c '., input_line_number'`
+/// reports `1` for both lines, not `1` then `2`) -- no test previously
+/// covered this, since every existing `-R` fixture's lines were all
+/// `\n`-terminated.
 ///
 /// Never called under `--slurp`: `-R -s` without `--input-dsv` returns
 /// early above this point, and `-R -s --input-dsv` takes the per-file DSV
@@ -3026,12 +3008,7 @@ fn build_raw_input_values(
     raw_inputs: &[(Option<usize>, String)],
     locations: &mut InputLocations,
 ) -> Vec<OwnedValue> {
-    let mut combined = String::new();
-    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
-    for (_, raw) in raw_inputs {
-        combined.push_str(raw);
-        file_ends.push(combined.len());
-    }
+    let (combined, file_ends) = concat_with_file_ends(raw_inputs);
 
     // ((content start, content end), line's own attribution-end offset --
     // the `\n`'s own position, or `combined.len()` for a final unterminated
@@ -3049,14 +3026,73 @@ fn build_raw_input_values(
         lines.push(((start, bytes.len()), bytes.len()));
     }
 
-    let mut values = Vec::with_capacity(lines.len());
-    let mut current: Option<(usize, LineCounter<'_>)> = None;
-    for ((content_start, content_end), end) in lines {
-        let content_raw = &combined[content_start..content_end];
-        let content = content_raw.strip_suffix('\r').unwrap_or(content_raw);
+    remap_ends_to_locations(
+        lines.iter().map(|&(_, end)| end),
+        raw_inputs,
+        &file_ends,
+        locations,
+    );
 
+    lines
+        .into_iter()
+        .map(|((content_start, content_end), _)| {
+            OwnedValue::String(combined[content_start..content_end].to_string())
+        })
+        .collect()
+}
+
+/// Concatenate every file's raw content, in order, into one string,
+/// recording each file's own cumulative end offset in the result -- shared
+/// by [`build_seq_values`] and [`build_raw_input_values`], both of which
+/// treat the whole multi-file input as one continuous byte stream for
+/// their own purposes (RFC 7464 records / newline-delimited lines).
+fn concat_with_file_ends(raw_inputs: &[(Option<usize>, String)]) -> (String, Vec<usize>) {
+    let mut combined = String::new();
+    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
+    for (_, raw) in raw_inputs {
+        combined.push_str(raw);
+        file_ends.push(combined.len());
+    }
+    (combined, file_ends)
+}
+
+/// Map each `end` offset in `ends` (non-decreasing, an exclusive position
+/// within the `combined` stream `file_ends` was built from -- see
+/// [`concat_with_file_ends`]) to its owning file and file-local line
+/// number, pushing one `(source, line)` location per `end` onto
+/// `locations` in the same order. Shared by [`build_seq_values`] and
+/// [`build_raw_input_values`].
+///
+/// A value/line ending *exactly* at a file boundary is attributed to the
+/// file *starting* there, not the file ending there: `partition_point`'s
+/// `fe <= end` predicate (not `fe < end`) is what makes that call, since
+/// `file_ends[i]` is both file `i`'s own exclusive end and file `i+1`'s
+/// start offset -- an `end` equal to that offset means the byte the
+/// record/line's own trailing delimiter occupies is the *first* byte of
+/// file `i+1`, not the last byte of file `i`. Getting this wrong (an
+/// earlier version of both callers used `fe < end`) misattributes the
+/// line/record to the wrong file entirely whenever a file's sole content is
+/// the delimiter that terminates the *previous* file's unterminated
+/// trailing content -- confirmed live against jq 1.7.1 in exactly that
+/// degenerate case (three files `"abc"`, `"\n"`, `"def\n"`): both the
+/// reported line number and the `error(...)` location moved to the correct
+/// (second) file once fixed, matching jq exactly; before the fix both
+/// pointed at the first file instead.
+///
+/// `current` caches the one [`LineCounter`] in use, replaced only when
+/// `partition_point` reports a new file index -- since `end` values are
+/// non-decreasing, that index is too, so this never backtracks to a file
+/// already passed.
+fn remap_ends_to_locations(
+    ends: impl Iterator<Item = usize>,
+    raw_inputs: &[(Option<usize>, String)],
+    file_ends: &[usize],
+    locations: &mut InputLocations,
+) {
+    let mut current: Option<(usize, LineCounter<'_>)> = None;
+    for end in ends {
         let file_idx = file_ends
-            .partition_point(|&fe| fe < end)
+            .partition_point(|&fe| fe <= end)
             .min(file_ends.len().saturating_sub(1));
         if current.as_ref().map(|(idx, _)| *idx) != Some(file_idx) {
             current = Some((
@@ -3076,10 +3112,7 @@ fn build_raw_input_values(
             .1
             .advance_to(end.saturating_sub(file_start));
         locations.push(src, line);
-        values.push(OwnedValue::String(content.to_string()));
     }
-
-    values
 }
 
 /// Parse `--seq` content into values paired with each surviving segment's

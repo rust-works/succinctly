@@ -21232,6 +21232,69 @@ fn test_jq_raw_input_error_location_after_cross_file_join_1809() -> Result<()> {
     Ok(())
 }
 
+/// #1809 code review: a line ending *exactly* at a file boundary -- a file
+/// whose entire content is the single `\n` that terminates the *previous*
+/// file's unterminated trailing text -- must attribute to that middle
+/// file, not the first one. An earlier version of the fix used a
+/// `partition_point` predicate (`fe < end`) that got this one degenerate
+/// case backwards even though every other boundary case (including the
+/// non-degenerate cross-file joins above) happened to come out right.
+/// Every expectation here is jq 1.7.1's own live output.
+#[test]
+fn test_jq_raw_input_line_number_and_error_location_at_exact_file_boundary_1809() -> Result<()> {
+    let (stdout, stderr, code, _paths) = run_jq_over_files(
+        &["-R", "-c", "., input_line_number"],
+        &["abc", "\n", "def\n"],
+    )?;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abc\"\n1\n\"def\"\n1\n");
+
+    let (_, stderr, code, paths) =
+        run_jq_over_files(&["-R", "-c", "error(\"x\")"], &["abc", "\n", "def\n"])?;
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains(&format!("(at {}:1): x", paths[1])),
+        "the joined line `abc` must report the MIDDLE file (whose only \
+         content is the `\\n` terminating it), not the first: {stderr}"
+    );
+    assert!(!stderr.contains(&paths[0]), "{stderr}");
+
+    Ok(())
+}
+
+/// #1809 code review: real jq's `-R` reader never strips a trailing `\r`
+/// from a line -- it splits only on `\n`, keeping `\r` as literal content.
+/// Pinned against jq 1.7.1's own live output.
+#[test]
+fn test_jq_raw_input_preserves_trailing_cr_1809() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", "."], Some("abc\r\ndef\r\n")).expect("raw-input CRLF repro runs");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abc\\r\"\n\"def\\r\"\n");
+
+    Ok(())
+}
+
+/// #1809 code review: a single, non-multi-file `-R` input with an
+/// unterminated trailing line -- the line-number quirk the fix's own doc
+/// comment claims to have corrected, isolated from any cross-file join.
+/// Pinned against jq 1.7.1's own live output.
+#[test]
+fn test_jq_raw_input_line_number_unterminated_single_file_1809() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-R", "-c", "., input_line_number"], Some("abc\ndef"))
+            .expect("raw-input single-file repro runs");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abc\"\n1\n\"def\"\n1\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-R", "-c", "., input_line_number"], Some("abc"))
+        .expect("raw-input single unterminated line repro runs");
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "\"abc\"\n0\n");
+
+    Ok(())
+}
+
 /// #1088: `path()` reports a numeric component as the key *was*, not as the
 /// index it resolves to.
 ///
