@@ -12,9 +12,7 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{
-    cargo_run_features, classify_cargo_run_exit, exit_code_or_signal_death, MAX_CARGO_RETRIES,
-};
+use cargo_run_exit::exit_code_or_signal_death;
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -371,39 +369,24 @@ fn test_file_not_found() -> Result<()> {
 
 /// Runs `json validate` over multiple files via `cargo run` (needed so this
 /// test still builds from source rather than requiring a pre-built binary),
-/// retrying on the same transient conditions `run_jq_file`
-/// (`tests/jq_cli_tests.rs`) does: exit 101 from concurrent `cargo build`
-/// lock contention, or a signal death under that same load (#1691 code
-/// review -- these two tests originally had no retry loop at all, unlike
-/// every other `cargo run`-spawning helper in this codebase).
+/// via `succinctly_bin()` (#1847), like every other helper in this file --
+/// this used to be the one holdout still spawning a second `cargo run`
+/// subprocess, which orphans the real `succinctly` grandchild (reparented
+/// to init, blocked forever on its now-unreadable stdout pipe) the moment
+/// anything kills the outer `cargo test` process group (`cargo-guard.sh`
+/// does this by design on a detected stall, #935). No retry loop needed
+/// either: `succinctly_bin()`'s compile-time path isn't a second cargo
+/// invocation that can hit lock contention (exit 101), unlike the removed
+/// `classify_cargo_run_exit` path this used to need.
 fn run_json_validate_via_cargo(files: &[&std::path::Path]) -> Result<i32> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                cargo_run_features(),
-                "--bin",
-                "succinctly",
-                "--",
-                "json",
-                "validate",
-            ])
-            .args(files)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()?;
+    let output = Command::new(succinctly_bin())
+        .args(["json", "validate"])
+        .args(files)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let Some(exit_code) =
-            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
-        else {
-            std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        };
-        return Ok(exit_code);
-    }
-    unreachable!()
+    exit_code_or_signal_death(output.status, &output.stderr)
 }
 
 #[test]

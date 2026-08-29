@@ -5,44 +5,28 @@
 
 use anyhow::Result;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{
-    cargo_run_features, classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES,
-};
+use cargo_run_exit::signal_death_error;
 
-/// Helper to run a CLI command and capture its output
+/// Helper to run a CLI command and capture its output. A thin wrapper over
+/// `run_cli_bin`'s own already-correct approach (#1847): this used to spawn
+/// a *second* `cargo run` subprocess, which orphans the real `succinctly`
+/// grandchild -- reparented to init, blocked forever on its now-unreadable
+/// stdout pipe -- the moment anything kills the outer `cargo test` process
+/// group (`cargo-guard.sh` does this by design on a detected stall, #935).
+/// `CARGO_BIN_EXE_succinctly` needs no retry loop either: it's a
+/// compile-time path to the binary this very test binary's own build
+/// already produced, not a second cargo invocation that can hit lock
+/// contention (`MAX_CARGO_RETRIES`/`classify_cargo_run_exit` accordingly
+/// dropped, not just unused).
 fn run_cli(args: &[&str]) -> Result<String> {
-    for attempt in 0..MAX_CARGO_RETRIES {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--features",
-                cargo_run_features(),
-                "--bin",
-                "succinctly",
-                "--",
-            ])
-            .args(args)
-            .output()?;
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let Some(exit_code) =
-            classify_cargo_run_exit(output.status, &stderr, attempt, MAX_CARGO_RETRIES)?
-        else {
-            std::thread::sleep(Duration::from_millis(100 * (attempt as u64 + 1)));
-            continue;
-        };
-
-        if exit_code != 0 {
-            anyhow::bail!("Command failed: {stderr}");
-        }
-
-        return Ok(String::from_utf8(output.stdout)?);
+    let (stdout, stderr, exit_code) = run_cli_bin(args)?;
+    if exit_code != 0 {
+        anyhow::bail!("Command failed: {stderr}");
     }
-    unreachable!()
+    Ok(stdout)
 }
 
 #[test]
