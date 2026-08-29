@@ -1890,29 +1890,32 @@ fn get_inputs(
     // Process based on input mode
     let mut values = Vec::new();
 
-    // `--seq` (RFC 7464, #1571): a record's bytes can genuinely span a file
-    // boundary -- real jq's own reader treats every file as one continuous
-    // byte stream for parsing purposes (unrelated to whether `-s` is also
-    // passed: `-s` only changes what happens to the *values* afterward, not
-    // how records are delimited), so this handles the whole file list at
-    // once via [`build_seq_values`] rather than per file inside the loop
-    // below. The other three modes keep the per-file loop unchanged for now:
-    // plain JSON's `find_json_values`/`parse_json_stream` never had a
-    // record delimiter to lose in the first place (multiple JSON files are
-    // just independent value streams concatenated in the output, with no
-    // boundary-spanning-record concept to get wrong), and DSV rows are
-    // line-oriented and unverified either way. Raw-input (`-R`) is NOT
-    // actually safe from this class of bug -- confirmed live against
-    // pinned jq 1.7.1 that `-R`'s reader joins a file's own unterminated
-    // trailing line with the next file's first line the same way `--seq`
-    // joins a boundary-split record, which succinctly's own per-file
-    // `raw.lines()` loop below does not (#1809, filed rather than fixed
-    // here to keep this PR scoped to `--seq`).
+    // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
+    // genuinely join content across a file boundary -- real jq's own
+    // reader treats every file as one continuous byte stream for parsing
+    // purposes (unrelated to whether `-s` is also passed: `-s` only
+    // changes what happens to the *values* afterward, not how records/lines
+    // are delimited) -- so both handle the whole file list at once via
+    // [`build_seq_values`]/[`build_raw_input_values`] rather than per file
+    // inside the loop below. Plain JSON keeps the per-file loop unchanged:
+    // `find_json_values`/`parse_json_stream` never had a record delimiter
+    // to lose in the first place (multiple JSON files are just independent
+    // value streams concatenated in the output, with no
+    // boundary-spanning-value concept to get wrong). DSV rows are
+    // line-oriented and unverified either way (no jq DSV oracle to check
+    // against), so they also keep the per-file loop -- including when
+    // combined with `-R` (`args.raw_input && args.input_dsv.is_some()`),
+    // which the DSV branch inside the loop already takes over first.
     if args.seq && !args.raw_input && args.input_dsv.is_none() {
         values = build_seq_values(&raw_inputs, &mut locations, args.slurp);
         if !args.slurp {
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
+    } else if args.raw_input && args.input_dsv.is_none() {
+        // Never reached with `args.slurp`: `-R -s` without `--input-dsv`
+        // already returned early above this point.
+        values = build_raw_input_values(&raw_inputs, &mut locations);
+        debug_assert_eq!(locations.len(), values.len(), "one location per value");
     } else {
         for (file_idx, raw) in raw_inputs {
             let src = file_idx.unwrap_or(0);
@@ -1932,18 +1935,6 @@ fn get_inputs(
                     }
                 }
                 values.extend(parsed);
-            } else if args.raw_input {
-                // Raw input: each line becomes a string. Deliberately ungated by
-                // `!args.slurp` (#1541), unlike its three siblings above/below --
-                // `args.raw_input && args.slurp` can only reach this arm when
-                // `args.input_dsv` is also set (otherwise the dedicated `-R -s`
-                // early return above already handled it), and the DSV check is
-                // tried first in this `if`/`else if` chain, so it always wins:
-                // this arm is unreachable whenever `args.slurp` is true.
-                for (line_idx, line) in raw.lines().enumerate() {
-                    values.push(OwnedValue::String(line.to_string()));
-                    locations.push(src, line_idx + 1);
-                }
             } else {
                 // JSON input: validate first if --validate is set
                 if args.validate {
@@ -3000,6 +2991,95 @@ fn build_seq_values(
     }
 
     parsed.into_iter().map(|(v, _)| v).collect()
+}
+
+/// Build the values and one `(source, line)` location per value for
+/// raw-input (`-R`) mode across the whole file list at once (#1809).
+///
+/// Mirrors [`build_seq_values`]'s concatenate-then-remap pattern: real jq's
+/// `-R` reader treats multiple files as one continuous byte stream for
+/// line-splitting too -- confirmed live against jq 1.7.1 that a file's own
+/// unterminated trailing line joins with the next file's first line, the
+/// same way `--seq` joins a boundary-split record. This can't reuse
+/// `build_seq_values` directly (RS-delimited/JSON-shaped, not
+/// newline-shaped), but reuses its exact
+/// `file_ends`/`partition_point`/[`LineCounter`] remap loop.
+///
+/// Splits on `\n` matching [`str::lines`]'s own rules (a trailing `\r` is
+/// stripped from each line's content; a trailing `\n` does not open an
+/// extra empty final line) rather than calling `str::lines()` itself, since
+/// that discards the byte offsets this needs for the remap. Attributing
+/// each line's *end* offset to a file via `LineCounter::advance_to` also
+/// fixes a real jq 1.7.1 line-number quirk single-file `-R` already had
+/// wrong: a final line with no trailing `\n` reports the *previous*
+/// completed line's number, not one past it (confirmed live: `printf
+/// 'abc\ndef' | jq -R -c '., input_line_number'` reports `1` for both
+/// lines, not `1` then `2`) -- no test previously covered this, since every
+/// existing `-R` fixture's lines were all `\n`-terminated.
+///
+/// Never called under `--slurp`: `-R -s` without `--input-dsv` returns
+/// early above this point, and `-R -s --input-dsv` takes the per-file DSV
+/// branch instead (DSV is checked first in that loop's `if`/`else`), so
+/// `args.raw_input && args.input_dsv.is_none()` -- this function's own
+/// call-site guard -- can only be reached with `slurp == false`.
+fn build_raw_input_values(
+    raw_inputs: &[(Option<usize>, String)],
+    locations: &mut InputLocations,
+) -> Vec<OwnedValue> {
+    let mut combined = String::new();
+    let mut file_ends: Vec<usize> = Vec::with_capacity(raw_inputs.len());
+    for (_, raw) in raw_inputs {
+        combined.push_str(raw);
+        file_ends.push(combined.len());
+    }
+
+    // ((content start, content end), line's own attribution-end offset --
+    // the `\n`'s own position, or `combined.len()` for a final unterminated
+    // line).
+    let mut lines: Vec<((usize, usize), usize)> = Vec::new();
+    let bytes = combined.as_bytes();
+    let mut start = 0usize;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines.push(((start, idx), idx));
+            start = idx + 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(((start, bytes.len()), bytes.len()));
+    }
+
+    let mut values = Vec::with_capacity(lines.len());
+    let mut current: Option<(usize, LineCounter<'_>)> = None;
+    for ((content_start, content_end), end) in lines {
+        let content_raw = &combined[content_start..content_end];
+        let content = content_raw.strip_suffix('\r').unwrap_or(content_raw);
+
+        let file_idx = file_ends
+            .partition_point(|&fe| fe < end)
+            .min(file_ends.len().saturating_sub(1));
+        if current.as_ref().map(|(idx, _)| *idx) != Some(file_idx) {
+            current = Some((
+                file_idx,
+                LineCounter::new(raw_inputs[file_idx].1.as_bytes()),
+            ));
+        }
+        let file_start = if file_idx == 0 {
+            0
+        } else {
+            file_ends[file_idx - 1]
+        };
+        let src = raw_inputs[file_idx].0.unwrap_or(0);
+        let line = current
+            .as_mut()
+            .expect("just set above")
+            .1
+            .advance_to(end.saturating_sub(file_start));
+        locations.push(src, line);
+        values.push(OwnedValue::String(content.to_string()));
+    }
+
+    values
 }
 
 /// Parse `--seq` content into values paired with each surviving segment's
