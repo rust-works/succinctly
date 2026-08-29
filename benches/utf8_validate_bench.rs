@@ -14,6 +14,13 @@
 //!   whose ASCII-run/multi-byte mix the synthetic generators do not reproduce
 //!
 
+// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
+// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
+// `eval_generic`) -- every call site here sizes from a single collection's
+// own length (or a length-times-constant) and was never part of that bug
+// shape.
+#![allow(clippy::disallowed_methods)]
+
 //! ## Sizes
 //!
 //! Benchmarks run at multiple sizes to show scaling characteristics:

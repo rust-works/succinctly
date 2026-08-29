@@ -4,6 +4,11 @@
 //! implementing the `DocumentValue` trait, enabling direct evaluation of both
 //! JSON and YAML without intermediate conversion.
 
+// #1670: see `eval.rs`'s own copy of this attribute for the full
+// rationale. Use `crate::jq::eval::vec_with_capacity`/`string_with_capacity`
+// for a legitimate single-length site here.
+#![warn(clippy::disallowed_methods)]
+
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
@@ -33,8 +38,8 @@ use super::eval::{
     extract_pattern_bindings, format_owned, index_one_owned as index_owned_by_key,
     literal_to_owned, needs_path_context, numeric_key_to_index, owned_bound_to_i64,
     owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
-    substitute_vars, tonumber_from_str, try_reserve_product, Control, Demand, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
+    substitute_vars, tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -1101,7 +1106,7 @@ impl<V: DocumentValue> LazySeq<V> {
     fn fold_one(&self, elem: LazyElem<V>) -> Result<Vec<LazyElem<V>>, Control> {
         let mut items = vec![elem];
         for instr in self.instructions.iter() {
-            let mut next_items = Vec::with_capacity(items.len());
+            let mut next_items = vec_with_capacity(items.len());
             for item in items {
                 next_items.extend(into_lazy_items(Self::eval_one(instr, item))?);
             }
@@ -1144,7 +1149,7 @@ impl<V: DocumentValue> LazySeq<V> {
     /// diagnostic).
     pub fn materialize_atomic(self) -> Result<OwnedValue, Control> {
         let items = self.drain_atomic()?;
-        let mut out = Vec::with_capacity(items.len());
+        let mut out = vec_with_capacity(items.len());
         for item in &items {
             out.push(lazy_elem_to_owned(item).map_err(Control::Error)?);
         }
@@ -2883,7 +2888,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // computed value).
             GenericResult::ManyCursor(cs) => {
                 let rest = Expr::Pipe(stages[j..].to_vec());
-                let mut per_element = Vec::with_capacity(cs.len());
+                let mut per_element = vec_with_capacity(cs.len());
                 for c in cs {
                     match eval_single::<S, _>(&rest, c.value(), optional, Some(c)) {
                         // The elements already piped through no
@@ -5757,7 +5762,7 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
         // generator's own control, the same priority a mid-pull `stray`
         // took before this batch conversion existed.
         Flow::Escaped(control) => {
-            let mut owned = Vec::with_capacity(out.len());
+            let mut owned = vec_with_capacity(out.len());
             let mut decode_err = None;
             for item in out {
                 match generic_item_into_owned(item) {
@@ -5906,7 +5911,7 @@ fn items_to_generic_result<V: DocumentValue>(
         .iter()
         .all(|item| matches!(item, GenericItem::OneCursorValue(_, _)))
     {
-        let mut owned = Vec::with_capacity(items.len());
+        let mut owned = vec_with_capacity(items.len());
         for item in items {
             let GenericItem::OneCursorValue(_, v) = item else {
                 unreachable!("checked by the all() above")
@@ -5931,7 +5936,7 @@ fn items_to_generic_result<V: DocumentValue>(
             .collect();
         return Ok(cursor_vec_to_generic_result(cursors));
     }
-    let mut owned = Vec::with_capacity(items.len());
+    let mut owned = vec_with_capacity(items.len());
     for item in items {
         match generic_item_into_owned(item) {
             Ok(v) => owned.push(v),
@@ -6849,9 +6854,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         return GenericResult::Owned(OwnedValue::Array(vec![]));
                     }
 
-                    let mut result = Vec::with_capacity(max_len);
+                    let mut result = vec_with_capacity(max_len);
                     for col_idx in 0..max_len {
-                        let mut column = Vec::with_capacity(items.len());
+                        let mut column = vec_with_capacity(items.len());
                         for item in &items {
                             if let OwnedValue::Array(arr) = item {
                                 column.push(arr.get(col_idx).cloned().unwrap_or(OwnedValue::Null));
@@ -6877,7 +6882,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
                     let mut result_obj = IndexMap::new();
                     for key in &all_keys {
-                        let mut values = Vec::with_capacity(items.len());
+                        let mut values = vec_with_capacity(items.len());
                         for item in &items {
                             if let OwnedValue::Object(obj) = item {
                                 values.push(obj.get(key).cloned().unwrap_or(OwnedValue::Null));

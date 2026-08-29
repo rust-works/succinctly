@@ -5,6 +5,13 @@
 //! - Various tree depths and sizes
 //! - find_close, find_open, enclose operations
 
+// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
+// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
+// `eval_generic`) -- every call site here sizes from a single collection's
+// own length (or a length-times-constant) and was never part of that bug
+// shape.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;

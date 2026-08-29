@@ -2,6 +2,14 @@
 //!
 //! Evaluates expressions against JSON using the cursor-based navigation API.
 
+// #1670: re-enable the crate-wide-`allow`d `disallowed_methods` lint here
+// (see `clippy.toml` and `src/lib.rs`) -- every known instance of the
+// unguarded-product-allocation bug shape (#1017/#1612/#1634/#1669) has
+// been in this file. Use `vec_with_capacity`/`string_with_capacity` for a
+// legitimate single-length site, `try_reserve_product`/
+// `try_reserve_product_labeled` for an actual product of lengths.
+#![warn(clippy::disallowed_methods)]
+
 #[cfg(not(test))]
 use alloc::borrow::Cow;
 #[cfg(not(test))]
@@ -4196,7 +4204,7 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     let mut left_bools = Vec::new();
     let left_control = push_truthiness(eval_operand(left), &mut left_bools);
 
-    let mut out = Vec::with_capacity(left_bools.len());
+    let mut out = vec_with_capacity(left_bools.len());
     for left_bool in left_bools {
         if left_bool == short_circuit {
             out.push(short_circuit);
@@ -6086,7 +6094,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // doesn't just truncate a Float key the way jq does.
     let key_idx = numeric_key_to_array_index::<S>(&key_owned);
 
-    let mut results: Vec<OwnedValue> = Vec::with_capacity(candidates.len());
+    let mut results: Vec<OwnedValue> = vec_with_capacity(candidates.len());
     let mut check_escape: Option<EvalEscape> = None;
     for obj_owned in candidates {
         match (&key_owned, &obj_owned) {
@@ -8950,7 +8958,7 @@ fn format_uri<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<S
     // ASCII, which is a boundary by construction.
     const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     let bytes = s.as_bytes();
-    let mut result = String::with_capacity(bytes.len());
+    let mut result = string_with_capacity(bytes.len());
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -9059,7 +9067,7 @@ fn format_urid<S: EvalSemantics>(value: &OwnedValue, optional: bool) -> Result<S
     // sequence -- corrupting both literal pass-through bytes and genuinely
     // percent-decoded ones. Collecting into a byte buffer and converting
     // once at the end round-trips non-ASCII input correctly.
-    let mut result = Vec::with_capacity(s.len());
+    let mut result = vec_with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -9395,7 +9403,7 @@ fn format_base64d<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq {
         let bytes = trimmed.as_bytes();
         let mut result = Vec::new();
-        let mut quantum: Vec<u8> = Vec::with_capacity(4);
+        let mut quantum: Vec<u8> = vec_with_capacity(4);
         let mut finished = false;
         let mut i = 0;
 
@@ -9572,7 +9580,7 @@ fn format_html<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<
     // continuation bytes (always >= 0x80) never collide with them, and a run
     // of bytes between matches can be copied in one `push_str` (#124).
     let bytes = s.as_bytes();
-    let mut result = String::with_capacity(bytes.len());
+    let mut result = string_with_capacity(bytes.len());
     let mut start = 0;
     for (i, &b) in bytes.iter().enumerate() {
         let entity = match b {
@@ -9887,7 +9895,7 @@ fn yaml_quote_string(s: &str) -> String {
 
     if needs_quoting {
         // Use double quotes and escape special characters
-        let mut result = String::with_capacity(s.len() + 2);
+        let mut result = string_with_capacity(s.len() + 2);
         result.push('"');
         for c in s.chars() {
             match c {
@@ -12250,7 +12258,7 @@ fn build_match_object(
 /// not just match(;"g")).
 #[cfg(feature = "regex")]
 fn stitch_split(input: &str, matches: &[regex::Captures]) -> Vec<String> {
-    let mut parts = Vec::with_capacity(matches.len() + 1);
+    let mut parts = vec_with_capacity(matches.len() + 1);
     let mut last_end = 0;
     for caps in matches {
         let m = caps
@@ -12381,7 +12389,7 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     matches: &[regex::Captures],
     optional: bool,
 ) -> Result<Vec<String>, QueryResult<'a, W>> {
-    let mut cells: Vec<Vec<String>> = Vec::with_capacity(matches.len());
+    let mut cells: Vec<Vec<String>> = vec_with_capacity(matches.len());
     let mut last_end = 0;
     for caps in matches {
         let m = caps
@@ -12389,7 +12397,7 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             .expect("capture group 0 is always present on a match");
         let outputs = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
         let gap = &input[last_end..m.start()];
-        let mut cell = Vec::with_capacity(outputs.len());
+        let mut cell = vec_with_capacity(outputs.len());
         for replacement in outputs {
             cell.push(combine_sub_gap::<W, S>(gap, replacement)?);
         }
@@ -12404,7 +12412,7 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let tail = &input[last_end..];
     Ok((0..rows)
         .map(|row| {
-            let mut out = String::with_capacity(input.len());
+            let mut out = string_with_capacity(input.len());
             for cell in &cells {
                 if let Some(piece) = cell.get(row) {
                     out.push_str(piece);
@@ -12488,7 +12496,7 @@ fn combine_sub_gap<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
         }
     };
-    let mut combined = String::with_capacity(gap.len() + replacement_text.len());
+    let mut combined = string_with_capacity(gap.len() + replacement_text.len());
     combined.push_str(gap);
     combined.push_str(&replacement_text);
     Ok(combined)
@@ -12868,7 +12876,7 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             if matches.is_empty() {
                 return QueryResult::Owned(OwnedValue::String(input));
             }
-            let mut out = String::with_capacity(input.len());
+            let mut out = string_with_capacity(input.len());
             let mut last_end = 0;
             for caps in &matches {
                 let m = caps
@@ -13094,7 +13102,7 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
             let (raw_flags_values, trailing) =
                 stream_outputs(eval_single::<W, S>(flags_expr, value.clone(), optional));
             let mut resolved_pattern: Option<String> = None;
-            let mut flags = Vec::with_capacity(raw_flags_values.len());
+            let mut flags = vec_with_capacity(raw_flags_values.len());
             for raw_flags in raw_flags_values {
                 match resolve_concat_flags::<S>(raw_pattern.clone(), raw_flags, concat) {
                     Ok((p, f)) => {
@@ -14069,6 +14077,26 @@ fn format_product(factors: &[usize]) -> String {
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join(" * ")
+}
+
+/// Allocate a `Vec` sized from exactly one collection's own length --
+/// never a product of independently-controlled lengths. This file and
+/// `eval_generic.rs` re-enable `clippy::disallowed_methods` on the raw
+/// `Vec::with_capacity` (see `clippy.toml`) so a *future* unguarded
+/// cross-product allocation (the #1017/#1612/#1634/#1669 bug shape)
+/// stands out as a disallowed raw call instead of blending in among the
+/// many legitimate single-length sites here; call this for the legitimate
+/// case, or [`try_reserve_product`]/[`try_reserve_product_labeled`] for an
+/// actual product of lengths (#1670).
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn vec_with_capacity<T>(len: usize) -> Vec<T> {
+    Vec::with_capacity(len)
+}
+
+/// [`vec_with_capacity`], for `String` (#1670).
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn string_with_capacity(len: usize) -> String {
+    String::with_capacity(len)
 }
 
 fn cannot_reserve_cross_product(factors: &[usize]) -> EvalError {
@@ -15588,7 +15616,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let last = paths.len().saturating_sub(1);
     let rhs_last = rhs_values.len() - 1;
-    let mut docs: Vec<OwnedValue> = Vec::with_capacity(rhs_values.len());
+    let mut docs: Vec<OwnedValue> = vec_with_capacity(rhs_values.len());
     for (j, mut new_value) in rhs_values.into_iter().enumerate() {
         // Every output but the last needs its own copy of `pristine`; the
         // last can just take it (nothing reads `pristine` after the loop),
@@ -16351,7 +16379,7 @@ struct SliceSplit {
 /// their own scan (the first for the first `Slice`, the second for the
 /// first non-terminal `Iterate`).
 fn flatten_path_components(exprs: &[Expr]) -> Vec<Expr> {
-    let mut flat = Vec::with_capacity(exprs.len());
+    let mut flat = vec_with_capacity(exprs.len());
     for e in exprs {
         push_path_components(&mut flat, e);
     }
@@ -17515,7 +17543,7 @@ impl PathPrefix {
     /// `Vec<Expr>`, root-to-leaf order. Paid once per branch, only where a
     /// flat path is actually required.
     fn to_vec(&self) -> Vec<Expr> {
-        let mut out = Vec::with_capacity(self.depth());
+        let mut out = vec_with_capacity(self.depth());
         let mut cur = self;
         while let Self::Node {
             parent, component, ..
@@ -18681,7 +18709,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             // An entirely empty `values` still falls through to
             // `resolve_leaf`, which already agrees with jq there
             // (`path(getpath(empty))` is no output in both).
-            let mut branches = Vec::with_capacity(values.len());
+            let mut branches = vec_with_capacity(values.len());
             let mut arg_escape: Option<EvalEscape> = None;
             if !values.is_empty() {
                 // Every failure inside this loop leaves via `arg_escape` +
@@ -21054,7 +21082,7 @@ fn apply_static_tail<'a, S: EvalSemantics>(
     branches: Vec<PathBranch<'a>>,
     tail: &[Expr],
 ) -> PathResolveResult<'a> {
-    let mut out = Vec::with_capacity(branches.len());
+    let mut out = vec_with_capacity(branches.len());
     for PathBranch {
         path: prefix,
         value: current,
@@ -21485,7 +21513,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         branches: Vec<PathBranch<'_>>,
         near_iterate: bool,
     ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
-        let mut kept = Vec::with_capacity(branches.len());
+        let mut kept = vec_with_capacity(branches.len());
         for branch in branches {
             if !branch.trackable {
                 let error = if near_iterate {
@@ -24333,7 +24361,7 @@ fn walk_impl_at_depth<S: EvalSemantics>(
     assert_value_tree_depth(depth);
     let processed = match value {
         OwnedValue::Array(arr) => {
-            let mut new_arr = Vec::with_capacity(arr.len());
+            let mut new_arr = vec_with_capacity(arr.len());
             for v in arr {
                 let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
                 new_arr.extend(vs);
@@ -25736,7 +25764,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // "rest is empty" fast path never fires here -- it degenerates
             // to exactly the `eval_pipe_with_path_context_internal` call
             // `map(f)` needs, no separate helper required.
-            let mut results = Vec::with_capacity(match value {
+            let mut results = vec_with_capacity(match value {
                 OwnedValue::Array(arr) => arr.len(),
                 OwnedValue::Object(entries) => entries.len(),
                 _ => 0,
@@ -27663,7 +27691,7 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
             // .[1:3])` is `[4]`, and a slice naming the same element as a bare
             // index deletes it once — `delpaths([[1],[{"start":1,"end":2}]])`
             // is `[1,3,4]`.
-            let mut indices: Vec<usize> = Vec::with_capacity(keys.len());
+            let mut indices: Vec<usize> = vec_with_capacity(keys.len());
             for key in keys {
                 match key {
                     OwnedValue::Object(desc) => {
@@ -33089,7 +33117,7 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
         .unwrap_or(0);
 
     // Build transposed result
-    let mut result = Vec::with_capacity(max_len);
+    let mut result = vec_with_capacity(max_len);
     for i in 0..max_len {
         let mut row = Vec::new();
         for inner in &inner_arrays {
@@ -33610,9 +33638,9 @@ fn pivot_arrays<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResul
     }
 
     // Build transposed array
-    let mut result = Vec::with_capacity(max_len);
+    let mut result = vec_with_capacity(max_len);
     for col_idx in 0..max_len {
-        let mut column = Vec::with_capacity(items.len());
+        let mut column = vec_with_capacity(items.len());
         for item in items {
             if let OwnedValue::Array(arr) = item {
                 // Get element at col_idx, or null if missing
@@ -33644,7 +33672,7 @@ fn pivot_objects<'a, W: Clone + AsRef<[u64]>>(items: &[OwnedValue]) -> QueryResu
     // Build result object with arrays for each key
     let mut result = IndexMap::new();
     for key in &all_keys {
-        let mut values = Vec::with_capacity(items.len());
+        let mut values = vec_with_capacity(items.len());
         for item in items {
             if let OwnedValue::Object(obj) = item {
                 values.push(obj.get(key).cloned().unwrap_or(OwnedValue::Null));

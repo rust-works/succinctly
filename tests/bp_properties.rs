@@ -6,6 +6,13 @@
 //! - RangeMin matches linear scan
 //! - Tree navigation consistency
 
+// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
+// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
+// `eval_generic`) -- every call site here sizes from a single collection's
+// own length (or a length-times-constant) and was never part of that bug
+// shape.
+#![allow(clippy::disallowed_methods)]
+
 use proptest::prelude::*;
 use succinctly::bp::{self, BalancedParens};
 

@@ -3,6 +3,13 @@
 //! Measures the performance of `find_json_escape` which uses SIMD to find bytes
 //! that need JSON escaping (", \, or control characters 0x00-0x1F).
 
+// #1670: `clippy.toml`'s `disallowed-methods` bans a bare `Vec`/`String`
+// `with_capacity` crate-wide (re-enabled only in `succinctly::jq::eval`/
+// `eval_generic`) -- every call site here sizes from a single collection's
+// own length (or a length-times-constant) and was never part of that bug
+// shape.
+#![allow(clippy::disallowed_methods)]
+
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 use succinctly::yaml::simd::find_json_escape;
