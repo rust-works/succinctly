@@ -667,7 +667,7 @@ its M2 fast path shares `stream_cursor!` with stdout, so an M2-eligible `map` ke
 and style through `-i` too — #1349 is about the `--inplace` **DOM fallback**, which a
 non-M2-eligible filter still reaches.
 
-### An untracked `Expr::Comma` branch — resolved for `path()`/`=`/`|=`, still open for `del()`
+### An untracked terminal path branch — resolved for `path()`/`=`/`|=`/compound-assigns, still open for `del()` and for trailing navigation
 
 [#1764](https://github.com/rust-works/succinctly/issues/1764): `reject_untracked_at_terminal`
 (`eval.rs`) is the shared check answering "is a `path()`/`del()`/`=`/`|=` branch that resolved
@@ -675,9 +675,9 @@ to a *computed* value, rather than a real navigation, actually an error" — jq'
 always yes (`Invalid path expression with result <v>`), and this check used to raise
 unconditionally for both modes.
 
-Real yq's answer for `path()`/`=`/`|=` is no: an untracked comma branch is a silent no-op,
-and every *other* branch is still written normally, regardless of the untracked branch's
-position or how it was produced:
+Real yq's answer for `path()`/`=`/`|=`/the compound-assign operators (`+=`/`-=`/`*=`; yq has
+no `/=`/`%=`/`//=` syntax at all to check against) is no: an untracked terminal branch is a
+silent no-op, and every *other* branch is still written normally, regardless of position:
 
 ```bash
 $ echo 'a: 1
@@ -688,7 +688,22 @@ b: 2' | succinctly yq '(.a, 1) = 5'   # matches, was: Error: Invalid path expres
 
 Confirmed position-independent (untracked first, middle, or last; all-branches-untracked;
 a computed value from an arbitrary expression rather than a bare literal) — every case gives
-the same "skip the untracked branch, write every other one" result.
+the same "skip the untracked branch, write every other one" result. **Not specific to a
+multi-branch `Expr::Comma` despite the check's own name**: a single bare untracked
+expression with no comma at all is the identical no-op —
+`(1) = 5` on `{a: 1}` leaves it unchanged too. A genuine error/break/halt produced *while
+computing* what would otherwise be an untracked value is not itself untracked and still
+propagates normally: `(.a, error("boom")) = 5` still raises `boom`.
+
+**Only the terminal position is fixed.** An untracked branch followed by *further
+navigation* — `(.a, 1 | .[]) = 5`, still real yq's own no-op — never reaches
+`reject_untracked_at_terminal` at all: `resolve_node`'s own `Expr::Iterate` arm (and
+`resolve_index_expr`'s analogous dynamic-key check) each raise independently and
+unconditionally before a branch gets anywhere near the terminal check. Fixing that needs
+`is_del`-equivalent awareness threaded into `resolve_node`, a 21-call-site function with its
+own scattered, independently jq-mode-verified checks — a materially larger and riskier
+surface than this fix's single terminal-position check, so left open rather than guessed at
+here. Tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868).
 
 **`del()` does not share this model and is deliberately excluded from the fix.** Its real
 behaviour, confirmed live across argument-order permutations, is order-*dependent* in a way
