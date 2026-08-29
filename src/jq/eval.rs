@@ -38,7 +38,8 @@ use core::cell::Cell;
 use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
-    effective_fields, effective_len, resolve_display_key, DisplayKeyGuard, DocumentFields,
+    effective_fields, effective_keys, effective_len, resolve_display_key, DisplayKeyGuard,
+    DocumentFields,
 };
 // Only consumed by `yaml_value_to_owned_checked`, which is itself
 // `#[cfg(feature = "std")]`-gated (`load()`'s YAML path) -- gated
@@ -5985,10 +5986,10 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Object(fields) => {
-            // #1829: delegates to `DocumentFields::keys()` (`document.rs`,
-            // already implemented for `JsonFields`) rather than a fourth
-            // hand-rolled copy of the same uncons/key_display_string/
-            // ends_unpaired walk (`document.rs`'s own default, this file's
+            // #1829: delegates to `effective_keys` (`document.rs`) rather
+            // than a fourth hand-rolled copy of the uncons/
+            // key_display_string/ends_unpaired walk (`document.rs`'s own
+            // `DocumentFields::keys()` default, this file's
             // `to_owned_checked_at_depth`, and an earlier draft of this very
             // function). Closes two gaps this function used to have on its
             // own: a decode-failure key is now preserved via its raw source
@@ -5999,7 +6000,25 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             // `,`/`:` delimiter (#1677) now raises too, closing a gap that
             // `to_owned_checked_at_depth` still has (out of scope for this
             // fix to touch there; noted, not silently left stale).
-            let mut keys = match DocumentFields::keys(&fields) {
+            //
+            // Not `DocumentFields::keys()` (that trait method's own
+            // default): code review found it walks via `uncons`, which
+            // materializes every field's *value* -- the same #1514 cost
+            // this function has no use for and `eval_generic.rs`'s own
+            // `keys_unsorted` writer specifically avoids via
+            // `DistinctKeyCursors`/`uncons_key`. `effective_keys` is that
+            // same cheap path, exposed as a free function for exactly this
+            // kind of caller. `collapse: false` matches this function's own
+            // prior behaviour on both sides of this fix (never collapsed a
+            // duplicate key, in either mode) -- `builtin_keys` has no
+            // `S: EvalSemantics` parameter to derive a mode-correct
+            // `S::COLLAPSE_DUPLICATE_KEYS` from, and real jq *does* collapse
+            // (confirmed live: `{"a":1,"a":2} | keys_unsorted` is `["a"]`).
+            // That divergence predates this fix on both the old hand-rolled
+            // walk and `DocumentFields::keys()` alike, so it isn't
+            // reintroduced or newly widened here -- tracked separately
+            // rather than folded into this fix's own narrower scope.
+            let mut keys = match effective_keys(&fields, false) {
                 Ok(keys) => keys,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -41101,11 +41120,31 @@ mod tests {
         query!(doc, "length",
             QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 2)
         );
+        // The fallback spelling itself is pinned, not just the count: a
+        // regression that replaced the decode-failure key with `""`, a
+        // placeholder, or an accidental duplicate of `"a"` would still pass
+        // a length-2 check alone.
         query!(doc, "keys_unsorted",
-            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 2)
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::String("\u{FFFD}\u{FFFD}".to_string()),
+                        OwnedValue::String("a".to_string()),
+                    ]
+                );
+            }
         );
         query!(doc, "keys",
-            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 2)
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("\u{FFFD}\u{FFFD}".to_string()),
+                    ]
+                );
+            }
         );
     }
 
@@ -41133,9 +41172,9 @@ mod tests {
     /// delimiter (#1677). JSON's semi-index treats the two as interchangeable
     /// gap bytes, so a missing colon leaves an even sibling count and
     /// `ends_unpaired()` alone can't see it; only `key_delimiter_ok`/
-    /// `value_delimiter_ok` (both inside `DocumentFields::keys()`) can. Real
-    /// jq rejects this document outright at parse time; succinctly's own
-    /// CLI path (`eval_generic.rs`) already raises here too
+    /// `value_delimiter_ok` (both inside `effective_keys`) can. Real jq
+    /// rejects this document outright at parse time; succinctly's own CLI
+    /// path (`eval_generic.rs`) already raises here too
     /// (`test_nonreserializing_builtins_raise_on_missing_delimiter_1677`) --
     /// this pins the library `eval()` entry point catching up to it for
     /// `keys`/`keys_unsorted` specifically.
@@ -41149,6 +41188,23 @@ mod tests {
         query!(doc, "keys",
             QueryResult::Error(_) => {}
         );
+    }
+
+    /// Code review, #1829/#1835: the object arm's new error paths (#1194,
+    /// #1677) return `QueryResult::Error` directly, with no `optional`
+    /// check of their own -- unlike this same function's scalar/array
+    /// `_ if optional => QueryResult::None` fallthrough. Not a gap: `keys?`/
+    /// `keys_unsorted?` always parses to `Expr::Optional`, whose own
+    /// `eval_try` unconditionally catches an ordinary `QueryResult::Error`
+    /// (mirrors `builtin_length`'s identical scalar-arm shape, already
+    /// established elsewhere in this file). Pinned here since neither
+    /// prior #1829 test exercises `?` at all.
+    #[test]
+    fn test_builtin_keys_optional_suppresses_malformed_key_errors_1829() {
+        for expr in ["keys?", "keys_unsorted?"] {
+            query!(br#"{"a":1,"b"}"#, expr, QueryResult::None => {});
+            query!(br#"{"a" 1, "b": 2}"#, expr, QueryResult::None => {});
+        }
     }
 
     #[test]

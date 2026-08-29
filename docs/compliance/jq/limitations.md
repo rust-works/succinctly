@@ -824,19 +824,41 @@ positional fast paths (`.[0]`, `first`, `last`, `.[n]`, tracked separately as #1
 `keys_unsorted`'s streaming truncation (a partial array can reach stdout beside the exit 5,
 for the same "cannot rewind a byte-at-a-time writer" reason).
 
-**Mostly not covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs`
-defines a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually
-re-exports, and the one used in `src/jq/mod.rs`'s own module-doc example — with its own
-unchecked `to_owned`/`effective_len`/`effective_fields`. `Builtin::Keys` (`keys`/
-`keys_unsorted`) is the one exception, fixed by #1829/#1835 to delegate to
-`DocumentFields::keys()` (the same shared walk `eval_generic.rs` uses) instead of a
-narrower hand-rolled copy, which gives it both this check and #1194's protection as a side
-effect. Every other builtin in this file has neither check: a library caller who follows the
-documented `eval()` example and evaluates straight off a fresh cursor gets no protection from
-either class outside `keys`/`keys_unsorted`. The CLI itself never reaches this path except
-through the reindex bridge, which only ever feeds it an already-validated `OwnedValue`, so
-`sjq`/`syq` are unaffected. The remaining call sites are tracked as a follow-up (#1829) rather
-than folded into #1677, which scoped itself to `eval_generic.rs`.
+**Partly covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs` defines
+a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually re-exports,
+and the one used in `src/jq/mod.rs`'s own module-doc example — with its own separate, unchecked
+`to_owned`/`effective_len`/`effective_fields`. Two different checks are in play, and their
+coverage differs:
+
+- **The #1194/#1642 decode-failure and structural-key policy** already reaches most of this
+  file's materializing builtins via `to_owned_checked`/`to_owned_checked_at_depth` (`in(xs)`,
+  `ltrimstr`/`rtrimstr`, the sort family, `min`/`max`/`unique`/`group_by`, `add`, `join`,
+  `flatten`, and every assignment RHS, among others) — not the wholesale gap the previous
+  revision of this paragraph implied.
+- **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
+  `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
+  every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
+  `keys_unsorted`) is the sole exception, fixed by #1829/#1835 to delegate to `effective_keys`
+  (`document.rs`) — the same `DistinctKeyCursors` walk `eval_generic.rs`'s own `keys_unsorted`
+  writer is built on, not a narrower hand-rolled copy — which gives it #1677 protection
+  alongside #1194/#1642's.
+
+A library caller who follows the documented `eval()` example and evaluates straight off a
+fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`; every other builtin in
+this file, checked or not on the decode-failure/#1194 axis, still misses it. The CLI itself
+never reaches this path except through the reindex bridge, which only ever feeds it an
+already-validated `OwnedValue`, so `sjq`/`syq` are unaffected. The remaining #1677 call sites
+are tracked as a follow-up (#1829) rather than folded into #1677 itself, which scoped itself to
+`eval_generic.rs`.
+
+Fixing `keys`/`keys_unsorted` alone creates a transitional inconsistency worth naming rather
+than leaving implicit: `to_entries` (and `with_entries`/`map_values`, which route through it)
+still silently drops a decode-failure or #1194-malformed key, so `keys_unsorted | length` and
+`to_entries | length` can now disagree with *each other* on the same document, where before
+#1829/#1835 both silently dropped the same key and so happened to agree. Not a new bug in
+either builtin -- `to_entries`'s own gap predates this fix and is #1829's own next-listed
+slice -- but the two builtins' agreement was accidental, not a guarantee, and this fix is the
+first thing to make that visible.
 
 ## Refusing an allocation jq does not survive
 
