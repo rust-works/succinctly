@@ -15458,6 +15458,16 @@ fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
             _ if is_yq_field_index_noop_scalar(current) => true,
             _ => false,
         },
+        // Defensive, not currently reachable: `steps` only ever contains
+        // `yq_assign_is_total_noop`'s own flattened `prefix`, whose every
+        // component is already provably one of `Field`/`Index`/
+        // `IndexNumber`/`Iterate` by the time it reaches here -- see that
+        // function's own identical "Defensive, not currently reachable"
+        // comment on its terminal-component check, confirmed there via
+        // patch-coverage output the same way this arm's own is (never
+        // fires). Kept for the same reason: the one thing standing between
+        // a future new static-classified `Expr` variant and this function
+        // silently mishandling it instead of falling to a safe default.
         _ => false,
     }
 }
