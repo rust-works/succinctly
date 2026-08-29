@@ -48,7 +48,7 @@ use cargo_run_exit::{spawn_with_signal_retry, succinctly_bin};
 /// design on a detected stall, #935/#1847). Bails with stderr on failure
 /// so a broken query is a loud test error, not a silently-empty snapshot.
 fn run(args: &[&str], stdin: &str) -> Result<String> {
-    let output = spawn_with_signal_retry(
+    let (output, exit_code) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
             command.args(args);
@@ -58,12 +58,6 @@ fn run(args: &[&str], stdin: &str) -> Result<String> {
     )?;
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
-    // itself; a real exit code is therefore always present here.
-    let exit_code = output
-        .status
-        .code()
-        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     if exit_code != 0 {
         anyhow::bail!("`succinctly {}` failed: {stderr}", args.join(" "));
     }

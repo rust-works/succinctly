@@ -353,7 +353,7 @@ fn test_json_generate_reproducible() -> Result<()> {
 /// since its `validate_generated_json` consolidation and both call sites
 /// were otherwise unexercised by any existing test in this file.
 fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
-    let output = spawn_with_signal_retry(
+    let (output, exit_code) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
             command.args(args);
@@ -364,14 +364,6 @@ fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // Signal death is handled (with retry) inside `spawn_with_signal_retry`
-    // itself; a real exit code is therefore always present here (#1546:
-    // `.code().unwrap_or(-1)` would otherwise coerce a signal-killed child
-    // to a fake exit code -1 rather than reporting the death).
-    let exit_code = output
-        .status
-        .code()
-        .expect("spawn_with_signal_retry only returns Ok with a real exit code");
     Ok((stdout, stderr, exit_code))
 }
 
