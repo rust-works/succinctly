@@ -20400,6 +20400,70 @@ impl FoldRegister {
     }
 }
 
+/// Path-checks a `reduce`/`foreach` source expression under ambient
+/// tracking before its values are taken from the untracked
+/// `eval_owned_expr_fork` evaluator, shared by [`resolve_reduce`] and
+/// [`resolve_foreach`] (#1467). Real jq evaluates a fold's source "with
+/// tracking on" and raises when it navigates *through* a computed value
+/// (`. as $x | reduce (keys[]) as $k (.; .)` raises "near attempt to
+/// iterate through" -- `keys[]`'s `Iterate` reaches into `keys`'s own
+/// untracked output -- live-verified against jq 1.7.1), even though most
+/// sources (`.a`, `.[]`, `keys`, `range(n)`, a literal) are accepted:
+/// `resolve_node`'s existing recursive dispatch already gets every one of
+/// those cases right for any other tracked position in this file, so
+/// routing the source through it here reuses that logic rather than
+/// re-deriving it.
+///
+/// `resolve_node`'s own branches are discarded -- only the escape
+/// matters, and only `Halt` and `EvalError::is_untracked_navigation_error`
+/// (the "near attempt to access/iterate" family this check exists to
+/// surface) are treated as fatal here. Any *other* escape -- an ordinary
+/// runtime `Error` or a `Break` -- returns `None`, deliberately ignored,
+/// even though `resolve_node` did in fact hit it: caught the hard way via
+/// a genuine regression this fix introduced and a test caught,
+/// `test_reduce_foreach_escapes_and_partial_prefix_1440`'s `foreach
+/// (1,2,error("s"))` case, whose `[[], []]` partial prefix an earlier
+/// version of this function silently discarded by treating *any*
+/// `resolve_node` escape as fatal -- that escape carries no information
+/// the caller doesn't already get, correctly along with any partial
+/// prefix, from its own `eval_owned_expr_fork` call immediately below.
+/// `resolve_node`'s own branches are discarded unconditionally regardless
+/// of which escape (if any) fired: `resolve_leaf`'s general, non-primitive
+/// case (`#986`'s deliberate defer-not-raise leaf) narrows a multi-output
+/// source like `range(3)` to its first value alone, which would silently
+/// truncate the fold to one iteration if taken as the real source.
+///
+/// **Documented cost, not fixed here**: narrowing to the first value
+/// means `resolve_leaf`'s stop-after-first sink never asks the source for
+/// a second output, but it does fully evaluate the first one -- so a
+/// source whose first output has a side effect (`stderr`, a consumed
+/// `input`) fires that side effect twice: once here, once more in
+/// `eval_owned_expr_fork` below for the real value. Real jq's own single
+/// tracked evaluation fires it once. Measured live against jq 1.7.1
+/// (`path(. as $x | reduce (stderr) as $i (0; $x))` writes one `stderr`
+/// line; this fix's approach writes two) -- accepted here as this
+/// approach's own stated trade-off rather than the alternative (threading
+/// a new "keep every output while tracking" mode through `resolve_node`'s
+/// entire ~20-call-site dispatch graph so the fold's real values could be
+/// taken from this same evaluation), which is a materially larger, more
+/// invasive change to a widely-shared traversal. See
+/// docs/compliance/jq/limitations.md.
+fn path_check_fold_source<S: EvalSemantics>(
+    source: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+) -> Option<EvalEscape> {
+    match resolve_node::<S>(source, value, trackable, snapshot) {
+        Ok(_) => None,
+        Err((_, EvalEscape::Halt(code))) => Some(EvalEscape::Halt(code)),
+        Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
+            Some(EvalEscape::Error(e))
+        }
+        Err(_) => None,
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -20429,6 +20493,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     trackable: bool,
     snapshot: bool,
 ) -> PathResolveResult<'a> {
+    // #1467: path-check the source under ambient tracking before taking
+    // its values from the untracked evaluator below.
+    if let Some(e) = path_check_fold_source::<S>(input, value, trackable, snapshot) {
+        return Err((Vec::new(), e));
+    }
     // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
     // output is always single-shot, so a `Partial` input just extracts the
     // control and drops the prefix (there's no path-tracking analogue of
@@ -20593,6 +20662,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     trackable: bool,
     snapshot: bool,
 ) -> PathResolveResult<'a> {
+    // #1467: path-check the source under ambient tracking before taking
+    // its values from the untracked evaluator below — see
+    // `resolve_reduce`'s identical check for the full rationale.
+    if let Some(e) = path_check_fold_source::<S>(input, value, trackable, snapshot) {
+        return Err((Vec::new(), e));
+    }
     // Unlike `reduce`, a `Partial` source stream's own prefix is iterated
     // below — mirrors `eval_foreach`'s identical rule.
     let (input_values, input_control) = eval_owned_expr_fork::<S>(input, value, false);
