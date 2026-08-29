@@ -2662,6 +2662,49 @@ fn test_raw_output0_seq_leaves_no_dangling_separator_on_rejection() -> Result<()
     Ok(())
 }
 
+/// #1830 code review: `route_write_error`'s five call sites are each
+/// independently wired (own `at`/location expression, own loop scope);
+/// round 2 review found two of them had no dedicated test even after
+/// round 1 closed the DSV gap. This one is the
+/// `while let Some(input) = jq::pop_remaining_input()` loop, reached
+/// whenever the filter syntactically uses `input`/`inputs`/
+/// `input_line_number` (#723) without `-n` -- `if false then input else
+/// . end` triggers that classification without actually needing to pull
+/// a second document, so a single-document input still exercises this
+/// exact loop.
+#[test]
+fn test_raw_output0_rejects_embedded_nul_via_pop_remaining_input_loop() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-r", "--raw-output0", "if false then input else . end"],
+        Some("\"b\\u0000c\"\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
+/// #1830 code review: the other previously-untested `route_write_error`
+/// call site -- the plain `for (idx, input) in inputs.iter().enumerate()`
+/// loop, reached under `-n` (or `--slurp`) when the filter does *not*
+/// use `input`/`inputs`. `-n` makes `.` itself `null`, so the
+/// NUL-containing value here comes from the filter's own string literal
+/// rather than the input document.
+#[test]
+fn test_raw_output0_rejects_embedded_nul_via_plain_materializing_loop() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-n", "-r", "--raw-output0", r#""b\u0000c""#], None)?;
+    assert_eq!(code, 5, "stdout: {out:?}, stderr: {err}");
+    assert!(out.is_empty(), "stdout: {out:?}");
+    assert!(
+        err.contains("Cannot dump a string containing NUL with --raw-output0 option"),
+        "stderr: {err}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_unbuffered_flag() -> Result<()> {
     // Test that --unbuffered flag works (just verify it parses correctly)
