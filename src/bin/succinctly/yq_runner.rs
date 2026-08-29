@@ -16,6 +16,7 @@ use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
     to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta,
 };
+use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, assert_value_tree_depth, nonfinite_display_string, sync_aliased_paths, Builtin,
     EvalError, Expr, NumberRepr, OwnedValue, QueryResult, YqSemantics,
@@ -125,24 +126,81 @@ impl<W: Write> ColorSink<'_, W> {
 /// renders into a buffer instead (still via the duplicate-key-safe cursor
 /// streamer passed in as `render`), then runs the buffer through `colorize`
 /// before writing the colorized result (#748).
+/// Render `render`'s output to `writer`, colorizing first if asked.
+///
+/// The nested `Result` is #1615's decode-failure channel, not redundancy: the
+/// outer `anyhow::Result` is a genuine *write* failure (the process cannot
+/// continue), while `Ok(Err(e))` is a well-formed run over a document holding
+/// a scalar that will not decode — a diagnostic for stderr and an exit code,
+/// which only the caller's [`ErrorSink`] can set. Collapsing the two would put
+/// a data error on the I/O path and lose the message, which is exactly the
+/// "bare, undiagnosed abort" that kept this gap open (see
+/// `docs/plan/decode-failure-routing.md`, Stage 6).
+///
+/// Whatever reached `out` before the failure is still written, colorized path
+/// included — the same keep-the-prefix-and-diagnose trade #1641/#1679 settled
+/// for their own streaming sites.
 fn stream_maybe_colored<W: Write, T>(
     writer: &mut W,
     use_color: bool,
     colorize: impl FnOnce(&str, &[usize]) -> String,
-    render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, core::fmt::Error>,
-) -> anyhow::Result<T> {
+    render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, StreamFailure>,
+) -> anyhow::Result<Result<T, EvalError>> {
     if use_color {
         let mut sink = ColorSink::Buffered(String::new(), Vec::new());
-        let value = render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))?;
+        let rendered = render(&mut sink);
         let ColorSink::Buffered(buf, boundaries) = sink else {
             unreachable!("stream_maybe_colored always constructs ColorSink::Buffered here")
         };
         write!(writer, "{}", colorize(&buf, &boundaries))?;
-        Ok(value)
+        match rendered {
+            Ok(value) => Ok(Ok(value)),
+            Err(StreamFailure::Decode(e)) => Ok(Err(e)),
+            Err(StreamFailure::Fmt) => Err(anyhow::anyhow!("Write error")),
+        }
     } else {
         let mut sink = ColorSink::Direct(FmtWriter(writer));
-        render(&mut sink).map_err(|_| anyhow::anyhow!("Write error"))
+        match render(&mut sink) {
+            Ok(value) => Ok(Ok(value)),
+            Err(StreamFailure::Decode(e)) => Ok(Err(e)),
+            Err(StreamFailure::Fmt) => Err(anyhow::anyhow!("Write error")),
+        }
     }
+}
+
+/// [`stream_maybe_colored`] for a render that produces no value, reporting a
+/// decode failure to `sink` instead of returning it (#1615).
+///
+/// Answers whether the render completed, so the caller can skip a trailing
+/// terminator write for output that was cut short.
+fn stream_or_report<W: Write>(
+    writer: &mut W,
+    use_color: bool,
+    sink: &mut ErrorSink,
+    colorize: impl FnOnce(&str, &[usize]) -> String,
+    render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<(), StreamFailure>,
+) -> anyhow::Result<bool> {
+    match stream_maybe_colored(writer, use_color, colorize, render)? {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            report_stream_decode_failure(sink, &e);
+            Ok(false)
+        }
+    }
+}
+
+/// Route a streamed decode failure to the same [`ErrorSink`] every
+/// *materializing* route already reports through (#1615), so one document
+/// gives one answer — message and exit code — however it was rendered.
+fn report_stream_decode_failure(sink: &mut ErrorSink, err: &EvalError) {
+    sink.report_stream(
+        DiagStyle::Yq,
+        &succinctly::jq::stream::StreamError {
+            message: err.message.clone(),
+            not_a_string: false,
+        },
+        &no_location(),
+    );
 }
 
 /// Evaluation context for passing variables to the jq evaluator.
@@ -3648,17 +3706,25 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     // No boundary recorded here -- the terminator is written
                     // directly to `$writer` below, outside this buffer (#1708).
-                    stream_maybe_colored(
+                    let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
                         |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                         |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
                     )?;
-                    terminator.write_io($writer)?;
-                    // Streaming skips evaluation, so inspect the document
-                    // value directly to keep `-e` falsy tracking (#178).
-                    if args.exit_status {
-                        any_truthy |= !$cursor.is_falsy();
+                    // #1615: this identity/P9 branch skips evaluation, so it
+                    // has no `StreamStats` to carry a diagnostic -- route the
+                    // decode failure to the same sink the evaluated branch
+                    // reaches via `absorb_stream_stats`.
+                    if let Err(e) = rendered {
+                        report_stream_decode_failure(&mut sink, &e);
+                    } else {
+                        terminator.write_io($writer)?;
+                        // Streaming skips evaluation, so inspect the document
+                        // value directly to keep `-e` falsy tracking (#178).
+                        if args.exit_status {
+                            any_truthy |= !$cursor.is_falsy();
+                        }
                     }
                 } else {
                     // M2 YAML path: evaluate and stream YAML results
@@ -3691,11 +3757,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $use_color,
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
-                            result.stream_yaml(out, yaml_indent, sort_keys, |w| {
-                                w.write_result_terminator(terminator)
-                            })
+                            result
+                                .stream_yaml(out, yaml_indent, sort_keys, |w| {
+                                    w.write_result_terminator(terminator)
+                                })
+                                .map_err(StreamFailure::from)
                         },
                     )?;
+                    // `GenericResult::stream_yaml` reports a decode failure
+                    // through `stats.error`, not by failing, so the outer
+                    // `Result` here is only ever `Ok` (#1615).
+                    let stats = stats.unwrap_or_default();
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
                 }
@@ -3703,17 +3775,22 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // M2 path: JSON output streaming
                 if is_identity {
                     // P9 path: stream directly without evaluation
-                    stream_maybe_colored(
+                    // See the YAML identity branch above (#1615).
+                    let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |out| $cursor.stream_json(out, json_indent, sort_keys),
                     )?;
-                    terminator.write_io($writer)?;
-                    // Streaming skips evaluation, so inspect the document
-                    // value directly to keep `-e` falsy tracking (#178).
-                    if args.exit_status {
-                        any_truthy |= !$cursor.is_falsy();
+                    if let Err(e) = rendered {
+                        report_stream_decode_failure(&mut sink, &e);
+                    } else {
+                        terminator.write_io($writer)?;
+                        // Streaming skips evaluation, so inspect the document
+                        // value directly to keep `-e` falsy tracking (#178).
+                        if args.exit_status {
+                            any_truthy |= !$cursor.is_falsy();
+                        }
                     }
                 } else {
                     // M2 path: evaluate and stream results
@@ -3723,11 +3800,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $use_color,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |out| {
-                            result.stream_json(out, json_indent, sort_keys, |w| {
-                                terminator.write_fmt(w)
-                            })
+                            result
+                                .stream_json(out, json_indent, sort_keys, |w| {
+                                    terminator.write_fmt(w)
+                                })
+                                .map_err(StreamFailure::from)
                         },
                     )?;
+                    // See the YAML branch above (#1615).
+                    let stats = stats.unwrap_or_default();
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
                 }
@@ -3790,31 +3871,35 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     if args.document.is_none() || args.document == Some(0) {
                         if is_identity {
                             // P9 path for identity on single doc
-                            if can_yaml_fast_path {
+                            let streamed_ok = if can_yaml_fast_path {
                                 // No boundary recorded here --
                                 // `write_terminator` below writes directly,
                                 // outside this buffer (#1708).
-                                stream_maybe_colored(
+                                stream_or_report(
                                     &mut writer,
                                     output_config.use_color,
+                                    &mut sink,
                                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
-                                )?;
+                                )?
                             } else {
-                                stream_maybe_colored(
+                                stream_or_report(
                                     &mut writer,
                                     output_config.use_color,
+                                    &mut sink,
                                     |s, _boundaries| {
                                         output::colorize_json(s, &ColorScheme::default())
                                     },
                                     |out| root.stream_json_document(out, json_indent, sort_keys),
-                                )?;
-                            }
-                            write_terminator(&mut writer, &output_config)?;
-                            // `root` is the virtual document sequence; falsiness
-                            // lives on the actual document value (#178).
-                            if args.exit_status {
-                                any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
+                                )?
+                            };
+                            if streamed_ok {
+                                write_terminator(&mut writer, &output_config)?;
+                                // `root` is the virtual document sequence; falsiness
+                                // lives on the actual document value (#178).
+                                if args.exit_status {
+                                    any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
+                                }
                             }
                         } else {
                             // M2 path: need to get the actual document cursor
@@ -3918,37 +4003,43 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         if should_process {
                             if is_identity {
                                 // P9 path for identity on single doc
-                                if can_yaml_fast_path {
+                                let streamed_ok = if can_yaml_fast_path {
                                     // No boundary recorded here --
                                     // `write_terminator` below writes
                                     // directly, outside this buffer (#1708).
-                                    stream_maybe_colored(
+                                    stream_or_report(
                                         &mut writer,
                                         output_config.use_color,
+                                        &mut sink,
                                         |s, boundaries| {
                                             colorize_yaml(s, Terminator::None, boundaries)
                                         },
                                         |out| {
                                             root.stream_yaml_document(out, yaml_indent, sort_keys)
                                         },
-                                    )?;
+                                    )?
                                 } else {
-                                    stream_maybe_colored(
+                                    stream_or_report(
                                         &mut writer,
                                         output_config.use_color,
+                                        &mut sink,
                                         |s, _boundaries| {
                                             output::colorize_json(s, &ColorScheme::default())
                                         },
                                         |out| {
                                             root.stream_json_document(out, json_indent, sort_keys)
                                         },
-                                    )?;
-                                }
-                                write_terminator(&mut writer, &output_config)?;
-                                // `root` is the virtual document sequence; falsiness
-                                // lives on the actual document value (#178).
-                                if args.exit_status {
-                                    any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
+                                    )?
+                                };
+                                if streamed_ok {
+                                    write_terminator(&mut writer, &output_config)?;
+                                    // `root` is the virtual document sequence;
+                                    // falsiness lives on the actual document
+                                    // value (#178).
+                                    if args.exit_status {
+                                        any_truthy |=
+                                            root.first_child().is_some_and(|c| !c.is_falsy());
+                                    }
                                 }
                             } else {
                                 // M2 path: need to get the actual document cursor
@@ -4341,10 +4432,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // to `-o=json` by #1577): `stream_yaml_sequence`/
             // `stream_json_sequence` are both generic over `core::fmt::Write`,
             // so each slots into `stream_maybe_colored` unmodified.
-            if output_config.output_format == OutputFormat::Json {
-                stream_maybe_colored(
+            let streamed_ok = if output_config.output_format == OutputFormat::Json {
+                stream_or_report(
                     &mut writer,
                     output_config.use_color,
+                    &mut sink,
                     |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                     |out| {
                         stream_json_sequence(
@@ -4356,13 +4448,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             sort_keys,
                         )
                     },
-                )?;
+                )?
             } else {
                 // No boundary recorded here -- `write_terminator` below
                 // writes directly, outside this buffer (#1708).
-                stream_maybe_colored(
+                stream_or_report(
                     &mut writer,
                     output_config.use_color,
+                    &mut sink,
                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                     |out| {
                         stream_yaml_sequence(
@@ -4374,16 +4467,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             sort_keys,
                         )
                     },
-                )?;
-            }
+                )?
+            };
             // #1701: this fast path streams straight to `&mut writer`
             // (like `stream_cursor!`'s own identity branch), so it needs
             // the same `Terminator`-based write instead of a hardcoded
             // `writeln!` -- confirmed live that `--slurp -0`/`--slurp
             // --join-output` still emitted a bare newline here before this
             // fix, unlike the `stream_cursor!`-based fast paths this same
-            // issue's title names.
-            write_terminator(&mut writer, &output_config)?;
+            // issue's title names. Skipped when the stream was cut short by a
+            // decode failure (#1615) -- the diagnostic is already on stderr
+            // and there is no complete result for a terminator to close.
+            if streamed_ok {
+                write_terminator(&mut writer, &output_config)?;
+            }
         } else {
             // #1493: resolve `Auto` against the uniform format of every
             // source, if they all agree (confirmed live: an all-JSON slurp

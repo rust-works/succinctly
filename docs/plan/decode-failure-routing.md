@@ -1,6 +1,6 @@
 # Decode-failure error routing for `to_owned`/`cursor_to_owned` (#1247, #1242, #1194)
 
-**Status: partially implemented — Stages 1–5 landed, 6 outstanding.** This
+**Status: implemented — Stages 1–6 all landed.** This
 document is the deliverable for
 [#1247](https://github.com/rust-works/succinctly/issues/1247), which was tiered Tier 3
 ("needs a design decision before implementation, not a same-pattern continuation of the
@@ -466,10 +466,11 @@ all of 17–20 under this stage's "✅ landed."** Re-reading both directly:
   architecturally the same class of gap Stage 6 below is about (a `core::fmt::Write`-only
   error channel that cannot cleanly raise mid-stream) — it was miscategorized as a simple
   Stage-4 fix rather than folded into Stage 6 alongside its YAML→JSON and YAML→YAML
-  siblings. See [yq Limitations § A bad escape in a streamed scalar still degrades
-  silently](../compliance/yq/limitations.md#a-bad-escape-in-a-streamed-scalar-still-degrades-silently-instead-of-raising)
-  for the two siblings that are recorded; this third one belongs in the same bucket once
-  Stage 6 is scoped.
+  siblings. **Its string arm is now fixed with those siblings by #1615** (Stage 6 below);
+  the `StandardJson::Error(_)` arm itself still writes `null`, since that is a
+  *structural* malformation (#1194's class), not a decode failure, and answering it here
+  alone would split #1194's decision across two issues. See [yq Limitations § A key that
+  will not decode is preserved](../compliance/yq/limitations.md#a-key-that-will-not-decode-is-preserved-as--rather-than-raising).
 
 One site was reverted after being written, and later fixed for real by
 [#1641](https://github.com/rust-works/succinctly/issues/1641). `print_json`'s
@@ -494,8 +495,8 @@ see
 
 Site 20 (`json/light.rs:2098`, the JSON→YAML streaming output path) is a genuinely
 different case from this one, not covered by #1641: it is built on `core::fmt::Write`,
-which really does carry no richer error type, so it remains folded into Stage 6 below
-alongside its YAML→JSON and YAML→YAML siblings.
+which really does carry no richer error type, so it was folded into Stage 6 below
+alongside its YAML→JSON and YAML→YAML siblings, and landed there with them (#1615).
 
 Evaluation still continues past the bad value, so the good documents either side of it in
 a multi-value stream are still processed (`ErrorSink`, #355). Real jq aborts the whole run
@@ -641,15 +642,43 @@ remaining cost is non-ASCII YAML on ARM (no NEON arm for `validate_utf8`, +4.8%/
 net of control on a 45%-non-ASCII 10 MB document) — still under the ceiling, ARM-only,
 and a targeted NEON fix if it ever matters, not blocking.
 
-**Stage 6 — make the YAML streaming path loud (new, split out of Stage 2).** After
-Stages 2 and 3, `succinctly yq -o=json '.'` on a document with a bad *escape* still emits
-`{"b":null}` at exit 0: the streaming transcoder's only error channel is
-`core::fmt::Result`, which carries no message, so Stage 2 could make its output valid but
-not make it raise. Every *materializing* route (a `--arg`-forced DOM, a multi-result
-filter, `to_entries`, `length`) already raises. Closing the gap needs `stream_json_value`
-and its callers to carry a richer error than `fmt::Error` — a contained change, but its
-own one. Stage 5 removes the invalid-UTF-8 half of this case at the input boundary, so
-what Stage 6 is left with is bad escapes only.
+**Stage 6 — make the YAML streaming path loud (new, split out of Stage 2). ✅ landed**
+via [#1615](https://github.com/rust-works/succinctly/issues/1615). After Stages 2 and 3,
+`succinctly yq -o=json '.'` on a document with a bad *escape* still emitted `{"b":null}`
+at exit 0: the streaming transcoder's only error channel was `core::fmt::Result`, which
+carries no message, so Stage 2 could make its output valid but not make it raise. Every
+*materializing* route (a `--arg`-forced DOM, a multi-result filter, `to_entries`,
+`length`) already raised. Stage 5 removed the invalid-UTF-8 half at the input boundary, so
+what Stage 6 was left with is bad escapes only.
+
+The richer error this stage was waiting on is `StreamFailure`
+([src/jq/stream.rs](../../src/jq/stream.rs)) — `Fmt` for a genuine writer failure,
+`Decode(EvalError)` for a scalar that will not decode. Because `From<core::fmt::Error>`
+converts into it, every existing `?` inside the writers kept working unchanged; only the
+family's return types and its leaf substitution sites needed touching, not each of its
+recursive call sites. There is deliberately **no** `From<StreamFailure> for
+core::fmt::Error`: that impl would let a plain `?` silently re-collapse a decode failure
+into the message-less error this type exists to escape, so its absence is what makes every
+such site a compile error instead.
+
+Four value-writer sites, not the three the issue scoped:
+
+1. `stream_json_value` (`yaml/light.rs`) — YAML→JSON, the site this doc originally named;
+2. `stream_yaml_string_value` (`yaml/light.rs`) — YAML→YAML, the *default* invocation;
+3. `stream_json_as_yaml`'s string arm (`json/light.rs`) — JSON→YAML (site 20 above), whose
+   failure was a message-less `core::fmt::Error` rather than a silent substitution;
+4. `stream_yaml_as_document`'s **root-scalar shortcut** (`yaml/light.rs`) — found only by
+   testing, not by the site inventory. It deliberately bypasses 1–3 (see #996/#852) and so
+   carried its own `unwrap_or(Cow::Borrowed("\"\""))` swallow, which meant the single most
+   common navigated shape, `yq '.b'`, still printed `""` at exit 0 while `yq -o=json '.b'`
+   on the same document raised.
+
+Mapping **keys** are excluded on purpose (`Undecodable::PreserveEmpty` in
+`yaml/light.rs`): #1642 settled that a key with no scalar form is preserved as `""` on
+every route, and `keys`/`to_entries`/`length` all report it, so raising in a streamed
+identity alone would have re-opened the same one-document-many-answers split on the key
+axis. The output already written before a failure is kept rather than buffered and
+discarded, matching #1641/#1679 and the "buffering the whole record" non-goal below.
 
 ## Non-goals (explicit, to prevent scope creep)
 

@@ -24246,33 +24246,55 @@ fn test_undecodable_mapping_key_does_not_hide_later_fields_1247() -> Result<()> 
 /// Two routes, deliberately different at this stage of #1247's design (see
 /// `docs/plan/decode-failure-routing.md`):
 ///
-/// * the **materializing** routes raise a real error and exit non-zero --
-///   except for a bad *key* (`"a\qb": 1`), which #1642 changed to preserve
-///   instead (via its raw source span, matching YAML's existing
-///   never-drop-a-key convention for a key with no scalar form), so it
-///   stays in this list only for the bad *value* case;
-/// * the **streaming** routes still degrade to `null`/`""` -- but the
-///   document they emit is now parseable, which is what this test's first
-///   half pins. Making streaming loud too needs an error channel through
-///   `stream_json_value`'s `core::fmt::Result`, which is its own stage.
+/// Since #1615 closed that design's Stage 6, both routes now agree, and this
+/// test pins the agreement rather than the split it used to record:
+///
+/// * a bad **value** raises on *every* route, streamed or materializing --
+///   #1615 gave the streaming writers the error channel through
+///   `stream_json_value`'s `core::fmt::Result` that Stage 6 was waiting on
+///   (`StreamFailure`), so `-o=json '.'` no longer emits `{"b":null}` at
+///   exit 0;
+/// * a bad **key** (`"a\qb": 1`) is preserved as `""` on every route, also
+///   both -- #1642's never-drop-a-key convention (via its raw source span,
+///   YAML's existing answer for a key with no scalar form, #222). #1615
+///   deliberately did *not* make keys raise: `keys`/`to_entries`/`length`
+///   all report such a key, so raising here alone would re-open the
+///   one-document-many-answers split #1642 closed, on the other axis.
 #[test]
 fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
-    // `materialized`: `None` if materializing must still raise (a bad
-    // *value*); `Some(json)` if it must now succeed with `json` per result
-    // (a bad *key*, #1642).
-    for (input, streamed, materialized) in [
-        ("b: \"x\\qy\"\n", r#"{"b":null}"#, None),
-        ("\"a\\qb\": 1\n", r#"{"":1}"#, Some(r#"{"":1}"#)),
+    // `expected`: `None` if the route must raise (a bad *value*);
+    // `Some(json)` if it must succeed with `json` per result (a bad *key*,
+    // #1642). Since #1615 the streaming and materializing routes share one
+    // expectation instead of differing.
+    for (input, expected) in [
+        ("b: \"x\\qy\"\n", None),
+        ("\"a\\qb\": 1\n", Some(r#"{"":1}"#)),
     ] {
-        // Streaming: still degrades, but the emitted JSON is valid. `-P`
-        // takes this route too -- it forces pretty-printing, not the DOM.
+        let materialized = expected;
+        // Streaming. `-P` takes this route too -- it forces pretty-printing,
+        // not the DOM.
         for extra in [
             &["-o", "json", "-I", "0"][..],
             &["-o", "json", "-I", "0", "-P"][..],
         ] {
-            let (output, exit_code) = run_yq_stdin(".", input, extra)?;
-            assert_eq!(exit_code, 0, "args {extra:?}, output: {output:?}");
-            assert_eq!(output.trim(), streamed, "args {extra:?}");
+            let (output, stderr, exit_code) = run_yq_split(".", input, extra)?;
+            match expected {
+                // #1615: raises now, where this used to pin `{"b":null}` at
+                // exit 0. Whatever prefix already reached stdout may stay --
+                // the diagnostic and the exit code are the contract, the same
+                // truncate-then-diagnose trade #1641/#1679 settled.
+                None => {
+                    assert_eq!(exit_code, 1, "args {extra:?}, output: {output:?}");
+                    assert!(
+                        stderr.contains("invalid escape sequence"),
+                        "args {extra:?}, stderr: {stderr}"
+                    );
+                }
+                Some(json) => {
+                    assert_eq!(exit_code, 0, "args {extra:?}, stderr: {stderr}");
+                    assert_eq!(output.trim(), json, "args {extra:?}");
+                }
+            }
         }
 
         // Materializing: `--arg` forces the DOM path, and a multi-result
@@ -24619,5 +24641,84 @@ fn test_colliding_display_key_error_is_uncatchable_yq_1813() -> Result<()> {
     );
     assert!(err.contains("ambiguous"), "stderr: {err}");
 
+    Ok(())
+}
+
+/// #1615: the three streaming *value* writers left as "Stage 6" in
+/// `docs/plan/decode-failure-routing.md` now raise a diagnosable decode
+/// failure instead of silently substituting `null`/`""` at exit 0.
+///
+/// Their only error channel used to be `core::fmt::Result`, which carries no
+/// message -- so the design doc deferred them rather than accept a "bare,
+/// undiagnosed abort". `StreamFailure` is that missing channel. Real yq
+/// rejects each of these documents outright (`found unknown escape
+/// character`, exit 1), and every *materializing* succinctly route has raised
+/// since #1247; these are the routes that did not.
+///
+/// The three sites, all reached below:
+/// 1. `stream_json_value` -- YAML->JSON (`-o=json`), the site the doc named;
+/// 2. `stream_yaml_string_value` -- YAML->YAML, the *default* invocation and
+///    by far the most common, never previously recorded anywhere;
+/// 3. `stream_json_as_yaml`'s string arm -- JSON->YAML, whose failure was a
+///    message-less `core::fmt::Error` rather than a silent substitution.
+#[test]
+fn test_streamed_value_decode_failure_raises_1615() -> Result<()> {
+    let yaml = "a: 1\nb: \"bad \\q escape\"\n";
+
+    // Sites 1 and 2, plus the evaluated (non-identity) route through
+    // `GenericResult::stream_json`/`stream_yaml`, which reports via
+    // `StreamStats::error` rather than by failing.
+    for (filter, extra) in [
+        (".", &["-o", "json"][..]),  // site 1: YAML -> JSON, identity/P9
+        (".", &[][..]),              // site 2: YAML -> YAML, identity/P9
+        (".b", &["-o", "json"][..]), // evaluated, JSON target
+        (".b", &[][..]),             // evaluated, YAML target
+    ] {
+        let (_, stderr, exit_code) = run_yq_split(filter, yaml, extra)?;
+        assert_eq!(exit_code, 1, "filter {filter:?} args {extra:?}: {stderr}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "filter {filter:?} args {extra:?}, stderr: {stderr}"
+        );
+    }
+
+    // Site 3: JSON -> YAML. `--slurp` because a bare `-p=json` invocation is
+    // re-parsed as YAML flow syntax and never reaches the JSON streamers at
+    // all -- only `--slurp`/`--eval-all`/`--inplace` route through real JSON
+    // parsing.
+    let json = "{\"a\":1,\"b\":\"bad \\q escape\"}";
+    let (_, stderr, exit_code) = run_yq_split(".", json, &["-p", "json", "--slurp"])?;
+    assert_eq!(exit_code, 1, "JSON->YAML slurp: {stderr}");
+
+    // A valid sibling is still readable: this raises on the bad scalar, not
+    // on the whole document (`.a` never touches `b`).
+    let (output, _, exit_code) = run_yq_split(".a", yaml, &["-o", "json"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "1");
+    Ok(())
+}
+
+/// #1615 must not disturb #1642: a decode-failure *key* is preserved as `""`
+/// on every route, streamed included, rather than raising.
+///
+/// This is the one asymmetry in #1615's fix and it is deliberate -- see
+/// `Undecodable` in `src/yaml/light.rs`. `keys`/`to_entries`/`length` all
+/// report such a key, so a streamed identity that raised on it would put the
+/// same document's answers back into disagreement, which is exactly what
+/// #1642 closed.
+#[test]
+fn test_streamed_key_decode_failure_still_preserved_1615() -> Result<()> {
+    let input = "\"a\\qb\": 1\nb: 2\n";
+    for (extra, expected) in [
+        (&["-o", "json", "-I", "0"][..], r#"{"":1,"b":2}"#),
+        (
+            &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
+            r#"{"":1,"b":2}"#,
+        ),
+    ] {
+        let (output, stderr, exit_code) = run_yq_split(".", input, extra)?;
+        assert_eq!(exit_code, 0, "args {extra:?}, stderr: {stderr}");
+        assert_eq!(output.trim(), expected, "args {extra:?}");
+    }
     Ok(())
 }
