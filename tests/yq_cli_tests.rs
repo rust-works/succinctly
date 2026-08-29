@@ -21708,19 +21708,19 @@ fn test_yq_nonterminal_iterate_in_assign_path_fans_out_1298() -> Result<()> {
 /// (RHS never runs), matching real yq exactly (live-verified against
 /// v4.53.3).
 ///
-/// This only closes the narrowest case -- `current` (`.a` itself) being a
+/// This only closed the narrowest case -- `current` (`.a` itself) being a
 /// genuine scalar. Real yq's actual rule turned out broader once
 /// live-probed further: `a: [1, 2]` (a real *container*, but every one of
 /// its own elements is itself a scalar `.b` would no-op into) *also*
-/// discards the RHS in real yq, and so does an empty/null-autovivified
-/// container (vacuously -- zero elements to check). Neither of those is
-/// implemented here; `navigate_read_only`'s new `Iterate` arm deliberately
-/// reports `Absent` (defer to normal evaluation) for *any* real
-/// `Array`/`Object`, so those broader cases still eagerly evaluate the
-/// RHS where real yq wouldn't -- filed as #1432 rather than expanded here.
-/// The second case below (`a: [1, {}]`, a genuinely *mixed* target where
-/// one element really does write) is the regression guard for what this
-/// fix must *not* accidentally suppress.
+/// discards the RHS in real yq, and so does an empty container (vacuously
+/// -- zero elements to check). That broader fan-out rule is now
+/// implemented too (#1432, `assign_path_all_noop`) -- see
+/// `test_yq_nonterminal_iterate_container_fanout_noop_1432` below.
+/// (A `Null` target is a separate case, deliberately still excluded --
+/// see `test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298`'s
+/// own updated doc comment.) The second case below (`a: [1, {}]`, a
+/// genuinely *mixed* target where one element really does write) is the
+/// regression guard for what this fix must *not* accidentally suppress.
 #[test]
 fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
     let (out, err, code) =
@@ -21740,20 +21740,97 @@ fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
 }
 
 /// #1298 (code review, #1432): a `Null` target for the `Iterate` -- neither
-/// a real container nor a genuine scalar -- falls to `navigate_read_only`'s
-/// `Iterate` arm's final `_ => Absent` catch-all, so the RHS still
-/// evaluates here even though real yq's own null-autovivify-to-`[]`
-/// behavior means the fan-out ends up empty and real yq discards the RHS
-/// too (`a: null` becomes `a: []` there, with the RHS never running --
-/// live-verified against yq v4.53.3). This is the exact gap #1432 tracks;
-/// pinned here as a known-divergent case, not a regression to fix in this
-/// PR.
+/// a real container nor a genuine scalar -- falls to `assign_path_all_noop`'s
+/// final `_ => false` catch-all, so the RHS still evaluates here even
+/// though real yq's own null-autovivify-to-`[]` behavior means the fan-out
+/// ends up empty and real yq discards the RHS too (`a: null` becomes
+/// `a: []` there, with the RHS never running -- live-verified against yq
+/// v4.53.3). #1432 deliberately leaves this excluded rather than folding it
+/// in: probing further (with a safe, always-evaluated RHS, independent of
+/// this predicate entirely) found that succinctly's write path doesn't even
+/// perform the `null` -> `[]` autovivification here at all (`a: null`
+/// stays `a: null` for `.a[].b = 5`, where real yq still produces
+/// `a: []`) -- a separate, pre-existing write-correctness bug that
+/// `yq_assign_is_total_noop`'s all-or-nothing `Skip(pristine)` short-circuit
+/// would make *permanent* rather than merely already-wrong if `Null` were
+/// folded into the no-op predicate. Filed as #1857; pinned here as a
+/// known-divergent case, not a regression to fix in this PR.
 #[test]
 fn test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298() -> Result<()> {
     let (_out, err, code) =
         run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: null\n", &["-o", "json"])?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1432: `yq_assign_is_total_noop`'s prefix walk (`assign_path_all_noop`)
+/// recurses into a mid-chain `Expr::Iterate` that hits a real
+/// `Array`/`Object`, instead of `navigate_read_only`'s old unconditional
+/// defer for any real container -- every element/value must itself no-op
+/// the remainder of the path (vacuously true for an empty container).
+/// Every shape here is a direct transcription of a live probe against yq
+/// v4.53.3, using `error("boom")` as the RHS so a wrongly-eager evaluation
+/// is directly observable as an exit code / stderr message rather than
+/// merely an output difference.
+#[test]
+fn test_yq_nonterminal_iterate_container_fanout_noop_1432() -> Result<()> {
+    // All-scalar array elements: matches the case already covered above
+    // (`a: [1, 2]`) via `test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298`'s
+    // first assertion's sibling shape -- restated here for locality with
+    // the rest of #1432's own new cases.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a[].b = error(\"boom\")",
+        "a:\n  - 1\n  - 2\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
+
+    // Empty array -- vacuously every element (zero of them) no-ops.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: []\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": []\n}");
+
+    // Empty object -- same, over `.values()` rather than array elements.
+    let (out, err, code) =
+        run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: {}\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": {}\n}");
+
+    // Object whose every value is itself a scalar.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a[].b = error(\"boom\")",
+        "a:\n  x: 1\n  y: 2\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "{\n  \"a\": {\n    \"x\": 1,\n    \"y\": 2\n  }\n}"
+    );
+
+    // Nested `Iterate`s (`.a[][].b`) -- the recursion must fan out at
+    // every level, not just the first.
+    let (out, err, code) = run_yq_stdin_with_stderr(
+        ".a[][].b = error(\"boom\")",
+        "a:\n  - [1, 2]\n  - [3]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "{\n  \"a\": [\n    [\n      1,\n      2\n    ],\n    [\n      3\n    ]\n  ]\n}"
+    );
+
+    // Regression guard: a single non-scalar element anywhere in the
+    // fan-out still genuinely writes, so the RHS still evaluates for real.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a:\n  - {}\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
     Ok(())
 }
 
