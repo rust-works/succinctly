@@ -36380,6 +36380,16 @@ mod tests {
             "join(\",\")",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
+        // A *multi*-output computed-index key (`.keys[]` as the key
+        // expression) reaches `to_owned_key_shape`'s own `QueryResult::Many`
+        // arm, distinct from the single-key case above (`QueryResult::One`)
+        // -- one valid key, one malformed, to also exercise the `.collect()`
+        // short-circuit rather than only its first element.
+        query!(
+            &b"{\"a\":1,\"keys\":[\"a\",\"\xff\xfe\"]}"[..],
+            ".[(.keys[])]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
     }
 
     /// #1755 positive control: valid data through each of the comparison-key
@@ -36421,6 +36431,11 @@ mod tests {
         );
         yq_query!(br#"["x","y"]"#, "join(\",\")",
             QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "x,y"); }
+        );
+        query!(br#"{"a":1,"b":2,"keys":["a","b"]}"#, ".[(.keys[])]",
+            QueryResult::Many(vs) => {
+                assert_eq!(vs.iter().map(to_owned).collect::<Vec<_>>(), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
         );
     }
 
