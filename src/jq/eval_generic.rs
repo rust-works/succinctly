@@ -288,6 +288,29 @@ pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, Eval
     to_owned_cursor_at_depth(cursor, 0)
 }
 
+/// Map every value through [`to_owned`], short-circuiting at the first
+/// decode failure.
+///
+/// One definition for the
+/// `.iter().map(to_owned).collect::<Result<Vec<_>, _>>()` shape 13 call
+/// sites across this file spelled out with their own turbofish (#1824).
+/// #1824 itself, filed against an earlier revision of this file, counted
+/// 19 (18 of which were this shape); most had already folded onto
+/// `collect_cursors()`/`collect_values()` by the time this landed, leaving
+/// 13 real sites for this pair of helpers to absorb.
+pub fn to_owned_all<'a, V: DocumentValue + 'a>(
+    values: impl IntoIterator<Item = &'a V>,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    values.into_iter().map(to_owned).collect()
+}
+
+/// The cursor-collecting sibling of [`to_owned_all`], for [`to_owned_cursor`].
+pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
+    cursors: impl IntoIterator<Item = &'a C>,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    cursors.into_iter().map(to_owned_cursor).collect()
+}
+
 fn to_owned_cursor_at_depth<C: DocumentCursor>(
     cursor: &C,
     depth: usize,
@@ -2234,12 +2257,8 @@ impl<V: DocumentValue> GenericResult<V> {
         Ok(match self.materialize_lazy() {
             Self::One(v) => Some(to_owned(&v)?),
             Self::OneCursor(c) => Some(to_owned_cursor(&c)?),
-            Self::Many(vs) => Some(OwnedValue::Array(
-                vs.iter().map(to_owned).collect::<Result<_, _>>()?,
-            )),
-            Self::ManyCursor(cs) => Some(OwnedValue::Array(
-                cs.iter().map(to_owned_cursor).collect::<Result<_, _>>()?,
-            )),
+            Self::Many(vs) => Some(OwnedValue::Array(to_owned_all(&vs)?)),
+            Self::ManyCursor(cs) => Some(OwnedValue::Array(to_owned_all_cursors(&cs)?)),
             Self::None => None,
             Self::Error(_) => None,
             Self::Owned(o) => Some(o),
@@ -2266,8 +2285,8 @@ impl<V: DocumentValue> GenericResult<V> {
         Ok(match self.materialize_lazy() {
             Self::One(v) => vec![to_owned(&v)?],
             Self::OneCursor(c) => vec![to_owned_cursor(&c)?],
-            Self::Many(vs) => vs.iter().map(to_owned).collect::<Result<_, _>>()?,
-            Self::ManyCursor(cs) => cs.iter().map(to_owned_cursor).collect::<Result<_, _>>()?,
+            Self::Many(vs) => to_owned_all(&vs)?,
+            Self::ManyCursor(cs) => to_owned_all_cursors(&cs)?,
             Self::None => vec![],
             Self::Error(_) => vec![],
             Self::Owned(o) => vec![o],
@@ -4375,15 +4394,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             {
                 GenericResult::One(v) => vec![owned_or_err!(to_owned(&v))],
                 GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_cursor(&c))],
-                GenericResult::Many(vs) => {
-                    owned_or_err!(vs.iter().map(to_owned).collect::<Result<Vec<_>, _>>())
-                }
-                GenericResult::ManyCursor(cs) => {
-                    owned_or_err!(cs
-                        .iter()
-                        .map(to_owned_cursor)
-                        .collect::<Result<Vec<_>, _>>())
-                }
+                GenericResult::Many(vs) => owned_or_err!(to_owned_all(&vs)),
+                GenericResult::ManyCursor(cs) => owned_or_err!(to_owned_all_cursors(&cs)),
                 GenericResult::None => Vec::new(),
                 GenericResult::Owned(v) => vec![v],
                 GenericResult::ManyOwned(vs) => vs,
@@ -6426,10 +6438,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(v) => {
                     if !any_owned {
                         any_owned = true;
-                        owned = owned_or_err!(cursors
-                            .iter()
-                            .map(to_owned_cursor)
-                            .collect::<Result<Vec<_>, _>>());
+                        owned = owned_or_err!(to_owned_all_cursors(&cursors));
                         cursors.clear();
                     }
                     owned.push(v);
@@ -6442,10 +6451,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     let out = if any_owned {
                         owned
                     } else {
-                        owned_or_err!(cursors
-                            .iter()
-                            .map(to_owned_cursor)
-                            .collect::<Result<Vec<_>, _>>())
+                        owned_or_err!(to_owned_all_cursors(&cursors))
                     };
                     return partial_generic(out, Control::Error(e));
                 }
@@ -6469,10 +6475,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         let out = if any_owned {
             owned
         } else {
-            owned_or_err!(cursors
-                .iter()
-                .map(to_owned_cursor)
-                .collect::<Result<Vec<_>, _>>())
+            owned_or_err!(to_owned_all_cursors(&cursors))
         };
         return partial_generic(out, Control::Halt(code));
     }
@@ -6736,10 +6739,9 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(elements) = target.as_array() {
         let items = elements.collect_values();
         let range = SliceBounds::from_literals(start, end).resolve(items.len());
-        return GenericResult::Owned(OwnedValue::Array(owned_or_err!(items[range]
-            .iter()
-            .map(to_owned)
-            .collect::<Result<Vec<_>, _>>())));
+        return GenericResult::Owned(OwnedValue::Array(owned_or_err!(to_owned_all(
+            items[range].iter()
+        ))));
     }
     // yq's object AST-child-layout slicing rule (#1102) — mirrors
     // `eval.rs`'s cursor-backed `Expr::Slice` arm for the same target type;
@@ -7153,11 +7155,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 use rand_chacha::ChaCha8Rng;
 
                 if let Some(elements) = value.as_array() {
-                    let mut values: Vec<OwnedValue> = owned_or_err!(elements
-                        .collect_cursors()
-                        .iter()
-                        .map(to_owned_cursor)
-                        .collect::<Result<Vec<_>, _>>());
+                    let mut values: Vec<OwnedValue> =
+                        owned_or_err!(to_owned_all_cursors(&elements.collect_cursors()));
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
@@ -7178,11 +7177,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Pivot => {
             if let Some(elements) = value.as_array() {
-                let items: Vec<OwnedValue> = owned_or_err!(elements
-                    .collect_cursors()
-                    .iter()
-                    .map(to_owned_cursor)
-                    .collect::<Result<Vec<_>, _>>());
+                let items: Vec<OwnedValue> =
+                    owned_or_err!(to_owned_all_cursors(&elements.collect_cursors()));
                 if items.is_empty() {
                     return GenericResult::Owned(OwnedValue::Array(vec![]));
                 }
@@ -7633,12 +7629,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Reverse => {
             if let Some(elements) = value.as_array() {
-                let values: Vec<OwnedValue> = owned_or_err!(elements
-                    .collect_cursors()
-                    .iter()
-                    .rev()
-                    .map(to_owned_cursor)
-                    .collect::<Result<Vec<_>, _>>());
+                let values: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(
+                    elements.collect_cursors().iter().rev()
+                ));
                 GenericResult::Owned(OwnedValue::Array(values))
             } else if optional {
                 GenericResult::None
