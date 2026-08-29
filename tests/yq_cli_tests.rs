@@ -19813,6 +19813,29 @@ fn test_1219_interior_slice_separated_by_iterate_is_noop() -> Result<()> {
     Ok(())
 }
 
+/// #1432 (coverage): `navigate_read_only`'s own `Expr::Iterate` arm --
+/// unchanged by #1432's fix, since `yq_assign_is_total_noop` now routes
+/// through the new `assign_path_all_noop` instead -- had no test reaching
+/// it independently through its one remaining caller, `yq_del_slice_outcome`
+/// (every existing `del()`+`Iterate` test either has no trailing slice run
+/// at all, or hits the interior-slice-in-prefix early return before ever
+/// calling `navigate_read_only`). `del(.a[].b[0:1])` has no slice anywhere
+/// in its prefix (`[Field(a), Iterate, Field(b)]`), so it reaches this
+/// arm's real-container branch directly. Live-verified against yq v4.53.3:
+/// both sides discard the `[0:1]` slice of every `.b`, matching the
+/// existing "residual prefix" no-op family above.
+#[test]
+fn test_yq_del_slice_outcome_iterate_prefix_real_container_1432() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[].b[0:1])",
+        r#"{"a":[{"b":[1,2,3]},{"b":[4,5,6]}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[{},{}]}"#);
+    Ok(())
+}
+
 /// #1223: a comma-grouped multi-path `del()` used to crash when a sibling's
 /// chained-slice target was an `Object`, instead of applying #1162's own
 /// parent-key-drop rule (which the *single-path* form of this exact query
