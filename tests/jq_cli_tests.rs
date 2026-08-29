@@ -11951,6 +11951,60 @@ fn test_resolve_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1517(
     Ok(())
 }
 
+/// #1528: the value-mode sibling of #1517's own fix -- `eval_slice_bound`/
+/// `eval_slice_expr` keep a bound generator's own partial prefix instead of
+/// discarding it on escape, same technique, re-verified for read (not path)
+/// position. Live-verified against jq 1.7.1 for every shape below.
+#[test]
+fn test_eval_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1528() -> Result<()> {
+    // `start` escapes: `end` (nested inside) is fully iterated for the one
+    // `start` value that did resolve.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#".[(0,error("b")):(2,3)]"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,20]\n[10,20,30]\n");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    // `end` escapes: `start` never gets to try a second value.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#".[(0,1):(2,error("b"))]"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,20]\n");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    // The issue's own `first`/`limit` repro.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"limit(1; .[(0,error("b")):(2,3)])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,20]\n");
+    assert_eq!(stderr, "");
+
+    // Reachable through an owned-pipe stage that materializes an
+    // `OwnedValue` ahead of the slice -- `eval.rs`'s own `eval_slice_bound`/
+    // `eval_slice_expr` copy, the "harder" of the two evaluators the issue
+    // names, not `eval_generic.rs`'s.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"sort | limit(1; .[(0,error("b")):(2,3)])"#],
+        Some("[30,10,20]"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,20]\n");
+    assert_eq!(stderr, "");
+
+    // `end` escapes with *zero* prior values -- `ends_escape` still wins
+    // over `starts_escape`, matching #1517's own "innermost escape wins"
+    // rule.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#".[(0,1):error("b")]"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains('b'), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #1517 Guard A (the write-side twin of #972's own Guard A, this time on
 /// the bound axis instead of the key axis): the exact boundary that would
 /// silently over-satisfy `take_path_branches` if the fix above overshot

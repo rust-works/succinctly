@@ -6249,24 +6249,55 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     // Bounds first: an empty start or end stream must not evaluate the
     // target at all.
-    let starts = match eval_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor) {
-        Ok(v) => v,
-        Err(Control::Error(e)) => return GenericResult::Error(e),
-        Err(Control::Break(label)) => return GenericResult::Break(label),
-        Err(Control::Halt(code)) => return GenericResult::Halt(code),
-    };
+    //
+    // #1528: keeps each bound generator's own partial prefix instead of
+    // discarding it on escape (same fix #1517 applied to the path-mode
+    // resolver, re-derived here for value mode). jq compiles `E[S:T]` as
+    // `S as $s | T as $t | E | .[$s:$t]` -- `T` (end) is nested inside `S`
+    // (start)'s own iteration and re-run fresh for every `$s`, so a `T`
+    // escape fires before `S` ever gets a chance to expose its own
+    // (confirmed against jq 1.7.1: `.[(0,1):error("b")]` on `[10,20,30]`
+    // prints nothing before raising `b`). `ends_escape` therefore wins over
+    // `starts_escape` for what ultimately propagates, and `starts` truncates
+    // to its own first value whenever `ends` escaped -- `start`'s second
+    // value would only ever be tried after `end`'s *own* re-run for it
+    // completes, which never happens once `end` has already escaped once.
+    // `end` itself is computed once here (not re-run per `s`), which is
+    // still correct: it depends only on `value`, not `s`, so its own
+    // (prefix, escape) pair is identical on every notional re-run.
+    //
+    // Not addressed here (pre-existing, separate from this fix): `target`'s
+    // own `Partial` arm below still discards its prefix outright rather than
+    // threading it through with the same truncation `target_escape` would
+    // need against `ends`, mirroring `resolve_slice_expr`'s own 3-way rule
+    // -- unreachable in practice today, since that arm already returns
+    // before the loop below can run at all.
+    let (starts, starts_escape) =
+        match eval_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor) {
+            Ok(v) => v,
+            Err(control) => return partial_generic(Vec::new(), control),
+        };
     if starts.is_empty() {
-        return GenericResult::None;
+        return match starts_escape {
+            None => GenericResult::None,
+            Some(control) => partial_generic(Vec::new(), control),
+        };
     }
-    let ends = match eval_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil) {
+    let (ends, ends_escape) = match eval_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil)
+    {
         Ok(v) => v,
-        Err(Control::Error(e)) => return GenericResult::Error(e),
-        Err(Control::Break(label)) => return GenericResult::Break(label),
-        Err(Control::Halt(code)) => return GenericResult::Halt(code),
+        Err(control) => return partial_generic(Vec::new(), control),
     };
+    let ends_escaped = ends_escape.is_some();
+    let bounds_escape = ends_escape.or(starts_escape);
     if ends.is_empty() {
-        return GenericResult::None;
+        return match bounds_escape {
+            None => GenericResult::None,
+            Some(control) => partial_generic(Vec::new(), control),
+        };
     }
+    let starts_len = if ends_escaped { 1 } else { starts.len() };
+    let starts = &starts[..starts_len];
 
     // Borrowed and owned targets are kept apart so the common (borrowed) case
     // never materializes the document — mirrors `eval_index_expr`.
@@ -6331,7 +6362,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     ]));
     match &targets {
         Targets::Borrowed(ts) => {
-            for s in &starts {
+            for s in starts {
                 for e in &ends {
                     for t in ts {
                         match slice_one_generic::<S, V>(t.clone(), *s, *e, optional) {
@@ -6345,7 +6376,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             }
         }
         Targets::Owned(ts) => {
-            for s in &starts {
+            for s in starts {
                 for e in &ends {
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
@@ -6358,9 +6389,15 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             }
         }
     }
-    // #1048: a zero-result collapse here (every (start, end) pair
-    // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
-    owned_vec_to_generic_result(out)
+    // #1528: the bound-escape info threaded through above still has to
+    // reach the final result -- a successful loop doesn't mean `start`/`end`
+    // themselves didn't escape after producing `out`'s own values.
+    match bounds_escape {
+        // #1048: a zero-result collapse here (every (start, end) pair
+        // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
+        None => owned_vec_to_generic_result(out),
+        Some(control) => partial_generic(out, control),
+    }
 }
 
 /// Evaluate one slice bound (`start` or `end`) against `value`/`cursor`.
@@ -6368,44 +6405,63 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
 /// a fractional dynamic bound still widens the slice the way a literal one
 /// does — see `eval::eval_slice_bound`. A missing bound (`None`) is a single
 /// `None` ("open on this side"), not an empty stream.
+///
+/// Keeps the bound generator's own partial prefix rather than discarding it
+/// on escape (#1528, mirroring #1517's identical fix for the path-mode
+/// resolver): the `Ok` tuple's second element is the escape (if any) that
+/// ended the stream, with `raw`/the converted `Vec` still holding whatever
+/// came before it. `Err` is reserved for a genuine type failure converting an
+/// already-resolved value (`owned_bound_to_i64` rejecting a non-numeric
+/// bound) -- same residual gap #1517's own doc comment leaves open: this
+/// still discards any prefix converted cleanly before that one bad value,
+/// a different failure shape from a generator's own escape that needs its
+/// own priority-ordering pass to fix, not a quick addition here.
 fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
     bound: &Option<Box<Expr>>,
     value: V,
     cursor: Option<V::Cursor>,
     round: fn(f64) -> f64,
-) -> Result<Vec<Option<i64>>, Control> {
+) -> Result<(Vec<Option<i64>>, Option<Control>), Control> {
     let Some(expr) = bound else {
-        return Ok(vec![None]);
+        return Ok((vec![None], None));
     };
-    let raw = match eval_single::<S, V>(expr, value, false, cursor) {
-        GenericResult::Error(e) => return Err(Control::Error(e)),
-        GenericResult::Break(label) => return Err(Control::Break(label)),
-        // Falling into `other => other.collect_owned()` below would discard
-        // the halt into an empty bound list instead of propagating it, so a
-        // dynamic slice bound like `.[:halt_error(3)]` would silently exit 0
-        // (#791).
-        GenericResult::Halt(code) => return Err(Control::Halt(code)),
-        GenericResult::None => return Ok(Vec::new()),
-        GenericResult::Partial(_, control) => return Err(control),
-        GenericResult::One(v) => vec![to_owned_key_shape(&v).map_err(Control::Error)?],
-        GenericResult::OneCursor(c) => {
-            vec![to_owned_key_shape_cursor(&c).map_err(Control::Error)?]
-        }
-        GenericResult::Many(vs) => vs
-            .iter()
-            .map(to_owned_key_shape)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Control::Error)?,
-        GenericResult::ManyCursor(cs) => cs
-            .iter()
-            .map(to_owned_key_shape_cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Control::Error)?,
-        other => other.collect_owned().map_err(Control::Error)?,
-    };
-    raw.iter()
+    let (raw, escape): (Vec<OwnedValue>, Option<Control>) =
+        match eval_single::<S, V>(expr, value, false, cursor) {
+            GenericResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+            GenericResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+            // Same "keep whatever prefix came before it" treatment as `Error`/
+            // `Break` -- a dynamic slice bound like `.[:halt_error(3)]` must
+            // still surface the halt (#791), it just no longer has to discard a
+            // successfully-produced prefix to do so.
+            GenericResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
+            GenericResult::None => (Vec::new(), None),
+            GenericResult::Partial(vs, control) => (vs, Some(control)),
+            GenericResult::One(v) => (vec![to_owned_key_shape(&v).map_err(Control::Error)?], None),
+            GenericResult::OneCursor(c) => (
+                vec![to_owned_key_shape_cursor(&c).map_err(Control::Error)?],
+                None,
+            ),
+            GenericResult::Many(vs) => (
+                vs.iter()
+                    .map(to_owned_key_shape)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Control::Error)?,
+                None,
+            ),
+            GenericResult::ManyCursor(cs) => (
+                cs.iter()
+                    .map(to_owned_key_shape_cursor)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Control::Error)?,
+                None,
+            ),
+            other => (other.collect_owned().map_err(Control::Error)?, None),
+        };
+    let converted = raw
+        .iter()
         .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((converted, escape))
 }
 
 /// Apply resolved bounds to one borrowed target. Mirrors `eval::eval_single`'s
@@ -11919,21 +11975,41 @@ mod tests {
     }
 
     #[test]
-    fn test_json_computed_slice_bounds_partial_bound_collapses_to_its_control() {
+    fn test_json_computed_slice_bounds_partial_bound_keeps_its_prefix_1528() {
         // A bound stream can itself be `Partial` (some outputs, then a
-        // control) — `eval_slice_bound` collapses that to the bare control,
-        // the same reduction a `Partial` *target* gets elsewhere (#400/#494).
+        // control) — `eval_slice_bound` keeps that prefix instead of
+        // collapsing to the bare control (#1528, mirroring #1517's identical
+        // fix for the path-mode resolver). Confirmed against jq 1.7.1:
+        // `.a[(1,2,error("x")):2]`/`.a[(1,2,break $out):2]` on
+        // `{"a":[1,2,3]}` both print `[2]` then `[]` (from `$s=1`/`$s=2`
+        // against the fixed end bound `2`) before the error/break fires on
+        // `$s`'s third candidate.
         let json = br#"{"a":[1,2,3]}"#;
         let index = JsonIndex::build(json);
 
         let expr = crate::jq::parse(r#".a[(1,2,error("x")):2]"#).unwrap();
-        assert!(eval_with_cursor(&expr, index.root(json)).is_error());
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec!["[2]", "[]"]
+                );
+                assert_eq!(e.message, "x");
+            }
+            other => panic!("expected Partial(_, Error), got {other:?}"),
+        }
 
         let expr = crate::jq::parse(".a[(1,2,break $out):2]").unwrap();
-        assert!(matches!(
-            eval_with_cursor(&expr, index.root(json)),
-            GenericResult::Break(label) if label == "out"
-        ));
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(prefix, Control::Break(label)) => {
+                assert_eq!(label, "out");
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec!["[2]", "[]"]
+                );
+            }
+            other => panic!("expected Partial(_, Break), got {other:?}"),
+        }
     }
 
     #[test]
