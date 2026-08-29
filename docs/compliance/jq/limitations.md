@@ -1393,6 +1393,39 @@ this. Tracked in
 (item 9) as a residual, not silently reintroduced — `each_limit_generic`'s own doc comment
 carries the same note at the call site.
 
+## A `?//`-alternatives bind under a short-circuiting consumer runs once, not once per alternative
+
+Real jq's short-circuiting builtins (`first`, `isempty`, `limit`, `any`, `all`, ...) are defined
+in `builtin.jq` as `label $out | ... break $out`. When the generator argument is a
+`?//`-alternatives bind and that `break` unwinds through it, jq's `?//` treats *any* escaping
+break as "this alternative failed, try the next" — it does not distinguish a label declared
+outside the whole `?//` from one declared inside it. The consumer's whole computation therefore
+runs once per alternative, even though only the first alternative's output is ever kept. Every
+row confirmed live against jq 1.7.1:
+
+| filter                              | jq 1.7.1             | succinctly jq |
+|-------------------------------------|----------------------|---------------|
+| `isempty(1 as $x ?// $y \| 5)`      | `false` then `false` | `false`       |
+| `[first(1 as $x ?// $y \| 5, 6)]`   | `[5,5]`              | `[5]`         |
+| `[limit(1; 1 as $x ?// $y \| 5)]`   | `[5,5]`              | `[5]`         |
+| `1 as $x ?// $y \| 5` (no consumer) | `5`                  | `5`           |
+
+`succinctly jq` resolves `?//` via static Rust-side pattern-alternative resolution
+(`try_pattern_alternatives`/`each_pattern_alternatives`, `src/jq/eval.rs`) with no concept of an
+outer `label`/`break` at all — its builtins are native Rust, not user-space `builtin.jq` macro
+expansions — so it always produces exactly one output regardless of alternative count. This is
+the *non-duplicating* direction: succinctly's own output is the smaller, arguably more intuitive
+one, but it is a real divergence from jq's own defined semantics.
+
+Not fixed here — whether to reproduce jq's per-alternative re-run behaviour is an open
+implementation question tracked in
+[#1519](https://github.com/rust-works/succinctly/issues/1519), which this entry was split from
+([#1831](https://github.com/rust-works/succinctly/issues/1831)) to record the divergence
+unconditionally regardless of how that question is resolved. Piggybacks on the `?//` retry rule
+from [#1457](https://github.com/rust-works/succinctly/issues/1457); unrelated to the other `?//`
+divergence already recorded above ([#1365](https://github.com/rust-works/succinctly/issues/1365),
+`?//`-alternatives folds not being path-tracked).
+
 ## `--seq`'s malformed-record warning covers one of jq's several message shapes
 
 Real jq warns on stderr ("`jq: ignoring parse error: ...`") whenever it silently drops a
