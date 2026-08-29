@@ -15548,10 +15548,24 @@ fn test_nth_non_integer_n_takes_ceil_1825() -> Result<()> {
 /// rounded away as `f + 1.0` crosses a power-of-two ULP-doubling boundary.
 /// Confirmed live against jq 1.7.1 for the smallest `f64` greater than
 /// `k`, for every `k = 2^m - 1` up to `511`.
+///
+/// A prior version of this test built that boundary value via `(k |
+/// tonumber) + 0.0000000000000002` -- a fixed offset that is smaller than
+/// half a ULP at every one of these magnitudes except `k == 1`, so jq's
+/// own `+` rounded it straight back down to exactly `k` for the other 8
+/// rows (confirmed: `3.0 + 0.0000000000000002 == 3.0` bit-for-bit).
+/// Those rows still asserted a correct output, but only by accident --
+/// they exercised plain integer `nth(k; ...)`, not the boundary case this
+/// test exists to pin, so a regression back to the old `ceil(x)` formula
+/// would have slipped past 8 of these 9 assertions (#1825 review, Angle
+/// A). Building the boundary value directly via `k`'s own bit pattern + 1
+/// ULP, instead of relying on jq's `+` to land on it, makes every row
+/// exercise the real boundary regardless of magnitude.
 #[test]
 fn test_nth_ulp_boundary_matches_jq_addition_order_1825() -> Result<()> {
-    for k in [1, 3, 7, 15, 31, 63, 127, 255, 511] {
-        let filter = format!("nth(({k} | tonumber) + 0.0000000000000002; range(1;2000))");
+    for k in [1i64, 3, 7, 15, 31, 63, 127, 255, 511] {
+        let smallest_float_above_k = f64::from_bits((k as f64).to_bits() + 1);
+        let filter = format!("nth({smallest_float_above_k:?}; range(1;2000))");
         let (stdout, stderr, code) = run_jq_full(&["-n", &filter], None)?;
         assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), (k + 1).to_string(), "{filter}");

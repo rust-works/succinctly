@@ -3357,6 +3357,32 @@ pub(crate) enum LimitN {
     Take(usize),
 }
 
+/// jq's `limit($n; f)`/`nth($n; f)` both take `ceil($n)` outputs of `f` for
+/// a positive `$n` (`limit`'s own definition -- `if $n > 0 then <take,
+/// decrementing $n by 1 per output, stop once the decremented count is <=
+/// 0> elif $n == 0 then empty else f end` -- consumes one whole unit of
+/// `$n` per iteration, so a fractional remainder still needs one more
+/// output to cross zero). `f > 0.0` is the caller's contract, not
+/// re-checked here (`debug_assert!` only): both call sites already branch
+/// on sign themselves, for a `LimitN::Take(0)`/`Unlimited` distinction this
+/// function has no reason to know about.
+///
+/// A single shared definition rather than one ceiling formula per caller,
+/// #1825 review: an earlier version of `classify_nth_n` re-derived this
+/// independently via the real-number identity `ceil(x + 1) == ceil(x) +
+/// 1`, true for exact reals but not for the rounded `f64` addition jq's
+/// own `$n + 1` actually performs -- the two diverge by one whenever `$n`
+/// crosses a power-of-two ULP-doubling boundary
+/// (`nth(1.0000000000000002; range(1;30))` is `2` in jq, confirmed live;
+/// the old formula computed `3`). Callers now perform that same rounded
+/// addition themselves (`classify_nth_n` passes `f + 1.0` here) instead of
+/// this function re-deriving an equivalent, so there is exactly one
+/// ceiling computation both share, not two independently-reasoned copies.
+fn ceil_positive_float_to_usize(f: f64) -> usize {
+    debug_assert!(f > 0.0);
+    f.ceil() as usize
+}
+
 pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError> {
     match n_value {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
@@ -3366,21 +3392,15 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError>
         | OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
         | OwnedValue::Null
         | OwnedValue::Bool(_) => Ok(LimitN::Unlimited),
-        // jq's own `limit($n; f)` is `if $n > 0 then <take, decrementing $n
-        // by 1 per output, stop once the decremented count is <= 0> elif
-        // $n == 0 then empty else f end` -- a positive `$n` therefore takes
-        // `ceil($n)` outputs (each iteration consumes one whole unit of
-        // `$n`, and a fractional remainder still needs one more output to
-        // cross zero), not the integer-only count this function used to
-        // require. `$n == 0.0` (including `-0.0`, which compares equal to
-        // `0.0` under IEEE 754) takes the `$n == 0` branch; NaN satisfies
-        // neither `> 0` nor `== 0`, so it falls to the same unlimited `else
-        // f` branch as a negative `$n` (#1825 -- confirmed live against jq
+        // `$n == 0.0` (including `-0.0`, which compares equal to `0.0`
+        // under IEEE 754) takes the `$n == 0` branch; NaN satisfies neither
+        // `> 0` nor `== 0`, so it falls to the same unlimited `else f`
+        // branch as a negative `$n` (#1825 -- confirmed live against jq
         // 1.7.1: `limit(nan; 1,2,3)` passes everything through, same as
         // `limit(-1; 1,2,3)`).
         OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
             if f > 0.0 {
-                Ok(LimitN::Take(f.ceil() as usize))
+                Ok(LimitN::Take(ceil_positive_float_to_usize(f)))
             } else if f == 0.0 {
                 Ok(LimitN::Take(0))
             } else {
@@ -3395,20 +3415,28 @@ pub(crate) fn classify_limit_n(n_value: OwnedValue) -> Result<LimitN, EvalError>
     }
 }
 
-/// `nth(n; expr)`'s own `n` classification, shared by [`builtin_nth_stream`]
-/// and `eval_generic.rs`'s `eval_nth_generic` (#1607) so the two spellings
-/// (`Builtin::NthStream`, the arm real `nth(n; expr)` calls reach, and the
-/// generic evaluator's native fast path over the same shape) can't drift
-/// apart the way a hand-copied classification already has once before
-/// (#1313, the reason [`classify_limit_n`] above exists at all).
+/// `nth(n; expr)`'s own `n` classification, shared by [`builtin_nth_stream`],
+/// `eval_nth_expr`, and `eval_generic.rs`'s `eval_nth_generic` (#1607) so
+/// the different spellings (`Builtin::NthStream`, the arm real `nth(n;
+/// expr)` calls reach; `Expr::NthExpr`, parser-unreachable today but
+/// exercised directly in tests; and the generic evaluator's native fast
+/// path over the same shape) can't drift apart the way a hand-copied
+/// classification already has once before (#1313, the reason
+/// [`classify_limit_n`] above exists at all).
 ///
-/// A document-sourced number arrives here as an `OwnedValue`; preferring
-/// `as_i64()` over `as_f64()` matters because an integer past `f64`'s
-/// 53-bit mantissa would otherwise be rounded on its way to `usize`.
+/// A document-sourced number arrives here as an `OwnedValue`; matching
+/// `Int`/`NumberLiteral(Int)` directly (rather than converting to `f64`
+/// first) matters because an integer past `f64`'s 53-bit mantissa would
+/// otherwise be rounded on its way to `usize`.
 pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
-        ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)) => {
-            let f = owned.as_f64().unwrap_or(0.0);
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            Ok(i as usize)
+        }
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+            Err(EvalError::new("nth doesn't support negative indices"))
+        }
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
             // `f.is_nan() || f < 0.0`, not just `f < 0.0`: the two only
             // differ for NaN, where `f < 0.0` is `false` (silently
             // accepting NaN as index `0`) but jq's own guard -- `nth($n;
@@ -3419,36 +3447,21 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
             if f.is_nan() || f < 0.0 {
                 return Err(EvalError::new("nth doesn't support negative indices"));
             }
-            // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` (see
-            // `classify_limit_n`'s own `Take(f.ceil() as usize)` for a
-            // positive `$n`) and returns the last one -- a 0-based stop
-            // index of `ceil($n + 1) - 1`. An earlier version of this fix
-            // computed that as `ceil($n)` instead, reasoning from the real-
-            // number identity `ceil(x + 1) == ceil(x) + 1` -- true for
-            // exact reals, but not for the rounded `f64` addition jq's own
-            // `$n + 1` actually performs: review found and confirmed live
-            // against jq 1.7.1 that the two diverge by one whenever `f`'s
-            // fractional part is small enough to be rounded away as
-            // `f + 1.0` crosses a power-of-two ULP-doubling boundary
-            // (`nth(1.0000000000000002; range(1;30))` is `2` in jq, but
-            // `ceil(f) as usize` computes `2` where the correct 0-based
-            // index is `1` -- every `f` that is the smallest `f64` greater
-            // than `k` for `k = 2^m - 1` reproduces this). Computing
-            // `f + 1.0` explicitly, the same rounding jq's own arithmetic
-            // performs, before ceiling avoids the gap between the two
-            // formulas entirely. Truncating (the original pre-#1825 `f as
-            // usize`) instead of this `+1`-then-ceil shape silently
-            // answered from one element earlier than jq for any positive
-            // non-integer `n`: `nth(0.4; 1,2,3)` is `2` in jq, not `1`.
-            // `as_i64()` is still preferred for an exact integer: past
-            // f64's 53-bit mantissa, converting to `f64` at all would
-            // already have lost precision.
-            Ok(owned.as_i64().map_or_else(
-                || ((f + 1.0).ceil() as usize).saturating_sub(1),
-                |i| i as usize,
-            ))
+            // jq's `nth($n; g)` takes `ceil($n + 1)` outputs of `g` and
+            // returns the last one -- a 0-based stop index of
+            // `ceil($n + 1) - 1`. `f + 1.0` is computed explicitly here
+            // (the same rounded `f64` addition jq's own arithmetic
+            // performs) rather than reasoned around via `ceil($n)` --
+            // see `ceil_positive_float_to_usize`'s own doc comment for
+            // why the two aren't interchangeable. `f >= 0.0` from the
+            // guard above guarantees `f + 1.0 >= 1.0 > 0.0`, so the
+            // subtraction below can never underflow -- a plain `- 1`,
+            // not `saturating_sub`, so a future change that weakens that
+            // guarantee fails loudly (a debug-build panic) instead of
+            // silently answering `0`.
+            Ok(ceil_positive_float_to_usize(f + 1.0) - 1)
         }
-        ref other => Err(EvalError::type_error("number", other.type_name())),
+        other => Err(EvalError::type_error("number", other.type_name())),
     }
 }
 
