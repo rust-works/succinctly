@@ -7309,6 +7309,75 @@ fn test_array_wrapped_path_context_builtin_optional_is_atomic_1302() -> Result<(
     Ok(())
 }
 
+/// #1826: `Builtin::Map(f)`'s path-context arm claimed the same
+/// array-construction atomicity `Expr::Array`'s arm above earns via #1302's
+/// fix, but never actually got it -- it passed the *ambient* `optional`
+/// straight into each element's own evaluation instead of forcing `false`
+/// and self-catching. An ambient `optional` (from an earlier `?` in the
+/// same pipe, still threaded downstream per this evaluator's model -- see
+/// `test_optional_dispatch_catches_atomically_not_broadcast_1335` below)
+/// let a genuine per-element error self-swallow into "no output for this
+/// element" before the array-level atomicity match ever saw it, silently
+/// *skipping* the erroring element instead of discarding the whole `map()`
+/// -- confirmed live pre-fix: `(.a)? | map(if key==1 then error("boom")
+/// else key end)` on `{"a":[1,2,3]}` produced `[0,2]`, where the
+/// structurally-identical `(.a)? | [.[] | if key==1 then error("boom") else
+/// key end]` already correctly produced nothing. Unlike #1302's own
+/// direct-`?`-on-the-construction repro, this one needs the *ambient*
+/// form (`?` on an earlier stage, `map(...)` unwrapped in `rest`) --
+/// `.a | map(...)?` (mirroring #1302's own test shape) does not reach the
+/// buggy code path at all, since that shape's `?` isolates with its own
+/// forced `false` via a different (already-correct) dispatch.
+#[test]
+fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
+    // Array target: the erroring element must discard the whole map, not
+    // just itself.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | map(if key==1 then error(\"boom\") else key end)",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Object target: same atomicity, `key` reporting the string key instead
+    // of an index.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | map(if key==\"y\" then error(\"boom\") else key end)",
+        ],
+        Some(r#"{"a":{"x":1,"y":2}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Without any ambient `?`, the same query still hard-errors -- the fix
+    // must not accidentally make every error inside `map()` vanish.
+    let (_stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            ".a | map(if key==1 then error(\"boom\") else key end)",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // Sibling positive case: a `map()` that never errors is unaffected by
+    // the ambient `optional`, and `rest` after it still runs normally.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a)? | map(key) | length"],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "3");
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::StringInterpolation` arm (#1334), the
 /// same gap #1302 fixed for `Expr::Array` -- so `"k=\(key)"` silently
 /// stubbed `key` to `null` inside a `\(...)` slot, even once
