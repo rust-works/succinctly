@@ -2606,6 +2606,24 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 let flags = self.parse_expr()?;
                 self.skip_ws();
+                // yq mode accepts (and ignores) any further `; expr`
+                // arguments at arity 3+, the same fixed-slot-past-arity-1
+                // parser leniency already established for `sub` above
+                // (#1122) -- confirmed live against yq v4.53.3: `split("x";
+                // "y"; "z")` parses and behaves identically to arity 2
+                // (#1439). Parsed and discarded here, not evaluated at all:
+                // `builtin_split_regex`'s yq-mode arm never evaluates `s`/
+                // `flags` either, so a discarded 3rd+ argument is
+                // consistent with that same "every argument past arity 1 is
+                // a dead AST slot" rule, not a separate carve-out for it.
+                if self.mode == ParserMode::Yq {
+                    while self.peek() == Some(';') {
+                        self.next();
+                        self.skip_ws();
+                        self.parse_expr()?;
+                        self.skip_ws();
+                    }
+                }
                 self.expect(')')?;
                 return Ok(Some(Builtin::SplitRegex(Box::new(s), Box::new(flags))));
             }

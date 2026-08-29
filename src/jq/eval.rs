@@ -13889,6 +13889,18 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // Real yq's `split(re; flags[, ...])` ignores every argument once arity
+    // exceeds 1 and behaves exactly as `split("")` -- the same fixed-AST-
+    // slot-past-arity-1 upstream Go bug shape already documented for
+    // `sub(re; s; flags)` (#1122), confirmed live against yq v4.53.3
+    // (#1439). Dispatched *before* either argument is evaluated, not just
+    // ignored after: `split(error("boom");"y")` doesn't raise in real yq
+    // (confirmed live), so `re_expr`/`flags_expr` must never be touched
+    // here, matching how `sub`'s own yq-mode arm never evaluates its
+    // `replacement`/`flags` either.
+    if S::TAG == EvalTag::Yq {
+        return yq_split_ignores_arguments::<W>(&value, optional);
+    }
     fanout_regex_pattern_with_collected_flags::<W, S>(
         re_expr,
         flags_expr,
@@ -13899,6 +13911,36 @@ fn builtin_split_regex<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             split_regex_resolved::<W>(pattern, global_flags, &value, optional)
         },
     )
+}
+
+/// Real yq's `split(re; flags[, ...extra arity-3+ args])`: never a regex
+/// split at all (#1439) -- see `builtin_split_regex`'s own doc comment for
+/// why this is dispatched to before `re_expr`/`flags_expr` are ever
+/// evaluated. Shares `split_regex_resolved`'s "read the input string,
+/// raising the same wording it already does for a decode failure or a
+/// non-string input" step (that error wording's own mismatch against real
+/// yq's `cannot split !!seq, can only split strings` is a separate,
+/// pre-existing, explicitly out-of-scope gap per #1439's own issue body,
+/// unrelated to arity) rather than `builtin_split`'s -- the two already
+/// diverge on this wording and #1439 doesn't unify them.
+#[cfg(feature = "regex")]
+fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let input = match value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(cow) => cow,
+            Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
+    };
+    let parts: Vec<OwnedValue> = input
+        .chars()
+        .map(|c| OwnedValue::String(c.to_string()))
+        .collect();
+    QueryResult::Owned(OwnedValue::Array(parts))
 }
 
 /// `split(re; flags)`'s work once the pattern and every flags value are

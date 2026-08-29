@@ -415,14 +415,31 @@ $ echo '"aaa"' | yq            'sub("A";"X";"i")'   # "aaa" (flags never read, n
 $ echo '"aaa"' | succinctly yq 'sub("A";"X";"i")'   # "aaa" (matches)
 ```
 
-`split`'s 2-arg `split(re; flags)` form has an unrelated, still-unresolved mystery of its
-own ([#1439](https://github.com/rust-works/succinctly/issues/1439)) — it doesn't do a regex
-split at all:
+### 2-argument `split(re; flags)` — resolved, real yq ignores every argument once arity exceeds 1
+
+`split`'s 2-arg `split(re; flags)` form had an unrelated mystery of its own, now resolved
+by [#1439](https://github.com/rust-works/succinctly/issues/1439): the same fixed-AST-slot
+shape as `sub` above, not a designed feature. Real yq's `split` ignores every argument once
+arity exceeds 1 and behaves exactly as `split("")` — splitting the input into individual
+Unicode characters, not a regex split, and not jq's `split/2`. Confirmed live: an
+`error(...)` placed in either the pattern or the flags argument never fires, and neither a
+present nor absent literal pattern changes the output at all:
 
 ```bash
 $ echo '"a1b2c"' | yq            -o=json 'split("[0-9]";"g")'   # ["a","1","b","2","c"]
-$ echo '"a1b2c"' | succinctly yq -o=json 'split("[0-9]";"g")'   # ["a","b","c"] -- jq-modeled regex split
+$ echo '"a1b2c"' | succinctly yq -o=json 'split("[0-9]";"g")'   # ["a","1","b","2","c"] (matches)
+$ echo '"a,b,c"' | yq            -o=json 'split(",";"g")'       # ["a",",","b",",","c"] -- pattern is present, still irrelevant
+$ echo '"a,b,c"' | succinctly yq -o=json 'split(",";"g")'       # ["a",",","b",",","c"] (matches)
 ```
+
+Per [ADR-0018](../../adrs/adr-0018.md) rule 3, succinctly reproduces this bug-for-bug rather
+than performing an actual regex split; arity 3+ is accepted and discarded (parser leniency),
+matching `sub`'s own arity 4+ handling above. The 1-arg `split(s)` form is unaffected — its
+own argument really is evaluated and used (`split(error("boom"))` still raises, confirmed
+live) — and `succinctly jq`'s `split/2` keeps its real jq-modeled regex-split behavior
+unchanged in jq mode. Non-string-input error wording (`array (...) cannot be matched, as it
+is not a string` vs. real yq's `cannot split !!seq, can only split strings`) is a separate,
+pre-existing gap unrelated to arity, not addressed here.
 
 ### Global regex zero-width-match iteration — resolved, real yq uses Go's `regexp`
 
@@ -551,7 +568,7 @@ which was true only before #1534.
   `inside` at all to verify it against — see the fan-out table above). Confirmed by
   `test_yq_contains_scalar_vs_scalar_kind_mismatch_answers_false_1649` and its siblings.
 
-### Regex flag grammar — `test`/`match`/`capture` fixed, `split` still open
+### Regex flag grammar — `test`/`match`/`capture` fixed
 
 **Fixed by [#1426](https://github.com/rust-works/succinctly/issues/1426):** real yq doesn't
 use jq's flag grammar at all for `test`/`match`/`capture` — only `g` is a real flag; every
@@ -574,9 +591,10 @@ Deliberately **not** extended to:
 - `sub` — moot rather than unverified now that #1122 resolved its mystery: 3-arg `sub`
   never evaluates its `flags` argument at all, so there is no flags *grammar* to check in
   the first place, valid or garbage.
-- `split` — its own mystery (#1439, above) is still genuinely unresolved; applying this
-  rule there without first understanding its actual argument semantics would be a new,
-  unverified guess.
+- `split` — moot rather than unverified now that #1439 resolved its mystery (above):
+  2-arg `split(re; flags)` never evaluates its `flags` argument (or its pattern) at all
+  once arity reaches 2, so there is no flags *grammar* to check in the first place,
+  valid or garbage — the same reasoning as `sub` immediately above.
 - `gsub`/`scan`/`splits` (not real yq builtins at all, per #1436 — flag validation is moot
   for a call real yq would reject before ever reaching it).
 - The array-unpack form (`test(["abc","i"])`, no explicit flags argument) — real yq's own
@@ -611,12 +629,14 @@ $ echo '"a1X5c"' | succinctly yq 'test(1.5)'      # was: Error: number (1.5) is 
 
 `Null`/`Bool`/`Int`/`Float`/`NumberLiteral` now coerce (`owned_to_string`-equivalent)
 before the existing type-check runs; jq mode is unaffected (real jq 1.7.1 keeps
-strict typing here too, matching ADR-0018 rule 2). `split(re;flags)`'s own output
-still diverges from real yq for an unrelated, already-tracked reason regardless of
-this fix (below: "3-argument `sub`" section's sibling gap, tracked as
-[#1439](https://github.com/rust-works/succinctly/issues/1439) — succinctly performs
-a real regex split, real yq's own `split` doesn't remove the matched delimiter at
-all) — this fix only closes the pattern-type gap, not #1439's separate one.
+strict typing here too, matching ADR-0018 rule 2). This coercion applied to
+2-arg `split(re;flags)`'s pattern too at the time — moot as of #1439 (above): once
+arity reaches 2, yq mode never evaluates the pattern at all (it dispatches to the
+same `split("")` behavior as every other arity-2+ call, regardless of what the
+pattern argument is), so there is no pattern *value* left for this coercion to
+apply to in yq mode any more, the same way #1439 also mooted the flags-grammar
+question for `split` above. jq mode's own `split/2` is unaffected either way — it
+never went through this coercion (strict typing, matching real jq).
 
 Deliberately **not** extended to a container (`Array`/`Object`) pattern — this fix's
 own live probes showed real yq doesn't simply error there either, but its exact
