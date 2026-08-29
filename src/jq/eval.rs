@@ -620,13 +620,20 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => {
             let mut map = IndexMap::new();
             for field in *fields {
-                // Get the key as a string
+                // A structurally non-string key (#1194) stays silently
+                // skipped here, matching #1642's established
+                // preserve-not-raise convention for that axis -- only a
+                // *string* key that fails to *decode* raises, mirroring
+                // the value arm just above.
                 if let StandardJson::String(key_str_val) = field.key() {
-                    if let Ok(cow) = key_str_val.as_str() {
-                        map.insert(
-                            cow.into_owned(),
-                            to_owned_checked_at_depth(&field.value(), depth + 1)?,
-                        );
+                    match key_str_val.as_str() {
+                        Ok(cow) => {
+                            map.insert(
+                                cow.into_owned(),
+                                to_owned_checked_at_depth(&field.value(), depth + 1)?,
+                            );
+                        }
+                        Err(e) => return Err(EvalError::decode_failure(e.message())),
                     }
                 }
             }
@@ -58689,6 +58696,34 @@ mod tests {
             other => {
                 panic!("expected the decode failure to bypass `optional` uncaught, got: {other:?}")
             }
+        }
+    }
+
+    /// #1734: `to_owned_checked_at_depth`'s `Object` arm guarded a field's
+    /// *value* against decode failure (the string-value arm just above)
+    /// but not its *key* -- an undecodable key was silently dropped from
+    /// the materialized map instead of raising, unlike every other
+    /// #1620/#1247 decode-failure site. Live-reachable via `sort` alone
+    /// (`builtin_sort` was already migrated to `to_owned_checked` by
+    /// #1755's own prior work): confirmed via the library API that
+    /// `[{<undecodable key>: 1}] | sort` used to return
+    /// `Owned(Array([Object({})]))` -- the whole field silently vanished,
+    /// no error -- rather than raising like the sibling string-value case
+    /// already did.
+    #[test]
+    fn eval_rs_to_owned_checked_object_key_decode_failure_raises_1734() {
+        let json: &[u8] = br#"[{"\ud800":1}]"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("sort").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "expected a decode-failure error, got: {e:?}"
+            ),
+            other => panic!(
+                "expected the undecodable object key to raise instead of being silently dropped, got: {other:?}"
+            ),
         }
     }
 
