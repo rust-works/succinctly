@@ -14234,6 +14234,40 @@ mod tests {
         assert_eq!(out, "");
     }
 
+    /// #1679: the `sorted: false` sibling of the test above -- the genuinely
+    /// lazy path (`stream_lazy_keys_json`/`stream_lazy_keys_yaml`, #685)
+    /// used to silently skip a #1194 key instead of raising, disagreeing
+    /// with `keys`'s `sorted: true` arm on the very same document. Both
+    /// output formats must now report the failure via `stats.error` too,
+    /// keeping whatever prefix (nothing, here, since the malformed key is
+    /// the only one) was already written.
+    #[test]
+    fn test_stream_unsorted_lazy_keys_arm_raises_on_malformed_key_1679() {
+        let json: &[u8] = b"{123: 1}";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("keys_unsorted").unwrap(), cursor);
+        assert!(matches!(
+            result,
+            GenericResult::LazyKeys { sorted: false, .. }
+        ));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert!(stats.error.is_some());
+        assert_eq!(out, "[]");
+
+        let mut out = String::new();
+        let stats = result
+            .stream_yaml(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .unwrap();
+        assert!(stats.error.is_some());
+        assert_eq!(out, "");
+    }
+
     /// `GenericResult::materialize_lazy`'s `LazyKeys` arm `Err` side:
     /// reached whenever a `LazyKeys` result is materialized by a consumer
     /// other than `stream_json`/`stream_yaml`/`fold_lazy_keys_stage` (which
