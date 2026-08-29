@@ -6506,41 +6506,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
     }
 }
 
-impl<W: AsRef<[u64]> + Clone> YamlFields<'_, W> {
-    /// Whether any field has this key -- stops at the first match instead
-    /// of walking to the end to resolve last-duplicate-key-wins for a value
-    /// existence alone doesn't need (#1739).
-    ///
-    /// Deliberately **not** [`find`](Self::find)'s own `if let
-    /// YamlValue::String(key) = ...` match: that skips an `Alias`-typed key
-    /// entirely, a real, separate pre-existing gap (`.b.hello` on `a: &k
-    /// hello\nb:\n  *k: 1` was already `null` before this function existed)
-    /// out of scope to fix here. `has()` itself never had that gap before
-    /// this native arm existed, though -- it used to reach a fully
-    /// materializing path that resolves aliases, so silently inheriting
-    /// `find`'s narrower match here would have been a real regression
-    /// against `has()`'s own prior behavior, not just a missed improvement
-    /// (code review, #1739). `DocumentValue::as_str()` on the whole key
-    /// value, not the inner string-payload `as_str()` `find` calls after
-    /// its own variant match, resolves an alias chain before decoding
-    /// (mirrors `key.as_str()`'s own `Alias` arm above in this file) while
-    /// keeping the same decode-failure-skip behavior for an ordinary string
-    /// key, since both ultimately call the identical inner `as_str().ok()`.
-    /// Needs the `Clone` bound `find`'s own impl block doesn't (that trait
-    /// method's `DocumentValue` impl requires it), so this lives in its own
-    /// block rather than widening every other method in `find`'s.
-    pub fn contains(&self, name: &str) -> bool {
-        let mut fields = self.clone();
-        while let Some((field, rest)) = fields.uncons() {
-            if field.key().as_str().is_some_and(|k| k.as_ref() == name) {
-                return true;
-            }
-            fields = rest;
-        }
-        false
-    }
-}
-
 impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
     type Value = YamlValue<'a, W>;
     type Cursor = YamlCursor<'a, W>;
@@ -6573,10 +6538,6 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
 
     fn find_cursor(&self, name: &str) -> Option<Self::Cursor> {
         YamlFields::find_cursor(self, name)
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        YamlFields::contains(self, name)
     }
 
     fn is_empty(&self) -> bool {

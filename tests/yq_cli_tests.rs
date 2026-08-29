@@ -15421,31 +15421,51 @@ fn test_builtin_has_yq_type_mismatch_never_errors_917() -> Result<()> {
 }
 
 /// #1739 review: `has()`'s new native single-key arm must not regress an
-/// alias-typed mapping key relative to `has()`'s own pre-#1739 behavior.
-/// `has()` used to reach a fully materializing path that resolves an alias
-/// key's target before comparing (same as `keys`/`.` already do for this
-/// document, both pinned alongside this test); the new native arm walks the
-/// raw field list directly, and an earlier draft of it only matched a
-/// literal `String`-variant key, silently excluding `Alias` and reporting
-/// `false` for a key `keys`/`.` both still agree exists. Not a claim this
-/// matches real yq -- real yq keeps an alias-typed key literal (`*k`, not
-/// resolved to its target) for `keys`/`.` on the identical document, a
-/// separate, pre-existing, out-of-scope divergence unrelated to #1739 (this
-/// codebase's own alias *value* resolution, not this key-existence check,
-/// would need to change to close that gap). This test only pins internal
-/// consistency: `has()` must keep agreeing with `keys()`/`.` on this
-/// crate's own resolved spelling, whatever it is.
+/// alias-typed mapping key relative to `has()`'s own pre-#1739 behavior, and
+/// must stay self-consistent with `keys()`/`.` on this crate's own resolved
+/// spelling for such a key -- whatever that spelling is, not a claim it
+/// matches real yq (real yq keeps an alias-typed key literal, `*k`, never
+/// resolving it at all; this crate's own alias-key resolution, correct or
+/// not, is a separate and out-of-scope question from this test).
+///
+/// Two review rounds each found a different way to get this wrong:
+/// `contains` originally matched only a literal `String`-variant key,
+/// silently excluding `Alias` (reporting `false` for a key `keys`/`.`
+/// agreed existed, since `has()` used to reach a fully materializing path
+/// that resolves aliases before this native arm existed); a fix using the
+/// whole-value `as_str()` then over-resolved a **multi-hop** alias chain
+/// relative to `keys()`'s own single-hop resolution (`key_string_kind`),
+/// disagreeing with `keys()` again, just for a deeper chain. Both cases are
+/// pinned here since `key_display_string` (the eventual, shared fix) is the
+/// same function `keys()` itself is built on, and could in principle regress
+/// either shape again without the two staying wired together this way.
 #[test]
 fn test_has_yq_alias_typed_key_matches_own_resolved_spelling_1739() -> Result<()> {
-    let doc = "a: &k hello\nb:\n  *k: 1\n";
-
-    let (out, code) = run_yq_stdin(r#".b | has("hello")"#, doc, &[])?;
+    // One-hop: an ordinary alias-typed key.
+    let one_hop = "a: &k hello\nb:\n  *k: 1\n";
+    let (out, code) = run_yq_stdin(r#".b | has("hello")"#, one_hop, &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "true");
-
-    let (out, code) = run_yq_stdin(".b | keys", doc, &["-o", "json", "-I0"])?;
+    let (out, code) = run_yq_stdin(".b | keys", one_hop, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"["hello"]"#);
+
+    // Two-hop: an alias to an alias used as a key. `keys()` only resolves
+    // one hop today (a separate, pre-existing gap of its own), so the
+    // *correct* answer here is that neither `has("hello")` (the fully
+    // resolved spelling) nor the raw key text matches -- only whatever
+    // `keys()` itself already reports (empty string, an unresolved
+    // complex-key fallback) should.
+    let two_hop = "a: &x hello\nb: &y *x\nc:\n  *y: 2\n";
+    let (out, code) = run_yq_stdin(r#".c | has("hello")"#, two_hop, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "false");
+    let (out, code) = run_yq_stdin(".c | keys", two_hop, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"[""]"#);
+    let (out, code) = run_yq_stdin(r#".c | has("")"#, two_hop, &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
     Ok(())
 }
 
