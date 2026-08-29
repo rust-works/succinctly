@@ -39,7 +39,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use super::document::{
     effective_fields, effective_fields_checked, effective_keys, effective_len, key_display_string,
-    resolve_display_key, DisplayKeyGuard, DocumentFields,
+    resolve_display_key, DisplayKeyGuard, DocumentElements, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::map_builtin_subexprs;
@@ -8579,19 +8579,30 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            let entries: Result<Vec<OwnedValue>, EvalError> = elements
-                .enumerate()
-                .map(|(i, elem)| {
-                    let mut entry = IndexMap::new();
-                    entry.insert("key".to_string(), OwnedValue::Int(i as i64));
-                    entry.insert("value".to_string(), to_owned_checked(&elem)?);
-                    Ok(OwnedValue::Object(entry))
-                })
-                .collect();
-            match entries {
-                Ok(entries) => QueryResult::Owned(OwnedValue::Array(entries)),
-                Err(e) => QueryResult::Error(e),
+            // #1829 review: `collect_cursors_checked` (`document.rs`), not
+            // a bare `enumerate()` -- the array counterpart of the Object
+            // arm's own #1677 fix below. Its own doc comment names
+            // `to_entries` on arrays as one of its two intended callers
+            // (`.[]` is the other): a malformed `,` between elements
+            // (`[1 2, 3]`) must raise here too, matching what the CLI's own
+            // `eval_generic.rs` path already enforces for `.[]`/`to_entries`
+            // on the identical input.
+            let cursors = match elements.collect_cursors_checked() {
+                Ok(c) => c,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let mut entries: Vec<OwnedValue> = vec_with_capacity(cursors.len());
+            for (i, cursor) in cursors.into_iter().enumerate() {
+                let val = match to_owned_checked(&cursor.value()) {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
+                };
+                let mut entry = IndexMap::new();
+                entry.insert("key".to_string(), OwnedValue::Int(i as i64));
+                entry.insert("value".to_string(), val);
+                entries.push(OwnedValue::Object(entry));
             }
+            QueryResult::Owned(OwnedValue::Array(entries))
         }
         StandardJson::Object(fields) => {
             // #1829: `effective_fields_checked` (`document.rs`) raises on a
@@ -43223,6 +43234,25 @@ mod tests {
     fn test_builtin_to_entries_raises_on_malformed_delimiter_1677() {
         query!(br#"{"a" 1, "b": 2}"#, "to_entries",
             QueryResult::Error(_) => {}
+        );
+    }
+
+    /// Code review, #1829: the *array* arm needed its own #1677 fix, not
+    /// just the object arm above -- `enumerate()` alone can't see a missing
+    /// `,` between elements, only `collect_cursors_checked` (`document.rs`,
+    /// whose own doc comment names `to_entries` on arrays as one of its two
+    /// intended callers) can. `[1 2, 3]` used to silently yield 3 entries
+    /// instead of raising, disagreeing with the CLI's own `eval_generic.rs`
+    /// path, which already enforces this for `.[]`/`to_entries` on the
+    /// identical input.
+    #[test]
+    fn test_builtin_to_entries_array_raises_on_malformed_delimiter_1677() {
+        query!(br"[1 2, 3]", "to_entries",
+            QueryResult::Error(_) => {}
+        );
+        // Positive control: a well-formed array is unaffected.
+        query!(br"[1, 2, 3]", "to_entries",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 3)
         );
     }
 
