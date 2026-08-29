@@ -34362,20 +34362,28 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(f) => f,
                 Err(e) => return QueryResult::Error(e),
             };
+            // Resolve each field's display key once, not once per
+            // requested key (code review, #1829): the raw scan the fix
+            // above replaced re-decoded every field's key on every outer
+            // iteration -- O(keys * fields) decodes where `checked`'s own
+            // keys never change across that loop. Unreachable in practice
+            // -- `effective_fields_checked` already rejected a
+            // structurally malformed key (#1194) -- checked anyway,
+            // matching `effective_keys`'s own defensive style rather than
+            // assuming.
+            let mut resolved_fields = vec_with_capacity(checked.len());
+            for field in &checked {
+                let Some(key) = key_display_string(&field.key) else {
+                    return QueryResult::Error(fields.malformed_member_error());
+                };
+                resolved_fields.push((key, field));
+            }
             // For objects, pick specified string keys
             let mut result = IndexMap::new();
             for key in keys {
                 if let OwnedValue::String(k) = key {
                     // Find the field in the object
-                    for field in &checked {
-                        // `effective_fields_checked` already rejected a
-                        // structurally malformed key (#1194), so `None`
-                        // here is unreachable in practice -- checked
-                        // anyway, matching `effective_keys`'s own
-                        // defensive style rather than assuming.
-                        let Some(resolved) = key_display_string(&field.key) else {
-                            return QueryResult::Error(fields.malformed_member_error());
-                        };
+                    for (resolved, field) in &resolved_fields {
                         if resolved.as_ref() == k.as_str() {
                             // #1755: to_owned_checked, not to_owned
                             // -- an undecodable picked value must
@@ -38019,6 +38027,44 @@ mod tests {
     fn test_builtin_paths_filter_raises_on_structurally_malformed_key_1829() {
         query!(br#"{"a":1,"b"}"#, "paths(true)",
             QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829 code review: `pick`/`omit(...)?` must suppress the new
+    /// malformed-key errors via the outer `Expr::Optional` catch, matching
+    /// `keys?`/`to_entries?`/`map_values(...)?`'s already-tested convention
+    /// -- flagged as a coverage gap (no runtime bug; both already behaved
+    /// correctly) since `pick`/`omit` were the only two of the five #1829
+    /// builtins in this slice without a dedicated test pinning it.
+    #[test]
+    fn test_builtin_pick_omit_optional_suppresses_malformed_key_errors_1829() {
+        query!(br#"{"a":1,"b"}"#, "pick([\"a\"])?", QueryResult::None => {});
+        query!(br#"{"a":1,"b"}"#, "omit([\"a\"])?", QueryResult::None => {});
+        query!(br#"{"a" 1, "b": 2}"#, "pick([\"b\"])?", QueryResult::None => {});
+        query!(br#"{"a" 1, "b": 2}"#, "omit([\"b\"])?", QueryResult::None => {});
+    }
+
+    /// #1829 code review: the object arm's `effective_fields_checked`
+    /// rewrite collapses a duplicate key to its last occurrence *before*
+    /// `pick` ever looks for it (jq mode) -- real jq collapses a repeated
+    /// document key at parse time, before any filter runs (`{"a":1,"a":2}
+    /// | .` is `{"a":2}`, confirmed live against jq 1.7.1), so `pick`
+    /// finding the *last* value here isn't a `pick`-specific policy, it's
+    /// `pick` correctly seeing the same document jq itself would. The old
+    /// raw `for field in *fields` scan `effective_fields_checked` replaced
+    /// found the *first* occurrence instead (`{"a":1}`), an undocumented
+    /// side effect this PR's diff didn't call out; pinned here so a future
+    /// change back to a raw scan doesn't silently regress it. `omit` is
+    /// unaffected either way -- its `IndexMap::insert` overwrite-on-
+    /// duplicate-key already produced last-value-wins under the old scan
+    /// too, since it walks (and inserts) every occurrence rather than
+    /// stopping at the first match the way `pick`'s lookup does.
+    #[test]
+    fn test_builtin_pick_finds_last_value_for_duplicate_key_1829() {
+        query!(br#"{"a":1,"a":2}"#, "pick([\"a\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(2)));
+            }
         );
     }
 

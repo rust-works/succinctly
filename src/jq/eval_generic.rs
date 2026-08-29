@@ -6815,9 +6815,8 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// `current_path.push`/`.pop()` around each recursive call (rather than a
 /// clone-and-extend style) is safe here because every `push` is followed,
 /// after the recursive call returns, by exactly one matching `pop` on every
-/// exit path -- the sole early exit before a `push` (`key_str()` returning
-/// `None`) is a `continue` that skips straight to the next field without
-/// ever pushing.
+/// exit path -- the sole early exit before a `push` (a malformed key) is a
+/// `return Err(..)` that unwinds the whole walk without ever pushing.
 ///
 /// The array branch walks `uncons()` directly rather than materializing
 /// `collect_values()`'s `Vec` first (code review, #868) -- arrays have no
@@ -6828,38 +6827,47 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// `to_owned`/`to_owned_cursor` already carry -- `current_path.len()` tracks
 /// depth without a separate counter, same shape as `collect_paths`'s own
 /// `#1021` guard.
+///
+/// #1829: `effective_fields_checked`, not the infallible `effective_fields`
+/// -- this is the CLI's own native `Builtin::Paths`/`Builtin::LeafPaths`
+/// dispatch (`eval_generic.rs`'s `eval_builtin`), reached directly by
+/// `succinctly jq`/`succinctly yq`, not through `eval.rs`'s
+/// `StandardJson`-specific `builtin_paths`/`builtin_leaf_paths` (those are
+/// reachable only via the public library entry point
+/// `succinctly::jq::eval`, per #1755's own precedent comment on the
+/// sort/min/max family having the identical library-only gap). This
+/// function's own doc comment used to admit "no error channel to raise
+/// through" for a structurally malformed key (#1194) -- fixed by giving it
+/// one, matching `keys`/`to_entries`/`map_values`'s already-established
+/// #1194/#1677 policy on the same document.
 fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     current_path: &mut Vec<OwnedValue>,
     paths: &mut Vec<OwnedValue>,
     leaves_only: bool,
-) {
+) -> Result<(), EvalError> {
     assert_nesting_depth(current_path.len());
     if let Some(fields) = value.as_object() {
-        let fields = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS);
-        if fields.is_empty() {
+        let checked = effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)?;
+        if checked.is_empty() {
             if leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            return;
+            return Ok(());
         }
-        for field in fields {
-            // `key_display_string`, not `field.key_str()`: a key that will
-            // not *decode* (#1247/#1385) is preserved via its raw source
-            // span rather than skipped (#1642), matching
-            // `length`/`keys`/`keys_unsorted`/`.` -- this loop used to
-            // silently drop such a field's path, disagreeing with `keys`
-            // over the same document. A key the format's grammar never
-            // allowed at all (#1194) is still skipped, same as before this
-            // fix (this function has no error channel to raise through).
+        for field in checked {
+            // Unreachable in practice -- `effective_fields_checked` already
+            // rejected a structurally malformed key (#1194) -- checked
+            // anyway, matching `effective_keys`'s own defensive style
+            // rather than assuming.
             let Some(key) = key_display_string(&field.key) else {
-                continue;
+                return Err(fields.malformed_member_error());
             };
             current_path.push(OwnedValue::String(key.into_owned()));
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            collect_paths_generic::<S, _>(&field.value, current_path, paths, leaves_only);
+            collect_paths_generic::<S, _>(&field.value, current_path, paths, leaves_only)?;
             current_path.pop();
         }
     } else if let Some(elements) = value.as_array() {
@@ -6867,7 +6875,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             if leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            return;
+            return Ok(());
         }
         let mut i = 0i64;
         let mut rest = elements;
@@ -6876,7 +6884,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
             if !leaves_only {
                 paths.push(OwnedValue::Array(current_path.clone()));
             }
-            collect_paths_generic::<S, _>(&elem, current_path, paths, leaves_only);
+            collect_paths_generic::<S, _>(&elem, current_path, paths, leaves_only)?;
             current_path.pop();
             i += 1;
             rest = tail;
@@ -6884,6 +6892,7 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
     } else if leaves_only {
         paths.push(OwnedValue::Array(current_path.clone()));
     }
+    Ok(())
 }
 
 /// Native `Builtin::Has` arm for the generic evaluator (#1739): checks
@@ -7488,24 +7497,28 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // just the root.
         Builtin::Paths => {
             let mut paths = Vec::new();
-            collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, false);
-            collapse_vec(
-                paths,
-                || GenericResult::None,
-                GenericResult::Owned,
-                GenericResult::ManyOwned,
-            )
+            match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, false) {
+                Ok(()) => collapse_vec(
+                    paths,
+                    || GenericResult::None,
+                    GenericResult::Owned,
+                    GenericResult::ManyOwned,
+                ),
+                Err(e) => GenericResult::Error(e),
+            }
         }
 
         Builtin::LeafPaths => {
             let mut paths = Vec::new();
-            collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, true);
-            collapse_vec(
-                paths,
-                || GenericResult::None,
-                GenericResult::Owned,
-                GenericResult::ManyOwned,
-            )
+            match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, true) {
+                Ok(()) => collapse_vec(
+                    paths,
+                    || GenericResult::None,
+                    GenericResult::Owned,
+                    GenericResult::ManyOwned,
+                ),
+                Err(e) => GenericResult::Error(e),
+            }
         }
 
         // The `is*` family reads through `tagged_type_name` rather than

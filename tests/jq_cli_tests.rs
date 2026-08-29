@@ -2940,6 +2940,38 @@ fn test_paths_and_leaf_paths_agree_with_keys_on_decode_failure_1642() -> Result<
     Ok(())
 }
 
+/// #1829: `paths`/`leaf_paths` dispatch, via the shipped CLI, straight to
+/// `eval_generic.rs`'s own native `Builtin::Paths`/`Builtin::LeafPaths` arm
+/// (`collect_paths_generic`) -- a *different* code path from the one
+/// `test_paths_and_leaf_paths_agree_with_keys_on_decode_failure_1642` above
+/// exercises for a merely-undecodable key. A structurally malformed key
+/// (#1194, the grammar never allowed it at all -- e.g. a trailing unpaired
+/// member) used to be silently skipped there instead of raising, so `paths`/
+/// `leaf_paths` disagreed with `keys` on the very shape #1194 exists to
+/// catch, and did so specifically at the CLI: this exact regression was
+/// invisible to a unit test that calls `succinctly::jq::eval` directly,
+/// since that library entry point routes through a completely different,
+/// separately-implemented `eval.rs` copy that never had this gap in the
+/// same way. Confirmed via `git bisect`-style manual check: unmodified
+/// `main`'s CLI binary returns `["a"]` (exit 0, `b`'s path silently
+/// dropped) for the first two queries below; this fix makes them agree
+/// with `keys`.
+#[test]
+fn test_paths_and_leaf_paths_raise_on_structurally_malformed_key_1829() -> Result<()> {
+    let doc = r#"{"a":1,"b"}"#;
+
+    let (_, _, code) = run_jq_full(&["-c", "paths"], Some(doc))?;
+    assert_ne!(code, 0, "paths must raise, not silently drop b's path");
+
+    let (_, _, code) = run_jq_full(&["-c", "leaf_paths"], Some(doc))?;
+    assert_ne!(code, 0, "leaf_paths must raise, not silently drop b's path");
+
+    let (_, _, code) = run_jq_full(&["-c", "keys"], Some(doc))?;
+    assert_ne!(code, 0, "sanity: keys already raises on this document");
+
+    Ok(())
+}
+
 /// #1642 follow-up: `to_owned`/`materialize` (`-S`, `-s`, a multi-result
 /// filter like `.,.`) build an `IndexMap<String, _>` keyed by
 /// `key_display_string`'s fallback. Two *different* decode-failure keys can
