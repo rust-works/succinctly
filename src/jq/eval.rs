@@ -26424,7 +26424,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            false,
+                            optional,
                             &mut results,
                         ) {
                             return stop;
@@ -26440,7 +26440,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            false,
+                            optional,
                             &mut results,
                         ) {
                             return stop;
@@ -26847,7 +26847,18 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // `Err(EvalEscape::Error(_)) if optional` catch and
                 // `eval_try`'s own "never catches Break/Halt" rule just
                 // below.
-                Some(QueryResult::Partial(_, Control::Error(e))) => {
+                //
+                // Both patterns are needed, not just `Partial`: `partial()`
+                // (#400/#494) collapses an *empty* prefix to the bare
+                // `Error`/`Break`/`Halt` variant, which happens exactly
+                // when the erroring element is the *first* one -- code
+                // review on #1826 caught that matching only `Partial` here
+                // left that case falling through to `Some(other) => other`
+                // unguarded by the gate below, reproducing the original bug
+                // whenever the failing element came first (`results` still
+                // empty at that point). `Expr::Array`'s own arm already ORs
+                // both shapes together in its one guard for the same reason.
+                Some(QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e))) => {
                     if optional {
                         QueryResult::None
                     } else {

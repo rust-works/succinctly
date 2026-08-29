@@ -7354,6 +7354,32 @@ fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout, "");
 
+    // The *first* element/entry erroring, not a later one: code review
+    // caught that `partial()` (#400/#494) collapses an *empty* accumulated
+    // prefix to a bare `Error`, not `Partial(_, Error)` -- a first-fix draft
+    // matched only the `Partial` shape here, so this exact case (nothing
+    // accumulated yet when the error hits) fell through unguarded and still
+    // hard-errored instead of producing no output.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | map(if key==0 then error(\"boom\") else key end)",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | map(if key==\"x\" then error(\"boom\") else key end)",
+        ],
+        Some(r#"{"a":{"x":1,"y":2}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
     // Without any ambient `?`, the same query still hard-errors -- the fix
     // must not accidentally make every error inside `map()` vanish.
     let (_stdout, stderr, code) = run_jq_full(
