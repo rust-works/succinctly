@@ -3479,6 +3479,24 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // Uncaught evaluation errors. Evaluation continues past one, so the failure
     // is remembered here and turned into yq's exit 1 below (#355).
     let mut sink = ErrorSink::default();
+    // #1615: set when a streamed *identity* render was cut off part-way
+    // through a document by a decode failure. Only the identity/P9 branches
+    // can leave the output mid-document: they stream a container's structure
+    // directly, so `a: 1\nb: ` is already written by the time the bad scalar
+    // is reached, with no newline to close it. The *evaluated* branches
+    // cannot -- `GenericResult`'s streamers report through `StreamStats`
+    // without emitting a partial scalar, which is why an evaluated filter
+    // still continues to the next document (#355) and only this flag stops
+    // the loop. Declared here, before `stream_cursor!`, because a bare
+    // identifier inside a `macro_rules!` resolves against definition-site
+    // scope -- the same reason `sink` itself lives out here.
+    // A `Cell`, not a plain `bool`: `stream_cursor!` expands in several
+    // places where nothing downstream reads the flag (the `--inplace`
+    // single-document arm has no loop to break out of), and a plain
+    // assignment there is a dead store -- `unused_assignments` fires, which
+    // `-D warnings` turns into a CI failure. `Cell::set` is a method call, so
+    // the lint does not apply, and the flag stays one shared value.
+    let stream_truncated = core::cell::Cell::new(false);
 
     // Check if expression contains split_doc - if so, each result is a separate document
     let has_split_doc = contains_split_doc(&program.expr);
@@ -3756,6 +3774,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // reaches via `absorb_stream_stats`.
                     if let Err(e) = rendered {
                         report_stream_decode_failure(&mut sink, &e);
+                        stream_truncated.set(true);
                     } else {
                         terminator.write_io($writer)?;
                         // Streaming skips evaluation, so inspect the document
@@ -3804,8 +3823,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     // `GenericResult::stream_yaml` reports a decode failure
                     // through `stats.error`, not by failing, so the outer
-                    // `Result` here is only ever `Ok` (#1615).
-                    let stats = stats.unwrap_or_default();
+                    // `Result` is only ever `Ok` here. Handled rather than
+                    // `unwrap_or_default()`ed anyway (#1615): defaulting would
+                    // discard the diagnostic and exit 0, re-creating the exact
+                    // silent swallow this change closes, if a future streamer
+                    // ever did return `Decode` from this arm.
+                    let stats = match stats {
+                        Ok(stats) => stats,
+                        Err(e) => {
+                            report_stream_decode_failure(&mut sink, &e);
+                            stream_truncated.set(true);
+                            Default::default()
+                        }
+                    };
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
                 }
@@ -3822,6 +3852,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     )?;
                     if let Err(e) = rendered {
                         report_stream_decode_failure(&mut sink, &e);
+                        stream_truncated.set(true);
                     } else {
                         terminator.write_io($writer)?;
                         // Streaming skips evaluation, so inspect the document
@@ -3846,7 +3877,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         },
                     )?;
                     // See the YAML branch above (#1615).
-                    let stats = stats.unwrap_or_default();
+                    let stats = match stats {
+                        Ok(stats) => stats,
+                        Err(e) => {
+                            report_stream_decode_failure(&mut sink, &e);
+                            stream_truncated.set(true);
+                            Default::default()
+                        }
+                    };
                     any_truthy |= stats.any_truthy;
                     absorb_stream_stats(&mut sink, &stats);
                 }
@@ -3892,8 +3930,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 output_config.use_color,
                                 output_config
                             );
-                            // See the matching check in the per-file loop below.
-                            if sink.halted().is_some() {
+                            // #1615: a truncated identity render has no
+                            // newline closing it, so continuing would weld the
+                            // next document's `---` onto the cut-off line --
+                            // producing output that reads back as valid YAML
+                            // with a fabricated value (`b: ---`), which is
+                            // worse than the silent `null` this change
+                            // replaces. Real yq aborts the whole run on this
+                            // input anyway.
+                            if sink.halted().is_some() || stream_truncated.get() {
                                 break;
                             }
                         }
@@ -4021,7 +4066,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // `can_use_m2_streaming` — would keep
                                 // streaming further documents and files
                                 // instead of stopping immediately.
-                                if sink.halted().is_some() {
+                                // #1615: see the `Sequence` arm's note above.
+                                if sink.halted().is_some() || stream_truncated.get() {
                                     break 'm2_files;
                                 }
                             }
@@ -4091,7 +4137,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         output_config
                                     );
                                     // See the matching check in the `Sequence` arm above.
-                                    if sink.halted().is_some() {
+                                    // #1615 adds the truncation term.
+                                    if sink.halted().is_some() || stream_truncated.get() {
                                         break 'm2_files;
                                     }
                                 }
@@ -4585,6 +4632,26 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
 
             let mut output_buffer = Vec::new();
+            // #1615: a decode failure must leave the file byte-identical, the
+            // way the *materializing* `--inplace` path already does (`-i '.a =
+            // 5'` on an undecodable scalar raises and does not touch the file)
+            // and the way real yq does on every filter. The streamed path
+            // reports through `sink` and keeps going, so it would otherwise
+            // reach the `fs::write` below and commit a truncated buffer --
+            // strictly worse than the silent `b: ""` this whole change
+            // replaces, because it destroys the user's own data. Compared
+            // rather than a bool so *any* diagnostic raised while building
+            // this file's buffer protects it, not only the streamed ones.
+            let reports_before_file = sink.report_count();
+            // Reset per file, not just per run: `--inplace` keeps editing the
+            // remaining files after one fails, so a flag left set by an
+            // earlier file would break the *next* file's document loop on its
+            // first iteration -- committing a buffer holding only that file's
+            // first document and silently dropping the rest. (The stdout paths
+            // need no such reset: their truncation break leaves the whole run
+            // via `break 'm2_files`, and the stdin branch has no file loop at
+            // all.)
+            stream_truncated.set(false);
 
             // `--inplace` never writes ANSI to disk (#809): shadow
             // `output_config` for the rest of this file's write so the DOM
@@ -4658,6 +4725,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     if sink.halted().is_some() {
                                         break;
                                     }
+                                    // #1615: same reasoning as the halt break
+                                    // above. Once a document has been cut off
+                                    // mid-value there is no newline to close
+                                    // it, so continuing would weld the next
+                                    // document's `---` onto the truncated
+                                    // line. The buffer is discarded by the
+                                    // write-back guard either way; stopping
+                                    // keeps it from growing a fabricated
+                                    // value first.
+                                    if stream_truncated.get() {
+                                        break;
+                                    }
                                 }
                                 global_doc_index += 1;
                                 docs = rest;
@@ -4673,20 +4752,34 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 .map_or(true, |target| global_doc_index == target);
                             if should_process {
                                 if is_identity {
-                                    if can_inplace_yaml_fast_path {
+                                    // #1615: a bare `map_err(|_| "Write
+                                    // error")` here would collapse a `Decode`
+                                    // into exactly the message-less error
+                                    // `StreamFailure` exists to escape -- and
+                                    // would leave `sink` unmarked, so the
+                                    // write-back guard above would still
+                                    // commit the truncated buffer.
+                                    let streamed = if can_inplace_yaml_fast_path {
                                         root.stream_yaml_document(
                                             &mut FmtWriter(&mut buf_writer),
                                             yaml_indent,
                                             sort_keys,
                                         )
-                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
                                     } else {
                                         root.stream_json_document(
                                             &mut FmtWriter(&mut buf_writer),
                                             json_indent,
                                             sort_keys,
                                         )
-                                        .map_err(|_| anyhow::anyhow!("Write error"))?;
+                                    };
+                                    match streamed {
+                                        Ok(()) => {}
+                                        Err(StreamFailure::Decode(e)) => {
+                                            report_stream_decode_failure(&mut sink, &e);
+                                        }
+                                        Err(StreamFailure::Fmt) => {
+                                            anyhow::bail!("Write error")
+                                        }
                                     }
                                     write_terminator(&mut buf_writer, &output_config)?;
                                     if args.exit_status {
@@ -4880,7 +4973,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // external contract to defer to here, only this project's own
             // considered choice to err toward preserving user data whenever
             // a halt is involved.
-            if any_real_output || sink.halted().is_none() {
+            // #1615 adds the `report_count` term; see `reports_before_file`.
+            if (any_real_output || sink.halted().is_none())
+                && sink.report_count() == reports_before_file
+            {
                 std::fs::write(path, &output_buffer)
                     .with_context(|| format!("failed to write to file: {}", path.display()))?;
             }
