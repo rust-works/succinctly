@@ -8789,7 +8789,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // the type system) before ever building the cursor `f` evaluates
         // against, so `v` can never carry an undecodable string here --
         // fixed anyway for the same structural-consistency reason as
-        // `eval_rhs_once`'s masked fix.
+        // `collect_rhs_outputs`'s masked fix (#1778).
         match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
             QueryResult::One(v) => match to_owned_checked(&v) {
                 Ok(v) => transformed.push(v),
@@ -15761,75 +15761,6 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
 // Assignment Operators Implementation
 // =============================================================================
 
-/// Evaluate an expression once against `value`, reducing its output stream to
-/// a single owned value: `One`/`Owned` pass through, `None` becomes `Null`,
-/// and a multi-valued stream keeps only its first element (also `Null` if
-/// empty). Used for the right-hand side of assignment operators, all of which
-/// jq evaluates as a single value rather than once per updated path.
-/// `Err` carries a `QueryResult` the caller should return immediately
-/// (an error or an in-flight `break`).
-fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-) -> Result<OwnedValue, QueryResult<'a, W>> {
-    match eval_single::<W, S>(expr, value, optional).materialize_cursor() {
-        // #1755: to_owned_checked, not to_owned -- an undecodable RHS
-        // value must raise, not silently become "" and get spliced into
-        // the update filter. Both callers (`eval_compound_assign`/
-        // `eval_alternative_assign`) immediately re-materialize the
-        // *whole* document via `eval_update`'s own already-fixed
-        // `to_owned_checked`, which happens to catch a bad RHS value
-        // today since it's necessarily part of that same document --
-        // fixed here too so correctness doesn't rest on that coincidence
-        // surviving a future refactor of either caller.
-        QueryResult::One(v) => to_owned_checked(&v).map_err(QueryResult::Error),
-        QueryResult::Owned(v) => Ok(v),
-        // #1313: a genuinely zero-output RHS (`.a += empty`) makes the
-        // *whole* compound/alternative assignment produce zero output in
-        // real jq (`value as $value | ...` never binds -- verified live
-        // against jq 1.7.1, all six operators plus `//=`), not a
-        // synthesized `null` spliced into the update filter --
-        // `Err(QueryResult::None)` is this function's own early-return
-        // signal, so both callers' existing `Err(early_return) => return
-        // early_return` arm already does the right thing here with no
-        // change on their end.
-        QueryResult::None => Err(QueryResult::None),
-        QueryResult::Error(e) => Err(QueryResult::Error(e)),
-        // `Many`/`ManyOwned` defaulting an *empty* vec to `Null` (instead of
-        // propagating zero-output the way the bare `None` arm above now
-        // does, code review #1313) relies on this crate's own hardened
-        // convention that a `Vec`-to-`QueryResult` collapse never
-        // constructs an empty `Many`/`ManyOwned` in the first place --
-        // `collapse_vec`/`owned_vec_to_result` convert an empty
-        // accumulator to `QueryResult::None` before either variant is ever
-        // built (the exact invariant #1038/#1043/#1048 hardened after each
-        // independently missing it). Live-probed several zero-output RHS
-        // shapes that could plausibly reach here as a nonempty-looking
-        // stream (`(1,2) | select(false)`, `(empty, empty)`) -- all
-        // correctly arrive as the `None` arm above instead, confirming the
-        // invariant holds for every reachable path today.
-        QueryResult::Many(vs) => vs.first().map_or(Ok(OwnedValue::Null), |v| {
-            to_owned_checked(v).map_err(QueryResult::Error)
-        }),
-        QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        QueryResult::Break(label) => Err(QueryResult::Break(label)),
-        QueryResult::Halt(code) => Err(QueryResult::Halt(code)),
-        // A trailing halt is never droppable, unlike the `Error`/`Break`
-        // cases below: `.a += (1, halt_error(3))` must exit 3, not silently
-        // compute `{"a":1}` (#791).
-        QueryResult::Partial(_, Control::Halt(code)) => Err(QueryResult::Halt(code)),
-        // Same "take the first output, ignore the rest" policy as `ManyOwned`
-        // above; the trailing `Error`/`Break` is dropped, consistent with how
-        // this function already doesn't fork over a multi-output RHS (#392, a
-        // separate, pre-existing limitation). Same empty-prefix invariant as
-        // `Many`/`ManyOwned` above applies here too -- a `Partial` prefix is
-        // never empty (see `partial`'s own contract).
-        QueryResult::Partial(vs, _control) => Ok(vs.into_iter().next().unwrap_or(OwnedValue::Null)),
-    }
-}
-
 /// Evaluate simple assignment: `.path = value`
 /// Sets the value at path and returns the modified input.
 ///
@@ -15837,11 +15768,12 @@ fn eval_rhs_once<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// desugaring is `value as $value | reduce path(paths) as $p (.; setpath($p;
 /// $value))`, so a `value` that produces more than one output runs the whole
 /// `reduce path(paths) as $p (...)` once per output, forking into one whole
-/// result document per RHS output (#392) -- not collapsing to the first the
-/// way `|=`/`+=`/`-=`/`//=`/etc. still correctly do via [`eval_rhs_once`]
-/// (unaffected by this function; it has its own callers). Every document is
-/// built by splicing that one RHS output into a fresh copy of the *original*
-/// input at every resolved path.
+/// result document per RHS output (#392). `+=`/`-=`/`*=`/`/=`/`%=`/`//=`
+/// now fork the same way (#1778, via [`eval_update_multi`]/
+/// [`collect_rhs_outputs`]) -- only `|=` still keeps just the filter's
+/// first output per iteration, by jq's own design, not a limitation.
+/// Every document is built by splicing that one RHS output into a fresh
+/// copy of the *original* input at every resolved path.
 ///
 /// A zero-output RHS produces zero documents, not one with the path set to
 /// `null`: jq's `value as $value | ...` never even reaches `path(paths)`
@@ -16255,6 +16187,141 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     QueryResult::Owned(result)
 }
 
+/// Evaluate `value_expr` once, keeping every output instead of collapsing
+/// to the first -- shared RHS-collection prologue for
+/// `eval_compound_assign`/`eval_alternative_assign` (#1778). A near-copy
+/// of `eval_assign`'s own inlined #392 prologue one function up;
+/// consolidating the two is `#1826`'s own tracked scope (extracting the
+/// shared isolate-and-atomically-catch-optional helper), not attempted
+/// here.
+fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value_expr: &Expr,
+    input: &StandardJson<'a, W>,
+    optional: bool,
+) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
+    match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(owned) => Ok((vec![owned], None)),
+            Err(e) => Err(QueryResult::Error(e)),
+        },
+        QueryResult::OneCursor(_) => {
+            unreachable!("materialize_cursor should have converted this")
+        }
+        QueryResult::Owned(v) => Ok((vec![v], None)),
+        QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect() {
+            Ok(owned) => Ok((owned, None)),
+            Err(e) => Err(QueryResult::Error(e)),
+        },
+        QueryResult::ManyOwned(vs) => Ok((vs, None)),
+        QueryResult::None => Ok((Vec::new(), None)),
+        QueryResult::Error(e) => Ok((Vec::new(), Some(Control::Error(e)))),
+        QueryResult::Break(label) => Ok((Vec::new(), Some(Control::Break(label)))),
+        QueryResult::Halt(code) => Ok((Vec::new(), Some(Control::Halt(code)))),
+        QueryResult::Partial(vs, control) => Ok((vs, Some(control))),
+    }
+}
+
+/// Shared multi-output-RHS fan-out for `eval_compound_assign`/
+/// `eval_alternative_assign` (#1778), mirroring `eval_assign`'s own #392/
+/// #1430 fix one function up: jq mode forks once per RHS output into its
+/// own whole-document copy; yq mode (on a *clean* completion only, same
+/// carve-out as `eval_assign` -- the error-interaction shape is #1779's
+/// territory, not this one's) collapses to just the *last* output, no
+/// fork. Oracle-verified for `+=` (jq forks: `.x += (10,20,30)` on
+/// `{"x":1}` is three documents; yq takes the last: one document, `{"x":
+/// 31}`).
+///
+/// Unlike `eval_assign` (which writes via `set_path` directly, since `=`
+/// has no filter of its own), each output here still needs
+/// `update_path`'s filter-application machinery: `build_filter` splices
+/// the given RHS output into the operator's own filter shape (`. op
+/// value` for compound assignment, `. // value` for alternative
+/// assignment) fresh per output, so `update_path`'s per-path `Identity`
+/// resolves to that output's own spliced value, not a shared one.
+fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+    scalar_slice_noop: bool,
+    rhs_values: Vec<OwnedValue>,
+    terminal: Option<Control>,
+    mut build_filter: impl FnMut(OwnedValue) -> Expr,
+) -> QueryResult<'a, W> {
+    let mut rhs_values = rhs_values;
+
+    // A zero-output RHS produces zero documents, matching `eval_assign`'s
+    // own #392 rule -- not `eval_rhs_once`'s old "collapse empty to Null"
+    // behavior.
+    if rhs_values.is_empty() {
+        return match terminal {
+            None => QueryResult::None,
+            Some(Control::Error(_)) if optional => QueryResult::None,
+            Some(control) => partial(Vec::new(), control),
+        };
+    }
+
+    // See `eval_assign`'s identical block for the full rationale: only on
+    // a clean completion, never a mid-stream error/break/halt.
+    if S::TAG == EvalTag::Yq && terminal.is_none() && rhs_values.len() > 1 {
+        let last = rhs_values.pop().expect("len > 1 checked above");
+        rhs_values.clear();
+        rhs_values.push(last);
+    }
+
+    let mut pristine = match to_owned_checked(&input) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
+        Ok(paths) => paths,
+        // `?` swallows only a genuine error; a halt always escapes (#791).
+        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
+        Err((_, escape)) => return escape.into(),
+    };
+    let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
+
+    let rhs_last = rhs_values.len() - 1;
+    let mut docs: Vec<OwnedValue> = vec_with_capacity(rhs_values.len());
+    for (j, rhs_value) in rhs_values.into_iter().enumerate() {
+        // Same "only the last output needs to own `pristine`" trick as
+        // `eval_assign`'s own loop -- spares the common single-output case
+        // a clone of the whole document it doesn't need.
+        let mut result = if j == rhs_last {
+            core::mem::replace(&mut pristine, OwnedValue::Null)
+        } else {
+            pristine.clone()
+        };
+        let filter = build_filter(rhs_value);
+        for path in &paths {
+            if let Err(escape) = update_path::<S>(&mut result, path, &filter, false, scalar_noop) {
+                // Atomic per RHS output, like `eval_assign`'s own per-output
+                // `set_path` error handling: this output contributes
+                // nothing, and the whole fan-out terminates here -- `docs`
+                // (only the strictly earlier, already-completed outputs)
+                // is everything that survives.
+                return match escape {
+                    EvalEscape::Error(_) if optional => owned_vec_to_result(docs),
+                    other => partial(docs, other.into()),
+                };
+            }
+        }
+        docs.push(result);
+    }
+
+    match terminal {
+        None => owned_vec_to_result(docs),
+        Some(Control::Error(e)) => {
+            if optional {
+                owned_vec_to_result(docs)
+            } else {
+                partial(docs, Control::Error(e))
+            }
+        }
+        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
+        Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
+    }
+}
+
 /// Evaluate compound assignment: `.path += value`, `.path -= value`, etc.
 fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     op: AssignOp,
@@ -16290,22 +16357,21 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // not against the sub-value at `a` (confirmed against real jq: `(.a,.b)
     // += .a` on `{"a":1,"b":2}` yields `{"a":2,"b":3}`, so `.b`'s `+=` sees
     // the pristine `.a`, not the value `.a` was just updated to). Evaluate it
-    // up front and splice in the resulting value rather than the raw
+    // up front and splice in the resulting value(s) rather than the raw
     // expression, so `update_path`'s per-path `Identity` no longer resolves
     // `.` inside it to the sub-value being replaced.
-    let rhs_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
+    //
+    // #1778: every output is kept, not just the first (`eval_rhs_once`'s
+    // old behavior) -- jq forks once per output, yq keeps only the last;
+    // see `eval_update_multi`'s own doc comment for the full rationale and
+    // oracle verification.
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
 
-    let filter = Expr::Arithmetic {
-        op: arith_op,
-        left: Box::new(Expr::Identity),
-        right: Box::new(owned_to_expr(&rhs_value)),
-    };
-
     // #1101's no-op applies to `Add` only (verified live that `-=`/`*=`
-    // error instead for this same shape) — `eval_update` runs the filter
+    // error instead for this same shape) — `update_path` runs the filter
     // normally either way, only skipping the final write when this is
     // `true` and the resolved target qualifies.
     //
@@ -16323,12 +16389,18 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // doesn't implement yet — left as `Add`-only, matching the original
     // scope, with the corrected understanding recorded on
     // `through_slice`'s own `Null` arm instead of folded in here.
-    eval_update::<W, S>(
+    eval_update_multi::<W, S>(
         path_expr,
-        &filter,
         input,
         optional,
         matches!(op, AssignOp::Add),
+        rhs_values,
+        terminal,
+        move |rhs_value| Expr::Arithmetic {
+            op: arith_op,
+            left: Box::new(Expr::Identity),
+            right: Box::new(owned_to_expr(&rhs_value)),
+        },
     )
 }
 
@@ -16353,29 +16425,43 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(unchanged);
     }
 
-    // Same root-vs-sub-value fix as eval_compound_assign: evaluate `value_expr`
-    // once against the original input before splicing it into the filter.
-    let rhs_value = match eval_rhs_once::<W, S>(value_expr, input.clone(), optional) {
+    // Same root-vs-sub-value fix as eval_compound_assign: evaluate
+    // `value_expr` once against the original input before splicing it into
+    // the filter.
+    //
+    // #1778: every output is kept, not just the first; see
+    // `eval_update_multi`'s own doc comment.
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
-
-    // Convert to update: .path //= value  becomes  .path |= . // value
-    let filter = Expr::Alternative(
-        Box::new(Expr::Identity),
-        Box::new(owned_to_expr(&rhs_value)),
-    );
 
     // `true`: real yq has no `//=` syntax at all (`'//' expects 2 args but
     // there is 1`, confirmed live), so there's no external oracle for this
     // operator specifically — but `//=` desugars to exactly the same `.path
     // |= (. // value)` shape a genuine `|=` call already no-ops on for this
-    // target (confirmed live: `.[0:1] |= (. // 99)` no-ops), through this
-    // same `eval_update` function. Leaving this `false` would make two
+    // target (confirmed live: `.[0:1] |= (. // 99)` no-ops), through the
+    // same `update_path` machinery. Leaving this `false` would make two
     // spellings of the identical operation disagree purely because of which
-    // AST shape reached `eval_update` — internal consistency, not an
-    // external-compat claim, is the justification here.
-    eval_update::<W, S>(path_expr, &filter, input, optional, true)
+    // AST shape reached `update_path` — internal consistency, not an
+    // external-compat claim, is the justification here. Same reasoning
+    // extends to yq mode's "take the last value" collapse below: real yq
+    // has no oracle for this operator, so it's judged by consistency with
+    // `|=`'s own already-correct multi-output-filter behavior instead.
+    eval_update_multi::<W, S>(
+        path_expr,
+        input,
+        optional,
+        true,
+        rhs_values,
+        terminal,
+        |rhs_value| {
+            Expr::Alternative(
+                Box::new(Expr::Identity),
+                Box::new(owned_to_expr(&rhs_value)),
+            )
+        },
+    )
 }
 
 /// Turn `root` into a fresh empty object if it is `Null`, otherwise leave it
@@ -37727,35 +37813,38 @@ mod tests {
         );
     }
 
-    /// #1755: `eval_rhs_once`'s own fix, pinned directly against the
+    /// #1755 (now against `collect_rhs_outputs`, #1778's replacement for
+    /// the now-removed `eval_rhs_once`): pinned directly against the
     /// private function rather than through `+=`/etc, since both real
     /// callers (`eval_compound_assign`/`eval_alternative_assign`)
-    /// immediately re-materialize the whole document via `eval_update`'s
-    /// own already-fixed `to_owned_checked` right after, masking this
-    /// fix at the integration level whenever the RHS value comes from the
-    /// same document (the only way it *can* come from a `StandardJson`
-    /// cursor at all). This test is what actually exercises the fixed
-    /// line -- a `+=`-based integration test would only prove
-    /// `eval_update`'s pre-existing fix, not this one.
+    /// immediately re-materialize the whole document via
+    /// `eval_update_multi`'s own `to_owned_checked(&input)` right after,
+    /// masking this fix at the integration level whenever the RHS value
+    /// comes from the same document (the only way it *can* come from a
+    /// `StandardJson` cursor at all -- `to_owned_checked` fails fast on
+    /// any undecodable string anywhere in the tree it converts, so the
+    /// whole-document pristine conversion independently catches it too).
+    /// This test is what actually exercises the fixed line.
     #[test]
-    fn test_eval_rhs_once_raises_on_decode_failure_1755() {
+    fn test_collect_rhs_outputs_raises_on_decode_failure_1755() {
         let json_bytes: &[u8] = b"\"\xff\xfe\"";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse(".").unwrap();
-        match eval_rhs_once::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), false) {
             Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("unexpected result: {other:?}"),
         }
 
         // The `QueryResult::Many(vs)` arm (not `One`, above): `.[]` on an
         // array materializes straight to `Many` (`Expr::Iterate`'s own
-        // arm), so its first cursor can carry an undecodable string too.
-        let json_bytes: &[u8] = b"[\"\xff\xfe\", 2]";
+        // arm), so a later cursor in the batch can carry an undecodable
+        // string too.
+        let json_bytes: &[u8] = b"[2, \"\xff\xfe\"]";
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse(".[]").unwrap();
-        match eval_rhs_once::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), false) {
             Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("unexpected result: {other:?}"),
         }
@@ -52502,7 +52591,7 @@ mod tests {
         // rather than aborting the whole generator on its first error, so
         // `error("boom")` is swallowed as `None` and `3` still runs --
         // diverging from jq's `{"a":1}` there. That divergence predates and
-        // is independent of #392 -- `eval_rhs_once` threaded the same
+        // is independent of #392 -- `collect_rhs_outputs` threads the same
         // `optional` flag into the RHS the same way -- and is not something
         // this fix changes or is responsible for.)
         assert_eq!(
@@ -52655,6 +52744,113 @@ mod tests {
                     OwnedValue::Int(4),
                 ]));
             }
+        );
+    }
+
+    /// #1778: `+=`'s RHS forks once per output in jq mode, matching real
+    /// jq (confirmed live, jq 1.7.1): `.x += (10,20,30)` on `{"x":1}` is
+    /// three documents, not one with the RHS collapsed to its first
+    /// output the way `eval_rhs_once` used to.
+    #[test]
+    fn test_compound_assign_multi_output_rhs_forks_once_per_output_1778() {
+        assert_eq!(
+            outputs(br#"{"x":1}"#, ".x += (10,20,30)"),
+            vec![r#"{"x":11}"#, r#"{"x":21}"#, r#"{"x":31}"#],
+        );
+    }
+
+    /// #1778: real yq takes only the *last* RHS output, with no fork
+    /// (confirmed live, yq v4.53.3): `.x += (10,20,30)` on `{"x":1}` is
+    /// one document, `{"x":31}` -- the same #1430 rule `eval_assign`
+    /// already applies to plain `=`.
+    #[test]
+    fn test_yq_compound_assign_multi_output_rhs_takes_last_value_1778() {
+        // `-=`/`*=` verified live too (yq v4.53.3): `.x -= (1,2,3)` on
+        // `{"x":10}` is `{"x":7}` (10-3); `.x *= (2,3,4)` is `{"x":40}`
+        // (10*4) -- both take only the last output, same as `+=`.
+        assert_eq!(
+            outputs_yq(br#"{"x":10}"#, ".x -= (1,2,3)"),
+            vec![r#"{"x":7}"#]
+        );
+        assert_eq!(
+            outputs_yq(br#"{"x":10}"#, ".x *= (2,3,4)"),
+            vec![r#"{"x":40}"#]
+        );
+        assert_eq!(
+            outputs_yq(br#"{"x":1}"#, ".x += (10,20,30)"),
+            vec![r#"{"x":31}"#]
+        );
+    }
+
+    /// #1778: a single-output RHS is completely unaffected by the fork/
+    /// last-value logic, in both modes.
+    #[test]
+    fn test_compound_assign_single_output_rhs_unaffected_1778() {
+        assert_eq!(outputs(br#"{"x":1}"#, ".x += 10"), vec![r#"{"x":11}"#]);
+        assert_eq!(outputs_yq(br#"{"x":1}"#, ".x += 10"), vec![r#"{"x":11}"#]);
+    }
+
+    /// #1778: a genuinely zero-output RHS (`empty`) makes the whole
+    /// compound assignment produce zero output (#1313's rule, still
+    /// correct after this fix's restructure) -- not a document with the
+    /// path set to `null`.
+    #[test]
+    fn test_compound_assign_empty_rhs_produces_no_output_1778() {
+        query!(br#"{"x":1}"#, ".x += empty",
+            QueryResult::None => {}
+        );
+    }
+
+    /// #1778: `//=`'s RHS forks the same way `+=`'s does in jq mode.
+    #[test]
+    fn test_alternative_assign_multi_output_rhs_forks_once_per_output_1778() {
+        assert_eq!(
+            outputs(br#"{"x":null}"#, ".x //= (10,20)"),
+            vec![r#"{"x":10}"#, r#"{"x":20}"#],
+        );
+    }
+
+    /// #1778: `//=` has no real yq syntax to compare against (see this
+    /// function's own doc comment), so the yq-mode "take the last value"
+    /// rule is judged by internal consistency with `|=` alone -- still
+    /// worth pinning that the collapse actually happens.
+    #[test]
+    fn test_yq_alternative_assign_multi_output_rhs_takes_last_value_1778() {
+        assert_eq!(
+            outputs_yq(br#"{"x":null}"#, ".x //= (10,20)"),
+            vec![r#"{"x":20}"#]
+        );
+    }
+
+    /// #1778: an RHS that errors partway through still keeps the
+    /// documents already forked before it, matching #400's "already-piped
+    /// output survives a downstream error" policy `eval_assign` already
+    /// follows for `=`.
+    #[test]
+    fn test_compound_assign_multi_output_rhs_errors_after_partial_output_1778() {
+        query!(br#"{"x":1}"#, r#".x += (10, error("boom"), 30)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), vec![r#"{"x":11}"#]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #1778: a multi-output RHS still forks once *per output*, not once
+    /// per (output, resolved path) pair, when the LHS path itself resolves
+    /// to more than one location -- matching `eval_assign`'s own
+    /// `test_compound_assign_multi_path_freezes_rhs`-adjacent behavior
+    /// (each output is applied to every resolved path within its own
+    /// single document copy).
+    #[test]
+    fn test_compound_assign_multi_path_with_multi_output_rhs_forks_per_output_not_per_path_1778() {
+        // Confirmed against real jq 1.7.1: `(.a,.b) += (10,20)` on
+        // `{"a":1,"b":2}` is two documents (one per RHS output), each with
+        // *both* paths updated by that same output -- not four documents
+        // (one per (path, output) pair).
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, "(.a,.b) += (10,20)"),
+            vec![r#"{"a":11,"b":12}"#, r#"{"a":21,"b":22}"#],
         );
     }
 
@@ -59434,19 +59630,20 @@ mod tests {
         }
     }
 
-    /// #1746 review: `eval_rhs_once` (the RHS materializer shared by every
+    /// #1746 review: `collect_rhs_outputs` (#1778's replacement for the
+    /// former `eval_rhs_once`, the RHS materializer shared by every
     /// compound/alternative assignment operator: `+=`, `-=`, `*=`, `/=`,
-    /// `%=`, `//=`) still calls the plain, unchecked `to_owned` -- but its
-    /// own corruption is unobservable through either of its two callers
-    /// (`eval_compound_assign`/`eval_alternative_assign`): both always call
-    /// `eval_update` immediately afterward on the *same, unmodified* input,
-    /// and `eval_update`'s own (already-fixed) `to_owned_checked(&input)`
-    /// re-materializes and decode-checks the whole document before the
-    /// (possibly-corrupted) RHS value is ever used. This pins that masking,
-    /// not a fix to `eval_rhs_once` itself -- confirmed by review that no
-    /// jq-constructible input can make `eval_rhs_once`'s own bug
-    /// independently observable, since every string it can navigate to must
-    /// already be part of the same input `eval_update` re-checks.
+    /// `%=`, `//=`) already raises on its own undecodable output, but even
+    /// if it didn't, the corruption would still be unobservable through
+    /// either of its two callers (`eval_compound_assign`/
+    /// `eval_alternative_assign`): both always call `eval_update_multi`
+    /// immediately afterward on the *same, unmodified* input, and that
+    /// function's own `to_owned_checked(&input)` re-materializes and
+    /// decode-checks the whole document before any RHS value is ever
+    /// used. This pins that masking -- no jq-constructible input can make
+    /// a hypothetical RHS-side bug independently observable here, since
+    /// every string the RHS can navigate to must already be part of the
+    /// same input `eval_update_multi` re-checks.
     #[test]
     fn eval_rs_compound_assign_raises_decode_failure_via_eval_update_1746() {
         let json: &[u8] = br#"{"a":"x","b":"\ud800"}"#;
