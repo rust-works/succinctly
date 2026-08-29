@@ -7553,9 +7553,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // jq: split("") returns each character as a separate element
                     // Rust's split("") includes empty strings at boundaries, so special-case it
                     let parts: Vec<OwnedValue> = if sep.is_empty() {
-                        cow.chars()
-                            .map(|c| OwnedValue::String(c.to_string()))
-                            .collect()
+                        split_into_individual_chars(&cow)
                     } else {
                         cow.split(&sep)
                             .map(|p| OwnedValue::String(p.to_string()))
@@ -14003,11 +14001,22 @@ fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>>(
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
     };
-    let parts: Vec<OwnedValue> = input
-        .chars()
+    QueryResult::Owned(OwnedValue::Array(split_into_individual_chars(&input)))
+}
+
+/// One `OwnedValue::String` per Unicode character of `s` -- `split("")`'s
+/// own behavior, shared by [`builtin_split`]'s empty-separator case and
+/// [`yq_split_ignores_arguments`] (#1439), whose entire arity-2+ result
+/// *is* this: real yq's `split(re; flags)` doesn't merely fall back to it
+/// on some edge case, it always equals it once arity exceeds 1. The two
+/// callers' surrounding error handling for a non-string/undecodable input
+/// intentionally differs (`builtin_split` vs. `split_regex_resolved`'s own
+/// wording, #1439's own issue body: not unified here), so only this pure
+/// splitting step is factored out, not the input-extraction around it.
+fn split_into_individual_chars(s: &str) -> Vec<OwnedValue> {
+    s.chars()
         .map(|c| OwnedValue::String(c.to_string()))
-        .collect();
-    QueryResult::Owned(OwnedValue::Array(parts))
+        .collect()
 }
 
 /// `split(re; flags)`'s work once the pattern and every flags value are
