@@ -36853,6 +36853,42 @@ mod tests {
             "pick((.k1,.k2))",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
+        // A fully-valid multi-output keys expression (`(.k1, .k2)`) still
+        // reaches `keys_owned`'s `QueryResult::Many` arm and its own
+        // `to_owned_checked` success path -- distinct from the
+        // decode-failure case above.
+        query!(
+            &b"{\"a\":1,\"b\":2,\"k1\":[\"a\"],\"k2\":[\"c\"]}"[..],
+            "pick((.k1,.k2))",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
+                assert!(!o.contains_key("b"));
+            }
+        );
+        query!(
+            &b"{\"a\":1,\"b\":2,\"k1\":[\"a\"],\"k2\":[\"c\"]}"[..],
+            "omit((.k1,.k2))",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert!(!o.contains_key("a"));
+                assert_eq!(o.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
+        // A single-output field-access keys expression (`.k`, not a
+        // literal array) reaches the `QueryResult::One` arm -- distinct
+        // from the literal-array case in the positive-control test above,
+        // which resolves to `QueryResult::Owned` instead.
+        query!(br#"{"a":1,"b":2,"k":["a"]}"#, "pick(.k)",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
+                assert!(!o.contains_key("b"));
+            }
+        );
+        query!(br#"{"a":1,"b":2,"k":["a"]}"#, "omit(.k)",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert!(!o.contains_key("a"));
+                assert_eq!(o.get("b"), Some(&OwnedValue::Int(2)));
+            }
+        );
     }
 
     /// the 18-site `builtin_tonumber`-shaped fix directly: before it, this
