@@ -4,6 +4,8 @@
 //! (including `JQ_COLORS` support), line-terminator selection (`Terminator`),
 //! and build-configuration diagnostics.
 
+use std::io::{BufWriter, Write};
+
 // Aliased: this module already has an `escape_json_body` of its own, which
 // picks *which* convention to use; the library's runs a chosen writer.
 use succinctly::jq::escape::{
@@ -317,6 +319,83 @@ pub fn flush_then_err<W: std::io::Write, T>(
         ));
     }
     Err(err)
+}
+
+/// A `BufWriter` wrapper whose `Drop` reports a flush failure to stderr
+/// instead of silently discarding it, the way `std::io::BufWriter`'s own
+/// `Drop` does (#1680).
+///
+/// `flush_then_err` (above) is the *complete* fix at the handful of
+/// early-return sites #1563/#1673 explicitly patched -- it propagates the
+/// flush failure as part of the real error, so the caller's own exit code
+/// and diagnostic both account for it. This wrapper is the backstop for
+/// every other early-return `?` in `run_jq`/`run_yq`'s own ~5,000-line
+/// bodies that doesn't route through that helper: a #1680 review found
+/// three follow-up commits were still needed to fully patch even the one
+/// PR's own narrow scope, "strong evidence that patching individual
+/// `?`-return sites by hand isn't converging." Wrapping the writer once,
+/// at construction, closes the *silent* half of the bug class everywhere
+/// at once, present and future, instead of requiring another manual audit
+/// pass every time a new early return is added to either function.
+///
+/// This does **not** recover the lost output itself -- once a `?` has
+/// already unwound past the point a later write would have happened, that
+/// output was never buffered in the first place, and if an *earlier*
+/// buffered write's flush now fails, those bytes are still gone. What
+/// changes is that the failure becomes a loud, visible diagnostic instead
+/// of a process exiting 0 (or a `?`-driven non-zero code with an unrelated
+/// message) while quietly dropping output. A `finish(self) -> Result<()>`
+/// consumed at every exit would `Result`-propagate a flush failure
+/// properly instead of merely reporting it, but that is the larger
+/// refactor of both functions' control flow this issue itself deferred.
+///
+/// Tracks whether an explicit `.flush()` call (`flush_then_err`'s own, or
+/// `--unbuffered`'s per-value flush) already observed and reported a
+/// failure, so `Drop`'s own flush attempt -- which always runs regardless
+/// of which path got the writer here -- doesn't print a second, redundant
+/// diagnostic for the exact same underlying failure the caller's own
+/// `Result` already carries.
+pub struct LoudFlushWriter<W: Write> {
+    inner: BufWriter<W>,
+    flush_already_failed: std::cell::Cell<bool>,
+}
+
+impl<W: Write> LoudFlushWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner: BufWriter::new(inner),
+            flush_already_failed: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<W: Write> Write for LoudFlushWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let result = self.inner.flush();
+        if result.is_err() {
+            self.flush_already_failed.set(true);
+        }
+        result
+    }
+}
+
+impl<W: Write> Drop for LoudFlushWriter<W> {
+    fn drop(&mut self) {
+        if self.flush_already_failed.get() {
+            return;
+        }
+        if let Err(e) = self.inner.flush() {
+            eprintln!("succinctly: failed to flush output: {e}");
+        }
+    }
 }
 
 /// Print build configuration information (similar to jq --build-configuration)
@@ -935,6 +1014,73 @@ pub fn colorize_json(json: &str, scheme: &ColorScheme) -> String {
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    /// A `Write` mock whose `flush()` always fails while `write`/`write_all`
+    /// always succeed, counting how many times the inner `flush()` was
+    /// actually invoked -- used to verify `LoudFlushWriter` (#1680) attempts
+    /// it exactly once, regardless of whether that one attempt happens via
+    /// an explicit caller flush or `Drop`'s own backstop.
+    struct FlushFailsWriter {
+        flush_calls: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Write for FlushFailsWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls.set(self.flush_calls.get() + 1);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "mock broken pipe",
+            ))
+        }
+    }
+
+    /// The redundancy this guards against: `flush_then_err` (or
+    /// `--unbuffered`'s per-value flush) already observed and will report
+    /// this exact failure through its own `Result` -- `Drop`'s own flush
+    /// attempt, which always runs regardless of how the writer's scope
+    /// ends, must not attempt (and therefore not separately report) the
+    /// same failure a second time.
+    #[test]
+    fn loud_flush_writer_skips_a_redundant_drop_flush_after_an_explicit_failure_1680() {
+        let flush_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let mut w = LoudFlushWriter::new(FlushFailsWriter {
+                flush_calls: flush_calls.clone(),
+            });
+            w.write_all(b"hello").unwrap();
+            assert!(w.flush().is_err());
+            assert_eq!(flush_calls.get(), 1);
+        }
+        assert_eq!(
+            flush_calls.get(),
+            1,
+            "Drop must not re-flush after an already-observed failure"
+        );
+    }
+
+    /// The actual #1680 fix: a caller that never explicitly flushes (every
+    /// early-return `?` this issue names) still gets exactly one flush
+    /// attempt, from `Drop` -- unlike `std::io::BufWriter`'s own `Drop`,
+    /// which would also attempt this but silently discard the result.
+    #[test]
+    fn loud_flush_writer_flushes_exactly_once_on_drop_when_never_flushed_explicitly_1680() {
+        let flush_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let mut w = LoudFlushWriter::new(FlushFailsWriter {
+                flush_calls: flush_calls.clone(),
+            });
+            w.write_all(b"hello").unwrap();
+        }
+        assert_eq!(
+            flush_calls.get(),
+            1,
+            "Drop's own attempt is the only one, and it must happen"
+        );
+    }
 
     /// The jq default spec, spelled out. Parsing this must be a no-op.
     const DEFAULT_SPEC: &str = "1;30:0;39:0;39:0;39:0;32:1;39:1;39:1;34";
