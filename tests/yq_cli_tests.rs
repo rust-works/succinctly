@@ -24441,3 +24441,43 @@ fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1645 code review: every JSON-side corruption regression test
+/// (`tests/jq_cli_tests.rs`) has no YAML sibling -- `push_generic_truthiness_cursor_error`
+/// is generic over `DocumentCursor` and reached identically by the yq
+/// evaluator, but nothing pinned that `select()` actually raises on a YAML
+/// decode failure nested inside its condition's container, only that it
+/// resolves alias falsiness correctly. Uses `\q` (not a recognized YAML
+/// escape) rather than `\x` (a valid two-hex-digit escape in YAML, unlike
+/// JSON) -- confirmed live against this binary that `\x41` decodes
+/// successfully in a YAML double-quoted string.
+#[test]
+fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Result<()> {
+    let doc = "bad:\n  - \"\\q\"\nkeep: 5\n";
+
+    let (select_out, select_err, select_code) =
+        run_yq_stdin_with_stderr("select(.bad) | .keep", doc, &[])?;
+    assert_ne!(
+        select_code, 0,
+        "select(.bad) must raise on the nested decode failure\nstdout: {select_out:?}\nstderr: {select_err:?}"
+    );
+    assert!(
+        select_err.contains("invalid escape sequence"),
+        "stderr: {select_err:?}"
+    );
+
+    // `.bad,.bad` is yq's multi-output materializing route (yq's analogue
+    // of jq's `-Sc`/`.,.` DOM-forcing tests) -- confirms select's new walk
+    // agrees with the pre-existing materializing path on this input.
+    let (materialize_out, materialize_err, materialize_code) =
+        run_yq_stdin_with_stderr(".bad,.bad", doc, &[])?;
+    assert_ne!(
+        materialize_code, 0,
+        "the materializing route must raise the same way\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
+    );
+    assert!(
+        materialize_err.contains("invalid escape sequence"),
+        "stderr: {materialize_err:?}"
+    );
+    Ok(())
+}
