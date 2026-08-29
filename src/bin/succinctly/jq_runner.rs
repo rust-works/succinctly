@@ -1092,7 +1092,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         if args.exit_status {
                             last_output = Some(result.clone());
                         }
-                        write_output(&mut out, &result, &output_config)?;
+                        // #1830: a `--raw-output0` NUL-content violation is
+                        // a data error belonging in jq's diagnostic channel
+                        // (exit 5), not a generic `anyhow` abort -- same
+                        // reasoning as `write_output_jq_value`'s own
+                        // `MalformedJsonError` handling below.
+                        if let Err(e) = write_output(&mut out, &result, &output_config) {
+                            match e.downcast_ref::<MalformedJsonError>() {
+                                Some(MalformedJsonError(err)) => {
+                                    sink.report(DiagStyle::Jq, err, &at.resolve());
+                                    break;
+                                }
+                                None => return flush_then_err(&mut out, e),
+                            }
+                        }
                     }
                     // halt/halt_error (#791) outranks everything else,
                     // including remaining rows/files still to process.
@@ -1474,7 +1487,23 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    write_output(&mut out, &result, &output_config)?;
+                    // #1830: same `MalformedJsonError` routing as the
+                    // DSV/lazy-path writers above -- a NUL-content
+                    // violation is jq's own diagnostic-channel error
+                    // (exit 5), not a generic `anyhow` abort.
+                    if let Err(e) = write_output(&mut out, &result, &output_config) {
+                        match e.downcast_ref::<MalformedJsonError>() {
+                            Some(MalformedJsonError(err)) => {
+                                sink.report(
+                                    DiagStyle::Jq,
+                                    err,
+                                    &ErrorAt::Live(&locations).resolve(),
+                                );
+                                break;
+                            }
+                            None => return flush_then_err(&mut out, e),
+                        }
+                    }
                 }
                 if let Some(code) = sink.halted() {
                     out.flush()?;
@@ -1503,7 +1532,21 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                     for result in results {
                         had_output = true;
                         last_output = Some(result.clone());
-                        write_output(&mut out, &result, &output_config)?;
+                        // #1830: same `MalformedJsonError` routing as the
+                        // sibling loops above.
+                        if let Err(e) = write_output(&mut out, &result, &output_config) {
+                            match e.downcast_ref::<MalformedJsonError>() {
+                                Some(MalformedJsonError(err)) => {
+                                    sink.report(
+                                        DiagStyle::Jq,
+                                        err,
+                                        &ErrorAt::Live(&locations).resolve(),
+                                    );
+                                    break;
+                                }
+                                None => return flush_then_err(&mut out, e),
+                            }
+                        }
                     }
                     if let Some(code) = sink.halted() {
                         out.flush()?;
@@ -1521,7 +1564,17 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 for result in results {
                     had_output = true;
                     last_output = Some(result.clone());
-                    write_output(&mut out, &result, &output_config)?;
+                    // #1830: same `MalformedJsonError` routing as the
+                    // sibling loops above.
+                    if let Err(e) = write_output(&mut out, &result, &output_config) {
+                        match e.downcast_ref::<MalformedJsonError>() {
+                            Some(MalformedJsonError(err)) => {
+                                sink.report(DiagStyle::Jq, err, &at.resolve());
+                                break;
+                            }
+                            None => return flush_then_err(&mut out, e),
+                        }
+                    }
                 }
                 if let Some(code) = sink.halted() {
                     out.flush()?;
@@ -3853,6 +3906,49 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     })
 }
 
+/// `--raw-output0` (#1830) uses NUL as its own record terminator, so a NUL
+/// byte embedded in a raw-output string's own content is genuinely
+/// ambiguous to any NUL-delimited consumer downstream (`xargs -0`,
+/// `read -d ''`) -- it would look identical to a record boundary. Real jq
+/// refuses rather than emit it: confirmed live against jq 1.7.1,
+/// `jq -r --raw-output0 '.'` on a string with an embedded NUL raises `jq:
+/// error (at <stdin>:0): Cannot dump a string containing NUL with
+/// --raw-output0 option`, exit 5 -- verified this fires only under
+/// `--raw-output0` specifically, not `-r`/`-j` alone (those use newline/no
+/// separator, where an embedded NUL creates no comparable ambiguity), and
+/// only when the *rendered* bytes would actually contain a raw NUL (JSON's
+/// own quoted output always escapes it to \u0000, six ASCII bytes, never
+/// a raw byte -- this check is unreachable from that path and is not
+/// wired there).
+///
+/// Checked here, immediately before the raw bytes reach the writer -- not
+/// via a buffer-then-scan pass over previously-written output -- so an
+/// already-good prior record (written by an earlier call to this same
+/// function inside the caller's own per-record loop) is never buffered or
+/// retroactively undone by a later record's violation. This mirrors real
+/// jq's own confirmed flush-then-error ordering: `.[]` over
+/// `[1, "bad value", 2]` under `--raw-output0` writes `1` (with its
+/// own NUL terminator) to stdout, then errors on the second value without
+/// writing any of its content, never reaching the third. This issue's
+/// (#1830) yq-mode sibling, #1709, found the opposite design ("materialize
+/// the whole rendered
+/// result, scan it, then write") on the yq side caused three separate
+/// regressions -- silently discarding already-good earlier results,
+/// leaving a dangling partial write on an error mid-multi-document-stream,
+/// and forcing full in-memory materialization of output this crate's own
+/// M2/P9 streaming architecture exists specifically to avoid (+65% peak
+/// RSS, measured). This function avoids all three by never buffering
+/// anything beyond the one string already in hand.
+fn reject_raw_output0_nul(s: &str, config: &OutputConfig) -> Result<()> {
+    if config.raw_output0 && s.as_bytes().contains(&0) {
+        return Err(MalformedJsonError(EvalError::new(
+            "Cannot dump a string containing NUL with --raw-output0 option",
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Write a single output JqValue (preserves number formatting when possible).
 fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     out: &mut Out,
@@ -3867,6 +3963,7 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
     // Handle raw output for strings
     if config.raw_output {
         if let Some(s) = value.as_str() {
+            reject_raw_output0_nul(&s, config)?;
             out.write_all(s.as_bytes())?;
             write_terminator(out, config)?;
             return Ok(());
@@ -3929,6 +4026,7 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
     // Handle raw output for strings
     if config.raw_output {
         if let OwnedValue::String(s) = value {
+            reject_raw_output0_nul(s, config)?;
             out.write_all(s.as_bytes())?;
             write_terminator(out, config)?;
             return Ok(());
