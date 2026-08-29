@@ -13831,31 +13831,56 @@ pub(crate) fn index_one_owned(
 /// reach comparable scale in principle; that variant wasn't pursued
 /// further within this issue's scope.
 pub(crate) fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
+    try_reserve_product_labeled(factors, cannot_reserve_cross_product)
+}
+
+/// [`try_reserve_product`], but with the caller's own `EvalError` message
+/// instead of `cannot_reserve_cross_product`'s "computed-index expansion"
+/// wording -- shared with [`cartesian_product`], whose own call sites
+/// (`combinations`) never index anything, so that message would mislead
+/// there (#1721).
+fn try_reserve_product_labeled<T>(
+    factors: &[usize],
+    err: impl Fn(&[usize]) -> EvalError,
+) -> Result<Vec<T>, EvalError> {
     if factors.contains(&0) {
         return Ok(Vec::new());
     }
-    let mut len: usize = 1;
-    for &f in factors {
-        let Some(next) = len.checked_mul(f) else {
-            return Err(cannot_reserve_cross_product(factors));
-        };
-        len = next;
-    }
+    let Some(len) = checked_product(factors) else {
+        return Err(err(factors));
+    };
     let mut out = Vec::new();
     if out.try_reserve_exact(len).is_err() {
-        return Err(cannot_reserve_cross_product(factors));
+        return Err(err(factors));
     }
     Ok(out)
 }
 
-fn cannot_reserve_cross_product(factors: &[usize]) -> EvalError {
-    let product = factors
+/// The checked product `factors` guards against overflowing, shared by
+/// [`try_reserve_product_labeled`]'s two error paths (an overflowing
+/// product, or a product that doesn't overflow but still can't be
+/// reserved) so both raise the same way from the same computation.
+fn checked_product(factors: &[usize]) -> Option<usize> {
+    factors
+        .iter()
+        .try_fold(1usize, |acc, &f| acc.checked_mul(f))
+}
+
+/// Renders `factors` as `"a * b * c"` for an allocation-refusal message --
+/// shared by [`cannot_reserve_cross_product`]/[`cannot_allocate_cartesian_product`],
+/// which differ only in the sentence this product is embedded in.
+fn format_product(factors: &[usize]) -> String {
+    factors
         .iter()
         .map(usize::to_string)
         .collect::<Vec<_>>()
-        .join(" * ");
+        .join(" * ")
+}
+
+fn cannot_reserve_cross_product(factors: &[usize]) -> EvalError {
     EvalError::new(format!(
-        "Cannot allocate {product} elements for a computed-index expansion"
+        "Cannot allocate {} elements for a computed-index expansion",
+        format_product(factors)
     ))
 }
 
@@ -31106,10 +31131,10 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //    rows there are -- `checked_combinations_len`'s own `base <= 1`
     //    short-circuit makes the row count permanently 1 regardless of n,
     //    so that guard alone never bounds this. `OwnedValue` is a larger
-    //    type than `indices`' own `usize`, so a `Vec<OwnedValue>`-sized
-    //    probe for this exact `n` subsumes `indices`' own allocation (a
-    //    smaller request for the same length) rather than needing a
-    //    second, separate guard for it.
+    //    type than the `usize` counter `mixed_radix_combinations` builds
+    //    internally, so a `Vec<OwnedValue>`-sized probe for this exact `n`
+    //    subsumes that counter's own allocation (a smaller request for the
+    //    same length) rather than needing a second, separate guard for it.
     let Some(total) = checked_combinations_len(base_array.len(), n) else {
         return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
     };
@@ -31145,7 +31170,14 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `results` must already be reserved for the caller's own already-guarded
 /// total capacity -- this only walks and pushes, it never sizes or grows
 /// the backing allocation itself, so it carries none of either caller's
-/// crash-prevention guards and must not be called before them.
+/// crash-prevention guards and must not be called before them. Both
+/// callers also guarantee `len_at(i) >= 1` for every `i` in `0..width`
+/// before calling in (an empty position would make `value_at(i, 0)`
+/// index out of bounds on the very first row, before any carry/bounds
+/// check runs) -- `builtin_combinations_n` via its own `n == 0`/
+/// `base_array.is_empty()` checks, `cartesian_product` via its own
+/// `arrays.is_empty()`/per-element emptiness checks.
+#[inline]
 fn mixed_radix_combinations(
     width: usize,
     results: &mut Vec<OwnedValue>,
@@ -31206,40 +31238,32 @@ fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, Eval
     }
 
     let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
-    // Not `try_reserve_product`, despite computing the identical guarded
-    // product: that helper's own message names ".[$keys]"-style computed
-    // indexing, which describes none of this builtin's own call sites
-    // (#1721) -- `combinations` never indexes anything.
-    let mut len: usize = 1;
-    for &l in &lens {
-        let Some(next) = len.checked_mul(l) else {
-            return Err(cannot_allocate_cartesian_product(&lens));
-        };
-        len = next;
-    }
-    let mut results = Vec::new();
-    if results.try_reserve_exact(len).is_err() {
-        return Err(cannot_allocate_cartesian_product(&lens));
-    }
+    // `try_reserve_product_labeled`, not the plain `try_reserve_product`
+    // every other cross-product call site uses: that one's own message
+    // names ".[$keys]"-style computed indexing, which describes none of
+    // this builtin's own call sites (#1721) -- `combinations` never
+    // indexes anything.
+    let mut results = try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?;
 
     mixed_radix_combinations(
         arrays.len(),
         &mut results,
-        |i| arrays[i].len(),
+        |i| lens[i],
         |i, idx| arrays[i][idx].clone(),
     );
 
     Ok(results)
 }
 
+/// Distinct from [`cannot_allocate_combinations`]/[`cannot_allocate_combinations_count`]
+/// (`combinations(n)`'s own guards): this one backs bare `combinations`
+/// (`cartesian_product`), whose factors are independent arrays' lengths
+/// rather than one base raised to a power, so it names the product
+/// directly instead of `base^n`.
 fn cannot_allocate_cartesian_product(lens: &[usize]) -> EvalError {
-    let product = lens
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(" * ");
     EvalError::new(format!(
-        "Cannot allocate {product} elements for combinations"
+        "Cannot allocate {} elements for combinations",
+        format_product(lens)
     ))
 }
 
