@@ -7470,19 +7470,14 @@ fn yq_join_separator(sep: OwnedValue) -> String {
     }
 }
 
-/// One step of `join`'s jq-mode fold: combine the running accumulator with
-/// the next element, interleaving the separator. See `builtin_join`'s doc
-/// comment for the algorithm this implements.
-fn join_step<S: EvalSemantics>(
-    acc: Option<OwnedValue>,
-    elem: OwnedValue,
-    sep: &OwnedValue,
-) -> Result<Option<OwnedValue>, EvalError> {
-    let left = match acc {
-        None => OwnedValue::String(String::new()),
-        Some(a) => arith_add::<S>(a, sep.clone())?,
-    };
-    let right = match elem {
+/// jq-mode `join`'s per-element stringification -- the separator-independent
+/// half of the fold `join_step` (pre-#1535) used to redo per separator
+/// output. `Null`/number/boolean become a string part; `String` passes
+/// through; `Array`/`Object` are passed through raw so `+` fails on them
+/// naturally in [`join_parts_with_separator`], matching real jq's own wording
+/// -- see `builtin_join`'s doc comment for the full algorithm.
+fn join_element_part(elem: OwnedValue) -> OwnedValue {
+    match elem {
         OwnedValue::Null => OwnedValue::String(String::new()),
         // `to_json()`, not `owned_to_string()`: jq's `tostring` renders
         // NaN as `null` (confirmed live, jq 1.7.1: `nan | tostring` ->
@@ -7495,9 +7490,8 @@ fn join_step<S: EvalSemantics>(
         | OwnedValue::Int(_)
         | OwnedValue::Float(_)
         | OwnedValue::NumberLiteral(..) => OwnedValue::String(elem.to_json()),
-        other => other, // String passes through; Array/Object stay raw so `+` fails naturally below.
-    };
-    Ok(Some(arith_add::<S>(left, right)?))
+        other => other,
+    }
 }
 
 /// Builtin: join(s) - join array elements with separator
@@ -7556,30 +7550,60 @@ fn builtin_join<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1535: the element walk/decode is separator-independent, so it's
+    // computed at most once here (lazily, on the fan-out's first call)
+    // instead of `join_with_separator`'s old per-separator re-walk of the
+    // source array/object from scratch. `value_for_parts` is consumed by
+    // `collect_join_parts` the first time the closure runs; every later
+    // call reuses the cached `parts` and never touches it again -- and if
+    // the separator generator produces zero outputs, the closure never
+    // runs at all, so an invalid target still contributes no error either,
+    // matching `join_with_separator`'s old never-called-on-empty-fanout
+    // behavior exactly.
+    let mut value_for_parts = Some(value.clone());
+    let mut parts: Option<Result<JoinParts, EvalError>> = None;
     fanout_arg::<W, S, _>(
         sep_expr,
-        value.clone(),
+        value,
         optional,
         // Real yq *has* `join` and does not fan it out: live-verified against
         // the pinned v4.53.3, `[.x | join((",","-"))]` on `[a, b]` is
         // `["a,b"]`, where jq gives both separators. Bug-for-bug (ADR-0018).
         ArgFanout::yq_native::<S>(),
-        |sep| join_with_separator::<W, S>(value.clone(), sep),
+        move |sep| {
+            let parts = parts.get_or_insert_with(|| {
+                collect_join_parts::<W, S>(value_for_parts.take().expect(
+                    "get_or_insert_with's closure runs at most once, the first time parts is None",
+                ))
+            });
+            match parts {
+                Ok(parts) => join_parts_with_separator::<W, S>(parts, sep),
+                Err(e) => QueryResult::Error(e.clone()),
+            }
+        },
     )
 }
 
-/// `join`'s work for one already-resolved separator — the body of
-/// [`builtin_join`], run once per output of its separator generator (#1279).
-///
-/// Takes `value` by value rather than by reference because both branches below
-/// consume the element/field cursors by move; the fan-out loop clones the
-/// cursor per iteration, which is a cursor copy rather than a document one.
-fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// Separator-independent join parts, hoisted out of the per-separator
+/// closure by [`collect_join_parts`] (#1535). Two shapes because yq's own
+/// element rendering (a container part always collapses to an empty/`"{}"`
+/// string, never JSON-decoded) is cheaper -- and different -- from jq's own
+/// per-element `join_element_part` conversion; see [`join_parts_with_separator`]
+/// for how each is consumed.
+enum JoinParts {
+    Jq(Vec<OwnedValue>),
+    Yq(Vec<String>),
+}
+
+/// `join`'s one-time element walk -- the separator-independent half of the
+/// work [`join_with_separator`] (pre-#1535) used to redo per separator
+/// output. Takes `value` by value, not by reference: iterating the
+/// element/field cursors consumes them, and this only ever runs once per
+/// `join` call regardless of how many separator outputs follow.
+fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
-    sep: OwnedValue,
-) -> QueryResult<'_, W> {
+) -> Result<JoinParts, EvalError> {
     if S::TAG == EvalTag::Yq {
-        let sep_str = yq_join_separator(sep);
         return match value {
             StandardJson::Array(elements) => {
                 // `to_owned_key_shape`, not `to_owned`: a container element
@@ -7595,19 +7619,21 @@ fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // collapse can't distinguish "genuinely empty" from
                 // "collapsed, contents unread" (a non-empty object would
                 // wrongly render as `{}` too).
+                //
+                // Re-verified live during #1535 (unrelated hoist): real yq
+                // v4.53.3's actual answer for `[{}] | join(",")` is `""`,
+                // not `"{}"` -- this special case may be wrong, or #1047's
+                // own original check may have covered a different shape.
+                // Not investigated further here; tracked as #1791.
                 let parts: Result<Vec<String>, EvalError> = elements
                     .map(|e| match &e {
                         StandardJson::Object(fields) if fields.is_empty() => Ok("{}".to_string()),
                         _ => to_owned_key_shape(&e).map(yq_join_element_part),
                     })
                     .collect();
-                let parts = match parts {
-                    Ok(parts) => parts,
-                    Err(e) => return QueryResult::Error(e),
-                };
-                QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
+                parts.map(JoinParts::Yq)
             }
-            other => QueryResult::Error(EvalError::new(format!(
+            other => Err(EvalError::new(format!(
                 "cannot join with {}, can only join arrays of scalars",
                 yaml_type_tag(&other)
             ))),
@@ -7615,38 +7641,103 @@ fn join_with_separator<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // No `_ if optional` guard on the non-iterable case below, and no
-    // `optional`-gated arm on `join_step`'s `arith_add` failures: `optional`
-    // is never forced `true` reaching a nested `Call` node like this one
-    // (see `Expr::Optional`'s dispatch in `eval_single`, #693) — a bare
-    // `join(...)?` suppresses these errors via the ancestor `eval_try`'s
-    // catch, not locally. Confirmed dead per #928's identical finding in
-    // the regex builtins: a dedicated `join(...)?` test for each site still
-    // showed 0 coverage hits on the guard itself.
+    // `optional`-gated arm on `join_parts_with_separator`'s `arith_add`
+    // failures: `optional` is never forced `true` reaching a nested `Call`
+    // node like this one (see `Expr::Optional`'s dispatch in `eval_single`,
+    // #693) — a bare `join(...)?` suppresses these errors via the ancestor
+    // `eval_try`'s catch, not locally. Confirmed dead per #928's identical
+    // finding in the regex builtins: a dedicated `join(...)?` test for each
+    // site still showed 0 coverage hits on the guard itself.
     //
-    // `try_fold` over the raw element iterator (not a collected `Vec`) so a
-    // type-mismatch error on an early element short-circuits immediately
-    // instead of paying to `to_owned` every later element first.
-    //
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
-    // raise, not silently join in as "".
-    let result = match value {
-        StandardJson::Array(mut elements) => elements.try_fold(None, |acc, e| {
-            join_step::<S>(acc, to_owned_checked(&e)?, &sep)
-        }),
-        StandardJson::Object(mut fields) => fields.try_fold(None, |acc, f| {
-            join_step::<S>(acc, to_owned_checked(&f.value())?, &sep)
-        }),
+    // #1755: `to_owned_checked`, not `to_owned` -- an undecodable element
+    // must raise, not silently join in as "". Stops decoding at the first
+    // `Array`/`Object` part rather than `.collect()`ing every element up
+    // front (#1535 review): `+` fails on any such part unconditionally,
+    // regardless of the separator's own value, so no later element can
+    // change whether the fold that consumes this list will fail there --
+    // and the original, pre-#1535 `try_fold` never decoded past that same
+    // point either. Not just an optimization: `to_owned`/`to_owned_checked`
+    // panic past `MAX_VALUE_TREE_DEPTH` (#1005), so eagerly decoding every
+    // element regardless of an early doomed one would reach a
+    // pathologically deep *later* element the original algorithm could
+    // never have reached, turning a graceful error into a crash. A scalar
+    // part can never itself trigger that panic (no container, no nesting),
+    // so stopping at the first container part -- decoded once, exactly
+    // where the original would have decoded it too -- closes the gap
+    // completely, not just narrows it.
+    let parts: Result<Vec<OwnedValue>, EvalError> = match value {
+        StandardJson::Array(elements) => {
+            collect_jq_join_parts_until_first_container(elements.map(|e| to_owned_checked(&e)))
+        }
+        StandardJson::Object(fields) => collect_jq_join_parts_until_first_container(
+            fields.map(|f| to_owned_checked(&f.value())),
+        ),
         _ => {
             if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
+                return Err(e);
             }
-            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+            return Err(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
         }
     };
+    Ok(JoinParts::Jq(parts?))
+}
 
-    match result {
-        Ok(acc) => QueryResult::Owned(acc.unwrap_or(OwnedValue::String(String::new()))),
-        Err(e) => QueryResult::Error(e),
+/// See [`collect_join_parts`]'s own doc comment on the jq-mode array/object
+/// arms for why this stops at the first `Array`/`Object` part instead of
+/// draining `elements` fully: `join_element_part` is applied lazily, one
+/// pulled element at a time, so nothing past that first container element
+/// is ever decoded via `to_owned` at all.
+fn collect_jq_join_parts_until_first_container(
+    elements: impl Iterator<Item = Result<OwnedValue, EvalError>>,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut parts = Vec::new();
+    for elem in elements {
+        // #1755: propagates a decode failure immediately, same as the
+        // `to_owned_checked(&e)?` this replaced -- an undecodable element
+        // must raise before the container short-circuit below ever gets a
+        // chance to apply to it.
+        let part = join_element_part(elem?);
+        let is_container = matches!(part, OwnedValue::Array(_) | OwnedValue::Object(_));
+        parts.push(part);
+        if is_container {
+            break;
+        }
+    }
+    Ok(parts)
+}
+
+/// `join`'s work for one already-resolved separator, given the already-
+/// collected [`JoinParts`] — run once per output of the separator generator
+/// (#1279), but no longer paying to re-walk the source array/object each
+/// time (#1535). See `builtin_join`'s doc comment for the algorithm this
+/// implements.
+fn join_parts_with_separator<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    parts: &JoinParts,
+    sep: OwnedValue,
+) -> QueryResult<'a, W> {
+    match parts {
+        JoinParts::Yq(parts) => {
+            let sep_str = yq_join_separator(sep);
+            QueryResult::Owned(OwnedValue::String(parts.join(&sep_str)))
+        }
+        // `parts.iter()`, not a consuming `into_iter()`: `parts` is shared
+        // across every separator output, so each fold clones only the part
+        // it actually accumulates -- a String/scalar clone, not the
+        // `to_owned`/`to_json()` decode `collect_join_parts` already paid
+        // once, up front.
+        JoinParts::Jq(parts) => {
+            let result = parts.iter().try_fold(None, |acc, part| {
+                let left = match acc {
+                    None => OwnedValue::String(String::new()),
+                    Some(a) => arith_add::<S>(a, sep.clone())?,
+                };
+                Ok(Some(arith_add::<S>(left, part.clone())?))
+            });
+            match result {
+                Ok(acc) => QueryResult::Owned(acc.unwrap_or(OwnedValue::String(String::new()))),
+                Err(e) => QueryResult::Error(e),
+            }
+        }
     }
 }
 
