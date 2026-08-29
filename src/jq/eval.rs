@@ -34371,30 +34371,71 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // structurally malformed key (#1194) -- checked anyway,
             // matching `effective_keys`'s own defensive style rather than
             // assuming.
+            //
+            // `key_display_string_kind`, not the plain `key_display_string`
+            // -- code review (#1829): the first version of this fix looked
+            // up a match with a bare linear scan, so two distinct
+            // undecodable keys sharing the same #1642 fallback spelling
+            // (e.g. `{"\xff\xfe":1,"\xff\xfd":2}`, both lossy-decoding to
+            // the same replacement text) silently resolved to whichever
+            // came first in document order -- inconsistent with
+            // `omit`/`map_values`/`to_entries` on the identical document,
+            // which all raise `colliding_display_key` for this shape via
+            // `DisplayKeyGuard`. `pick` doesn't build an `IndexMap` over
+            // every field the way those three do, so it can't reuse
+            // `DisplayKeyGuard` directly (that type answers "does the map
+            // already contain this key", not "do two *candidates* for the
+            // same lookup collide") -- the loop below applies the same
+            // underlying rule (a collision is only real when at least one
+            // colliding occurrence is itself a fallback key; an ordinary
+            // repeated key, reachable only in yq mode since jq mode
+            // collapses via `S::COLLAPSE_DUPLICATE_KEYS` above, is not an
+            // error) directly against the two matching candidates instead.
             let mut resolved_fields = vec_with_capacity(checked.len());
             for field in &checked {
-                let Some(key) = key_display_string(&field.key) else {
+                let Some((key, is_fallback)) = key_display_string_kind(&field.key) else {
                     return QueryResult::Error(fields.malformed_member_error());
                 };
-                resolved_fields.push((key, field));
+                resolved_fields.push((key, is_fallback, field));
             }
             // For objects, pick specified string keys
             let mut result = IndexMap::new();
             for key in keys {
                 if let OwnedValue::String(k) = key {
-                    // Find the field in the object
-                    for (resolved, field) in &resolved_fields {
-                        if resolved.as_ref() == k.as_str() {
-                            // #1755: to_owned_checked, not to_owned
-                            // -- an undecodable picked value must
-                            // raise, not silently become "".
-                            let owned = match to_owned_checked(&field.value) {
-                                Ok(v) => v,
-                                Err(e) => return QueryResult::Error(e),
-                            };
-                            result.insert(k.clone(), owned);
-                            break;
+                    // Find every field matching this requested key -- not
+                    // just the first -- so a genuine #1642 collision
+                    // between two candidates can be told apart from an
+                    // ordinary repeated key sharing the same match.
+                    let mut found = None;
+                    let mut collides = false;
+                    for (resolved, is_fallback, field) in &resolved_fields {
+                        if resolved.as_ref() != k.as_str() {
+                            continue;
                         }
+                        match found {
+                            None => found = Some((*is_fallback, field)),
+                            Some((first_is_fallback, _)) if first_is_fallback || *is_fallback => {
+                                collides = true;
+                                break;
+                            }
+                            // An ordinary duplicate match: first occurrence
+                            // wins, matching this loop's own pre-#1829
+                            // behavior for the non-fallback case.
+                            Some(_) => {}
+                        }
+                    }
+                    if collides {
+                        return QueryResult::Error(EvalError::colliding_display_key(k));
+                    }
+                    if let Some((_, field)) = found {
+                        // #1755: to_owned_checked, not to_owned
+                        // -- an undecodable picked value must
+                        // raise, not silently become "".
+                        let owned = match to_owned_checked(&field.value) {
+                            Ok(v) => v,
+                            Err(e) => return QueryResult::Error(e),
+                        };
+                        result.insert(k.clone(), owned);
                     }
                     // If key not found, yq silently skips it
                 }
@@ -38064,6 +38105,36 @@ mod tests {
         query!(br#"{"a":1,"a":2}"#, "pick([\"a\"])",
             QueryResult::Owned(OwnedValue::Object(o)) => {
                 assert_eq!(o.get("a"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    /// #1829 code review: two distinct undecodable keys whose #1642
+    /// fallback spellings collide must raise for `pick` too, matching
+    /// `omit`/`map_values`/`to_entries` on the identical document --
+    /// `pick` doesn't build a real `IndexMap` over every field the way
+    /// those three do, so it can't reuse `DisplayKeyGuard` directly, but
+    /// still must not silently resolve the ambiguity by picking whichever
+    /// candidate comes first in document order.
+    #[test]
+    fn test_builtin_pick_raises_on_colliding_fallback_keys_1829() {
+        let doc: &[u8] = b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}";
+        query!(doc, "pick([\"\u{fffd}\u{fffd}\"])",
+            QueryResult::Error(_) => {}
+        );
+    }
+
+    /// #1829 code review: an *ordinary* repeated key (no decode failure on
+    /// either side) reaching `pick`'s match loop -- only possible in yq
+    /// mode, since jq mode's `S::COLLAPSE_DUPLICATE_KEYS` already collapsed
+    /// it away before this loop ever runs -- must not be treated as a
+    /// #1642 collision. First occurrence wins, matching this loop's own
+    /// pre-#1829 behavior for the non-fallback case.
+    #[test]
+    fn test_builtin_pick_yq_mode_ordinary_duplicate_key_is_not_a_collision_1829() {
+        yq_query!(br#"{"a": 1, "a": 2}"#, "pick([\"a\"])",
+            QueryResult::Owned(OwnedValue::Object(o)) => {
+                assert_eq!(o.get("a"), Some(&OwnedValue::Int(1)));
             }
         );
     }

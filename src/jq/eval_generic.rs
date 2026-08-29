@@ -6813,10 +6813,15 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
 /// recorded, not in how the tree is traversed.
 ///
 /// `current_path.push`/`.pop()` around each recursive call (rather than a
-/// clone-and-extend style) is safe here because every `push` is followed,
-/// after the recursive call returns, by exactly one matching `pop` on every
-/// exit path -- the sole early exit before a `push` (a malformed key) is a
-/// `return Err(..)` that unwinds the whole walk without ever pushing.
+/// clone-and-extend style) is safe here despite an unbalanced `push` being
+/// reachable: the `?` on a nested recursive call (#1829) can now return
+/// `Err` right after a `push`, with no matching `pop`. That's fine only
+/// because `current_path` is never read again afterward -- every caller
+/// (`Builtin::Paths`/`Builtin::LeafPaths` in `eval_builtin`) passes a fresh
+/// `&mut Vec::new()` that is discarded whole the instant `Err` propagates
+/// out, not reused for a later path. A caller that ever needed to keep
+/// walking after absorbing this error (unlike today's "abort the whole
+/// builtin" policy) would have to restore the balance on that path too.
 ///
 /// The array branch walks `uncons()` directly rather than materializing
 /// `collect_values()`'s `Vec` first (code review, #868) -- arrays have no
