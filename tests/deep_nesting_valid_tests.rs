@@ -14,6 +14,16 @@
 //!
 //! Run with: cargo test --features cli --test deep_nesting_valid_tests
 
+// #1847 review: `run` spawns `CARGO_BIN_EXE_succinctly` directly rather
+// than building it on demand via an inner `cargo run --features cli` the
+// way this file's helper used to -- that on-demand build was what let a
+// plain `cargo test` (no `--features cli`) still pass. `CARGO_BIN_EXE_
+// succinctly` only exists (and only builds the bin target at all) when
+// the *outer* invocation already has `--features cli` active, matching
+// every other CLI-invoking test file's own guard (`yq_cli_tests.rs`,
+// `json_validate_tests.rs`, ...).
+#![cfg(feature = "cli")]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 

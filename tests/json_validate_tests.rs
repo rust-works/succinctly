@@ -367,18 +367,17 @@ fn test_file_not_found() -> Result<()> {
 // Multiple files tests
 // ============================================================================
 
-/// Runs `json validate` over multiple files via `cargo run` (needed so this
-/// test still builds from source rather than requiring a pre-built binary),
-/// via `succinctly_bin()` (#1847), like every other helper in this file --
-/// this used to be the one holdout still spawning a second `cargo run`
-/// subprocess, which orphans the real `succinctly` grandchild (reparented
-/// to init, blocked forever on its now-unreadable stdout pipe) the moment
-/// anything kills the outer `cargo test` process group (`cargo-guard.sh`
-/// does this by design on a detected stall, #935). No retry loop needed
-/// either: `succinctly_bin()`'s compile-time path isn't a second cargo
-/// invocation that can hit lock contention (exit 101), unlike the removed
-/// `classify_cargo_run_exit` path this used to need.
-fn run_json_validate_via_cargo(files: &[&std::path::Path]) -> Result<i32> {
+/// Runs `json validate` over multiple files, via `succinctly_bin()` (#1847)
+/// like every other helper in this file -- this used to be the one holdout
+/// still spawning a second `cargo run` subprocess, which orphans the real
+/// `succinctly` grandchild (reparented to init, blocked forever on its
+/// now-unreadable stdout pipe) the moment anything kills the outer `cargo
+/// test` process group (`cargo-guard.sh` does this by design on a detected
+/// stall, #935). No retry loop needed either: `succinctly_bin()`'s
+/// compile-time path isn't a second cargo invocation that can hit lock
+/// contention (exit 101), unlike the removed `classify_cargo_run_exit`
+/// path this used to need.
+fn run_json_validate_multi(files: &[&std::path::Path]) -> Result<i32> {
     let output = Command::new(succinctly_bin())
         .args(["json", "validate"])
         .args(files)
@@ -399,7 +398,7 @@ fn test_multiple_files_all_valid() -> Result<()> {
     writeln!(file2, r#"{{"b": 2}}"#)?;
     file2.flush()?;
 
-    let code = run_json_validate_via_cargo(&[file1.path(), file2.path()])?;
+    let code = run_json_validate_multi(&[file1.path(), file2.path()])?;
     assert_eq!(code, 0);
     Ok(())
 }
@@ -414,7 +413,7 @@ fn test_multiple_files_one_invalid() -> Result<()> {
     writeln!(file2, r#"{{"b": }}"#)?; // invalid
     file2.flush()?;
 
-    let code = run_json_validate_via_cargo(&[file1.path(), file2.path()])?;
+    let code = run_json_validate_multi(&[file1.path(), file2.path()])?;
     assert_eq!(code, 1);
     Ok(())
 }

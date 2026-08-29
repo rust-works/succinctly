@@ -3,6 +3,16 @@
 //! These tests use snapshot testing to ensure CLI outputs remain stable.
 //! Run with: cargo test --features cli --test cli_golden_tests
 
+// #1847 review: `run`/`run_cli_bin` spawn `CARGO_BIN_EXE_succinctly`
+// directly rather than building it on demand via an inner `cargo run
+// --features cli` the way this file's helpers used to -- that on-demand
+// build was what let a plain `cargo test` (no `--features cli`) still
+// pass. `CARGO_BIN_EXE_succinctly` only exists (and only builds the bin
+// target at all) when the *outer* invocation already has `--features
+// cli` active, matching every other CLI-invoking test file's own guard
+// (`yq_cli_tests.rs`, `json_validate_tests.rs`, ...).
+#![cfg(feature = "cli")]
+
 use anyhow::Result;
 use std::process::{Command, Stdio};
 
@@ -340,11 +350,13 @@ fn test_json_generate_reproducible() -> Result<()> {
     Ok(())
 }
 
-/// Runs the pre-built `succinctly` binary directly (unlike `run_cli` above, which
-/// spawns a second, uninstrumented binary via `cargo run` and so is invisible to
-/// `cargo llvm-cov`) -- needed for #1212's own coverage, since its
-/// `validate_generated_json` consolidation and both call sites are otherwise
-/// unexercised by any existing test in this file.
+/// Runs the pre-built `succinctly` binary directly -- `run_cli` above is
+/// now a thin wrapper over this same approach too (#1847), but this
+/// function predates that and originally existed specifically because
+/// `run_cli` *used* to spawn a second, uninstrumented binary via `cargo
+/// run`, invisible to `cargo llvm-cov`; needed for #1212's own coverage,
+/// since its `validate_generated_json` consolidation and both call sites
+/// were otherwise unexercised by any existing test in this file.
 fn run_cli_bin(args: &[&str]) -> Result<(String, String, i32)> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
         .args(args)
