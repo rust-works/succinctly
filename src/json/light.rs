@@ -2870,6 +2870,40 @@ mod tests {
         assert!(!out.is_empty());
     }
 
+    /// #1615 converted every arm of `stream_json_as_yaml` to `StreamResult`,
+    /// but only its string and nested-container arms had any coverage --
+    /// integers, floats, empty containers and the block-style closers were all
+    /// reformatted blind. This walks one document through every arm, in both
+    /// block and flow style, so a future edit to any of them is caught.
+    ///
+    /// The `StandardJson::Error` arm is deliberately not exercised: it still
+    /// writes `null` for a *structural* malformation (#1194's class, not a
+    /// decode failure), and reaching it needs a malformed index rather than a
+    /// document this constructor can build.
+    #[test]
+    fn test_stream_yaml_covers_every_value_arm_1615() {
+        let json = br#"{"i": 42, "neg": -7, "f": 1.5, "t": true, "fa": false,
+                        "n": null, "s": "x", "ea": [], "eo": {},
+                        "arr": [1, "two", [3], {"k": 4}],
+                        "obj": {"nested": {"deep": [5]}}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        // Block style (indent 2) and flow style (COMPACT) take different
+        // branches for every container arm, so both are walked.
+        for indent in [IndentSpec::spaces(2), IndentSpec::COMPACT] {
+            let mut out = String::new();
+            root.stream_yaml(&mut out, indent, false)
+                .expect("a fully decodable document must stream");
+            for expected in ["42", "-7", "1.5", "true", "false", "null", "x", "[]", "{}"] {
+                assert!(
+                    out.contains(expected),
+                    "missing {expected:?} in {out:?} (indent {indent:?})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cursor_line_column() {
         // JsonCursor previously had no `line()`/`column()` at all — it fell

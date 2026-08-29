@@ -24710,6 +24710,14 @@ fn test_streamed_value_decode_failure_raises_1615() -> Result<()> {
 fn test_streamed_key_decode_failure_still_preserved_1615() -> Result<()> {
     let input = "\"a\\qb\": 1\nb: 2\n";
     for (extra, expected) in [
+        // The default YAML target comes first: it is the most common
+        // invocation and the only one reaching `Undecodable::PreserveEmpty` in
+        // `write_yaml_field_key`. An earlier version of this test checked only
+        // the `-o json` rows below, which route through a different key arm --
+        // so the very behaviour it claimed to pin went unexercised, confirmed
+        // by that line reading zero hits in `cargo llvm-cov`.
+        (&[][..], "\"\": 1\nb: 2"),
+        (&["--arg", "z", "y"][..], "'': 1\nb: 2"),
         (&["-o", "json", "-I", "0"][..], r#"{"":1,"b":2}"#),
         (
             &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
@@ -24890,5 +24898,41 @@ fn test_inplace_truncation_flag_does_not_leak_across_files_1615() -> Result<()> 
         good_original,
         "a later, perfectly valid file must keep every document"
     );
+    Ok(())
+}
+
+/// #1615: the fan-out streaming arms raise too, not just the single-result
+/// ones.
+///
+/// `GenericResult` has four separate cursor-streaming arms that can meet an
+/// undecodable scalar -- `ManyCursor` (a filter yielding several cursors) and
+/// the `stream_sequence_*` pair (a `LazySeq` rendered straight from the source,
+/// #757) -- each in a JSON and a YAML flavour. They were converted alongside
+/// `OneCursor` but nothing exercised them, so this pins all four: without the
+/// `absorb_stream_failure` calls they would drop the diagnostic and exit 0.
+#[test]
+fn test_streamed_decode_failure_in_fanout_arms_1615() -> Result<()> {
+    let input = "- ok\n- \"bad \\q escape\"\n- also\n";
+    for (filter, extra) in [
+        (".[]", &[][..]),                           // ManyCursor, YAML target
+        (".[]", &["-o", "json", "-I", "0"][..]),    // ManyCursor, JSON target
+        ("map(.)", &[][..]),                        // stream_sequence_yaml
+        ("map(.)", &["-o", "json", "-I", "0"][..]), // stream_sequence_json
+    ] {
+        let (_, stderr, exit_code) = run_yq_split(filter, input, extra)?;
+        assert_eq!(exit_code, 1, "filter {filter:?} args {extra:?}: {stderr}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "filter {filter:?} args {extra:?}, stderr: {stderr}"
+        );
+    }
+
+    // The same shapes over a document that decodes cleanly must be untouched.
+    let clean = "- ok\n- fine\n- also\n";
+    for (filter, extra) in [(".[]", &[][..]), ("map(.)", &["-o", "json", "-I", "0"][..])] {
+        let (output, stderr, exit_code) = run_yq_split(filter, clean, extra)?;
+        assert_eq!(exit_code, 0, "filter {filter:?} args {extra:?}: {stderr}");
+        assert!(output.contains("ok"), "filter {filter:?}: {output:?}");
+    }
     Ok(())
 }
