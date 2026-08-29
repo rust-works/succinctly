@@ -15383,17 +15383,82 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
     ) {
         return false;
     }
-    match navigate_read_only(root, prefix) {
-        PrefixNavOutcome::Resolved(parent) => is_yq_field_index_noop_scalar(parent),
-        // A scalar hit mid-prefix is a no-op regardless of what the
-        // terminal component was going to do (#1232) -- the scalar can't
-        // become a container no matter how much further path is left.
-        PrefixNavOutcome::HitScalar => true,
-        // An absent prefix (missing field/out-of-range index/`Null`) isn't
-        // this predicate's case at all -- defer to the normal RHS
-        // evaluation and let `set_path`'s own existing `get_path_mut`
-        // report whatever it reports for a genuinely missing path.
-        PrefixNavOutcome::Absent => false,
+    assign_path_all_noop(root, prefix)
+}
+
+/// Whether writing through `steps` (a `yq_assign_is_total_noop` prefix --
+/// its own flattened path minus the terminal component) into `current` is
+/// a total no-op. Subsumes `navigate_read_only`'s three-way
+/// `Resolved`/`HitScalar`/`Absent` outcome as its own base case (`steps`
+/// exhausted -- `current` is the terminal component's parent, so
+/// `is_yq_field_index_noop_scalar` decides exactly as it always did) but
+/// additionally recurses into `.iter().all(...)`/`.values().all(...)`
+/// whenever a mid-chain `Expr::Iterate` fans into a real `Array`/`Object`,
+/// instead of `navigate_read_only`'s own unconditional `Absent` for that
+/// case (#1432) -- a read-only, non-mutating dry run of
+/// `set_path_through_iterate`'s own per-element recursion, restricted to
+/// the `Field`/`Index`/`IndexNumber`/`Iterate` step vocabulary that's all
+/// `yq_assign_is_total_noop`'s caller ever hands it (its own slice check
+/// already excludes anything else before this is reached). Vacuously true
+/// whenever a fanned-into container is empty -- `set_path_through_iterate`
+/// itself does nothing when there are no elements to iterate. Live-verified
+/// against yq v4.53.3: `a: []`/`a: {}` (empty), `a: [1, 2]`/`a: {x: 1, y:
+/// 1}` (all-scalar), and a nested `a: [[1,2],[3]]` under `.a[][].b` all
+/// agree with the oracle in both directions (RHS discarded and the final
+/// document byte-identical to a safe, always-evaluated RHS), while a
+/// single non-scalar element anywhere in the fan-out (`a: [1, {}]`) still
+/// correctly evaluates the RHS.
+///
+/// Deliberately excludes `Null`: real yq's `.a[].b = v` on `a: null`
+/// autovivifies `null` to `[]` as part of the write itself (confirmed live
+/// against a safe, non-erroring RHS: `yq '.a[].b = 5'` on `a: null`
+/// produces `a: []`), so it is not a *total* no-op the way an empty or
+/// all-scalar container is -- the document still changes. Checked
+/// independently of this fix (same safe-RHS probe against this codebase's
+/// unmodified write path) and found that autovivification currently
+/// doesn't happen there at all -- `a: null` stays `a: null` -- a
+/// pre-existing write-correctness bug this predicate can't fix (it only
+/// ever decides whether to skip evaluating the RHS, and the existing
+/// caller's `Skip(pristine)` short-circuit returns the *unmodified*
+/// original when this returns `true`, which would make the missing
+/// autovivification permanent instead of merely already-wrong). Filed
+/// separately as #1857 rather than folded into this predicate.
+fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
+    let (step, rest) = match steps.split_first() {
+        None => return is_yq_field_index_noop_scalar(current),
+        Some(pair) => pair,
+    };
+    let (step, _optional) = unwrap_path_component(step);
+    match step {
+        Expr::Field(name) => match current {
+            OwnedValue::Object(map) => match map.get(name) {
+                Some(v) => assign_path_all_noop(v, rest),
+                None => false,
+            },
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
+            OwnedValue::Array(arr) => {
+                let len = arr.len() as i64;
+                let actual = if *idx < 0 { len + idx } else { *idx };
+                if actual >= 0 && (actual as usize) < arr.len() {
+                    assign_path_all_noop(&arr[actual as usize], rest)
+                } else {
+                    false
+                }
+            }
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        Expr::Iterate => match current {
+            OwnedValue::Array(arr) => arr.iter().all(|elem| assign_path_all_noop(elem, rest)),
+            OwnedValue::Object(map) => map.values().all(|elem| assign_path_all_noop(elem, rest)),
+            // Not `Null` -- see this function's own doc comment (#1857).
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -15625,7 +15690,7 @@ fn yq_del_slice_outcome(
     let prefix_components: Vec<Expr> = prefix.iter().map(|s| s.component.clone()).collect();
     if !matches!(
         navigate_read_only(root, &prefix_components),
-        PrefixNavOutcome::Resolved(_)
+        PrefixNavOutcome::Resolved
     ) {
         return YqDelSliceOutcome::NotApplicable;
     }
@@ -15659,9 +15724,14 @@ fn yq_del_slice_outcome(
 /// unresolved parent, deferring to normal RHS evaluation and letting
 /// `.a.b.c = error("boom")` on `a: 5` raise `boom` where real yq no-ops
 /// silently (RHS never runs) — live-verified against yq v4.53.3.
-enum PrefixNavOutcome<'a> {
-    /// Every prefix step navigated an existing value.
-    Resolved(&'a OwnedValue),
+enum PrefixNavOutcome {
+    /// Every prefix step navigated an existing value. Carries no payload:
+    /// `yq_assign_is_total_noop` used to read the resolved parent off this
+    /// variant for its own terminal scalar check, but that check now lives
+    /// inside `assign_path_all_noop`'s own base case (#1432), so the only
+    /// remaining reader (`yq_del_slice_outcome`) only ever matches the
+    /// variant itself via `matches!(..., Resolved(_))`.
+    Resolved,
     /// A step tried to index into a real, non-`Null` scalar.
     HitScalar,
     /// Missing key, out-of-range index, `Null`, or a container-type
@@ -15691,7 +15761,7 @@ enum PrefixNavOutcome<'a> {
 /// container-mismatch case (or `OwnedValue` gains a variant) in one walker,
 /// mirror it here too — a drift would make `yq_assign_is_total_noop`
 /// disagree with what the real write does.
-fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> PrefixNavOutcome<'a> {
+fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> PrefixNavOutcome {
     let mut current = root;
     for step in steps {
         let (step, _optional) = unwrap_path_component(step);
@@ -15751,7 +15821,7 @@ fn navigate_read_only<'a>(root: &'a OwnedValue, steps: &[Expr]) -> PrefixNavOutc
             _ => return PrefixNavOutcome::Absent,
         };
     }
-    PrefixNavOutcome::Resolved(current)
+    PrefixNavOutcome::Resolved
 }
 
 /// Apply a resolved slice directly to an owned value.
