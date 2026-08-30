@@ -15767,31 +15767,35 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
     };
     let (step, _optional) = unwrap_path_component(step);
     match step {
-        Expr::Field(name) => match current {
-            OwnedValue::Object(map) => match map.get(name) {
+        Expr::Field(name) => {
+            // A missing key and an explicit `Null` value autovivify
+            // identically (real yq's `.a.b[].z = v` on `a: {}` and on
+            // `a: {b: null}`/`a: null` all behave the same, confirmed
+            // live) -- both resolve to the same "step into `Null`"
+            // child, recursing the same way rather than giving up
+            // immediately, so a later `Iterate` in `rest` still gets to
+            // answer `RhsUnusedButChanges` for its own empty fan-out
+            // (round-3 review of #1920 found this gap: an earlier
+            // version of this fix special-cased the two shapes with
+            // near-duplicate arms instead of one shared child
+            // resolution; `.a.b[].z = error("boom")` used to still
+            // evaluate the RHS either way, where real yq needs it for
+            // neither).
+            static NULL: OwnedValue = OwnedValue::Null;
+            let child = match current {
+                OwnedValue::Object(map) => Some(map.get(name).unwrap_or(&NULL)),
+                OwnedValue::Null => Some(current),
+                _ => None,
+            };
+            match child {
                 Some(v) => classify_yq_assign_prefix(v, rest),
-                // An absent key autovivifies exactly like an explicit
-                // `Null` value would (real yq's `.a.b[].z = v` on `a: {}`
-                // and on `a: {b: null}` behave identically, confirmed
-                // live) -- recurse the same way rather than giving up
-                // immediately, so a later `Iterate` in `rest` still gets
-                // to answer `RhsUnusedButChanges` for its own empty
-                // fan-out (round-3 review of #1920 found this gap: the
-                // old unconditional `NeedsRhs` here meant `.a.b[].z =
-                // error("boom")` on `a: {}`/`a: null` both still
-                // evaluated the RHS, where real yq needs it for neither).
-                None => classify_yq_assign_prefix(&OwnedValue::Null, rest),
-            },
-            // Same reasoning as the `None` case just above -- an explicit
-            // `Null` here (as opposed to one this function itself just
-            // synthesized from an absent key) autovivifies identically,
-            // so it recurses the same way instead of falling into the
-            // catch-all below (which is reserved for a genuine type
-            // mismatch, e.g. `Field` against an `Array`).
-            OwnedValue::Null => classify_yq_assign_prefix(current, rest),
-            _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
-            _ => PathAssignOutcome::NeedsRhs,
-        },
+                // Reached only for a genuine type mismatch (e.g. `Field`
+                // against an `Array`), or a real scalar -- not `Null`,
+                // which is always routed through the `child` match above.
+                None if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
+                None => PathAssignOutcome::NeedsRhs,
+            }
+        }
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
             OwnedValue::Array(arr) => {
                 let len = arr.len() as i64;
@@ -16643,8 +16647,15 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // with zero elements to write into.
     if outcomes.iter().all(PathAssignOutcome::rhs_unused) {
         let mut result = pristine;
-        for path in &paths {
-            set_path::<S>(&mut result, path, OwnedValue::Null, true, true)?;
+        // Only `RhsUnusedButChanges` paths actually need this write -- a
+        // `TotalNoop` one (this `all()` check doesn't require every
+        // outcome to be `RhsUnusedButChanges` specifically, just not
+        // `NeedsRhs`) already changes nothing, so writing a placeholder
+        // through it would be a wasted navigate-and-no-op.
+        for (path, outcome) in paths.iter().zip(&outcomes) {
+            if matches!(outcome, PathAssignOutcome::RhsUnusedButChanges) {
+                set_path::<S>(&mut result, path, OwnedValue::Null, true, true)?;
+            }
         }
         return Ok(YqAssignNoopCheck::Skip(result));
     }
