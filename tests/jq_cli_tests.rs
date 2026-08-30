@@ -27069,3 +27069,25 @@ fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1937: a generator-argument builtin's multi-output result used to
+/// silently array-collapse when a `key`/`parent`/`file_index`/`path()`
+/// construct anywhere in the same pipe routed evaluation through
+/// `eval_owned_expr_full`'s slow path instead of the ordinary fan-out-aware
+/// evaluator -- the exact same sub-expression fanned out correctly on its
+/// own but collapsed into a single array once an unrelated `key` was
+/// appended. Fixed by switching to a "take first" policy (matching
+/// `result_to_owned`'s sibling family) instead of array-collapsing;
+/// verified here via the actual computed *value*, not just `key`'s own
+/// output (which doesn't depend on the value and so can't distinguish the
+/// two policies by itself).
+#[test]
+fn test_owned_expr_full_takes_first_output_instead_of_array_collapsing_1937() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(
+        &["-c", ".a | ltrimstr((\"x\",\"z\")) | (key, .)"],
+        Some(r#"{"a":"xax"}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"\n\"ax\"");
+    Ok(())
+}

@@ -25444,23 +25444,34 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         QueryResult::One(v) => Ok(Some((to_owned(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
-        QueryResult::Many(vs) => {
-            if vs.len() == 1 {
-                Ok(Some((to_owned(&vs[0]), None)))
-            } else {
-                Ok(Some((
-                    OwnedValue::Array(vs.iter().map(to_owned).collect()),
-                    None,
-                )))
-            }
-        }
-        QueryResult::ManyOwned(vs) => {
-            if vs.len() == 1 {
-                Ok(Some((vs.into_iter().next().unwrap(), None)))
-            } else {
-                Ok(Some((OwnedValue::Array(vs), None)))
-            }
-        }
+        // #1937: take the *first* output rather than array-collapsing a
+        // multi-output result into `OwnedValue::Array` -- matches
+        // `result_to_owned_full`'s identical policy for the same reason:
+        // real fan-out for this function's own 4 call sites (all inside
+        // `eval_pipe_with_path_context_internal`) is the "materially
+        // larger, too invasive" architecture #1522's own design doc
+        // already declined once (#1277 cluster 4's explicit non-goal).
+        // Array-collapse wasn't a safer middle ground -- it made the
+        // *same* sub-expression silently disagree with itself depending
+        // on whether an unrelated `key`/`parent`/`file_index`/`path()`
+        // elsewhere in the pipe happened to route it through this
+        // function instead of the ordinary fan-out-aware evaluator
+        // (confirmed live: `.a | ltrimstr(("x","z"))` fans out to two
+        // outputs, `"ax"`/`"xax"`; adding a trailing `| key` collapsed
+        // them into one `["ax","xax"]`, then ran `key` once against
+        // that array instead of twice against the real values). Taking
+        // first is still wrong relative to real jq's own 2-output
+        // answer, but it is *consistently* wrong the same way
+        // `result_to_owned`'s sibling family already is, rather than
+        // silently changing shape based on unrelated nearby syntax.
+        // An empty `Many`/`ManyOwned` is the same "zero outputs" case
+        // as the bare `QueryResult::None` arm below, not a distinct
+        // value -- matches `result_to_owned_full`'s own handling of the
+        // same shape, and #1280's whole point (this function's purpose
+        // is keeping a genuinely empty result distinguishable from
+        // `null`, not manufacturing an empty array in its place).
+        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned(v), None))),
+        QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().map(|v| (v, None))),
         // The one behavior change from `eval_owned_expr_ctrl_full`'s own
         // slow path (#1280): `None`, not `Ok(Some((Null, None)))`.
         QueryResult::None => Ok(None),
@@ -25474,17 +25485,15 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         // after some values were already produced, not have it silently
         // discarded (#791).
         QueryResult::Partial(_, Control::Halt(code)) => Err(Control::Halt(code)),
-        // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
-        // above; the trailing `Error`/`Break` is now exposed via the second
-        // tuple element instead of silently dropped (#1164) -- a caller
-        // using this function (rather than the plain `eval_owned_expr_ctrl`
-        // above) is expected to apply it to its own final result.
+        // Same take-first policy as `Many`/`ManyOwned` above (#1937,
+        // `Partial`'s own prefix is never empty -- see `partial` --
+        // so there is always a first value to take); the trailing
+        // `Error`/`Break` is still exposed via the second tuple element
+        // instead of silently dropped (#1164) -- a caller using this
+        // function (rather than the plain `eval_owned_expr_ctrl` above)
+        // is expected to apply it to its own final result.
         QueryResult::Partial(vs, control) => {
-            if vs.len() == 1 {
-                Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
-            } else {
-                Ok(Some((OwnedValue::Array(vs), Some(control))))
-            }
+            Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
         }
     }
 }
@@ -63179,13 +63188,19 @@ mod tests {
         }
     }
 
-    /// #1164: `eval_owned_expr_ctrl_full` (backs `builtin_envvar`'s fix
-    /// above) is exercised there only via a shape that lands in its
+    /// #1164/#1937: `eval_owned_expr_ctrl_full` (backs `builtin_envvar`'s
+    /// fix above) is exercised there only via a shape that lands in its
     /// `Partial`, single-value arm. Its sibling arms -- an argument
     /// generator with 2+ *borrowed* outputs and no escape at all (`Many`),
     /// the owned equivalent (`ManyOwned`), and a `Partial` with 2+ prior
     /// values -- are covered directly here instead of hunting for CLI
     /// syntax that happens to produce each borrowed/owned distinction.
+    ///
+    /// #1937 changed what these two arms actually return: a multi-output
+    /// result now takes the *first* value (matching `result_to_owned`'s
+    /// sibling policy) instead of array-collapsing every output into a
+    /// single `OwnedValue::Array` -- see `eval_owned_expr_full`'s own
+    /// `Many`/`Partial` arms for the full rationale.
     #[test]
     fn eval_owned_expr_ctrl_full_many_shapes_and_multi_value_partial_1164() {
         // Many (borrowed, 2+ outputs, no escape): `eval_owned_expr_ctrl_full`
@@ -63202,19 +63217,17 @@ mod tests {
             ])),
             false,
         ) {
-            Ok((OwnedValue::Array(vs), None)) => {
-                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-            }
+            Ok((v, None)) => assert_eq!(v, OwnedValue::Int(1)),
             other => panic!("unexpected result: {other:?}"),
         }
 
-        // Multi-value Partial (2+ values, then a break): the `else` branch
-        // of the `vs.len() == 1` check inside the `Partial` arm.
+        // Multi-value Partial (2+ values, then a break): takes the first
+        // value, same as the `Many` case above.
         let expr = parse("(1, 2, break $out)").unwrap();
         match eval_owned_expr_ctrl_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Ok((OwnedValue::Array(vs), Some(Control::Break(label)))) => {
+            Ok((v, Some(Control::Break(label)))) => {
                 assert_eq!(label, "out");
-                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+                assert_eq!(v, OwnedValue::Int(1));
             }
             other => panic!("unexpected result: {other:?}"),
         }
