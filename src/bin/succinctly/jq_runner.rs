@@ -18,7 +18,7 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
     self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
-    OwnedValue, Program,
+    OwnedValue, Program, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -4497,10 +4497,33 @@ fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<Owned
 ///
 /// Guarded against adversarially deep JSON input (thousands of nested
 /// arrays/objects, which would otherwise recurse this writer once per
-/// nesting level and overflow the stack) by the shared
-/// [`succinctly::jq::eval_generic::MAX_NESTING_DEPTH`] ceiling -- see that
-/// constant's own doc comment for how 256 was chosen, including this
-/// function's own measured debug-build crash boundary of depth 600-700.
+/// nesting level and overflow the stack) by the
+/// [`succinctly::jq::MAX_VALUE_TREE_DEPTH`] ceiling (384) -- **not**
+/// [`succinctly::jq::eval_generic::MAX_NESTING_DEPTH`] (256), despite this
+/// function importing that constant too for an unrelated panic-message
+/// check elsewhere in this file. Before #1819, this writer used
+/// `MAX_NESTING_DEPTH` for its own guard, one level lower than
+/// `MAX_VALUE_TREE_DEPTH` -- the ceiling every *other* value-tree consumer
+/// in the binary already honors (`OwnedValue::to_json`, `compare_values`,
+/// `eval.rs`'s own `to_owned`, `reconcile_presentation`,
+/// `format_json_impl`). A value strictly between the two limits passed
+/// every construction-time guard, started printing, and only failed
+/// **mid-write** -- after this function had already flushed up to 256
+/// levels of syntactically-incomplete JSON to `out` (`anyhow::ensure!`
+/// fires per-level, so every shallower stack frame's own opening
+/// delimiter is already written by the time a deeper frame raises).
+/// Matching `MAX_VALUE_TREE_DEPTH` closes that gap: nothing that passes
+/// this crate's own construction-time depth ceiling can trip a *stricter*
+/// one at print time. This function's own measured debug-build crash
+/// boundary is 600-700 (see `MAX_NESTING_DEPTH`'s doc comment), so 384
+/// leaves the same order of headroom `MAX_VALUE_TREE_DEPTH` itself was
+/// tuned against for its own tightest consumer (580) -- comfortably safe.
+/// A pure-cursor document deeper than 384 (no `OwnedValue` construction
+/// involved at all) still hits this same corrupted-partial-output pattern,
+/// just at the higher threshold -- eliminating that residual would need a
+/// depth pre-check ahead of any writing, which isn't cheap to do generically
+/// for an arbitrary cursor; #1819 scopes this fix to closing the
+/// construction/print ceiling mismatch, not that broader limitation.
 /// Unlike `eval_generic::to_owned`'s own guard (a panic, since that
 /// function sits too deep in the evaluator's hot path for a `Result`-based
 /// fix), this one is a clean, catchable `anyhow` error: a query like the
@@ -4550,8 +4573,8 @@ where
     Wrd: Clone + AsRef<[u64]>,
 {
     anyhow::ensure!(
-        level < MAX_NESTING_DEPTH,
-        "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+        level < MAX_VALUE_TREE_DEPTH,
+        "nesting depth exceeds limit of {MAX_VALUE_TREE_DEPTH}"
     );
     let compact = config.compact;
     let indent = &config.indent_string;

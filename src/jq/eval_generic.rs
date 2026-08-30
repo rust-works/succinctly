@@ -76,22 +76,31 @@ use crate::json::JsonIndex;
 /// materialization step — a 128 limit broke that test outright. Measured
 /// directly on a debug build (the more fragile of the two, larger
 /// per-frame stack cost than release): the real crash boundary for this
-/// function sits between depth 2000 (safe) and 3000 (overflow), and for
-/// `print_json` in `src/bin/succinctly/jq_runner.rs` (same limit, guards
-/// the identity-query fast path this function's own guard can't reach)
-/// between 600 (safe) and 700 (overflow) — 256 clears the 200 floor with
-/// margin and sits comfortably under both boundaries, including headroom
-/// for a CI runner with a smaller default stack than the dev machine this
-/// was measured on.
+/// function sits between depth 2000 (safe) and 3000 (overflow) — 256 clears
+/// the 200 floor with margin and sits comfortably under that boundary,
+/// including headroom for a CI runner with a smaller default stack than the
+/// dev machine this was measured on.
 ///
 /// `pub`, not private: every recursive tree-materialization function that
 /// isn't itself one of this module's own (`to_owned`/`to_owned_cursor`/
 /// `to_owned_with_comments`, all guarded via [`assert_nesting_depth`] below)
-/// needs the same ceiling -- `jq_runner.rs`'s `print_json` and `lazy.rs`'s
-/// `cursor_to_owned` both import this rather than hand-rolling their own
-/// copy, so the whole binary has exactly one number to retune (#998 review:
-/// two independent copies of this same constant had already drifted apart
-/// in wording, if not value, before this consolidation).
+/// needs the same ceiling -- `lazy.rs`'s `cursor_to_owned` imports this
+/// rather than hand-rolling its own copy, so the whole binary has exactly
+/// one number to retune for this guard family (#998 review: two independent
+/// copies of this same constant had already drifted apart in wording, if
+/// not value, before this consolidation).
+///
+/// `jq_runner.rs`'s `print_json` also imports this constant, but only for an
+/// unrelated purpose: recognizing `to_owned_cursor_at_depth`'s own panic
+/// message text (see `nesting_depth_panic_message`) so it can be
+/// distinguished from an unrelated panic. `print_json`'s *own* recursion
+/// guard was moved to [`super::value::MAX_VALUE_TREE_DEPTH`] by #1819 --
+/// see that constant's doc comment and `print_json`'s own for why one
+/// shared ceiling was wrong for this specific pairing: `print_json` prints
+/// values this crate has already promised (via `MAX_VALUE_TREE_DEPTH`) to
+/// support up to that depth, and its own measured crash boundary (600-700,
+/// noted above) has room to match that promise instead of failing 128
+/// levels earlier.
 pub const MAX_NESTING_DEPTH: usize = 256;
 
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998).

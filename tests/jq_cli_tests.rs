@@ -16711,13 +16711,18 @@ fn test_func_def_arity_overload_through_path_context_evaluator_1376() -> Result<
 /// for it -- confirmed live before this fix, `succinctly jq '.'` on a
 /// 200,000-level-deep document aborted with a raw stack overflow (SIGABRT,
 /// exit 134), not a clean error. `print_json` needs its own guard.
+///
+/// #1819 moved that guard's own ceiling from `MAX_NESTING_DEPTH` (256) to
+/// `MAX_VALUE_TREE_DEPTH` (384) -- this test's 500-deep input still clears
+/// either ceiling, so it keeps demonstrating the same rejection, just with
+/// the new number.
 #[test]
 fn test_identity_query_rejects_adversarial_nesting_998() -> Result<()> {
     let input = nested_arrays(500);
     let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
     assert_eq!(code, 1, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -16731,6 +16736,69 @@ fn test_identity_query_accepts_nesting_under_limit_998() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// #1819: `MAX_NESTING_DEPTH` (256, `print_json`'s old ceiling) and
+/// `MAX_VALUE_TREE_DEPTH` (384, every other value-tree consumer's ceiling,
+/// including the construction-time guards a `reduce`-built value passes
+/// through) used to disagree, so a value strictly between them passed
+/// construction and then failed **mid-print** -- after `print_json` had
+/// already flushed a large amount of syntactically-incomplete JSON to
+/// stdout. Confirmed live before this fix: this exact query corrupted
+/// output and exited 1 with a raw `anyhow` message instead of printing a
+/// complete, valid document. 300 is the issue's own repro depth, squarely
+/// inside the former 257-384 gap.
+#[test]
+fn test_reduce_built_value_in_former_depth_gap_prints_cleanly_1819() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "reduce range(300) as $i (null; [.])"], Some("1"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    let want = format!("{}null{}", "[".repeat(300), "]".repeat(300));
+    assert_eq!(stdout.trim_end(), want);
+    Ok(())
+}
+
+/// #1819 companion: the identity path (pure cursor navigation, no
+/// `OwnedValue` construction at all) must round-trip the same former-gap
+/// depths cleanly, not just the `reduce`-constructed case above --
+/// `print_json` is the only guard either shape ever reaches.
+#[test]
+fn test_identity_query_in_former_depth_gap_prints_cleanly_1819() -> Result<()> {
+    let input = nested_arrays(300);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// #1819 boundary: exactly `MAX_VALUE_TREE_DEPTH - 1` (383) levels deep must
+/// still succeed -- the last depth the new ceiling accepts.
+#[test]
+fn test_identity_query_accepts_exactly_384_boundary_minus_one_1819() -> Result<()> {
+    let input = nested_arrays(383);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), input);
+    Ok(())
+}
+
+/// #1819 boundary: exactly `MAX_VALUE_TREE_DEPTH` (384) levels deep must
+/// still raise cleanly -- the new ceiling has a real edge, it didn't just
+/// move the corruption threshold out without limit. This is the
+/// crate's own documented depth-support ceiling (`MAX_VALUE_TREE_DEPTH`,
+/// #1005), so failing here -- rather than silently accepting arbitrarily
+/// deep input -- is deliberate, matching every other value-tree consumer's
+/// own boundary tests.
+#[test]
+fn test_identity_query_rejects_exactly_384_boundary_1819() -> Result<()> {
+    let input = nested_arrays(384);
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "."], Some(&input))?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
