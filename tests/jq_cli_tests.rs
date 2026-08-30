@@ -20336,52 +20336,91 @@ fn test_path_context_builtin_arm_non_swallowed_result_unaffected_1280() -> Resul
     Ok(())
 }
 
-/// #1937: `.a | ltrimstr(("xax","x")) | [length, key]` forces the fanned-out
-/// `ltrimstr(("xax","x"))` (two outputs: `""`, then `"ax"`, matching real
-/// jq's own generator-argument fan-out for the isolated `ltrimstr` call,
-/// confirmed against jq 1.7.1) through the `Expr::Builtin(_)` arm's
-/// `eval_owned_expr_opt` call, since the trailing `key` needs path tracking.
-/// That call array-collapses the two outputs into `["", "ax"]` before
-/// continuing, so `length` measures the *array* (2, the comma-branch count)
-/// rather than either individual string's own length. `key` itself has no
-/// jq oracle (succinctly extension) and is content-independent, so it's
-/// included only to force path-context routing.
-///
-/// This is a known, documented gap (`docs/compliance/jq/limitations.md`),
-/// not a fix -- #1937's own investigation found the alternative (take the
-/// *first* output instead of collapsing) is a strictly worse regression for
-/// this helper's other call sites (silently drops every `recurse`/`..`/
-/// `paths` output but the first, with no error), so array-collapse remains.
-/// Pinned here as a regression guard against re-introducing that regression.
+/// #1937/#1964: `.a | ltrimstr(("xax","x")) | [length, key]` forces the
+/// fanned-out `ltrimstr(("xax","x"))` (two outputs: `""`, then `"ax"`,
+/// matching real jq's own generator-argument fan-out for the isolated
+/// `ltrimstr` call, confirmed against jq 1.7.1) through the
+/// `Expr::Builtin(_)` arm, since the trailing `key` needs path tracking.
+/// #1937 found this arm array-collapsed the two outputs into `["", "ax"]`
+/// before continuing (so `length` measured the *array*, 2, rather than
+/// either individual string's own length), and rejected the "take first
+/// instead" fix attempt as a worse regression for this arm's other traffic
+/// (zero-arg generators like `recurse` reached through the *same* arm).
+/// #1964 closed the gap properly instead -- `eval_owned_input` in place of
+/// `eval_owned_expr_opt` preserves the `ManyOwned` shape that
+/// `continue_rest_with_context` already knew how to fan out through `rest` --
+/// so this now produces one `[length, key]` result per `ltrimstr` output,
+/// matching real jq's own fan-out semantics for the first time. `key` itself
+/// has no jq oracle (succinctly extension) and is content-independent, so
+/// it's included only to force path-context routing.
 #[test]
-fn test_path_context_builtin_arm_multi_output_still_array_collapses_1937() -> Result<()> {
+fn test_path_context_builtin_arm_multi_output_fans_out_1964() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &["-c", r#".a | ltrimstr(("xax","x")) | [length, key]"#],
         Some(r#"{"a":"xax"}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out, "[2,\"a\"]\n");
+    assert_eq!(out, "[0,\"a\"]\n[2,\"a\"]\n");
     Ok(())
 }
 
-/// #1937: the generic `_` fallback arm (`eval_pipe_with_path_context_internal`)
+/// #1937/#1964: the generic `_` fallback arm (`eval_pipe_with_path_context_internal`)
 /// backs far more than argument-fan-out builtins -- it's also how a
 /// zero-arg generator (`recurse`, `range`, `..`) or an arbitrary comma
 /// branch gets evaluated whenever a sibling `key`/`parent`/`file_index`
-/// forces the whole pipe through path-context routing. An earlier fix
-/// attempt (round 1, take-first) silently discarded every `recurse` output
-/// but the first here with no error at all -- confirmed live during
-/// `/code-review` before merging. Array-collapse, while still the wrong
-/// shape relative to real jq's own fan-out, at least keeps every value
-/// visible; pinned here as a regression guard.
+/// forces the whole pipe through path-context routing. #1937's own
+/// investigation found and rejected a "take first" fix attempt here (it
+/// silently discarded every `recurse` output but the first, with no error
+/// at all -- confirmed live during that PR's `/code-review`). #1964's
+/// `eval_owned_input` fix closes the gap without that regression: `recurse`'s
+/// 3 outputs now each pair with `key`'s own output, matching real jq's own
+/// fan-out (`.a | [recurse]` gives the same 3 values, confirmed against jq
+/// 1.7.1) instead of collapsing them into one array.
 #[test]
-fn test_path_context_generic_fallback_recurse_still_array_collapses_1937() -> Result<()> {
+fn test_path_context_generic_fallback_recurse_fans_out_1964() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &["-c", ".a | (recurse, key)"],
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out, "[{\"b\":{\"c\":1}},{\"c\":1},1]\n\"a\"\n");
+    assert_eq!(out, "{\"b\":{\"c\":1}}\n{\"c\":1}\n1\n\"a\"\n");
+    Ok(())
+}
+
+/// #1964's own primary repro: `range(0;5)` (parsed as `Expr::Range`, not
+/// `Expr::Builtin` -- it falls into the generic `_` fallback arm, not the
+/// `Expr::Builtin(_)` arm the issue's own "root cause" section named) as one
+/// branch of a `Comma` alongside `key`, inside an array construction.
+/// Confirmed against jq 1.7.1 with a literal substituted for `key` (which
+/// has no oracle, being a succinctly-only extension):
+/// `jq -c '.a | [(range(0;5), "a")]'` on `{"a":"x"}` also gives
+/// `[0,1,2,3,4,"a"]`.
+#[test]
+fn test_comma_range_and_key_fan_out_in_array_1964() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ".a | [(range(0;5), key)]"], Some(r#"{"a":"x"}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "[0,1,2,3,4,\"a\"]\n");
+    Ok(())
+}
+
+/// #1964 sibling: the same shape reached through `limit`'s own body (newly
+/// routed into path-context evaluation by #1961/#1765) instead of a bare
+/// comma. Unlike the issue's own claimed pre-fix repro (`[[0,1,2,3,4],"a"]`),
+/// live-verified against this branch's own pre-#1964 state that this
+/// particular combination already produced the correct `[0,1]` -- `limit`'s
+/// own truncation happens to land on `range`'s first 2 elements before the
+/// path-context evaluator ever reaches `key` in the same branch, so the
+/// array-collapse bug this issue is about doesn't manifest for this exact
+/// `n`/generator-length combination. Kept as a regression guard for the
+/// correct behavior, not evidence #1964 changed this specific case.
+#[test]
+fn test_comma_range_and_key_fan_out_through_limit_1964() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a | [limit(2; (range(0;5), key))]"],
+        Some(r#"{"a":"x"}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "[0,1]\n");
     Ok(())
 }
 

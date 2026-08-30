@@ -28732,13 +28732,38 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Handle other builtins that don't need special path handling.
             // `first` already *is* this `Expr::Builtin`, so evaluate it
             // directly rather than reconstructing an equivalent one.
-            match eval_owned_expr_opt::<S>(first, value, optional) {
+            //
+            // `eval_owned_input`, not `eval_owned_expr_opt` (#1964): the
+            // latter collapses a genuinely multi-output builtin (`range`,
+            // `splits`, `recurse`, ...) into a single `OwnedValue::Array`
+            // before this arm ever sees it -- wrong whenever this branch
+            // reaches here via `Expr::Comma` (`(range(0;5), key)`), since
+            // `accumulate_path_context_step`'s caller already knows how to
+            // fan a `QueryResult::ManyOwned` out into separate branch
+            // outputs (see its own `ManyOwned` arm) -- it was never given
+            // the chance to, because this arm handed it one collapsed value
+            // instead. `eval_owned_input` preserves `Many`/`ManyOwned`
+            // (`eval.rs`'s own doc comment: "keeps Many/ManyOwned intact"),
+            // and `continue_rest_with_context` below already fans those out
+            // through `rest` per-element (its own `ManyOwned`/`Many` arms) --
+            // no change needed there or in `accumulate_path_context_step`,
+            // both already handle the shape this arm was never producing.
+            match eval_owned_input::<W, S>(first, value, optional) {
                 // #1280: a builtin that legitimately produced nothing (a
                 // `?`-swallowed type mismatch, or its own zero-output
                 // result) contributes zero outputs to this comma/pipe
                 // branch, matching real jq's own `.a?`-style empty-not-null
                 // path semantics -- not `QueryResult::Owned(Null)`.
-                Ok(None) => QueryResult::None,
+                QueryResult::None => QueryResult::None,
+                // `?` swallows only a genuine error; a halt always escapes
+                // (#791). Same gate the old `eval_owned_expr_opt`-based arm
+                // applied on its own `Err(EvalEscape::Error(_))` case, kept
+                // here as the same safety net even though `optional` was
+                // already threaded into `eval_owned_input` itself -- a
+                // caller-level check for whatever slips through unswallowed
+                // rather than trusting every internal call site to have
+                // applied it.
+                QueryResult::Error(_) if optional => QueryResult::None,
                 // #1313: `continue_rest_with_context` (shared with the
                 // `Expr::Object`/`Array`/`Literal` arm below and the
                 // generic fallback further below) replaces the old
@@ -28748,19 +28773,17 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // navigational position), so it needs no extra `.clone()`
                 // of its own the way that arm does. The helper's own
                 // `rest.is_empty()` fast path (#1445) is what keeps this
-                // arm's *value* move free too.
-                Ok(Some(result)) => continue_rest_with_context::<W, S>(
-                    QueryResult::Owned(result),
+                // arm's *value* move free too, and its own `ManyOwned`/
+                // `Many` arms are what now correctly fan out a multi-output
+                // builtin's result through `rest` (#1964).
+                result => continue_rest_with_context::<W, S>(
+                    result,
                     rest,
                     root,
                     file_origin,
                     current_path,
                     optional,
                 ),
-                // `?` swallows only a genuine error; a halt always escapes
-                // (#791).
-                Err(EvalEscape::Error(_)) if optional => QueryResult::None,
-                Err(escape) => escape.into(),
             }
         }
         // `[key]`/`[parent]`/`[file_index]` (#1302): the generic
@@ -29448,28 +29471,44 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         _ => {
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
-            match eval_owned_expr_opt::<S>(first, value, optional) {
+            //
+            // `eval_owned_input`, not `eval_owned_expr_opt` (#1964): this
+            // fallback is what a genuinely multi-output expression with no
+            // dedicated arm -- `Expr::Range` (`range(0;5)`) is the actual
+            // AST node the issue's own repro hits, not `Expr::Builtin(_)`
+            // above, despite the issue's own "root cause" section naming
+            // that arm; same underlying bug, same fix, different arm -- and
+            // `Comma`/arbitrary sub-pipes reach when `needs_path_context`'s
+            // own recursion has no more specific arm for them. Same
+            // rationale as the `Expr::Builtin(_)` arm's identical fix
+            // above: `eval_owned_expr_opt` collapsed every case here into a
+            // single `OwnedValue::Array` before `continue_rest_with_context`/
+            // `accumulate_path_context_step` (both already `ManyOwned`-aware)
+            // ever got a chance to fan it out.
+            match eval_owned_input::<W, S>(first, value, optional) {
                 // #1280: a legitimately-empty result (a `?`-swallowed type
                 // mismatch reached through this generic fallback) is zero
                 // outputs, matching real jq -- not a spurious `null`.
-                Ok(None) => QueryResult::None,
+                QueryResult::None => QueryResult::None,
+                // `?` swallows only a genuine error; a halt always escapes
+                // (#791). Same safety net as the `Expr::Builtin(_)` arm
+                // above.
+                QueryResult::Error(_) if optional => QueryResult::None,
                 // #1313: same `continue_rest_with_context` hand-off as the
                 // `Expr::Builtin(_)` arm above -- root/current_path stay
                 // unchanged (this arm never moves navigational position
                 // either, it just loses further path *tracking* for
-                // whatever it evaluates).
-                Ok(Some(result)) => continue_rest_with_context::<W, S>(
-                    QueryResult::Owned(result),
+                // whatever it evaluates). Its own `ManyOwned`/`Many` arms
+                // now correctly fan out a multi-output expression's result
+                // through `rest` (#1964).
+                result => continue_rest_with_context::<W, S>(
+                    result,
                     rest,
                     root,
                     file_origin,
                     current_path,
                     optional,
                 ),
-                // `?` swallows only a genuine error; a halt always escapes
-                // (#791).
-                Err(EvalEscape::Error(_)) if optional => QueryResult::None,
-                Err(escape) => escape.into(),
             }
         }
     }
