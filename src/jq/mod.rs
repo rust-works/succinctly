@@ -83,7 +83,7 @@ pub mod stream;
 mod value;
 pub mod walk;
 
-pub use error::{BinOp, Control, EvalError};
+pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub use eval::{
     eval, eval_lenient, eval_owned_with_file_index, nonfinite_display_string, substitute_vars,
     sync_aliased_paths, EvalSemantics, JqSemantics, QueryResult, YqSemantics,

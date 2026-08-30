@@ -28,20 +28,62 @@ use super::value::OwnedValue;
 pub struct EvalError {
     pub message: String,
 
-    /// The raw payload of `error(v)`, kept so that `catch` can inspect a
-    /// non-string value: jq binds the *raised value* as the catch handler's
-    /// input, so `try error({a:1}) catch .` must yield `{"a":1}` rather than
-    /// the rendered string `"{\"a\":1}"`.
+    /// Either the raw payload of `error(v)`, or a tag for one of the
+    /// "never suppressed by `?`/`try`/`catch`" error classes that used to be
+    /// recognized only by matching `message` against a fixed set of string
+    /// literals/prefixes/suffixes (#1840). That string-matching classifier
+    /// already produced two real bugs from the same root cause: #1660 (a
+    /// user's own `error("invalid escape sequence")` was wrongly forced
+    /// uncatchable) and #1813 (a dynamic message didn't match any literal in
+    /// the list, so it was wrongly left catchable). [`ErrorKind`]'s variants
+    /// are checked directly instead.
     ///
-    /// `None` for errors raised internally by the evaluator (type errors and
-    /// friends). jq models those as string errors, so [`EvalError::payload`]
-    /// falls back to `message` wrapped in [`OwnedValue::String`].
+    /// `None` for errors raised internally by the evaluator with no special
+    /// classification (ordinary type errors and friends). jq models those as
+    /// string errors, so [`EvalError::payload`] falls back to `message`
+    /// wrapped in [`OwnedValue::String`].
     ///
-    /// The CLI reads it for a second purpose: jq appends `(not a string)` to an
-    /// uncaught diagnostic when the raised value is not a string, which only
-    /// the payload can decide — `message` has already lost the distinction
-    /// (#355).
-    pub value: Option<OwnedValue>,
+    /// The CLI reads [`EvalError::payload_is_not_a_string`] for a second
+    /// purpose: jq appends `(not a string)` to an uncaught diagnostic when
+    /// the raised value is not a string, which only the payload can decide —
+    /// `message` has already lost the distinction (#355).
+    pub value: EvalErrorPayload,
+}
+
+/// [`EvalError::value`]'s type: a value, a classification tag, or neither.
+///
+/// `error(v)`'s raw payload and a "this message always means X" tag are
+/// mutually exclusive in practice — every constructor that sets one never
+/// sets the other — so folding both into one field costs nothing extra
+/// size-wise over the `Option<OwnedValue>` this replaces:
+/// `size_of::<EvalErrorPayload>()` measures identical to
+/// `size_of::<Option<OwnedValue>>()`, because `OwnedValue`'s discriminant
+/// already has spare niche capacity beyond `Option`'s single "empty" state.
+/// A plain extra tag *field* on `EvalError` was tried once instead and
+/// reverted (see the `#[cfg(test)]` regression test
+/// `eval_error_kind_variant_does_not_regress_size_or_the_1021_stack_overflow_fix`
+/// below for why that mattered) — this enum avoids that cost entirely by
+/// riding along in the space `Option<OwnedValue>` already used.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalErrorPayload {
+    None,
+    Value(OwnedValue),
+    Kind(ErrorKind),
+}
+
+/// A classification [`EvalError::value`] can carry instead of a real payload
+/// — see [`EvalErrorPayload::Kind`].
+///
+/// Every variant here means "never
+/// suppressed by `?`, never handed to a `catch` handler" at some scope; the
+/// exact scope differs per [`EvalError::is_decode_failure`]/
+/// [`EvalError::is_invalid_path_expression`]/
+/// [`EvalError::is_untracked_navigation_error`]'s own doc comments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    DecodeFailure,
+    InvalidPathExpression,
+    UntrackedNavigation,
 }
 
 /// A stream terminator: what ended a sequence of outputs when it wasn't
@@ -417,7 +459,21 @@ impl EvalError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            value: None,
+            value: EvalErrorPayload::None,
+        }
+    }
+
+    /// Create an error tagged with a classification [`ErrorKind`] instead of
+    /// a real payload (#1840) -- the base constructor for
+    /// [`Self::decode_failure`]/[`Self::colliding_display_key`]/
+    /// [`Self::invalid_path_expression`]/
+    /// [`Self::invalid_path_expression_near_access`]/
+    /// [`Self::invalid_path_expression_near_iterate`], the same way
+    /// [`Self::new`] is the base for every plain, unclassified error.
+    fn with_kind(message: impl Into<String>, kind: ErrorKind) -> Self {
+        Self {
+            message: message.into(),
+            value: EvalErrorPayload::Kind(kind),
         }
     }
 
@@ -453,24 +509,29 @@ impl EvalError {
         };
         Self {
             message,
-            value: Some(value),
+            value: EvalErrorPayload::Value(value),
         }
     }
 
     /// The value this error raises, as `catch` should see it.
     ///
-    /// Errors from `error(v)` return `v` unchanged; internal errors return
-    /// their message as a string, matching how jq raises them.
+    /// Errors from `error(v)` return `v` unchanged; internal errors (no
+    /// payload, or a [`ErrorKind`] classification tag) return their message
+    /// as a string, matching how jq raises them.
     pub fn payload(self) -> OwnedValue {
-        self.value.unwrap_or(OwnedValue::String(self.message))
+        match self.value {
+            EvalErrorPayload::Value(v) => v,
+            EvalErrorPayload::None | EvalErrorPayload::Kind(_) => OwnedValue::String(self.message),
+        }
     }
 
     /// Whether the raised payload was something other than a string.
     ///
     /// Drives jq's `(not a string)` marker on an uncaught error. Internal
-    /// errors (no payload) are message-shaped and therefore never flagged.
+    /// errors (no payload, or a classification tag) are message-shaped and
+    /// therefore never flagged.
     pub fn payload_is_not_a_string(&self) -> bool {
-        matches!(&self.value, Some(v) if !matches!(v, OwnedValue::String(_)))
+        matches!(&self.value, EvalErrorPayload::Value(v) if !matches!(v, OwnedValue::String(_)))
     }
 
     /// Create a type error.
@@ -849,11 +910,14 @@ impl EvalError {
     /// embedded value is (jq's shared `jv_dump_string_trunc`), so a long
     /// result still previews to `DUMP_KEEP` bytes.
     pub fn invalid_path_expression(value: &OwnedValue) -> Self {
-        Self::new(format!(
-            "{}{}",
-            Self::INVALID_PATH_EXPRESSION_PREFIX,
-            dump_truncated(value)
-        ))
+        Self::with_kind(
+            format!(
+                "{}{}",
+                Self::INVALID_PATH_EXPRESSION_PREFIX,
+                dump_truncated(value)
+            ),
+            ErrorKind::InvalidPathExpression,
+        )
     }
 
     const INVALID_PATH_EXPRESSION_PREFIX: &'static str = "Invalid path expression with result ";
@@ -883,12 +947,15 @@ impl EvalError {
         element: &OwnedValue,
         container: &OwnedValue,
     ) -> Self {
-        Self::new(format!(
-            "{}{} of {}",
-            Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX,
-            dump_truncated(element),
-            dump_truncated(container)
-        ))
+        Self::with_kind(
+            format!(
+                "{}{} of {}",
+                Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX,
+                dump_truncated(element),
+                dump_truncated(container)
+            ),
+            ErrorKind::UntrackedNavigation,
+        )
     }
 
     const UNTRACKED_NAVIGATION_ACCESS_PREFIX: &'static str =
@@ -906,11 +973,14 @@ impl EvalError {
     /// "near attempt to iterate through 5", never "Cannot iterate over
     /// number").
     pub fn invalid_path_expression_near_iterate(container: &OwnedValue) -> Self {
-        Self::new(format!(
-            "{}{}",
-            Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX,
-            dump_truncated(container)
-        ))
+        Self::with_kind(
+            format!(
+                "{}{}",
+                Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX,
+                dump_truncated(container)
+            ),
+            ErrorKind::UntrackedNavigation,
+        )
     }
 
     const UNTRACKED_NAVIGATION_ITERATE_PREFIX: &'static str =
@@ -929,11 +999,10 @@ impl EvalError {
     /// decide *not* to prune it there — see that arm's doc comment for the
     /// jq-1.7.1-confirmed `.b?` vs `(.b)?` distinction this exists for.
     pub fn is_untracked_navigation_error(&self) -> bool {
-        self.message
-            .starts_with(Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX)
-            || self
-                .message
-                .starts_with(Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX)
+        matches!(
+            self.value,
+            EvalErrorPayload::Kind(ErrorKind::UntrackedNavigation)
+        )
     }
 
     /// Whether this is an [`Self::invalid_path_expression`] — a statement
@@ -945,8 +1014,10 @@ impl EvalError {
     /// lone call site that needs to tell the two apart is `resolve_node`'s
     /// bare-`?` arm in `eval.rs`.
     pub fn is_invalid_path_expression(&self) -> bool {
-        self.message
-            .starts_with(Self::INVALID_PATH_EXPRESSION_PREFIX)
+        matches!(
+            self.value,
+            EvalErrorPayload::Kind(ErrorKind::InvalidPathExpression)
+        )
     }
 
     /// A decode failure while materializing a lazily-indexed document value
@@ -956,7 +1027,7 @@ impl EvalError {
     /// own equivalent is a parse-time rejection no program could ever catch
     /// either.
     pub fn decode_failure(reason: impl Into<String>) -> Self {
-        Self::new(reason)
+        Self::with_kind(reason, ErrorKind::DecodeFailure)
     }
 
     /// `object key "<key>" is ambiguous: ...` (#1642) — a #1620-class
@@ -966,14 +1037,17 @@ impl EvalError {
     /// but a display-keyed map has no way to hold both). This is what
     /// `to_owned`/`materialize` raise instead, via
     /// [`super::document::resolve_display_key`]/[`super::document::DisplayKeyGuard`].
-    /// [`Self::is_decode_failure`] recognizes the fixed suffix this
-    /// constructor always appends, the same way [`Self::invalid_path_expression`]
-    /// and its own `is_*` check share a prefix constant, so the two can
-    /// never independently drift out of sync (confirmed live before this
-    /// fix, #1813: this previously built its message ad hoc via `format!`
-    /// at its one call site in `document.rs`, and `is_decode_failure`'s
-    /// fixed literal list didn't include it — `try sort catch .` and
-    /// `sort?` both wrongly treated this as an ordinary catchable error).
+    /// [`Self::is_decode_failure`] checks the [`ErrorKind::DecodeFailure`]
+    /// tag this constructor sets directly (#1840), not `message` text — this
+    /// used to share a fixed-suffix convention with
+    /// [`Self::invalid_path_expression`]'s own prefix constant so the two
+    /// couldn't independently drift out of sync, but drifting was exactly
+    /// what happened once anyway (confirmed live before that fix, #1813:
+    /// this previously built its message ad hoc via `format!` at its one
+    /// call site in `document.rs`, and `is_decode_failure`'s fixed literal
+    /// list didn't include it — `try sort catch .` and `sort?` both wrongly
+    /// treated this as an ordinary catchable error). A tag can't drift out
+    /// of sync with itself the way a duplicated string constant can.
     ///
     /// Called directly (not via a `document.rs`-local wrapper, #1813
     /// review) from three sites across two crates: `document.rs`'s own
@@ -983,10 +1057,13 @@ impl EvalError {
     /// `jq::mod`, so a re-exporting wrapper added an extra hop without
     /// adding any encapsulation.
     pub fn colliding_display_key(key: &str) -> Self {
-        Self::new(format!(
-            "object key \"{key}\" is ambiguous{}",
-            Self::COLLIDING_DISPLAY_KEY_SUFFIX
-        ))
+        Self::with_kind(
+            format!(
+                "object key \"{key}\" is ambiguous{}",
+                Self::COLLIDING_DISPLAY_KEY_SUFFIX
+            ),
+            ErrorKind::DecodeFailure,
+        )
     }
 
     const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": an undecodable key's display form \
@@ -998,40 +1075,31 @@ impl EvalError {
     /// [`Self::is_invalid_path_expression`] exempts its own narrow error
     /// class without leaving the ordinary catchable `Error` channel.
     ///
-    /// #1660 code review: classifying purely by matching `message` against
-    /// these literal strings collided with a user's own `error("invalid
-    /// escape sequence")` -- live-verified against jq 1.7.1, real jq
-    /// retries/catches/suppresses it as an ordinary error, where the naive
-    /// string match wrongly forced it uncatchable. `self.value.is_some()`
-    /// -- true only for [`Self::from_value`]/[`Self::from_value_with`],
-    /// i.e. exactly `error(v)` -- rules that out first at zero extra
-    /// storage cost: every constructor besides those two routes through
-    /// [`Self::new`], which always leaves `value` `None` (confirmed by
-    /// grep -- `Self { ... }` literal construction exists nowhere else in
-    /// this file), so an internally-raised decode failure is unaffected. A
-    /// dedicated boolean field was tried first instead of this check, but
+    /// #1840: this used to classify purely by matching `message` against a
+    /// fixed set of string literals/prefixes/suffixes, which produced two
+    /// real bugs from the same root cause -- #1660 (a user's own
+    /// `error("invalid escape sequence")` collided with the literal list and
+    /// was wrongly forced uncatchable; live-verified against jq 1.7.1, real
+    /// jq retries/catches/suppresses it as an ordinary error) and #1813 (a
+    /// dynamic message, built ad hoc via `format!`, didn't match any literal
+    /// in the list, so it was wrongly left catchable). Checking
+    /// [`ErrorKind::DecodeFailure`] directly instead makes both classes of
+    /// mistake structurally impossible: a constructor either tags its error
+    /// with this `Kind` or it doesn't, there is no message text for a future
+    /// literal list to miss or a legitimate user error to collide with.
+    ///
+    /// This costs nothing extra over the plain `Option<OwnedValue>`
+    /// [`EvalErrorPayload`] replaces -- see that type's own doc comment. A
+    /// dedicated boolean *field* on `EvalError` was tried first instead, but
     /// `EvalError` had no spare padding to absorb it: the extra 8 bytes
-    /// propagated into `QueryResult`/`Control`'s recursive-materializer
-    /// call frames and turned a previously-controlled "nesting depth
-    /// exceeds limit" panic into a genuine stack overflow during unwind
+    /// propagated into `QueryResult`/`Control`'s recursive-materializer call
+    /// frames and turned a previously-controlled "nesting depth exceeds
+    /// limit" panic into a genuine stack overflow during unwind
     /// (`jq::lazy::tests::into_owned_panics_past_nesting_depth_limit_1021`)
-    /// -- reverted in favor of this zero-size-cost check instead.
+    /// -- reverted in favor of `EvalErrorPayload`'s niche-sharing enum
+    /// instead, which avoids that cost entirely.
     pub fn is_decode_failure(&self) -> bool {
-        if self.value.is_some() {
-            return false;
-        }
-        let base = self
-            .message
-            .strip_suffix(" in object key")
-            .unwrap_or(&self.message);
-        matches!(
-            base,
-            "invalid UTF-8 in string"
-                | "invalid number format"
-                | "invalid escape sequence in string"
-                | "invalid unicode escape sequence"
-                | "invalid escape sequence"
-        ) || self.message.ends_with(Self::COLLIDING_DISPLAY_KEY_SUFFIX)
+        matches!(self.value, EvalErrorPayload::Kind(ErrorKind::DecodeFailure))
     }
 
     /// Whether this error class is *always* uncatchable, with no positional
@@ -1555,10 +1623,32 @@ mod tests {
     fn internal_errors_carry_no_payload_but_catch_sees_the_message() {
         let err = EvalError::cannot_iterate_with(EvalTag::Jq, &OwnedValue::Int(1));
         assert_eq!(err.message, "Cannot iterate over number (1)");
-        assert_eq!(err.value, None);
+        assert_eq!(err.value, EvalErrorPayload::None);
         assert_eq!(
             err.payload(),
             OwnedValue::String("Cannot iterate over number (1)".to_string())
+        );
+    }
+
+    /// #1840: `EvalErrorPayload`'s whole reason for existing is riding along
+    /// in the same space `Option<OwnedValue>` already used -- verify that
+    /// empirically rather than trusting the doc comment's claim, and pin
+    /// `EvalError`'s own size so a future change to either type can't
+    /// silently regress it back into the #1021 stack-overflow class of bug
+    /// (see `jq::lazy::tests::into_owned_panics_past_nesting_depth_limit_1021`,
+    /// which exercises the actual regression this guards).
+    #[test]
+    fn eval_error_kind_variant_does_not_regress_size_or_the_1021_stack_overflow_fix() {
+        assert_eq!(
+            core::mem::size_of::<EvalErrorPayload>(),
+            core::mem::size_of::<Option<OwnedValue>>(),
+            "EvalErrorPayload must not be larger than the Option<OwnedValue> it replaces"
+        );
+        assert_eq!(
+            core::mem::size_of::<EvalError>(),
+            96,
+            "EvalError's size regressed -- see #1021's doc comment on EvalErrorPayload \
+             for why an 8-byte increase here turns a controlled panic into a stack overflow"
         );
     }
 
