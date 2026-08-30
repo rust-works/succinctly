@@ -20183,28 +20183,13 @@ fn resolve_node<'a, S: EvalSemantics>(
         // a given call site produces.
         //
         // #1935: `first(f)` is exactly `limit(1; f)` for path-tracking
-        // purposes, so it needs the same two fast paths
-        // `resolve_limit_one_n` already applies for `limit`, not just
-        // `take_path_branches`'s generic truncate-after-the-fact shape:
-        //
-        // - `repeat(f)` has no natural termination (#1906) -- `resolve_node`
-        //   on a bare `Expr::Repeat` never returns, so truncating its result
-        //   afterward cannot work; `resolve_repeat_bounded` (already generic
-        //   over its bound) must intercept before that call. Live-verified
-        //   against jq 1.7.1: `{"a":1} | path(first(repeat(.)))` is `[]`.
-        // - `.[]` (#1850) is merely slow unbounded, not infinite, but
-        //   `resolve_node`'s `Expr::Iterate` arm still fully materializes
-        //   every element into a `PathBranch` before truncation -- an O(N)
-        //   allocation for what `resolve_iterate_bounded`'s own `.take(n)`
-        //   makes O(1). Same `trackable` gate `resolve_limit_one_n` uses:
-        //   when untracked, falls through to the generic path below, which
-        //   raises the correct error on its own.
+        // purposes, so it shares `resolve_limit_one_n`'s own bounded
+        // dispatch (`resolve_node_bounded`, which fast-paths `repeat`/`.[]`
+        // the same way `limit` does) rather than `take_path_branches`'s
+        // generic truncate-after-the-fact shape alone. Live-verified against
+        // jq 1.7.1: `{"a":1} | path(first(repeat(.)))` is `[]`.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            match unwrap_paren(inner) {
-                Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, 1),
-                Expr::Iterate if trackable => resolve_iterate_bounded::<S>(value, 1),
-                _ => take_path_branches(resolve_node::<S>(inner, value, trackable, snapshot), 1),
-            }
+            resolve_node_bounded::<S>(inner, value, trackable, snapshot, 1)
         }
 
         // `if cond then a else b end`: only the branch the runtime actually
@@ -20791,6 +20776,56 @@ fn resolve_limit<'a, S: EvalSemantics>(
     }
 }
 
+/// Shared "resolve `expr`, capped at `n` branches" dispatch for every
+/// bounded consumer of a generator (`limit(n; expr)` and, since #1935,
+/// `first(f)` == `limit(1; f)` for path-tracking purposes) -- extracted from
+/// two independent, drifting copies of this same three-way match (#1935's
+/// own code review, echoing the "duplicated predicates diverge silently"
+/// lesson #106 already burned this file on once).
+///
+/// - #1850: bare `.[]` is bounded directly via `.take(n)` on the same
+///   iterator `resolve_node`'s own `Expr::Iterate` arm builds, making
+///   `path(limit(n; .[]))`/`path(first(.[]))` O(n) instead of O(document
+///   size) -- see [`resolve_iterate_bounded`]'s own doc comment for why this
+///   is scoped to exactly this shape rather than `resolve_node`'s generator
+///   path in general: every other arm there returns a fully materialized
+///   `Vec<PathBranch>` with no sink/early-stop protocol to plug into, so a
+///   fully general fix is a separate, much wider design question that
+///   issue itself left open.
+/// - #1906: `repeat(f)` needs the same interception, for a correctness
+///   reason rather than a performance one -- see [`resolve_repeat_bounded`]'s
+///   own doc comment. This has to intercept *before* the generic
+///   `resolve_node` call below, not truncate its result afterward the way
+///   `take_path_branches` does for every other shape: an un-intercepted
+///   `Expr::Repeat` falls through to `resolve_leaf`'s general case, which
+///   evaluates it via the ordinary (value-mode) evaluator -- bounded by
+///   `eval_repeat`'s own `MAX_ITERATIONS = 1000` round cap, so it *does*
+///   still return, just slowly and with the wrong answer for a `repeat`
+///   whose body is otherwise perfectly path-trackable (confirmed live: the
+///   pre-#1906 code returned "Invalid path expression" for `path(limit(3;
+///   repeat(.)))` after computing, not hanging on, up to 1000 rounds).
+///   Only a body that never produces *any* output (`repeat(empty)`) comes
+///   close to a true hang, and even that is bounded by the same cap.
+///
+/// Both fast paths are gated the same way their originals were: `Iterate`
+/// requires `trackable` (an untracked value falls through to the generic
+/// path below, which raises the correct error on its own); `Repeat` has no
+/// such gate because `resolve_repeat_bounded` re-threads `trackable` through
+/// its own per-round `resolve_node` call instead.
+fn resolve_node_bounded<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    n: usize,
+) -> PathResolveResult<'a> {
+    match unwrap_paren(expr) {
+        Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, n),
+        Expr::Iterate if trackable => resolve_iterate_bounded::<S>(value, n),
+        _ => take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n),
+    }
+}
+
 /// `path(limit(n; expr))`'s resolution for one already-resolved `n` — the body
 /// of [`resolve_limit`], run once per output of its `n` generator (#1279).
 fn resolve_limit_one_n<'a, S: EvalSemantics>(
@@ -20814,28 +20849,7 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     if n == 0 {
         return Ok(Vec::new());
     }
-    // #1850: bare `.[]` (the shape the issue itself measures) is bounded
-    // directly via `.take(n)` on the same iterator `resolve_node`'s own
-    // `Expr::Iterate` arm builds, making `path(limit(n; .[]))` O(n)
-    // instead of O(document size) -- see `resolve_iterate_bounded`'s own
-    // doc comment for why this is scoped to exactly this shape rather than
-    // `resolve_node`'s generator path in general: every other arm there
-    // returns a fully materialized `Vec<PathBranch>` with no
-    // sink/early-stop protocol to plug into, so a fully general fix is a
-    // separate, much wider design question this issue itself left open.
-    if trackable && matches!(unwrap_paren(expr), Expr::Iterate) {
-        return resolve_iterate_bounded::<S>(value, n);
-    }
-    // #1906: `repeat(f)` has no natural termination at all (unlike `.[]`
-    // above, whose unbounded form is merely slow, not infinite) -- see
-    // `resolve_repeat_bounded`'s own doc comment. This has to intercept
-    // before the generic `resolve_node` call below, not truncate its
-    // result afterward the way `take_path_branches` does for every other
-    // shape: `resolve_node` would never return in the first place.
-    if let Expr::Repeat(f) = unwrap_paren(expr) {
-        return resolve_repeat_bounded::<S>(f, value, trackable, snapshot, n);
-    }
-    take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n)
+    resolve_node_bounded::<S>(expr, value, trackable, snapshot, n)
 }
 
 /// `repeat(f)`'s own path-branch construction (#1906), bounded to at most
