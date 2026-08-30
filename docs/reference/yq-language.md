@@ -283,9 +283,11 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
 
 ### Date/Time Extensions
 
-Beyond jq's standard date functions (`now`, and `gmtime`/`strftime`/`strptime`
-behind `--jq-extensions` -- see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)),
-yq adds:
+Beyond jq's standard date functions (`now` stays ungated; `gmtime`, `localtime`,
+`mktime`, `strftime`, `strptime`, `todate`, `fromdate`, `todateiso8601`, and
+`fromdateiso8601` all need `--jq-extensions` -- see
+[Gated jq Builtins](#gated-jq-builtins---jq-extensions) for the full list), yq
+adds:
 
 | Function        | Description                   | Example                             |
 |-----------------|-------------------------------|-------------------------------------|

@@ -25955,9 +25955,13 @@ fn test_map_map_values_scalar_target_noops_in_yq_mode_1907() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "5");
 
-    // Every scalar kind passes through unchanged.
+    // Every scalar kind passes through unchanged, for both builtins.
     for (input, expected) in [("5\n", "5"), ("true\n", "true"), ("\"x\"\n", "\"x\"")] {
         let (out, code) = run_yq_stdin("map(.)", input, args)?;
+        assert_eq!(code, 0, "input {input:?}");
+        assert_eq!(out.trim(), expected, "input {input:?}");
+
+        let (out, code) = run_yq_stdin("map_values(.)", input, args)?;
         assert_eq!(code, 0, "input {input:?}");
         assert_eq!(out.trim(), expected, "input {input:?}");
     }
