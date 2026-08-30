@@ -4029,6 +4029,63 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
+/// Demand-aware `Expr::Iterate` fan-out for an array (#1597 part 2): walks
+/// `uncons_cursor()` one element at a time, pushing each straight to `sink`,
+/// instead of `eval_single`'s `Expr::Iterate` arm, which calls
+/// `collect_cursors_checked` -- a full upfront walk into a `Vec` -- before
+/// the first cursor ever reaches a consumer. `first(.[])`/`first(.[] | f)`
+/// paid for materializing every element's cursor on a 2M-element array to
+/// answer a query needing exactly one (#1597).
+///
+/// No `rest`/pipe-stage parameter, unlike [`each_lazy_keys_iterate_sink`]/
+/// [`each_lazy_seq_iterate_sink`]: those exist to unpack a `GenericResult::
+/// LazyKeys`/`LazySeq` marker `fold_pipe_stages_sink` already knows is
+/// followed immediately by `.[]` in a *known* stage list. A bare `.[]`
+/// reached through [`eval_each_generic`]'s own per-node dispatch has no such
+/// marker or stage list -- `sink` here already *is* "whatever the caller
+/// needs done with each element" (chaining through the rest of a `Pipe`,
+/// feeding a `Comma` branch, etc.), the same as every other native arm in
+/// that match (`each_if_generic` and siblings) that calls `sink` directly.
+///
+/// Reimplements, rather than reuses, [`DocumentElements::collect_cursors_checked`]'s
+/// #1677 gap check (`preceding_delimiter_ok` against the expected `,`/none
+/// for the first element) per element instead of over the whole container
+/// up front -- the array counterpart of `collect_cursors_checked`'s own
+/// per-element loop, just yielding as it goes instead of only returning once
+/// finished.
+///
+/// **Deliberate divergence**, the same shape [`each_lazy_seq_iterate_sink`]'s
+/// own doc comment already accepts for `LazySeq`: a malformed comma *after*
+/// whatever the consumer actually pulled is never detected, since the walk
+/// that would find it never runs past what was asked for. `first(.[])` on
+/// `[1,,3]` still raises correctly (the fault is on the very first element
+/// examined); `first(.[])` on a well-formed `1` followed by a *later*
+/// malformed gap does not see it. Every eager caller of
+/// `collect_cursors_checked` (`.[]` reached through the rest of the
+/// evaluator, `to_entries`) is unaffected -- only this demand-aware path
+/// takes the trade. Recorded in `docs/compliance/jq/limitations.md`.
+fn each_lazy_array_iterate_sink<V: DocumentValue>(
+    elements: V::Elements,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut elems = elements;
+    let mut is_first = true;
+    while let Some((cursor, next)) = elems.uncons_cursor() {
+        if let Some(pos) = cursor.text_position() {
+            let expected = if is_first { None } else { Some(b',') };
+            if !cursor.preceding_delimiter_ok(pos, expected) {
+                return Flow::Escaped(Control::Error(elems.malformed_element_error()));
+            }
+        }
+        is_first = false;
+        elems = next;
+        if sink(GenericItem::OneCursor(cursor)) == Demand::Stop {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    Flow::Exhausted
+}
+
 /// Demand-aware twin of `fold_pipe_stages` (#1565): folds an already-produced
 /// `LazyKeys`/`LazyIndexRange`/`LazySeq` item through the remaining pipe
 /// stages one at a time, honoring `sink`'s `Demand` the moment `Expr::Iterate`
@@ -5007,6 +5064,19 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Limit { n, expr } => {
             each_limit_generic::<S, V>(n, expr, value, optional, cursor, sink)
         }
+
+        // #1597 part 2: `.[]` over an array, walked lazily -- see
+        // `each_lazy_array_iterate_sink`'s own doc comment. Every other
+        // shape (object, non-container, decode failure) still falls back
+        // to `eval_single`'s existing, correct-but-eager handling -- an
+        // object's own duplicate-key collapse semantics need
+        // `DistinctKeyCursors`' streaming-collapse machinery extended to
+        // also carry value cursors, a separate and larger change not
+        // attempted here.
+        Expr::Iterate => match value.as_array() {
+            Some(elements) => each_lazy_array_iterate_sink(elements, sink),
+            None => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
+        },
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }

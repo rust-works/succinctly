@@ -1406,6 +1406,32 @@ the already-checked, always-walks `fold_lazy_keys_stage`. Pinned by
 and
 [`test_jq_keys_unsorted_demand_aware_still_known_gap_past_what_it_pulled_1770`](../../../tests/jq_cli_tests.rs).
 
+## A truncating consumer of a plain array `.[]` skips a malformed comma it never needed
+
+Sibling of the `map(f)`/`keys_unsorted[]` divergences above, for the same underlying
+reason. [#1597](https://github.com/rust-works/succinctly/issues/1597) gave `.[]` over a
+real array its own demand-aware walk (`each_lazy_array_iterate_sink`,
+`src/jq/eval_generic.rs`) so `first(.[])`/`limit(n; .[])` stop pulling cursors after `n`
+elements instead of materializing every one first (a 2M-element array's `first(.[] | .)`
+went from ~92 MB peak RSS to matching the ~28 MB `length` control). The walk still checks
+each element's own preceding `,` (#1677) as it goes — an element the sink *actually pulls*
+is checked exactly as before — but a malformed comma sitting *after* whatever the consumer
+stopped at is never reached:
+
+```
+$ printf '[,1,3]' | succinctly jq -c 'first(.[])'   # error, exit 5 (malformed comma IS the first thing examined)
+$ printf '[1,,3]' | succinctly jq -c 'first(.[])'   # 1, exit 0    (malformed comma is past element 1)
+$ printf '[1,,3]' | succinctly jq -c '.[]'          # error, exit 5 (unaffected -- always exhausts)
+```
+
+Deliberate, for the same reason the two divergences above are: restoring the check here
+would mean walking past the point the demand-aware sink stopped, defeating the reason
+`each_lazy_array_iterate_sink` exists rather than routing through the always-eager
+`collect_cursors_checked`. Objects are unaffected by this specific change — a plain `.[]`
+over an object still takes the original eager path (`.[]`'s duplicate-key collapse
+semantics need `DistinctKeyCursors`'s streaming-collapse machinery extended to also carry
+value cursors, deferred as separate, larger remaining scope on #1597).
+
 ## `limit`'s own `n` argument is not demand-aware when it is itself a generator
 
 Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention

@@ -23358,6 +23358,118 @@ fn test_first_over_lazy_seq_iterate_skips_later_error_1565() -> Result<()> {
     Ok(())
 }
 
+/// #1597 part 2: `.[]` over a real array now walks lazily
+/// (`each_lazy_array_iterate_sink`), so `first`/`limit` stop pulling cursors
+/// instead of collecting every one up front. Output must stay byte-identical
+/// to jq for every ordinary shape -- correctness is unaffected, only how
+/// much of the array gets touched.
+#[test]
+fn test_array_iterate_lazy_correctness_1597() -> Result<()> {
+    let input = r"[10,20,30,40,50]";
+    for (args, want_out) in [
+        (&["-c", "first(.[])"][..], "10\n"),
+        (&["-c", "first(.[] | . + 1)"][..], "11\n"),
+        (&["-c", "[limit(2; .[])]"][..], "[10,20]\n"),
+        (&["-c", "[limit(100; .[])]"][..], "[10,20,30,40,50]\n"),
+        (&["-c", "[.[]]"][..], "[10,20,30,40,50]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(input))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want_out, 0),
+            "`{}` -- stderr: {stderr}",
+            args.join(" ")
+        );
+    }
+
+    // Empty array: `.[]` produces zero outputs, so `first` produces none
+    // either -- no output at all, not `null`. Oracle-verified against jq
+    // 1.7.1 (`echo '[]' | jq -c 'first(.[])'` prints nothing, exit 0).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(.[])"], Some("[]"))?;
+    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+
+    // Non-array target still raises the same error as before.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(.[])"], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("Cannot iterate"), "{stderr}");
+
+    Ok(())
+}
+
+/// #1597 part 2 companion: a later error is skipped exactly like
+/// #1565's `map(f) | .[]` divergence -- the same trade, now for a plain
+/// array `.[]` reached without any `map`/`keys_unsorted` producer in
+/// between. `first`/`limit` never evaluate past what they needed, so an
+/// element that would error past the stopping point never runs at all.
+#[test]
+fn test_array_iterate_lazy_skips_unneeded_later_evaluation_1597() -> Result<()> {
+    let input = r#"[1,"x",3]"#;
+    // Diverges from jq: jq's `.[] | error` here still only evaluates one
+    // output before `first` stops, same as succinctly -- this is testing
+    // laziness of *evaluation*, already true before #1597 (#1461/#1565); the
+    // point is confirming the new arm didn't regress it.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "first(.[] | if type == \"string\" then error(\"boom\") else . end)",
+        ],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "stderr: {stderr}");
+
+    // A `limit` that never reaches the failing element also stays clean.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "[limit(1; .[] | if type == \"string\" then error(\"boom\") else . end)]",
+        ],
+        Some(input),
+    )?;
+    assert_eq!((stdout.as_str(), code), ("[1]\n", 0), "stderr: {stderr}");
+
+    // Reaching the failing element still raises, same as jq.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "[limit(2; .[] | if type == \"string\" then error(\"boom\") else . end)]",
+        ],
+        Some(input),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("boom"), "{stderr}");
+
+    Ok(())
+}
+
+/// #1597 part 2 (#1677 sibling of #1565/#1770): a malformed `,` sitting
+/// *after* whatever a truncating consumer actually pulled is never
+/// detected, since `each_lazy_array_iterate_sink` never walks past the
+/// point `sink` stopped at. See `docs/compliance/jq/limitations.md`'s "A
+/// truncating consumer of a plain array `.[]` skips a malformed comma it
+/// never needed" for the full writeup -- there is no meaningful jq
+/// comparison here (jq's own strict parser rejects this input outright
+/// before either evaluator runs), so this pins succinctly's own
+/// lazy-vs-eager behavior directly instead.
+#[test]
+fn test_array_iterate_lazy_skips_later_malformed_comma_1597() -> Result<()> {
+    // The malformed comma sits between element 1 and element 2 -- past
+    // what `first(.[])` needed, so it goes undetected.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(.[])"], Some("[1,,3]"))?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "stderr: {stderr}");
+
+    // A malformed comma *before* the first element is the very first thing
+    // examined, so it is still caught.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(.[])"], Some("[,1,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    // Plain `.[]` (no truncation) still walks the whole array and always
+    // catches it, unaffected by this change.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1,,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #1519, found while implementing #1462's own oracle sweep: real jq's
 /// short-circuiting builtins are macro-expanded `label $out | ... break
 /// $out` definitions, and its `?//`-alternatives operator retries the next
