@@ -1573,11 +1573,20 @@ records, where `main` has 787.
 
 That is a statement about malformed-record handling, not a guarantee about `--seq` as a
 whole. On multi-record streams a *separate, pre-existing* rule still diverges in the other
-direction: real jq drops a trailing record that is not newline-terminated, and succinctly
-keeps it (`printf '\x1e0007\n\x1e[]'` is `7` in jq, `7` and `[]` here -- identical on
-`main`, so not introduced by this work). Measured over 2,000 multi-record streams: 133 such
-cases here against `main`'s 610, the reduction coming entirely from the malformed-record
-rules above. Reproducing the prefix needs the same thing the diagnostics
+direction, and it is **not** simply "the trailing record lacks a newline" -- a first draft of
+this note said that, and the oracle contradicts it:
+
+```
+$ printf '\x1e"a"\x1e"b"'    | jq --seq -c '.'   # "a" and "b"  -- no newline anywhere, both kept
+$ printf '\x1e"a"\n\x1e"b"'  | jq --seq -c '.'   # "a" only     -- a newline earlier changes it
+$ printf '\x1e"a"\n\x1e"b"\n'| jq --seq -c '.'   # "a" and "b"
+```
+
+The trigger is a newline appearing *earlier in the stream*: once jq's reader has seen one, a
+later record must itself be newline-terminated to be emitted. succinctly keeps it either way
+(`printf '\x1e0007\n\x1e[]'` is `7` in jq, `7` and `[]` here) -- identical on `main`, so not
+introduced by this work. Measured over 2,000 multi-record streams: 133 such cases here
+against `main`'s 610, the reduction coming entirely from the malformed-record rules above. Reproducing the prefix needs the same thing the diagnostics
 do -- jq's `--seq` reader is a streaming lexer/parser with error recovery, and knowing which
 values survive means knowing where its parser gave up. A token scanner cannot substitute for
 it, and trying was actively harmful: an attempt to emit the prefix by scanning tokens and
