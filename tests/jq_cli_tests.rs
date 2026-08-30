@@ -7025,26 +7025,25 @@ fn test_limit_path_context_resolves_1765() -> Result<()> {
     Ok(())
 }
 
-/// #1964 (found in review of this fix): pre-existing, unrelated to `limit`
-/// itself -- `eval_pipe_with_path_context_internal`'s `Expr::Comma` arm
-/// routes every branch through this same evaluator, including a branch that
-/// doesn't need path context at all (`range(0;5)`), which then falls to the
-/// generic `Expr::Builtin(_)` catch-all's single-output `eval_owned_expr_opt`
-/// and collapses the whole multi-output builtin into one array. Reachable on
-/// `main` today without `limit` (`.a | [(range(0;5), key)]` already gives
-/// `[[0,1,2,3,4],"a"]`) -- this fix's own new `Expr::Limit` routing just
-/// makes it reachable through `limit`'s body too, since it evaluates that
-/// body through the identical evaluator. Pinned here rather than fixed,
-/// matching #1964's own scoping (a general fix belongs to that evaluator's
-/// `Comma`/`Builtin` combination, not this narrower `Limit`-specific PR).
+/// #1964 (found in review of the `Expr::Limit` path-context fix above, then
+/// fixed by #1964 itself): `eval_pipe_with_path_context_internal`'s
+/// `Expr::Comma` arm routes every branch through this same evaluator,
+/// including a branch that doesn't need path context at all (`range(0;5)`),
+/// which used to fall to the generic `Expr::Builtin(_)` catch-all's
+/// single-output `eval_owned_expr_opt` and collapse the whole multi-output
+/// builtin into one array before `limit` ever got to truncate it. #1964
+/// fixed the underlying evaluator (`eval_owned_input` in place of
+/// `eval_owned_expr_opt`), so `limit`'s own truncation now sees the real,
+/// fanned-out stream: 2 of the 6 genuine outputs (`range`'s 5 plus `key`'s
+/// 1), not one already-collapsed 5-element array.
 #[test]
-fn test_limit_path_context_inherits_comma_multi_output_collapse_known_gap_1964() -> Result<()> {
+fn test_limit_path_context_comma_multi_output_fans_out_1964() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | [limit(2; (range(0;5), key))]"],
         Some(r#"{"a":"x"}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[[0,1,2,3,4],\"a\"]");
+    assert_eq!(stdout.trim(), "[0,1]");
 
     Ok(())
 }
@@ -20405,27 +20404,6 @@ fn test_comma_range_and_key_fan_out_in_array_1964() -> Result<()> {
     let (out, err, code) = run_jq_full(&["-c", ".a | [(range(0;5), key)]"], Some(r#"{"a":"x"}"#))?;
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out, "[0,1,2,3,4,\"a\"]\n");
-    Ok(())
-}
-
-/// #1964 sibling: the same shape reached through `limit`'s own body (newly
-/// routed into path-context evaluation by #1961/#1765) instead of a bare
-/// comma. Unlike the issue's own claimed pre-fix repro (`[[0,1,2,3,4],"a"]`),
-/// live-verified against this branch's own pre-#1964 state that this
-/// particular combination already produced the correct `[0,1]` -- `limit`'s
-/// own truncation happens to land on `range`'s first 2 elements before the
-/// path-context evaluator ever reaches `key` in the same branch, so the
-/// array-collapse bug this issue is about doesn't manifest for this exact
-/// `n`/generator-length combination. Kept as a regression guard for the
-/// correct behavior, not evidence #1964 changed this specific case.
-#[test]
-fn test_comma_range_and_key_fan_out_through_limit_1964() -> Result<()> {
-    let (out, err, code) = run_jq_full(
-        &["-c", ".a | [limit(2; (range(0;5), key))]"],
-        Some(r#"{"a":"x"}"#),
-    )?;
-    assert_eq!(code, 0, "err={err}");
-    assert_eq!(out, "[0,1]\n");
     Ok(())
 }
 
