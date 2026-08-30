@@ -25818,3 +25818,60 @@ fn test_nested_suppressed_update_unwinds_every_level_1428() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1428 review follow-up: a slice can be a *read-through* step whose own tail
+/// declines to write, and then the chain built to reach it is stranded exactly
+/// like the plain iterate case.
+///
+/// This class was reached only after the guard started making tails legitimately
+/// write nothing: `through_slice`'s `Null` arm then saw an unwritten `Null` and
+/// raised its write-time "A slice of an array can only be assigned another
+/// array", turning a document jq leaves alone into a hard exit-5 failure. The
+/// arm now distinguishes the two using `terminal_write`, which exists for
+/// exactly that question -- when the edit *is* the write, a `Null` result means
+/// the RHS was `null`, and `null | .[0:1] = null` does still raise.
+#[test]
+fn test_read_through_slice_that_writes_nothing_is_a_noop_1428() -> Result<()> {
+    for (input, filter, expected) in [
+        ("null", ".[0:1][0][]? = 9", "null\n"),
+        ("null", ".[0:1][0][]? |= 9", "null\n"),
+        ("null", ".[0:1][0][]? += 1", "null\n"),
+        ("null", ".a[0:1][0][]? = 9", "null\n"),
+        // The slice immediately followed by an iterate -- filed as #1873 while
+        // it was still failing, and closed by this same fix.
+        ("null", ".a[0:1][]? = 9", "null\n"),
+        ("{}", ".a[0:1][]? = 9", "{}\n"),
+        ("null", ".[0:1][]? = 9", "null\n"),
+        // An existing `null` parent is untouched either way.
+        ("{\"a\":null}", ".a[0:1][]? = 9", "{\"a\":null}\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+
+    // A slice write that *does* write still builds its chain...
+    for (input, filter, expected) in [
+        ("null", ".a[0:1] = [9]", "{\"a\":[9]}\n"),
+        ("null", ".[0:1] = [9]", "[9]\n"),
+        ("null", ".a[0:1][0] = 9", "{\"a\":[9]}\n"),
+        ("null", ".a[0:1]? = [9]", "{\"a\":[9]}\n"),
+        ("[1,2,3]", ".[0:2] = [9]", "[9,3]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+
+    // ...and a terminal slice assignment of a non-array still raises, which is
+    // what keeps the `terminal_write` distinction honest.
+    for filter in [".[0:1] = null", ".[0:1] = 9"] {
+        let (_, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_ne!(code, 0, "{filter} must raise");
+        assert!(
+            stderr.contains("slice of an array"),
+            "{filter} -- got {stderr}"
+        );
+    }
+    Ok(())
+}
