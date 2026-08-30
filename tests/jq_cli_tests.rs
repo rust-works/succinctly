@@ -25155,6 +25155,78 @@ fn test_try_catch_forces_and_catches_a_lazyseq_failure_1812() -> Result<()> {
     Ok(())
 }
 
+/// #1936: `try_single_generic` (`eval_generic.rs`'s `?`/`try`/`catch`
+/// dispatch) forced a `LazySeq` before this boundary could close (#1812
+/// above), but had no equivalent arm for `GenericResult::LazyKeys` --
+/// `keys`/`keys_unsorted` on an object stay lazy until something actually
+/// materializes them, so a #1194 malformed (non-string) key raised only
+/// once that later, boundary-less materialization happened, escaping `?`/
+/// `try` entirely. `sort?`/`try (sort) catch` on the identical document
+/// already worked (`sort` has no lazy fast path, so it materializes and
+/// fails inside the boundary's own dispatch) -- this pins `keys_unsorted`/
+/// `keys` (the `sorted: true` path through the same `LazyKeys` variant) to
+/// the same already-correct behavior. Confirmed live against unmodified
+/// `main` before this fix: both `keys_unsorted?` and
+/// `try (keys_unsorted) catch "c"` raised uncaught, exit 5.
+#[test]
+fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -> Result<()> {
+    let doc = "{123: 1}";
+
+    for filter in ["sort?", "keys?", "keys_unsorted?"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("", 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    for filter in [
+        r#"try (keys) catch "c""#,
+        r#"try (keys_unsorted) catch "c""#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("\"c\"\n", 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1936 companion: `GenericResult::LazyIndexRange` (`keys`/`keys_unsorted`
+/// on an *array*, not an object) rides the same new `materialize_lazy()`
+/// forcing this fix added, but -- unlike `LazyKeys` -- can never actually
+/// fail (its value is fully described by the array's length alone, #684).
+/// Pins that forcing it through the `?`/`try` boundary is still a no-op for
+/// valid data, on both the array and object shapes.
+#[test]
+fn test_optional_and_try_catch_unaffected_by_lazykeys_lazyindexrange_forcing_1936() -> Result<()> {
+    for (doc, filter, want) in [
+        (r#"["a","b"]"#, "keys_unsorted?", "[0,1]\n"),
+        (r#"["a","b"]"#, r#"try (keys) catch "c""#, "[0,1]\n"),
+        (r#"{"b":1,"a":2}"#, "keys_unsorted?", "[\"b\",\"a\"]\n"),
+        (
+            r#"{"b":1,"a":2}"#,
+            r#"try (keys) catch "c""#,
+            "[\"a\",\"b\"]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
+            .unwrap_or_else(|e| panic!("`{filter}` on `{doc}` failed to run: {e}"));
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "`{filter}` on `{doc}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #1194 (the half in #1247's scope): a *structurally* malformed value --
 /// one the semi-index accepted as a span but could not classify as any JSON
 /// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
