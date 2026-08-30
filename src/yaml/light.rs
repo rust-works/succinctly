@@ -1837,19 +1837,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // that ever had a comment to place.
                             if let Some(comment) = field.key_cursor().line_comment_raw() {
                                 write_line_comment(out, Some(comment))?;
-                                if value.anchor().is_some() || value.explicit_tag().is_some() {
-                                    out.write_char('\n')?;
-                                    if let Some(anchor) = value.anchor() {
-                                        out.write_char('&')?;
-                                        out.write_str(anchor)?;
-                                        if value.explicit_tag().is_some() {
-                                            out.write_char(' ')?;
-                                        }
-                                    }
-                                    if let Some(tag) = value.explicit_tag() {
-                                        out.write_str(tag)?;
-                                    }
-                                }
+                                // Same anchor/tag rendering as the `else`
+                                // arm below, differing only in its leading
+                                // separator: a newline here (the value goes
+                                // on its own line), a space there (#1448).
+                                write_anchor_tag_sep(
+                                    out,
+                                    '\n',
+                                    value.anchor(),
+                                    value.explicit_tag(),
+                                )?;
                             } else {
                                 write_anchor_tag(out, value.anchor(), value.explicit_tag())?;
                             }
@@ -6820,8 +6817,25 @@ fn write_anchor_tag<Out: core::fmt::Write>(
     anchor: Option<&str>,
     tag: Option<&str>,
 ) -> core::fmt::Result {
+    write_anchor_tag_sep(out, ' ', anchor, tag)
+}
+
+/// [`write_anchor_tag`] with the leading separator spelled out.
+///
+/// Every caller writes `&anchor`, then ` !!tag` if both are present, and
+/// nothing at all when neither is -- what differs is only what precedes it.
+/// A compact sequence item whose value goes on its own line needs a newline
+/// there rather than a space, and open-coding that one difference left a
+/// near-verbatim copy of this body inline (#1448). Parameterising the
+/// separator is the whole of the difference.
+fn write_anchor_tag_sep<Out: core::fmt::Write>(
+    out: &mut Out,
+    separator: char,
+    anchor: Option<&str>,
+    tag: Option<&str>,
+) -> core::fmt::Result {
     if anchor.is_some() || tag.is_some() {
-        out.write_char(' ')?;
+        out.write_char(separator)?;
     }
     if let Some(anchor) = anchor {
         out.write_char('&')?;
@@ -7036,17 +7050,34 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // case had no special handling at all and fell through to the scalar
     // dispatch, which at least preserved the tag (with the wrong `""` quote
     // style this fix corrects below).
-    let absent = is_deferred_value_absent(&value);
     // `is_container()`, not `is_yaml_cursor_container` (which excludes an
     // *empty* container): `{a: &anc !!mytag {}}` drops its tag today too,
     // same bug, and there's no separate scalar dispatch for an empty
     // container to collide with.
-    if value.is_container() || absent {
+    //
+    // A container is *never* absent -- `is_deferred_value_absent` answers
+    // only for an unquoted empty string and returns `false` for every other
+    // shape -- so asking it about one is wasted work. It used to be computed
+    // up front for both uses below; deriving it lazily, only once the value
+    // is known not to be a container, measured ~4% off a flow-heavy 4 MB
+    // document (#1448 item 1, which asked for exactly this to be benchmarked
+    // before being changed).
+    let absent = if value.is_container() {
         if let Some(tag) = value.explicit_tag() {
             out.write_str(tag)?;
             out.write_char(' ')?;
         }
-    }
+        false
+    } else {
+        let absent = is_deferred_value_absent(&value);
+        if absent {
+            if let Some(tag) = value.explicit_tag() {
+                out.write_str(tag)?;
+                out.write_char(' ')?;
+            }
+        }
+        absent
+    };
     // A flow-context value that materializes as nothing at all still needs
     // *some* token -- unlike block style, where #1077's `write_deferred_value`
     // can just leave it out entirely -- because a following `,`/`}`/`]`
