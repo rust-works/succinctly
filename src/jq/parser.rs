@@ -3717,15 +3717,25 @@ impl<'a> Parser<'a> {
         }
 
         // Phase 15: Date/Time functions
+        //
+        // #1907: `gmtime`/`localtime`/`mktime` are real yq's lexer rejecting
+        // these outright (confirmed live, v4.53.3: "invalid input text
+        // ...") -- jq-only surface, gated like the neighboring
+        // `strftime`/`strptime` below, not real yq's own
+        // `from_unix`/`to_unix`/`tz(...)` (Phase 21 below, left ungated
+        // since real yq does accept those).
         if self.matches_keyword("gmtime") {
+            self.reject_unless_jq_extensions("gmtime")?;
             self.consume_keyword("gmtime");
             return Ok(Some(Builtin::Gmtime));
         }
         if self.matches_keyword("localtime") {
+            self.reject_unless_jq_extensions("localtime")?;
             self.consume_keyword("localtime");
             return Ok(Some(Builtin::Localtime));
         }
         if self.matches_keyword("mktime") {
+            self.reject_unless_jq_extensions("mktime")?;
             self.consume_keyword("mktime");
             return Ok(Some(Builtin::Mktime));
         }
@@ -3751,19 +3761,26 @@ impl<'a> Parser<'a> {
             self.expect(')')?;
             return Ok(Some(Builtin::Strptime(Box::new(fmt))));
         }
+        // #1907: same jq-only gating as gmtime/localtime/mktime above --
+        // confirmed live (v4.53.3) real yq's lexer rejects all four of
+        // these too.
         if self.matches_keyword("todateiso8601") {
+            self.reject_unless_jq_extensions("todateiso8601")?;
             self.consume_keyword("todateiso8601");
             return Ok(Some(Builtin::Todateiso8601));
         }
         if self.matches_keyword("fromdateiso8601") {
+            self.reject_unless_jq_extensions("fromdateiso8601")?;
             self.consume_keyword("fromdateiso8601");
             return Ok(Some(Builtin::Fromdateiso8601));
         }
         if self.matches_keyword("todate") {
+            self.reject_unless_jq_extensions("todate")?;
             self.consume_keyword("todate");
             return Ok(Some(Builtin::Todate));
         }
         if self.matches_keyword("fromdate") {
+            self.reject_unless_jq_extensions("fromdate")?;
             self.consume_keyword("fromdate");
             return Ok(Some(Builtin::Fromdate));
         }

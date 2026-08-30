@@ -6792,6 +6792,20 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             map_over::<W, S>(f, fields.map(|fld| fld.value()), optional)
         }
+        // #1907: real yq no-ops a scalar target for `map` entirely -- `f`
+        // never even runs (confirmed live, v4.53.3: `5 | map(error("boom"))`
+        // succeeds silently, `5`) -- unlike jq, which always errors here.
+        // `null` gets yq's usual empty-container treatment instead of a
+        // literal passthrough (matches the `*=` merge rule documented in
+        // CLAUDE.md: "null acts as an empty container on either side of a
+        // yq-mode merge"); every other scalar passes through byte-for-byte
+        // unchanged, so no decode-check is needed here at all -- nothing
+        // ever reads its content (the "uniform fix regressed content-
+        // independent ops" lesson, #1820's own review).
+        StandardJson::Null if S::TAG == EvalTag::Yq => {
+            QueryResult::Owned(OwnedValue::Array(Vec::new()))
+        }
+        _ if S::TAG == EvalTag::Yq => QueryResult::One(value),
         _ => {
             // #1820: sibling `map_over`'s own per-element path is already
             // checked (#1755); this outer type-error fallback for a
@@ -6970,6 +6984,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `.[]` does. Confirmed live: `5 | map_values(.)` raises "Cannot
         // iterate over number (5)" in jq 1.7.1.
         //
+        // #1907: real yq, by contrast, no-ops a scalar target entirely --
+        // see `builtin_map`'s identical arm above for the full rationale
+        // (confirmed live for `map_values` too, v4.53.3: `5 |
+        // map_values(error("boom"))` succeeds silently, `5`).
+        StandardJson::Null if S::TAG == EvalTag::Yq => {
+            QueryResult::Owned(OwnedValue::Array(Vec::new()))
+        }
+        _ if S::TAG == EvalTag::Yq => QueryResult::One(value),
         // #1820: scalar_decode_failure first -- same gap as builtin_map's
         // sibling fallback above.
         _ => scalar_fallback(&value, optional, || {

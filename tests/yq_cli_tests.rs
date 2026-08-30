@@ -25930,3 +25930,100 @@ fn test_key_comment_puts_anchor_tag_on_next_line_1448() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1907: real yq no-ops `map`/`map_values` on a scalar target entirely --
+/// the filter never even runs (confirmed live, yq v4.53.3: a scalar target
+/// with an update filter that would always error still succeeds silently
+/// and unchanged) -- where jq always errors ("cannot iterate over"). `null`
+/// specifically gets yq's usual empty-container treatment (matches the
+/// `*=` merge rule already documented in CLAUDE.md) rather than a literal
+/// passthrough; every other scalar passes through byte-for-byte unchanged.
+/// `map` and `map_values` reach real yq's CLI through two different
+/// evaluators (`map` has its own fast native arm in `eval_generic.rs`
+/// since #725; `map_values` still falls through to `eval.rs`'s
+/// `builtin_map_values` via the reindex fallback) -- both needed the fix.
+#[test]
+fn test_map_map_values_scalar_target_noops_in_yq_mode_1907() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+
+    // A real update filter's own error never fires -- the filter doesn't
+    // run at all.
+    let (out, code) = run_yq_stdin("map(error(\"boom\"))", "5\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "5");
+    let (out, code) = run_yq_stdin("map_values(error(\"boom\"))", "5\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "5");
+
+    // Every scalar kind passes through unchanged.
+    for (input, expected) in [("5\n", "5"), ("true\n", "true"), ("\"x\"\n", "\"x\"")] {
+        let (out, code) = run_yq_stdin("map(.)", input, args)?;
+        assert_eq!(code, 0, "input {input:?}");
+        assert_eq!(out.trim(), expected, "input {input:?}");
+    }
+
+    // `null` becomes an empty array instead, not a literal `null` passthrough.
+    let (out, code) = run_yq_stdin("map(.)", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+    let (out, code) = run_yq_stdin("map_values(.)", "null\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+
+    // Arrays/objects are unaffected -- the filter still runs normally.
+    let (out, code) = run_yq_stdin("map(. + 1)", "[1, 2]\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,3]");
+    let (out, code) = run_yq_stdin("map_values(. + 1)", "a: 1\nb: 2\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":2,"b":3}"#);
+
+    Ok(())
+}
+
+/// #1907: `gmtime`/`localtime`/`mktime`/`todate`/`fromdate`/
+/// `todateiso8601`/`fromdateiso8601` are jq's own date/time builtins --
+/// real yq's lexer rejects every one of them outright (confirmed live,
+/// v4.53.3: "invalid input text ..."), unlike `now`/`from_unix`/`to_unix`/
+/// `tz(...)`, which really are yq syntax. Gated behind `--jq-extensions`
+/// like the neighboring `strftime`/`strptime` (#1512's own precedent), not
+/// left silently accepting broader syntax than the reference it matches.
+#[test]
+fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
+    for kw in [
+        "gmtime",
+        "localtime",
+        "mktime",
+        "todate",
+        "fromdate",
+        "todateiso8601",
+        "fromdateiso8601",
+    ] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(kw, "0\n", &[])?;
+        assert_ne!(
+            code, 0,
+            "builtin {kw:?} should be rejected without the flag"
+        );
+        assert!(
+            stderr.contains("--jq-extensions"),
+            "builtin {kw:?}, stderr: {stderr}"
+        );
+    }
+
+    // The flag genuinely re-enables them (each parses and runs, whatever
+    // its own answer is for this input -- only checking it's no longer a
+    // *parse* error).
+    for kw in ["gmtime", "localtime", "todate", "todateiso8601"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(kw, "0\n", &["--jq-extensions"])?;
+        assert_eq!(code, 0, "builtin {kw:?}, stderr: {stderr}");
+    }
+
+    // Real yq's own date/time extensions stay ungated (unaffected by this
+    // fix, sanity-checked here so a future accidental over-broad gate
+    // regresses loudly).
+    let (out, code) = run_yq_stdin("from_unix", "0\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1970-01-01T00:00:00Z");
+
+    Ok(())
+}
