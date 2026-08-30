@@ -51,6 +51,22 @@ scopes:
     description: "Documentation and optimization notes"
     examples: ["docs: update AVX-512 results", "docs: add PFSM integration guide"]
     file_patterns: ["docs/**", "*.md", ".claude/**"]
+  - name: "adr"
+    description: "Architecture Decision Records"
+    examples: ["adr: add ADR-0019 for jq path-context tracking", "adr: fix no-line-numbers rule"]
+    file_patterns: ["docs/adrs/**"]
+  - name: "arch"
+    description: "Architecture and design documentation"
+    examples: ["arch: document semi-indexing overview", "arch: add JSON parsing architecture doc"]
+    file_patterns: ["docs/architecture/**"]
+  - name: "bench-docs"
+    description: "Benchmark results and reports"
+    examples: ["bench-docs: update jq benchmark table", "bench-docs: regenerate yq comparison"]
+    file_patterns: ["docs/benchmarks/**"]
+  - name: "guides"
+    description: "Project guides and tutorials"
+    examples: ["guides: update release checklist", "guides: add benchmarking A/B method"]
+    file_patterns: ["docs/guides/**"]
   - name: "ci"
     description: "CI/CD pipelines, GitHub Actions, and commit-lint configuration"
     examples: ["ci: add SIMD feature matrix", "ci: fix benchmark workflow"]
