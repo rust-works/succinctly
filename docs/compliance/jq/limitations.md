@@ -1039,17 +1039,21 @@ never gets this far). Falls under ADR-0018's "would take the host process down" 
 the fix that turned this from an uncaught process panic into a clean, catchable
 diagnostic.
 
-This fix is scoped to the CLI's default (lazy) per-document dispatch, matching #1793's own
-repro — the identical panic remains uncaught via any of: a CLI flag that forces
-whole-batch materialization up front (`--slurp`, `-S`/`--sort-keys`, `-C`/`--color-output`,
-`--ascii-output`, `--slurpfile`); a filter using `input`/`inputs`/`input_line_number`,
-which routes to that same materializing branch with *no flag at all* (#1818); `-e`/
+#1793's own fix was scoped to the CLI's default (lazy) per-document dispatch, matching its
+own repro. #1818 closed the identical gap on the CLI's *other* top-level branch — a CLI
+flag that forces whole-batch materialization up front (`--slurp`, `-S`/`--sort-keys`,
+`-C`/`--color-output`, `--ascii-output`, `--slurpfile`), or a filter using
+`input`/`inputs`/`input_line_number`, which routes to that same materializing branch with
+*no flag at all* — via `validate_json_delimiters`'s own checked guard
+(`check_nesting_depth`, `src/jq/eval_generic.rs`) rather than `catch_unwind`, since that
+walk already threads a `Result` and runs before any user filter evaluates at all.
+
+Still uncaught, tracked separately, not fixed by either #1793 or #1818: `-e`/
 `--exit-status`'s own separate materializer (`src/jq/lazy.rs`, already pinned uncaught by
 `test_exit_status_query_rejects_adversarial_nesting_998`); and `succinctly yq`, which has
-no equivalent guard on either its default or materializing path at all (#1817). Tracked
-separately, not fixed here. Confirmed live, also pre-existing and unrelated to this fix:
-`print_json`'s own guard can flush corrupted/truncated JSON to stdout before it fires
-(#1819).
+no equivalent guard on either its default or materializing path at all (#1817). Confirmed
+live, also pre-existing and unrelated to either fix: `print_json`'s own guard can flush
+corrupted/truncated JSON to stdout before it fires (#1819).
 
 ## Regex flags `l` and `n`
 
