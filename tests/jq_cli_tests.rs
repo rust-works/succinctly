@@ -1879,14 +1879,23 @@ fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<(
 
 /// #1645 code review: `push_generic_truthiness_cursor_error` is a second,
 /// hand-copied implementation of the same "walk and raise on corruption"
-/// predicate `to_owned_cursor_at_depth` already implements for
-/// materialization (`-S`, `-s`, `.,.`) -- the exact "duplicated predicate"
-/// shape this repo's own testing guidance warns diverges silently unless a
-/// test pins that every site agrees, not just that each is individually
-/// correct (see the `testing` skill and CLAUDE.md's "Duplicated predicates
-/// diverge silently" note, #106). For each malformed shape below, checks
-/// that `select(.bad) | .keep` (the new walk) and `-Sc .` on the bare `.bad`
-/// value (the pre-existing materializing walk) raise on the *same* input.
+/// predicate `to_owned_at_depth`/`to_owned_cursor_at_depth`/
+/// `cursor_to_owned_at_depth` (`lazy.rs`) already implement for
+/// materialization -- the exact "duplicated predicate" shape this repo's own
+/// testing guidance warns diverges silently unless a test pins that every
+/// site agrees, not just that each is individually correct (see the
+/// `testing` skill and CLAUDE.md's "Duplicated predicates diverge silently"
+/// note, #106). #1803 extended this from 2 sites to 3: `select(.bad) | .keep`
+/// (`push_generic_truthiness_cursor_error`), `-Sc .bad` (`to_owned_at_depth`,
+/// confirmed live via temporary tracing -- `-S` does *not* route through the
+/// cursor-aware sibling despite the name resemblance), and `-e .bad`
+/// (`cursor_to_owned_at_depth`, `lazy.rs` -- a JSON-only fourth
+/// implementation with no `DocumentValue`/`DocumentCursor` generic bound,
+/// reached only via `--exit-status`'s `JqValue::materialize()` path, #1098's
+/// own doc comment). All three agree on every case below; #1803 also probed
+/// for a genuine cross-site divergence and found none here -- the real bug
+/// that investigation surfaced (#1960) turned out to be an unrelated YAML
+/// flow-scalar parser bug, not a traversal-function disagreement.
 #[test]
 fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
     let cases = [
@@ -1932,6 +1941,14 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
         assert_eq!(
             materialize_code, 5,
             "[{label}] -Sc .bad must raise the same way select's condition walk does\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
+        );
+
+        let (exit_status_out, exit_status_err, exit_status_code) =
+            run_jq_full(&["-e", ".bad"], Some(doc))
+                .unwrap_or_else(|e| panic!("[{label}] -e run failed: {e}"));
+        assert_eq!(
+            exit_status_code, 5,
+            "[{label}] -e .bad must raise the same way select/-Sc do (cursor_to_owned_at_depth, lazy.rs)\nstdout: {exit_status_out:?}\nstderr: {exit_status_err:?}"
         );
     }
     Ok(())
