@@ -20182,19 +20182,28 @@ fn resolve_node<'a, S: EvalSemantics>(
         // parser path. Keeping both arms means it does not matter which one
         // a given call site produces.
         //
-        // #1935: `repeat(f)` needs the same interception `resolve_limit_one_n`
-        // already applies for `limit` -- `resolve_node` on a bare
-        // `Expr::Repeat` never returns (no natural termination, #1906), so
-        // `take_path_branches`'s truncate-after-the-fact shape cannot work
-        // here either. `resolve_repeat_bounded` is already generic over its
-        // bound; `first(f)` is exactly `limit(1; f)` for this purpose.
-        // Live-verified against jq 1.7.1: `{"a":1} | path(first(repeat(.)))`
-        // is `[]`.
+        // #1935: `first(f)` is exactly `limit(1; f)` for path-tracking
+        // purposes, so it needs the same two fast paths
+        // `resolve_limit_one_n` already applies for `limit`, not just
+        // `take_path_branches`'s generic truncate-after-the-fact shape:
+        //
+        // - `repeat(f)` has no natural termination (#1906) -- `resolve_node`
+        //   on a bare `Expr::Repeat` never returns, so truncating its result
+        //   afterward cannot work; `resolve_repeat_bounded` (already generic
+        //   over its bound) must intercept before that call. Live-verified
+        //   against jq 1.7.1: `{"a":1} | path(first(repeat(.)))` is `[]`.
+        // - `.[]` (#1850) is merely slow unbounded, not infinite, but
+        //   `resolve_node`'s `Expr::Iterate` arm still fully materializes
+        //   every element into a `PathBranch` before truncation -- an O(N)
+        //   allocation for what `resolve_iterate_bounded`'s own `.take(n)`
+        //   makes O(1). Same `trackable` gate `resolve_limit_one_n` uses:
+        //   when untracked, falls through to the generic path below, which
+        //   raises the correct error on its own.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            if let Expr::Repeat(f) = unwrap_paren(inner) {
-                resolve_repeat_bounded::<S>(f, value, trackable, snapshot, 1)
-            } else {
-                take_path_branches(resolve_node::<S>(inner, value, trackable, snapshot), 1)
+            match unwrap_paren(inner) {
+                Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, 1),
+                Expr::Iterate if trackable => resolve_iterate_bounded::<S>(value, 1),
+                _ => take_path_branches(resolve_node::<S>(inner, value, trackable, snapshot), 1),
             }
         }
 
