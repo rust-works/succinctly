@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors};
 use succinctly::jq::eval_generic::{
-    assert_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, GenericResult,
+    check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, GenericResult,
     MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::map_builtin_subexprs;
@@ -4376,10 +4376,20 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
 /// though the default `sjq -c .` path already rejects it since #1643.
 ///
 /// `depth` guards against a stack overflow on adversarially deep input the
-/// same way [`generic_to_owned`]'s own recursion does (`assert_nesting_depth`,
-/// #998) -- this walk runs *before* that one on the same document, so it
-/// needs the identical ceiling rather than risking a raw stack overflow at
-/// some other depth first.
+/// same way [`generic_to_owned`]'s own recursion does, but as a catchable
+/// error (`check_nesting_depth`, #1818) rather than a panic
+/// (`assert_nesting_depth`, #998): this walk runs *before* any user filter
+/// evaluation even begins (`parse_json_stream`'s fallback, backing `-S`,
+/// `-C`, `--slurp`, `--ascii-output`, `--slurpfile`, and any filter using
+/// `input`/`inputs`), so there's no `try`/`catch`-reachability concern the
+/// way there is for `to_owned`'s own hot-path guard -- and a clean,
+/// reported error beats a bare panic exiting 101 with an un-jq-shaped
+/// message, matching `print_json`'s own `anyhow::ensure!`-based guard for
+/// the analogous case on the lazy identity-path (confirmed live: an
+/// adversarially deep document between 256 and 384 levels used to panic
+/// here uncaught -- `succinctly jq -c --sort-keys '.' deep.json` exited 101
+/// with `thread 'main' panicked at ...: nesting depth exceeds limit of
+/// 256` instead of a clean jq-channel error).
 ///
 /// Not a hot path: `parse_json_stream_strict`'s `serde_json` validation
 /// already runs first and only fails (routing here) for a real jq leniency
@@ -4390,7 +4400,7 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
 ) -> core::result::Result<(), EvalError> {
-    assert_nesting_depth(depth);
+    check_nesting_depth(depth)?;
     match cursor.value() {
         StandardJson::Array(elements) => {
             let mut saw_any = false;

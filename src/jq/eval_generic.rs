@@ -120,6 +120,27 @@ pub fn assert_nesting_depth(depth: usize) {
     super::value::assert_depth(depth, MAX_NESTING_DEPTH);
 }
 
+/// Checked sibling of [`assert_nesting_depth`] (#1818).
+///
+/// Same [`MAX_NESTING_DEPTH`] ceiling, the identical message
+/// `assert_depth`'s own `panic!`/`print_json`'s own `anyhow::ensure!` both
+/// use, but as a catchable `EvalError` instead of a panic -- for a caller
+/// that isn't the evaluator's own hot recursion (where a panic is
+/// deliberate, see `to_owned`'s own doc comment on why an `EvalError` there
+/// would make a stack-overflow guard catchable by `try`/`catch`) but a
+/// CLI-level input-validation walk (`jq_runner.rs`'s
+/// `validate_json_delimiters`, reached before any user filter runs) that
+/// already threads a `Result` and has no such concern.
+pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
+    if depth < MAX_NESTING_DEPTH {
+        Ok(())
+    } else {
+        Err(EvalError::new(format!(
+            "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
+        )))
+    }
+}
+
 /// Convert a DocumentValue to an OwnedValue.
 ///
 /// This enables the evaluator to work with both JSON and YAML inputs.

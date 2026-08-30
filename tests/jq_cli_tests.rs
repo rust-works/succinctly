@@ -16970,6 +16970,103 @@ fn test_unrelated_value_tree_depth_panic_is_not_caught_by_1793_fix() -> Result<(
     Ok(())
 }
 
+/// #1818: `run_jq`'s *other* top-level branch -- taken whenever
+/// `can_use_lazy_path` is `false` (`--slurp`/`-s`, `-S`/`--sort-keys`,
+/// `-C`/`--color-output`, `--ascii-output`, `--slurpfile`, or a filter using
+/// `input`/`inputs`/`input_line_number`) -- reaches
+/// `validate_json_delimiters` (`parse_json_stream`'s fallback) with no
+/// equivalent guard against #1793's own `MAX_NESTING_DEPTH` panic, unlike
+/// the lazy path that fix already covers. Confirmed live before this fix:
+/// each flag below panicked uncaught (exit 101, a bare `thread 'main'
+/// panicked at ...` message) rather than reporting a clean jq-channel
+/// error.
+///
+/// This branch materializes the whole batch up front, so (unlike
+/// `test_adversarial_nesting_does_not_abort_rest_of_stream_1793`'s lazy-path
+/// isolation) there's no expectation of processing documents on either side
+/// of the adversarial one -- only that the failure is a clean, catchable
+/// error instead of a panic.
+#[test]
+fn test_slurp_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1818 sibling case: `-S`/`--sort-keys` reaches the identical fallback
+/// path as `--slurp` above.
+#[test]
+fn test_sort_keys_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--sort-keys", "."], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1818 sibling case: `-C`/`--color-output` forces the same
+/// whole-batch-materializing branch.
+#[test]
+fn test_color_output_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-C", "."], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1818 sibling case: `--ascii-output`, the fourth flag named in the
+/// issue's own repro.
+#[test]
+fn test_ascii_output_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--ascii-output", "."], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1818 sibling case: a filter using `inputs` also forces the
+/// whole-batch-materializing branch (`can_use_lazy_path` excludes it), even
+/// with no special CLI flag at all.
+#[test]
+fn test_inputs_filter_reports_clean_error_on_adversarial_nesting_1818() -> Result<()> {
+    let input = nested_arrays(500);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[inputs]"], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the five tests above: legitimately-nested input well under
+/// the limit must still succeed through this branch too, unaffected by the
+/// new checked guard.
+#[test]
+fn test_slurp_accepts_nesting_under_limit_1818() -> Result<()> {
+    let input = nested_arrays(100);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), format!("[{input}]"));
+    Ok(())
+}
+
 /// #1008 (yq PR) code review: `format_number_jq_compat`'s `value == 0.0`/
 /// `value as i64` checks don't distinguish -0.0 from 0.0 (IEEE 754), so a
 /// negative-zero exponent literal silently lost its sign across all three
