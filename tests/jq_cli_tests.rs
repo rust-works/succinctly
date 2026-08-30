@@ -172,6 +172,78 @@ fn spawn_jq(args: &[&str], stdin_input: Option<&[u8]>) -> Result<(std::process::
     )
 }
 
+/// Runs the binary with stdout and stderr pointed at the *same* file, so the
+/// two streams' real interleaving survives (#1653).
+///
+/// `run_jq_full`'s separate pipes cannot express ordering at all: they record
+/// what each stream contained, never which write happened first -- and
+/// ordering is the entire property under test here. A temp file, rather than
+/// one pipe shared by two `Stdio`s, because a `File` can simply be duplicated
+/// into both slots.
+///
+/// Cannot route through `spawn_jq`/`spawn_with_signal_retry` (#1884) the way
+/// every other helper here does: those hardcode piped stdout/stderr, which is
+/// exactly the wiring this one has to replace. It reuses their primitives
+/// (`succinctly_bin`, `signal_death_error`, `MAX_CARGO_RETRIES`) and repeats
+/// their retry -- ENOENT while a sibling test rebuilds the binary, and a
+/// signal-killed child (#1516/#1691) -- rather than reimplementing the retry
+/// policy with different numbers.
+fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32)> {
+    let dir = std::env::temp_dir().join(format!(
+        "sjq-interleave-{}-{}",
+        std::process::id(),
+        // Distinct per call within one process: two tests running
+        // concurrently in the same binary would otherwise share a path.
+        INTERLEAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("combined.txt");
+
+    for attempt in 0..MAX_CARGO_RETRIES {
+        // Truncate per attempt: a retry must not read a previous attempt's
+        // bytes back as if this run had produced them.
+        std::fs::File::create(&path)?;
+        let out_handle = std::fs::File::options().append(true).open(&path)?;
+        let err_handle = out_handle.try_clone()?;
+        let spawned = Command::new(succinctly_bin())
+            .arg("jq")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(out_handle))
+            .stderr(Stdio::from(err_handle))
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < MAX_CARGO_RETRIES =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Some(input) = input {
+                stdin.write_all(input.as_bytes())?;
+            }
+        }
+        let status = child.wait()?;
+        let combined = std::fs::read_to_string(&path)?;
+        if let Some(code) = status.code() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Ok((combined, code));
+        }
+        if attempt + 1 >= MAX_CARGO_RETRIES {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(signal_death_error(status, &combined));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+    }
+    unreachable!()
+}
+
+static INTERLEAVE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Helper to run jq with null input (-n)
 fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let mut args: Vec<&str> = vec!["-n"];
@@ -25667,5 +25739,100 @@ fn test_string_slice_terminal_write_runs_edit_before_refusing_1876_1883() -> Res
     );
     assert_eq!(stdout, "");
 
+    Ok(())
+}
+
+/// #1653: `--unbuffered` must actually interleave stdout and stderr in real
+/// time, not merely flush a batch that was already fully evaluated.
+///
+/// Every expected string here is jq 1.7.1's own combined output, captured
+/// live. The property is *ordering*, so these assert on one merged stream
+/// (`run_jq_interleaved`) -- separately-captured pipes would pass even with
+/// the batching bug, since each stream's own contents were always correct.
+///
+/// The `-n` and `--slurp` forms are the routes this fix streams; a document
+/// read on the M2 lazy path is deliberately not asserted here (see
+/// `test_streamed_ordering_not_yet_reached_on_m2_path_1653`).
+#[test]
+fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
+    for (args, input, expected) in [
+        // The issue's own repro: `1` is written before `debug` is evaluated.
+        (
+            vec!["--unbuffered", "-cn", "1, debug, 2"],
+            None,
+            "1\n[\"DEBUG:\",null]\nnull\n2\n",
+        ),
+        // An uncaught error is a side effect with the same ordering rule:
+        // the outputs that preceded it are already on stdout.
+        (
+            vec!["--unbuffered", "-cn", "1, error(\"x\"), 3"],
+            None,
+            "1\njq: error (at <unknown>): x\n",
+        ),
+        // `halt_error` writes its payload after the earlier output. A
+        // *number* payload is written as JSON with a trailing newline (a
+        // string payload is the raw, newline-less case) -- captured from
+        // jq 1.7.1, byte-for-byte, rather than assumed.
+        (
+            vec!["--unbuffered", "-cn", "1, (2|halt_error), 3"],
+            None,
+            "1\n2\n",
+        ),
+        // `stderr` echoes its input without a trailing newline, so the
+        // interleaving is visible as `null` butting against the next line.
+        (
+            vec!["--unbuffered", "-cn", "1, stderr, 2"],
+            None,
+            "1\nnullnull\n2\n",
+        ),
+        // Per-element, through a pipe: each element's stdout write lands
+        // before the next element is evaluated at all.
+        (
+            vec!["--unbuffered", "-cn", "range(3) | (., debug)"],
+            None,
+            "0\n[\"DEBUG:\",0]\n0\n1\n[\"DEBUG:\",1]\n1\n2\n[\"DEBUG:\",2]\n2\n",
+        ),
+        // `--slurp` reaches the same streaming path.
+        (
+            vec!["--unbuffered", "-c", "--slurp", "1, debug, 2"],
+            Some("{}"),
+            "1\n[\"DEBUG:\",[{}]]\n[{}]\n2\n",
+        ),
+        // So does the input-queue bridge (`inputs`), which streams through
+        // `eval_each_owned` rather than collecting first.
+        (
+            vec!["--unbuffered", "-cn", "inputs, debug"],
+            Some("1\n2\n"),
+            "1\n2\n[\"DEBUG:\",null]\nnull\n",
+        ),
+    ] {
+        let (combined, _code) = run_jq_interleaved(&args, input)?;
+        assert_eq!(combined, expected, "args {args:?} input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1653: the M2 lazy path (a document read from stdin/a file) still batches.
+///
+/// Pinned deliberately rather than left untested. Streaming it means routing
+/// the CLI's default path through the demand-driven evaluator, and
+/// `each_lazy_keys_iterate_sink` there skips the #1194 malformed-key check
+/// that #1629 added specifically so bare `keys_unsorted[]` *would* raise --
+/// a gap #1770 closed as an accepted trade for early-exit consumers like
+/// `first(...)`, not one that may be universalized to the default path.
+/// Routing M2 through it was tried and reverted: it regressed six tests
+/// across #1642/#1629/#1770's undecodable-key handling.
+///
+/// When that is resolved, this test should start failing -- at which point
+/// the expectation becomes jq's own
+/// `["DEBUG:",1]\n1\n["DEBUG:",2]\n2\n` and it moves into the test above.
+#[test]
+fn test_streamed_ordering_not_yet_reached_on_m2_path_1653() -> Result<()> {
+    let (combined, code) = run_jq_interleaved(&["--unbuffered", "-c", ".[]|debug"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        combined, "[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n1\n2\n",
+        "M2 path still batches; see this test's doc comment"
+    );
     Ok(())
 }
