@@ -1333,11 +1333,12 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
 /// `bsearch`), and the 21 names #1714 found still ungated (`add`, `min_by`,
 /// `max_by`, `implode`, `INDEX`, `walk`, `floor`, `ceil`, `round`, `sqrt`,
 /// `fabs`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `sinh`, `cosh`,
-/// `tanh`, `atan2`), and #1837/#1882's own 16 names -- the adjacent trig
-/// functions #1714 left untouched (`asin`, `acos`, `atan`, `sin`, `cos`,
-/// `tan`, `asinh`, `acosh`, `atanh`), `skip` (a #983-lineage builtin that,
-/// unlike its siblings `limit`/`nth`, was never gated at all), and 6 more
-/// (`abs`, `trunc`, `isinfinite`, `isnormal`, `isfinite`, `nan`) found by
+/// `tanh`, `atan2`), and 16 more names from PR #1885 -- #1837's 9 adjacent
+/// trig functions #1714 left untouched (`asin`, `acos`, `atan`, `sin`,
+/// `cos`, `tan`, `asinh`, `acosh`, `atanh`), #1882's `skip` (a #983-lineage
+/// builtin that, unlike its siblings `limit`/`nth`, was never gated at
+/// all), and 6 more (`abs`, `trunc`, `isinfinite`, `isnormal`, `isfinite`,
+/// `nan`) found by
 /// #1885's own code review tracing this same "Phase 10"/"Phase 12" gap
 /// further -- see #1887 for the still-unaudited remainder of this surface.
 #[test]
