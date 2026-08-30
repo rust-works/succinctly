@@ -26224,15 +26224,80 @@ fn test_nested_slice_delete_on_empty_update_filter_noops_on_null_1877() -> Resul
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "[2,3,4,5]");
 
-    // Regression guard: a slice followed by a plain `Index` (not another
-    // slice) is a separate, pre-existing, out-of-scope divergence (the
-    // general "`.a |= empty` should delete the key/element, not write
-    // `null`" gap for `Field`/`Index`, #1894's own follow-up territory) --
-    // confirmed unchanged before and after this fix, not newly broken by
-    // it.
+    // A slice followed by a plain `Index` (not another slice) -- #1916
+    // closed the general "`.a |= empty` should delete the key/element, not
+    // write `null`" gap for `Field`/`Index`, so this now deletes the
+    // element too, matching jq's own answer, rather than the `[null,2,3,4]`
+    // this assertion recorded before that fix landed.
     let (stdout, _stderr, code) = run_jq_full(&["-c", ".[0:2][0] |= empty"], Some("[1,2,3,4]"))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[null,2,3,4]");
+    assert_eq!(stdout.trim(), "[2,3,4]");
+
+    Ok(())
+}
+
+/// #1916: an update filter that produces no output at all deletes the
+/// key/element it targets, rather than leaving it `null` -- jq's `_modify`
+/// falls back to `delpaths` here (the same mechanism #1877/#1894 already
+/// gave `through_slice`'s slice arms). Every expected value below is real
+/// jq 1.7.1's own output, captured live.
+#[test]
+fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
+    // Field: the key disappears entirely, not `"a":null`.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a |= empty"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"b":2}"#);
+
+    // Index: the element is removed, the array shrinks.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[0] |= empty"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2,3]");
+
+    // Iterate over an array: every element that updates to nothing is
+    // dropped.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[] |= empty"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
+
+    // Iterate over an object: same, keyed by name.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[] |= empty"], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "{}");
+
+    // Out-of-range positive/negative indices stay a true no-op: nothing
+    // was ever really there to delete, so nothing is padded in either.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[5] |= empty"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,2,3]");
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[-5] |= empty"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,2,3]");
+
+    // The bounds check on a *real* write still fires -- it lives on the
+    // write path, not the delete path an empty filter takes instead.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[-5] |= 99"], Some("[1,2,3]"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Out of bounds negative array index"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // An autovivified container that ends up with nothing written into it
+    // reverts to `null` rather than surfacing as an artifact of the
+    // attempt (`{}`/`[]`).
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a |= empty"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[0] |= empty"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    // Nested: only the reached leaf is deleted, ancestors that already
+    // existed are left in place.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a.b |= empty"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":{}}"#);
 
     Ok(())
 }
