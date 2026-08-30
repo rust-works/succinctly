@@ -12832,6 +12832,53 @@ fn test_path_repeat_tracks_through_trackable_body_1906() -> Result<()> {
     Ok(())
 }
 
+/// Code review on PR #1933 (fixing #1906): an earlier version of
+/// `resolve_repeat_bounded` always propagated a later round's error, even
+/// when `limit`'s own `n` was already satisfied by branches produced
+/// before it -- something real jq's own lazy `limit` never even reaches.
+/// Confirmed live against jq 1.7.1: exit 0, `[]`, no error at all.
+#[test]
+fn test_path_repeat_error_dropped_once_limit_satisfied_1933() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(limit(1; repeat((., error(\"boom\")))))"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "[]\n");
+    Ok(())
+}
+
+/// Code review on PR #1933: an earlier version of `resolve_repeat_bounded`
+/// had no per-branch budget at all, unlike `eval_repeat`'s value-mode
+/// sibling (`REDUCE_FOREACH_MAX_STEPS`) -- letting a large `limit()`-
+/// supplied `n` combined with a wide-fanning-out body allocate far more
+/// than value-mode allows for the identical query shape. Both modes now
+/// cut at exactly 10000 branches with the same "repeat: maximum
+/// iterations exceeded" message.
+#[test]
+fn test_path_repeat_width_budget_matches_value_mode_1933() -> Result<()> {
+    let input = format!(
+        "[{}]",
+        (0..20001)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (path_stdout, path_stderr, path_code) =
+        run_jq_full(&["-c", "path(limit(50000; repeat(.[])))"], Some(&input))?;
+    let (value_stdout, value_stderr, value_code) =
+        run_jq_full(&["-c", "limit(50000; repeat(.[]))"], Some(&input))?;
+    assert_eq!(path_code, 5, "stderr: {path_stderr}");
+    assert_eq!(value_code, 5, "stderr: {value_stderr}");
+    assert!(
+        path_stderr.contains("repeat: maximum iterations exceeded"),
+        "stderr: {path_stderr}"
+    );
+    assert_eq!(path_stdout.lines().count(), 10000);
+    assert_eq!(path_stdout.lines().count(), value_stdout.lines().count());
+    Ok(())
+}
+
 #[test]
 fn test_walk_nested_break_reaches_its_enclosing_label() -> Result<()> {
     // Before this fix, a nested `f` application collapsed a `Control::Break`
