@@ -3120,11 +3120,13 @@ fn test_colliding_display_key_error_is_uncatchable_1813() -> Result<()> {
 }
 
 /// #1813 companion: a user's own `error(...)` call, even with the exact
-/// fixed suffix text `is_decode_failure` now also matches on, must stay
-/// ordinarily catchable -- the same `self.value.is_some()` guard #1660
-/// already established for the other decode-failure message literals
-/// covers this new one too, since `error(v)` is the only constructor that
-/// ever sets `value`.
+/// suffix text `is_decode_failure` also recognizes as a genuine decode
+/// failure, must stay ordinarily catchable. `is_decode_failure()` checks
+/// `EvalErrorPayload::Kind(ErrorKind::DecodeFailure)` (#1840) -- `error(v)`
+/// sets `EvalErrorPayload::Value(v)` instead, a distinct enum variant no
+/// `Kind`-matching arm can ever match regardless of `v`'s content -- so this
+/// user error can never be misclassified as a decode failure no matter what
+/// text it carries.
 #[test]
 fn test_user_error_matching_colliding_key_suffix_stays_catchable_1813() -> Result<()> {
     let filter = r#"try error("object key \"x\" is ambiguous: an undecodable key's display form collides with another key of the same name and cannot be represented") catch ("caught: " + .)"#;

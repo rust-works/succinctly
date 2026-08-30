@@ -40241,11 +40241,13 @@ mod tests {
     /// collided with a user's own `error(...)` raising one of those exact
     /// strings, wrongly forcing an ordinary, catchable error uncatchable.
     /// Live-verified against jq 1.7.1: real jq retries/catches/suppresses
-    /// these normally. `is_decode_failure()` now checks `self.value.is_some()`
-    /// first (see its own doc comment in `error.rs`) -- true only for a
-    /// user's `error(v)`, never for an internally-raised decode failure --
-    /// so this must retry (not propagate) exactly like the "ordinary error"
-    /// negative control above.
+    /// these normally. `is_decode_failure()` now checks
+    /// `EvalErrorPayload::Kind(ErrorKind::DecodeFailure)` (#1840) -- set only
+    /// by the handful of constructors that actually raise a decode failure,
+    /// never by `error(v)` (which sets `EvalErrorPayload::Value(v)` instead)
+    /// -- so a user's `error("invalid escape sequence")` here must retry
+    /// (not propagate) exactly like the "ordinary error" negative control
+    /// above.
     #[test]
     fn test_pattern_alternative_retry_not_confused_by_decode_failure_wording_1660() {
         for wording in [
