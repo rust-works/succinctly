@@ -1567,9 +1567,17 @@ $ printf '\x1e1,2\n'        | jq            --seq -c '.'   # prints 2
 $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints nothing
 ```
 
-**The divergence is deliberately one-directional: succinctly's output is a subset of jq's
-here, not a superset** -- measured, not proven, at 0 superset violations across 6,000
-randomly generated records (`main` has 787). Reproducing the prefix needs the same thing the diagnostics
+**The divergence from *this* rule is one-directional: succinctly's output is a subset of
+jq's, not a superset** -- 0 superset violations across 6,000 randomly generated single
+records, where `main` has 787.
+
+That is a statement about malformed-record handling, not a guarantee about `--seq` as a
+whole. On multi-record streams a *separate, pre-existing* rule still diverges in the other
+direction: real jq drops a trailing record that is not newline-terminated, and succinctly
+keeps it (`printf '\x1e0007\n\x1e[]'` is `7` in jq, `7` and `[]` here -- identical on
+`main`, so not introduced by this work). Measured over 2,000 multi-record streams: 133 such
+cases here against `main`'s 610, the reduction coming entirely from the malformed-record
+rules above. Reproducing the prefix needs the same thing the diagnostics
 do -- jq's `--seq` reader is a streaming lexer/parser with error recovery, and knowing which
 values survive means knowing where its parser gave up. A token scanner cannot substitute for
 it, and trying was actively harmful: an attempt to emit the prefix by scanning tokens and

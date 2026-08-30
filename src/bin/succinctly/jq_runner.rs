@@ -3261,16 +3261,6 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
             .get(i + 1)
             .map_or(bytes.len(), |&next| next - 1);
 
-        // Trailing-whitespace-only trim for the *reported* end offset, so a
-        // value's line lands on the record itself, not the separator/
-        // whitespace after it -- matches `json_seq_ends`'s own rule. Can't
-        // walk past `start`: the byte immediately before it is either the
-        // string start or an RS byte, and neither is whitespace.
-        let mut end = raw_end;
-        while end > start && bytes[end - 1].is_ascii_whitespace() {
-            end -= 1;
-        }
-
         // Full (both-sides) trim to decide parse-eligibility -- matches
         // the original per-segment `segment.trim()` check exactly.
         let raw_segment = &s[start..raw_end];
@@ -3294,31 +3284,22 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         // re-scanned up to three times, each pass allocating and
         // re-tokenizing. The *untrimmed* text, so the number-terminator
         // rule can see the whitespace that trimming would remove.
-        let ranges = seq_record_scan(raw_segment).values;
-        // Two different conditions reach `drop_trailing`, and #1723 only
-        // relaxes one of them.
-        //
-        // *No RS byte anywhere* (`has_rs` false) is #1525's abandonment
-        // case: real jq drops the entire input, however well-formed its
-        // content is (`printf '1 2\n' | jq --seq -c .` prints nothing), so
-        // the record is still skipped wholesale. Relaxing this was a
-        // regression the differential sweep caught -- it started emitting
-        // `1` and `2` there.
-        //
-        // With an RS byte present, only a *malformed* trailing record is
-        // skipped wholesale. When it scans, its own last value may still be
-        // an ambiguous bare number, but the values before it are real
-        // output real jq emits (`\x1e1 2` => `1`), so that decision moved
-        // into `seq_record_values`, per value.
-        if i == last_idx && drop_trailing && (!has_rs || ranges.is_empty()) {
+        // `i < last_idx`: this record is followed by another RS byte, which
+        // is the boundary at which a bare literal is truncatable.
+        let ranges = seq_record_scan(raw_segment, i < last_idx).values;
+        // *No RS byte anywhere* is #1525's abandonment case: real jq drops
+        // the entire input, however well-formed its content is (`printf
+        // '1 2\n' | jq --seq -c .` prints nothing). With an RS byte present
+        // there is nothing extra to do here -- `seq_record_scan` has already
+        // decided, per value, what this record yields, and `ranges` is empty
+        // for a record it dropped.
+        if i == last_idx && drop_trailing && !has_rs {
             continue;
         }
 
-        // Real jq emits every value it managed to read out of a record and
-        // resyncs past what it could not (#1723) -- a record is not
-        // all-or-nothing, so there is no "does this parse" gate here any
-        // more. `ranges` is already exactly the set of values that survived
-        // `seq_record_scan`'s three rules.
+        // `ranges` is exactly the set of values `seq_record_scan` decided
+        // this record yields -- empty for one it dropped, so there is no
+        // separate "does this parse" gate here.
         for &(vs, ve) in &ranges {
             let Ok(v) = crate::output::json_bytes_to_owned_value(&raw_segment.as_bytes()[vs..ve])
             else {
@@ -3368,7 +3349,7 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 /// `docs/compliance/jq/limitations.md` rather than papered over. Reaching
 /// jq's own answer needs its incremental parser's failure classification,
 /// which is what #1723 asks for and is tracked there.
-fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
+fn seq_record_scan(raw_segment: &str, rs_terminated: bool) -> SeqRecordScan {
     let bytes = raw_segment.as_bytes();
     let mut values = Vec::new();
     let mut pos = 0;
@@ -3418,7 +3399,7 @@ fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
     // input arriving. `\x1e1 2` is `1`; `\x1e1 2 ` (trailing space) is `1`
     // and `2`; `\x1etrue\x1e3` is `3` alone.
     let trailing_unresolved = match values.last() {
-        Some(&(vs, ve)) if !seq_pending_token_is_terminated(bytes, vs, ve) => {
+        Some(&(vs, ve)) if !seq_pending_token_is_terminated(bytes, vs, ve, rs_terminated) => {
             values.pop();
             true
         }
@@ -3463,21 +3444,45 @@ fn seq_token_is_pending(bytes: &[u8], start: usize) -> bool {
     matches!(bytes[start], b'-' | b'.' | b'0'..=b'9' | b't' | b'f' | b'n')
 }
 
-/// Whether a *pending* token ending a record was confirmed by trailing
-/// whitespace.
+/// Whether a *pending* token ending a record was confirmed.
 ///
 /// jq's incremental scanner cannot rule out more input arriving for a token
-/// with no closing delimiter, so one that butts against the record boundary
-/// is abandoned. This covers literals as well as numbers -- oracle-verified
-/// at an RS boundary, where `\x1etrue\x1e3\n` and `\x1enull\x1e3\n` both
-/// yield only `3`, while `\x1e"a"\x1e3\n` and `\x1e[1]\x1e3\n` keep both.
-/// An earlier version checked numbers alone and left 92 shapes emitting a
-/// value jq drops.
-fn seq_pending_token_is_terminated(bytes: &[u8], start: usize, end: usize) -> bool {
-    if !seq_token_is_pending(bytes, start) {
+/// with no closing delimiter, so one butting against a record boundary may
+/// be abandoned -- but **numbers and literals differ on which boundary**,
+/// and conflating them cost data in both directions:
+///
+/// | token | at an RS byte | at real EOF |
+/// |-------|---------------|-------------|
+/// | number (`1`) | abandoned | abandoned |
+/// | literal (`true`) | abandoned | **kept** |
+/// | string/array/object | kept | kept |
+///
+/// Checking numbers alone left 92 shapes emitting a `true` jq drops;
+/// checking both at every boundary then dropped `printf '\x1etrue'`, which
+/// jq prints. Both were found by differential sweeps, not by reasoning.
+fn seq_pending_token_is_terminated(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    rs_terminated: bool,
+) -> bool {
+    if bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
         return true;
     }
-    bytes.get(end).is_some_and(u8::is_ascii_whitespace)
+    match bytes[start] {
+        // A number is truncatable at *either* boundary: more digits could
+        // always follow, so jq abandons it at an RS byte and at real EOF
+        // alike (`\x1e1` and `\x1e1\x1e3` both drop the `1`).
+        b'-' | b'.' | b'0'..=b'9' => false,
+        // A bare literal is truncatable only at an RS byte. At real EOF jq
+        // has seen all the input there will ever be, so `true` is complete:
+        // `printf '\x1etrue'` prints `true`, while `\x1etrue\x1e3` prints
+        // only `3`. Treating the two boundaries alike dropped the EOF case
+        // and lost data real jq (and `main`) keep.
+        b't' | b'f' | b'n' => !rs_terminated,
+        // Self-delimiting: nothing to confirm.
+        _ => true,
+    }
 }
 
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
@@ -3546,8 +3551,9 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     // the ambiguous trailing bare number this function used to ask about
     // separately -- now rule 3, applied per value. Scanned on `tail`
     // (untrimmed) so that rule can see the terminating whitespace.
-    let scan = seq_record_scan(tail);
-    scan.trailing_unresolved || scan.values.is_empty()
+    // `false`: this is the stream's trailing record by construction, so its
+    // end is real EOF, never an RS byte.
+    seq_record_scan(tail, false).trailing_unresolved
 }
 
 /// Whether `--seq -s`'s trailing record, read across every file on the
