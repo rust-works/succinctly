@@ -1632,11 +1632,15 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// review): unlike `Error`/`Break`, `halt` is not a catchable signal --
 /// this file already has a long-established rule for exactly this
 /// (`resolve_leaf`'s own doc comment, #987: "an already-triggered halt
-/// must not be downgraded into a catchable path error"). Converting it to
-/// `Control::Error` here would violate that same rule for a caller that
-/// treats `Halt` as "stop everything now" and `Error` as "report and
-/// continue" -- a worse outcome than the corrupted-value bug this function
-/// exists to fix. The halt is kept, but the corrupted element (and
+/// must not be downgraded into a catchable path error"). This isn't only a
+/// library-API concern either: `yq_runner.rs`'s own `evaluate_input` calls
+/// this same `jq::eval` directly (for `--slurp`/`--eval-all`/etc.), and its
+/// `query_result_to_owned_values` genuinely treats the two differently --
+/// `Halt` calls `sink.request_halt(code)` (no diagnostic, short-circuits
+/// the run) where `Partial(_, Control::Error(e))` calls `sink.report(...)`
+/// and keeps going. Converting one into the other here would silently
+/// resume processing a real CLI invocation meant to stop, not just violate
+/// an abstract rule. The halt is kept, but the corrupted element (and
 /// anything `promote_borrowed_checked` never reached past it) is dropped
 /// from the reported prefix rather than leaking the old `""` substitution
 /// -- neither silently wrong output nor a silently downgraded halt.
@@ -40455,6 +40459,21 @@ mod tests {
         );
     }
 
+    /// #1832 review: `eval_fanout`'s own `resolve_terminal_prefix` call
+    /// site for `Control::Halt` needs its own pin, not just `eval_comma`'s
+    /// -- a future edit could swap which branch reaches which control at
+    /// this specific call site without `eval_comma`'s test catching it.
+    /// See `test_eval_comma_halt_is_not_downgraded_by_decode_failure_1832`
+    /// for the full rationale.
+    #[test]
+    fn test_eval_fanout_halt_is_not_downgraded_by_decode_failure_1832() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "if (true, false) then .a else halt end",
+            QueryResult::Halt(0) => {}
+        );
+    }
+
     /// #1832: `eval_pipe`'s own `Many`-branch loop shares the identical
     /// `merge_owned` (now `resolve_terminal_prefix`) terminal-control bug
     /// as `eval_comma`/`eval_fanout` -- an undecodable element from an
@@ -40479,6 +40498,19 @@ mod tests {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
                 assert_eq!(e.message, "boom");
             }
+        );
+    }
+
+    /// #1832 review: `eval_pipe`'s own `resolve_terminal_prefix` call site
+    /// for `Control::Halt` needs its own pin too -- see
+    /// `test_eval_comma_halt_is_not_downgraded_by_decode_failure_1832` for
+    /// the full rationale.
+    #[test]
+    fn test_eval_pipe_many_branch_halt_is_not_downgraded_by_decode_failure_1832() {
+        query!(
+            b"{\"arr\": [\"\xff\xfe\", 5]}",
+            ".arr[] | if type == \"string\" then . else halt end",
+            QueryResult::Halt(0) => {}
         );
     }
 
