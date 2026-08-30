@@ -25594,3 +25594,73 @@ fn test_slice_update_with_identity_tail_still_raises_1428() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1876/#1883: `through_slice`'s `OwnedValue::String` *terminal-write* arm
+/// used to refuse with the generic `Cannot update string slices` message
+/// immediately, without ever running the update filter -- unlike its
+/// `!terminal_write` sibling just above it (and every other arm in this
+/// function), which always runs `edit` first. This discarded the filter's
+/// own side effects (`debug`/`stderr`) and swallowed its own genuine errors
+/// (an explicit `error(...)` call, or an arithmetic type error from `+=`/
+/// `-=`) behind the generic refusal instead of letting them propagate --
+/// confirmed live against jq 1.7.1 for all three repros below.
+#[test]
+fn test_string_slice_terminal_write_runs_edit_before_refusing_1876_1883() -> Result<()> {
+    // `debug`'s stderr side effect still fires even though the write is
+    // ultimately refused -- both jq and succinctly print the debug line,
+    // then refuse with the same generic message.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:2] |= (debug|9)"], Some("\"hello\""))?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("DEBUG:"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // An explicit `error(...)` inside the update filter propagates as
+    // itself, not as the generic string-slice refusal.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[0:2] |= error(\"boom\")"], Some("\"hello\""))?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // `+=`/`-=`'s own arithmetic type error surfaces instead of the generic
+    // refusal (#1883's own repro).
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:1] += 1"], Some("\"s\""))?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be added"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:1] -= 1"], Some("\"s\""))?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("cannot be subtracted"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // Control: when the update filter succeeds with an ordinary value, the
+    // write is still refused with the generic message (the refusal itself
+    // is correct jq behavior -- only the *ordering* relative to `edit`
+    // changed).
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:1] = \"X\""], Some("\"hello\""))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    Ok(())
+}

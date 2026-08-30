@@ -17458,7 +17458,26 @@ fn through_slice<E: From<EvalError>>(
                 .expect("Array/String target always yields Some from slice_owned_value");
             edit(&mut throwaway)
         }
-        OwnedValue::String(_) => Err(EvalError::cannot_update_string_slices().into()),
+        // #1876/#1883: real jq evaluates the update filter's side effects
+        // (and surfaces its own errors) *before* refusing the write --
+        // this arm used to refuse immediately, discarding `edit` entirely,
+        // so a `debug`/`stderr` side effect never fired and a genuine
+        // `error(...)`/arithmetic type error inside the update filter was
+        // replaced by this generic message instead of propagating.
+        // Mirrors the `!terminal_write` arm just above: run `edit` against
+        // the same throwaway substring, propagate whatever it produces via
+        // `?`, and only *then* raise the refusal once `edit` itself has
+        // succeeded (confirmed live against jq 1.7.1: `"hello" | .[0:2] |=
+        // (debug|9)` prints the debug line before still refusing with this
+        // same message; `"hello" | .[0:2] |= error("boom")` raises "boom"
+        // instead; `"s" | .[0:1] += 1` raises the real arithmetic error,
+        // not this one).
+        OwnedValue::String(_) => {
+            let mut throwaway = slice_owned_value(root, start, end, optional)?
+                .expect("Array/String target always yields Some from slice_owned_value");
+            edit(&mut throwaway)?;
+            Err(EvalError::cannot_update_string_slices().into())
+        }
         // yq's slice-assignment no-op (#1101, generalized to any nesting
         // depth by #1116): `through_slice` is the single choke point every
         // slice write passes through, in both `set_path` (`=`) and
