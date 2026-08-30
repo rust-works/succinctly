@@ -998,25 +998,37 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             )),
         },
 
-        Expr::Iterate => match value {
-            StandardJson::Array(elements) => {
-                let results: Vec<_> = elements.collect();
-                QueryResult::Many(results)
+        // #1820: `scalar_decode_failure` before the `optional`/type-error
+        // fallback -- an undecodable-string scalar must raise its own
+        // decode failure, not the generic `cannot_iterate_with` message
+        // built from an unchecked `to_owned` (which silently substitutes
+        // `""` into the message and, worse, would still report "cannot
+        // iterate" instead of the real reason, even under `?`, where a
+        // decode failure must never be suppressed, #1247/#1620).
+        Expr::Iterate => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
             }
-            // Duplicate keys collapse here in jq mode (#1385): the object
-            // jq iterates has already had a repeated key reduced to one
-            // member. yq keeps every occurrence, so `effective_fields`
-            // degenerates to the plain walk this used to do inline.
-            StandardJson::Object(fields) => {
-                let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                    .into_iter()
-                    .map(|f| f.value)
-                    .collect();
-                QueryResult::Many(results)
+            match value {
+                StandardJson::Array(elements) => {
+                    let results: Vec<_> = elements.collect();
+                    QueryResult::Many(results)
+                }
+                // Duplicate keys collapse here in jq mode (#1385): the object
+                // jq iterates has already had a repeated key reduced to one
+                // member. yq keeps every occurrence, so `effective_fields`
+                // degenerates to the plain walk this used to do inline.
+                StandardJson::Object(fields) => {
+                    let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                        .into_iter()
+                        .map(|f| f.value)
+                        .collect();
+                    QueryResult::Many(results)
+                }
+                _ if optional => QueryResult::None,
+                _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
             }
-            _ if optional => QueryResult::None,
-            _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
-        },
+        }
 
         // `.[EXPR]?`/`.[S:E]?`: jq's `?` here guards only the *final*
         // indexing/slicing operation, not evaluation of the bracket's own
@@ -5482,7 +5494,14 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate boolean NOT.
 fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
-    let owned = to_owned(&value);
+    // #1820: to_owned_checked, not to_owned -- an undecodable string is
+    // truthy either way (`is_truthy` never treats a string as falsy), so
+    // unchecked `to_owned`'s silent `""` substitution used to make
+    // `!"<bad-string>"` quietly answer `!true` instead of raising.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     QueryResult::Owned(OwnedValue::Bool(!owned.is_truthy()))
 }
 
@@ -5646,7 +5665,19 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(escape) => return escape.into(),
             }
         }
-        None => to_owned(&value),
+        // #1820: to_owned_checked, not to_owned -- bare `error` raises the
+        // *payload* verbatim (per this function's own doc comment above),
+        // so an undecodable string used to silently become the `""`
+        // payload instead of raising its own decode failure. Returns
+        // immediately, bypassing `optional`'s suppression below entirely --
+        // matching #1247/#1620's established "a decode failure is never
+        // suppressed by `?`" rule, unlike an ordinary `error(...)?`, which
+        // this function's own `if optional` branch does legitimately
+        // suppress.
+        None => match to_owned_checked(&value) {
+            Ok(v) => v,
+            Err(e) => return QueryResult::Error(e),
+        },
     };
 
     if optional {
@@ -6233,8 +6264,20 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             let arr: Vec<OwnedValue> = (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
             QueryResult::Owned(OwnedValue::Array(arr))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
+        _ => {
+            // #1820: scalar_decode_failure before the optional/type-error
+            // fallback -- an undecodable-string scalar must raise its own
+            // decode failure, never suppressed by `?` (#1247/#1620),
+            // instead of the generic `has_no_keys` message built from an
+            // unchecked `to_owned`.
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+        }
     }
 }
 
@@ -6655,8 +6698,21 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             map_over::<W, S>(f, fields.map(|fld| fld.value()), optional)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        _ => {
+            // #1820: sibling `map_over`'s own per-element path is already
+            // checked (#1755); this outer type-error fallback for a
+            // non-container `value` wasn't -- an undecodable-string scalar
+            // must raise its own decode failure, never suppressed by `?`
+            // (#1247/#1620), instead of the generic message built from an
+            // unchecked `to_owned`.
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -6819,12 +6875,22 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Owned(OwnedValue::Array(results))
         }
-        _ if optional => QueryResult::None,
         // #929: real jq defines map_values(f) via `.[] |= f`'s own `.[]`,
         // so a non-object/array input fails the same way any other bare
         // `.[]` does. Confirmed live: `5 | map_values(.)` raises "Cannot
         // iterate over number (5)" in jq 1.7.1.
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        //
+        // #1820: scalar_decode_failure first -- same gap as builtin_map's
+        // sibling fallback above.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+        }
     }
 }
 
@@ -8907,8 +8973,19 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             }
             QueryResult::Owned(OwnedValue::Array(entries))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::has_no_keys(&to_owned(&value))),
+        _ => {
+            // #1820: the Array/Object arms are already checked (this is
+            // `to_owned_checked`'s own "primary" call site); the residual
+            // scalar fallback was missed. Same guard as builtin_keys'
+            // sibling fallback.
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+        }
     }
 }
 
@@ -11793,7 +11870,14 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
     _optional: bool,
 ) -> QueryResult<'_, W> {
     // Simplified: just return the value as JSON lines format
-    let owned = to_owned(&value);
+    //
+    // #1820: to_owned_checked, not to_owned -- an undecodable string
+    // anywhere in `value` used to silently become `""` in the *actual
+    // streamed output* below, not just an error message.
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     fn collect_stream(
         value: &OwnedValue,
         path: &mut Vec<OwnedValue>,
@@ -11834,8 +11918,17 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
     // This is a complex operation - provide a simplified version
     match &value {
         StandardJson::Array(_) => {
-            // For now, return the input - full implementation would reconstruct
-            QueryResult::Owned(to_owned(&value))
+            // For now, return the input - full implementation would
+            // reconstruct.
+            //
+            // #1820: to_owned_checked, not to_owned -- this passes the
+            // array straight through as real output, so an undecodable
+            // string inside it used to silently become `""` instead of
+            // raising.
+            match to_owned_checked(&value) {
+                Ok(v) => QueryResult::Owned(v),
+                Err(e) => QueryResult::Error(e),
+            }
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
@@ -28870,7 +28963,14 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let depth = to_owned(&value);
+    // #1820: to_owned_checked, not to_owned -- `.` (here `value`) becomes
+    // the truncation depth compared against every event's own path length
+    // below; an undecodable string used as `.` silently became `""`
+    // instead of raising.
+    let depth = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // A `Partial`'s trailing control is not intercepted here (#694): its
     // prefix of events is processed below like any other, and the control
@@ -31579,10 +31679,15 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    let arr = match to_owned(&value) {
-        OwnedValue::Array(a) => a,
-        _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::mktime_requires_array()),
+    // #1820: to_owned_checked, not to_owned -- converts before checking
+    // type, so an undecodable top-level string used to silently become
+    // `""` and get misreported as "not an array" instead of raising its
+    // own decode failure (never suppressed by `?`, #1247/#1620).
+    let arr = match to_owned_checked(&value) {
+        Ok(OwnedValue::Array(a)) => a,
+        Ok(_) if optional => return QueryResult::None,
+        Ok(_) => return QueryResult::Error(EvalError::mktime_requires_array()),
+        Err(e) => return QueryResult::Error(e),
     };
 
     // Need at least 6 elements: [year, month, day, hour, minute, second]
@@ -31812,8 +31917,12 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
                     )
                 }
-                _ => match to_owned(&value) {
-                    OwnedValue::Array(arr) => {
+                // #1820: to_owned_checked, not to_owned -- converts before
+                // checking type, same "convert before type-check" shape as
+                // `builtin_mktime`'s own fix above.
+                _ => match to_owned_checked(&value) {
+                    Err(e) => return QueryResult::Error(e),
+                    Ok(OwnedValue::Array(arr)) => {
                         // Real jq requires the full 8-element array — weekday and
                         // yearday included — not just the 6 fields mktime needs.
                         // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
@@ -31866,8 +31975,8 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             get_int(7),
                         )
                     }
-                    _ if optional => return QueryResult::None,
-                    _ => {
+                    Ok(_) if optional => return QueryResult::None,
+                    Ok(_) => {
                         return QueryResult::Error(
                             EvalError::strftime_requires_parsed_datetime_inputs(),
                         )
@@ -35014,7 +35123,14 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the variable name
-    let owned_value = to_owned(&value);
+    //
+    // #1820: to_owned_checked, not to_owned -- `value` (`.`, the binding
+    // `var` is evaluated against) used to silently become `""` on an
+    // undecodable string instead of raising.
+    let owned_value = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
     let var_result = eval_owned_expr_ctrl_full::<S>(var, &owned_value, optional);
     let (var_name, trailing) = match var_result {
         Ok((OwnedValue::String(s), trailing)) => (s, trailing),
@@ -39326,6 +39442,179 @@ mod tests {
         query!(br"[1]", "[tostream]",
             QueryResult::Owned(OwnedValue::Array(v)) => { assert_eq!(v.len(), 2); }
         );
+    }
+
+    /// #1820: category 1 of the follow-up audit that found more genuine
+    /// `to_owned` instances of #1755's shape than the misc-bucket slice's
+    /// own named scope covered. Each case is a scalar-fallback or
+    /// whole-value conversion this audit found unguarded; grouped into one
+    /// test since each is a one-line repro of the identical pattern
+    /// (`scalar_decode_failure`/`to_owned_checked` now guards it) rather
+    /// than a materially different behavior needing its own test.
+    ///
+    /// `builtin_paths`/`each_paths_filter`/`builtin_leaf_paths` -- three of
+    /// the issue's own sixteen named sites -- turned out to already be
+    /// fixed by #1829, an unrelated PR that landed between #1820's filing
+    /// and this pickup; not re-tested here since #1829's own tests already
+    /// cover them.
+    #[test]
+    fn test_to_owned_decode_failure_sweep_1820() {
+        // eval_single, Expr::Iterate arm: `.[]` on an undecodable-string
+        // scalar.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a[]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // eval_not: `not` (jq has no `!` operator -- this is a keyword).
+        query!(
+            b"\"\xff\xfe\"",
+            "not",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // eval_error: bare `error` raises `.` itself as the payload.
+        query!(
+            b"\"\xff\xfe\"",
+            "error",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // eval_error: `?` never suppresses the decode failure, unlike an
+        // ordinary `error?`.
+        query!(
+            b"\"\xff\xfe\"",
+            "error?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_keys / keys_unsorted: scalar fallback.
+        query!(
+            b"\"\xff\xfe\"",
+            "keys",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            b"\"\xff\xfe\"",
+            "keys_unsorted",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_map: scalar fallback (the Array/Object arms' own
+        // per-element path was already fixed by #1755).
+        query!(
+            b"\"\xff\xfe\"",
+            "map(.)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_map_values: same shape.
+        query!(
+            b"\"\xff\xfe\"",
+            "map_values(.)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_to_entries: scalar fallback (Array/Object arms already
+        // fixed).
+        query!(
+            b"\"\xff\xfe\"",
+            "to_entries",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_tojsonstream: whole-value conversion feeding real
+        // streamed output.
+        query!(
+            b"[\"\xff\xfe\"]",
+            "tojsonstream",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_fromjsonstream: Array arm passes a possibly-corrupted
+        // array straight through as output.
+        query!(
+            b"[\"\xff\xfe\"]",
+            "fromjsonstream",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_truncate_stream: `.` (here an undecodable string) is the
+        // truncation depth.
+        query!(
+            b"\"\xff\xfe\"",
+            "truncate_stream(tostream)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_mktime: converts before checking type.
+        query!(
+            b"\"\xff\xfe\"",
+            "mktime",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // builtin_strftime: non-Number arm, converts before checking type.
+        query!(
+            b"\"\xff\xfe\"",
+            "strftime(\"%Y\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1820 positive control: valid data through every shape in the sweep
+    /// above is unaffected.
+    #[test]
+    fn test_to_owned_decode_failure_sweep_valid_data_unaffected_1820() {
+        query!(br#"{"a":["x"]}"#, ".a[]",
+            QueryResult::Many(_) | QueryResult::One(_) => {}
+        );
+        query!(br"true", "not",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        query!(br#""x""#, "error",
+            QueryResult::Error(e) => { assert_eq!(e.message, "x"); }
+        );
+        query!(br#""x""#, "keys",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+        query!(br#""x""#, "map(.)",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+        query!(br#""x""#, "map_values(.)",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+        query!(br#""x""#, "to_entries",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+        query!(br#"["x"]"#, "tojsonstream",
+            QueryResult::Owned(OwnedValue::Array(_)) => {}
+        );
+        query!(br#"["x"]"#, "fromjsonstream",
+            QueryResult::Owned(OwnedValue::Array(_)) => {}
+        );
+        {
+            let json_bytes: &[u8] = b"0";
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse("truncate_stream(tostream)").unwrap();
+            if let QueryResult::Error(e) = eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                assert!(!e.is_decode_failure());
+            }
+        }
+        query!(br#""x""#, "mktime",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+        query!(br#""x""#, "strftime(\"%Y\")",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
+        );
+    }
+
+    /// #1820: `builtin_envvar` is unreachable through any parsed CLI query
+    /// (env access resolves through a separate, constant-field-access code
+    /// path, per this file's own established precedent for testing this
+    /// function -- see `builtin_envvar_propagates_halt_from_variable_name_
+    /// expression` above) -- exercised via a direct call, same as those.
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_builtin_envvar_raises_on_decode_failure_1820() {
+        let json = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let var = parse("\"PATH\"").unwrap();
+        match builtin_envvar::<Vec<u64>, JqSemantics>(&var, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// #1755: the "misc bucket" slice -- `INDEX`/`INDEX(stream;...)`,
