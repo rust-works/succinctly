@@ -20142,6 +20142,29 @@ fn test_path_context_builtin_arm_non_swallowed_result_unaffected_1280() -> Resul
     Ok(())
 }
 
+/// #1937: `.a | ltrimstr(("xax","x")) | [length, key]` forces the fanned-out
+/// `ltrimstr(("xax","x"))` (two outputs: `""`, then `"ax"`, matching real
+/// jq's own generator-argument fan-out for the isolated `ltrimstr` call,
+/// confirmed against jq 1.7.1) through the `Expr::Builtin(_)` arm's
+/// `eval_owned_expr_opt` call, since the trailing `key` needs path tracking.
+/// Before this fix, that call array-collapsed the two outputs into
+/// `["", "ax"]` before continuing, so `length` measured the *array* (always
+/// 2, matching the fixed comma-branch count regardless of the actual string
+/// values) rather than the real first string's own length (0). `key` itself
+/// has no jq oracle (succinctly extension) and is content-independent, so
+/// it's included only to force path-context routing -- `length`'s value is
+/// what actually distinguishes take-first from array-collapse here.
+#[test]
+fn test_path_context_builtin_arm_multi_output_takes_first_not_array_collapse_1937() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", r#".a | ltrimstr(("xax","x")) | [length, key]"#],
+        Some(r#"{"a":"xax"}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "[0,\"a\"]\n");
+    Ok(())
+}
+
 /// #1280's `Expr::Object`/`Array`/`Literal` arm: an object-construction key
 /// generator that produces zero outputs (`{(empty): 1}`) means the whole
 /// construction contributes zero outputs, matching real jq
