@@ -55952,36 +55952,34 @@ mod tests {
         );
     }
 
-    /// Characterization test (see `.claude/skills/testing/SKILL.md`'s
-    /// "Pinning Known-Wrong Behaviour" section): pins the exact `.a: null`
-    /// stub #1873's fix above leaves behind, which is *not* what real jq
-    /// produces (`/usr/bin/jq` 1.7.1 leaves `null`/`{}`/`{"b":1}` completely
-    /// untouched for these queries). The stub is issue #1428's separate,
-    /// pre-existing, broader defect -- eager `Field` autovivification
-    /// during path navigation, reachable with no slice involved at all
-    /// (`null | .a[]? = 9` already produces the identical `{"a":null}` on
-    /// `main`, before and after #1873's fix). This is not asserting
-    /// desired behaviour -- if #1428 is ever fixed, update these
-    /// expectations to match real jq instead.
+    /// Was a characterization test pinning the `.a: null` stub #1873's fix
+    /// left behind, with the standing instruction "if #1428 is ever fixed,
+    /// update these expectations to match real jq instead". #1428 is fixed,
+    /// so these now assert `/usr/bin/jq` 1.7.1's own answers: the document is
+    /// left completely untouched, because an `Iterate` over the `Null` that
+    /// autovivification produced has no elements to assign to, so the write
+    /// never happens and the chain built to reach it is never committed.
+    ///
+    /// Kept under its original subject (a slice with a mid-chain iterate
+    /// tail) rather than folded into the `#1428` tests in
+    /// `tests/jq_cli_tests.rs`: this exercises the library entry point
+    /// directly, and it is the shape where `through_slice`'s own `Null` arm
+    /// and #1428's parent-probe have to agree.
     #[test]
-    fn test_assign_slice_mid_chain_iterate_over_null_leaves_field_stub_characterize_preexisting_bug_1428(
-    ) {
+    fn test_assign_slice_mid_chain_iterate_over_null_leaves_document_untouched_1428() {
         query!(br"null", r".a[0:1][]? = 9",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#,
-                    "#1428 fixed? update this expectation to match real jq's \"null\"");
+                assert_eq!(v.to_json(), r"null");
             }
         );
         query!(br#"{"b":1}"#, r".a[0:1][]? = 9",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"b":1,"a":null}"#,
-                    "#1428 fixed? update this expectation to match real jq's {{\"b\":1}}");
+                assert_eq!(v.to_json(), r#"{"b":1}"#);
             }
         );
         query!(br"null", r".a[0:1][]? |= 9",
             QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#,
-                    "#1428 fixed? update this expectation to match real jq's \"null\"");
+                assert_eq!(v.to_json(), r"null");
             }
         );
     }
