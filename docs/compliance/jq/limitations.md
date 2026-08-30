@@ -1567,15 +1567,23 @@ $ printf '\x1e1,2\n'        | jq            --seq -c '.'   # prints 2
 $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints nothing
 ```
 
-**The divergence is deliberately one-directional: succinctly's output is always a subset of
-jq's here, never a superset.** Reproducing the prefix needs the same thing the diagnostics
+**The divergence is deliberately one-directional: succinctly's output is a subset of jq's
+here, not a superset** -- measured, not proven, at 0 superset violations across 6,000
+randomly generated records (`main` has 787). Reproducing the prefix needs the same thing the diagnostics
 do -- jq's `--seq` reader is a streaming lexer/parser with error recovery, and knowing which
 values survive means knowing where its parser gave up. A token scanner cannot substitute for
 it, and trying was actively harmful: an attempt to emit the prefix by scanning tokens and
 skipping bad ones **fabricated output**, printing values real jq never prints (`\x1e1-2\n`
-became `1` and `-2`, where jq lexes one malformed number and prints nothing). Requiring
-whitespace after every token is what rules that out, at the cost of dropping records jq can
-partially read. Both directions are pinned by
+became `1` and `-2`, where jq lexes one malformed number and prints nothing). Requiring a
+*pending* token -- a number or bare `true`/`false`/`null`, neither of which carries a closing
+delimiter -- to be confirmed by whitespace or the start of a self-delimiting value is what
+rules that out, at the cost of dropping records jq can partially read. Strings, objects and
+arrays are exempt: they self-terminate, so `\x1e{"a":1}{"b":2}\n` and `\x1e1[1]\n` are two
+values apiece in both tools. Requiring whitespace after *every* token instead, as a first
+draft did, dropped 332 records real jq reads fully.
+
+The same pending-token rule applies at a record boundary, where `\x1etrue\x1e3\n` yields
+only `3` -- a bare literal is as truncatable as a bare number. Both directions are pinned by
 `test_seq_adjacent_tokens_never_fabricate_1723` and
 `test_seq_partially_readable_record_is_dropped_whole_1723`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).

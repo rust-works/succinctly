@@ -2518,10 +2518,9 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
 /// this dispatch drifting from it.
 ///
 /// "Ends" is structural, not a validity verdict: `{"a":1 xyz}` scans as one
-/// token because its braces match, and only validation rejects it. That
-/// distinction is what makes real jq's resync behaviour reproducible -- it
-/// never resyncs *into* a container that scanned but failed to validate, and
-/// this function is where "scanned" is decided.
+/// token because its braces match, and only validation rejects it. Keeping
+/// the two separate is what lets the `--seq` caller reject a whole record
+/// without ever reading a value out of the middle of a malformed one.
 fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
     match bytes[pos] {
         // Object or array - find matching close
@@ -3327,18 +3326,14 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
                 // the pre-#1723 path dropped it.
                 continue;
             };
-            // The record's own trimmed end for its last value, so a
-            // one-value record reports the identical line it always did;
-            // earlier values report their own end, which is what jq's
-            // per-value line reporting needs. Ranges index the untrimmed
-            // record, so `start` is the right base (an earlier pass mixed
-            // trimmed ranges with the untrimmed start and named the wrong
-            // line, and across files the wrong file).
-            let value_end = if (vs, ve) == ranges[ranges.len() - 1] {
-                end
-            } else {
-                start + ve
-            };
+            // Every value reports its own end. Handing the record's trimmed
+            // end to the *last* range was wrong once the pending-token rule
+            // could pop the real last token: the survivor then inherited a
+            // line past the value that was dropped (a review found
+            // `\x1e"a"\n\n\n2\x1e"z"\n` reporting line 3 where jq reports
+            // line 1). For a single-value record the two are identical
+            // anyway, since a value's end *is* the record's trimmed end.
+            let value_end = start + ve;
             results.push((v, value_end));
         }
         // Genuine parse failures are silently ignored per RFC 7464
@@ -3391,24 +3386,39 @@ fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
         if !seq_value_is_valid(&raw_segment[pos..end]) {
             return SeqRecordScan::dropped();
         }
-        // The delimiter check. A token may be followed by whitespace, or by
-        // nothing at all (the record's end); anything else means the record
-        // is not the clean sequence of values this function is willing to
-        // split, and a scanner's guess at where the boundary really lies is
-        // precisely what fabricated output.
-        if bytes.get(end).is_some_and(|b| !b.is_ascii_whitespace()) {
+        // The delimiter check, and it applies only to *pending* tokens.
+        //
+        // A string, object or array carries its own closing delimiter, so
+        // adjacency cannot mis-split it and jq reads `{"a":1}{"b":2}` and
+        // `"a""b"` as two values apiece -- requiring whitespace after those
+        // dropped records real jq reads fully (a review measured 332 such
+        // regressions). A number or literal has no closing delimiter: it is
+        // "pending" until something confirms it, which is exactly where a
+        // scanner and jq's lexer can disagree.
+        //
+        // What confirms one, oracle-verified: whitespace, or the start of a
+        // self-delimiting value (`1[1]` and `1"a"` are two values in jq).
+        // Anything else -- another digit, a letter, `-`, or structural
+        // punctuation -- means this record is not a clean sequence of
+        // values, and guessing at the boundary is what fabricated output.
+        if seq_token_is_pending(bytes, pos)
+            && bytes
+                .get(end)
+                .is_some_and(|b| !b.is_ascii_whitespace() && !matches!(b, b'"' | b'{' | b'['))
+        {
             return SeqRecordScan::dropped();
         }
         values.push((pos, end));
         pos = end;
     }
 
-    // Rule 3, and the only value-level drop that survives: a bare number
-    // ending the record with no whitespace after it is ambiguous to jq's
-    // incremental scanner, which cannot rule out more digits arriving.
-    // `\x1e1 2` is `1`; `\x1e1 2 ` (trailing space) is `1` and `2`.
+    // The only value-level drop that survives: a *pending* token (number or
+    // bare literal) ending the record with no whitespace after it is
+    // ambiguous to jq's incremental scanner, which cannot rule out more
+    // input arriving. `\x1e1 2` is `1`; `\x1e1 2 ` (trailing space) is `1`
+    // and `2`; `\x1etrue\x1e3` is `3` alone.
     let trailing_unresolved = match values.last() {
-        Some(&(vs, ve)) if !seq_number_is_terminated(bytes, vs, ve) => {
+        Some(&(vs, ve)) if !seq_pending_token_is_terminated(bytes, vs, ve) => {
             values.pop();
             true
         }
@@ -3444,14 +3454,27 @@ impl SeqRecordScan {
     }
 }
 
-/// Rule 3 above: a number token counts as complete only when whitespace
-/// follows it inside the record.
+/// Whether the token at `start..end` is *pending* -- a number or a bare
+/// `true`/`false`/`null`, neither of which carries a closing delimiter.
 ///
-/// Non-numbers self-terminate (`"`, `}`, `]`, the last letter of
-/// `true`/`false`/`null`) and are unaffected -- oracle-verified:
-/// `\x1e{"a":1},2\n` keeps the object, while `\x1e1,2\n` loses the `1`.
-fn seq_number_is_terminated(bytes: &[u8], start: usize, end: usize) -> bool {
-    if !matches!(bytes[start], b'-' | b'.' | b'0'..=b'9') {
+/// Strings, objects and arrays are self-delimiting and are never pending:
+/// `"`, `}` and `]` end them unambiguously.
+fn seq_token_is_pending(bytes: &[u8], start: usize) -> bool {
+    matches!(bytes[start], b'-' | b'.' | b'0'..=b'9' | b't' | b'f' | b'n')
+}
+
+/// Whether a *pending* token ending a record was confirmed by trailing
+/// whitespace.
+///
+/// jq's incremental scanner cannot rule out more input arriving for a token
+/// with no closing delimiter, so one that butts against the record boundary
+/// is abandoned. This covers literals as well as numbers -- oracle-verified
+/// at an RS boundary, where `\x1etrue\x1e3\n` and `\x1enull\x1e3\n` both
+/// yield only `3`, while `\x1e"a"\x1e3\n` and `\x1e[1]\x1e3\n` keep both.
+/// An earlier version checked numbers alone and left 92 shapes emitting a
+/// value jq drops.
+fn seq_pending_token_is_terminated(bytes: &[u8], start: usize, end: usize) -> bool {
+    if !seq_token_is_pending(bytes, start) {
         return true;
     }
     bytes.get(end).is_some_and(u8::is_ascii_whitespace)
@@ -3481,7 +3504,7 @@ fn seq_value_is_valid(value_text: &str) -> bool {
 ///
 /// Two shapes, both silently swallowed by real jq's own `--seq` reader:
 ///
-/// - **Genuinely malformed/truncated** -- [`seq_record_scan`] returns `None`
+/// - **Genuinely malformed/truncated** -- [`seq_record_scan`] yields no values
 ///   (an unterminated string/object, e.g.), matching
 ///   [`parse_json_seq_with_ends`]'s own silent-drop rule (RFC 7464's
 ///   recommended failure mode, #1243).
