@@ -3487,10 +3487,17 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// copies can't independently drift the way `nth`/`limit`'s once did (#1313,
 /// the reason [`classify_limit_n`]/[`classify_nth_n`] exist).
 ///
-/// Takes the already-extracted `f64` rather than an `OwnedValue`/`StandardJson`
-/// -- unlike `classify_limit_n`/`classify_nth_n`, both call sites already do
-/// their own (unchanged, out of scope here) type check on `$n` before this
-/// runs, so there is no non-numeric case for this function to classify.
+/// Takes an `OwnedValue` and matches `Int`/`NumberLiteral(Int)` directly,
+/// same as `classify_limit_n`/`classify_nth_n` -- not a pre-extracted `f64`
+/// (an earlier version of this function did that, and a #1879 review caught
+/// it: converting a document-sourced integer to `f64` *before* classifying
+/// silently rounds any magnitude past `f64`'s 53-bit mantissa, an exactness
+/// regression against the `f as usize`-truncation-was-already-correct
+/// conclusion below, and against this codebase's `NumberLiteral`/#387
+/// large-integer discipline generally). The `QueryResult::One` call site
+/// converts its `StandardJson::Number` to an `OwnedValue` via [`to_owned`]
+/// before calling this, rather than extracting `f64` itself, for the same
+/// reason.
 ///
 /// Real jq's own definition (`builtin.jq`, confirmed against jq's current
 /// source -- `skip/2` postdates the pinned 1.7.1 oracle, so a live repro
@@ -3516,11 +3523,22 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// `0.4 -> -0.6`, first emitting on item 1, i.e. skips 0 (`floor(0.4)`).
 /// #1846/#1849 both suspected this should ceiling like `limit`/`nth` instead
 /// -- it should not; adding a ceiling here would be a regression, not a fix.
-fn classify_skip_n(f: f64) -> Result<usize, EvalError> {
-    if f.is_nan() || f < 0.0 {
-        Err(EvalError::new("skip doesn't support negative count"))
-    } else {
-        Ok(f as usize)
+fn classify_skip_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
+    match n_owned {
+        OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
+            Ok(i as usize)
+        }
+        OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
+            Err(EvalError::new("skip doesn't support negative count"))
+        }
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+            if f.is_nan() || f < 0.0 {
+                Err(EvalError::new("skip doesn't support negative count"))
+            } else {
+                Ok(f as usize)
+            }
+        }
+        other => Err(EvalError::type_error("number", other.type_name())),
     }
 }
 
@@ -10673,9 +10691,8 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
-            if let StandardJson::Number(num) = v {
-                let f = num.as_f64().unwrap_or(0.0);
-                match classify_skip_n(f) {
+            if let StandardJson::Number(_) = v {
+                match classify_skip_n(to_owned(&v)) {
                     Ok(n) => n,
                     Err(e) => return QueryResult::Error(e),
                 }
@@ -10684,14 +10701,11 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         QueryResult::Owned(
-            ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
-        ) => {
-            let f = owned.as_f64().unwrap_or(0.0);
-            match classify_skip_n(f) {
-                Ok(n) => n,
-                Err(e) => return QueryResult::Error(e),
-            }
-        }
+            owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
+        ) => match classify_skip_n(owned) {
+            Ok(n) => n,
+            Err(e) => return QueryResult::Error(e),
+        },
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
@@ -57405,7 +57419,7 @@ mod tests {
 
     #[test]
     fn test_classify_skip_n_nan_errors_1846() {
-        assert!(classify_skip_n(f64::NAN).is_err());
+        assert!(classify_skip_n(OwnedValue::Float(f64::NAN)).is_err());
     }
 
     #[test]
@@ -57413,22 +57427,37 @@ mod tests {
         // See classify_skip_n's own doc comment for the hand-traced
         // derivation: skip's decrement-per-item generator floors, unlike
         // limit/nth's ceiling classify_limit_n/classify_nth_n use.
-        assert_eq!(classify_skip_n(1.5).unwrap(), 1);
-        assert_eq!(classify_skip_n(0.4).unwrap(), 0);
-        assert_eq!(classify_skip_n(2.5).unwrap(), 2);
-        assert_eq!(classify_skip_n(2.0).unwrap(), 2);
+        assert_eq!(classify_skip_n(OwnedValue::Float(1.5)).unwrap(), 1);
+        assert_eq!(classify_skip_n(OwnedValue::Float(0.4)).unwrap(), 0);
+        assert_eq!(classify_skip_n(OwnedValue::Float(2.5)).unwrap(), 2);
+        assert_eq!(classify_skip_n(OwnedValue::Float(2.0)).unwrap(), 2);
     }
 
     #[test]
     fn test_classify_skip_n_negative_errors_1846() {
-        assert!(classify_skip_n(-1.0).is_err());
-        assert!(classify_skip_n(-0.5).is_err());
+        assert!(classify_skip_n(OwnedValue::Float(-1.0)).is_err());
+        assert!(classify_skip_n(OwnedValue::Float(-0.5)).is_err());
+        assert!(classify_skip_n(OwnedValue::Int(-1)).is_err());
     }
 
     #[test]
     fn test_classify_skip_n_zero_is_zero_1846() {
-        assert_eq!(classify_skip_n(0.0).unwrap(), 0);
-        assert_eq!(classify_skip_n(-0.0).unwrap(), 0);
+        assert_eq!(classify_skip_n(OwnedValue::Float(0.0)).unwrap(), 0);
+        assert_eq!(classify_skip_n(OwnedValue::Float(-0.0)).unwrap(), 0);
+        assert_eq!(classify_skip_n(OwnedValue::Int(0)).unwrap(), 0);
+    }
+
+    /// #1879 review: an earlier version of `classify_skip_n` took a
+    /// pre-extracted `f64`, silently rounding a document-sourced integer
+    /// past `f64`'s 53-bit mantissa. Matching `OwnedValue::Int` directly
+    /// (like `classify_limit_n`/`classify_nth_n`) preserves the exact value.
+    #[test]
+    fn test_classify_skip_n_preserves_large_integer_precision_1879() {
+        let large = (1i64 << 53) + 3;
+        assert_eq!(
+            classify_skip_n(OwnedValue::Int(large)).unwrap(),
+            large as usize
+        );
     }
 
     #[test]

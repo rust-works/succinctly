@@ -15796,12 +15796,15 @@ fn test_skip_fractional_count_floors_not_ceils_1846() -> Result<()> {
 }
 
 /// Same fractional-floors-not-ceils check via the `QueryResult::One`
-/// (document-sourced number, `StandardJson::Number`) extraction branch, not
-/// just the `Owned` (computed-literal) branch the tests above reach --
-/// both arms had their own hand-inlined copy of the classification logic
-/// pre-#1846, so both need coverage independently (see
-/// `test_skip_number_literal_n_387`, which covers this branch's integer
-/// case but not its fractional one).
+/// (document-sourced number, `StandardJson::Number`) extraction branch,
+/// reached by a bare `.n` field access -- not the `Owned`
+/// (`NumberLiteral`/computed) branch the tests above reach via a literal or
+/// `getpath` (see `test_skip_number_literal_n_387`'s own comment, which
+/// notes `getpath` is specifically required to force that *other* arm; a
+/// bare `.n` here is what reaches this one instead). Both arms had their
+/// own hand-inlined copy of the classification logic pre-#1846 -- and, pre-
+/// #1879 review, this `One` arm had no coverage at all, integer or
+/// fractional.
 #[test]
 fn test_skip_fractional_count_from_document_floors_1846() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
@@ -15810,6 +15813,22 @@ fn test_skip_fractional_count_from_document_floors_1846() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "[2,3,4]\n");
+    Ok(())
+}
+
+/// The `QueryResult::One` arm's plain-integer case, via the same bare `.n`
+/// field access as the test above -- closes the gap #1879 review found:
+/// `test_skip_number_literal_n_387` looked like it covered this (same
+/// `{"n":..., "arr":[...]}` shape) but actually forces the `Owned` arm via
+/// `getpath`, leaving this arm's integer path with no test until now.
+#[test]
+fn test_skip_integer_count_from_document_1879() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[skip(.n; .arr[])]"],
+        Some(r#"{"n": 2, "arr": [10,20,30,40,50]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[30,40,50]\n");
     Ok(())
 }
 
