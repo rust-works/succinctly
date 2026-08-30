@@ -40730,6 +40730,118 @@ mod tests {
         );
     }
 
+    /// #1902: the `QueryResult::One` (single, not multi-output) arms of
+    /// each of the three fixed sites, plus the `Many` partial-prefix arms
+    /// -- the sweep test above only ever hit the `Many`-with-empty-prefix
+    /// shape, since the corrupted value was always first in a 2-element
+    /// stream.
+    #[test]
+    fn test_eval_as_reduce_foreach_single_and_partial_prefix_shapes_1902() {
+        // eval_as: bound-value conversion, `QueryResult::One` arm.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a as $v | $v",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // eval_as: body output, `QueryResult::Many` arm with a non-empty
+        // prefix -- `.b` (valid) is pushed to `all_results` before `.a`
+        // (corrupted) fails within the same body's multi-output.
+        query!(
+            b"{\"a\": \"\xff\xfe\", \"b\": \"ok\"}",
+            "1 as $v | (.b, .a)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+                assert!(e.is_decode_failure());
+            }
+        );
+        // eval_reduce: `input`, `QueryResult::One` arm (a single corrupted
+        // value, not iterated via `.[]`).
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "reduce .a as $x (0; . + 1)",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // eval_reduce: INIT, `QueryResult::One` arm.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "reduce (1,2) as $x (.a; . + [$x])",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // eval_reduce: INIT, `QueryResult::Many` arm with a non-empty
+        // prefix -- `.arr[]` (`Expr::Iterate`) reaches `eval_reduce`'s own
+        // `materialize_cursor()` as one un-promoted `Many` of borrowed
+        // cursors (unlike a comma of separate sub-expressions, which
+        // `eval_comma`'s own #1832 promotion would already have converted
+        // -- and already caught the decode failure on -- before it ever
+        // reaches here). INIT's first element (`0`) succeeds before its
+        // second (corrupted) fails; the fork over the successfully
+        // converted `0` still completes and contributes its own real
+        // output (`1`) before the decode failure surfaces as
+        // `finish_fork`'s trailing control.
+        query!(
+            b"{\"arr\": [0, \"\xff\xfe\"]}",
+            "reduce 1 as $x (.arr[]; . + $x)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.is_decode_failure());
+            }
+        );
+        // eval_reduce: `input`, `QueryResult::One` arm with a *valid*
+        // single value (the success half of the `One` arm's match).
+        query!(
+            br#"{"a": 5}"#,
+            "reduce .a as $x (0; . + $x)",
+            QueryResult::Owned(OwnedValue::Int(n)) => assert_eq!(n, 5)
+        );
+        // eval_as: body output, `QueryResult::Many` arm's success case --
+        // `.arr[]` (valid, multi-output) reaches this arm directly, the
+        // same un-promoted-cursor shape as the `eval_reduce` INIT case
+        // above.
+        query!(
+            br#"{"arr": [1, 2]}"#,
+            "0 as $v | .arr[]",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        // eval_foreach: `input`, `QueryResult::One` arm.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[foreach .a as $x (0; . + 1)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // eval_foreach: INIT, `QueryResult::One` arm.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[foreach (1,2) as $x (.a; . + [$x])]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // eval_foreach: INIT, `QueryResult::Many` arm with a non-empty
+        // prefix -- same `.arr[]` un-promoted-cursor shape as the
+        // `eval_reduce` INIT case above.
+        query!(
+            b"{\"arr\": [0, \"\xff\xfe\"]}",
+            "[foreach 1 as $x (.arr[]; . + $x)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+    }
+
+    /// #1902: `finish_fork`'s own fix -- an *ordinary* trailing error is
+    /// still suppressed by an ambient `optional`, unlike a decode failure.
+    /// `reduce`/`foreach` don't have direct `EXPR?` surface on their own
+    /// input/INIT sub-expressions, so this drives `optional` in through the
+    /// `?`-suffixed builtin argument path (`limit`'s generator argument),
+    /// which routes through `eval_single(..., optional)` the same way
+    /// `eval_reduce`/`eval_foreach`'s own input/INIT calls do.
+    #[test]
+    fn test_finish_fork_still_suppresses_ordinary_error_under_optional_1902() {
+        query!(
+            br"0",
+            "(reduce (1, error(\"boom\")) as $x (0; . + $x))?",
+            QueryResult::None => {}
+        );
+    }
+
     /// #1755: the "misc bucket" slice -- `INDEX`/`INDEX(stream;...)`,
     /// `getpath`, `any`/`all` (bare and `(cond)`/`(gen;cond)` forms),
     /// `eval_pipe`'s path-context entry, `combinations`/`combinations(n)`,
