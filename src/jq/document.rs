@@ -1276,15 +1276,25 @@ impl KeyHashes {
         }
     }
 
-    /// A table sized for `keys` insertions without a rehash: capacity is
-    /// the next power of two at or above `2 * keys`, keeping the load
-    /// factor at or below one half.
+    /// A table sized for `keys` insertions without a rehash: capacity is the
+    /// next power of two at or above `4 * keys / 3`, matching
+    /// [`insert`](Self::insert)'s own three-quarter growth threshold.
+    ///
+    /// Kept in step with that threshold deliberately (#1588). It used to
+    /// round up from `2 * keys` for the old one-half factor, and leaving it
+    /// there would have made this constructor allocate a table one power of
+    /// two larger than the growth path reaches for the same key count --
+    /// 2^21 rather than 2^20 slots at 629,881 keys. That matters because
+    /// this is exactly the constructor #1588's "give the table a capacity
+    /// hint" direction points at: wiring it up while it disagreed with
+    /// `insert` would have silently restored the memory this change removes.
     pub fn with_capacity(keys: usize) -> Self {
         if keys == 0 {
             return Self::new();
         }
         let slots = keys
-            .saturating_mul(2)
+            .saturating_mul(4)
+            .div_ceil(3)
             .next_power_of_two()
             .max(Self::MIN_SLOTS);
         Self {
