@@ -26163,3 +26163,93 @@ fn test_streamed_lazy_seq_materialization_control_1653() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1723: one RFC 7464 record can hold more than one JSON value, and real jq
+/// emits every one of them.
+///
+/// `succinctly jq --seq` used to drop such a record **in full**, exit 0 --
+/// silent data loss on a record real jq reads fine, not the missing-warning
+/// gap #1723 was filed as. The cause was `seq_record_parses` validating the
+/// whole record as a single value, so `1 2` looked malformed.
+///
+/// Every expectation captured from jq 1.7.1.
+#[test]
+fn test_seq_record_with_multiple_values_emits_all_1723() -> Result<()> {
+    for (input, expected) in [
+        // Mixed types, whitespace-separated.
+        ("\x1e1 \"x\" [2]\n", "1\n\"x\"\n[2]\n"),
+        // A newline is just whitespace inside a record -- not a boundary.
+        ("\x1e1\n2\n", "1\n2\n"),
+        ("\x1enull null\n", "null\nnull\n"),
+        ("\x1e\"a\" \"b\"\n", "\"a\"\n\"b\"\n"),
+        ("\x1etrue false null\n", "true\nfalse\nnull\n"),
+        ("\x1e[1] 2 {\"a\":3}\n", "[1]\n2\n{\"a\":3}\n"),
+        ("\x1e{\"a\":1} {\"b\":2}\n", "{\"a\":1}\n{\"b\":2}\n"),
+        ("\x1e{} []\n", "{}\n[]\n"),
+        ("\x1e-1 -2\n", "-1\n-2\n"),
+        ("\x1e1  2\n", "1\n2\n"),
+        // Multi-value records interleave with ordinary single-value ones.
+        ("\x1e1 2\n\x1e3\n", "1\n2\n3\n"),
+        // The leading-zero retry (#1243) still applies, in either position.
+        ("\x1e007e5 1\n", "7E+5\n1\n"),
+        ("\x1e1 007e5\n", "1\n7E+5\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?} -- stderr={stderr}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1723: adding multi-value support must not resurrect a value real jq
+/// abandons.
+///
+/// Two rules would have been broken by a naive "emit every value in the
+/// record" change, and each is pinned here because the differential sweep
+/// caught them as regressions in the first drafts:
+///
+/// 1. A record's *last* value is dropped when it is a bare number with no
+///    terminating byte after it -- jq's incremental number scanner cannot
+///    rule out more digits arriving. That rule was already encoded for the
+///    stream's final record; it is really per-record, so `\x1e1 2\x1e3`
+///    keeps `1` and `3` but drops the `2`, while a single newline after the
+///    `2` disambiguates it and all three survive.
+/// 2. Input with **no RS byte anywhere** is abandoned wholesale (#1525),
+///    however well-formed its content is -- relaxing the trailing-record
+///    skip for multi-value records started emitting it.
+#[test]
+fn test_seq_multivalue_still_drops_what_jq_abandons_1723() -> Result<()> {
+    for (input, expected, why) in [
+        (
+            "\x1e1 2\x1e3\n",
+            "1\n3\n",
+            "bare number before RS is ambiguous",
+        ),
+        (
+            "\x1e1 2\n\x1e3\n",
+            "1\n2\n3\n",
+            "a newline disambiguates it",
+        ),
+        ("\x1e1 2", "1\n", "bare number at EOF is ambiguous"),
+        ("\x1e1 2 ", "1\n2\n", "trailing space disambiguates it"),
+        (
+            "1 2\n",
+            "",
+            "no RS byte anywhere: whole input abandoned (#1525)",
+        ),
+        (
+            "\x1e1\n\x1e2",
+            "1\n",
+            "single-value trailing bare number, unchanged",
+        ),
+        ("\x1e1\n", "1\n", "plain single-value record, unchanged"),
+        ("\x1e{\"a\":1\n", "", "malformed record still dropped whole"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}

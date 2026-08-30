@@ -1509,9 +1509,24 @@ $ printf '\x1exyz\n'           | jq --seq -c '.'
 jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)
 ```
 
-`succinctly jq --seq` emits nothing on stderr for any of these — output-wise it's already
-correct (RFC 7464's own recommended failure mode, #1093/#1267/#1243: the malformed record is
-dropped either way), the gap is purely the missing diagnostic. Matching these needs enough
+`succinctly jq --seq` emits nothing on stderr for any of these. Output-wise a *wholly*
+malformed record is already correct (RFC 7464's own recommended failure mode,
+#1093/#1267/#1243: it is dropped either way), but a record that is well-formed up to a
+malformed suffix is not: real jq emits the values it managed to read first, and succinctly
+drops the record entire.
+
+```
+$ printf '\x1e1 {invalid\n' | jq --seq -c '.'          # jq:         warns, then prints 1
+$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'  # succinctly: prints nothing
+```
+
+That prefix-emission gap is the same problem as the missing diagnostic, not a separate one:
+both need to know *where* in the record jq's parser gave up. (jq's own answer here is not
+always "everything before the error" either — `\x1e1,2\n` prints `2`, not `1`.)
+
+A record holding several *well-formed* values is no longer affected: #1723 fixed
+`succinctly jq --seq` dropping those in full (`\x1e1 "x" [2]\n` is three outputs, as in real
+jq), which was silent data loss rather than a diagnostic gap. Matching these needs enough
 of jq's own incremental-parser failure classification to know which of its internal states a
 segment would have failed in, not just whether it parses — deliberately deferred, tracked in
 [#1723](https://github.com/rust-works/succinctly/issues/1723).
