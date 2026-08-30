@@ -1532,6 +1532,57 @@ underlying exit-code divergence properly needs `get_inputs` to be able to raise 
 fatal `EvalError` from this specific condition rather than only ever warning or returning
 values — not attempted here.
 
+## Real-time stdout/stderr interleaving: every route but the M2 lazy path
+
+Real jq is a lazy generator, so a filter that both writes to stdout and triggers a stderr
+side effect (`debug`, `stderr`, `halt_error`) or raises mid-stream interleaves the two as it
+goes. `succinctly jq` evaluated a whole input's filter into a `Vec` before writing *any* of
+it, so every stderr write had already happened by the time the first stdout write ran —
+which no amount of buffering could fix, `--unbuffered`'s per-write `flush()` included
+([#1653](https://github.com/rust-works/succinctly/issues/1653)).
+
+Fixed for the `-n`, `--slurp`, and `input`/`inputs`-bridge routes, which now write each
+output as the evaluator produces it (`evaluate_input_streaming`,
+[src/bin/succinctly/jq_runner.rs](../../../src/bin/succinctly/jq_runner.rs), over
+`eval_each_with_cursor`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
+
+```
+$ jq            --unbuffered -cn '1, debug, 2'   2>&1     # 1 / ["DEBUG:",null] / null / 2
+$ succinctly jq --unbuffered -cn '1, debug, 2'   2>&1     # same
+```
+
+**Still batched: a document read from a file or stdin** — the M2 lazy path:
+
+```
+$ echo '[1,2]' | jq            --unbuffered -c '.[]|debug'   2>&1
+["DEBUG:",1]
+1
+["DEBUG:",2]
+2
+$ echo '[1,2]' | succinctly jq --unbuffered -c '.[]|debug'   2>&1
+["DEBUG:",1]
+["DEBUG:",2]
+1
+2
+```
+
+Not an oversight, and not merely unfinished: streaming that path means routing the CLI's
+*default* route through the demand-driven evaluator, whose `each_lazy_keys_iterate_sink`
+deliberately skips the malformed-key check (#1194) that
+[#1629](https://github.com/rust-works/succinctly/issues/1629) added so that bare
+`keys_unsorted[]` *would* raise. [#1770](https://github.com/rust-works/succinctly/issues/1770)
+closed that gap as an accepted trade for early-exit consumers like `first(...)` — see
+"A truncating consumer of `keys_unsorted[]` skips a malformed member it never needed" above
+— on the reasoning that detecting it requires the full walk such a consumer exists to avoid.
+Making it the default route would silently generalise that trade to every query. Tried and
+reverted while fixing #1653: it regressed six tests across #1642/#1629/#1770's
+undecodable-key handling, including `.,.` on a document with colliding undecodable keys
+emitting them twice at exit 0 instead of raising.
+
+`test_streamed_ordering_not_yet_reached_on_m2_path_1653`
+([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)) pins the current batched output, so
+this stops being silent the moment it changes.
+
 ## Deliberate divergences (ADR-0018 rule 4)
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
