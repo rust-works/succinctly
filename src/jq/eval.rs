@@ -17323,18 +17323,15 @@ fn set_path<S: EvalSemantics>(
                             },
                             // `set_path` (`=`) has no `|= empty` concept --
                             // its RHS is always a real, already-materialized
-                            // value -- so this adapts its `Result<(), E>`
-                            // into `through_slice`'s `Result<bool, E>` by
-                            // always reporting `true` (#1877/#1894).
+                            // value (#1877/#1894, see `always_wrote`).
                             |sub| {
-                                set_path::<S>(
+                                always_wrote(set_path::<S>(
                                     sub,
                                     &split.tail,
                                     new_value.clone(),
                                     scalar_noop,
                                     container_noop,
-                                )
-                                .map(|()| true)
+                                ))
                             },
                         )
                         .map(|_| ())
@@ -17363,8 +17360,13 @@ fn set_path<S: EvalSemantics>(
                         // See the probe closure above for why this always
                         // reports `true`.
                         |sub| {
-                            set_path::<S>(sub, &split.tail, new_value, scalar_noop, container_noop)
-                                .map(|()| true)
+                            always_wrote(set_path::<S>(
+                                sub,
+                                &split.tail,
+                                new_value,
+                                scalar_noop,
+                                container_noop,
+                            ))
                         },
                     )
                     .map(|_| ()),
@@ -17601,6 +17603,14 @@ struct SliceEditFlags {
     terminal_write: bool,
 }
 
+/// Adapts a caller with no `|= empty` concept (`set_path`'s three
+/// `through_slice` call sites, `delete_at_path`'s one) into `through_slice`'s
+/// `edit` signature by always reporting `true` -- see `through_slice`'s own
+/// doc comment for what the `bool` means and why these callers are exempt.
+fn always_wrote<E>(result: Result<(), E>) -> Result<bool, E> {
+    result.map(|()| true)
+}
+
 /// `edit`'s `bool` payload (#1877/#1894): whether a real value reached this
 /// slot, as opposed to `|= empty` running out with nothing to write. `true`
 /// covers both an ordinary value and an already-completed nested delete
@@ -17609,8 +17619,9 @@ struct SliceEditFlags {
 /// begin with," which only the terminal `Array`/`String`/`Null` arms below
 /// ever act on -- every other caller of `through_slice` (`set_path`'s three
 /// call sites, `delete_at_path`'s one) has no `|= empty` concept at all and
-/// adapts its own `Result<(), E>` edit into this shape by always reporting
-/// `true`.
+/// adapts its own `Result<(), E>` edit into this shape via [`always_wrote`],
+/// discarding `through_slice`'s own returned `bool` the same way via a
+/// plain `.map(|_| ())` at the call site.
 fn through_slice<E: From<EvalError>>(
     root: &mut OwnedValue,
     start: Option<i64>,
@@ -17679,6 +17690,13 @@ fn through_slice<E: From<EvalError>>(
                 return Err(EvalError::slice_assign_non_array().into());
             };
             arr.splice(range, items);
+            // Always `true` past this point, even when `!terminal_write`
+            // and `wrote` was `false`: `root` here is already a real Array
+            // (this arm only matches an existing one, never a freshly
+            // autovivified `Null`), so the caller that would need to undo
+            // an over-eager autovivification (`update_path`'s Field/Index
+            // "stranded" check, gated on `matches!(*current, Null)`) can
+            // never fire for this slot regardless of what's reported here.
             Ok(true)
         }
         // jq reads a string slice but will not write one back, whatever the
@@ -17723,6 +17741,13 @@ fn through_slice<E: From<EvalError>>(
                     Err(EvalError::cannot_delete_fields_from("string").into())
                 }
             } else {
+                // Always `true`, regardless of `wrote`: reaching this arm
+                // at all means `root` was already a String on entry (the
+                // `Null` arm below only ever promotes `Null` to `Array`,
+                // never to `String`), so the ancestor slot that could have
+                // been freshly autovivified is necessarily something else
+                // -- the same "can't be the stranded slot" reasoning as
+                // the `Array` arm's own trailing `Ok(true)` above.
                 Ok(true)
             }
         }
@@ -17749,6 +17774,11 @@ fn through_slice<E: From<EvalError>>(
         _ if scalar_noop && is_yq_slice_empty_container_scalar(root) => {
             let mut throwaway = OwnedValue::Array(Vec::new());
             edit(&mut throwaway)?;
+            // Always `true`: this is yq's own unconditional slice no-op
+            // (unrelated to #1877/#1894's jq-only `|= empty` mechanism --
+            // `container_noop`/`undo_stranded` already gate the new logic
+            // out of yq mode entirely, so this arm's answer is never
+            // actually consulted).
             Ok(true)
         }
         // A `Null` target that reaches here in *jq* mode still needs a
@@ -17854,6 +17884,9 @@ fn through_slice<E: From<EvalError>>(
             *root = OwnedValue::Array(items);
             Ok(true)
         }
+        // Always `true`: a target this arm applies to (a scalar not
+        // covered by any arm above) was never `Null` to begin with, so
+        // it's never the slot an ancestor's stranding check is watching.
         _ if optional => Ok(true),
         other => Err(EvalError::cannot_index_with_type(owned_type_name(other), "object").into()),
     }
@@ -18482,6 +18515,18 @@ fn update_path<S: EvalSemantics>(
                                 // `Iterate` is involved) -- both answer the
                                 // same question, "was anything really
                                 // written," just via different evidence.
+                                //
+                                // Neither clause subsumes the other: this
+                                // function's own `Iterate` arms (both the
+                                // terminal one and the mid-chain copy just
+                                // below) always report `Ok(true)` for an
+                                // `Array`/`Object` root regardless of how
+                                // many elements they actually touch,
+                                // including zero -- so an iterate over a
+                                // freshly-created empty container never
+                                // registers as `Ok(false)`, and
+                                // `reaches_iterate` stays the only signal
+                                // that catches it.
                                 let stranded = created
                                     && undo_stranded
                                     && (reaches_iterate(&rest) || matches!(result, Ok(false)))
@@ -31170,12 +31215,9 @@ fn delete_at_path(
                                 terminal_write: yq_mode,
                             },
                             // `del()` has its own, already-correct deletion
-                            // mechanism with no `|= empty` concept -- adapt
-                            // its `Result<(), E>` into `through_slice`'s
-                            // `Result<bool, E>` by always reporting `true`
-                            // (#1877/#1894, mirroring `set_path`'s own
-                            // adapters).
-                            |sub| delete_at_path(sub, &rest, optional, yq_mode).map(|()| true),
+                            // mechanism with no `|= empty` concept (#1877/
+                            // #1894, see `always_wrote`).
+                            |sub| always_wrote(delete_at_path(sub, &rest, optional, yq_mode)),
                         )
                         .map(|_| ())
                     }
