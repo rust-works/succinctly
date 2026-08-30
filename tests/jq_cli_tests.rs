@@ -12753,11 +12753,14 @@ fn test_repeat_value_budget_bounds_total_output_independent_of_fan_out() -> Resu
     // budget, a single highly-fanning-out round (`range(20001)` produces
     // 20001 values in one round) could balloon `outputs` far past any
     // reasonable size before the per-round `MAX_ITERATIONS` cap ever had a
-    // chance to matter. `repeat` is a succinctly extension (no upstream jq
-    // builtin to compare against), so this pins succinctly's own contract:
-    // the budget (`REDUCE_FOREACH_MAX_STEPS`, shared with `reduce`/
-    // `foreach`) cuts the stream at exactly 10000 values with a clear
-    // error, not an unbounded allocation.
+    // chance to matter. `repeat` genuinely is a real jq builtin (confirmed
+    // live against jq 1.7.1, #1906 -- an earlier version of this comment
+    // wrongly called it a succinctly extension with no upstream builtin to
+    // compare against), but this specific budget-exceeded contract at this
+    // exact threshold is succinctly's own choice, not something to compare
+    // against jq for: the budget (`REDUCE_FOREACH_MAX_STEPS`, shared with
+    // `reduce`/`foreach`) cuts the stream at exactly 10000 values with a
+    // clear error, not an unbounded allocation.
     let (stdout, stderr, code) = run_jq_full(&["-c", "repeat(range(20001))"], Some("null"))?;
     assert_eq!(code, 5, "stderr: {stderr:?}");
     assert_eq!(stdout.lines().count(), 10000, "stdout: {stdout:?}");
@@ -12766,6 +12769,66 @@ fn test_repeat_value_budget_bounds_total_output_independent_of_fan_out() -> Resu
         stderr.contains("maximum iterations exceeded"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #1906: `repeat(f)` inside `path(...)` was treated as an untracked value
+/// even when `f` was itself perfectly path-trackable (e.g. `.`), raising
+/// "Invalid path expression" where real jq tracks through it correctly.
+/// Every case here confirmed live against jq 1.7.1.
+#[test]
+fn test_path_repeat_tracks_through_trackable_body_1906() -> Result<()> {
+    // The issue's own repro.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(limit(3; repeat(.)))"], Some("{\"a\":1}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n[]\n[]\n");
+
+    // `repeat(f)` re-resolves `f` against the *original* value every round,
+    // never the previous round's own result -- unlike `recurse(f)`, which
+    // chains and deepens. Confirmed live: `recurse(.a)` on the same input
+    // gives the progressively deepening `[]`, `["a"]`, `["a","a"]`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "path(limit(3; repeat(.a)))"],
+        Some("{\"a\":{\"a\":2}}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n[\"a\"]\n[\"a\"]\n");
+
+    // A multi-output body fans out every round, exactly like `eval_repeat`'s
+    // own identical value-mode semantics.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(limit(5; repeat(.[])))"], Some("[1,2]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[0]\n[1]\n[0]\n[1]\n[0]\n");
+
+    // A non-path-shaped body still raises immediately -- unaffected by
+    // this fix, which only closes the false-negative for a genuinely
+    // trackable body.
+    let (_, stderr, code) = run_jq_full(&["-c", "path(limit(3; repeat(1)))"], Some("null"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "stderr: {stderr}"
+    );
+
+    // A body that errors on its first cycle still raises that error,
+    // rather than retrying further rounds.
+    let (_, stderr, code) = run_jq_full(&["-c", "path(limit(3; repeat(.+1)))"], Some("0"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "stderr: {stderr}"
+    );
+
+    // `limit(3; repeat(empty))` hangs forever against real jq 1.7.1 itself
+    // (`repeat`'s own recursive definition has no base case at all) --
+    // succinctly's value-mode `repeat` already deliberately diverges from
+    // that hang via a round-count backstop (`eval_repeat`'s own
+    // `MAX_ITERATIONS`), and this fix keeps path-mode consistent with it
+    // rather than reintroducing the hang only here.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(limit(3; repeat(empty)))"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
     Ok(())
 }
 

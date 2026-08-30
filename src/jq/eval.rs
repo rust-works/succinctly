@@ -20904,7 +20904,70 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     if trackable && matches!(unwrap_paren(expr), Expr::Iterate) {
         return resolve_iterate_bounded::<S>(value, n);
     }
+    // #1906: `repeat(f)` has no natural termination at all (unlike `.[]`
+    // above, whose unbounded form is merely slow, not infinite) -- see
+    // `resolve_repeat_bounded`'s own doc comment. This has to intercept
+    // before the generic `resolve_node` call below, not truncate its
+    // result afterward the way `take_path_branches` does for every other
+    // shape: `resolve_node` would never return in the first place.
+    if let Expr::Repeat(f) = unwrap_paren(expr) {
+        return resolve_repeat_bounded::<S>(f, value, trackable, snapshot, n);
+    }
     take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n)
+}
+
+/// `repeat(f)`'s own path-branch construction (#1906), bounded to at most
+/// `n` branches -- mirroring [`resolve_iterate_bounded`]'s #1850 precedent
+/// in shape, but for a correctness reason rather than a performance one:
+/// `repeat(f)` has no base case at all (real jq's own `def repeat(f): f,
+/// repeat(f);`, unconditional on how many outputs `f` produced), so an `f`
+/// that never errors and never produces a value on some round loops
+/// forever -- confirmed live, `limit(3; repeat(empty))` hangs against
+/// pinned jq 1.7.1 too. `resolve_node`'s other arms all return a fully
+/// materialized `Vec<PathBranch>` for `take_path_branches` to truncate
+/// afterward, which cannot work here: the call would simply never return.
+///
+/// Each cycle re-resolves `f` against the *same* original `value`, never
+/// the previous cycle's own result -- `repeat` has no leading `.,` the way
+/// `recurse`'s `., (f | r)` does, and threads no state between rounds at
+/// all. Confirmed live against jq 1.7.1: `{"a":{"a":2}} | path(limit(2;
+/// repeat(.a)))` is `["a"]`, `["a"]` -- the identical single-level path
+/// twice, not the progressively deepening `["a"]`, `["a","a"]` `recurse(.a)`
+/// gives for the same input -- matching `eval_repeat`'s own identical
+/// value-only semantics (its doc comment: "evaluates `expr` with the
+/// original input each time").
+///
+/// `MAX_ITERATIONS` mirrors `eval_repeat`'s own identical backstop
+/// (`src/jq/eval.rs`) against exactly the same unbounded-empty-round
+/// case -- a deliberate divergence from real jq's own hang, not new to
+/// this fix: `eval_repeat`'s value-mode sibling already terminates
+/// `limit(3; repeat(empty))` with no output instead of hanging, and this
+/// keeps path-mode consistent with it rather than reintroducing the hang
+/// only here.
+fn resolve_repeat_bounded<'a, S: EvalSemantics>(
+    f: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    n: usize,
+) -> PathResolveResult<'a> {
+    const MAX_ITERATIONS: usize = 1000;
+    let mut branches = Vec::new();
+    for _ in 0..MAX_ITERATIONS {
+        if branches.len() >= n {
+            break;
+        }
+        match resolve_node::<S>(f, value, trackable, snapshot) {
+            Ok(mut b) => branches.append(&mut b),
+            Err((mut b, e)) => {
+                branches.append(&mut b);
+                branches.truncate(n);
+                return Err((branches, e));
+            }
+        }
+    }
+    branches.truncate(n);
+    Ok(branches)
 }
 
 /// `.[]`'s own path-branch construction (#1850), bounded to at most `n`
