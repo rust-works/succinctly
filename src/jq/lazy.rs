@@ -718,6 +718,9 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
         };
         keys.push(OwnedValue::String(s.into_owned()));
     }
+    // Missing `|| cursors.delimiter_fault()` here (unlike `eval_generic.rs`'s
+    // `distinct_key_cursors_checked`/`keys_are_well_formed`) is a
+    // pre-existing, tracked gap (#1956), not addressed in this pass.
     if cursors.ended_unpaired() {
         return Err(fields.malformed_member_error());
     }
