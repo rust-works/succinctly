@@ -392,7 +392,7 @@ otherwise-verified fix (which is strictly more correct than what it replaced: it
 real regression at `-I=4` introduced mid-fix and two cases pre-#1485 `main` never got right
 at all, `-I=5`/`-I=6`).
 
-### `input`, `inputs`, `input_line_number` — parse-time gated behind `--jq-extensions`, still not functional
+### `input`, `inputs`, `input_line_number` — resolved, rejected unconditionally like real yq
 
 Real yq has no such builtins at any arity — its lexer rejects the identifiers exactly as it
 rejects a name that does not exist
@@ -404,39 +404,43 @@ $ printf 'a: 1\n' | yq 'inputs'      # Error: 1:1: lexer: invalid input text "in
 $ printf 'a: 1\n' | yq 'no_such_fn'  # Error: 1:1: lexer: invalid input text "no_such_fn"
 ```
 
-**By default, succinctly now matches this unconditionally** — #1507 gated all three behind
-`--jq-extensions` in the parser, the same treatment as the ~65 other jq-only builtins already
-gated that way, closing the one divergence this section used to record (a call site that was
-never reached, e.g. `if false then input else . end`, used to be silently accepted rather
-than rejected — pinned by `test_yq_unreached_input_builtin_now_rejected_1507`,
-[tests/yq_cli_tests.rs](../../../tests/yq_cli_tests.rs)):
+succinctly now matches this unconditionally, in the parser (`reject_in_yq_mode`,
+[src/jq/parser.rs](../../../src/jq/parser.rs)) rather than at dispatch
+(`input_builtins_unsupported_in_yq_mode`, [src/jq/eval.rs](../../../src/jq/eval.rs), added by
+#723):
 
 ```bash
 $ printf 'a: 1\n' | succinctly yq 'input'
-Error: parse error: parse error at position 0: "input" is not part of yq's syntax; pass --jq-extensions to enable succinctly's jq-compatible builtin surface
+Error: parse error: parse error at position 0: input is not supported in yq mode
 ```
 
-**Unlike every other name in that gated class, passing `--jq-extensions` does not make these
-three work.** They still error, now from `input_builtins_unsupported_in_yq_mode`
-([src/jq/eval.rs](../../../src/jq/eval.rs)) at dispatch:
+This closes the one divergence this section used to record: dispatch only fires for a call
+site that's actually *reached*, so `if false then input else . end` used to be silently
+accepted instead of rejected — pinned by
+`test_yq_unreached_input_builtin_now_rejected_1507`
+([tests/yq_cli_tests.rs](../../../tests/yq_cli_tests.rs)).
 
-```bash
-$ printf 'a: 1\n' | succinctly yq --jq-extensions 'input'
-Error: input is not supported in yq mode
-```
-
-This isn't a divergence to fix — there's no oracle to match, since real yq has no
-`--jq-extensions` equivalent to compare against at all. It's a deliberate two-layer gate: the
-parser change only lifts the *syntax* restriction; the *architectural* one underneath is real
-and unaddressed. yq mode's document loop is cursor-native (`YamlValue::Sequence(docs)` walked
-by `uncons_cursor`, [src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs))
+**Deliberately *not* routed through the `--jq-extensions` gate** the ~65 other jq-only
+builtins use, even though real yq lacks all of them the same way. That flag's contract
+elsewhere is "pass this and the builtin becomes usable" — but no flag value makes these three
+usable, since yq mode's document loop is cursor-native (`YamlValue::Sequence(docs)` walked by
+`uncons_cursor`, [src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs))
 precisely so duplicate mapping keys (#1398) and ADR-0017's comment/anchor side-trees survive;
 jq's queue is `Vec<(OwnedValue, u32, u32)>`. Reusing jq's queue would push YAML documents
 through `OwnedValue` and silently lose all three, so real support needs a second,
-cursor-native queue — tracked as its own follow-up, not attempted here. Deleting the dispatch
-check instead would reopen the exact bug it was added to fix (#723), just reachable via
-`--jq-extensions` instead of unconditionally: `input` reporting a spurious "break" on every
-document, `inputs` silently producing no output at all.
+cursor-native queue — tracked as its own follow-up, not attempted here (#1507's own "Option
+A"). An earlier version of this fix *did* route them through `--jq-extensions`, and that
+reopened the exact divergence above one layer down: the flag let the keyword parse, so the
+dispatch-time check's reachability-dependence came right back for the unreached-branch case,
+just gated behind an opt-in flag instead of the unconditional default. Rejecting in the
+parser regardless of the flag closes it for good, and matches real yq's own behavior more
+precisely besides -- there is no `--jq-extensions`-shaped escape hatch in real yq either.
+
+`input_builtins_unsupported_in_yq_mode` stays in `eval.rs` even though the parser now catches
+every CLI-reachable case: `Expr`, `Builtin`, `eval`, and `YqSemantics` are public API
+(`succinctly::jq`), so a library consumer can construct `Expr::Builtin(Builtin::Input)`
+directly and evaluate it with `YqSemantics`, bypassing the parser (and any CLI flag) entirely
+— deleting the check would reopen #723's bug for that surface specifically.
 
 ### 3-argument `sub(re; s; flags)` — resolved, real yq ignores everything past the pattern
 
