@@ -10896,6 +10896,81 @@ fn test_resolve_limit_path_context_rejects_non_numeric_n() -> Result<()> {
     Ok(())
 }
 
+/// #1850: `path(limit(n; .[]))` on a bare `.[]` now resolves via
+/// `resolve_iterate_bounded`'s `.take(n)`-bounded iterator instead of
+/// `resolve_node` + `take_path_branches`'s eager-materialize-then-truncate
+/// pattern. Output must stay byte-identical for `n` under, at, and over the
+/// array's length -- the bound only changes how much work is done, never
+/// which branches are produced. Oracle-verified against jq 1.7.1.
+#[test]
+fn test_path_limit_bare_iterate_array_bounded_1850() -> Result<()> {
+    let input = r"[10,20,30,40,50]";
+    for (n, want) in [
+        ("3", "[0]\n[1]\n[2]"),
+        ("5", "[0]\n[1]\n[2]\n[3]\n[4]"),
+        ("100", "[0]\n[1]\n[2]\n[3]\n[4]"),
+        ("0", ""),
+    ] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", &format!("path(limit({n}; .[]))")], Some(input))?;
+        assert_eq!(code, 0, "n={n} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "n={n}");
+    }
+    Ok(())
+}
+
+/// #1850 companion: the same bounded fast path for an object, matching
+/// jq's own insertion-order `.[]` iteration.
+#[test]
+fn test_path_limit_bare_iterate_object_bounded_1850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(limit(2; .[]))"],
+        Some(r#"{"a":1,"b":2,"c":3}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]\n[\"b\"]");
+    Ok(())
+}
+
+/// #1850 companion: a non-iterable target still raises the same
+/// `cannot_iterate_with` error the unbounded `Expr::Iterate` arm always
+/// did -- the bounded fast path must not silently swallow this into an
+/// empty result.
+#[test]
+fn test_path_limit_bare_iterate_non_container_still_errors_1850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(limit(3; .[]))"], Some("5"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("Cannot iterate"), "{stderr}");
+    Ok(())
+}
+
+/// #1850 companion: a redundantly-parenthesized `.[]` (`(.[])`) must still
+/// take the bounded fast path -- `unwrap_paren` peels the wrapper before
+/// the `Expr::Iterate` shape check, matching `resolve_node`'s own
+/// paren-transparency elsewhere.
+#[test]
+fn test_path_limit_bare_iterate_through_parens_bounded_1850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path(limit(2; (.[])))"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0]\n[1]");
+    Ok(())
+}
+
+/// #1850 companion: a compound expression (`.[] | select(...)`) is not the
+/// bare `Expr::Iterate` shape the fast path targets, so it still takes the
+/// original eager `resolve_node` + `take_path_branches` route -- confirming
+/// the fast path's narrower scope doesn't regress the general case.
+#[test]
+fn test_path_limit_compound_iterate_still_correct_1850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(limit(2; .[] | select(. > 15)))"],
+        Some("[10,20,30,40]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1]\n[2]");
+    Ok(())
+}
+
 #[test]
 fn test_as_binding_propagates_halt_from_bind_expression() -> Result<()> {
     // `eval_as`'s `bound_result` match: a halt while evaluating the bind

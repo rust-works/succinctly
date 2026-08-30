@@ -20468,7 +20468,64 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     if n == 0 {
         return Ok(Vec::new());
     }
+    // #1850: bare `.[]` (the shape the issue itself measures) is bounded
+    // directly via `.take(n)` on the same iterator `resolve_node`'s own
+    // `Expr::Iterate` arm builds, making `path(limit(n; .[]))` O(n)
+    // instead of O(document size) -- see `resolve_iterate_bounded`'s own
+    // doc comment for why this is scoped to exactly this shape rather than
+    // `resolve_node`'s generator path in general: every other arm there
+    // returns a fully materialized `Vec<PathBranch>` with no
+    // sink/early-stop protocol to plug into, so a fully general fix is a
+    // separate, much wider design question this issue itself left open.
+    if trackable && matches!(unwrap_paren(expr), Expr::Iterate) {
+        return resolve_iterate_bounded::<S>(value, n);
+    }
     take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n)
+}
+
+/// `.[]` bounded to at most `n` branches (#1850) -- mirrors `resolve_node`'s
+/// own `Expr::Iterate` arm exactly (same `PathBranch`/`PathPrefix`
+/// construction, same [`EvalError::cannot_iterate_with`] for every other
+/// value shape), with `.take(n)` inserted into each container's iterator so
+/// [`resolve_limit_one_n`] never visits more than `n` elements. `items.iter()`/
+/// `map.iter()` are already lazy; the only change from the unbounded arm is
+/// stopping the walk early, not the values or error it produces -- confirmed
+/// live to be byte-identical to the old eager-then-truncate path for `n`
+/// under, at, and over the container's length.
+fn resolve_iterate_bounded<S: EvalSemantics>(
+    value: &OwnedValue,
+    n: usize,
+) -> PathResolveResult<'_> {
+    let root = PathPrefix::root();
+    match value {
+        OwnedValue::Array(items) => Ok(items
+            .iter()
+            .enumerate()
+            .take(n)
+            .map(|(i, v)| {
+                PathBranch::new(
+                    PathPrefix::extend(&root, Expr::Index(i as i64)),
+                    Cow::Borrowed(v),
+                    true,
+                )
+            })
+            .collect()),
+        OwnedValue::Object(map) => Ok(map
+            .iter()
+            .take(n)
+            .map(|(k, v)| {
+                PathBranch::new(
+                    PathPrefix::extend(&root, Expr::Field(k.clone())),
+                    Cow::Borrowed(v),
+                    true,
+                )
+            })
+            .collect()),
+        other => Err((
+            Vec::new(),
+            EvalError::cannot_iterate_with(S::TAG, other).into(),
+        )),
+    }
 }
 
 /// Convert a static, non-`Identity` path component into the `OwnedValue` jq
