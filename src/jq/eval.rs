@@ -25162,25 +25162,36 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream of values
     let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    // #1902: to_owned_checked/promote_borrowed_checked, not to_owned -- an
-    // undecodable input element used to silently become `""` instead of
+    // #1902/#1934: to_owned_checked/promote_borrowed_checked, not to_owned --
+    // an undecodable input element used to silently become `""` instead of
     // raising. A decode failure is never suppressed by `optional` (#1620),
     // matching the "drop the prefix, propagate unconditionally" policy the
-    // comment below already applies to an ordinary `Partial` error.
+    // comment below already applies to an ordinary `Partial` error -- but a
+    // *non*-decode-failure conversion error (a #1194 malformed-member or
+    // #1642 collision error) is an ordinary error like any other, and
+    // `optional` should suppress it the same way the bare `QueryResult::Error`
+    // arm below already does (#1934 item 3: this used to be unconditionally
+    // fatal regardless of `optional`, unlike that sibling arm).
     let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => match to_owned_checked(&v) {
             Ok(v) => vec![v],
+            Err(e) if optional && !e.is_decode_failure() => return QueryResult::None,
             Err(e) => return QueryResult::Error(e),
         },
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
             Ok(vs) => vs,
+            Err((_, e)) if optional && !e.is_decode_failure() => return QueryResult::None,
             Err((_, e)) => return QueryResult::Error(e),
         },
         QueryResult::Owned(v) => vec![v],
         QueryResult::ManyOwned(vs) => vs,
         QueryResult::None => Vec::new(),
-        QueryResult::Error(_) if optional => return QueryResult::None,
+        // #1934 item 2: a decode failure raised directly by `input`'s own
+        // evaluation (not via the checked-conversion arms above) must not
+        // be suppressed by `optional` either, matching `finish_fork`'s
+        // identical guard -- this arm had drifted from it.
+        QueryResult::Error(e) if optional && !e.is_decode_failure() => return QueryResult::None,
         QueryResult::Error(e) => return QueryResult::Error(e),
         QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::Halt(code) => return QueryResult::Halt(code),
@@ -25189,7 +25200,9 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
         // at all, just the error) — so a `Partial` input stream just extracts
         // the control and drops the prefix, same as the bare arms above.
-        QueryResult::Partial(_prefix, Control::Error(_)) if optional => return QueryResult::None,
+        QueryResult::Partial(_prefix, Control::Error(e)) if optional && !e.is_decode_failure() => {
+            return QueryResult::None;
+        }
         QueryResult::Partial(_prefix, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_prefix, Control::Break(label)) => return QueryResult::Break(label),
         QueryResult::Partial(_prefix, Control::Halt(code)) => return QueryResult::Halt(code),
@@ -25207,27 +25220,33 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // forks below before the decode failure surfaces as the terminal
     // control via `finish_fork`, which #1902 also fixed to never suppress
     // a decode failure under `optional`).
-    let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
-        match init_result.materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
-                Ok(v) => (vec![v], None),
-                Err(e) => (Vec::new(), Some(Control::Error(e))),
-            },
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
-                Ok(vs) => (vs, None),
-                Err((prefix, e)) => (prefix, Some(Control::Error(e))),
-            },
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => (Vec::new(), None),
-            QueryResult::Error(_) if optional => return QueryResult::None,
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            QueryResult::Halt(code) => return QueryResult::Halt(code),
-            QueryResult::Partial(_, Control::Error(_)) if optional => return QueryResult::None,
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
+    let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) = match init_result
+        .materialize_cursor()
+    {
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => (vec![v], None),
+            Err(e) => (Vec::new(), Some(Control::Error(e))),
+        },
+        QueryResult::OneCursor(_) => unreachable!(),
+        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+            Ok(vs) => (vs, None),
+            Err((prefix, e)) => (prefix, Some(Control::Error(e))),
+        },
+        QueryResult::Owned(v) => (vec![v], None),
+        QueryResult::ManyOwned(vs) => (vs, None),
+        QueryResult::None => (Vec::new(), None),
+        // #1934 item 2: same drift as the `input` block above -- a
+        // decode failure raised directly by INIT's own evaluation must
+        // not be suppressed by `optional`, matching `finish_fork`.
+        QueryResult::Error(e) if optional && !e.is_decode_failure() => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Error(e)) if optional && !e.is_decode_failure() => {
+            return QueryResult::None;
+        }
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+    };
 
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
@@ -25826,31 +25845,33 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // ordinary `Partial`'s control (the comment above): the already-decoded
     // prefix is still iterated below before the decode failure surfaces as
     // the terminal control.
-    let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
-        match input_result.materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
-                Ok(v) => (vec![v], None),
-                Err(e) => (Vec::new(), Some(Control::Error(e))),
-            },
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
-                Ok(vs) => (vs, None),
-                Err((prefix, e)) => (prefix, Some(Control::Error(e))),
-            },
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => (Vec::new(), None),
-            // An immediate (non-`Partial`) error has no prefix to salvage,
-            // so `?` suppresses it the same way `eval_reduce`'s equivalent
-            // arm already does — this one was missing it, letting an
-            // ambient `?` fail to catch an error in the source stream
-            // (#534 follow-up).
-            QueryResult::Error(_) if optional => return QueryResult::None,
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            QueryResult::Halt(code) => return QueryResult::Halt(code),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
+    let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) = match input_result
+        .materialize_cursor()
+    {
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => (vec![v], None),
+            Err(e) => (Vec::new(), Some(Control::Error(e))),
+        },
+        QueryResult::OneCursor(_) => unreachable!(),
+        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+            Ok(vs) => (vs, None),
+            Err((prefix, e)) => (prefix, Some(Control::Error(e))),
+        },
+        QueryResult::Owned(v) => (vec![v], None),
+        QueryResult::ManyOwned(vs) => (vs, None),
+        QueryResult::None => (Vec::new(), None),
+        // An immediate (non-`Partial`) error has no prefix to salvage,
+        // so `?` suppresses it the same way `eval_reduce`'s equivalent
+        // arm already does — this one was missing it, letting an
+        // ambient `?` fail to catch an error in the source stream
+        // (#534 follow-up). #1934 item 2: excludes a decode failure from
+        // that suppression too, matching `finish_fork`.
+        QueryResult::Error(e) if optional && !e.is_decode_failure() => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+    };
 
     // Evaluate INIT. Each of its outputs forks the whole foreach into a
     // fully independent execution over `input_values` (#534): `[foreach
@@ -41020,6 +41041,128 @@ mod tests {
                 assert!(e.is_decode_failure());
             }
             other => panic!("expected the decode failure to survive optional, got: {other:?}"),
+        }
+    }
+
+    /// #1934 item 2: `eval_reduce`'s bare `QueryResult::Error` arm on its
+    /// `input`/INIT streams, and `eval_foreach`'s equivalent `input` arm,
+    /// lacked the `!is_decode_failure()` exclusion `finish_fork` already
+    /// has -- a decode failure produced directly by that stream's own
+    /// evaluation (not via this function's own checked-conversion arms,
+    /// covered by the `1902` tests above) was wrongly suppressed under
+    /// `optional`.
+    ///
+    /// `optional == true` is not reachable here via any query this CLI can
+    /// currently parse -- confirmed across #1902/#1934's own review
+    /// (including a probe that replaced `finish_fork`'s guard body with
+    /// `panic!()` and ran the full test suite with zero hits): `?` catches
+    /// via `eval_try`'s post-hoc Error-to-`None` conversion on the *whole*
+    /// wrapped expression, not by forcing that expression's own ambient
+    /// `optional` true. Exercised directly, like this file's other "no
+    /// parser construction site" tests (e.g.
+    /// `builtin_envvar_propagates_halt_from_variable_name_expression`).
+    /// `keys` on a non-container value reaches `scalar_fallback`, which
+    /// raises a decode failure straight from `input`'s own evaluation --
+    /// distinct from `to_owned_checked` materializing an already-produced
+    /// `One`/`Many`, which the #1902 tests above already cover.
+    #[test]
+    fn test_eval_reduce_and_foreach_bare_error_arms_exclude_decode_failure_1934() {
+        let json: &[u8] = b"\"\xff\xfe\"";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let keys_expr = parse("keys").unwrap();
+        let init_expr = parse("0").unwrap();
+        let update_expr = parse(". + 1").unwrap();
+
+        // eval_reduce's `input` arm.
+        match eval_reduce::<Vec<u64>, JqSemantics>(
+            &keys_expr,
+            &[],
+            &init_expr,
+            &update_expr,
+            root.value(),
+            true,
+        ) {
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+            }
+            other => panic!("expected the decode failure to survive optional, got: {other:?}"),
+        }
+
+        // eval_reduce's INIT arm (same repro, roles swapped).
+        match eval_reduce::<Vec<u64>, JqSemantics>(
+            &parse("(1,2)").unwrap(),
+            &[],
+            &keys_expr,
+            &update_expr,
+            root.value(),
+            true,
+        ) {
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+            }
+            other => panic!("expected the decode failure to survive optional, got: {other:?}"),
+        }
+
+        // eval_foreach's `input` arm.
+        match eval_foreach::<Vec<u64>, JqSemantics>(
+            &keys_expr,
+            &[],
+            &init_expr,
+            &update_expr,
+            None,
+            root.value(),
+            true,
+        ) {
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+            }
+            other => panic!("expected the decode failure to survive optional, got: {other:?}"),
+        }
+    }
+
+    /// #1934 item 3: `eval_reduce`'s `input` arm treated *every*
+    /// `to_owned_checked`/`promote_borrowed_checked` failure as
+    /// unconditionally fatal, including a non-decode-failure error (a
+    /// #1194 malformed-member error) that the sibling bare
+    /// `QueryResult::Error` arm a few lines below already respects
+    /// `optional` for. `{"a":1,"b"}` is a trailing unpaired object member
+    /// JSON's own semi-index accepts (#1194) -- `.` (identity) surfaces it
+    /// as-is, and `to_owned_checked` raises on the full walk.
+    #[test]
+    fn test_eval_reduce_input_to_owned_checked_error_respects_optional_unless_decode_failure_1934()
+    {
+        let json: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let identity = parse(".").unwrap();
+        let init_expr = parse("0").unwrap();
+        let update_expr = parse(". + 1").unwrap();
+
+        match eval_reduce::<Vec<u64>, JqSemantics>(
+            &identity,
+            &[],
+            &init_expr,
+            &update_expr,
+            root.value(),
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected suppression under optional, got: {other:?}"),
+        }
+
+        // Same repro, `optional = false`: still raises, matching the
+        // sibling bare-error arm's own contract.
+        match eval_reduce::<Vec<u64>, JqSemantics>(
+            &identity,
+            &[],
+            &init_expr,
+            &update_expr,
+            root.value(),
+            false,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected an unsuppressed error, got: {other:?}"),
         }
     }
 
