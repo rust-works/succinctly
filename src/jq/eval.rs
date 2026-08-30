@@ -16696,61 +16696,21 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // Evaluate the RHS once, keeping every output instead of collapsing to
-    // the first (#392). `terminal` carries a trailing `Error`/`Break` when
-    // the stream didn't simply run out -- the same `Partial` shape every
-    // other multi-output combinator here uses (#400, #494), so the
-    // zero-prefix case (a bare `Error`/`Break`) and the nonzero-prefix case
-    // (`Partial`) share one code path below instead of two.
-    let (mut rhs_values, terminal): (Vec<OwnedValue>, Option<Control>) =
-        match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
-                Ok(owned) => (vec![owned], None),
-                Err(e) => return QueryResult::Error(e),
-            },
-            QueryResult::OneCursor(_) => {
-                unreachable!("materialize_cursor should have converted this")
-            }
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect() {
-                Ok(owned) => (owned, None),
-                Err(e) => return QueryResult::Error(e),
-            },
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => (Vec::new(), None),
-            QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
-            QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
-            QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
+    // the first (#392) -- shared with `eval_compound_assign`/
+    // `eval_alternative_assign` (#1778/#1844).
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
+    // #392/#1430: zero-output-RHS early return, and yq's collapse-to-last
+    // on a clean multi-output completion -- shared with `eval_update_multi`
+    // (#1844). See `normalize_rhs_values_for_fork`'s own doc comment for
+    // the full rationale of both rules.
+    let (rhs_values, terminal) =
+        match normalize_rhs_values_for_fork::<W, S>(rhs_values, terminal, optional) {
+            Ok(v) => v,
+            Err(early_return) => return early_return,
         };
-
-    // A zero-output RHS produces zero documents (a genuine behavior change
-    // from before this fix, which forced a zero-output RHS to `Null` via
-    // `eval_rhs_once`) -- see the doc comment above.
-    if rhs_values.is_empty() {
-        return match terminal {
-            None => QueryResult::None,
-            Some(Control::Error(_)) if optional => QueryResult::None,
-            Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
-        };
-    }
-
-    // Real yq's `=` never forks over a multi-output RHS the way jq's does
-    // (#392): it applies only the *last* output, once, to every resolved
-    // path -- confirmed live (v4.53.3): `.x = (1,2,3)` on `{"x":0}` is
-    // `{"x":3}`, one document, not three; `.a[] = .a[] + 1` on `{"a":[1,2]}`
-    // is `{"a":[3,3]}`, not two documents (#1430's own claimed expected
-    // output, `{"a":[2,3]}`, does not match live yq at all). Only collapsed
-    // on a *clean* completion (`terminal.is_none()`): a mid-stream error/
-    // break/halt keeps jq's existing partial-prefix fan-out below, since
-    // real yq's error-interaction behavior here hasn't been verified and
-    // this fix doesn't attempt to redefine it (#1430 was filed as, and this
-    // stays scoped to, the successful-completion case -- the error-
-    // interaction shape is tracked separately as #1779).
-    if S::TAG == EvalTag::Yq && terminal.is_none() && rhs_values.len() > 1 {
-        let last = rhs_values.pop().expect("len > 1 checked above");
-        rhs_values.clear();
-        rhs_values.push(last);
-    }
 
     // Resolve computed keys against the *original* document, before any
     // write, then apply them to every RHS output in turn: `.[("a","b")] =
@@ -16776,7 +16736,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `NotChecked` case (jq mode, or a genuinely dynamic path) still needs
     // to resolve here from scratch, exactly as this function always did
     // before that check existed.
-    let (mut pristine, paths) = match yq_noop_check {
+    let (pristine, paths) = match yq_noop_check {
         YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
@@ -16796,80 +16756,45 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     };
 
-    let last = paths.len().saturating_sub(1);
-    let rhs_last = rhs_values.len() - 1;
-    let mut docs: Vec<OwnedValue> = vec_with_capacity(rhs_values.len());
-    for (j, mut new_value) in rhs_values.into_iter().enumerate() {
-        // Every output but the last needs its own copy of `pristine`; the
-        // last can just take it (nothing reads `pristine` after the loop),
-        // sparing the overwhelmingly common single-output case (`.a = 5`) a
-        // clone of the whole document it doesn't need. Same "only the final
-        // one needs to own it" trick as `new_value` below, just on the
-        // document instead of the RHS value.
-        let mut result = if j == rhs_last {
-            core::mem::replace(&mut pristine, OwnedValue::Null)
-        } else {
-            pristine.clone()
-        };
-        for (i, path) in paths.iter().enumerate() {
-            // Only the final application needs to own `new_value`.
-            let value = if i == last {
-                core::mem::replace(&mut new_value, OwnedValue::Null)
+    // `=` has no filter of its own: `write_one` writes `value` directly via
+    // `set_path`, cloning it per path except the last (which just moves it
+    // out) -- the same "only the final one needs to own it" trick
+    // `fork_rhs_over_paths` itself already applies one level up, to
+    // `pristine` across RHS outputs. See its doc comment for `is_last_path`.
+    //
+    // yq's slice-assignment no-op (#1101/#1116's scalar case, widened to a
+    // real array/string target by #1142) — `set_path` itself now no-ops
+    // the *write* whenever it reaches a slice step targeting a scalar or
+    // container (see `through_slice`'s doc comment), whether that's the
+    // whole path (`5 | .[0:1] = 99`) or reached through a chain (`.a[0:1] =
+    // 99` on a scalar or array/string `.a`). The RHS (`value`, already
+    // fully computed above) is always evaluated normally either way, so its
+    // own errors/halt/break still propagate (`.[0:1] = error("boom")`
+    // genuinely errors in real yq; only `.[0:1] = 99`-shaped *successful*
+    // RHS values are silently discarded) — `=` has no filter of its own
+    // left to protect from a discarded write, so unlike `eval_update`
+    // there's no throwaway-execution step needed here at all, just passing
+    // the yq-mode flag through (twice: `=` has no operator-based exception
+    // the way `-=`/`*=` do for a *scalar* target, so both the scalar and
+    // container no-op flags are simply `S::TAG == EvalTag::Yq` here, unlike
+    // `eval_update`'s operator-gated `scalar_noop`).
+    let yq_noop = S::TAG == EvalTag::Yq;
+    fork_rhs_over_paths::<W, _>(
+        pristine,
+        &paths,
+        rhs_values,
+        terminal,
+        optional,
+        |value| value,
+        |result, path, value, is_last_path| {
+            let value = if is_last_path {
+                core::mem::replace(value, OwnedValue::Null)
             } else {
-                new_value.clone()
+                value.clone()
             };
-            // yq's slice-assignment no-op (#1101/#1116's scalar case,
-            // widened to a real array/string target by #1142) — `set_path`
-            // itself now no-ops the *write* whenever it reaches a slice
-            // step targeting a scalar or container (see `through_slice`'s
-            // doc comment), whether that's the whole path (`5 | .[0:1] =
-            // 99`) or reached through a chain (`.a[0:1] = 99` on a scalar
-            // or array/string `.a`). The RHS (`value`, already fully
-            // computed above) is always evaluated normally either way, so
-            // its own errors/halt/break still propagate (`.[0:1] = error(
-            // "boom")` genuinely errors in real yq; only `.[0:1] = 99`
-            // -shaped *successful* RHS values are silently discarded) —
-            // `=` has no filter of its own left to protect from a
-            // discarded write, so unlike `eval_update` there's no
-            // throwaway-execution step needed here at all, just passing
-            // the yq-mode flag through (twice: `=` has no operator-based
-            // exception the way `-=`/`*=` do for a *scalar* target, so
-            // both the scalar and container no-op flags are simply
-            // `S::TAG == EvalTag::Yq` here, unlike `eval_update`'s
-            // operator-gated `scalar_noop` below).
-            if let Err(e) = set_path::<S>(
-                &mut result,
-                path,
-                value,
-                S::TAG == EvalTag::Yq,
-                S::TAG == EvalTag::Yq,
-            ) {
-                // Atomic per RHS output, like `reduce`: this value's own
-                // path list contributes nothing, and the whole fan-out
-                // terminates here -- `docs` (only the strictly earlier,
-                // already-completed outputs) is everything that survives.
-                return if optional {
-                    owned_vec_to_result(docs)
-                } else {
-                    partial(docs, Control::Error(e))
-                };
-            }
-        }
-        docs.push(result);
-    }
-
-    match terminal {
-        None => owned_vec_to_result(docs),
-        Some(Control::Error(e)) => {
-            if optional {
-                owned_vec_to_result(docs)
-            } else {
-                partial(docs, Control::Error(e))
-            }
-        }
-        Some(Control::Break(label)) => partial(docs, Control::Break(label)),
-        Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
-    }
+            set_path::<S>(result, path, value, yq_noop, yq_noop).map_err(EvalEscape::from)
+        },
+    )
 }
 
 /// Evaluate update assignment: `.path |= filter`
@@ -16945,14 +16870,13 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Evaluate `value_expr` once, keeping every output instead of collapsing
-/// to the first -- shared RHS-collection prologue for
-/// `eval_compound_assign`/`eval_alternative_assign` (#1778). A near-copy
-/// of `eval_assign`'s own inlined #392 prologue one function up (and this
-/// function's own fork loop below duplicates `eval_assign`'s in turn) --
-/// consolidating the two is `#1844`'s own tracked scope, not attempted
-/// here to keep this fix reviewable at a similar size to prior slices in
-/// the decode-failure series it followed, and because unifying them means
-/// also touching `eval_assign` itself.
+/// to the first -- shared RHS-collection prologue for `eval_assign`/
+/// `eval_compound_assign`/`eval_alternative_assign` (#392/#1778/#1844).
+/// `terminal` carries a trailing `Error`/`Break` when the stream didn't
+/// simply run out -- the same `Partial` shape every other multi-output
+/// combinator here uses (#400, #494), so the zero-prefix case (a bare
+/// `Error`/`Break`) and the nonzero-prefix case (`Partial`) share one code
+/// path in [`normalize_rhs_values_for_fork`] below instead of two.
 fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value_expr: &Expr,
     input: &StandardJson<'a, W>,
@@ -16980,84 +16904,89 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Shared multi-output-RHS fan-out for `eval_compound_assign`/
-/// `eval_alternative_assign` (#1778), mirroring `eval_assign`'s own #392/
-/// #1430 fix one function up: jq mode forks once per RHS output into its
-/// own whole-document copy; yq mode (on a *clean* completion only, same
-/// carve-out as `eval_assign` -- the error-interaction shape is #1779's
-/// territory, not this one's) collapses to just the *last* output, no
-/// fork. Oracle-verified for `+=` (jq forks: `.x += (10,20,30)` on
-/// `{"x":1}` is three documents; yq takes the last: one document, `{"x":
-/// 31}`).
+/// Normalizes a freshly-[`collect_rhs_outputs`]ed RHS-output list before
+/// the fork loop runs -- shared by `eval_assign`/`eval_compound_assign`/
+/// `eval_alternative_assign` (#392/#1430/#1844):
 ///
-/// Unlike `eval_assign` (which writes via `set_path` directly, since `=`
-/// has no filter of its own), each output here still needs
-/// `update_path`'s filter-application machinery: `build_filter` splices
-/// the given RHS output into the operator's own filter shape (`. op
-/// value` for compound assignment, `. // value` for alternative
-/// assignment) fresh per output, so `update_path`'s per-path `Identity`
-/// resolves to that output's own spliced value, not a shared one.
-fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    path_expr: &Expr,
-    input: StandardJson<'a, W>,
-    optional: bool,
-    scalar_slice_noop: bool,
-    rhs_values: Vec<OwnedValue>,
+/// - A zero-output RHS produces zero documents (`Err` short-circuits the
+///   caller directly with that result) -- not `eval_rhs_once`'s old
+///   "collapse empty to `Null`" behavior.
+/// - Real yq never forks over a multi-output RHS the way jq's does (#392):
+///   it applies only the *last* output, once, to every resolved path --
+///   confirmed live (v4.53.3): `.x = (1,2,3)` on `{"x":0}` is `{"x":3}`,
+///   one document, not three; `.a[] = .a[] + 1` on `{"a":[1,2]}` is
+///   `{"a":[3,3]}`, not two documents (#1430's own claimed expected
+///   output, `{"a":[2,3]}`, does not match live yq at all). Only collapsed
+///   on a *clean* completion (`terminal.is_none()`): a mid-stream error/
+///   break/halt keeps jq's existing partial-prefix fan-out, since real
+///   yq's error-interaction behavior here hasn't been verified and this
+///   fix doesn't attempt to redefine it (#1430 was filed as, and this
+///   stays scoped to, the successful-completion case -- the error-
+///   interaction shape is tracked separately as #1779).
+fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    mut rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
-    mut build_filter: impl FnMut(OwnedValue) -> Expr,
-) -> QueryResult<'a, W> {
-    let mut rhs_values = rhs_values;
-
-    // A zero-output RHS produces zero documents, matching `eval_assign`'s
-    // own #392 rule -- not `eval_rhs_once`'s old "collapse empty to Null"
-    // behavior.
+    optional: bool,
+) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     if rhs_values.is_empty() {
-        return match terminal {
+        return Err(match terminal {
             None => QueryResult::None,
             Some(Control::Error(_)) if optional => QueryResult::None,
-            Some(control) => partial(Vec::new(), control),
-        };
+            Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
+        });
     }
-
-    // See `eval_assign`'s identical block for the full rationale: only on
-    // a clean completion, never a mid-stream error/break/halt.
     if S::TAG == EvalTag::Yq && terminal.is_none() && rhs_values.len() > 1 {
         let last = rhs_values.pop().expect("len > 1 checked above");
         rhs_values.clear();
         rhs_values.push(last);
     }
+    Ok((rhs_values, terminal))
+}
 
-    let mut pristine = match to_owned_checked(&input) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
-        Ok(paths) => paths,
-        // `?` swallows only a genuine error; a halt always escapes (#791).
-        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-        Err((_, escape)) => return escape.into(),
-    };
-    let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
-
+/// Shared RHS-fork loop for `eval_assign`/`eval_compound_assign`/
+/// `eval_alternative_assign` (#1844): forks a whole document per RHS
+/// output (`rhs_values` and `terminal` already normalized by
+/// [`normalize_rhs_values_for_fork`], so `rhs_values` is never empty
+/// here), applying `write_one` to every one of `paths` in turn against
+/// that output's own copy of `pristine`.
+///
+/// Only the last RHS output needs to own `pristine` (nothing reads it
+/// after the loop) -- spares the overwhelmingly common single-output case
+/// (`.a = 5`) a clone of the whole document it doesn't need.
+///
+/// `prepare` turns a raw RHS output into whatever state `write_one` needs
+/// across every path it's applied to for that output: `eval_assign` passes
+/// the value itself through unchanged, since `set_path` consumes it *per
+/// path* (via `write_one`'s own `is_last_path`, the same "only the final
+/// one needs to own it" trick one level up); `eval_compound_assign`/
+/// `eval_alternative_assign` pass `build_filter`, since `update_path` only
+/// ever borrows the filter it builds once per RHS output and applies
+/// unchanged to every path (`is_last_path` is unused there).
+fn fork_rhs_over_paths<'a, W: Clone + AsRef<[u64]>, State>(
+    mut pristine: OwnedValue,
+    paths: &[Expr],
+    rhs_values: Vec<OwnedValue>,
+    terminal: Option<Control>,
+    optional: bool,
+    mut prepare: impl FnMut(OwnedValue) -> State,
+    mut write_one: impl FnMut(&mut OwnedValue, &Expr, &mut State, bool) -> Result<(), EvalEscape>,
+) -> QueryResult<'a, W> {
     let rhs_last = rhs_values.len() - 1;
+    let last_path = paths.len().saturating_sub(1);
     let mut docs: Vec<OwnedValue> = vec_with_capacity(rhs_values.len());
     for (j, rhs_value) in rhs_values.into_iter().enumerate() {
-        // Same "only the last output needs to own `pristine`" trick as
-        // `eval_assign`'s own loop -- spares the common single-output case
-        // a clone of the whole document it doesn't need.
         let mut result = if j == rhs_last {
             core::mem::replace(&mut pristine, OwnedValue::Null)
         } else {
             pristine.clone()
         };
-        let filter = build_filter(rhs_value);
-        for path in &paths {
-            if let Err(escape) = update_path::<S>(&mut result, path, &filter, false, scalar_noop) {
-                // Atomic per RHS output, like `eval_assign`'s own per-output
-                // `set_path` error handling: this output contributes
-                // nothing, and the whole fan-out terminates here -- `docs`
-                // (only the strictly earlier, already-completed outputs)
-                // is everything that survives.
+        let mut state = prepare(rhs_value);
+        for (i, path) in paths.iter().enumerate() {
+            if let Err(escape) = write_one(&mut result, path, &mut state, i == last_path) {
+                // Atomic per RHS output: this output's own path list
+                // contributes nothing, and the whole fan-out terminates
+                // here -- `docs` (only the strictly earlier,
+                // already-completed outputs) is everything that survives.
                 return match escape {
                     EvalEscape::Error(_) if optional => owned_vec_to_result(docs),
                     other => partial(docs, other.into()),
@@ -17079,6 +17008,57 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Some(Control::Break(label)) => partial(docs, Control::Break(label)),
         Some(Control::Halt(code)) => partial(docs, Control::Halt(code)),
     }
+}
+
+/// Evaluate compound/alternative assignment's shared post-RHS machinery for
+/// `eval_compound_assign`/`eval_alternative_assign` (#1778), routed through
+/// [`normalize_rhs_values_for_fork`]/[`fork_rhs_over_paths`] since #1844.
+///
+/// Unlike `eval_assign` (which writes via `set_path` directly, since `=`
+/// has no filter of its own), each output here still needs
+/// `update_path`'s filter-application machinery: `build_filter` splices
+/// the given RHS output into the operator's own filter shape (`. op
+/// value` for compound assignment, `. // value` for alternative
+/// assignment) fresh per output, so `update_path`'s per-path `Identity`
+/// resolves to that output's own spliced value, not a shared one.
+fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: StandardJson<'a, W>,
+    optional: bool,
+    scalar_slice_noop: bool,
+    rhs_values: Vec<OwnedValue>,
+    terminal: Option<Control>,
+    build_filter: impl FnMut(OwnedValue) -> Expr,
+) -> QueryResult<'a, W> {
+    let (rhs_values, terminal) =
+        match normalize_rhs_values_for_fork::<W, S>(rhs_values, terminal, optional) {
+            Ok(v) => v,
+            Err(early_return) => return early_return,
+        };
+
+    let pristine = match to_owned_checked(&input) {
+        Ok(v) => v,
+        Err(e) => return QueryResult::Error(e),
+    };
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
+        Ok(paths) => paths,
+        // `?` swallows only a genuine error; a halt always escapes (#791).
+        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
+        Err((_, escape)) => return escape.into(),
+    };
+    let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
+
+    fork_rhs_over_paths::<W, _>(
+        pristine,
+        &paths,
+        rhs_values,
+        terminal,
+        optional,
+        build_filter,
+        move |result, path, filter, _is_last_path| {
+            update_path::<S>(result, path, filter, false, scalar_noop).map(|_wrote| ())
+        },
+    )
 }
 
 /// Evaluate compound assignment: `.path += value`, `.path -= value`, etc.
