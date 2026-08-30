@@ -3583,14 +3583,17 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Builtins));
         }
         if self.matches_keyword("inputs") {
+            self.reject_unless_jq_extensions("inputs")?;
             self.consume_keyword("inputs");
             return Ok(Some(Builtin::Inputs));
         }
         if self.matches_keyword("input_line_number") {
+            self.reject_unless_jq_extensions("input_line_number")?;
             self.consume_keyword("input_line_number");
             return Ok(Some(Builtin::InputLineNumber));
         }
         if self.matches_keyword("input") {
+            self.reject_unless_jq_extensions("input")?;
             self.consume_keyword("input");
             return Ok(Some(Builtin::Input));
         }
@@ -6707,6 +6710,13 @@ mod tests {
     /// (the `--jq-extensions` CLI flag's parser-level counterpart) accepts
     /// them. jq mode is unaffected either way -- it already accepts this
     /// whole surface unconditionally, gate or no gate.
+    ///
+    /// #1507 adds `input`/`inputs`/`input_line_number` -- this test only
+    /// covers parsing, so it doesn't distinguish them from the rest here:
+    /// unlike every other name in this list, they still error once
+    /// evaluated even with the gate open (see
+    /// `input_builtins_unsupported_in_yq_mode`, `src/jq/eval.rs`), since
+    /// yq mode's document loop has no real support for them yet.
     #[test]
     fn test_yq_mode_rejects_jq_only_builtins_unless_jq_extensions_1512() {
         let cases: &[(&str, &str)] = &[
@@ -6733,6 +6743,9 @@ mod tests {
             ("trunc", "1.5 | trunc"),
             ("isinfinite", "1 | isinfinite"),
             ("nan", "nan"),
+            ("input", "input"),
+            ("inputs", "inputs"),
+            ("input_line_number", "input_line_number"),
         ];
 
         for (name, filter) in cases {
