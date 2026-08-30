@@ -1877,6 +1877,36 @@ fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<(
     Ok(())
 }
 
+/// Runs `succinctly jq <extra_args> <filter>` over `doc` and asserts it
+/// raises with `code` and a stderr containing `expect_stderr` -- shared by
+/// [`test_select_and_materialize_agree_on_corruption_1645`]'s three
+/// comparison arms so each one asserts on the *message*, not just the exit
+/// code (#1803 code review: an exit-code-only check can't tell "the expected
+/// corruption was caught" from "an unrelated bug in this arm's own code path
+/// happened to raise the same code").
+fn assert_jq_raises(
+    label: &str,
+    op_label: &str,
+    extra_args: &[&str],
+    filter: &str,
+    doc: &str,
+    code: i32,
+    expect_stderr: &str,
+) {
+    let mut args: Vec<&str> = extra_args.to_vec();
+    args.push(filter);
+    let (out, err, actual_code) = run_jq_full(&args, Some(doc))
+        .unwrap_or_else(|e| panic!("[{label}] {op_label} run failed: {e}"));
+    assert_eq!(
+        actual_code, code,
+        "[{label}] {op_label} must raise\nstdout: {out:?}\nstderr: {err:?}"
+    );
+    assert!(
+        err.contains(expect_stderr),
+        "[{label}] {op_label} stderr must contain {expect_stderr:?}\nstderr: {err:?}"
+    );
+}
+
 /// #1645 code review: `push_generic_truthiness_cursor_error` is a second,
 /// hand-copied implementation of the same "walk and raise on corruption"
 /// predicate `to_owned_at_depth`/`to_owned_cursor_at_depth`/
@@ -1896,59 +1926,78 @@ fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<(
 /// for a genuine cross-site divergence and found none here -- the real bug
 /// that investigation surfaced (#1960) turned out to be an unrelated YAML
 /// flow-scalar parser bug, not a traversal-function disagreement.
+///
+/// **Known scope limit** (#1803 code review): this is example-based
+/// coverage over a hand-picked case list, not an exhaustive or randomized
+/// check -- see `.claude/skills/testing/SKILL.md`'s "Invariant Tests Over
+/// Duplicated Logic" section for why a corpus-wide or fuzzed cross-check
+/// catches more of this bug class than a fixed list ever can. A differential
+/// fuzzer varying nesting depth/format/malformation kind across these same
+/// three CLI paths would close that gap; not attempted here to keep this PR
+/// to the scope it actually verified (see #1803's own comment thread).
 #[test]
 fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
+    let decode_failure_err = "invalid escape sequence";
+    let structural_err = "unexpected character";
+    let collision_err = "ambiguous";
+
     let cases = [
-        ("decode failure, top level", r#"{"bad": "\x", "keep": 5}"#),
+        (
+            "decode failure, top level",
+            r#"{"bad": "\x", "keep": 5}"#,
+            decode_failure_err,
+        ),
         (
             "decode failure, nested in array",
             r#"{"bad": ["\x"], "keep": 5}"#,
+            decode_failure_err,
         ),
         (
             "decode failure, nested in object",
             r#"{"bad": {"x": "\x"}, "keep": 5}"#,
+            decode_failure_err,
         ),
         (
             "structural error, top level",
             r#"{"bad": xyz123, "keep": 5}"#,
+            structural_err,
         ),
         (
             "structural error, nested in array",
             r#"{"bad": [xyz123], "keep": 5}"#,
+            structural_err,
         ),
         (
             "structural error, nested in object",
             r#"{"bad": {"x": xyz123}, "keep": 5}"#,
+            structural_err,
         ),
         (
             "#1642 colliding decode-failure keys",
             r#"{"bad": {"\ud800":1,"\ud800":2}, "keep": 5}"#,
+            collision_err,
         ),
     ];
 
-    for (label, doc) in cases {
-        let (select_out, select_err, select_code) =
-            run_jq_full(&["select(.bad) | .keep"], Some(doc))
-                .unwrap_or_else(|e| panic!("[{label}] select run failed: {e}"));
-        assert_eq!(
-            select_code, 5,
-            "[{label}] select(.bad) must raise\nstdout: {select_out:?}\nstderr: {select_err:?}"
+    for (label, doc, expect_stderr) in cases {
+        assert_jq_raises(
+            label,
+            "select(.bad)",
+            &[],
+            "select(.bad) | .keep",
+            doc,
+            5,
+            expect_stderr,
         );
-
-        let (materialize_out, materialize_err, materialize_code) =
-            run_jq_full(&["-Sc", ".bad"], Some(doc))
-                .unwrap_or_else(|e| panic!("[{label}] materialize run failed: {e}"));
-        assert_eq!(
-            materialize_code, 5,
-            "[{label}] -Sc .bad must raise the same way select's condition walk does\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
-        );
-
-        let (exit_status_out, exit_status_err, exit_status_code) =
-            run_jq_full(&["-e", ".bad"], Some(doc))
-                .unwrap_or_else(|e| panic!("[{label}] -e run failed: {e}"));
-        assert_eq!(
-            exit_status_code, 5,
-            "[{label}] -e .bad must raise the same way select/-Sc do (cursor_to_owned_at_depth, lazy.rs)\nstdout: {exit_status_out:?}\nstderr: {exit_status_err:?}"
+        assert_jq_raises(label, "-Sc .bad", &["-Sc"], ".bad", doc, 5, expect_stderr);
+        assert_jq_raises(
+            label,
+            "-e .bad (cursor_to_owned_at_depth, lazy.rs)",
+            &["-e"],
+            ".bad",
+            doc,
+            5,
+            expect_stderr,
         );
     }
     Ok(())

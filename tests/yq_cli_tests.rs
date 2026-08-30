@@ -1762,6 +1762,29 @@ fn test_yaml_native_dom_ordinary_repeated_key_still_overwrites_1749() -> Result<
     Ok(())
 }
 
+/// Runs a yq filter over `yaml` with `extra_args` and asserts it raises with
+/// a stderr containing `expect_stderr` -- shared by
+/// [`test_select_and_write_agree_on_corruption_1803`]'s comparison arms so
+/// each one asserts on the *message*, not just a nonzero exit code (#1803
+/// code review: exit-code-only can't distinguish "the expected corruption
+/// was caught" from an unrelated bug that happens to also raise).
+fn assert_yq_raises(
+    label: &str,
+    op_label: &str,
+    filter: &str,
+    yaml: &str,
+    extra_args: &[&str],
+    expect_stderr: &str,
+) {
+    let (_out, err, code) = run_yq_stdin_with_stderr(filter, yaml, extra_args)
+        .unwrap_or_else(|e| panic!("[{label}] {op_label} run failed: {e}"));
+    assert_eq!(code, 1, "[{label}] {op_label} must raise, stderr: {err}");
+    assert!(
+        err.contains(expect_stderr),
+        "[{label}] {op_label} stderr must contain {expect_stderr:?}, stderr: {err}"
+    );
+}
+
 /// #1803: `select(.bad) | .keep` (`push_generic_truthiness_cursor_error`)
 /// and a write op (`.keep = 9`, which forces the YAML DOM path per ADR-0017
 /// -- `to_owned_with_comments_at_depth`/`to_owned_at_depth`/
@@ -1773,31 +1796,81 @@ fn test_yaml_native_dom_ordinary_repeated_key_still_overwrites_1749() -> Result<
 /// bareword like `xyz123`) has no YAML analog (it's a perfectly valid plain
 /// scalar there), so only the two malformation classes meaningful in both
 /// formats -- a decode failure and a #1642 colliding-key collision -- are
-/// covered here.
+/// covered here, at the same three nesting depths (top/array/object) the
+/// JSON test uses.
+///
+/// A third, pre-existing comparison route for a *nested* YAML decode failure
+/// (`select` vs. `.bad,.bad`, yq's multi-output materializing path) already
+/// lives in `test_select_raises_on_yaml_decode_failure_nested_in_container_1645`
+/// above -- this test adds a third arm of its own (`.keep = 9 -o=json`) to
+/// every case, confirming the DOM-write path agrees under `-o=json` output
+/// too, not just the default YAML output the rest of this test (and that
+/// pre-existing one) exercise.
+///
+/// **Known scope limits** (#1803 code review, same caveat as the JSON test's
+/// own doc comment): example-based coverage over a hand-picked case list,
+/// not exhaustive or randomized. Additionally, the write op exercises three
+/// functions together (`to_owned_with_comments_at_depth`/`to_owned_at_depth`/
+/// `to_owned_cursor_at_depth`) and can only tell "the write path as a whole
+/// raised," not "all three functions individually agree" -- a regression
+/// isolated to just one of the three, masked by another still raising
+/// downstream, would not be caught here.
 #[test]
 fn test_select_and_write_agree_on_corruption_1803() -> Result<()> {
+    let decode_failure_err = "invalid escape sequence";
+    let collision_err = "ambiguous";
+
     let cases = [
-        ("decode failure", "bad: \"a\\qb\"\nkeep: 5\n"),
+        (
+            "decode failure, top level",
+            r#"bad: "a\qb"
+keep: 5
+"#,
+            decode_failure_err,
+        ),
+        (
+            "decode failure, nested in array",
+            r#"bad: ["a\qb"]
+keep: 5
+"#,
+            decode_failure_err,
+        ),
+        (
+            "decode failure, nested in object",
+            r#"bad:
+  x: "a\qb"
+keep: 5
+"#,
+            decode_failure_err,
+        ),
         (
             "#1642 colliding decode-failure keys",
-            "bad:\n  \"a\\qb\": 1\n  \"a\\zc\": 2\nkeep: 5\n",
+            r#"bad:
+  "a\qb": 1
+  "a\zc": 2
+keep: 5
+"#,
+            collision_err,
         ),
     ];
 
-    for (label, yaml) in cases {
-        let (_select_out, select_err, select_code) =
-            run_yq_stdin_with_stderr("select(.bad) | .keep", yaml, &[])
-                .unwrap_or_else(|e| panic!("[{label}] select run failed: {e}"));
-        assert_eq!(
-            select_code, 1,
-            "[{label}] select(.bad) must raise, stderr: {select_err}"
+    for (label, yaml, expect_stderr) in cases {
+        assert_yq_raises(
+            label,
+            "select(.bad)",
+            "select(.bad) | .keep",
+            yaml,
+            &[],
+            expect_stderr,
         );
-
-        let (_write_out, write_err, write_code) = run_yq_stdin_with_stderr(".keep = 9", yaml, &[])
-            .unwrap_or_else(|e| panic!("[{label}] write run failed: {e}"));
-        assert_eq!(
-            write_code, 1,
-            "[{label}] .keep = 9 must raise the same way select's condition walk does, stderr: {write_err}"
+        assert_yq_raises(label, ".keep = 9", ".keep = 9", yaml, &[], expect_stderr);
+        assert_yq_raises(
+            label,
+            ".keep = 9 -o=json",
+            ".keep = 9",
+            yaml,
+            &["-o=json"],
+            expect_stderr,
         );
     }
     Ok(())
