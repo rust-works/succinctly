@@ -1556,21 +1556,29 @@ $ printf '\x1exyz\n'           | jq --seq -c '.'
 jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)
 ```
 
-`succinctly jq --seq` emits nothing on stderr for any of these — the gap is now **purely the
-diagnostic**. The output side matches real jq, including a record that is well-formed up to a
-malformed suffix, which #1723 fixed:
+`succinctly jq --seq` emits nothing on stderr for any of these, and its *output* also
+diverges: real jq emits the values it managed to read before the malformed point, while
+succinctly drops the whole record.
 
 ```
 $ printf '\x1e1 {invalid\n' | jq            --seq -c '.'   # warns, then prints 1
-$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'   # prints 1, silently
+$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'   # prints nothing
+$ printf '\x1e1,2\n'        | jq            --seq -c '.'   # prints 2
+$ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints nothing
 ```
 
-Reproducing jq's *values* here needed three rules, all oracle-derived and pinned by
-`test_seq_malformed_suffix_keeps_the_prefix_1723`: a token that scans is validated and
-dropped if invalid but never resynced into (`{"a":1 xyz}` yields nothing, not `"a"`); an
-unterminated `"`/`{`/`[` swallows the rest of the record while other junk resyncs (structural
-punctuation by one byte, a bad token up to the next whitespace); and a number is complete
-only when whitespace follows it, which is why `\x1e1,2\n` yields `2` alone.
+**The divergence is deliberately one-directional: succinctly's output is always a subset of
+jq's here, never a superset.** Reproducing the prefix needs the same thing the diagnostics
+do -- jq's `--seq` reader is a streaming lexer/parser with error recovery, and knowing which
+values survive means knowing where its parser gave up. A token scanner cannot substitute for
+it, and trying was actively harmful: an attempt to emit the prefix by scanning tokens and
+skipping bad ones **fabricated output**, printing values real jq never prints (`\x1e1-2\n`
+became `1` and `-2`, where jq lexes one malformed number and prints nothing). Requiring
+whitespace after every token is what rules that out, at the cost of dropping records jq can
+partially read. Both directions are pinned by
+`test_seq_adjacent_tokens_never_fabricate_1723` and
+`test_seq_partially_readable_record_is_dropped_whole_1723`
+([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
 A record holding several *well-formed* values is likewise unaffected: #1723 fixed
 `succinctly jq --seq` dropping those in full (`\x1e1 "x" [2]\n` is three outputs, as in real

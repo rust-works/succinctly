@@ -3348,39 +3348,34 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 }
 
 /// Every JSON value a `--seq` record yields, as byte ranges into the record's
-/// *untrimmed* text, plus the offset of the first thing that went wrong.
+/// *untrimmed* text.
 ///
-/// Real jq's `--seq` reader does not treat a record as all-or-nothing: it
-/// emits every value it managed to read and resyncs past what it could not
-/// (#1723). Three rules, each oracle-derived, together reproduce every shape
-/// I could find:
+/// **Conservative by construction: this never emits a value real jq would
+/// not.** A record whose tokens are not cleanly whitespace-separated, or any
+/// of whose tokens is not legal JSON, yields *nothing* -- the pre-#1723
+/// whole-record drop.
 ///
-/// 1. **A token that scans is validated, and dropped if invalid -- never
-///    resynced into.** `{"a":1 xyz}` scans as one token (its braces match),
-///    fails validation, and jq emits *nothing* -- it does not go back and
-///    pick the `"a"` out of the middle. Scanning past it is what prevents
-///    that.
-/// 2. **A byte that cannot start a token is skipped, one byte at a time.**
-///    `} 5` emits `5`; `tru 5` emits `5`.
-/// 3. **A number is only complete when whitespace follows it.** jq's
-///    incremental scanner cannot rule out more digits arriving otherwise, so
-///    `1,2` emits only `2` (the `1` is lost to the `,`), `1 2,3` emits `1`
-///    and `3`, and `\x1e1 2\x1e3` emits `1` and `3`. This *subsumes* the
-///    trailing-bare-number rule an earlier pass at #1723 wrote as a separate
-///    last-value special case -- same rule, applied per value instead of
-///    once at the end.
+/// That conservatism is the point, and it was learned the hard way. An
+/// earlier version of this function tried to reproduce jq's own resync
+/// (emit the values before a malformed suffix, skip the bad token, carry
+/// on). jq's `--seq` reader is a streaming lexer/parser with error recovery,
+/// and a token scanner cannot imitate it: the attempt **fabricated output**,
+/// emitting values real jq never emits. `\x1e1-2\n` is the clearest case --
+/// jq lexes `1-2` as one malformed number and prints nothing, while a
+/// scanner reads `1` then `-2` and prints both. `\x1e1null\n`, `\x1e12true\n`
+/// and `\x1etrue1\n` all fail the same way, and `\x1e5-3 7\n` printed `-3`
+/// out of the middle of a bad token.
 ///
-/// Scanning the untrimmed text is what makes rule 3 expressible: the
-/// whitespace that terminates the final number is exactly what trimming
-/// removes.
+/// Requiring whitespace after every token is what makes that impossible:
+/// the adjacency a scanner mis-splits is exactly what this rejects. The cost
+/// is that a record jq *can* partially read is dropped instead -- a
+/// divergence in the safe direction, recorded in
+/// `docs/compliance/jq/limitations.md` rather than papered over. Reaching
+/// jq's own answer needs its incremental parser's failure classification,
+/// which is what #1723 asks for and is tracked there.
 fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
     let bytes = raw_segment.as_bytes();
     let mut values = Vec::new();
-    // Whether the *last* thing the scan looked at failed. Distinct from
-    // "any failure": `\x1e"a" 2` yields a value AND ends unresolved, and
-    // that combination is exactly what leaves real jq's incremental parser
-    // with no EOF position to report (`<unknown>`, #1542).
-    let mut trailing_unresolved = false;
     let mut pos = 0;
 
     while pos < bytes.len() {
@@ -3390,64 +3385,36 @@ fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
         if pos >= bytes.len() {
             break;
         }
-        match scan_one_json_token(bytes, pos) {
-            Some(end) => {
-                let text = &raw_segment[pos..end];
-                if !seq_value_is_valid(text) {
-                    trailing_unresolved = true;
-                    // A token that scanned but is not legal JSON is a *bad
-                    // token*: the rest of its non-whitespace run belongs to
-                    // it too, and must not be re-read as a value. `tru5`
-                    // scans only as far as `tru`, and resuming at the `5`
-                    // emitted a `5` real jq never does.
-                    pos = end;
-                    while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
-                        pos += 1;
-                    }
-                } else if seq_number_is_terminated(bytes, pos, end) {
-                    values.push((pos, end));
-                    trailing_unresolved = false;
-                    pos = end;
-                } else {
-                    // Legal JSON, but an unterminated number (rule 3). Only
-                    // *this* value is dropped -- what follows is still read,
-                    // which is why this cannot consume the run the way an
-                    // invalid token does (`\x1e1,2\n` must still emit `2`).
-                    trailing_unresolved = true;
-                    pos = end;
-                }
-            }
-            None => {
-                trailing_unresolved = true;
-                // An *unterminated* `"`/`{`/`[` swallows the rest of the
-                // record -- jq never resyncs out of one, oracle-verified:
-                // `\x1e[1,2\n` and `\x1e"a 5\n` emit nothing at all, while
-                // `\x1e1 [1,2\n` still emits the `1` that preceded it. A
-                // byte that merely cannot *start* a value is different and
-                // does resync (`\x1e} 5\n`, `\x1efals 7\n`, `\x1e-e5 7\n`
-                // all emit `7`/`5`), which is why this is keyed on the
-                // opener rather than on "the token failed".
-                if matches!(bytes[pos], b'"' | b'{' | b'[') {
-                    break;
-                }
-                // Everything else resyncs, but by how much depends on what
-                // it is. Structural punctuation is a single stray byte and
-                // jq resumes right after it (`\x1e,2\n` emits `2`); any
-                // other junk is a *bad token*, consumed whole up to the next
-                // whitespace, so its interior is never re-read as a value.
-                // Oracle-verified: `\x1e-e5 7\n`, `\x1exy5 7\n`,
-                // `\x1etru5 7\n` and `\x1e@ 7\n` all emit only `7` -- a
-                // one-byte skip would have found the `5` inside `-e5`.
-                if matches!(bytes[pos], b',' | b'}' | b']' | b':') {
-                    pos += 1;
-                } else {
-                    while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
-                        pos += 1;
-                    }
-                }
-            }
+        let Some(end) = scan_one_json_token(bytes, pos) else {
+            return SeqRecordScan::dropped();
+        };
+        if !seq_value_is_valid(&raw_segment[pos..end]) {
+            return SeqRecordScan::dropped();
         }
+        // The delimiter check. A token may be followed by whitespace, or by
+        // nothing at all (the record's end); anything else means the record
+        // is not the clean sequence of values this function is willing to
+        // split, and a scanner's guess at where the boundary really lies is
+        // precisely what fabricated output.
+        if bytes.get(end).is_some_and(|b| !b.is_ascii_whitespace()) {
+            return SeqRecordScan::dropped();
+        }
+        values.push((pos, end));
+        pos = end;
     }
+
+    // Rule 3, and the only value-level drop that survives: a bare number
+    // ending the record with no whitespace after it is ambiguous to jq's
+    // incremental scanner, which cannot rule out more digits arriving.
+    // `\x1e1 2` is `1`; `\x1e1 2 ` (trailing space) is `1` and `2`.
+    let trailing_unresolved = match values.last() {
+        Some(&(vs, ve)) if !seq_number_is_terminated(bytes, vs, ve) => {
+            values.pop();
+            true
+        }
+        Some(_) => false,
+        None => true,
+    };
     SeqRecordScan {
         values,
         trailing_unresolved,
@@ -3459,9 +3426,22 @@ struct SeqRecordScan {
     /// Byte ranges, into the record's *untrimmed* text, of every value the
     /// record yields.
     values: Vec<(usize, usize)>,
-    /// Whether the record *ends* unresolved -- see the field's own note in
-    /// `seq_record_scan`.
+    /// Whether the record ends unresolved -- a malformed record, or one
+    /// whose final value is an ambiguous bare number. This is what leaves
+    /// real jq's incremental parser with no EOF position to report
+    /// (`<unknown>`, #1542), and it is *not* the same question as "yielded
+    /// nothing": `\x1e"a" 2` yields `"a"` and still ends unresolved.
     trailing_unresolved: bool,
+}
+
+impl SeqRecordScan {
+    /// A record that yields nothing and ends unresolved.
+    fn dropped() -> Self {
+        Self {
+            values: Vec::new(),
+            trailing_unresolved: true,
+        }
+    }
 }
 
 /// Rule 3 above: a number token counts as complete only when whitespace
