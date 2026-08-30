@@ -150,12 +150,14 @@ pub fn succinctly_bin() -> &'static str {
 ///
 /// Shared by every direct-spawn CLI test helper (#1847 review) --
 /// `cli_golden_tests.rs`, `cli_characterization_tests.rs`,
-/// `deep_nesting_valid_tests.rs` and `json_validate_tests.rs` each
-/// independently dropped this retry (along with the lock-contention case
-/// that genuinely no longer applies) when first converting away from
-/// `cargo run`; sharing one copy here instead of four independently
-/// drifting ones is the same fix `classify_cargo_run_exit`'s own doc
-/// comment already describes for the exit-code-classification half of
+/// `deep_nesting_valid_tests.rs`, `json_validate_tests.rs`, and (via #1884's
+/// follow-up fix, after that file's own bespoke copy was found to have
+/// silently dropped this exact retry) `jq_cli_tests.rs` each independently
+/// dropped this retry (along with the lock-contention case that genuinely
+/// no longer applies) when first converting away from `cargo run`; sharing
+/// one copy here instead of five independently drifting ones is the same
+/// fix `classify_cargo_run_exit`'s own doc comment already describes for
+/// the exit-code-classification half of
 /// this same problem.
 ///
 /// `build` is called fresh on each retry attempt, since a spawned
