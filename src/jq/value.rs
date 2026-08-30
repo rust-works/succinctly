@@ -30,7 +30,10 @@ use super::expr::Literal;
 ///
 /// Guards [`OwnedValue::to_json`]/`to_json_for_reindex`/`==`/
 /// `eval::compare_values`/`eval.rs`'s own `to_owned`/
-/// `yq_runner::reconcile_presentation`/`output::format_json_impl`.
+/// `yq_runner::reconcile_presentation`/`output::format_json_impl`/
+/// `jq_runner::print_json` (#1819 -- moved here from the stricter,
+/// mismatched `eval_generic::MAX_NESTING_DEPTH`, see that function's own
+/// doc comment).
 ///
 /// Deliberately a *separate* constant from
 /// [`eval_generic::MAX_NESTING_DEPTH`](super::eval_generic::MAX_NESTING_DEPTH)
