@@ -138,12 +138,15 @@ pub fn succinctly_bin() -> &'static str {
 
 /// Spawns `build()` (already configured with args), optionally writing
 /// `stdin_input` to it, retrying the whole spawn+wait up to
-/// [`MAX_CARGO_RETRIES`] times if the child was killed by a signal rather
-/// than exiting with a real code -- an OOM kill, another session's
-/// `pkill`, or a stall-guard's process-group kill (`cargo-guard.sh`, by
-/// design, on a detected stall, #935) catching this specific child, all
-/// just as plausible under this repo's routine heavy concurrent
-/// multi-session load as the cargo-lock-contention case
+/// [`MAX_CARGO_RETRIES`] times on either of two transient failures: `spawn()`
+/// itself returning `ENOENT` (a concurrent, differently-featured `cargo
+/// test` invocation sharing this `target/` directory can be transiently
+/// mid-relink of the shared `succinctly_bin()` path, #550), or the spawned
+/// child being killed by a signal rather than exiting with a real code -- an
+/// OOM kill, another session's `pkill`, or a stall-guard's process-group
+/// kill (`cargo-guard.sh`, by design, on a detected stall, #935) catching
+/// this specific child, all just as plausible under this repo's routine
+/// heavy concurrent multi-session load as the cargo-lock-contention case
 /// `classify_cargo_run_exit` retries for. Unlike that function, there is
 /// no exit-101 case to also retry on here: a direct `succinctly_bin()`
 /// spawn has no cargo invocation of its own to contend on a lock.
@@ -152,13 +155,17 @@ pub fn succinctly_bin() -> &'static str {
 /// `cli_golden_tests.rs`, `cli_characterization_tests.rs`,
 /// `deep_nesting_valid_tests.rs`, `json_validate_tests.rs`, and (via #1884's
 /// follow-up fix, after that file's own bespoke copy was found to have
-/// silently dropped this exact retry) `jq_cli_tests.rs` each independently
-/// dropped this retry (along with the lock-contention case that genuinely
-/// no longer applies) when first converting away from `cargo run`; sharing
-/// one copy here instead of five independently drifting ones is the same
-/// fix `classify_cargo_run_exit`'s own doc comment already describes for
-/// the exit-code-classification half of
-/// this same problem.
+/// silently dropped signal-death retry) `jq_cli_tests.rs` each independently
+/// dropped some or all of this retry surface (along with the lock-contention
+/// case that genuinely no longer applies) when first converting away from
+/// `cargo run`; sharing one copy here instead of five independently
+/// drifting ones is the same fix `classify_cargo_run_exit`'s own doc comment
+/// already describes for the exit-code-classification half of this same
+/// problem. (#1884 code review, round 3: this function's own `spawn()` call
+/// used a bare `?` with no `ENOENT` handling until this paragraph's fix --
+/// the one piece of `spawn_jq_full`'s old protection that got lost when
+/// `jq_cli_tests.rs` first adopted this shared helper, since this function
+/// didn't have it either at the time.)
 ///
 /// `build` is called fresh on each retry attempt, since a spawned
 /// `std::process::Command` cannot be reused. `stdout`/`stderr` are always
@@ -203,7 +210,16 @@ pub fn spawn_with_signal_retry(
             } else {
                 std::process::Stdio::null()
             });
-        let mut child = command.spawn()?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < MAX_CARGO_RETRIES =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if let Some(input) = stdin_input {
             use std::io::Write;
             if let Some(mut sin) = child.stdin.take() {

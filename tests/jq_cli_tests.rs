@@ -141,24 +141,35 @@ fn run_jq_stdin_streams(
 /// cargo writes its own `Finished`/`Running` progress lines to stderr, which
 /// would be indistinguishable from the diagnostics under test, and that also
 /// makes the lock-contention retry unnecessary. Delegates to the shared
-/// `spawn_with_signal_retry` (#1884 code review) rather than a file-local
-/// reimplementation, so this file's ~190 `run_jq_stdin`/`run_jq_null`-routed
-/// call sites get the same signal-death retry the four files #1847 migrated
-/// already share -- a file-local copy here would have been a fifth,
-/// independently-drifting one for the exact problem that helper's own doc
-/// comment says sharing one copy was meant to stop.
+/// `spawn_jq` (in turn `spawn_with_signal_retry`, #1884 code review) rather
+/// than a file-local reimplementation, so this file's ~190
+/// `run_jq_stdin`/`run_jq_null`-routed call sites get the same
+/// spawn/signal-death retry the four files #1847 migrated already share --
+/// a file-local copy here would have been a fifth, independently-drifting
+/// one for the exact problem that helper's own doc comment says sharing one
+/// copy was meant to stop.
 fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i32)> {
-    let (output, exit_code) = spawn_with_signal_retry(
+    let (output, exit_code) = spawn_jq(args, input.map(str::as_bytes))?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    Ok((stdout, stderr, exit_code))
+}
+
+/// Spawns `succinctly jq <args>`, writing `stdin_input` when `Some` -- the
+/// one place every direct-binary jq invocation in this file builds its
+/// `Command`, so a future change to how the subcommand is invoked (a new
+/// common flag, a different `succinctly_bin()` argv shape) is a single
+/// edit rather than the six near-identical copies code review found here
+/// before this consolidation (#1884).
+fn spawn_jq(args: &[&str], stdin_input: Option<&[u8]>) -> Result<(std::process::Output, i32)> {
+    spawn_with_signal_retry(
         || {
             let mut command = Command::new(succinctly_bin());
             command.arg("jq").args(args);
             command
         },
-        input.map(str::as_bytes),
-    )?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    Ok((stdout, stderr, exit_code))
+        stdin_input,
+    )
 }
 
 /// Helper to run jq with null input (-n)
@@ -4107,14 +4118,7 @@ fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
 fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, i32)> {
     let mut args: Vec<&str> = extra_args.to_vec();
     args.push(filter);
-    let (output, exit_code) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(&args);
-            command
-        },
-        Some(input),
-    )?;
+    let (output, exit_code) = spawn_jq(&args, Some(input))?;
     Ok((output.stdout, exit_code))
 }
 
@@ -4255,9 +4259,9 @@ fn test_seq_malformed_record_with_rs_byte_does_not_warn_1525() -> Result<()> {
 /// RS-containing one still warns on real jq, with one of the other
 /// message templates #1723 tracks -- not this one; not exercised here.)
 ///
-/// Spawns via `spawn_with_signal_retry` (not a bare `Command::new(...).
-/// output()`) for its retry protection against a transient `ENOENT` or a
-/// signal-killed child under concurrent load (#550, #1884).
+/// Spawns via `spawn_jq` (not a bare `Command::new(...).output()`) for its
+/// retry protection against a transient `ENOENT` or a signal-killed child
+/// under concurrent load (#550, #1884).
 #[test]
 fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<()> {
     let mut valid_file = NamedTempFile::new()?;
@@ -4266,16 +4270,7 @@ fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<
 
     let valid_path = valid_file.path().to_str().unwrap();
     let empty_path = empty_file.path().to_str().unwrap();
-    let (output, _) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command
-                .arg("jq")
-                .args(["--seq", "-c", ".", valid_path, empty_path]);
-            command
-        },
-        None,
-    )?;
+    let (output, _) = spawn_jq(&["--seq", "-c", ".", valid_path, empty_path], None)?;
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stderr)?, "");
@@ -4286,8 +4281,8 @@ fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<
 
 /// #1525: two RS-less files report a line/column computed from their
 /// *concatenation*, not either file's own content alone -- oracle-verified
-/// against the pinned jq 1.7.1 binary. Spawns via `spawn_with_signal_retry`
-/// for its retry protection, same reason as the test above.
+/// against the pinned jq 1.7.1 binary. Spawns via `spawn_jq` for its retry
+/// protection, same reason as the test above.
 #[test]
 fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
     let mut file_a = NamedTempFile::new()?;
@@ -4297,14 +4292,7 @@ fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
 
     let path_a = file_a.path().to_str().unwrap();
     let path_b = file_b.path().to_str().unwrap();
-    let (output, _) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(["--seq", "-c", ".", path_a, path_b]);
-            command
-        },
-        None,
-    )?;
+    let (output, _) = spawn_jq(&["--seq", "-c", ".", path_a, path_b], None)?;
 
     assert!(output.status.success());
     assert_eq!(
@@ -4325,14 +4313,7 @@ fn test_seq_no_rs_warning_column_counts_raw_bytes_not_substituted_1525() -> Resu
     input.push(0xFF); // invalid UTF-8 lead byte -> substituted to 3-byte U+FFFD
     input.extend_from_slice(b"cd");
 
-    let (output, _) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(["--seq", "-c", "."]);
-            command
-        },
-        Some(&input),
-    )?;
+    let (output, _) = spawn_jq(&["--seq", "-c", "."], Some(&input))?;
 
     assert!(output.status.success());
     assert_eq!(
@@ -4388,14 +4369,7 @@ fn test_seq_no_rs_warning_strips_leading_bom_1525() -> Result<()> {
     input.extend_from_slice(b"\xEF\xBB\xBF");
     input.extend_from_slice(b"1 2");
 
-    let (output, _) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(["--seq", "-c", "."]);
-            command
-        },
-        Some(&input),
-    )?;
+    let (output, _) = spawn_jq(&["--seq", "-c", "."], Some(&input))?;
 
     assert!(output.status.success());
     assert_eq!(
