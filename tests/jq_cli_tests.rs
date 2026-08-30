@@ -25755,12 +25755,15 @@ fn test_string_slice_terminal_write_runs_edit_before_refusing_1876_1883() -> Res
 /// `test_streamed_ordering_not_yet_reached_on_m2_path_1653`).
 #[test]
 fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
-    for (args, input, expected) in [
+    // (args, stdin, combined stdout+stderr, exit code) -- all four captured
+    // live from jq 1.7.1, byte for byte.
+    for (args, input, expected, expected_code) in [
         // The issue's own repro: `1` is written before `debug` is evaluated.
         (
             vec!["--unbuffered", "-cn", "1, debug, 2"],
             None,
             "1\n[\"DEBUG:\",null]\nnull\n2\n",
+            0,
         ),
         // An uncaught error is a side effect with the same ordering rule:
         // the outputs that preceded it are already on stdout.
@@ -25768,15 +25771,17 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             vec!["--unbuffered", "-cn", "1, error(\"x\"), 3"],
             None,
             "1\njq: error (at <unknown>): x\n",
+            5,
         ),
         // `halt_error` writes its payload after the earlier output. A
         // *number* payload is written as JSON with a trailing newline (a
         // string payload is the raw, newline-less case) -- captured from
-        // jq 1.7.1, byte-for-byte, rather than assumed.
+        // jq, not assumed.
         (
             vec!["--unbuffered", "-cn", "1, (2|halt_error), 3"],
             None,
             "1\n2\n",
+            5,
         ),
         // `stderr` echoes its input without a trailing newline, so the
         // interleaving is visible as `null` butting against the next line.
@@ -25784,6 +25789,7 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             vec!["--unbuffered", "-cn", "1, stderr, 2"],
             None,
             "1\nnullnull\n2\n",
+            0,
         ),
         // Per-element, through a pipe: each element's stdout write lands
         // before the next element is evaluated at all.
@@ -25791,12 +25797,14 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             vec!["--unbuffered", "-cn", "range(3) | (., debug)"],
             None,
             "0\n[\"DEBUG:\",0]\n0\n1\n[\"DEBUG:\",1]\n1\n2\n[\"DEBUG:\",2]\n2\n",
+            0,
         ),
         // `--slurp` reaches the same streaming path.
         (
             vec!["--unbuffered", "-c", "--slurp", "1, debug, 2"],
             Some("{}"),
             "1\n[\"DEBUG:\",[{}]]\n[{}]\n2\n",
+            0,
         ),
         // So does the input-queue bridge (`inputs`), which streams through
         // `eval_each_owned` rather than collecting first.
@@ -25804,10 +25812,24 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             vec!["--unbuffered", "-cn", "inputs, debug"],
             Some("1\n2\n"),
             "1\n2\n[\"DEBUG:\",null]\nnull\n",
+            0,
+        ),
+        // `-S` forces materialization and so routes here too -- one of four
+        // flags (`-S`, `-a`, `-R`, `--seq`) this fix reaches that the first
+        // draft of the compliance note failed to list.
+        (
+            vec!["--unbuffered", "-c", "-S", "1, debug, 2"],
+            Some("{}"),
+            "1\n[\"DEBUG:\",{}]\n{}\n2\n",
+            0,
         ),
     ] {
-        let (combined, _code) = run_jq_interleaved(&args, input)?;
+        let (combined, code) = run_jq_interleaved(&args, input)?;
         assert_eq!(combined, expected, "args {args:?} input {input:?}");
+        // The exit code is pinned alongside the bytes rather than derived
+        // from them: it is part of the captured behaviour for the
+        // `error(...)`/`halt_error` rows.
+        assert_eq!(code, expected_code, "exit code for {args:?}");
     }
     Ok(())
 }
