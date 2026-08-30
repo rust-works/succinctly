@@ -3265,14 +3265,17 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Tanh));
         }
         if self.matches_keyword("asinh") {
+            self.reject_unless_jq_extensions("asinh")?;
             self.consume_keyword("asinh");
             return Ok(Some(Builtin::Asinh));
         }
         if self.matches_keyword("acosh") {
+            self.reject_unless_jq_extensions("acosh")?;
             self.consume_keyword("acosh");
             return Ok(Some(Builtin::Acosh));
         }
         if self.matches_keyword("atanh") {
+            self.reject_unless_jq_extensions("atanh")?;
             self.consume_keyword("atanh");
             return Ok(Some(Builtin::Atanh));
         }
@@ -3293,26 +3296,32 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Atan2(Box::new(y), Box::new(x))));
         }
         if self.matches_keyword("asin") {
+            self.reject_unless_jq_extensions("asin")?;
             self.consume_keyword("asin");
             return Ok(Some(Builtin::Asin));
         }
         if self.matches_keyword("acos") {
+            self.reject_unless_jq_extensions("acos")?;
             self.consume_keyword("acos");
             return Ok(Some(Builtin::Acos));
         }
         if self.matches_keyword("atan") {
+            self.reject_unless_jq_extensions("atan")?;
             self.consume_keyword("atan");
             return Ok(Some(Builtin::Atan));
         }
         if self.matches_keyword("sin") {
+            self.reject_unless_jq_extensions("sin")?;
             self.consume_keyword("sin");
             return Ok(Some(Builtin::Sin));
         }
         if self.matches_keyword("cos") {
+            self.reject_unless_jq_extensions("cos")?;
             self.consume_keyword("cos");
             return Ok(Some(Builtin::Cos));
         }
         if self.matches_keyword("tan") {
+            self.reject_unless_jq_extensions("tan")?;
             self.consume_keyword("tan");
             return Ok(Some(Builtin::Tan));
         }
@@ -3600,6 +3609,7 @@ impl<'a> Parser<'a> {
 
         // skip(n; expr) - skip first n outputs from expr
         if self.matches_keyword("skip") {
+            self.reject_unless_jq_extensions("skip")?;
             self.consume_keyword("skip");
             self.skip_ws();
             self.expect('(')?;
@@ -6710,6 +6720,9 @@ mod tests {
             ("debug", "debug"),
             ("isempty", "isempty(empty)"),
             ("limit", "limit(1; .)"),
+            ("skip", "skip(1; .)"),
+            ("asin", "0.5 | asin"),
+            ("acosh", "1.5 | acosh"),
         ];
 
         for (name, filter) in cases {
