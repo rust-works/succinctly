@@ -6811,7 +6811,9 @@ fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool 
 /// call site instead, the only one of this function's four original
 /// callers that ever had a comment to place (#1828): baking that shape in
 /// here meant three call sites always passed `None` for it, each carrying
-/// a comment in this function's own doc explaining why.
+/// a comment in this function's own doc explaining why. That call site now
+/// reaches this same rendering through [`write_anchor_tag_sep`] with a
+/// `'\n'` separator, rather than its own open-coded copy (#1448).
 fn write_anchor_tag<Out: core::fmt::Write>(
     out: &mut Out,
     anchor: Option<&str>,
@@ -6824,10 +6826,12 @@ fn write_anchor_tag<Out: core::fmt::Write>(
 ///
 /// Every caller writes `&anchor`, then ` !!tag` if both are present, and
 /// nothing at all when neither is -- what differs is only what precedes it.
-/// A compact sequence item whose value goes on its own line needs a newline
-/// there rather than a space, and open-coding that one difference left a
-/// near-verbatim copy of this body inline (#1448). Parameterising the
-/// separator is the whole of the difference.
+/// The one caller that passes `'\n'` is a block mapping field whose key
+/// carried a trailing `#` comment (#1132/#1828): the comment has just been
+/// written, so the anchor/tag cannot share that line and go to column 0 on
+/// the next one. Open-coding that single difference left a near-verbatim
+/// copy of this body inline (#1448); parameterising the separator is the
+/// whole of it.
 fn write_anchor_tag_sep<Out: core::fmt::Write>(
     out: &mut Out,
     separator: char,
@@ -6883,7 +6887,10 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     unit: char,
     sort_keys: bool,
 ) -> StreamResult {
-    let absent = is_deferred_value_absent(value);
+    // Same container short-circuit as `write_yaml_child_inline` (#1448):
+    // `value()` -- and so `resolve_merge_keys` -- is not worth running for a
+    // shape `is_deferred_value_absent` can only ever answer `false` for.
+    let absent = !value.is_container() && is_deferred_value_absent(value);
     let anchor = value.anchor();
     let tag = if absent { value.explicit_tag() } else { None };
     write_anchor_tag(out, anchor, tag)?;
@@ -7055,29 +7062,29 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // same bug, and there's no separate scalar dispatch for an empty
     // container to collide with.
     //
-    // A container is *never* absent -- `is_deferred_value_absent` answers
-    // only for an unquoted empty string and returns `false` for every other
-    // shape -- so asking it about one is wasted work. It used to be computed
-    // up front for both uses below; deriving it lazily, only once the value
-    // is known not to be a container, measured ~4% off a flow-heavy 4 MB
-    // document (#1448 item 1, which asked for exactly this to be benchmarked
-    // before being changed).
-    let absent = if value.is_container() {
+    // `absent` is derived only once the value is known *not* to be a
+    // container, which is pure saving: `is_deferred_value_absent` calls
+    // `value()`, and on a mapping that runs `resolve_merge_keys` -- a walk
+    // over every field, allocating, even with no `<<` key present. #1448
+    // asked for this to be benchmarked before being changed; a probe with
+    // the check removed outright measured 11.4% on a flow-heavy 4 MB
+    // document, of which this recovers 3.0%.
+    //
+    // The safety of hard-coding `false` for a container is a property of
+    // `value()`, *not* of the predicate: `value()` short-circuits
+    // `is_container()` and returns `Sequence`/`Mapping` before it can reach
+    // any other arm, so `is_deferred_value_absent` was already returning
+    // `false` for every container. (The predicate itself answers `true` for
+    // `Null`, so "it only says yes for an empty unquoted string" would be
+    // the wrong reason -- review caught that phrasing here.)
+    let container = value.is_container();
+    let absent = !container && is_deferred_value_absent(&value);
+    if container || absent {
         if let Some(tag) = value.explicit_tag() {
             out.write_str(tag)?;
             out.write_char(' ')?;
         }
-        false
-    } else {
-        let absent = is_deferred_value_absent(&value);
-        if absent {
-            if let Some(tag) = value.explicit_tag() {
-                out.write_str(tag)?;
-                out.write_char(' ')?;
-            }
-        }
-        absent
-    };
+    }
     // A flow-context value that materializes as nothing at all still needs
     // *some* token -- unlike block style, where #1077's `write_deferred_value`
     // can just leave it out entirely -- because a following `,`/`}`/`]`
