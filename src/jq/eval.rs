@@ -27378,6 +27378,19 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // have raised (e.g. `(1, error("x")) | file_index` reported the raw
         // `1` instead of `file_index`'s resolved value, and never reported
         // an error for a `rest` that itself fails).
+        //
+        // `catch_error_under_optional(..., atomic: false)` (#1964 code
+        // review): `partial(results, outer_control)` alone reattaches
+        // `outer_control` unconditionally, never consulting this function's
+        // own `optional` parameter -- so `?` failed to suppress a trailing
+        // error once #1964 gave the `Expr::Builtin(_)`/generic-fallback arms
+        // a real `Partial` to hand this function instead of discarding it
+        // themselves beforehand (`(recurse(...if ... then error(...) ...))?`
+        // kept its prefix output correctly but then still raised, where real
+        // jq suppresses the error and keeps the prefix). `atomic: false`
+        // matches this arm's own "keep the prefix, don't discard it" shape
+        // (the same policy `Expr::Iterate`'s identical call already uses),
+        // not the array/object-construction "discard everything" policy.
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
             for v in vs {
@@ -27393,7 +27406,7 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return stop;
                 }
             }
-            partial(results, outer_control)
+            catch_error_under_optional::<W>(partial(results, outer_control), optional, false)
         }
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
     }
@@ -27529,6 +27542,14 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
+        // `catch_error_under_optional(..., atomic: false)` (#1964 code
+        // review): same gap `continue_rest_with_context`'s identical arm had
+        // -- a bare `partial(results, outer_control)` reattaches
+        // `outer_control` unconditionally, never consulting this function's
+        // own `optional` parameter, so `?` failed to suppress a trailing
+        // error while still correctly keeping the already-produced prefix.
+        // `atomic: false` matches this arm's "keep the prefix" shape, not
+        // an array/object-construction "discard everything" policy.
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
             for v in vs {
@@ -27544,7 +27565,7 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return stop;
                 }
             }
-            partial(results, outer_control)
+            catch_error_under_optional::<W>(partial(results, outer_control), optional, false)
         }
         QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => unreachable!(
             "eval_pipe_with_path_context_internal only ever produces \
@@ -27966,6 +27987,51 @@ fn eval_bind_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         None => owned_vec_to_result(all_results),
     });
     continue_rest_with_context::<W, S>(combined, rest, root, file_origin, current_path, optional)
+}
+
+/// Shared by `eval_pipe_with_path_context_internal`'s `Expr::Builtin(_)` arm
+/// and its generic `_` fallback (#1964 code review): evaluate `first` via
+/// [`eval_owned_input`] -- which preserves `Many`/`ManyOwned` instead of
+/// collapsing a multi-output expression to one value the way
+/// `eval_owned_expr_opt` used to -- then hand the result to
+/// [`continue_rest_with_context`], applying the same `optional`-swallow
+/// safety net both call sites need. Neither arm moves navigational
+/// position, so both pass `root`/`current_path` through unchanged.
+fn eval_and_continue_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    first: &Expr,
+    value: &OwnedValue,
+    rest: &[Expr],
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match eval_owned_input::<W, S>(first, value, optional) {
+        // #1280: a builtin/expression that legitimately produced nothing (a
+        // `?`-swallowed type mismatch, or its own zero-output result)
+        // contributes zero outputs to this comma/pipe branch, matching real
+        // jq's own `.a?`-style empty-not-null path semantics -- not
+        // `QueryResult::Owned(Null)`.
+        QueryResult::None => QueryResult::None,
+        // `?` swallows only a genuine error; a halt always escapes (#791).
+        // Same gate the old `eval_owned_expr_opt`-based arms applied on
+        // their own `Err(EvalEscape::Error(_))` case, kept here as a
+        // caller-level safety net even though `optional` is already
+        // threaded into `eval_owned_input` itself.
+        QueryResult::Error(_) if optional => QueryResult::None,
+        // `continue_rest_with_context`'s own `rest.is_empty()` fast path
+        // (#1445) and its `ManyOwned`/`Many` arms are what correctly fan a
+        // multi-output result through `rest` (#1964) -- no change needed
+        // there, or in `accumulate_path_context_step`, for either caller.
+        result => continue_rest_with_context::<W, S>(
+            result,
+            rest,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
+    }
 }
 
 /// Internal helper that also tracks the root value for parent navigation,
@@ -28733,58 +28799,27 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // `first` already *is* this `Expr::Builtin`, so evaluate it
             // directly rather than reconstructing an equivalent one.
             //
-            // `eval_owned_input`, not `eval_owned_expr_opt` (#1964): the
-            // latter collapses a genuinely multi-output builtin (`range`,
-            // `splits`, `recurse`, ...) into a single `OwnedValue::Array`
-            // before this arm ever sees it -- wrong whenever this branch
-            // reaches here via `Expr::Comma` (`(range(0;5), key)`), since
+            // `eval_and_continue_with_context` (#1964), not
+            // `eval_owned_expr_opt` directly: the latter collapses a
+            // genuinely multi-output builtin (`range`, `splits`, `recurse`,
+            // ...) into a single `OwnedValue::Array` before this arm ever
+            // saw it -- wrong whenever this branch reaches here via
+            // `Expr::Comma` (`(range(0;5), key)`), since
             // `accumulate_path_context_step`'s caller already knows how to
             // fan a `QueryResult::ManyOwned` out into separate branch
-            // outputs (see its own `ManyOwned` arm) -- it was never given
-            // the chance to, because this arm handed it one collapsed value
-            // instead. `eval_owned_input` preserves `Many`/`ManyOwned`
-            // (`eval.rs`'s own doc comment: "keeps Many/ManyOwned intact"),
-            // and `continue_rest_with_context` below already fans those out
-            // through `rest` per-element (its own `ManyOwned`/`Many` arms) --
-            // no change needed there or in `accumulate_path_context_step`,
-            // both already handle the shape this arm was never producing.
-            match eval_owned_input::<W, S>(first, value, optional) {
-                // #1280: a builtin that legitimately produced nothing (a
-                // `?`-swallowed type mismatch, or its own zero-output
-                // result) contributes zero outputs to this comma/pipe
-                // branch, matching real jq's own `.a?`-style empty-not-null
-                // path semantics -- not `QueryResult::Owned(Null)`.
-                QueryResult::None => QueryResult::None,
-                // `?` swallows only a genuine error; a halt always escapes
-                // (#791). Same gate the old `eval_owned_expr_opt`-based arm
-                // applied on its own `Err(EvalEscape::Error(_))` case, kept
-                // here as the same safety net even though `optional` was
-                // already threaded into `eval_owned_input` itself -- a
-                // caller-level check for whatever slips through unswallowed
-                // rather than trusting every internal call site to have
-                // applied it.
-                QueryResult::Error(_) if optional => QueryResult::None,
-                // #1313: `continue_rest_with_context` (shared with the
-                // `Expr::Object`/`Array`/`Literal` arm below and the
-                // generic fallback further below) replaces the old
-                // hand-rolled "if `rest` is empty, return; else recurse" --
-                // unlike that arm, this one keeps the enclosing `root`/
-                // `current_path` unchanged (a builtin doesn't move
-                // navigational position), so it needs no extra `.clone()`
-                // of its own the way that arm does. The helper's own
-                // `rest.is_empty()` fast path (#1445) is what keeps this
-                // arm's *value* move free too, and its own `ManyOwned`/
-                // `Many` arms are what now correctly fan out a multi-output
-                // builtin's result through `rest` (#1964).
-                result => continue_rest_with_context::<W, S>(
-                    result,
-                    rest,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ),
-            }
+            // outputs. The shared helper routes through `eval_owned_input`
+            // instead, which preserves that shape, and is shared with the
+            // generic `_` fallback below -- both arms had the identical bug
+            // and the identical fix.
+            eval_and_continue_with_context::<W, S>(
+                first,
+                value,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         // `[key]`/`[parent]`/`[file_index]` (#1302): the generic
         // `Expr::Array` arm below builds the array via `eval_owned_expr_opt`
@@ -29197,13 +29232,28 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
             // Value-constructing expressions reset the path context
             // because we're now at the "root" of a newly constructed value
-            match eval_owned_expr_opt::<S>(first, value, optional) {
+            //
+            // `eval_owned_input`, not `eval_owned_expr_opt` (#1964 code
+            // review): the identical collapse bug the `Expr::Builtin(_)`/
+            // generic-fallback arms above were fixed for also lives here --
+            // `.a | ({x:(1,2)}, key)` collapsed `(1,2)` into `{"x":[1,2]}`
+            // instead of two separate objects (confirmed live; swapping
+            // `key` for a literal, `.a | ({x:(1,2)}, "a")`, matches jq
+            // 1.7.1's own fanned-out shape). This arm can't reuse
+            // `continue_rest_with_context`'s own `ManyOwned` handling
+            // directly, though: that shares one `root`/`current_path`
+            // across every element, correct for `Builtin`/the fallback
+            // (whose navigational position never moves) but wrong here,
+            // where *each* constructed value must become its own root --
+            // so a multi-output result loops by hand below instead,
+            // mirroring how `Expr::Comma` accumulates its own branches.
+            match eval_owned_input::<W, S>(first, value, optional) {
                 // #1280: a zero-output generator inside the construction
                 // (`{(empty): 1}`, `[empty]` behaves differently -- this is
                 // specifically the object-key-generator case) means the
                 // whole construction contributes zero outputs, matching real
                 // jq -- not a spurious `null`.
-                Ok(None) => QueryResult::None,
+                QueryResult::None => QueryResult::None,
                 // #1313: hands off to `continue_rest_with_context` (shared
                 // with the `Expr::Builtin(_)` arm above and the generic
                 // fallback further below) instead of hand-rolling "if
@@ -29217,7 +29267,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 // `intermediate` here, and this arm (unlike `Builtin`/the
                 // fallback) needs the *new* value as `root`, not the
                 // enclosing one already in scope.
-                Ok(Some(result)) => {
+                QueryResult::Owned(result) => {
                     let root = result.clone();
                     continue_rest_with_context::<W, S>(
                         QueryResult::Owned(result),
@@ -29228,10 +29278,54 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         optional,
                     )
                 }
+                // #1964: each constructed value gets its own root/reset
+                // path, then its own `rest` continuation -- see this arm's
+                // own doc comment above for why `continue_rest_with_context`
+                // can't be delegated to wholesale here the way the
+                // `Builtin`/fallback arms do.
+                QueryResult::ManyOwned(vs) => {
+                    let mut results = Vec::new();
+                    for v in vs {
+                        let root = v.clone();
+                        let step = continue_rest_with_context::<W, S>(
+                            QueryResult::Owned(v),
+                            rest,
+                            &root,
+                            file_origin,
+                            &[],
+                            optional,
+                        );
+                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            return stop;
+                        }
+                    }
+                    owned_vec_to_result(results)
+                }
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791).
-                Err(EvalEscape::Error(_)) if optional => QueryResult::None,
-                Err(escape) => escape.into(),
+                QueryResult::Error(_) if optional => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                QueryResult::Break(label) => QueryResult::Break(label),
+                QueryResult::Halt(code) => QueryResult::Halt(code),
+                // A `Partial`'s own trailing control still discards the
+                // already-produced prefix here, matching this arm's
+                // pre-#1964 behavior for the escape case -- unlike the
+                // `Builtin`/fallback arms (#1964 code review), extending
+                // prefix-streaming to this arm would need each
+                // already-produced value to also get its own root/`rest`
+                // treatment before the escape fires, a separate, unverified
+                // extension not attempted here; #1964 scoped this fix to
+                // the reported multi-output-with-no-escape case.
+                QueryResult::Partial(_, control) => match control {
+                    Control::Error(e) => QueryResult::Error(e),
+                    Control::Break(label) => QueryResult::Break(label),
+                    Control::Halt(code) => QueryResult::Halt(code),
+                },
+                QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => {
+                    unreachable!(
+                        "eval_owned_input never returns a borrowed-cursor variant (see its own doc comment)"
+                    )
+                }
             }
         }
         Expr::If {
@@ -29472,44 +29566,24 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // For other expressions, evaluate normally and continue
             // Note: This loses path context for complex expressions
             //
-            // `eval_owned_input`, not `eval_owned_expr_opt` (#1964): this
-            // fallback is what a genuinely multi-output expression with no
-            // dedicated arm -- `Expr::Range` (`range(0;5)`) is the actual
-            // AST node the issue's own repro hits, not `Expr::Builtin(_)`
-            // above, despite the issue's own "root cause" section naming
-            // that arm; same underlying bug, same fix, different arm -- and
-            // `Comma`/arbitrary sub-pipes reach when `needs_path_context`'s
-            // own recursion has no more specific arm for them. Same
-            // rationale as the `Expr::Builtin(_)` arm's identical fix
-            // above: `eval_owned_expr_opt` collapsed every case here into a
-            // single `OwnedValue::Array` before `continue_rest_with_context`/
-            // `accumulate_path_context_step` (both already `ManyOwned`-aware)
-            // ever got a chance to fan it out.
-            match eval_owned_input::<W, S>(first, value, optional) {
-                // #1280: a legitimately-empty result (a `?`-swallowed type
-                // mismatch reached through this generic fallback) is zero
-                // outputs, matching real jq -- not a spurious `null`.
-                QueryResult::None => QueryResult::None,
-                // `?` swallows only a genuine error; a halt always escapes
-                // (#791). Same safety net as the `Expr::Builtin(_)` arm
-                // above.
-                QueryResult::Error(_) if optional => QueryResult::None,
-                // #1313: same `continue_rest_with_context` hand-off as the
-                // `Expr::Builtin(_)` arm above -- root/current_path stay
-                // unchanged (this arm never moves navigational position
-                // either, it just loses further path *tracking* for
-                // whatever it evaluates). Its own `ManyOwned`/`Many` arms
-                // now correctly fan out a multi-output expression's result
-                // through `rest` (#1964).
-                result => continue_rest_with_context::<W, S>(
-                    result,
-                    rest,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ),
-            }
+            // `eval_and_continue_with_context` (#1964), shared with the
+            // `Expr::Builtin(_)` arm above -- this fallback is what a
+            // genuinely multi-output expression with no dedicated arm hits:
+            // `Expr::Range` (`range(0;5)`) is the actual AST node #1964's
+            // own repro exercised, not `Expr::Builtin(_)` as that issue's
+            // "root cause" section named, despite the identical underlying
+            // bug and fix. `Comma`/arbitrary sub-pipes reach here too,
+            // whenever `needs_path_context`'s own recursion has no more
+            // specific arm for them.
+            eval_and_continue_with_context::<W, S>(
+                first,
+                value,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
     }
 }

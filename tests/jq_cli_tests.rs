@@ -20364,20 +20364,25 @@ fn test_path_context_builtin_arm_multi_output_fans_out_1964() -> Result<()> {
     Ok(())
 }
 
-/// #1937/#1964: the generic `_` fallback arm (`eval_pipe_with_path_context_internal`)
-/// backs far more than argument-fan-out builtins -- it's also how a
-/// zero-arg generator (`recurse`, `range`, `..`) or an arbitrary comma
-/// branch gets evaluated whenever a sibling `key`/`parent`/`file_index`
-/// forces the whole pipe through path-context routing. #1937's own
-/// investigation found and rejected a "take first" fix attempt here (it
-/// silently discarded every `recurse` output but the first, with no error
-/// at all -- confirmed live during that PR's `/code-review`). #1964's
-/// `eval_owned_input` fix closes the gap without that regression: `recurse`'s
-/// 3 outputs now each pair with `key`'s own output, matching real jq's own
-/// fan-out (`.a | [recurse]` gives the same 3 values, confirmed against jq
-/// 1.7.1) instead of collapsing them into one array.
+/// #1937/#1964: the `Expr::Builtin(_)` arm (`eval_pipe_with_path_context_internal`)
+/// backs far more than argument-fan-out builtins -- `recurse` (`Builtin::Recurse`)
+/// is a *zero*-arg generator reached through this same arm whenever a
+/// sibling `key`/`parent`/`file_index` forces the whole pipe through
+/// path-context routing (`range`/arbitrary comma branches with no dedicated
+/// arm instead reach the generic `_` fallback further below -- see
+/// `test_comma_range_and_key_fan_out_in_array_1964` for that arm's own
+/// coverage; this test's own name previously called this "the generic
+/// fallback arm," which #1964's own code review caught as inaccurate for
+/// `recurse` specifically). #1937's own investigation found and rejected a
+/// "take first" fix attempt here (it silently discarded every `recurse`
+/// output but the first, with no error at all -- confirmed live during that
+/// PR's `/code-review`). #1964's `eval_owned_input` fix closes the gap
+/// without that regression: `recurse`'s 3 outputs now each pair with `key`'s
+/// own output, matching real jq's own fan-out (`.a | [recurse]` gives the
+/// same 3 values, confirmed against jq 1.7.1) instead of collapsing them
+/// into one array.
 #[test]
-fn test_path_context_generic_fallback_recurse_fans_out_1964() -> Result<()> {
+fn test_path_context_builtin_arm_recurse_fans_out_1964() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &["-c", ".a | (recurse, key)"],
         Some(r#"{"a":{"b":{"c":1}}}"#),
@@ -20421,6 +20426,53 @@ fn test_comma_range_and_key_fan_out_through_limit_1964() -> Result<()> {
     )?;
     assert_eq!(code, 0, "err={err}");
     assert_eq!(out, "[0,1]\n");
+    Ok(())
+}
+
+/// #1964 code review: the `Expr::Object`/`Array`/`Literal` arm has the
+/// identical collapse bug the `Expr::Builtin(_)`/generic-fallback arms were
+/// fixed for -- a `/code-review` finder demonstrated it live even though
+/// this PR's own first draft (incorrectly) documented this arm as "not
+/// known to be live-reachable" with a genuine multi-output result.
+/// `Expr::Object`/`Array`/`Literal` isn't itself in `needs_path_context`'s
+/// own recursion, but that's irrelevant here: routing through this whole
+/// evaluator is decided at the *enclosing* comma/pipe level, so an object
+/// construction with its own internal generator still lands in this arm
+/// whenever a sibling `key` forces the enclosing comma through path-context
+/// routing. Confirmed against jq 1.7.1 with a literal substituted for `key`:
+/// `.a | ({x:(1,2)}, "a")` gives the identical 3-value sequence.
+#[test]
+fn test_path_context_object_arm_multi_output_fans_out_1964() -> Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", ".a | ({x:(1,2)}, key)"], Some(r#"{"a":"x"}"#))?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "{\"x\":1}\n{\"x\":2}\n\"a\"\n");
+    Ok(())
+}
+
+/// #1964 code review: fixing the `Expr::Builtin(_)`/generic-fallback arms to
+/// hand `continue_rest_with_context` a real `Partial` (instead of
+/// discarding the prefix themselves, as `eval_owned_expr_opt` used to)
+/// exposed a latent gap in `continue_rest_with_context` itself: its own
+/// `Partial` arm reattached the trailing control unconditionally, never
+/// consulting its own `optional` parameter -- so `?` correctly kept a
+/// generator's already-produced prefix but then failed to suppress the
+/// trailing error, where real jq's `?` suppresses it. Fixed by routing
+/// through the existing `catch_error_under_optional` helper (the same one
+/// `Expr::Iterate`/`Builtin::Map` already use for their own "keep the
+/// prefix, gate only the error" policy) instead of a bare `partial(...)`.
+/// The identical fix was also applied to `continue_rest_with_fresh_root`'s
+/// twin `Partial` arm, which had the same gap.
+#[test]
+fn test_path_context_optional_suppresses_trailing_error_after_partial_output_1964() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            r#".a | (recurse(if type=="object" then error("boom") else empty end))? | key"#,
+        ],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "\"a\"\n");
     Ok(())
 }
 

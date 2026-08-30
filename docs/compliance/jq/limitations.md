@@ -1938,7 +1938,7 @@ protocol for `resolve_node`, the same shape `eval_each_owned` already gives valu
 evaluation) rather than attempted here; the narrow `first`/`limit` fixes already close
 the two shapes named in #1906/#1935's own repros.
 
-### A generator-argument expression used to fan out normally, then silently narrow to a single array the moment `key`/`parent`/`file_index` showed up anywhere else in the same pipe -- fixed for 2 of 4 sites
+### A generator-argument expression used to fan out normally, then silently narrow to a single array the moment `key`/`parent`/`file_index` showed up anywhere else in the same pipe -- fixed for 3 of 4 sites
 
 [#1277](https://github.com/rust-works/succinctly/issues/1277)'s clusters 1-3
 (closed by [#1522](https://github.com/rust-works/succinctly/issues/1522)/[#1279](https://github.com/rust-works/succinctly/issues/1279))
@@ -1993,17 +1993,26 @@ dedicated arm. Take-first would have silently and permanently discarded 2 of
 `recurse`'s 3 outputs with no error and no trace -- reverted before merging.
 
 **[#1964](https://github.com/rust-works/succinctly/issues/1964) closed the
-gap properly for the 2 sites that actually needed it**, without take-first's
-regression: the `Expr::Builtin(_)` arm and the generic `_` fallback now
+gap properly for 3 of the 4 sites**, without take-first's regression: the
+`Expr::Builtin(_)` arm, the generic `_` fallback, and (added during that
+issue's own `/code-review`, after a finder disproved the "not known to be
+live-reachable" claim below) the `Expr::Object`/`Array`/`Literal` arm now
 route through `eval_owned_input` (which preserves `Many`/`ManyOwned`)
 instead of `eval_owned_expr_opt` (which collapsed to one value).
 `continue_rest_with_context`/`accumulate_path_context_step` -- the functions
 that actually fan a `Comma` branch's output back out into the enclosing
 computation -- already handled `ManyOwned` correctly; they just never used
-to receive one from these two arms. No change was needed to either of them,
-or to `eval_owned_expr_full`/`result_to_owned_full` at all -- #1937's
+to receive one from these three arms. No change was needed to either of
+them, or to `eval_owned_expr_full`/`result_to_owned_full` at all -- #1937's
 mistake was treating this as a policy question for a shared helper, when it
-was really a "the wrong function got called" bug local to these two arms.
+was really a "the wrong function got called" bug local to a handful of arms.
+The `Expr::Object`/`Array`/`Literal` arm couldn't reuse
+`continue_rest_with_context`'s own `ManyOwned` handling directly, though:
+that shares one `root`/`current_path` across every element, correct for
+`Builtin`/the fallback (whose navigational position never moves) but wrong
+here, where *each* constructed value must become its own root -- so that
+arm loops by hand instead, mirroring how `Expr::Comma` accumulates its own
+branches.
 
 ```console
 $ echo '{"a":{"b":{"c":1}}}' | succinctly jq -c '.a | (recurse, key)'
@@ -2013,23 +2022,46 @@ $ echo '{"a":{"b":{"c":1}}}' | succinctly jq -c '.a | (recurse, key)'
 "a"
 $ echo '{"a":"x"}' | succinctly jq -c '.a | [(range(0;5), key)]'
 [0,1,2,3,4,"a"]
+$ echo '{"a":"x"}' | succinctly jq -c '.a | ({x:(1,2)}, key)'
+{"x":1}
+{"x":2}
+"a"
 ```
 
-Both now match real jq's own fan-out shape (confirmed against jq 1.7.1 with
-a literal substituted for `key`, which has no oracle):
-`jq -c '.a | [recurse]'` and `jq -c '.a | [(range(0;5), "a")]'` give the
-identical value sequences.
+All three now match real jq's own fan-out shape (confirmed against jq 1.7.1
+with a literal substituted for `key`, which has no oracle):
+`jq -c '.a | [recurse]'`, `jq -c '.a | [(range(0;5), "a")]'`, and
+`jq -c '.a | ({x:(1,2)}, "a")'` give the identical value sequences.
 
-**Two sites remain unfixed**: `ParentN`'s own `n` argument (`parent((1,2))`
+**Fixing the `Expr::Builtin(_)`/fallback arms surfaced one further latent
+bug, in shared code neither #1937 nor #1964's first draft touched**:
+`continue_rest_with_context` (and its twin, `continue_rest_with_fresh_root`)
+each have a `Partial` arm that pipes an already-produced prefix through
+`rest` before reattaching the trailing `Control` -- but neither one gated
+that reattachment on their own `optional` parameter, so `?` correctly kept
+the prefix but then failed to suppress the trailing error:
+
+```console
+$ echo '{"a":{"b":{"c":1}}}' | succinctly jq -c \
+    '.a | (recurse(if type=="object" then error("boom") else empty end))? | key'
+# before this fix: "a" printed, then "boom" raised anyway, exit 5 -- `?` didn't suppress it
+# after:           "a"                                                exit 0 -- matches jq (substituting a literal for `key`)
+```
+
+This was unreachable before #1964 gave these two arms a real `Partial` to
+hand `continue_rest_with_context` in the first place (previously,
+`eval_owned_expr_opt` intercepted the shape itself and discarded the prefix
+entirely -- a different, separately-known bug). Fixed by routing both
+functions' `Partial` arms through the existing `catch_error_under_optional`
+helper (the same one `Expr::Iterate`/`Builtin::Map` already use for this
+exact "keep the prefix, gate only the error" policy) instead of a bare
+`partial(...)` call.
+
+**One site remains unfixed**: `ParentN`'s own `n` argument (`parent((1,2))`
 still array-collapses `n` to `[1,2]`, then errors on the wrong type -- a
-narrower, lower-traffic case than the two builtin/fallback arms #1964
-covered, not attempted there) and the `Expr::Object`/`Array`/`Literal` arm
-(in practice not known to be live-reachable with a genuine `Many`/`ManyOwned`
-result -- `Expr::Object` isn't included in `needs_path_context`'s own
-recursion, and `Array`/`Literal` collect an inner generator into one
-container value rather than splitting across top-level outputs, per #1937's
-own review investigation). Full fan-out for these two, if ever needed,
-remains out of scope per #1522's design doc.
+narrower, lower-traffic case than the three arms fixed above, not attempted
+here). Full fan-out for it, if ever needed, remains out of scope per
+#1522's design doc.
 
 ## Provenance
 
