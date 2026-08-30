@@ -392,7 +392,7 @@ otherwise-verified fix (which is strictly more correct than what it replaced: it
 real regression at `-I=4` introduced mid-fix and two cases pre-#1485 `main` never got right
 at all, `-I=5`/`-I=6`).
 
-### `input`, `inputs`, `input_line_number` — resolved, rejected unconditionally like real yq
+### `input`, `inputs`, `input_line_number` — resolved as a call target, matching real yq's lexer
 
 Real yq has no such builtins at any arity — its lexer rejects the identifiers exactly as it
 rejects a name that does not exist
@@ -404,8 +404,8 @@ $ printf 'a: 1\n' | yq 'inputs'      # Error: 1:1: lexer: invalid input text "in
 $ printf 'a: 1\n' | yq 'no_such_fn'  # Error: 1:1: lexer: invalid input text "no_such_fn"
 ```
 
-succinctly now matches this unconditionally, in the parser (`reject_in_yq_mode`,
-[src/jq/parser.rs](../../../src/jq/parser.rs)) rather than at dispatch
+succinctly now matches this unconditionally *as a call target*, in the parser
+(`reject_in_yq_mode`, [src/jq/parser.rs](../../../src/jq/parser.rs)) rather than at dispatch
 (`input_builtins_unsupported_in_yq_mode`, [src/jq/eval.rs](../../../src/jq/eval.rs), added by
 #723):
 
@@ -414,11 +414,20 @@ $ printf 'a: 1\n' | succinctly yq 'input'
 Error: parse error: parse error at position 0: input is not supported in yq mode
 ```
 
-This closes the one divergence this section used to record: dispatch only fires for a call
-site that's actually *reached*, so `if false then input else . end` used to be silently
+This closes the call-target divergence this section used to record: dispatch only fires for a
+call site that's actually *reached*, so `if false then input else . end` used to be silently
 accepted instead of rejected — pinned by
 `test_yq_unreached_input_builtin_now_rejected_1507`
-([tests/yq_cli_tests.rs](../../../tests/yq_cli_tests.rs)).
+([tests/yq_cli_tests.rs](../../../tests/yq_cli_tests.rs)). It does **not** close every route to
+these three names: a bare object-construction key (`{input: 5}`) bypasses `reject_in_yq_mode`
+entirely, since that parses through a different code path
+(`parse_object_construction`'s bare-identifier-key branch) that never reaches
+`try_parse_builtin`. That's one instance of a wider, pre-existing, undocumented divergence —
+succinctly's object-key grammar accepts jq's permissive bare identifiers unconditionally,
+with no yq-mode restriction, for *any* name (`{foo: 5}` succeeds the same way) — tracked
+separately as [#1966](https://github.com/rust-works/succinctly/issues/1966) rather than folded
+into this fix, since properly closing it means deciding how strict `succinctly yq`'s
+object-key grammar should be relative to jq's, not a small patch scoped to 3 names.
 
 **Deliberately *not* routed through the `--jq-extensions` gate** the ~65 other jq-only
 builtins use, even though real yq lacks all of them the same way. That flag's contract
