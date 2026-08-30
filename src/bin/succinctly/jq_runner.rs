@@ -3245,7 +3245,7 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     // real jq, not `[1,2]`, even though "2" alone is perfectly valid JSON.
     // Computed once, up front, and checked only against the last segment
     // below -- the already-malformed case is caught either way (this
-    // check, or `seq_record_parses` failing on its own a few lines down),
+    // check, or `seq_record_scan` failing on its own a few lines down),
     // but the ambiguous-number case parses just fine on its own and needs
     // this explicit exclusion to be dropped at all.
     let drop_trailing = seq_trailing_record_is_dropped(s);
@@ -3268,10 +3268,27 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 
         // Full (both-sides) trim to decide parse-eligibility -- matches
         // the original per-segment `segment.trim()` check exactly.
-        let segment = s[start..raw_end].trim();
+        let raw_segment = &s[start..raw_end];
+        let segment = raw_segment.trim();
         if segment.is_empty() {
             continue;
         }
+        // Anything before the *first* RS byte is not a record at all, and
+        // real jq discards it however well-formed it is: `printf '"a"
+        // \x1e3\n' | jq --seq -c .` prints only `3`. Segment 0 is that
+        // prefix whenever the input has an RS byte -- and when it has none,
+        // segment 0 *is* the whole input and #1525's abandonment rule below
+        // owns it instead. (A review caught this: multi-value support made
+        // a pre-existing single-value leak here emit every value in the
+        // prefix, widening the divergence rather than introducing it.)
+        if has_rs && i == 0 {
+            continue;
+        }
+        // Scanned once here and reused for both the drop decision and the
+        // value extraction below -- a review found this record being
+        // re-scanned up to three times, each pass allocating and
+        // re-tokenizing.
+        let scanned = seq_record_scan(segment);
         // Two different conditions reach `drop_trailing`, and #1723 only
         // relaxes one of them.
         //
@@ -3287,15 +3304,15 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         // an ambiguous bare number, but the values before it are real
         // output real jq emits (`\x1e1 2` => `1`), so that decision moved
         // into `seq_record_values`, per value.
-        if i == last_idx && drop_trailing && (!has_rs || !seq_record_parses(segment)) {
+        if i == last_idx && drop_trailing && (!has_rs || scanned.is_none()) {
             continue;
         }
 
         // Try to parse as JSON, silently ignore failures
-        if seq_record_parses(segment) {
+        if let Some(ranges) = scanned {
             // One RFC 7464 record can hold *more than one* JSON value, and
             // real jq emits every one of them (#1723): `\x1e1 "x" [2]\n`
-            // is three outputs, not a malformed record. `seq_record_parses`
+            // is three outputs, not a malformed record. `seq_record_scan`
             // above only answers "does this record parse at all", so the
             // split into individual values happens here, reusing the same
             // `find_json_values` scanner the ordinary document path uses.
@@ -3303,7 +3320,16 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
             // Before this, a multi-value record failed whole-segment
             // validation and was dropped in full -- silent data loss on a
             // record real jq reads fine, not merely a missing diagnostic.
-            for (v, value_end) in seq_record_values(segment, &s[start..raw_end], start, end) {
+            // `trimmed_start`, not `start`: the ranges index the *trimmed*
+            // segment, so pairing them with the untrimmed record start
+            // reported offsets that were short by the leading whitespace --
+            // enough to name the wrong line, and across files the wrong
+            // file (a review found `\x1e  "a"\n"b"\n` naming lines 0/2
+            // where jq names 1/2).
+            let trimmed_start = start + (raw_segment.len() - raw_segment.trim_start().len());
+            for (v, value_end) in
+                seq_record_values(segment, raw_segment, &ranges, trimmed_start, end)
+            {
                 results.push((v, value_end));
             }
         }
@@ -3313,19 +3339,17 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     results
 }
 
-/// Every JSON value inside one already-parse-checked `--seq` record, paired
-/// with the absolute end offset each value should report (#1723).
+/// Every JSON value inside one `--seq` record, paired with the absolute end
+/// offset each value should report (#1723).
 ///
-/// `segment` is the trimmed record text and `raw_segment` the *untrimmed*
-/// text between record boundaries -- both are needed: values are scanned out
-/// of the trimmed text, but the trailing-whitespace question below can only
-/// be asked of the untrimmed one (asking the trimmed text makes every bare
-/// number look unterminated, which silently dropped even a plain `\x1e1\n`
-/// in the first draft of this function). `segment_start` is the record's
-/// offset in the whole input, and `trimmed_end` its trailing-whitespace-
-/// trimmed end -- the offset the pre-#1723 single-value path reported, kept
-/// as the last value's end so a one-value record's reported line is
-/// byte-identical to before.
+/// `segment` is the trimmed record text and `ranges` its values' byte ranges
+/// within it (from [`seq_record_scan`], computed once by the caller rather
+/// than re-derived here -- a review found this function re-scanning a record
+/// the caller had already scanned twice). `trimmed_start`/`trimmed_end` are
+/// that trimmed text's own absolute bounds, so an earlier value's reported
+/// offset lands on the value itself; the last value keeps `trimmed_end`
+/// exactly, so a one-value record's reported line stays byte-identical to
+/// the pre-#1723 single-value path.
 ///
 /// **The last value can still be dropped.** Real jq's incremental number
 /// scanner cannot rule out more digits arriving while a bare number is the
@@ -3344,39 +3368,31 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
 fn seq_record_values(
     segment: &str,
     raw_segment: &str,
-    segment_start: usize,
+    ranges: &[(usize, usize)],
+    trimmed_start: usize,
     trimmed_end: usize,
 ) -> Vec<(OwnedValue, usize)> {
-    let Some((text, ranges)) = seq_record_scan(segment) else {
-        // `seq_record_parses` said yes and this says no: nothing to emit,
-        // and no error channel here by design (RFC 7464 drops the record
-        // either way).
-        return Vec::new();
-    };
-    let text = text.as_ref();
-
     let mut out = Vec::new();
     let last = ranges.len().saturating_sub(1);
-    for (i, (vs, ve)) in ranges.iter().copied().enumerate() {
+    for (i, &(vs, ve)) in ranges.iter().enumerate() {
         let is_last = i == last;
-        if is_last && seq_record_last_value_is_ambiguous(&text[vs..ve], raw_segment) {
+        let value_text = &segment[vs..ve];
+        if is_last && seq_record_last_value_is_ambiguous(value_text, raw_segment) {
             continue;
         }
-        let Ok(v) = crate::output::json_bytes_to_owned_value(&text.as_bytes()[vs..ve]) else {
+        let Some(v) = seq_value_to_owned(value_text) else {
             // Parses but will not decode (#1247): dropped, exactly as the
             // pre-#1723 single-value path dropped it.
             continue;
         };
-        // The last value keeps the record's own trimmed end so a
-        // single-value record reports the identical line it always did;
-        // earlier values report their own end, which is what jq's
-        // per-value line reporting needs.
-        let end = if is_last {
-            trimmed_end
-        } else {
-            segment_start + ve
-        };
-        out.push((v, end));
+        out.push((
+            v,
+            if is_last {
+                trimmed_end
+            } else {
+                trimmed_start + ve
+            },
+        ));
     }
     out
 }
@@ -3391,59 +3407,56 @@ fn seq_record_last_value_is_ambiguous(value_text: &str, raw_segment: &str) -> bo
     is_bare_number && raw_segment.trim_end() == raw_segment
 }
 
-/// Whether a trimmed, non-empty `--seq` record segment parses as JSON --
-/// [`parse_json_seq_with_ends`]'s own per-segment success check, factored out so
-/// [`seq_trailing_record_is_dropped`] can ask the identical question about
-/// one specific segment without duplicating the leading-zero retry logic.
-fn seq_record_parses(segment: &str) -> bool {
-    seq_record_scan(segment).is_some()
+/// Split a trimmed, non-empty `--seq` record into its JSON values' byte
+/// ranges, or `None` if it is malformed.
+///
+/// One record can hold more than one value (#1723), so this cannot be the
+/// single whole-segment `validate::validate` call it was before -- that call
+/// is what made `\x1e1 2\n` look malformed and silently dropped both values.
+/// Each range is *still* validated strictly and individually, so the scanner
+/// (a tokenizer, not a validator) cannot widen what `--seq` accepts:
+/// `find_json_values` locates the boundaries, `validate::validate` decides
+/// whether each one is legal JSON.
+///
+/// **Ranges index `segment` itself, never a normalized copy.** #1243's
+/// leading-zero retry is applied per value instead, to decide validity and
+/// again to build the value. Re-scanning a normalized string was an offset
+/// bug a review caught: `normalize_leading_zero_numbers` *deletes* leading
+/// zeros rather than rewriting in place, so ranges taken from the normalized
+/// text are shorter than the original and name the wrong line
+/// (`\x1e0007\n"b"\n` reported lines 0/2 where jq reports 1/2).
+fn seq_record_scan(segment: &str) -> Option<Vec<(usize, usize)>> {
+    let ranges = find_json_values(segment.as_bytes()).ok()?;
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges
+        .iter()
+        .all(|&(a, b)| seq_value_is_valid(&segment[a..b]))
+        .then_some(ranges)
 }
 
-/// The text a `--seq` record's values were scanned out of, and each value's
-/// `(start, end)` range within it.
-///
-/// The text is a `Cow` because the leading-zero retry (#1243) has to scan a
-/// *normalized* copy, while the ordinary case borrows the record as-is.
-type SeqRecordScan<'a> = (Cow<'a, str>, Vec<(usize, usize)>);
+/// Whether one value out of a `--seq` record is legal JSON, allowing the
+/// same leading-zero form (`007e5`) `--seq` has accepted since #1243.
+fn seq_value_is_valid(value_text: &str) -> bool {
+    if validate::validate(value_text.as_bytes()).is_ok() {
+        return true;
+    }
+    let normalized = normalize_leading_zero_numbers(value_text);
+    normalized != value_text && validate_json_str(&normalized).is_ok()
+}
 
-/// Split a trimmed, non-empty `--seq` record into its JSON values, or `None`
-/// if it is malformed.
-///
-/// One record can hold more than one value (#1723), so this cannot be a
-/// single whole-segment `validate::validate` call the way it was before --
-/// that call is what made `\x1e1 2\n` look malformed and silently dropped
-/// both values. Each extracted value is *still* validated strictly and
-/// individually, so the scanner (which is a tokenizer, not a validator)
-/// cannot widen what this accepts: `find_json_values` locates the value
-/// boundaries, `validate::validate` decides whether each one is legal JSON.
-///
-/// The leading-zero retry (`007e5`) is unchanged in effect, just expressed
-/// as a second pass over the normalized text; offsets stay usable across it
-/// because normalization only rewrites digits in place, never reorders or
-/// inserts.
-fn seq_record_scan(segment: &str) -> Option<SeqRecordScan<'_>> {
-    let normalized = normalize_leading_zero_numbers(segment);
-    let mut candidates: Vec<Cow<'_, str>> = vec![Cow::Borrowed(segment)];
-    // Only worth a second pass when normalization actually changed
-    // something; identical text would fail the identical way.
-    if normalized != segment {
-        candidates.push(Cow::Owned(normalized));
+/// One `--seq` record value as an `OwnedValue`, applying #1243's
+/// leading-zero normalization to that value alone.
+fn seq_value_to_owned(value_text: &str) -> Option<OwnedValue> {
+    if let Ok(v) = crate::output::json_bytes_to_owned_value(value_text.as_bytes()) {
+        return Some(v);
     }
-    for text in candidates {
-        let Ok(ranges) = find_json_values(text.as_bytes()) else {
-            continue;
-        };
-        if ranges.is_empty() {
-            continue;
-        }
-        if ranges
-            .iter()
-            .all(|&(a, b)| validate::validate(&text.as_bytes()[a..b]).is_ok())
-        {
-            return Some((text, ranges));
-        }
+    let normalized = normalize_leading_zero_numbers(value_text);
+    if normalized == value_text {
+        return None;
     }
-    None
+    crate::output::json_bytes_to_owned_value(normalized.as_bytes()).ok()
 }
 
 /// Whether `raw`'s trailing `--seq` record (RFC 7464, everything after the
@@ -3455,7 +3468,7 @@ fn seq_record_scan(segment: &str) -> Option<SeqRecordScan<'_>> {
 ///
 /// Two shapes, both silently swallowed by real jq's own `--seq` reader:
 ///
-/// - **Genuinely malformed/truncated** -- [`seq_record_parses`] fails on it
+/// - **Genuinely malformed/truncated** -- [`seq_record_scan`] returns `None`
 ///   (an unterminated string/object, e.g.), matching
 ///   [`parse_json_seq_with_ends`]'s own silent-drop rule (RFC 7464's
 ///   recommended failure mode, #1243).
@@ -3490,11 +3503,17 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     if segment.is_empty() {
         return false;
     }
-    if !seq_record_parses(segment) {
+    let Some(ranges) = seq_record_scan(segment) else {
         return true;
-    }
-    let is_bare_number = matches!(segment.as_bytes().first(), Some(b'-' | b'0'..=b'9'));
-    is_bare_number && tail.trim_end() == tail
+    };
+    // The record's *last* value decides this, not its first byte. Before
+    // #1723 a record was always exactly one value, so the two were the same
+    // question; now they are not, and asking the first byte gets both
+    // multi-value shapes wrong in opposite directions -- a review found
+    // `\x1e"a" 2` reporting a line where jq reports `<unknown>`, and
+    // `\x1e1 "a"` the reverse.
+    let (vs, ve) = ranges[ranges.len() - 1];
+    seq_record_last_value_is_ambiguous(&segment[vs..ve], tail)
 }
 
 /// Whether `--seq -s`'s trailing record, read across every file on the
