@@ -21886,8 +21886,9 @@ fn test_yq_unreached_input_builtin_now_rejected_1507() -> Result<()> {
         "if false then input_line_number else . end",
     ] {
         for extra_args in [[].as_slice(), ["--jq-extensions"].as_slice()] {
-            let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", extra_args)?;
+            let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", extra_args)?;
             assert_eq!(code, 1, "{filter} ({extra_args:?}) stderr: {stderr}");
+            assert_eq!(out, "", "{filter} ({extra_args:?}) should write no stdout");
             assert!(
                 stderr.contains("is not supported in yq mode"),
                 "{filter} ({extra_args:?}) stderr: {stderr}"
