@@ -18472,9 +18472,12 @@ fn get_path_mut<'a>(
 /// either forwards its single recursive call's answer unchanged, or, where
 /// it can suppress a write itself (an `optional`/yq-no-op branch, or an
 /// `Iterate`/mid-chain arm that legitimately touches zero or many
-/// elements), reports its own outcome directly. The only consumer today is
-/// `through_slice`'s `Null`/`Array`/`String` arms, which use it to
-/// distinguish `|= empty` from a literal `null` write.
+/// elements), reports its own outcome directly. Consumed in three places:
+/// `through_slice`'s `Null`/`Array`/`String` arms (to distinguish `|=
+/// empty` from a literal `null` write), the mid-chain `Pipe` arm's
+/// "stranded" autoviv-undo check, and -- since #1916 -- this function's own
+/// terminal `Field`/`Index`/`Iterate` arms, which delete the key/element
+/// outright on `false` instead of leaving it `null`.
 fn update_path<S: EvalSemantics>(
     root: &mut OwnedValue,
     path_expr: &Expr,
@@ -18521,11 +18524,7 @@ fn update_path<S: EvalSemantics>(
             // only the filter's *first* output, never an array of every
             // output (#392) -- `eval_owned_expr` collapsed a multi-output
             // result into exactly that array (`.a |= (1,2)` produced
-            // `{"a":[1,2]}` instead of jq's `{"a":1}`). A zero-output
-            // filter still falls back to `Null` here -- `.a |= empty`
-            // leaves `"a":null` rather than deleting the key the way real
-            // jq does, a separate, pre-existing bug this fix does not
-            // change.
+            // `{"a":[1,2]}` instead of jq's `{"a":1}`).
             //
             // `_first`, not the plain `eval_owned_multi` (#694): jq's
             // `_modify` only ever observes the update filter's first
@@ -18533,23 +18532,40 @@ fn update_path<S: EvalSemantics>(
             // surface -- `.a |= (1, error("x"))` is `{"a":1}` in jq 1.7.1,
             // not an error.
             //
-            // A zero-output filter still falls back to `Null` here -- `.a
-            // |= empty` leaves `"a":null` rather than deleting the key the
-            // way real jq does, a separate, pre-existing bug this fix does
-            // not change (#1877/#1894 are scoped to `through_slice`'s own
-            // arms, not this general field/index case). The `false`
-            // returned alongside it is the one place that signal
-            // originates -- see this function's own doc comment.
+            // A zero-output filter still falls back to `Null` at *this*
+            // level -- the `Field`/`Index`/`Iterate` arms above are what
+            // turn that into a real delete (#1916), by checking the
+            // `wrote` bool returned here rather than inspecting the
+            // resulting value (a legitimate `.a |= null` also leaves
+            // `Null` behind, and must not be deleted).
             let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
             let wrote = !outputs.is_empty();
             *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
             Ok(wrote)
         }
         Expr::Field(name) => {
+            let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_object(root);
             if let OwnedValue::Object(map) = root {
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                update_path::<S>(current, &Expr::Identity, filter_expr, optional, scalar_noop)
+                let wrote =
+                    update_path::<S>(current, &Expr::Identity, filter_expr, optional, scalar_noop)?;
+                if !wrote {
+                    // #1916: an update filter that produced no output at
+                    // all (`.a |= empty`) deletes the key instead of
+                    // leaving it `null` -- jq's `_modify` falls back to
+                    // `delpaths` here, mirroring `through_slice`'s own
+                    // `|= empty` splice (#1877/#1894). `root_was_null`
+                    // mirrors the mid-chain `Field` arm below: undo the
+                    // autovivification too if nothing ended up in it, so
+                    // `null | .a |= empty` stays `null` rather than
+                    // becoming `{}`.
+                    map.shift_remove(name);
+                    if root_was_null && map.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                }
+                Ok(wrote)
             } else if optional
                 // #1181: unconditional on the operator, unlike `scalar_noop`
                 // above (which is `container_noop`'s slice-only, #1101
@@ -18566,15 +18582,63 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
-                update_path::<S>(
-                    write_index(arr, *idx)?,
-                    &Expr::Identity,
-                    filter_expr,
-                    optional,
-                    scalar_noop,
-                )
+                // #1916: bounds-checking is deferred behind the filter,
+                // mirroring `delete_at_path`'s own `Expr::Index` arm --
+                // real jq resolves an index leniently for *reading*
+                // (`getpath`-style: any out-of-range position, either
+                // direction, reads as `null` rather than erroring) and
+                // only applies the write-time check (`write_index`,
+                // padding for a positive overshoot / erroring for a
+                // negative one) once a real value is actually about to
+                // land. Confirmed live: `.[-5] |= 99` raises "Out of
+                // bounds negative array index", but `.[-5] |= empty`
+                // silently no-ops -- the error exists only on the write
+                // path, never the read/delete one that an empty update
+                // filter takes instead.
+                let len = arr.len() as i64;
+                let actual_idx = if *idx < 0 { len + idx } else { *idx };
+                let in_bounds = actual_idx >= 0 && (actual_idx as usize) < arr.len();
+                let wrote = if in_bounds {
+                    let wrote = update_path::<S>(
+                        &mut arr[actual_idx as usize],
+                        &Expr::Identity,
+                        filter_expr,
+                        optional,
+                        scalar_noop,
+                    )?;
+                    if !wrote {
+                        arr.remove(actual_idx as usize);
+                    }
+                    wrote
+                } else {
+                    // Probe once against a detached `null`, the value
+                    // `getpath` would read here -- never run the filter
+                    // twice (#1428: a real write below reuses this
+                    // scratch's already-computed value rather than
+                    // re-invoking `filter_expr`). A `!wrote` here is a
+                    // true no-op: nothing was ever padded in, so there
+                    // is nothing to undo, matching `delpaths` silently
+                    // skipping an out-of-range index either direction.
+                    let mut scratch = OwnedValue::Null;
+                    let wrote = update_path::<S>(
+                        &mut scratch,
+                        &Expr::Identity,
+                        filter_expr,
+                        optional,
+                        scalar_noop,
+                    )?;
+                    if wrote {
+                        *write_index(arr, *idx)? = scratch;
+                    }
+                    wrote
+                };
+                if !wrote && root_was_null {
+                    *root = OwnedValue::Null;
+                }
+                Ok(wrote)
             } else if optional || noop_scalar {
                 Ok(false)
             } else {
@@ -18593,27 +18657,46 @@ fn update_path<S: EvalSemantics>(
             }
             match root {
                 OwnedValue::Array(arr) => {
-                    for elem in arr.iter_mut() {
-                        update_path::<S>(
-                            elem,
+                    // #1916: `.[] |= empty` removes every element whose
+                    // update filter produced no output, rather than
+                    // leaving it `null` (mirrors the `Field`/`Index` arms
+                    // above and `through_slice`'s own `|= empty` splice,
+                    // #1877/#1894). No `root_was_null` restore is needed
+                    // here unlike those two: an `Array` root is never
+                    // itself `Null` by the time this arm runs, and a
+                    // freshly yq-autovivified empty array is meant to
+                    // stay (#1181), not revert. Rebuilt in one pass
+                    // rather than removed in place, since a `Vec::remove`
+                    // per dropped element would be quadratic.
+                    let mut retained = vec_with_capacity(arr.len());
+                    for mut elem in core::mem::take(arr) {
+                        if update_path::<S>(
+                            &mut elem,
                             &Expr::Identity,
                             filter_expr,
                             optional,
                             scalar_noop,
-                        )?;
+                        )? {
+                            retained.push(elem);
+                        }
                     }
+                    *arr = retained;
                     Ok(true)
                 }
                 OwnedValue::Object(map) => {
-                    for value in map.values_mut() {
-                        update_path::<S>(
-                            value,
+                    let mut retained = IndexMap::with_capacity(map.len());
+                    for (key, mut value) in core::mem::take(map) {
+                        if update_path::<S>(
+                            &mut value,
                             &Expr::Identity,
                             filter_expr,
                             optional,
                             scalar_noop,
-                        )?;
+                        )? {
+                            retained.insert(key, value);
+                        }
                     }
+                    *map = retained;
                     Ok(true)
                 }
                 _ if optional || noop_scalar => Ok(false),
@@ -55717,12 +55800,14 @@ mod tests {
     }
 
     #[test]
-    fn test_update_assign_empty_rhs_characterizes_preexisting_null_bug() {
+    fn test_update_assign_empty_rhs_deletes_key_1916() {
         // Real jq deletes the key when the update filter produces no output
-        // (`.a |= empty` on `{}` is `{}`); succinctly currently leaves it
-        // `null`. Pre-existing, out of scope for #392 -- if this is ever
-        // fixed, update this test.
-        assert_eq!(outputs(b"{}", ".a |= empty"), vec![r#"{"a":null}"#]);
+        // (`.a |= empty` on `{}` is `{}`) rather than leaving it `null` --
+        // #1916 closed that gap in the `Field`/`Index`/`Iterate` terminal
+        // arms of `update_path`. This test used to characterize the
+        // pre-existing bug (`{"a":null}`); it now asserts the fixed,
+        // jq-matching answer.
+        assert_eq!(outputs(b"{}", ".a |= empty"), vec![r"{}"]);
     }
 
     #[test]
