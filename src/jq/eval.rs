@@ -40819,6 +40819,23 @@ mod tests {
             ".obj as {k: $v} | $v",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
+        // `each_as`'s `materialize_bound_values` call, `QueryResult::Many`
+        // arm with a non-empty prefix: `.arr[]` binds two values, the
+        // first (valid) converts before the second (corrupted) fails.
+        query!(
+            b"{\"arr\": [\"ok\", \"\xff\xfe\"]}",
+            "[limit(2; .arr[] as $v | $v)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // `eval_as_pattern`'s own `QueryResult::Many` arm with a non-empty
+        // prefix: `.arrs[]` binds two whole array *values* (`[$v]`
+        // destructures each), the first (valid) converts before the
+        // second (containing a corrupted element) fails.
+        query!(
+            b"{\"arrs\": [[\"ok\"], [\"\xff\xfe\"]]}",
+            "[.arrs[] as [$v] | $v]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
     }
 
     /// #1902 review: `eval_foreach`'s `init_values.is_empty()` early return
