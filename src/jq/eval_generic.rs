@@ -4047,12 +4047,11 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// feeding a `Comma` branch, etc.), the same as every other native arm in
 /// that match (`each_if_generic` and siblings) that calls `sink` directly.
 ///
-/// Reimplements, rather than reuses, [`DocumentElements::collect_cursors_checked`]'s
-/// #1677 gap check (`preceding_delimiter_ok` against the expected `,`/none
-/// for the first element) per element instead of over the whole container
-/// up front -- the array counterpart of `collect_cursors_checked`'s own
-/// per-element loop, just yielding as it goes instead of only returning once
-/// finished.
+/// Shares [`DocumentCursor::element_gap_ok`]'s #1677 gap check with
+/// [`DocumentElements::collect_cursors_checked`] rather than duplicating
+/// it -- the loop shape differs (this one yields as it goes instead of
+/// only returning once finished, since that is the entire point), but the
+/// check itself is the same one definition either way.
 ///
 /// **Deliberate divergence**, the same shape [`each_lazy_seq_iterate_sink`]'s
 /// own doc comment already accepts for `LazySeq`: a malformed comma *after*
@@ -4071,11 +4070,16 @@ fn each_lazy_array_iterate_sink<V: DocumentValue>(
     let mut elems = elements;
     let mut is_first = true;
     while let Some((cursor, next)) = elems.uncons_cursor() {
-        if let Some(pos) = cursor.text_position() {
-            let expected = if is_first { None } else { Some(b',') };
-            if !cursor.preceding_delimiter_ok(pos, expected) {
-                return Flow::Escaped(Control::Error(elems.malformed_element_error()));
-            }
+        if !cursor.element_gap_ok(is_first) {
+            // `elements.malformed_element_error()`, not `elems` (the
+            // per-iteration state at the point of failure) -- matching
+            // `collect_cursors_checked`'s own `self.malformed_element_error()`
+            // convention (#1597 code review). Every format shipped today
+            // ignores the receiver entirely (the default) or re-derives from
+            // the whole document regardless of which cursor calls it (JSON),
+            // so this has no observable effect now, but keeps both call
+            // sites' conventions identical for a future format where it might.
+            return Flow::Escaped(Control::Error(elements.malformed_element_error()));
         }
         is_first = false;
         elems = next;
