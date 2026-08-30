@@ -1975,15 +1975,32 @@ it is recorded here as a still-open policy question, matching
 [yq Limitations](../yq/limitations.md)'s "Merge-flag `+` and `d` combined" precedent for a
 divergence accepted on its merits without fitting the letter of rule 4.
 
-### `--raw-output0`'s new NUL-content error (#1830) inherits `ErrorSink`'s pre-existing exit-code stickiness (#1855) — not fixed here
+### Exit code is sticky (any-error) across multi-document input — accepted divergence, ADR-0018 rule 4 (#1855)
 
-[#1830](https://github.com/rust-works/succinctly/issues/1830) added a check rejecting a
-`--raw-output0` string whose own content contains a NUL byte, matching real jq's own refusal.
-That new error reports through the same `ErrorSink`/`sink.hit()` convention every other jq
-error in this file already uses — which means it also inherits `ErrorSink`'s existing,
-separately-tracked divergence: real jq's own exit code for an uncaught error reflects only the
-*last* top-level document processed, not "was any document rejected", where succinctly's
-`sink.hit()` is sticky for the whole run once set:
+`succinctly jq`'s exit code is a **sticky any-error** flag: once any uncaught error is
+reported anywhere during the run, the final exit code is forced to 5
+(`ErrorSink::hit()`, checked once after the whole input loop finishes, `jq_runner.rs`).
+Real jq's exit code instead reflects only the **most recently processed top-level input
+document's own outcome** — an error on an earlier document does not affect the exit code
+if a later document processes cleanly:
+
+```console
+$ printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | jq '.a / .b'
+2
+$ echo $?
+0                              # first doc errored, second succeeded -- exit 0
+$ printf '{"a":1,"b":0}\n{"a":4,"b":2}\n' | succinctly jq '.a / .b'
+2
+$ echo $?
+5                              # sink.hit() stays sticky from the first document
+```
+
+The stickiness *does* apply across multiple outputs produced by one document
+(`.[] | 1/.`), but real jq resets it at the next top-level document boundary; succinctly's
+`sink.hit()` never resets for the life of the run. [#1830](https://github.com/rust-works/succinctly/issues/1830)'s
+`--raw-output0` NUL-content check inherits the same stickiness through the same
+`ErrorSink`/`sink.hit()` convention every other jq error in this file already uses — it is
+not a separate divergence, just another error class that can trigger this one:
 
 ```console
 $ printf '"a"\n"b\u0000c"\n"d"\n' | jq -r --raw-output0 '.'
@@ -1996,11 +2013,22 @@ $ echo $?
 5                                         # sink.hit() stays sticky from the middle document
 ```
 
-This is not specific to the NUL check -- it is the general `ErrorSink` stickiness behavior,
-already filed as [#1855](https://github.com/rust-works/succinctly/issues/1855) ("jq: exit code
-is sticky (any-error) across multi-document input; real jq uses only the last document's
-outcome") before #1830 added this particular error class to the set of things that can trigger
-it. #1830 deliberately did not attempt a fix here, to avoid duplicating #1855's own scope.
+**This is a deliberate, considered divergence, not an oversight.** [#355](https://github.com/rust-works/succinctly/issues/355)
+originally found `succinctly jq` exiting 0 on *every* error — a strictly worse bug than the
+one described here — and its fix introduced today's sticky-any-error behavior on the
+reasoning that a shell script checking `$?` after a multi-document run generally wants "did
+*anything* fail," not just "did the *last* thing fail." [#1855](https://github.com/rust-works/succinctly/issues/1855)
+re-examined that decision, implemented and fully verified a jq-exact (last-document-wins)
+fix, and then closed as won't-fix rather than merge it: none of ADR-0018's four permitted
+divergence conditions literally cover this case (jq's own output is readable and nothing is
+corrupted), so per rule 4 it is recorded here as an intentional exception on its merits —
+the same footing as the `docs/plan/decode-failure-routing.md` Stage-4 precedent immediately
+above, and unlike that one, this one has a name: it is a user-facing CLI exit-code contract
+that real scripts may already depend on in its current form, and reversing it is a behavior
+change rather than a bug fix in the ordinary sense. `succinctly yq`'s own exit-code semantics
+are unaffected by any of this — real yq genuinely *is* sticky-any-error across documents,
+unlike jq, so `yq_runner.rs`'s own use of `sink.hit()` at its final exit-code check already
+matches and needs no exception recorded in [yq Limitations](../yq/limitations.md).
 
 ### `ascii_downcase`/`ascii_upcase` inside `path()` name the outer value, not jq's inner exploded-array step — no carve-out; recorded on its merits
 
