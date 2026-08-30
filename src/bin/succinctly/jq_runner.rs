@@ -3245,16 +3245,6 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     // The stream's own trailing record, when real jq's incremental reader
     // never resolves it (malformed, or an ambiguous bare number at true
     // EOF -- see `seq_trailing_record_is_dropped`), is silently dropped
-    // from the *output* too, not just from the error-location computation
-    // (#1542): `printf '\x1e1\n\x1e2' | jq --seq -s '.'` gives `[1]` on
-    // real jq, not `[1,2]`, even though "2" alone is perfectly valid JSON.
-    // Computed once, up front, and checked only against the last segment
-    // below -- the already-malformed case is caught either way (this
-    // check, or `seq_record_scan` failing on its own a few lines down),
-    // but the ambiguous-number case parses just fine on its own and needs
-    // this explicit exclusion to be dropped at all.
-    let drop_trailing = seq_trailing_record_is_dropped(s);
-
     let mut results = Vec::new();
     for (i, &start) in segment_starts.iter().enumerate() {
         let raw_end = segment_starts
@@ -3279,23 +3269,23 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         if has_rs && i == 0 {
             continue;
         }
-        // Scanned once here and reused for both the drop decision and the
-        // value extraction below -- a review found this record being
-        // re-scanned up to three times, each pass allocating and
-        // re-tokenizing. The *untrimmed* text, so the number-terminator
-        // rule can see the whitespace that trimming would remove.
-        // `i < last_idx`: this record is followed by another RS byte, which
-        // is the boundary at which a bare literal is truncatable.
-        let ranges = seq_record_scan(raw_segment, i < last_idx).values;
         // *No RS byte anywhere* is #1525's abandonment case: real jq drops
         // the entire input, however well-formed its content is (`printf
-        // '1 2\n' | jq --seq -c .` prints nothing). With an RS byte present
-        // there is nothing extra to do here -- `seq_record_scan` has already
-        // decided, per value, what this record yields, and `ranges` is empty
-        // for a record it dropped.
-        if i == last_idx && drop_trailing && !has_rs {
+        // '1 2\n' | jq --seq -c .` prints nothing). Checked *before* the
+        // scan below, which would otherwise tokenize and validate the whole
+        // input only for it to be discarded. With an RS byte present there
+        // is nothing extra to do here -- `seq_record_scan` decides per value
+        // what a record yields, and returns nothing for one it drops.
+        if !has_rs {
             continue;
         }
+        // Scanned once and reused -- a review found this record being
+        // re-scanned up to three times, each pass allocating and
+        // re-tokenizing. The *untrimmed* text, so the pending-token rule can
+        // see the whitespace that trimming would remove. `i < last_idx`:
+        // this record is followed by another RS byte, the boundary at which
+        // a bare literal is truncatable.
+        let ranges = seq_record_scan(raw_segment, i < last_idx).values;
 
         // `ranges` is exactly the set of values `seq_record_scan` decided
         // this record yields -- empty for one it dropped, so there is no
