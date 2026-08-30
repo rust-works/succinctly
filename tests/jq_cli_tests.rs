@@ -12879,15 +12879,19 @@ fn test_path_repeat_width_budget_matches_value_mode_1933() -> Result<()> {
     Ok(())
 }
 
-/// #1935: `first(f)` needs the identical `Expr::Repeat` interception #1906
-/// gave `limit` -- `first(repeat(f))` is exactly `limit(1; repeat(f))` for
-/// path-tracking purposes, but was routing through the generic (would-never-
-/// return) `resolve_node` call instead. Confirmed live against jq 1.7.1.
-/// `nth(n; repeat(f))` and a `repeat` reached only through an intervening
-/// `if`/`Alternative`/other combinator remain a documented, deliberately
-/// out-of-scope gap (issue #1935's own suggested disposition -- `nth` has no
-/// path-context support at all yet to extend, and the general combinator-
-/// nesting case needs a materially bigger design change).
+/// #1935: `first(f)` needs the same `resolve_node_bounded` dispatch #1906/
+/// #1850 gave `limit` -- `first(f)` is exactly `limit(1; f)` for
+/// path-tracking purposes, but was routing through the generic
+/// `take_path_branches(resolve_node(...), 1)` shape instead, which cannot
+/// fast-path either `repeat` or `.[]` (an un-intercepted `Expr::Repeat`
+/// falls through to `resolve_leaf`'s general case, itself bounded by
+/// `eval_repeat`'s own 1000-round cap -- so it still returns, just slowly
+/// and with the wrong answer, not a true hang). Confirmed live against jq
+/// 1.7.1. `nth(n; repeat(f))` and a `repeat` reached only through an
+/// intervening `if`/`Alternative`/other combinator remain a documented,
+/// deliberately out-of-scope gap (issue #1935's own suggested disposition --
+/// `nth` has no path-context support at all yet to extend, and the general
+/// combinator-nesting case needs a materially bigger design change).
 #[test]
 fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-c", "path(first(repeat(.)))"], Some("{\"a\":1}"))?;
@@ -12913,6 +12917,45 @@ fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-c", "path(first(.a,.b))"], Some("{\"a\":1,\"b\":2}"))?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "[\"a\"]\n");
+
+    Ok(())
+}
+
+/// #1935 (code review): the `Expr::Iterate` fast path (#1850) is the other
+/// half of `resolve_node_bounded`'s dispatch, reused by `first(f)` alongside
+/// `Expr::Repeat` -- covered separately from the `repeat`-focused test above
+/// since it went unpinned by any of this issue's own tests despite being
+/// live-verified during review. `path(limit(1; .[]))`'s already-established
+/// #1850 behavior is the parity baseline `first(.[])` must match, since the
+/// two are the same bound expressed two ways.
+#[test]
+fn test_path_first_iterate_uses_bounded_fast_path_1935() -> Result<()> {
+    let (first_stdout, _, first_code) = run_jq_full(&["-c", "path(first(.[]))"], Some("[1,2,3]"))?;
+    let (limit_stdout, _, limit_code) =
+        run_jq_full(&["-c", "path(limit(1; .[]))"], Some("[1,2,3]"))?;
+    assert_eq!(first_code, 0);
+    assert_eq!(first_stdout, "[0]\n");
+    assert_eq!(first_stdout, limit_stdout);
+    assert_eq!(first_code, limit_code);
+
+    let (stdout, _, code) = run_jq_full(&["-c", "path(first(.[]))"], Some("{\"a\":1,\"b\":2}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n");
+
+    // Empty container: no branch to keep, not an error.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(first(.[]))"], Some("[]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Untracked value still raises the correct error rather than silently
+    // taking the fast path (the same `trackable` gate `limit` uses).
+    let (_, stderr, code) =
+        run_jq_full(&["-c", "path(try error(1) catch first(.[]))"], Some("null"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr}"
+    );
 
     Ok(())
 }
