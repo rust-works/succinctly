@@ -26253,3 +26253,102 @@ fn test_seq_multivalue_still_drops_what_jq_abandons_1723() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1723 code review: content before the *first* RS byte is not a record,
+/// and real jq discards it however well-formed it is.
+///
+/// Multi-value support made a pre-existing single-value leak here emit
+/// *every* value in that prefix, widening the divergence rather than
+/// introducing it -- `"a" "b"\x1e3` printed all three. Both the widened and
+/// the original leak are fixed: only `3` survives, as in jq.
+#[test]
+fn test_seq_discards_content_before_first_rs_byte_1723() -> Result<()> {
+    for (input, expected, why) in [
+        (
+            "\"a\" \"b\"\x1e3\n",
+            "3\n",
+            "multi-value prefix, widened by #1723",
+        ),
+        (
+            "\"a\"\x1e3\n",
+            "3\n",
+            "single-value prefix, leaked on main too",
+        ),
+        ("1 2\x1e3\n", "3\n", "numeric prefix"),
+        (
+            "1 2\n",
+            "",
+            "no RS at all: #1525 abandonment still owns this",
+        ),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1723 code review: the error-location marker a `--seq` value reports.
+///
+/// Three separate offset defects, none of which any existing test could
+/// catch because none assert the `(at file:line)` marker at all:
+///
+/// - `seq_trailing_record_is_dropped` tested the trailing record's *first
+///   byte* for "ambiguous bare number". Before #1723 a record was always one
+///   value, so first-byte and last-value were the same question; with
+///   multi-value records they differ, and `\x1e1 "a"` reported `<unknown>`
+///   where jq names the line.
+/// - Non-last values paired ranges taken from the *trimmed* record with the
+///   *untrimmed* record's start offset, so leading whitespace shifted the
+///   reported line (`\x1e  "a"\n"b"\n`).
+/// - Scanning a leading-zero-normalized copy produced ranges shorter than
+///   the original, because normalization *deletes* zeros rather than
+///   rewriting in place (`\x1e0007\n"b"\n`). Ranges now always index the
+///   original text, with normalization applied per value.
+#[test]
+fn test_seq_value_error_location_marker_1723() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("sjq-seq-1723-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("z.json");
+    let path = file.to_str().expect("temp path is utf-8");
+
+    for (input, expected_marker, why) in [
+        ("\x1e1 \"a\"", "z.json:0", "last value is not a bare number"),
+        (
+            "\x1e\"a\" 2",
+            "<unknown>",
+            "last value IS an ambiguous bare number",
+        ),
+        (
+            "\x1e  \"a\"\n\"b\"\n",
+            "z.json:2",
+            "leading whitespace must not shift the line",
+        ),
+        (
+            "\x1e0007\n\"b\"\n",
+            "z.json:2",
+            "normalization must not shift the line",
+        ),
+        ("\x1e\"a\"", "z.json:0", "single value, unchanged"),
+        (
+            "\x1e1\n\x1e2",
+            "<unknown>",
+            "single trailing bare number, unchanged",
+        ),
+    ] {
+        std::fs::write(&file, input)?;
+        let (_out, stderr, _code) =
+            run_jq_full(&["--seq", "-s", "-c", "error(\"x\")", path], None)?;
+        let marker = stderr
+            .lines()
+            .find(|l| l.starts_with("jq: error"))
+            .unwrap_or_default();
+        assert!(
+            marker.contains(expected_marker),
+            "input {input:?} -- {why}: expected {expected_marker:?} in {marker:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
