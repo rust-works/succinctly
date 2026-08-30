@@ -1629,20 +1629,17 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// substituting `""` for an undecodable string instead of raising.
 ///
 /// `Control::Halt` is deliberately excluded from the preemption (#1832
-/// review): unlike `Error`/`Break`, `halt` is not a catchable signal, and
-/// downstream (`yq_runner.rs`) treats `Control::Halt` as "stop the whole
-/// process now" versus `Control::Error` as "report and continue" --
-/// downgrading an already-triggered halt into a continuable error would
-/// resume processing later documents a halting script explicitly meant to
-/// stop, a worse outcome than the corrupted-value bug this function exists
-/// to fix. The halt is kept, but the corrupted element (and anything
-/// `promote_borrowed_checked` never reached past it) is dropped from the
-/// reported prefix rather than leaking the old `""` substitution -- neither
-/// silently wrong output nor a silently resumed process. Whether a
-/// decode failure discovered this way should surface at all when it
-/// collides with a halt is a real, narrower design question of its own
-/// (#1899) -- this only guarantees the two specific wrong outcomes above
-/// don't happen while that's unresolved.
+/// review): unlike `Error`/`Break`, `halt` is not a catchable signal --
+/// this file already has a long-established rule for exactly this
+/// (`resolve_leaf`'s own doc comment, #987: "an already-triggered halt
+/// must not be downgraded into a catchable path error"). Converting it to
+/// `Control::Error` here would violate that same rule for a caller that
+/// treats `Halt` as "stop everything now" and `Error` as "report and
+/// continue" -- a worse outcome than the corrupted-value bug this function
+/// exists to fix. The halt is kept, but the corrupted element (and
+/// anything `promote_borrowed_checked` never reached past it) is dropped
+/// from the reported prefix rather than leaking the old `""` substitution
+/// -- neither silently wrong output nor a silently downgraded halt.
 fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
     borrowed: Vec<StandardJson<'_, W>>,
     owned: Option<Vec<OwnedValue>>,
