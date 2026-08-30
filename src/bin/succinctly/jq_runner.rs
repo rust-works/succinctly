@@ -4584,7 +4584,8 @@ where
 {
     anyhow::ensure!(
         level < MAX_VALUE_TREE_DEPTH,
-        "nesting depth exceeds limit of {MAX_VALUE_TREE_DEPTH}"
+        "{}",
+        succinctly::jq::nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH)
     );
     let compact = config.compact;
     let indent = &config.indent_string;

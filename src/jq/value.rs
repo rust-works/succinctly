@@ -89,7 +89,18 @@ pub const MAX_VALUE_TREE_DEPTH: usize = 384;
 /// code review).
 #[track_caller]
 pub fn assert_depth(depth: usize, max: usize) {
-    assert!(depth < max, "nesting depth exceeds limit of {max}");
+    assert!(depth < max, "{}", nesting_depth_exceeded_message(max));
+}
+
+/// The message every depth-limit guard reports past `max` levels of nesting.
+///
+/// Shared by every guard -- panicking (`assert_depth`) or checked
+/// ([`eval_generic::check_nesting_depth`](super::eval_generic::check_nesting_depth),
+/// `jq_runner.rs`'s `print_json`) -- so a wording change can't drift
+/// between the forms the way two independent copies of this exact string
+/// already did once before being consolidated into `assert_depth` (#998).
+pub fn nesting_depth_exceeded_message(max: usize) -> String {
+    format!("nesting depth exceeds limit of {max}")
 }
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005).

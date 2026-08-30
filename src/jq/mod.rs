@@ -110,7 +110,8 @@ pub use parser::{
 };
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
-    assert_value_tree_depth, format_number_jq_compat, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
+    assert_value_tree_depth, format_number_jq_compat, nesting_depth_exceeded_message, NumberRepr,
+    OwnedValue, MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --

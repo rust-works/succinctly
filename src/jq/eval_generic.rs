@@ -122,22 +122,26 @@ pub fn assert_nesting_depth(depth: usize) {
 
 /// Checked sibling of [`assert_nesting_depth`] (#1818).
 ///
-/// Same [`MAX_NESTING_DEPTH`] ceiling, the identical message
-/// `assert_depth`'s own `panic!`/`print_json`'s own `anyhow::ensure!` both
-/// use, but as a catchable `EvalError` instead of a panic -- for a caller
-/// that isn't the evaluator's own hot recursion (where a panic is
-/// deliberate, see `to_owned`'s own doc comment on why an `EvalError` there
-/// would make a stack-overflow guard catchable by `try`/`catch`) but a
-/// CLI-level input-validation walk (`jq_runner.rs`'s
+/// Same [`MAX_NESTING_DEPTH`] ceiling as `assert_depth`'s own `panic!`,
+/// sharing its message-building via `value::nesting_depth_exceeded_message`
+/// (also used by `print_json`'s own `anyhow::ensure!`, though that guard
+/// checks against the separate, wider `MAX_VALUE_TREE_DEPTH` ceiling since
+/// #1819 -- the shared function takes `max` as a parameter precisely so the
+/// message text can't drift between guards that legitimately check
+/// different ceilings). This one is a catchable `EvalError` instead of a
+/// panic -- for a caller that isn't the evaluator's own hot recursion
+/// (where a panic is deliberate, see `to_owned`'s own doc comment on why an
+/// `EvalError` there would make a stack-overflow guard catchable by
+/// `try`/`catch`) but a CLI-level input-validation walk (`jq_runner.rs`'s
 /// `validate_json_delimiters`, reached before any user filter runs) that
 /// already threads a `Result` and has no such concern.
 pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
     if depth < MAX_NESTING_DEPTH {
         Ok(())
     } else {
-        Err(EvalError::new(format!(
-            "nesting depth exceeds limit of {MAX_NESTING_DEPTH}"
-        )))
+        Err(EvalError::new(
+            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+        ))
     }
 }
 
