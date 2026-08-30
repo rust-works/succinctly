@@ -217,6 +217,8 @@ path_non_path_keys	path(keys)	{"a":1}	Invalid path expression with result ["a"]
 path_non_path_pipe_to_builtin	path(.a | tostring)	{"a":1}	Invalid path expression with result "1"
 path_non_path_object_construction	path({a:1})	{"a":1}	Invalid path expression with result {"a":1}
 path_non_path_optional_not_suppressed	path(("a")?)	{"a":1}	Invalid path expression with result "a"
+path_non_path_ascii_downcase_prelude_step	path(.a | ascii_downcase)	{"a":"xyz"}	Invalid path expression near attempt to iterate through [120,121,122]
+path_non_path_ascii_upcase_prelude_step	path(.a | ascii_upcase)	{"a":"xyz"}	Invalid path expression near attempt to iterate through [120,121,122]
 infinite_preview	scan(infinite)	"x"	number (1.797693134...) is not a string
 neg_infinite_preview	scan(-infinite)	"x"	number (-1.79769313...) is not a string
 nan_preview	scan(nan)	"x"	number (null) is not a string

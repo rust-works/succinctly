@@ -341,6 +341,12 @@ path_non_path_keys	path(keys)	{"a":1}
 path_non_path_pipe_to_builtin	path(.a | tostring)	{"a":1}
 path_non_path_object_construction	path({a:1})	{"a":1}
 path_non_path_optional_not_suppressed	path(("a")?)	{"a":1}
+# ascii_downcase/ascii_upcase are jq prelude definitions (explode | map(...) |
+# implode), so jq's own refusal fires one step deeper than the other
+# pipe-to-builtin probes above -- at the exploded array's iterate step, not
+# at the outer boundary (#1561).
+path_non_path_ascii_downcase_prelude_step	path(.a | ascii_downcase)	{"a":"xyz"}
+path_non_path_ascii_upcase_prelude_step	path(.a | ascii_upcase)	{"a":"xyz"}
 
 # ── non-finite float value previews (#930) ────────────────────────────────
 # describe()/dump_truncated() rendered an overflowed/infinite float preview
