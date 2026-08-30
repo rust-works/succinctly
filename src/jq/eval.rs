@@ -17268,16 +17268,24 @@ fn through_slice<E: From<EvalError>>(
         // `sub` staying `Null` reflects the RHS itself, not a swallowed
         // no-op -- confirmed live it still errors in real jq.
         //
-        // This reads "`sub` is still `Null`" as "nothing was written,"
-        // which is sound only because every tail shape `edit` can recurse
-        // into today either leaves `sub` as something other than `Null`
-        // (`Field`/`Index` always autovivify a container first) or
-        // propagates a real `Err` before `sub` is ever inspected
-        // (`Expr::Optional`'s error classification only swallows a
-        // *non*-write-time-application error). If a future tail shape ever
-        // produced a genuine write that happened to leave `sub` at `Null`,
-        // this check would misread it as a no-op -- there is no compiler-
-        // enforced link between the two, only this invariant.
+        // This reads "`sub` is still `Null`" as "nothing was written," which
+        // holds for a tail that is *directly* a swallowed no-op (`Field`/
+        // `Index` always autovivify a container first; `Expr::Optional`
+        // only swallows a non-write-time-application `Err`) -- but not in
+        // general: a tail with a `Field`/`Index` step *before* the swallowed
+        // no-op leaves `sub` as an autovivified husk (e.g. `Object({"c":
+        // Null})`), not bare `Null`, so this check misses it. Confirmed live
+        // this narrower gap already exists, unrelated to and unmoved by
+        // this fix: `null | .a[0:1].c[]? = 9` still wrongly raises this
+        // arm's array-required error (real jq no-ops), and `null |
+        // .a[0:1][0]?.c[]? = 9` wrongly *commits* a write real jq no-ops
+        // (`{"a":[{"c":null}]}` vs jq's `null`) -- both identical before and
+        // after this fix. That's the same family of bug #1428 tracks (a
+        // write-time decision inferred from what navigation left behind
+        // rather than from an explicit "did anything actually get written"
+        // signal), just one nesting level deeper than what this fix
+        // narrowly closes; not attempted here since #1428 is already being
+        // worked as its own, more structural fix.
         OwnedValue::Null if !container_noop => {
             let mut sub = OwnedValue::Null;
             edit(&mut sub)?;
@@ -55551,9 +55559,9 @@ mod tests {
         // `|=` and every compound assignment operator desugar through the
         // same `through_slice`/`set_path`-or-`update_path` arm, so they
         // share the bug and the fix identically -- oracle-verified each
-        // one is a no-op on `null` in real jq too (`+=`/`-=`/`*=`/`//=`/
-        // `%=`, not just `|=`).
-        for op in ["|=", "+=", "-=", "*=", "//=", "%="] {
+        // one is a no-op on `null` in real jq too (`+=`/`-=`/`*=`/`/=`/
+        // `//=`/`%=`, not just `|=`).
+        for op in ["|=", "+=", "-=", "*=", "/=", "//=", "%="] {
             query!(br"null", &format!(".a[0:1][]? {op} 9"), QueryResult::Owned(_) => {});
         }
         // A non-optional `Iterate` tail still raises the ordinary
