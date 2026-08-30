@@ -15799,8 +15799,9 @@ fn test_skip_fractional_count_floors_not_ceils_1846() -> Result<()> {
 /// (document-sourced number, `StandardJson::Number`) extraction branch,
 /// reached by a bare `.n` field access -- not the `Owned`
 /// (`NumberLiteral`/computed) branch the tests above reach via a literal or
-/// `getpath` (see `test_skip_number_literal_n_387`'s own comment, which
-/// notes `getpath` is specifically required to force that *other* arm; a
+/// `getpath` (see `test_skip_number_literal_n_387` in `src/jq/eval.rs`'s
+/// own comment, which notes `getpath` is specifically required to force
+/// that *other* arm; a
 /// bare `.n` here is what reaches this one instead). Both arms had their
 /// own hand-inlined copy of the classification logic pre-#1846 -- and, pre-
 /// #1879 review, this `One` arm had no coverage at all, integer or
@@ -15818,7 +15819,7 @@ fn test_skip_fractional_count_from_document_floors_1846() -> Result<()> {
 
 /// The `QueryResult::One` arm's plain-integer case, via the same bare `.n`
 /// field access as the test above -- closes the gap #1879 review found:
-/// `test_skip_number_literal_n_387` looked like it covered this (same
+/// `test_skip_number_literal_n_387` (in `src/jq/eval.rs`) looked like it covered this (same
 /// `{"n":..., "arr":[...]}` shape) but actually forces the `Owned` arm via
 /// `getpath`, leaving this arm's integer path with no test until now.
 #[test]

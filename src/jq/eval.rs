@@ -3495,13 +3495,16 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// regression against the `f as usize`-truncation-was-already-correct
 /// conclusion below, and against this codebase's `NumberLiteral`/#387
 /// large-integer discipline generally). The `QueryResult::One` call site
-/// converts its `StandardJson::Number` to an `OwnedValue` via [`to_owned`]
-/// before calling this, rather than extracting `f64` itself, for the same
-/// reason.
+/// builds its `OwnedValue` from `num.as_i64()`/`as_f64()` directly (trying
+/// the exact integer path first, same as this function does internally)
+/// rather than routing through [`to_owned`], which would box an unused copy
+/// of the source digits for no benefit here (also a #1879 review finding).
 ///
 /// Real jq's own definition (`builtin.jq`, confirmed against jq's current
 /// source -- `skip/2` postdates the pinned 1.7.1 oracle, so a live repro
-/// isn't possible; verified by hand-tracing the generator below instead):
+/// isn't possible; verified by hand-tracing the generator below instead --
+/// **unverified against a live binary; re-check once the pinned oracle
+/// reaches jq 1.8+, see #1880**):
 /// ```jq
 /// def skip($n; expr):
 ///   if $n > 0 then foreach expr as $item ($n; . - 1; if . < 0 then $item else empty end)
@@ -3523,6 +3526,7 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// `0.4 -> -0.6`, first emitting on item 1, i.e. skips 0 (`floor(0.4)`).
 /// #1846/#1849 both suspected this should ceiling like `limit`/`nth` instead
 /// -- it should not; adding a ceiling here would be a regression, not a fix.
+/// See #1880 for re-verifying this against a live oracle once one exists.
 fn classify_skip_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
@@ -10691,8 +10695,23 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let n_result = eval_single::<W, S>(n_expr, value.clone(), optional);
     let n = match n_result {
         QueryResult::One(v) => {
-            if let StandardJson::Number(_) = v {
-                match classify_skip_n(to_owned(&v)) {
+            if let StandardJson::Number(num) = v {
+                // Built directly from `num.as_i64()`/`as_f64()` rather than
+                // `to_owned(&v)` (a #1879 review finding): `to_owned` routes
+                // a `StandardJson::Number` through `from_number_bytes`,
+                // which re-validates the digit span and boxes a copy of the
+                // source text into `OwnedValue::NumberLiteral` -- allocation
+                // and work `classify_skip_n` immediately throws away, since
+                // its match arms only read the parsed `Int`/`Float`. This
+                // still preserves exact integer precision past `f64`'s
+                // 53-bit mantissa (the #1879 fix `to_owned` was introduced
+                // for), since `as_i64()` is tried first, same as `to_owned`
+                // itself does internally.
+                let owned = match num.as_i64() {
+                    Ok(i) => OwnedValue::Int(i),
+                    Err(_) => OwnedValue::Float(num.as_f64().unwrap_or(f64::NAN)),
+                };
+                match classify_skip_n(owned) {
                     Ok(n) => n,
                     Err(e) => return QueryResult::Error(e),
                 }
