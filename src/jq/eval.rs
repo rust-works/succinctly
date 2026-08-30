@@ -16901,6 +16901,31 @@ fn write_index(arr: &mut Vec<OwnedValue>, idx: i64) -> Result<&mut OwnedValue, E
     Ok(&mut arr[actual_idx])
 }
 
+/// #1428: does this path step reach its target *through* an `Iterate`?
+///
+/// The guard below is only sound for an iterate. Over the `Null` that
+/// autovivification just produced, an iterate has no elements, so it writes
+/// nothing *structurally* -- that conclusion needs no inspection of the
+/// resulting value. Every other component (`Identity`, `Field`, `Index`,
+/// `Slice`) does write, and a write whose value happens to be `null` is
+/// indistinguishable from no write at all by looking at the target: an earlier
+/// version of this fix inferred "unwritten" from "still `Null`" and so dropped
+/// `null | (.a|.) = null` to `null` (jq, and yq, keep `{"a": null}`).
+fn reaches_iterate(expr: &Expr) -> bool {
+    match unwrap_path_component(expr).0 {
+        Expr::Iterate => true,
+        // Anywhere along the chain, not just at its head: `update_path`
+        // recurses one component at a time, and a frame two levels above the
+        // iterate (`.a` in `.a.b[]? |= 9`) still has to undo its own slot.
+        // The inner frame restores *its* parent to `Null` when it undoes, so
+        // by the time the outer frame looks, "still `Null`" is again an
+        // accurate reading -- but only if it knows an iterate was involved at
+        // all, which is what this answers.
+        Expr::Pipe(inner) => inner.iter().any(reaches_iterate),
+        _ => false,
+    }
+}
+
 /// #1428: does reaching `tail` from a *freshly created* parent actually write
 /// anything?
 ///
@@ -17072,8 +17097,9 @@ fn set_path(
                 // writes into the detached `Null` and so falls straight
                 // through, leaving `null | .a = 9` and friends untouched.
                 let mut would_create = false;
-                if get_path_mut(root, parent_path, scalar_noop, false, &mut would_create)?
-                    .is_none()
+                if reaches_iterate(last_path)
+                    && get_path_mut(root, parent_path, scalar_noop, false, &mut would_create)?
+                        .is_none()
                     // See the `split_at_iterate` arm above.
                     && would_create
                     && !tail_writes_from_fresh_parent(|probe| {
@@ -18074,9 +18100,16 @@ fn update_path<S: EvalSemantics>(
                                     optional,
                                     scalar_noop,
                                 );
+                                // `reaches_iterate`: only an iterate can
+                                // decline to write over the `Null` just
+                                // created, so only there does "still `Null`"
+                                // mean "never written". Without it, a
+                                // legitimate `null` write (`(.a|.) |= null`)
+                                // is undone.
                                 let stranded = created
                                     && result.is_ok()
                                     && undo_stranded
+                                    && reaches_iterate(&rest)
                                     && matches!(*current, OwnedValue::Null);
                                 (result, stranded)
                             };
@@ -18122,8 +18155,10 @@ fn update_path<S: EvalSemantics>(
                                     optional,
                                     scalar_noop,
                                 );
+                                // See the `Field` arm above.
                                 let stranded = result.is_ok()
                                     && undo_stranded
+                                    && reaches_iterate(&rest)
                                     && matches!(*current, OwnedValue::Null);
                                 (result, stranded)
                             };

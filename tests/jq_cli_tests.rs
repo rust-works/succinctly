@@ -25754,3 +25754,67 @@ fn test_suppressed_write_still_raises_real_type_errors_1428() -> Result<()> {
     assert_eq!(stdout, "5\n");
     Ok(())
 }
+
+/// #1428 review follow-up: a write whose *value* is `null` is still a write.
+///
+/// The first two versions of this fix inferred "nothing was written" from "the
+/// target is still `Null`", which is indistinguishable from a legitimate `null`
+/// write. `null | (.a|.) = null` dropped to `null` where jq (and yq) keep
+/// `{"a":null}` -- 56 distinct filter shapes regressed this way, none of them
+/// covered by the suite, because they all need an explicit `|` inside the path
+/// to produce an `Identity`-shaped tail.
+///
+/// The guard is now structural: it applies only where the deciding component
+/// is an `Iterate`, which over a freshly-created `Null` writes nothing *by
+/// construction* -- no inspection of the resulting value required.
+#[test]
+fn test_null_valued_write_is_still_a_write_1428() -> Result<()> {
+    for (input, filter, expected) in [
+        ("null", "(.a|.) = null", "{\"a\":null}\n"),
+        ("null", "(.a|.) = .x", "{\"a\":null}\n"),
+        ("null", "(.a|.b) = null", "{\"a\":{\"b\":null}}\n"),
+        ("null", "(.a|.) |= null", "{\"a\":null}\n"),
+        ("null", "(.a|.) |= .", "{\"a\":null}\n"),
+        ("null", "(.a|.) //= null", "{\"a\":null}\n"),
+        ("null", "(.a|.) += null", "{\"a\":null}\n"),
+        ("null", "(.a[0]|.) |= null", "{\"a\":[null]}\n"),
+        (
+            "null",
+            "(.[5]|.) = null",
+            "[null,null,null,null,null,null]\n",
+        ),
+        // A plain terminal write of `null` was never at risk, but pins the
+        // pair: the paren form above and this one must agree.
+        ("null", ".a = null", "{\"a\":null}\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+    Ok(())
+}
+
+/// #1428 review follow-up: the `|=` walker recurses one component at a time, so
+/// a frame two or more levels above the iterate has to undo its own slot too.
+///
+/// Checking only the head of the remaining path left `null | .a.b[]? |= 9` as
+/// `{"a":{}}` -- the inner frame correctly removed `.b`, but `.a` was then an
+/// empty object rather than the `Null` it started as, so the outer frame could
+/// not tell. 40 (input, filter) pairs were still wrong at that point.
+#[test]
+fn test_nested_suppressed_update_unwinds_every_level_1428() -> Result<()> {
+    for (input, filter) in [
+        ("null", ".a.b[]? |= 9"),
+        ("null", ".a.b[]? |= null"),
+        ("null", ".a.b[]? += 1"),
+        ("null", ".a.b.c[]? |= 9"),
+        ("null", ".a.b.c.d[]? |= 9"),
+        ("null", ".a.b.c[]? //= null"),
+        ("{}", ".a.b[]? |= 9"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, format!("{input}\n"), "{input} | {filter}");
+    }
+    Ok(())
+}
