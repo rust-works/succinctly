@@ -1292,27 +1292,27 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // now carries `1` forward as `Partial`'s prefix instead of
             // collapsing straight to a bare `Error`.
             QueryResult::Error(e) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Error(e),
-                );
+                let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Control::Error(e));
+                return partial(prefix, control);
             }
             QueryResult::Break(label) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Break(label),
-                );
+                let (prefix, control) =
+                    resolve_terminal_prefix(borrowed, owned, Control::Break(label));
+                return partial(prefix, control);
             }
             QueryResult::Halt(code) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Halt(code),
-                );
+                let (prefix, control) =
+                    resolve_terminal_prefix(borrowed, owned, Control::Halt(code));
+                return partial(prefix, control);
             }
             QueryResult::Partial(vs, control) => {
-                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
-                merged.extend(vs);
-                return partial(merged, control);
+                return match owned.map_or_else(|| promote_borrowed_checked(borrowed), Ok) {
+                    Ok(mut prefix) => {
+                        prefix.extend(vs);
+                        partial(prefix, control)
+                    }
+                    Err((prefix, e)) => partial(prefix, Control::Error(e)),
+                };
             }
         }
     }
@@ -1608,17 +1608,36 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Merge a borrowed accumulator and an owned accumulator into one owned
-/// prefix, in the order their values were produced. Shared by every
-/// stream-combining function that promotes a borrowed `Vec<StandardJson>` to
-/// owned the moment an owned value (or a terminal control) forces it.
-fn merge_owned<W: Clone + AsRef<[u64]>>(
+/// Resolve the accumulated prefix for a terminal control arm (`Error`/
+/// `Break`/`Halt`/`Partial`) across `eval_comma`/`eval_fanout`/`eval_pipe`'s
+/// identical `Many`-branch loops: `owned` directly if promotion already
+/// happened (in which case `borrowed` is always already empty, moved out by
+/// whichever promotion point set `owned` -- every push after that point
+/// goes to `owned`, never back to `borrowed`), otherwise checked-promoting
+/// whatever's left in `borrowed` for the first time via the existing
+/// [`promote_borrowed_checked`].
+///
+/// Fallible (#1832): an undecodable element in `borrowed` was never
+/// checked, because nothing forced promotion before this later element's
+/// own `control` signal fired. That undecodable element sits *earlier* in
+/// evaluation order than `control`, so it wins -- real jq's single-pass
+/// evaluation would have raised on it first. Returns the shorter,
+/// successfully-converted prefix paired with the decode error in place of
+/// `control`, the same "keep the prefix, earliest error wins" rule
+/// `push_promoted`/`promote_borrowed_checked` already established for the
+/// main promotion path (#1755/#1790) -- this is that rule's other half, for
+/// the terminal-control path those two never covered. Before this fix,
+/// `borrowed`'s conversion here ran through unchecked `to_owned`, silently
+/// substituting `""` for an undecodable string instead of raising.
+fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
     borrowed: Vec<StandardJson<'_, W>>,
-    owned: Vec<OwnedValue>,
-) -> Vec<OwnedValue> {
-    let mut merged: Vec<OwnedValue> = borrowed.iter().map(to_owned).collect();
-    merged.extend(owned);
-    merged
+    owned: Option<Vec<OwnedValue>>,
+    control: Control,
+) -> (Vec<OwnedValue>, Control) {
+    match owned.map_or_else(|| promote_borrowed_checked(borrowed), Ok) {
+        Ok(prefix) => (prefix, control),
+        Err((prefix, e)) => (prefix, Control::Error(e)),
+    }
 }
 
 /// Collapse a `Vec<T>` accumulator into the smallest shape representing it:
@@ -4007,62 +4026,75 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 
     for bit in bits {
         match body(bit).materialize_cursor() {
-            QueryResult::One(v) => match owned.as_mut() {
-                Some(acc) => acc.push(to_owned(&v)),
-                None => borrowed.push(v),
-            },
+            // #1832: push_promoted/promote_borrowed_checked, not unchecked
+            // to_owned -- eval_fanout had the identical #1755/#1790
+            // silently-corrupt-on-promotion bug shape already fixed for
+            // eval_pipe/eval_comma, just never applied here.
+            QueryResult::One(v) => {
+                if let Err(e) = push_promoted(core::iter::once(v), &mut borrowed, &mut owned) {
+                    let merged = owned.expect("push_promoted only errors when owned is Some");
+                    return partial(merged, Control::Error(e));
+                }
+            }
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
-            QueryResult::Many(vs) => match owned.as_mut() {
-                Some(acc) => acc.extend(vs.iter().map(to_owned)),
-                None => borrowed.extend(vs),
-            },
-            QueryResult::Owned(v) => owned
-                .get_or_insert_with(|| {
-                    core::mem::take(&mut borrowed)
-                        .iter()
-                        .map(to_owned)
-                        .collect()
-                })
-                .push(v),
-            QueryResult::ManyOwned(vs) => owned
-                .get_or_insert_with(|| {
-                    core::mem::take(&mut borrowed)
-                        .iter()
-                        .map(to_owned)
-                        .collect()
-                })
-                .extend(vs),
+            QueryResult::Many(vs) => {
+                if let Err(e) = push_promoted(vs, &mut borrowed, &mut owned) {
+                    let merged = owned.expect("push_promoted only errors when owned is Some");
+                    return partial(merged, Control::Error(e));
+                }
+            }
+            QueryResult::Owned(v) => {
+                if owned.is_none() {
+                    match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                        Ok(acc) => owned = Some(acc),
+                        Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                    }
+                }
+                owned.as_mut().unwrap().push(v);
+            }
+            QueryResult::ManyOwned(vs) => {
+                if owned.is_none() {
+                    match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                        Ok(acc) => owned = Some(acc),
+                        Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                    }
+                }
+                owned.as_mut().unwrap().extend(vs);
+            }
             QueryResult::None => {}
             QueryResult::Error(e) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Error(e),
-                );
+                let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Control::Error(e));
+                return partial(prefix, control);
             }
             QueryResult::Break(label) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Break(label),
-                );
+                let (prefix, control) =
+                    resolve_terminal_prefix(borrowed, owned, Control::Break(label));
+                return partial(prefix, control);
             }
             QueryResult::Halt(code) => {
-                return partial(
-                    merge_owned(borrowed, owned.unwrap_or_default()),
-                    Control::Halt(code),
-                );
+                let (prefix, control) =
+                    resolve_terminal_prefix(borrowed, owned, Control::Halt(code));
+                return partial(prefix, control);
             }
             QueryResult::Partial(vs, control) => {
-                let mut merged = merge_owned(borrowed, owned.unwrap_or_default());
-                merged.extend(vs);
-                return partial(merged, control);
+                return match owned.map_or_else(|| promote_borrowed_checked(borrowed), Ok) {
+                    Ok(mut prefix) => {
+                        prefix.extend(vs);
+                        partial(prefix, control)
+                    }
+                    Err((prefix, e)) => partial(prefix, Control::Error(e)),
+                };
             }
         }
     }
 
     match cond_control {
-        Some(control) => partial(merge_owned(borrowed, owned.unwrap_or_default()), control),
+        Some(control) => {
+            let (prefix, control) = resolve_terminal_prefix(borrowed, owned, control);
+            partial(prefix, control)
+        }
         None => match owned {
             Some(acc) => owned_vec_to_result(acc),
             None => borrowed_vec_to_result(borrowed),
@@ -14354,15 +14386,23 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         if let Err(e) =
                             push_promoted(core::iter::once(r), &mut borrowed, &mut owned)
                         {
-                            let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                            return partial(prefix, Control::Error(e));
+                            // #1832: push_promoted's own error already came
+                            // from a checked conversion, but `owned` could
+                            // in principle still be `None` here in a future
+                            // refactor -- go through the same checked
+                            // resolution as every other terminal arm rather
+                            // than assume the invariant silently.
+                            let (prefix, control) =
+                                resolve_terminal_prefix(borrowed, owned, Control::Error(e));
+                            return partial(prefix, control);
                         }
                     }
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Many(rs) => {
                         if let Err(e) = push_promoted(rs, &mut borrowed, &mut owned) {
-                            let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                            return partial(prefix, Control::Error(e));
+                            let (prefix, control) =
+                                resolve_terminal_prefix(borrowed, owned, Control::Error(e));
+                            return partial(prefix, control);
                         }
                     }
                     QueryResult::Owned(r) => {
@@ -14387,21 +14427,28 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // A downstream error/break no longer discards outputs
                     // already piped through from earlier elements (#400).
                     QueryResult::Error(e) => {
-                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                        return partial(prefix, Control::Error(e));
+                        let (prefix, control) =
+                            resolve_terminal_prefix(borrowed, owned, Control::Error(e));
+                        return partial(prefix, control);
                     }
                     QueryResult::Break(label) => {
-                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                        return partial(prefix, Control::Break(label));
+                        let (prefix, control) =
+                            resolve_terminal_prefix(borrowed, owned, Control::Break(label));
+                        return partial(prefix, control);
                     }
                     QueryResult::Halt(code) => {
-                        let prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                        return partial(prefix, Control::Halt(code));
+                        let (prefix, control) =
+                            resolve_terminal_prefix(borrowed, owned, Control::Halt(code));
+                        return partial(prefix, control);
                     }
                     QueryResult::Partial(rs, control) => {
-                        let mut prefix = owned.unwrap_or_else(|| merge_owned(borrowed, Vec::new()));
-                        prefix.extend(rs);
-                        return partial(prefix, control);
+                        return match owned.map_or_else(|| promote_borrowed_checked(borrowed), Ok) {
+                            Ok(mut prefix) => {
+                                prefix.extend(rs);
+                                partial(prefix, control)
+                            }
+                            Err((prefix, e)) => partial(prefix, Control::Error(e)),
+                        };
                     }
                 }
             }
@@ -38449,6 +38496,54 @@ mod tests {
         );
     }
 
+    /// #1832: `eval_comma`'s terminal-control arms (`Error`/`Break`/`Halt`/
+    /// `Partial`) shared the identical unchecked-`to_owned` promotion bug
+    /// #1790 fixed for the main promotion path, just reached via
+    /// `merge_owned` (now `resolve_terminal_prefix`) instead of
+    /// `push_promoted`/`promote_borrowed_checked` directly -- an
+    /// undecodable *earlier* branch never gets checked before a *later*
+    /// branch's own error/break/halt forces the prefix to be built. The
+    /// earlier, still-unchecked decode failure must win over the later
+    /// signal, matching the evaluation order real jq's single pass implies.
+    #[test]
+    fn test_eval_comma_error_path_prefix_raises_on_decode_failure_1832() {
+        // `.a` (borrowed, undecodable) sits unchecked until `error("boom")`
+        // forces the prefix -- the decode failure must win over "boom".
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a, error(\"boom\")",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // `break` must be preempted by the same earlier decode failure.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "label $out | (.a, break $out)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // A `Partial` arriving from a nested control construct still goes
+        // through the same checked resolution before its own `vs` is
+        // appended -- the earlier decode failure preempts it entirely,
+        // discarding `vs` rather than appending it to a prefix that was
+        // never actually valid.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".a, (1, error(\"boom\"))",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1832 positive control: valid data through the same terminal-control
+    /// shapes is unaffected by routing through the checked resolution.
+    #[test]
+    fn test_eval_comma_error_path_prefix_valid_data_unaffected_1832() {
+        query!(br#"{"a":"x"}"#, ".a, error(\"boom\")",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
     /// #1620: a decode failure reached through this module's own dispatch
     /// (the public `succinctly::jq::eval` library API, not the CLI's
     /// `eval_generic.rs` bridge) must not be suppressed by `?` -- same rule,
@@ -40226,6 +40321,82 @@ mod tests {
         // `None`, not `Many(vec![])`. Confirmed live against jq 1.7.1.
         query!(br"1", "if (true, false) then empty else empty end",
             QueryResult::None => {}
+        );
+    }
+
+    /// #1832: `eval_fanout`'s own main promotion path (the `Owned`/
+    /// `ManyOwned` arms) had the identical unchecked-`to_owned` bug shape
+    /// #1755/#1790 already fixed for `eval_pipe`/`eval_comma` -- an
+    /// undecodable *earlier* branch (`.a`, borrowed) never gets checked
+    /// before a *later* owned branch (`1`) forces the whole batch to
+    /// promote. `eval_fanout` was never given the equivalent fix, unlike
+    /// the two functions its own tail match was already known to mirror
+    /// (see `test_fanout_all_empty_branches_collapse_to_none_1043` above).
+    #[test]
+    fn test_eval_fanout_main_path_raises_on_decode_failure_1832() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "if (true, false) then .a else 1 end",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1832: `eval_fanout`'s terminal-control arms (`Error`/`Break`/`Halt`/
+    /// `Partial`) shared the same `merge_owned` (now `resolve_terminal_
+    /// prefix`) bug as `eval_comma`'s identical arms -- see
+    /// `test_eval_comma_error_path_prefix_raises_on_decode_failure_1832`
+    /// for the equivalent `eval_comma` case this mirrors.
+    #[test]
+    fn test_eval_fanout_error_path_prefix_raises_on_decode_failure_1832() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "if (true, false) then .a else error(\"boom\") end",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1832 positive control: valid data through both `eval_fanout` shapes
+    /// above is unaffected by routing through the checked promotion/
+    /// resolution.
+    #[test]
+    fn test_eval_fanout_decode_paths_valid_data_unaffected_1832() {
+        query!(br#"{"a":"x"}"#, "if (true, false) then .a else 1 end",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string()), OwnedValue::Int(1)]);
+            }
+        );
+        query!(br#"{"a":"x"}"#, "if (true, false) then .a else error(\"boom\") end",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #1832: `eval_pipe`'s own `Many`-branch loop shares the identical
+    /// `merge_owned` (now `resolve_terminal_prefix`) terminal-control bug
+    /// as `eval_comma`/`eval_fanout` -- an undecodable element from an
+    /// *earlier* array element, still sitting unchecked in `borrowed`,
+    /// must win over a *later* element's own `error(...)`.
+    #[test]
+    fn test_eval_pipe_many_branch_error_path_prefix_raises_on_decode_failure_1832() {
+        query!(
+            b"{\"arr\": [\"\xff\xfe\", 5]}",
+            ".arr[] | if type == \"string\" then . else error(\"boom\") end",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1832 positive control: valid data through the same `eval_pipe`
+    /// `Many`-branch shape is unaffected.
+    #[test]
+    fn test_eval_pipe_many_branch_error_path_prefix_valid_data_unaffected_1832() {
+        query!(br#"{"arr": ["x", 5]}"#,
+            ".arr[] | if type == \"string\" then . else error(\"boom\") end",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+                assert_eq!(e.message, "boom");
+            }
         );
     }
 
