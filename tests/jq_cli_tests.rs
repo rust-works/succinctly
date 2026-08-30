@@ -13,7 +13,8 @@ use tempfile::NamedTempFile;
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
 use cargo_run_exit::{
-    classify_cargo_run_exit, spawn_with_signal_retry, succinctly_bin, MAX_CARGO_RETRIES,
+    classify_cargo_run_exit, signal_death_error, spawn_with_signal_retry, succinctly_bin,
+    MAX_CARGO_RETRIES,
 };
 
 /// #1516: a signal-killed child used to render as an inscrutable
@@ -242,6 +243,33 @@ fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32
 }
 
 static INTERLEAVE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `spawn_jq`'s counterpart for the environment-variable test cluster
+/// (#1889 code review): the 8 tests covering `NO_COLOR`/`JQ_COLORS`/
+/// `JQ_LIBRARY_PATH`/`HOME` each independently hand-rolled the same
+/// `Command::new(succinctly_bin()); cmd.arg("jq").args(args).env(...)`
+/// closure since `spawn_jq` itself has no way to set an environment
+/// variable -- sharing one copy here instead of 8 near-identical ones is
+/// the same fix `spawn_jq`'s own doc comment already describes for the
+/// six-copies-of-one-`Command` problem (#1884).
+fn spawn_jq_with_env(
+    args: &[&str],
+    env_key: &str,
+    env_value: impl AsRef<std::ffi::OsStr>,
+    stdin_input: Option<&[u8]>,
+) -> Result<(std::process::Output, i32)> {
+    spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .arg("jq")
+                .args(args)
+                .env(env_key, env_value.as_ref());
+            command
+        },
+        stdin_input,
+    )
+}
 
 /// Helper to run jq with null input (-n)
 fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
@@ -3697,15 +3725,10 @@ fn test_args_combined() -> Result<()> {
 fn test_no_color_env_var() -> Result<()> {
     // Test that NO_COLOR environment variable disables color output
     // When NO_COLOR is set and no explicit -C/-M flag is given, colors should be disabled.
-    let (result, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args([
-                "jq", ".", // No -C or -M flag
-            ])
-            .env("NO_COLOR", "1");
-            cmd
-        },
+    let (result, _code) = spawn_jq_with_env(
+        &["."], // No -C or -M flag
+        "NO_COLOR",
+        "1",
         Some(b"{\"a\":1}"),
     )?;
     let stdout = String::from_utf8(result.stdout)?;
@@ -3723,16 +3746,10 @@ fn test_jq_colors_env_var() -> Result<()> {
     // Test that JQ_COLORS environment variable customizes colors
     // Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
     // Use a distinctive color for null (red = 31) to verify it works
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args([
-                "jq", "-C", // Force color output
-                "-n", "null",
-            ])
-            .env("JQ_COLORS", "0;31:::::::"); // Red null, defaults for rest
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-C", "-n", "null"], // Force color output
+        "JQ_COLORS",
+        "0;31:::::::", // Red null, defaults for rest
         None,
     )?;
 
@@ -3748,18 +3765,10 @@ fn test_jq_colors_env_var() -> Result<()> {
 #[test]
 fn test_color_output_overrides_no_color() -> Result<()> {
     // Test that -C flag overrides NO_COLOR env var
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args([
-                "jq",
-                "-C", // Force color
-                "-n",
-                r#"{"a":1}"#,
-            ])
-            .env("NO_COLOR", "1"); // This should be overridden by -C
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-C", "-n", r#"{"a":1}"#], // Force color
+        "NO_COLOR",
+        "1", // This should be overridden by -C
         None,
     )?;
 
@@ -3775,18 +3784,10 @@ fn test_color_output_overrides_no_color() -> Result<()> {
 #[test]
 fn test_monochrome_overrides_jq_colors() -> Result<()> {
     // Test that -M flag disables colors even if JQ_COLORS is set
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args([
-                "jq",
-                "-M", // Monochrome output
-                "-n",
-                r#"{"a":1}"#,
-            ])
-            .env("JQ_COLORS", "0;31:0;32:0;33:0;34:0;35:0;36:0;37:0;38");
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-M", "-n", r#"{"a":1}"#], // Monochrome output
+        "JQ_COLORS",
+        "0;31:0;32:0;33:0;34:0;35:0;36:0;37:0;38",
         None,
     )?;
 
@@ -3803,15 +3804,7 @@ fn test_monochrome_overrides_jq_colors() -> Result<()> {
 fn test_jq_colors_invalid_spec_warns_and_uses_defaults() -> Result<()> {
     // A malformed JQ_COLORS spec is rejected as a whole: jq warns on stderr,
     // falls back to the default scheme, and still exits successfully.
-    let (output, code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args(["jq", "-C", "-n", "null"])
-                .env("JQ_COLORS", "bogus");
-            cmd
-        },
-        None,
-    )?;
+    let (output, code) = spawn_jq_with_env(&["-C", "-n", "null"], "JQ_COLORS", "bogus", None)?;
 
     assert_eq!(code, 0);
     let stderr = String::from_utf8(output.stderr)?;
@@ -3937,14 +3930,10 @@ fn test_jq_library_path_env() -> Result<()> {
     std::fs::write(&module_path, "def quadruple: . * 4;")?;
 
     // Test JQ_LIBRARY_PATH environment variable
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args(["jq", "-n"])
-                .arg(r#"include "envmod"; 5 | quadruple"#)
-                .env("JQ_LIBRARY_PATH", temp_dir.path());
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-n", r#"include "envmod"; 5 | quadruple"#],
+        "JQ_LIBRARY_PATH",
+        temp_dir.path(),
         None,
     )?;
 
@@ -3998,13 +3987,10 @@ fn test_home_jq_file_autoload() -> Result<()> {
     std::fs::write(&jq_file, "def my_custom_func: . * 100;")?;
 
     // Test that function from ~/.jq is available
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args(["jq", "-n", "5 | my_custom_func"])
-                .env("HOME", temp_home.path());
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-n", "5 | my_custom_func"],
+        "HOME",
+        temp_home.path(),
         None,
     )?;
 
@@ -4035,14 +4021,10 @@ fn test_home_jq_dir_search_path() -> Result<()> {
     std::fs::write(jq_dir.join("homemod.jq"), "def home_func: . + 1000;")?;
 
     // Test that module from ~/.jq directory can be included
-    let (output, _code) = spawn_with_signal_retry(
-        || {
-            let mut cmd = Command::new(succinctly_bin());
-            cmd.args(["jq", "-n"])
-                .arg(r#"include "homemod"; 7 | home_func"#)
-                .env("HOME", temp_home.path());
-            cmd
-        },
+    let (output, _code) = spawn_jq_with_env(
+        &["-n", r#"include "homemod"; 7 | home_func"#],
+        "HOME",
+        temp_home.path(),
         None,
     )?;
 
