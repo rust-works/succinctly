@@ -377,6 +377,7 @@ surface (#1512):
 | `isempty(f)`                                         | True if `f` produces no output                |
 | `debug`, `debug(msg)`                                | Print to stderr, pass value through           |
 | `infinite`, `isnan`                                  | IEEE 754 infinity literal / NaN test          |
+| `nan`, `isinfinite`, `isnormal`, `isfinite`          | IEEE 754 NaN literal / classification (#1885) |
 | `gsub(re; s)`, `scan(re)`, `splits(re)`              | Not real yq builtins at any arity (#1436)     |
 | `inside(s)`                                          | Membership test, `contains`'s inverse         |
 | `startswith(s)`, `endswith(s)`                       | String prefix / suffix test                   |
@@ -394,6 +395,7 @@ surface (#1512):
 | `INDEX(idx_expr)`, `INDEX(stream; idx_expr)`         | Build an object keyed by an index expr (#1714)|
 | `walk(f)`                                            | Recursively transform every node (#1714)      |
 | `floor`, `ceil`, `round`, `sqrt`, `fabs`             | Basic math functions (#1714)                  |
+| `abs`, `trunc`                                       | Absolute value / truncate to integer (#1885)  |
 | `log`, `log2`, `log10`                               | Logarithms (#1714)                            |
 | `exp`, `exp2`, `exp10`                               | Exponentials (#1714)                          |
 | `sinh`, `cosh`, `tanh`                               | Hyperbolic trig functions (#1714)             |

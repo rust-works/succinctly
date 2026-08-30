@@ -1333,10 +1333,13 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
 /// `bsearch`), and the 21 names #1714 found still ungated (`add`, `min_by`,
 /// `max_by`, `implode`, `INDEX`, `walk`, `floor`, `ceil`, `round`, `sqrt`,
 /// `fabs`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `sinh`, `cosh`,
-/// `tanh`, `atan2`), and #1837/#1882's own 10 names -- the adjacent trig
+/// `tanh`, `atan2`), and #1837/#1882's own 16 names -- the adjacent trig
 /// functions #1714 left untouched (`asin`, `acos`, `atan`, `sin`, `cos`,
-/// `tan`, `asinh`, `acosh`, `atanh`) plus `skip`, a #983-lineage builtin
-/// that (unlike its siblings `limit`/`nth`) was never gated at all.
+/// `tan`, `asinh`, `acosh`, `atanh`), `skip` (a #983-lineage builtin that,
+/// unlike its siblings `limit`/`nth`, was never gated at all), and 6 more
+/// (`abs`, `trunc`, `isinfinite`, `isnormal`, `isfinite`, `nan`) found by
+/// #1885's own code review tracing this same "Phase 10"/"Phase 12" gap
+/// further -- see #1887 for the still-unaudited remainder of this surface.
 #[test]
 fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     for filter in [
@@ -1388,6 +1391,12 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "acosh(1.5)",
         "atanh(0.5)",
         "skip(1; .)",
+        "abs",
+        "trunc",
+        "isinfinite",
+        "isnormal",
+        "isfinite",
+        "nan",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -1461,6 +1470,12 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "1.5 | acosh",
         "0.5 | atanh",
         "[1,2,3] | [skip(1; .[])]",
+        "(-1.5) | abs",
+        "1.5 | trunc",
+        "1 | isinfinite",
+        "1 | isnormal",
+        "1 | isfinite",
+        "nan",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
@@ -7614,17 +7629,18 @@ fn test_yq_json_output_special_floats_still_null_after_1060() -> Result<()> {
 /// `format!("{f}")` that this exact test caught live: `nan | tostring` gave
 /// `"NaN"` instead of `.nan`, silently inconsistent with `nan | @text`
 /// (documented in CLAUDE.md as "same as tostring") which already gave
-/// `.nan`.
+/// `.nan`. `--jq-extensions` is needed for the `nan`-literal filters since
+/// #1885 gated that keyword in yq mode.
 #[test]
 fn test_yq_tostring_computed_nan_uses_yaml_spelling_1060() -> Result<()> {
     for filter in ["nan | tostring", "(0/0) | tostring"] {
-        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["-r"])?;
+        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["-r", "--jq-extensions"])?;
         assert_eq!(code, 0, "for {filter:?}: {stdout:?}");
         assert_eq!(stdout.trim_end(), ".nan", "for {filter:?}");
     }
     // `@text` is documented as identical to `tostring` -- confirm they now
     // agree on the same computed value.
-    let (stdout, code) = run_yq_stdin("nan | @text", "a: 1\n", &["-r"])?;
+    let (stdout, code) = run_yq_stdin("nan | @text", "a: 1\n", &["-r", "--jq-extensions"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), ".nan");
     Ok(())
@@ -19698,19 +19714,28 @@ fn test_1220_delpaths_reports_first_offending_component() -> Result<()> {
 /// for *itself* (preserving the pre-existing "NaN path silently drops"
 /// behavior, unrelated to #1220's own scope), not for other, genuinely
 /// bad-typed components sharing the same path. Unreachable via real yq
-/// (its lexer rejects a bare `nan` token outright), so this pins
-/// succinctly's own internal consistency rather than an oracle behavior.
+/// (its lexer rejects a bare `nan` token outright, and -- since #1885 --
+/// succinctly's own yq mode now matches that by default too), so this pins
+/// succinctly's own internal consistency (behind `--jq-extensions`) rather
+/// than an oracle behavior.
 #[test]
 fn test_1220_delpaths_nan_does_not_suppress_sibling_type_check() -> Result<()> {
     // A NaN alongside a bad-typed sibling still reports the sibling.
-    let (_out, stderr, code) =
-        run_yq_stdin_with_stderr("delpaths([[nan,true]])", "[1,2,3]", &["-o=json"])?;
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "delpaths([[nan,true]])",
+        "[1,2,3]",
+        &["-o=json", "--jq-extensions"],
+    )?;
     assert_ne!(code, 0, "stderr: {stderr}");
     assert!(stderr.contains("found !!bool instead"), "stderr: {stderr}");
 
     // A NaN alone still silently drops rather than erroring (NaN itself is
     // never reported as the offending type, matching pre-#1220 behavior).
-    let (out, code) = run_yq_stdin("delpaths([[nan]])", "[1,2,3]", &["-o=json", "-I=0"])?;
+    let (out, code) = run_yq_stdin(
+        "delpaths([[nan]])",
+        "[1,2,3]",
+        &["-o=json", "-I=0", "--jq-extensions"],
+    )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[1,2,3]");
     Ok(())
