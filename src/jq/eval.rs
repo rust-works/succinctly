@@ -26418,12 +26418,16 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// time a caller's loop breaks, its own `results` binding is already empty
 /// -- reusing it here instead of the pattern's own `prefix` would silently
 /// keep nothing.
-fn catch_error_under_optional<W: Clone + AsRef<[u64]>>(
+fn catch_error_under_optional<W>(
     stopped: QueryResult<'_, W>,
     optional: bool,
     atomic: bool,
 ) -> QueryResult<'_, W> {
     match stopped {
+        // `atomic` only has a prefix to discard-or-keep once one was
+        // actually accumulated (the `Partial` arm below); a bare `Error`
+        // (`partial()`'s own empty-prefix collapse, #400/#494) has nothing
+        // for `atomic` to affect either way.
         QueryResult::Error(e) => {
             if optional {
                 QueryResult::None
@@ -26431,19 +26435,16 @@ fn catch_error_under_optional<W: Clone + AsRef<[u64]>>(
                 QueryResult::Error(e)
             }
         }
-        QueryResult::Partial(prefix, Control::Error(e)) => {
-            if optional {
-                if atomic {
-                    QueryResult::None
-                } else {
-                    owned_vec_to_result(prefix)
-                }
-            } else if atomic {
-                QueryResult::Error(e)
-            } else {
-                QueryResult::Partial(prefix, Control::Error(e))
-            }
-        }
+        // All four `(atomic, optional)` cells, spelled out as a flat table
+        // rather than nested conditionals so each is visible at a glance:
+        // `atomic` decides whether `prefix` survives at all; `optional`
+        // decides whether the survival (or lack of one) also raises.
+        QueryResult::Partial(prefix, Control::Error(e)) => match (atomic, optional) {
+            (true, true) => QueryResult::None,
+            (true, false) => QueryResult::Error(e),
+            (false, true) => owned_vec_to_result(prefix),
+            (false, false) => QueryResult::Partial(prefix, Control::Error(e)),
+        },
         QueryResult::Partial(_, Control::Break(label)) if atomic => QueryResult::Break(label),
         QueryResult::Partial(_, Control::Halt(code)) if atomic => QueryResult::Halt(code),
         other => other,
