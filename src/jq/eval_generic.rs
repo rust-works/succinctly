@@ -4287,19 +4287,31 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
 /// regardless (#1067): a future change that ever violates that invariant
 /// degrades gracefully instead of silently misbehaving.
 ///
-/// A `LazySeq` hasn't necessarily failed *yet* -- it's lazy, so it never
-/// matches the `Error`/`Break`/`Partial` arms above even when pulling it
-/// would fail (#724, #725). This boundary needs to know *now* whether
-/// `inner` fails, so force it here -- same one-pass cost
-/// `materialize_atomic` already pays at every other materializing boundary
-/// in this file. Without this arm, `inner` falls through to `other =>
-/// other` below and escapes the boundary entirely: the error only surfaces
-/// later, at whatever downstream site finally pulls the `LazySeq`, by which
-/// point this `try`/`catch`/`?` is long gone (confirmed against real jq:
-/// `[1,2,"x"]|map(.+1)?` is empty/exit-0 in jq, but errored/exit-5 here
-/// before this arm existed). `halt` is never caught here either way,
-/// matching `Control`'s own pass-through guarantee and the `other => other`
-/// wildcard's identical treatment of a bare `GenericResult::Halt`.
+/// None of `LazyKeys`/`LazyIndexRange`/`LazySeq` have necessarily failed
+/// *yet* -- all three are lazy, so none of them matches the
+/// `Error`/`Break`/`Partial` arms above even when pulling one would fail
+/// (#724, #725, #683, #684). This boundary needs to know *now* whether
+/// `inner` fails, so force all three via [`GenericResult::materialize_lazy`]
+/// before the match below runs -- same one-pass cost every other
+/// materializing boundary in this file already pays. Without this,
+/// `inner`'s lazy result falls through to `other => other` and escapes the
+/// boundary entirely: the error only surfaces later, at whatever downstream
+/// site finally pulls it, by which point this `try`/`catch`/`?` is long
+/// gone (confirmed against real jq for `LazySeq`: `[1,2,"x"]|map(.+1)?` is
+/// empty/exit-0 in jq, but errored/exit-5 here before that arm existed;
+/// `LazyKeys`' own #1936 case has no jq oracle -- `keys_unsorted` on a
+/// non-string key is a document real jq's own parser rejects outright -- so
+/// it's pinned by comparing against this same boundary's already-correct
+/// `sort?`/`try (sort) catch` handling of the identical document instead).
+/// `halt` is never caught here either way, matching `Control`'s own
+/// pass-through guarantee and the `other => other` wildcard's identical
+/// treatment of a bare `GenericResult::Halt`.
+///
+/// [`each_try_generic`] below, this function's push-model twin, does *not*
+/// need the equivalent fix: its `keys`/`keys_unsorted` dispatch already
+/// forces each key through `each_lazy_keys_iterate_sink`'s own, separately
+/// fixed catchability path (#1770) rather than ever producing a
+/// `GenericResult::LazyKeys` in the first place.
 fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     inner: &Expr,
     catch: Option<&Expr>,
@@ -4313,7 +4325,7 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
             None => GenericResult::None,
         }
     };
-    match eval_single::<S, _>(inner, value, optional, cursor) {
+    match eval_single::<S, _>(inner, value, optional, cursor).materialize_lazy() {
         GenericResult::Error(e) if e.is_decode_failure() => GenericResult::Error(e),
         GenericResult::Error(e) => run_catch(&e.payload()),
         GenericResult::Break(_) => run_catch(&OwnedValue::Null),
@@ -4326,13 +4338,6 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Partial(prefix, Control::Break(_)) => {
             prepend_generic(prefix, run_catch(&OwnedValue::Null))
         }
-        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
-            Ok(owned) => GenericResult::Owned(owned),
-            Err(Control::Error(e)) if e.is_decode_failure() => GenericResult::Error(e),
-            Err(Control::Error(e)) => run_catch(&e.payload()),
-            Err(Control::Break(_)) => run_catch(&OwnedValue::Null),
-            Err(Control::Halt(code)) => GenericResult::Halt(code),
-        },
         other => other,
     }
 }
