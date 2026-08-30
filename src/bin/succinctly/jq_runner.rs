@@ -3595,13 +3595,20 @@ fn evaluate_input_streaming(
 /// One streamed output as an `OwnedValue`, or `None` when there is nothing to
 /// write (a decode failure already reported to `sink`, or an empty result).
 ///
-/// Carries the per-variant materialization the eager `evaluate_input`
-/// used to do inline (removed in #1653, once every call site streamed), for
-/// exactly the
-/// variants a *single* sink item can be. `Many`/`ManyCursor`/`ManyOwned`/
-/// `Partial` are unreachable here by construction -- the sink is fed one item
-/// at a time, and `drain_result_generic` is what splits those multi-value
-/// shapes into individual items before they ever arrive.
+/// Carries the per-variant materialization the eager `evaluate_input` used to
+/// do inline (removed in #1653, once every call site streamed), for exactly
+/// the variants a *single* sink item can be.
+///
+/// That is a strictly smaller set than `GenericResult`'s: a sink item is
+/// always a `GenericItem`, and `generic_item_to_result` maps its six variants
+/// onto `One`/`OneCursor`/`Owned`/`LazyKeys`/`LazyIndexRange`/`LazySeq` and
+/// nothing else. The remaining eight -- `None`, `Error`, `Break`, `Halt`, and
+/// the four multi-value shapes -- are therefore unreachable *by
+/// construction*, not merely unlikely, so they share one arm rather than
+/// eight speculative ones that could never run (an earlier draft spelled all
+/// eight out, which read as real handling and left a dozen permanently
+/// uncovered lines behind). A control never arrives as an item either: it is
+/// returned as the `Flow`'s own outcome and reported by the caller.
 fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
     result: GenericResult<V>,
     sink: &mut ErrorSink,
@@ -3656,27 +3663,16 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
                 None
             }
         },
-        GenericResult::None => None,
-        GenericResult::Error(e) => {
-            sink.report(DiagStyle::Jq, &e, &at.resolve());
-            None
-        }
-        GenericResult::Break(label) => {
-            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
-            None
-        }
-        GenericResult::Halt(code) => {
-            sink.request_halt(code);
-            None
-        }
-        // Structurally unreachable, and *silently* so: a sink item can only
-        // be one of the six `GenericItem` variants `generic_item_to_result`
-        // maps, and none of them is multi-valued. `None` rather than
-        // `unreachable!()` keeps a future regression from taking the process
-        // down -- but it would drop values rather than print them, so the
-        // trade is stated here instead of being described as a graceful
-        // fallback it is not (review finding).
-        GenericResult::Many(_)
+        // The eight shapes a sink item provably never takes (see this
+        // function's doc comment). `None` rather than `unreachable!()` so a
+        // future regression cannot take the process down -- but it would drop
+        // values rather than print them, so the trade is stated here instead
+        // of being dressed up as a graceful fallback it is not.
+        GenericResult::None
+        | GenericResult::Error(_)
+        | GenericResult::Break(_)
+        | GenericResult::Halt(_)
+        | GenericResult::Many(_)
         | GenericResult::ManyCursor(_)
         | GenericResult::ManyOwned(_)
         | GenericResult::Partial(..) => None,

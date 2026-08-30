@@ -25858,3 +25858,88 @@ fn test_streamed_ordering_not_yet_reached_on_m2_path_1653() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1653: the streaming path's own `--input-dsv` row loop, including the
+/// `-e` branch that materializes each row's last output.
+///
+/// `--input-dsv` was a fifth `evaluate_input` call site the first pass at
+/// #1653 missed, so it kept batching after every other route streamed; these
+/// pin both that it streams and that `-e` still reports row truthiness.
+#[test]
+fn test_dsv_rows_stream_and_track_exit_status_1653() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("sjq-dsv-1653-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let csv = dir.join("rows.csv");
+    std::fs::write(&csv, "a,b\n1,2\n")?;
+    let path = csv.to_str().expect("temp path is utf-8");
+
+    // Each row's output is written before the next row is evaluated, so the
+    // per-row `debug` lands *after* that row's own `1`, not before both rows.
+    let (combined, code) = run_jq_interleaved(
+        &[
+            "--unbuffered",
+            "-c",
+            "--input-dsv",
+            ",",
+            "1, debug, 2",
+            path,
+        ],
+        None,
+    )?;
+    assert_eq!(
+        combined,
+        "1\n[\"DEBUG:\",[\"a\",\"b\"]]\n[\"a\",\"b\"]\n2\n\
+         1\n[\"DEBUG:\",[\"1\",\"2\"]]\n[\"1\",\"2\"]\n2\n"
+    );
+    assert_eq!(code, 0);
+
+    // `-e` on the same path: the last output drives the exit code.
+    let (out, _err, code) = run_jq_full(&["-c", "-e", "--input-dsv", ",", ".[0]", path], None)?;
+    assert_eq!(out, "\"a\"\n\"1\"\n");
+    assert_eq!(code, 0);
+    let (_out, _err, code) = run_jq_full(&["-c", "-e", "--input-dsv", ",", "null", path], None)?;
+    assert_eq!(code, 1, "a null last output is jq's falsy exit");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// #1653: a `LazySeq` item that fails while being materialized on the
+/// streaming path still reports through `sink`, for each control it can
+/// raise.
+///
+/// `map(f)` stays lazy until this boundary forces it, so `f`'s own
+/// error/halt surfaces here rather than during evaluation -- the one arm of
+/// `materialize_stream_item` that handles a control at all (every other
+/// control is the `Flow`'s outcome, reported by the caller).
+#[test]
+fn test_streamed_lazy_seq_materialization_control_1653() -> Result<()> {
+    for (filter, expected_out, expected_code, expected_err) in [
+        ("[1,2]|map(.+1)", "[2,3]\n", 0, ""),
+        (
+            "[1,0]|map(1/.)",
+            "",
+            5,
+            "number (1) and number (0) cannot be divided because the divisor is zero",
+        ),
+        (
+            "[1,2]|map(if .==2 then halt_error(3) else . end)",
+            "",
+            3,
+            "2",
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["--slurp", "-c", filter], Some("{}"))?;
+        assert_eq!(out, expected_out, "stdout for {filter}");
+        assert_eq!(code, expected_code, "exit for {filter} -- stderr={err}");
+        if expected_err.is_empty() {
+            assert_eq!(err, "", "stderr for {filter}");
+        } else {
+            assert!(
+                err.contains(expected_err),
+                "stderr for {filter}: got {err:?}"
+            );
+        }
+    }
+    Ok(())
+}
