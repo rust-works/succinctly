@@ -26760,7 +26760,42 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // native and un-boxed rather than unified into one iterator, to
             // avoid trading this duplication for a `Box<dyn Iterator>`'s
             // allocation and dynamic dispatch on every `.[]`.
+            //
+            // Each element's own step is run with `optional` forced to
+            // `false`, not the ambient value this arm itself received --
+            // the same `Expr::Array`/`Builtin::Map` fix (#1302/#1826),
+            // applied here for `Expr::Iterate` (#1869): passing the ambient
+            // value straight through let a genuine per-element error
+            // self-swallow into `QueryResult::None` before
+            // `accumulate_path_context_step` ever saw it as a stop signal,
+            // silently *skipping* that one element and continuing to the
+            // next instead of aborting the traversal -- confirmed live:
+            // `(.a)? | .[] | if key==1 then error("boom") else key end` on
+            // `{"a":[1,2,3]}` produced `0`/`2` (element 1 silently
+            // skipped), where real jq's own equivalent (`.a | .[] | ...`,
+            // no `?` -- an ordinary generator error always aborts
+            // everything downstream, `?` or not) emits `0` then errors.
+            //
+            // Unlike `Array`/`Map`, `Iterate` is not a constructor -- there
+            // is no atomic "discard the whole in-progress collection"
+            // model to reach for, so an escaping `Error` (when the ambient
+            // `optional` genuinely catches it) keeps the prefix already
+            // produced rather than discarding it (`owned_vec_to_result`,
+            // matching the path-context `Expr::Optional` arm's own
+            // keep-prefix precedent a few arms below, #1335). `Break`/
+            // `Halt` are never caught by this arm's ambient `optional` at
+            // all, even when it's `true` -- unlike `Optional`'s own arm
+            // (which only ever runs when there's a literal `?` right here,
+            // so unconditional catching is correct there), an ambient
+            // `optional` reaching `Iterate` can come from an *unrelated*
+            // enclosing `?` bleeding through `rest` (the pre-existing,
+            // documented #1335 "rest inherits suppression" gap) -- and a
+            // `break`'s label target is lexically scoped, never something
+            // an unrelated ancestor's `?` may intercept. Both fall through
+            // `Some(other) => other` unchanged, preserving whatever prefix
+            // `accumulate_path_context_step` already attached (#400/#494).
             let mut results = Vec::new();
+            let mut stopped = None;
             match value {
                 OwnedValue::Array(arr) => {
                     for (i, v) in arr.iter().enumerate() {
@@ -26771,10 +26806,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
-                            return stop;
+                            stopped = Some(stop);
+                            break;
                         }
                     }
                 }
@@ -26787,17 +26823,35 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                             root,
                             file_origin,
                             current_path,
-                            optional,
+                            false,
                             &mut results,
                         ) {
-                            return stop;
+                            stopped = Some(stop);
+                            break;
                         }
                     }
                 }
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
-            owned_vec_to_result(results)
+            match stopped {
+                None => owned_vec_to_result(results),
+                Some(QueryResult::Error(e)) => {
+                    if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(e)
+                    }
+                }
+                Some(QueryResult::Partial(prefix, Control::Error(e))) => {
+                    if optional {
+                        owned_vec_to_result(prefix)
+                    } else {
+                        partial(prefix, Control::Error(e))
+                    }
+                }
+                Some(other) => other,
+            }
         }
         Expr::Paren(inner) => {
             // Parentheses don't change path, just evaluate inner

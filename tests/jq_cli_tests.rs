@@ -7606,6 +7606,111 @@ fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
     Ok(())
 }
 
+/// #1869: the identical bug class as #1826/#1302, but for `Expr::Iterate`'s
+/// own path-context arm (bare `.[]`, not `map(f)`). Confirmed live pre-fix:
+/// `(.a)? | .[] | if key==1 then error("boom") else key end` on
+/// `{"a":[1,2,3]}` produced `0`/`2` -- the erroring element (1) silently
+/// *skipped* rather than aborting the traversal, since the ambient
+/// `optional` reached each element's own recursive evaluation instead of
+/// being forced to `false` and self-caught at this arm's own level.
+///
+/// Unlike `Array`/`Map`, `Iterate` is not a constructor -- there's no
+/// atomic in-progress collection to discard wholesale, so the fix keeps
+/// whatever prefix was already produced before the error (real jq's own
+/// `(1, 2, error("x"))?`-style "keep everything before the catch" model,
+/// #1335) rather than discarding it to nothing the way `map()`'s own fix
+/// does.
+#[test]
+fn test_iterate_path_context_ambient_optional_keeps_prefix_not_skip_1869() -> Result<()> {
+    // Array target: element 0 succeeds and is kept; element 1 errors and
+    // stops the traversal (element 2 must never run) -- not "skip 1, keep
+    // going to 2".
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | .[] | if key==1 then error(\"boom\") else key end",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+
+    // Object target: same shape, `key` reporting the string key.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | .[] | if key==\"y\" then error(\"boom\") else key end",
+        ],
+        Some(r#"{"a":{"x":1,"y":2,"z":3}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"x\"\n");
+
+    // The *first* element/entry erroring: `partial()` (#400/#494) collapses
+    // an empty accumulated prefix to a bare `Error`, which this arm's own
+    // `if optional` gate must still catch (not just the `Partial` shape) --
+    // #1826's review caught the same gap for `map()`.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "(.a)? | .[] | if key==0 then error(\"boom\") else key end",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // Without any ambient `?`, the same query still hard-errors, keeping
+    // the pre-error prefix on stdout -- matches real jq's own equivalent
+    // (`.a | .[] | if .==2 then error("boom") else . end` on `[1,2,3]`
+    // emits `1` then errors, confirmed live against jq 1.7.1) exactly:
+    // an ordinary generator error always aborts everything downstream.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            ".a | .[] | if key==1 then error(\"boom\") else key end",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `break` must never be caught by this arm's ambient `optional`, with
+    // or without one present -- a label's target is lexically scoped, not
+    // something an unrelated ancestor's `?` may intercept (unlike
+    // `Expr::Optional`'s own arm, which only ever runs when there's a
+    // literal `?` right there). Both must keep the pre-break prefix
+    // (`0`) and terminate with the same success/no-op-past-label exit.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | ((.a)? | .[] | if key==1 then break $out else key end)",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | (.a | .[] | if key==1 then break $out else key end)",
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+
+    // Sibling positive case: a `.[]` that never errors is unaffected by the
+    // ambient `optional`, and `rest` after it still runs normally.
+    let (stdout, _, code) = run_jq_full(&["-c", "(.a)? | .[] | key"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n1\n2\n");
+
+    Ok(())
+}
+
 /// `needs_path_context` had no `Expr::StringInterpolation` arm (#1334), the
 /// same gap #1302 fixed for `Expr::Array` -- so `"k=\(key)"` silently
 /// stubbed `key` to `null` inside a `\(...)` slot, even once
