@@ -38,14 +38,18 @@ use super::expr::Literal;
 /// Deliberately a *separate* constant from
 /// [`eval_generic::MAX_NESTING_DEPTH`](super::eval_generic::MAX_NESTING_DEPTH)
 /// (256), not a reuse of it: that ceiling guards cursor-to-`OwnedValue`
-/// *conversion* functions, individually tuned against their own measured
-/// crash boundaries (600-700 for the tightest of that set, `print_json`).
-/// This constant's own guarded functions are a different shape with
-/// different measured boundaries (debug build, default 2MiB test-thread
-/// stack — the more fragile of debug/release, matching how 256 was itself
-/// measured): `reconcile_presentation` crashes between depth 580-600 (the
-/// tightest of this set), `format_json_impl` between 650-700, and
-/// `eval.rs`'s own `to_owned` between 1800-2000. Reusing 256 here would be
+/// *conversion* functions (`to_owned`/`to_owned_cursor`/`cursor_to_owned`),
+/// individually tuned against their own measured crash boundaries --
+/// `to_owned`'s own sits between 1800-2000. (`print_json` used to share
+/// that ceiling too; #1819 moved it to this one instead, since it was the
+/// wrong pairing -- see this constant's "Guards" list above and
+/// `print_json`'s own doc comment.) This constant's own guarded functions
+/// are a different shape with different measured boundaries (debug build,
+/// default 2MiB test-thread stack — the more fragile of debug/release,
+/// matching how 256 was itself measured): `reconcile_presentation` crashes
+/// between depth 580-600 (the tightest of this set), `format_json_impl`
+/// between 650-700, `print_json` between 600-700, and `eval.rs`'s own
+/// `to_owned` between 1800-2000. Reusing 256 here would be
 /// wrong in the *other* direction: 256 does not clear
 /// `tests/jq_recurse_depth_tests.rs`'s deliberately-pinned depth-300
 /// correctness capability for `path(..)`/`path(recurse)` (#626's de-risk
