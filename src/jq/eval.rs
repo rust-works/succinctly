@@ -17059,7 +17059,7 @@ fn set_path<S: EvalSemantics>(
                     // that case on its own, exactly as it did before #1428.
                     && would_create
                     && !tail_writes_from_fresh_parent(|probe| {
-                        set_path_through_iterate(
+                        set_path_through_iterate::<S>(
                             probe,
                             split.optional,
                             &split.tail,
@@ -17122,7 +17122,7 @@ fn set_path<S: EvalSemantics>(
                                 terminal_write: matches!(split.tail, Expr::Identity),
                             },
                             |sub| {
-                                set_path(
+                                set_path::<S>(
                                     sub,
                                     &split.tail,
                                     new_value.clone(),
@@ -17176,7 +17176,7 @@ fn set_path<S: EvalSemantics>(
                     // See the `split_at_iterate` arm above.
                     && would_create
                     && !tail_writes_from_fresh_parent(|probe| {
-                        set_path(
+                        set_path::<S>(
                             probe,
                             last_path,
                             new_value.clone(),
