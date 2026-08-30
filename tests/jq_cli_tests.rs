@@ -4183,6 +4183,44 @@ fn test_seq_output_format() -> Result<()> {
     Ok(())
 }
 
+/// #1913: real jq's `--seq` writes the RS separator before each *JSON*
+/// output, but not before a genuinely raw (`-r`/`-j`) string output --
+/// confirmed live against jq 1.7.1. `succinctly jq` used to write it
+/// unconditionally, corrupting every `--seq -r`/`--seq -j` record with a
+/// leading `\x1e` byte jq does not emit.
+#[test]
+fn test_seq_omits_rs_before_raw_output_1913() -> Result<()> {
+    // `-r`: no leading RS at all.
+    let (output, code) = run_jq_binary_stdin(".", b"\x1e\"a\"\n\x1e\"b\"\n", &["--seq", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"a\nb\n");
+
+    // `-j`: same, and no trailing newline either.
+    let (output, code) = run_jq_binary_stdin(".", b"\x1e\"a\"\n\x1e\"b\"\n", &["--seq", "-j"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"ab");
+
+    // Control: plain `--seq` (no `-r`/`-j`) still gets the separator.
+    let (output, code) = run_jq_binary_stdin(".", b"\x1e\"a\"\n", &["--seq", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"\x1e\"a\"\n");
+
+    // `-r` falling back to JSON output for a non-string value still gets
+    // the separator -- real jq's own behavior, confirmed live.
+    let (output, code) = run_jq_binary_stdin(".", b"\x1e42\n", &["--seq", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"\x1e42\n");
+
+    // The `-n`/`inputs` materializing path (a separate writer function)
+    // gets the same fix.
+    let (output, code) =
+        run_jq_binary_stdin("inputs", b"\x1e\"a\"\n\x1e\"b\"\n", &["--seq", "-n", "-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, b"a\nb\n");
+
+    Ok(())
+}
+
 #[test]
 fn test_seq_input_parsing() -> Result<()> {
     // --seq should parse RS-separated input values

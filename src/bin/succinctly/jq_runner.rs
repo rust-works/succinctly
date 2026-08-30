@@ -4168,8 +4168,15 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         reject_raw_output0_nul(s, config)?;
     }
 
-    // In seq mode, prepend RS (Record Separator) before each value
-    if config.seq {
+    // In seq mode, prepend RS (Record Separator) before each *JSON* value
+    // only -- real jq never writes it before a genuinely raw (`-r`/`-j`)
+    // string output, confirmed live against jq 1.7.1 (`--seq -r` produces
+    // no leading `\x1e` at all, #1913). `raw_str` already carries exactly
+    // that distinction: `None` here covers both "not in raw-output mode"
+    // and "`-r`'s value isn't a string," and jq's own `-r` on a non-string
+    // value falls back to JSON output *with* the separator, which this
+    // reuse gets right for free.
+    if config.seq && raw_str.is_none() {
         out.write_all(&[ASCII_RS])?;
     }
 
@@ -4242,8 +4249,10 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
         reject_raw_output0_nul(s, config)?;
     }
 
-    // In seq mode, prepend RS (Record Separator) before each value
-    if config.seq {
+    // In seq mode, prepend RS (Record Separator) before each *JSON* value
+    // only -- see `write_output_jq_value`'s identical fix (#1913) for the
+    // full rationale; `raw_str` already carries the same distinction here.
+    if config.seq && raw_str.is_none() {
         out.write_all(&[ASCII_RS])?;
     }
 
