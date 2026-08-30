@@ -1881,6 +1881,52 @@ protocol for `resolve_node`, the same shape `eval_each_owned` already gives valu
 evaluation) rather than attempted here; the narrow `first`/`limit` fixes already close
 the two shapes named in #1906/#1935's own repros.
 
+### A generator-argument expression fans out normally, then silently narrows to its first output the moment `key`/`parent`/`file_index` shows up anywhere else in the same pipe
+
+[#1277](https://github.com/rust-works/succinctly/issues/1277)'s clusters 1-3
+(closed by [#1522](https://github.com/rust-works/succinctly/issues/1522)/[#1279](https://github.com/rust-works/succinctly/issues/1279))
+gave generator-argument builtins real fan-out: a builtin whose argument is a
+generator now produces one output per argument output, matching real jq.
+Four call sites inside `eval_pipe_with_path_context_internal`
+(`src/jq/eval.rs`) -- `ParentN`'s own `n` argument, the `Expr::Builtin(_)`
+arm, the `Expr::Object`/`Array`/`Literal` arm, and the generic `_` fallback
+-- were an explicit non-goal of that fix, since giving them the same real
+fan-out is a materially larger change (`docs/plan/jq-generator-argument-fanout.md`).
+Those 4 sites route through `eval_owned_expr_opt`/`eval_owned_expr_full`,
+which -- until [#1937](https://github.com/rust-works/succinctly/issues/1937)
+-- array-collapsed a multi-output expression into a single
+`OwnedValue::Array` instead of fanning out or taking the first output.
+
+```console
+$ echo '{"a":"xax"}' | succinctly jq -c '.a | ltrimstr(("x","z"))'
+"ax"
+"xax"
+$ echo '{"a":"xax"}' | succinctly jq -c '.a | ltrimstr(("x","z")) | key'
+"a"
+```
+
+The first query (no `key`, so the ordinary fan-out-aware evaluator handles
+it) correctly produces 2 outputs, matching real jq's own fan-out for this
+exact query (confirmed against jq 1.7.1). The second query is identical
+except for the trailing `key`, which forces the whole pipe through
+`eval_pipe_with_path_context_internal` since `key` needs path tracking --
+`key` itself has no jq oracle (succinctly extension), so this specific
+combination can't be demonstrated as a *jq* divergence in isolation, but it
+is a genuine, demonstrated internal inconsistency: the same sub-expression
+fans out correctly or silently narrows to one value depending on whether an
+unrelated path-tracking builtin happens to be anywhere else in the pipe.
+
+#1937 changed the narrowing from array-collapse to take-first (matching
+`result_to_owned_full`'s identical policy for the same shapes, and its
+`x as $b | ...` rationale for why real jq's own generator-argument
+desugaring only ever drives the rest of a computation off the *first*
+output) -- internally consistent with that sibling function's behavior now,
+rather than being a second, differently-wrong answer. This is **not** a fix
+to full fidelity: real jq still produces every output here, and neither
+take-first nor array-collapse matches that. Left as a known, documented gap
+rather than the larger fan-out rework #1522's design doc already declined
+for these 4 sites.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |

@@ -25481,23 +25481,28 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         QueryResult::One(v) => Ok(Some((to_owned(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
-        QueryResult::Many(vs) => {
-            if vs.len() == 1 {
-                Ok(Some((to_owned(&vs[0]), None)))
-            } else {
-                Ok(Some((
-                    OwnedValue::Array(vs.iter().map(to_owned).collect()),
-                    None,
-                )))
-            }
-        }
-        QueryResult::ManyOwned(vs) => {
-            if vs.len() == 1 {
-                Ok(Some((vs.into_iter().next().unwrap(), None)))
-            } else {
-                Ok(Some((OwnedValue::Array(vs), None)))
-            }
-        }
+        // Take-first, not array-collapse (#1937): real jq's generator-argument
+        // desugaring (`f(x)` ~= `x as $b | ...`) runs the caller's computation
+        // against `x`'s *first* output only -- see `result_to_owned_full`'s
+        // identical policy and doc comment, which this now matches instead of
+        // diverging from it. An empty `Many`/`ManyOwned` is the same
+        // "zero outputs" case as a bare `QueryResult::None`, not an empty
+        // array (same reasoning as `result_to_owned_full`).
+        //
+        // This is a deliberate simplification, not full fan-out: giving these
+        // 4 call sites (`ParentN`'s `n`, `Builtin`, `Object`/`Array`/`Literal`,
+        // the generic fallback -- all inside
+        // `eval_pipe_with_path_context_internal`) real one-output-per-argument-
+        // output fan-out is the "materially larger, too invasive" fix #1522's
+        // design doc (`docs/plan/jq-generator-argument-fanout.md`) explicitly
+        // declined for this exact helper. Taking the first output instead of
+        // array-collapsing it is *not* a correct match for real jq either --
+        // jq still produces every output -- but it is at least internally
+        // consistent with `result_to_owned`'s sibling policy, rather than the
+        // previous array-collapse being a second, different wrong answer.
+        // Residual gap documented in `docs/compliance/jq/limitations.md`.
+        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned(v), None))),
+        QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().map(|v| (v, None))),
         // The one behavior change from `eval_owned_expr_ctrl_full`'s own
         // slow path (#1280): `None`, not `Ok(Some((Null, None)))`.
         QueryResult::None => Ok(None),
@@ -25511,17 +25516,15 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         // after some values were already produced, not have it silently
         // discarded (#791).
         QueryResult::Partial(_, Control::Halt(code)) => Err(Control::Halt(code)),
-        // Same collapse-to-single-or-array policy as `Many`/`ManyOwned`
-        // above; the trailing `Error`/`Break` is now exposed via the second
-        // tuple element instead of silently dropped (#1164) -- a caller
-        // using this function (rather than the plain `eval_owned_expr_ctrl`
-        // above) is expected to apply it to its own final result.
+        // Same take-first policy as `Many`/`ManyOwned` above (a `Partial`
+        // prefix is never empty, per `partial`'s own contract -- same
+        // assumption `result_to_owned_full` relies on for its identical arm);
+        // the trailing `Error`/`Break` is still exposed via the second tuple
+        // element instead of silently dropped (#1164) -- a caller using this
+        // function (rather than the plain `eval_owned_expr_ctrl` above) is
+        // expected to apply it to its own final result.
         QueryResult::Partial(vs, control) => {
-            if vs.len() == 1 {
-                Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
-            } else {
-                Ok(Some((OwnedValue::Array(vs), Some(control))))
-            }
+            Ok(Some((vs.into_iter().next().unwrap(), Some(control))))
         }
     }
 }
@@ -63223,13 +63226,18 @@ mod tests {
     /// the owned equivalent (`ManyOwned`), and a `Partial` with 2+ prior
     /// values -- are covered directly here instead of hunting for CLI
     /// syntax that happens to produce each borrowed/owned distinction.
+    ///
+    /// #1937 changed both of these from array-collapse to take-first (see
+    /// `eval_owned_expr_full`'s own doc comment) -- updated in place here
+    /// rather than left pinning the old, now-removed collapse behavior.
     #[test]
     fn eval_owned_expr_ctrl_full_many_shapes_and_multi_value_partial_1164() {
         // Many (borrowed, 2+ outputs, no escape): `eval_owned_expr_ctrl_full`
         // reindexes `input` into its own internal JsonIndex/cursor before
         // evaluating, so a comma of two field accesses against an object
         // input reaches `eval_single`'s `Many` arm (borrowed cursor values),
-        // not already-owned ones.
+        // not already-owned ones. Takes the first output (#1937), not an
+        // array of both.
         let expr = parse(".a, .b").unwrap();
         match eval_owned_expr_ctrl_full::<JqSemantics>(
             &expr,
@@ -63239,19 +63247,19 @@ mod tests {
             ])),
             false,
         ) {
-            Ok((OwnedValue::Array(vs), None)) => {
-                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-            }
+            Ok((v, None)) => assert_eq!(v.to_json(), "1"),
             other => panic!("unexpected result: {other:?}"),
         }
 
         // Multi-value Partial (2+ values, then a break): the `else` branch
-        // of the `vs.len() == 1` check inside the `Partial` arm.
+        // of the `vs.len() == 1` check inside the old `Partial` arm --
+        // now takes the first value (#1937), with the trailing break still
+        // exposed rather than dropped (#1164).
         let expr = parse("(1, 2, break $out)").unwrap();
         match eval_owned_expr_ctrl_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Ok((OwnedValue::Array(vs), Some(Control::Break(label)))) => {
+            Ok((v, Some(Control::Break(label)))) => {
+                assert_eq!(v.to_json(), "1");
                 assert_eq!(label, "out");
-                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
             other => panic!("unexpected result: {other:?}"),
         }
@@ -63292,6 +63300,46 @@ mod tests {
         let expr = parse("[1,2,3] | .[0:1][]").unwrap();
         match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
             Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    /// #1937: a genuinely multi-output expression takes its *first* output
+    /// instead of array-collapsing every output into one `OwnedValue::Array`
+    /// -- consistent with `result_to_owned_full`'s identical policy for the
+    /// same shapes (see that function's own doc comment for why: real jq's
+    /// generator-argument desugaring uses only the first output to drive the
+    /// rest of the computation). Not full fan-out -- #1522's design doc
+    /// explicitly declined that as too invasive for this helper -- just no
+    /// longer manufacturing a second, differently-wrong answer.
+    #[test]
+    fn eval_owned_expr_full_takes_first_not_array_collapse_1937() {
+        // QueryResult::Many, len() > 1: `.[]` over a two-key object.
+        let input = OwnedValue::Object(IndexMap::from([
+            ("a".to_string(), OwnedValue::Int(1)),
+            ("b".to_string(), OwnedValue::Int(2)),
+        ]));
+        let expr = parse(".[]").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &input, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "1"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // QueryResult::ManyOwned, len() > 1: a constructed array's own `.[]`.
+        let expr = parse("[10,20,30] | .[]").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &OwnedValue::Null, false) {
+            Ok(Some((v, None))) => assert_eq!(v.to_json(), "10"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // QueryResult::Many, len() == 0: same "zero outputs" case as a bare
+        // `QueryResult::None`, not an empty array -- `.[]` over `{}` produces
+        // nothing at all, matching `result_to_owned_full`'s identical
+        // "an empty Many/ManyOwned is the same zero-outputs case" rule.
+        let empty_obj = OwnedValue::Object(IndexMap::new());
+        let expr = parse(".[]").unwrap();
+        match eval_owned_expr_full::<JqSemantics>(&expr, &empty_obj, false) {
+            Ok(None) => {}
             other => panic!("unexpected result: {other:?}"),
         }
     }
