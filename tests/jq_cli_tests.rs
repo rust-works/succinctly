@@ -25875,3 +25875,40 @@ fn test_read_through_slice_that_writes_nothing_is_a_noop_1428() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1428 review follow-up: `update_path`'s slice arm must compute
+/// `terminal_write`, not hardcode `false`.
+///
+/// `set_path`'s slice arm has always derived it from its tail. `update_path`'s
+/// hardcoded `false` was harmless while `through_slice`'s `Null` arm treated
+/// every unwritten `Null` as an error -- but once that arm learned to no-op for
+/// a genuine read-through, the wrong flag made it swallow the real error for a
+/// filter that writes `null` directly to the slice.
+#[test]
+fn test_slice_update_with_identity_tail_still_raises_1428() -> Result<()> {
+    for (input, filter) in [
+        ("null", "(.a[0:1]|.) |= null"),
+        ("{\"a\":null}", "(.a[0:1]|.) |= null"),
+        ("null", "(.[0:1]|.) |= null"),
+        ("null", "(.a[0:1]|.) |= 9"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_ne!(code, 0, "{input} | {filter} must raise, got {stdout:?}");
+        assert!(
+            stderr.contains("slice of an array"),
+            "{input} | {filter} -- got {stderr}"
+        );
+    }
+
+    // The read-through spelling of the same shape still no-ops, which is the
+    // distinction `terminal_write` draws.
+    for (input, filter, expected) in [
+        ("null", ".a[0:1][]? |= 9", "null\n"),
+        ("null", ".a[0:1][0][]? |= 9", "null\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
+        assert_eq!(stdout, expected, "{input} | {filter}");
+    }
+    Ok(())
+}
