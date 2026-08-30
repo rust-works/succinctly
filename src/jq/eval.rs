@@ -884,6 +884,17 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
             patterns,
             body,
         } => patterns.len() == 1 && (needs_path_context(expr) || needs_path_context(body)),
+        // `limit(n; expr)` (#1765, item 2 of #1663's own remaining-gaps
+        // list): `expr` doesn't navigate away from the caller's own
+        // position (`eval_limit` evaluates it against the same `value`
+        // `n` was), so a `key`/`parent`/`file_index` inside it needs the
+        // same ambient context. `n` itself is deliberately excluded here,
+        // matching the dedicated eval arm below exactly (its own `n`
+        // evaluation always goes through the ordinary evaluator) -- a
+        // `key`/`parent`/`file_index` inside `n` is a narrower, rarer gap
+        // left unaddressed, same scoping precedent as `AsPattern`'s own
+        // `?//`-chain exclusion above.
+        Expr::Limit { expr, .. } => needs_path_context(expr),
         _ => false,
     }
 }
@@ -28987,6 +28998,88 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                     let bindings = extract_pattern_bindings(&patterns[0], bound_val, false)?;
                     Ok(substitute_vars(body, as_var_refs(&bindings)))
                 },
+            )
+        }
+        // `limit(n; expr)` (#1765, item 2 of #1663's own remaining-gaps
+        // list): `n` is evaluated through the ordinary evaluator, exactly
+        // like `eval_limit` itself -- only `expr` (this arm's own guard,
+        // via `needs_path_context`) is threaded through this eager
+        // evaluator instead. `n` producing more than one output isn't
+        // handled here (mirrors `eval_owned_expr_opt`'s own single-value
+        // contract, already relied on by the `Object`/`Array`/`Literal`
+        // arm below) -- a narrower, rarer gap than this fix's own repro
+        // (`limit(1; key)`), left unaddressed like the `?//`-chain
+        // exclusion above.
+        //
+        // This evaluator is fully eager, unlike `each_take_n`'s lazy "pull
+        // at most n, then stop" generator (#820's own fix) -- but this arm
+        // only runs when `expr` needs path context (rare), so the common
+        // case stays on `eval_limit`'s existing lazy path, untouched.
+        // Trading #820's stop-early optimization for correctness in the
+        // one shape that needs it is the accepted cost here, not a
+        // regression of the common case.
+        Expr::Limit { n, expr } if needs_path_context(expr) => {
+            let n_value = match eval_owned_expr_opt::<S>(n, value, optional) {
+                Ok(Some(v)) => v,
+                Ok(None) => return QueryResult::None,
+                Err(escape) => return escape.into(),
+            };
+            let limited = match classify_limit_n(n_value) {
+                Ok(LimitN::Unlimited) => eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(expr),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ),
+                Ok(LimitN::Take(0)) => QueryResult::None,
+                Ok(LimitN::Take(n)) => match eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(expr),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ) {
+                    QueryResult::Owned(v) => QueryResult::Owned(v),
+                    QueryResult::ManyOwned(mut vs) => {
+                        vs.truncate(n);
+                        owned_vec_to_result(vs)
+                    }
+                    QueryResult::None => QueryResult::None,
+                    QueryResult::Error(e) => QueryResult::Error(e),
+                    QueryResult::Break(label) => QueryResult::Break(label),
+                    QueryResult::Halt(code) => QueryResult::Halt(code),
+                    // Enough outputs arrived before the trailing control
+                    // fired: drop it, matching `limit_with_n`'s own
+                    // `Flow::Stopped`/`Flow::Exhausted` arms. Otherwise the
+                    // terminator is what `limit` actually reaches, matching
+                    // `limit_with_n`'s own `Flow::Escaped` arm.
+                    QueryResult::Partial(mut vs, control) => {
+                        if vs.len() >= n {
+                            vs.truncate(n);
+                            owned_vec_to_result(vs)
+                        } else {
+                            partial(vs, control)
+                        }
+                    }
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                },
+                Err(e) => return QueryResult::Error(e),
+            };
+            continue_rest_with_context::<W, S>(
+                limited,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
             )
         }
         Expr::Object(_) | Expr::Array(_) | Expr::Literal(_) => {
