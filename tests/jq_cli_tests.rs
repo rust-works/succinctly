@@ -6,24 +6,16 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::{classify_cargo_run_exit, signal_death_error, MAX_CARGO_RETRIES};
-
-/// Maximum retries for spawning the pre-built binary directly.
-///
-/// Every test in this file execs a fixed path (`CARGO_BIN_EXE_succinctly`)
-/// rather than rebuilding it via `cargo run` (#1859) -- but `spawn()` can
-/// still transiently observe that path mid-write if a *concurrent* test
-/// binary elsewhere in the crate is still linking it (e.g. a differently
-/// featured `cargo test` invocation sharing the same `target/` directory)
-/// and fail with `ENOENT` (#550).
-const MAX_SPAWN_RETRIES: u32 = 3;
+use cargo_run_exit::{
+    classify_cargo_run_exit, signal_death_error, spawn_with_signal_retry, succinctly_bin,
+    MAX_CARGO_RETRIES,
+};
 
 /// #1516: a signal-killed child used to render as an inscrutable
 /// `left: -1, right: 0` panic -- exercises `classify_cargo_run_exit`
@@ -125,9 +117,9 @@ fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(Strin
 /// Helper to run jq command with input from stdin, keeping stderr.
 ///
 /// Most tests only care about stdout and the exit code; use this when the
-/// absence of a diagnostic is itself the thing under test. `--quiet` keeps
-/// cargo's own progress lines ("Compiling", "Blocking waiting for file lock")
-/// off stderr, so what remains is the binary's.
+/// absence of a diagnostic is itself the thing under test. Delegates to
+/// `run_jq_full`, which execs the pre-built binary directly (#1859), so
+/// stderr here is exactly the binary's own -- no cargo output to filter.
 fn run_jq_stdin_streams(
     filter: &str,
     input: &str,
@@ -145,52 +137,28 @@ fn run_jq_stdin_streams(
 /// it unusable for the diagnostics in #355 — those live entirely on stderr and
 /// in the exit code, and their `(at <file>:<line>)` marker needs a real file.
 ///
-/// Invokes the built binary directly rather than through `cargo run`: cargo
-/// writes its own `Finished`/`Running` progress lines to stderr, which would be
-/// indistinguishable from the diagnostics under test. That also makes the
-/// lock-contention retry unnecessary — but the direct spawn can still race
-/// concurrent rebuilds of the same path, so it gets its own retry below (#550).
+/// Invokes the built binary directly rather than through `cargo run` (#1859):
+/// cargo writes its own `Finished`/`Running` progress lines to stderr, which
+/// would be indistinguishable from the diagnostics under test, and that also
+/// makes the lock-contention retry unnecessary. Delegates to the shared
+/// `spawn_with_signal_retry` (#1884 code review) rather than a file-local
+/// reimplementation, so this file's ~190 `run_jq_stdin`/`run_jq_null`-routed
+/// call sites get the same signal-death retry the four files #1847 migrated
+/// already share -- a file-local copy here would have been a fifth,
+/// independently-drifting one for the exact problem that helper's own doc
+/// comment says sharing one copy was meant to stop.
 fn run_jq_full(args: &[&str], input: Option<&str>) -> Result<(String, String, i32)> {
-    let mut cmd = spawn_jq_full(args)?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        if let Some(input) = input {
-            stdin.write_all(input.as_bytes())?;
-        }
-    }
-
-    let output = cmd.wait_with_output()?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(args);
+            command
+        },
+        input.map(str::as_bytes),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-    let Some(exit_code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
     Ok((stdout, stderr, exit_code))
-}
-
-/// Spawns the pre-built `succinctly` binary, retrying on `ENOENT`.
-///
-/// See `MAX_SPAWN_RETRIES` for why this retry exists.
-fn spawn_jq_full(args: &[&str]) -> std::io::Result<std::process::Child> {
-    for attempt in 0..MAX_SPAWN_RETRIES {
-        match Command::new(env!("CARGO_BIN_EXE_succinctly"))
-            .arg("jq")
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => return Ok(child),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < MAX_SPAWN_RETRIES =>
-            {
-                std::thread::sleep(Duration::from_millis(50 * (attempt as u64 + 1)));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    unreachable!()
 }
 
 /// Helper to run jq with null input (-n)
@@ -4124,19 +4092,9 @@ fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
     // An empty operand used to reach `result_to_owned`, which reported it as
     // `Error("no value")` and printed a diagnostic. jq emits nothing at all,
     // quietly. The goldens compare stdout only, so stderr is asserted here.
-    //
-    // Matching on the absence of a diagnostic rather than on a byte-empty
-    // stderr keeps the test independent of whatever else may reach that stream:
-    // `--quiet` silences cargo's own progress lines, but not a rustc warning
-    // from the build it triggers. Requiring stderr to be empty would couple this
-    // assertion to the whole workspace compiling warning-free, which is not what
-    // it is testing.
     let (stdout, stderr, code) = run_jq_stdin_streams("empty and true", "null", &["-c"])?;
     assert_eq!(stdout, "", "expected no output");
-    assert!(
-        !stderr.contains("jq: error"),
-        "expected no diagnostic on stderr, got: {stderr}"
-    );
+    assert_eq!(stderr, "", "expected no diagnostic on stderr");
     assert_eq!(code, 0, "expected success");
     Ok(())
 }
@@ -4149,17 +4107,14 @@ fn test_boolean_with_empty_operand_is_silent() -> Result<()> {
 fn run_jq_binary_stdin(filter: &str, input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, i32)> {
     let mut args: Vec<&str> = extra_args.to_vec();
     args.push(filter);
-    let mut cmd = spawn_jq_full(&args)?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input)?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let Some(exit_code) = output.status.code() else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(signal_death_error(output.status, &stderr));
-    };
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(&args);
+            command
+        },
+        Some(input),
+    )?;
     Ok((output.stdout, exit_code))
 }
 
@@ -4300,10 +4255,9 @@ fn test_seq_malformed_record_with_rs_byte_does_not_warn_1525() -> Result<()> {
 /// RS-containing one still warns on real jq, with one of the other
 /// message templates #1723 tracks -- not this one; not exercised here.)
 ///
-/// Spawns via `spawn_jq_full` (not a bare `Command::new(...).output()`)
-/// for its `ENOENT`-retry protection: other tests in this file rebuild
-/// the shared binary path concurrently (see `MAX_SPAWN_RETRIES`'s own
-/// doc comment, #550).
+/// Spawns via `spawn_with_signal_retry` (not a bare `Command::new(...).
+/// output()`) for its retry protection against a transient `ENOENT` or a
+/// signal-killed child under concurrent load (#550, #1884).
 #[test]
 fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<()> {
     let mut valid_file = NamedTempFile::new()?;
@@ -4312,9 +4266,16 @@ fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<
 
     let valid_path = valid_file.path().to_str().unwrap();
     let empty_path = empty_file.path().to_str().unwrap();
-    let mut cmd = spawn_jq_full(&["--seq", "-c", ".", valid_path, empty_path])?;
-    drop(cmd.stdin.take());
-    let output = cmd.wait_with_output()?;
+    let (output, _) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .arg("jq")
+                .args(["--seq", "-c", ".", valid_path, empty_path]);
+            command
+        },
+        None,
+    )?;
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stderr)?, "");
@@ -4325,8 +4286,8 @@ fn test_seq_no_rs_warning_suppressed_by_another_source_with_rs_1525() -> Result<
 
 /// #1525: two RS-less files report a line/column computed from their
 /// *concatenation*, not either file's own content alone -- oracle-verified
-/// against the pinned jq 1.7.1 binary. Spawns via `spawn_jq_full` for its
-/// `ENOENT`-retry protection, same reason as the test above.
+/// against the pinned jq 1.7.1 binary. Spawns via `spawn_with_signal_retry`
+/// for its retry protection, same reason as the test above.
 #[test]
 fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
     let mut file_a = NamedTempFile::new()?;
@@ -4336,9 +4297,14 @@ fn test_seq_no_rs_warning_across_multiple_files_1525() -> Result<()> {
 
     let path_a = file_a.path().to_str().unwrap();
     let path_b = file_b.path().to_str().unwrap();
-    let mut cmd = spawn_jq_full(&["--seq", "-c", ".", path_a, path_b])?;
-    drop(cmd.stdin.take());
-    let output = cmd.wait_with_output()?;
+    let (output, _) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(["--seq", "-c", ".", path_a, path_b]);
+            command
+        },
+        None,
+    )?;
 
     assert!(output.status.success());
     assert_eq!(
@@ -4359,11 +4325,14 @@ fn test_seq_no_rs_warning_column_counts_raw_bytes_not_substituted_1525() -> Resu
     input.push(0xFF); // invalid UTF-8 lead byte -> substituted to 3-byte U+FFFD
     input.extend_from_slice(b"cd");
 
-    let mut cmd = spawn_jq_full(&["--seq", "-c", "."])?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(&input)?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, _) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(["--seq", "-c", "."]);
+            command
+        },
+        Some(&input),
+    )?;
 
     assert!(output.status.success());
     assert_eq!(
@@ -4419,11 +4388,14 @@ fn test_seq_no_rs_warning_strips_leading_bom_1525() -> Result<()> {
     input.extend_from_slice(b"\xEF\xBB\xBF");
     input.extend_from_slice(b"1 2");
 
-    let mut cmd = spawn_jq_full(&["--seq", "-c", "."])?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(&input)?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, _) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(["--seq", "-c", "."]);
+            command
+        },
+        Some(&input),
+    )?;
 
     assert!(output.status.success());
     assert_eq!(
@@ -6113,9 +6085,11 @@ fn test_number_literal_underflow_beyond_i32_exponent_range_1099() -> Result<()> 
 ///
 /// CLI-level counterpart to `value.rs`'s
 /// `test_format_number_jq_compat_subnormal_preserves_mantissa_1177` (same
-/// #1099-established pattern: `run_jq_stdin` spawns a subprocess, invisible
-/// to `cargo llvm-cov`, so both an in-process and a CLI-level test exist
-/// for the same fix rather than one being redundant with the other).
+/// #1099-established pattern: `run_jq_stdin` spawns the real binary through
+/// its actual argv/stdin/stdout process boundary, which an in-process
+/// function call can't exercise -- CLI argument parsing, stdin piping, and
+/// stdout serialization are each their own surface a fix can regress
+/// independently of the underlying formatting logic).
 #[test]
 fn test_number_literal_subnormal_preserves_mantissa_1177() -> Result<()> {
     let (output, code) = run_jq_stdin(".", "5e-324", &["-c"])?;
@@ -6139,8 +6113,9 @@ fn test_number_literal_subnormal_preserves_mantissa_1177() -> Result<()> {
 
 /// CLI-level counterpart to
 /// `test_format_number_jq_compat_scientific_notation_preserves_trailing_zeros_1206`
-/// (`run_jq_stdin` spawns `cargo run`, invisible to `cargo llvm-cov`, so both
-/// an in-process and a CLI-level test exist for the same fix).
+/// (`run_jq_stdin` exercises the real CLI argv/stdin/stdout boundary, which
+/// an in-process function call can't -- see the matching comment on
+/// `test_number_literal_subnormal_preserves_mantissa_1177` above).
 #[test]
 fn test_number_literal_scientific_notation_preserves_trailing_zeros_via_cli_1206() -> Result<()> {
     let (output, code) = run_jq_stdin(".", "1.50e10", &["-c"])?;
@@ -6349,9 +6324,7 @@ fn test_as_binding_non_iterable_literal_still_raises_945() -> Result<()> {
 /// (the root-level defaults) whenever they weren't the very first pipe stage:
 /// the CLI's streaming evaluator (`eval_generic.rs`) bridged only the bare
 /// trailing builtin to the full evaluator, discarding the pipe structure
-/// `eval.rs`'s `needs_path_context` routing needs to see (#554). Uses
-/// `run_jq_full` (the pre-built binary), not the `cargo run`-based
-/// `run_jq_stdin`, so this is actually covered by `cargo llvm-cov`.
+/// `eval.rs`'s `needs_path_context` routing needs to see (#554).
 #[test]
 fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
     let (output, _, code) = run_jq_full(&["-c", ".a | path"], Some(r#"{"a":1}"#))?;
@@ -7941,8 +7914,7 @@ fn test_keys_unsorted_lazy_output_140() -> Result<()> {
 /// decoding or sorting, while bare `keys`/`.[]`/`.[n]`/`first`/`last` stay
 /// byte-identical to today's eager-sorted output (`JqValue::LazyKeysArray`
 /// is document-order-only, so a sorted result never reaches it -- see the
-/// `generic_result_to_jq_values` fix in `jq_runner.rs`). Uses `run_jq_full`
-/// (the pre-built binary), not `cargo run` (invisible to coverage).
+/// `generic_result_to_jq_values` fix in `jq_runner.rs`).
 #[test]
 fn test_keys_lazy_length_output_683() -> Result<()> {
     let input = r#"{"b":1,"a":2,"c":3}"#;
