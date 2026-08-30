@@ -1135,23 +1135,30 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
                     let row_value = OwnedValue::Array(fields);
 
-                    // Evaluate expression on this row
-                    let results = evaluate_input(&row_value, &expr, &context, &at, &mut sink)?;
-
-                    for result in results {
-                        had_output = true;
-                        if args.exit_status {
-                            last_output = Some(result.clone());
-                        }
-                        if route_write_error(
-                            &mut sink,
-                            &mut out,
-                            || at.resolve(),
-                            |o| write_output(o, &result, &output_config),
-                        )? {
-                            break;
-                        }
-                    }
+                    // Evaluate expression on this row, streaming (#1653):
+                    // each output must reach stdout before the next one is
+                    // evaluated, or a mid-stream `debug`/`stderr`/`error`
+                    // side effect lands ahead of output that preceded it.
+                    evaluate_input_streaming(
+                        &row_value,
+                        &expr,
+                        &context,
+                        &at,
+                        &mut sink,
+                        &mut |sink, result| {
+                            had_output = true;
+                            if args.exit_status {
+                                last_output = Some(result.clone());
+                            }
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.resolve(),
+                                |o| write_output(o, &result, &output_config),
+                            )?;
+                            Ok(!stop)
+                        },
+                    )?;
                     // halt/halt_error (#791) outranks everything else,
                     // including remaining rows/files still to process.
                     if let Some(code) = sink.halted() {
@@ -2321,7 +2328,8 @@ impl InputLocations {
 /// **b** (#1309, item 4).
 ///
 /// Reading the position after evaluation returns is sound because
-/// `evaluate_input` reports at most once per call: its `Error`, `Break`,
+/// `evaluate_input_streaming` reports the same *set* of diagnostics the
+/// eager `evaluate_input` it replaced did (#1653) -- its `Error`, `Break`,
 /// `Halt` and `Partial` arms are mutually exclusive variants of one returned
 /// value, and an uncaught control ends the evaluation, so nothing can consume
 /// another document between the raise and the report.
@@ -2637,7 +2645,7 @@ fn validate_and_materialize_json(
 /// own doc for why `serde_json::Value`, not the cheaper `IgnoredAny`),
 /// which reparses the same, now-known-valid text through this crate's own
 /// fidelity-preserving JSON semi-indexer (the same one the primary input
-/// path already uses, see `evaluate_input` above).
+/// path already uses, see `evaluate_input_streaming` above).
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
@@ -2845,7 +2853,7 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 
 /// Parse a JSON stream (multiple JSON values) from a string. Backs both
 /// `--slurpfile` and, more heavily, the crate's own default/primary JSON
-/// document-input path (see the `evaluate_input` call site above, reached
+/// document-input path (see the `evaluate_input_streaming` call site above, reached
 /// on every ordinary `sjq`/`succinctly jq` invocation that isn't
 /// `--seq`/`--raw-input`/`--input-dsv`).
 ///
@@ -2862,7 +2870,7 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// reject trailing garbage) with no `serde_json` dependency at all, while
 /// this function's own validation strictness is load-bearing for more than
 /// just `--slurpfile`'s CLI-arg error message -- the main input path's own
-/// call site (below `evaluate_input`) depends on this function rejecting
+/// call site (below `evaluate_input_streaming`) depends on this function rejecting
 /// everything `find_json_values` would reject, so its own internal
 /// `find_json_values` cross-check never diverges.
 ///
@@ -3500,14 +3508,14 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
     }
 }
 
-/// Evaluate the expression against an input value.
+/// Evaluate the expression against an input value, handing each output to
+/// `on_value` the moment the evaluator produces it (#1653).
 ///
-/// An uncaught error is reported to `sink` and yields no values, so evaluation
-/// continues with the next input the way jq does; `sink` then drives the exit
-/// code (#355).
-/// Streaming twin of [`evaluate_input`] (#1653): hand each output to
-/// `on_value` the moment the evaluator produces it, instead of collecting a
-/// whole input's results and writing them afterwards.
+/// Replaced the eager `evaluate_input`, which collected a whole input's
+/// results into a `Vec` and returned them for the caller to write
+/// afterwards; once every call site streamed, that function had no callers
+/// left and was removed rather than kept as a second, divergent copy of the
+/// same per-variant materialization.
 ///
 /// Real jq is a lazy generator, so a filter that writes to stdout *and*
 /// triggers a stderr side effect (`debug`, `stderr`, `halt_error`) or raises
@@ -3521,9 +3529,22 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 /// borrow checker cannot see that the two uses never overlap in time.
 ///
 /// `on_value` returns `false` to stop the generator (a write error the caller
-/// is already reporting). Errors reach `sink` exactly as in `evaluate_input`,
-/// but *after* the outputs that preceded them have been written, which is
-/// what makes `1, error("x"), 3` print `1` before its diagnostic like jq.
+/// is already reporting). An uncaught error is reported to `sink` and yields
+/// no values, so evaluation continues with the next input the way jq does and
+/// `sink` drives the exit code (#355) -- but it is reported *after* the
+/// outputs that preceded it have been written, which is what makes
+/// `1, error("x"), 3` print `1` before its diagnostic like jq.
+///
+/// A per-item materialization failure (`materialize_stream_item`'s
+/// `sink.materialize` calls) is defense-in-depth rather than reachable in
+/// practice: `cursor` is always rooted in `input.to_json()`, a fresh
+/// serialization of an already-decoded `OwnedValue` -- a Rust `String`, which
+/// by construction cannot hold an undecodable byte sequence, and whose
+/// escapes this crate's own serializer writes. Same argument
+/// `eval_generic.rs`'s textually-similar bridge relies on (search
+/// "defense-in-depth" there). Kept as a reported diagnostic rather than an
+/// `unwrap()` so a real failure, if that invariant is ever violated,
+/// surfaces as an ordinary `EvalError` instead of a panic.
 fn evaluate_input_streaming(
     input: &OwnedValue,
     expr: &jq::Expr,
@@ -3542,7 +3563,7 @@ fn evaluate_input_streaming(
         match materialize_stream_item(result, sink, at) {
             // Nothing to write: either genuinely no value, or a failure this
             // call already reported to `sink` (same "report and keep going"
-            // contract `evaluate_input`'s own arms follow, #355).
+            // contract the eager path's own arms followed, #355).
             None => true,
             Some(v) => match on_value(sink, v) {
                 Ok(keep_going) => keep_going,
@@ -3553,16 +3574,20 @@ fn evaluate_input_streaming(
             },
         }
     });
-    if let Some(e) = write_err {
-        return Err(e);
-    }
+    // The control is reported *before* any write error is surfaced. The eager
+    // path reported it during evaluation, i.e. always before the caller's
+    // write loop could fail; returning `Err` first here would let an I/O
+    // failure swallow the evaluator's own diagnostic (review finding).
     match control {
         None => {}
         Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, &at.resolve()),
         Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, &at.resolve()),
         // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
-        // call -- matching `evaluate_input`'s own `Halt` arm.
+        // call -- matching the eager path's own `Halt` arm.
         Some(jq::Control::Halt(code)) => sink.request_halt(code),
+    }
+    if let Some(e) = write_err {
+        return Err(e);
     }
     Ok(())
 }
@@ -3570,7 +3595,9 @@ fn evaluate_input_streaming(
 /// One streamed output as an `OwnedValue`, or `None` when there is nothing to
 /// write (a decode failure already reported to `sink`, or an empty result).
 ///
-/// Mirrors [`evaluate_input`]'s per-variant materialization for exactly the
+/// Carries the per-variant materialization the eager `evaluate_input`
+/// used to do inline (removed in #1653, once every call site streamed), for
+/// exactly the
 /// variants a *single* sink item can be. `Many`/`ManyCursor`/`ManyOwned`/
 /// `Partial` are unreachable here by construction -- the sink is fed one item
 /// at a time, and `drain_result_generic` is what splits those multi-value
@@ -3590,7 +3617,7 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
             &at.resolve(),
         ),
         GenericResult::Owned(v) => Some(v),
-        // Same fallback reasoning as `evaluate_input`'s own `LazyKeys` arm:
+        // Same fallback reasoning the eager path's `LazyKeys` arm carried:
         // a fast-pathed `keys | length` never reaches this boundary, so this
         // only fires for bare `keys`/`keys_unsorted`. Sort iff `sorted`
         // (#683), matching eager `Keys`.
@@ -3642,173 +3669,17 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
             sink.request_halt(code);
             None
         }
-        // Unreachable per this function's doc comment; materialized rather
-        // than `unreachable!()` so a future sink that *does* hand back a
-        // multi-value item degrades into correct-but-eager output instead of
-        // taking the process down.
+        // Structurally unreachable, and *silently* so: a sink item can only
+        // be one of the six `GenericItem` variants `generic_item_to_result`
+        // maps, and none of them is multi-valued. `None` rather than
+        // `unreachable!()` keeps a future regression from taking the process
+        // down -- but it would drop values rather than print them, so the
+        // trade is stated here instead of being described as a graceful
+        // fallback it is not (review finding).
         GenericResult::Many(_)
         | GenericResult::ManyCursor(_)
         | GenericResult::ManyOwned(_)
         | GenericResult::Partial(..) => None,
-    }
-}
-
-fn evaluate_input(
-    input: &OwnedValue,
-    expr: &jq::Expr,
-    _context: &EvalContext,
-    at: &ErrorAt<'_>,
-    sink: &mut ErrorSink,
-) -> Result<Vec<OwnedValue>> {
-    // Convert OwnedValue to JSON bytes for indexing
-    let json_str = input.to_json();
-    let json_bytes = json_str.as_bytes();
-
-    // Build index and evaluate
-    let index = JsonIndex::build(json_bytes);
-    let cursor = index.root(json_bytes);
-
-    // Use eval_with_cursor to preserve cursor context for position-based navigation
-    // (at_offset, at_position builtins)
-    let result = eval_with_cursor(expr, cursor);
-
-    // A decode failure while materializing a result is an uncaught error like
-    // any other (#1247): report it to `sink` and yield nothing, so the next
-    // input still runs and the exit code is still set (`ErrorSink`, #355).
-    // Mirrors the `GenericResult::Error` arm below.
-    //
-    // Every `Err(e)` this macro's `One`/`Many`/`ManyCursor` call sites below
-    // can produce is defense-in-depth rather than reachable in practice:
-    // `cursor` is always rooted in `input.to_json()`, a fresh serialization
-    // of an already-decoded `OwnedValue` (a Rust `String`, which by
-    // construction can't hold an undecodable byte sequence, and whose
-    // escapes this crate's own serializer writes) -- same argument
-    // `eval_generic.rs`'s textually-similar bridge relies on (search
-    // "defense-in-depth" there). Kept as `Result` rather than `.unwrap()` so
-    // a real failure, if this invariant is ever violated, surfaces as a
-    // normal `EvalError` instead of a panic.
-    // Convert result to Vec<OwnedValue>
-    match result {
-        GenericResult::One(v) => {
-            let Some(v) = sink.materialize(DiagStyle::Jq, generic_to_owned(&v), &at.resolve())
-            else {
-                return Ok(vec![]);
-            };
-            Ok(vec![v])
-        }
-        GenericResult::OneCursor(c) => {
-            let Some(v) =
-                sink.materialize(DiagStyle::Jq, generic_to_owned(&c.value()), &at.resolve())
-            else {
-                return Ok(vec![]);
-            };
-            Ok(vec![v])
-        }
-        GenericResult::Many(vs) => {
-            let Some(vs) = sink.materialize(
-                DiagStyle::Jq,
-                vs.iter()
-                    .map(generic_to_owned)
-                    .collect::<core::result::Result<Vec<_>, _>>(),
-                &at.resolve(),
-            ) else {
-                return Ok(vec![]);
-            };
-            Ok(vs)
-        }
-        GenericResult::ManyCursor(cs) => {
-            let Some(vs) = sink.materialize(
-                DiagStyle::Jq,
-                cs.iter()
-                    .map(|c| generic_to_owned(&c.value()))
-                    .collect::<core::result::Result<Vec<_>, _>>(),
-                &at.resolve(),
-            ) else {
-                return Ok(vec![]);
-            };
-            Ok(vs)
-        }
-        // Fallback: materialize. This runner boundary never sees a
-        // fast-pathed `keys`/`keys_unsorted | length`/`.[]`/`.[n]`/`first`/
-        // `last` — those are fully resolved inside the evaluator's `Pipe`
-        // dispatch before it gets here — so this only fires for `keys`/
-        // `keys_unsorted` alone, or piped into something else (`map`,
-        // `select`, ...). Sort iff `sorted` (#683), matching eager `Keys`.
-        GenericResult::LazyKeys {
-            fields,
-            sorted,
-            collapse,
-        } => {
-            let Some(mut keys) = sink.materialize(
-                DiagStyle::Jq,
-                effective_keys(&fields, collapse),
-                &at.resolve(),
-            ) else {
-                return Ok(vec![]);
-            };
-            if sorted {
-                keys.sort();
-            }
-            Ok(vec![OwnedValue::Array(
-                keys.into_iter().map(OwnedValue::String).collect(),
-            )])
-        }
-        // Same reasoning as `LazyKeys` above, for array `keys`/
-        // `keys_unsorted` (#684).
-        GenericResult::LazyIndexRange(len) => Ok(vec![OwnedValue::Array(
-            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
-        )]),
-        // Same reasoning as `LazyKeys`/`LazyIndexRange` above, for a
-        // composed `map` chain (#724, #725) that never resolved into a
-        // narrower shape before reaching this materializing boundary.
-        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
-            Ok(v) => Ok(vec![v]),
-            Err(jq::Control::Error(e)) => {
-                sink.report(DiagStyle::Jq, &e, &at.resolve());
-                Ok(vec![])
-            }
-            Err(jq::Control::Break(label)) => {
-                sink.report_break(DiagStyle::Jq, &label, &at.resolve());
-                Ok(vec![])
-            }
-            Err(jq::Control::Halt(code)) => {
-                sink.request_halt(code);
-                Ok(vec![])
-            }
-        },
-        GenericResult::None => Ok(vec![]),
-        GenericResult::Error(e) => {
-            sink.report(DiagStyle::Jq, &e, &at.resolve());
-            Ok(vec![])
-        }
-        GenericResult::Owned(v) => Ok(vec![v]),
-        GenericResult::ManyOwned(vs) => Ok(vs),
-        GenericResult::Break(label) => {
-            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
-            Ok(vec![])
-        }
-        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
-        // call — `request_halt` records the exit code for the loop above to
-        // short-circuit on, without touching `hit`/`report_count`.
-        GenericResult::Halt(code) => {
-            sink.request_halt(code);
-            Ok(vec![])
-        }
-        // The outputs already produced no longer vanish behind the failure
-        // (#400, #494): report the diagnostic (which drives the exit code
-        // via `sink`), but still return the prefix for the caller to print.
-        GenericResult::Partial(vs, jq::Control::Error(e)) => {
-            sink.report(DiagStyle::Jq, &e, &at.resolve());
-            Ok(vs)
-        }
-        GenericResult::Partial(vs, jq::Control::Break(label)) => {
-            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
-            Ok(vs)
-        }
-        GenericResult::Partial(vs, jq::Control::Halt(code)) => {
-            sink.request_halt(code);
-            Ok(vs)
-        }
     }
 }
 

@@ -3058,8 +3058,9 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
 /// for a write error). Each output arrives as a single-output
 /// [`GenericResult`], so every consumer's existing per-result handling --
 /// including the lazy `LazyKeys`/`LazyIndexRange`/`LazySeq` variants -- keeps
-/// working unchanged. Items arrive via the same [`generic_item_to_result`]
-/// conversion every other sink consumer uses.
+/// working unchanged. Items arrive via the same `generic_item_to_result`
+/// conversion every other sink consumer uses (private, so named rather than
+/// linked -- a public item may not link to it).
 ///
 /// Returns `Some(control)` iff evaluation terminated in a control (an uncaught
 /// error, `break`, or `halt`); everything produced *before* it has already
@@ -3100,7 +3101,8 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         };
         return match crate::jq::eval::eval_each_owned::<S>(expr, &owned, false, &mut owned_sink) {
             Flow::Exhausted => None,
-            Flow::Stopped { .. } => None,
+            // Kept for the same reason as the streaming branch below.
+            Flow::Stopped { pending } => pending,
             Flow::Escaped(c) => Some(c),
         };
     }
@@ -3114,11 +3116,16 @@ pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     };
     match eval_each_generic::<S, C::Value>(expr, cursor.value(), false, Some(cursor), &mut sink) {
         Flow::Exhausted => None,
-        // A `pending` control is one an eager fallback had already raised
-        // before the sink said stop; the CLI's own stop is a write error it
-        // is already reporting, so surfacing the control too would double
-        // report. Dropped, matching every Stage 2 consumer of `Stopped`.
-        Flow::Stopped { .. } => None,
+        // `pending` is *kept*, unlike every Stage 2 consumer of `Stopped`
+        // (`each_take_first`, `each_take_n`, ...), which drop it. Those are
+        // early-exit consumers in the middle of a filter, where a control
+        // raised past what the consumer asked for must not escape --
+        // `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0. This is the
+        // opposite position: the final consumer, where a control that *was*
+        // already raised still has to reach the exit code. Dropping it here
+        // would silently lose a `halt`'s code, matching `resolve_leaf`'s own
+        // reasoning (#987) rather than the early-exit consumers'.
+        Flow::Stopped { pending } => pending,
         Flow::Escaped(c) => Some(c),
     }
 }

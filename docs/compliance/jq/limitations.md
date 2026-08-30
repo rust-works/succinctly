@@ -1541,8 +1541,10 @@ it, so every stderr write had already happened by the time the first stdout writ
 which no amount of buffering could fix, `--unbuffered`'s per-write `flush()` included
 ([#1653](https://github.com/rust-works/succinctly/issues/1653)).
 
-Fixed for the `-n`, `--slurp`, and `input`/`inputs`-bridge routes, which now write each
-output as the evaluator produces it (`evaluate_input_streaming`,
+Fixed for every route except the M2 lazy path below — `-n`, `--slurp`, `--input-dsv`, the
+`input`/`inputs` bridge, and any flag that forces materialization (`-S`, `-a`, `-R`,
+`--seq`, `--args`) — all of which now write each output as the evaluator produces it
+(`evaluate_input_streaming`,
 [src/bin/succinctly/jq_runner.rs](../../../src/bin/succinctly/jq_runner.rs), over
 `eval_each_with_cursor`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
 
