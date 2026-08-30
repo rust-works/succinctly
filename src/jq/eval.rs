@@ -894,6 +894,19 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `key`/`parent`/`file_index` inside `n` is a narrower, rarer gap
         // left unaddressed, same scoping precedent as `AsPattern`'s own
         // `?//`-chain exclusion above.
+        //
+        // Review: this arm only takes effect for the CLI (`eval_generic.rs`)
+        // when `limit(...)` sits inside an enclosing `Pipe`/`Array`, whose
+        // own `needs_path_context` scan is what actually triggers the
+        // bridge into `eval.rs`'s path-context evaluator -- a genuinely
+        // standalone top-level `limit(n; expr)` still reaches
+        // `eval_generic.rs`'s own `each_limit_generic`/`eval_limit_generic`
+        // directly, which has no equivalent check of its own. Left
+        // unaddressed: no observably-wrong repro was found for this case
+        // (a `key`/`parent`/`file_index` with no prior navigation is
+        // legitimately `null`/root-equivalent either way), and any real
+        // navigation before `limit` already creates the enclosing `Pipe`
+        // this arm needs.
         Expr::Limit { expr, .. } => needs_path_context(expr),
         _ => false,
     }
@@ -29024,24 +29037,27 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 Ok(None) => return QueryResult::None,
                 Err(escape) => return escape.into(),
             };
-            let limited = match classify_limit_n(n_value) {
-                Ok(LimitN::Unlimited) => eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(expr),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ),
-                Ok(LimitN::Take(0)) => QueryResult::None,
-                Ok(LimitN::Take(n)) => match eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(expr),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ) {
+            // `Take(0)` must skip evaluating `expr` entirely (jq's own
+            // `elif $n==0 then empty` -- no side effects), so this has to
+            // be peeled off before the single shared eval call below runs,
+            // not folded into a branch that also has to run it.
+            let n = match classify_limit_n(n_value) {
+                Ok(LimitN::Unlimited) => None,
+                Ok(LimitN::Take(0)) => return QueryResult::None,
+                Ok(LimitN::Take(n)) => Some(n),
+                Err(e) => return QueryResult::Error(e),
+            };
+            let body_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(expr),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let limited = match n {
+                None => body_result,
+                Some(n) => match body_result {
                     QueryResult::Owned(v) => QueryResult::Owned(v),
                     QueryResult::ManyOwned(mut vs) => {
                         vs.truncate(n);
@@ -29071,7 +29087,6 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                         )
                     }
                 },
-                Err(e) => return QueryResult::Error(e),
             };
             continue_rest_with_context::<W, S>(
                 limited,
