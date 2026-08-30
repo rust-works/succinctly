@@ -637,7 +637,9 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
         }
         stream_json_string(out, &key, write_json_body_yq)?;
     }
-    if error.is_none() && cursors.ended_unpaired() {
+    // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
+    // -- `is_malformed()` checks both #1194 faults this walk can find.
+    if error.is_none() && cursors.is_malformed() {
         *error = Some(fields.malformed_member_error());
     }
     if indent.width > 0 {
@@ -968,7 +970,9 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             }
             stream_yaml_string(out, &key)?;
         }
-        if error.is_none() && cursors.ended_unpaired() {
+        // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
+        // -- `is_malformed()` checks both #1194 faults this walk can find.
+        if error.is_none() && cursors.is_malformed() {
             *error = Some(fields.malformed_member_error());
         }
         out.write_char(']')
@@ -986,7 +990,9 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
             out.write_str("- ")?;
             stream_yaml_string(out, &key)?;
         }
-        if error.is_none() && cursors.ended_unpaired() {
+        // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
+        // -- `is_malformed()` checks both #1194 faults this walk can find.
+        if error.is_none() && cursors.is_malformed() {
             *error = Some(fields.malformed_member_error());
         }
         Ok(())
@@ -1369,6 +1375,56 @@ mod tests {
             err.expect("an unpaired member is not JSON");
             assert_eq!(yaml_block, "");
         }
+    }
+
+    /// #1956: sibling of the unpaired-field test above, for the *other* fault
+    /// [`DistinctKeyCursors::is_malformed`] covers -- a missing `,`/`:`
+    /// delimiter (#1677) with an even member count, so the walk yields both
+    /// keys cleanly and only `delimiter_fault()` (not `ended_unpaired()`)
+    /// catches it at exhaustion. All three writers here used to check
+    /// `ended_unpaired()` alone and missed this fault entirely, matching the
+    /// gap `Builtin::Last`'s own arm had (`eval_generic.rs`) before this fix.
+    #[test]
+    fn test_stream_lazy_keys_raises_on_missing_delimiter_1956() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        let json = br#"{"a" 1, "b": 2}"#;
+        let index = JsonIndex::build(json);
+        let StandardJson::Object(fields) = index.root(json).value() else {
+            panic!("expected object");
+        };
+
+        let mut json_out = String::new();
+        let mut err = None;
+        stream_lazy_keys_json(&fields, true, &mut json_out, IndentSpec::COMPACT, &mut err).unwrap();
+        err.expect("a missing ':' delimiter is not JSON");
+        assert_eq!(
+            json_out, r#"["a","b"]"#,
+            "both keys are written before the post-loop fault check fires"
+        );
+
+        let mut yaml_flow = String::new();
+        let mut err = None;
+        stream_lazy_keys_yaml(&fields, true, &mut yaml_flow, IndentSpec::COMPACT, &mut err)
+            .unwrap();
+        err.expect("a missing ':' delimiter is not JSON");
+        assert_eq!(yaml_flow, "[a, b]");
+
+        let mut yaml_block = String::new();
+        let mut err = None;
+        stream_lazy_keys_yaml(
+            &fields,
+            true,
+            &mut yaml_block,
+            IndentSpec {
+                width: 2,
+                unit: ' ',
+            },
+            &mut err,
+        )
+        .unwrap();
+        err.expect("a missing ':' delimiter is not JSON");
+        assert_eq!(yaml_block, "- a\n- b");
     }
 
     /// The `yq` JSON convention (what the M2 fast path for `.field`/`.[0]`/

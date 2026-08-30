@@ -994,9 +994,11 @@ fn keys_are_well_formed<V: DocumentValue>(
 /// a no-op for the latter). Pulled out so the check itself has exactly one
 /// definition instead of two copies that could silently drift apart (the
 /// codebase's own precedent for why this matters: `Builtin::Last`'s inline
-/// walk below already diverged from both of these by omitting the
-/// `delimiter_fault()` half of the check -- tracked as #1956, not fixed
-/// here since it predates and is independent of this fix).
+/// walk below once diverged from both of these by omitting the
+/// `delimiter_fault()` half of the check -- #1956 fixed that arm, plus two
+/// more sites found the same way, by adding
+/// [`DistinctKeyCursors::is_malformed`] so a caller can no longer check one
+/// half of the pair and forget the other).
 fn walk_distinct_keys_checked<V: DocumentValue>(
     fields: &V::Fields,
     collapse: bool,
@@ -1009,7 +1011,7 @@ fn walk_distinct_keys_checked<V: DocumentValue>(
         }
         on_cursor(cursor);
     }
-    if cursors.ended_unpaired() || cursors.delimiter_fault() {
+    if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
     Ok(())
@@ -1129,34 +1131,55 @@ impl<V: DocumentValue> LazySource<V> {
     }
     /// Pull one element forward, storing "the rest" back into `self`. Once a
     /// variant's underlying cons-list is empty (or `next == len`), every
-    /// subsequent call returns `None` forever.
-    fn advance(&mut self) -> Option<LazyElem<V>> {
-        match self {
+    /// subsequent call returns `Ok(None)` forever -- except `Keys`, which can
+    /// still raise on that same exhaustion (#1956: a `keys_unsorted | map(f)`
+    /// chain sourced its elements straight from `DistinctKeyCursors::next()`
+    /// without ever asking `is_malformed()`, the exact check every other
+    /// `keys_unsorted` consumer already made -- confirmed live, `keys_unsorted
+    /// | map(.)` over a document with a missing `,`/`:` silently succeeded
+    /// while every sibling spelling correctly raised).
+    fn advance(&mut self) -> Result<Option<LazyElem<V>>, EvalError> {
+        Ok(match self {
             Self::Elements(elements) => {
-                let (cursor, rest) = elements.uncons_cursor()?;
+                let Some((cursor, rest)) = elements.uncons_cursor() else {
+                    return Ok(None);
+                };
                 *elements = rest;
                 Some(LazyElem::Cursor(cursor))
             }
             Self::Values(fields) => {
-                let (field, rest) = fields.uncons()?;
+                let Some((field, rest)) = fields.uncons() else {
+                    return Ok(None);
+                };
                 *fields = rest;
                 Some(LazyElem::Cursor(field.value_cursor))
             }
-            Self::Keys(keys) => Some(LazyElem::Cursor(keys.next()?.1)),
+            Self::Keys(keys) => match keys.next() {
+                Some((key, cursor)) => {
+                    if key_is_malformed(&key) {
+                        return Err(keys.malformed_member_error());
+                    }
+                    Some(LazyElem::Cursor(cursor))
+                }
+                None if keys.is_malformed() => return Err(keys.malformed_member_error()),
+                None => None,
+            },
             Self::IndexRange { next, len } => {
                 if *next >= *len {
-                    return None;
+                    return Ok(None);
                 }
                 let i = *next;
                 *next += 1;
                 Some(LazyElem::Owned(OwnedValue::Int(i as i64)))
             }
             Self::CollapsedValues { cursors, next } => {
-                let cursor = cursors.get(*next).copied()?;
+                let Some(cursor) = cursors.get(*next).copied() else {
+                    return Ok(None);
+                };
                 *next += 1;
                 Some(LazyElem::Cursor(cursor))
             }
-        }
+        })
     }
 }
 
@@ -1365,7 +1388,11 @@ impl<V: DocumentValue> Iterator for LazySeq<V> {
             if let Some(item) = self.pending.pop() {
                 return Some(Ok(item));
             }
-            let elem = self.source.advance()?;
+            let elem = match self.source.advance() {
+                Ok(Some(elem)) => elem,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(Control::Error(e))),
+            };
             match self.fold_one(elem) {
                 Ok(mut items) => {
                     items.reverse();
@@ -3703,9 +3730,9 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 last_cursor = Some(cursor);
             }
             // #1956: matches this function's own `distinct_key_cursors_checked`/
-            // `keys_are_well_formed` siblings, which both check
-            // `ended_unpaired() || delimiter_fault()` together.
-            if cursors.ended_unpaired() || cursors.delimiter_fault() {
+            // `keys_are_well_formed` siblings via the same
+            // `DistinctKeyCursors::is_malformed` they use.
+            if cursors.is_malformed() {
                 return GenericResult::Error(fields.malformed_member_error());
             }
             match last_cursor {

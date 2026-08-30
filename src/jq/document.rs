@@ -1763,6 +1763,26 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
     pub fn ended_unpaired(&self) -> bool {
         self.ended_unpaired
     }
+
+    /// Either #1194 fault together: [`ended_unpaired`](Self::ended_unpaired)
+    /// or [`delimiter_fault`](Self::delimiter_fault). One definition of the
+    /// combined check, so a caller can't correctly check one half and
+    /// forget the other -- #1956 was exactly that: two call sites checking
+    /// `ended_unpaired()` alone, missing the `delimiter_fault()` sibling
+    /// three others already had. Same "only meaningful once exhausted"
+    /// contract as both halves individually.
+    pub fn is_malformed(&self) -> bool {
+        self.ended_unpaired() || self.delimiter_fault()
+    }
+
+    /// The error to raise once [`is_malformed`](Self::is_malformed) is
+    /// `true` -- delegates to the whole object's own `all` copy rather than
+    /// `rest` (stale mid-object on one #1194 shape, already exhausted on the
+    /// other), so a caller holding only this walk and no separate `F` of its
+    /// own (`LazySource::Keys`, #1956) can still build the right error.
+    pub fn malformed_member_error(&self) -> EvalError {
+        self.all.malformed_member_error()
+    }
 }
 
 impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
@@ -2036,7 +2056,7 @@ pub fn effective_keys<F: DocumentFields>(
     // (`eval_generic.rs`) applies to its own `DistinctKeyCursors` walk --
     // this one just never got wired to it when #1642 rewrote this function
     // onto `DistinctKeyCursors` on `main`, ahead of this check existing.
-    if cursors.ended_unpaired() || cursors.delimiter_fault() {
+    if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
     Ok(keys)
