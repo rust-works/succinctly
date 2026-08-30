@@ -2505,18 +2505,33 @@ fn prepend<W: Clone + AsRef<[u64]>>(
     match result.materialize_cursor() {
         QueryResult::None => owned_vec_to_result(prefix),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::One(v) => {
-            prefix.push(to_owned(&v));
-            owned_vec_to_result(prefix)
-        }
+        // #1908 (Category 2 of #1820's audit): `to_owned_checked`, not
+        // `to_owned` -- the catch handler's own result can hold an
+        // undecodable string (e.g. `try (.a, (.b | error({x: .}))) catch
+        // .x` on a `.b` whose bytes don't decode), and this splice must
+        // raise `EvalError::decode_failure` instead of silently
+        // substituting `""`, matching #1755's established rule.
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(owned) => {
+                prefix.push(owned);
+                owned_vec_to_result(prefix)
+            }
+            Err(e) => partial(prefix, Control::Error(e)),
+        },
         QueryResult::Owned(v) => {
             prefix.push(v);
             owned_vec_to_result(prefix)
         }
-        QueryResult::Many(vs) => {
-            prefix.extend(vs.iter().map(to_owned));
-            owned_vec_to_result(prefix)
-        }
+        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+            Ok(owned) => {
+                prefix.extend(owned);
+                owned_vec_to_result(prefix)
+            }
+            Err((partial_owned, e)) => {
+                prefix.extend(partial_owned);
+                partial(prefix, Control::Error(e))
+            }
+        },
         QueryResult::ManyOwned(vs) => {
             prefix.extend(vs);
             owned_vec_to_result(prefix)
@@ -44845,6 +44860,69 @@ mod tests {
                 assert_eq!(label, "out");
             }
         );
+    }
+
+    /// #1908 (#1820 Category 2): `prepend` -- the function backing
+    /// `try`/`catch`'s output-prefix splicing -- used unchecked `to_owned`
+    /// on the catch handler's own result, silently substituting `""` for an
+    /// undecodable string instead of raising `EvalError::decode_failure`.
+    ///
+    /// Exercised directly against `prepend` rather than through a full
+    /// `try`/`catch` query: every path that could hand `prepend` an
+    /// undecodable *borrowed* cursor turns out to be intercepted upstream
+    /// today (`error(msg)`'s own payload materialization already raises a
+    /// decode failure unconditionally per #1907's fix, before `prepend` is
+    /// ever reached; `break`'s catch input is hardcoded `Null`; a variable
+    /// bound before `try` resolves through a separate, already-owned path
+    /// that never reaches `prepend`'s cursor arms at all). Matching #1897's
+    /// own `eval_index_expr` precedent for this same situation, this
+    /// white-box test still pins the fix directly against the function
+    /// (and was confirmed to fail without it, by temporarily reverting the
+    /// fix and re-running).
+    #[test]
+    fn prepend_raises_on_handler_decode_failure_1908() {
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\", \"b\": \"ok\"}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        // `One` arm.
+        let expr = parse(".a").unwrap();
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+        match prepend(vec![OwnedValue::Int(1)], result) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.is_decode_failure());
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // `Many` arm: a decodable value ahead of the undecodable one.
+        let expr = parse(".b, .a").unwrap();
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+        match prepend(vec![OwnedValue::Int(1)], result) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Int(1), OwnedValue::String("ok".to_string())]
+                );
+                assert!(e.is_decode_failure());
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // Positive control: a fully decodable handler result still splices
+        // normally.
+        let expr = parse(".b").unwrap();
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false);
+        match prepend(vec![OwnedValue::Int(1)], result) {
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Int(1), OwnedValue::String("ok".to_string())]
+                );
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
