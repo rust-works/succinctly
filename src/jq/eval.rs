@@ -17321,6 +17321,11 @@ fn set_path<S: EvalSemantics>(
                                 container_noop,
                                 terminal_write: matches!(split.tail, Expr::Identity),
                             },
+                            // `set_path` (`=`) has no `|= empty` concept --
+                            // its RHS is always a real, already-materialized
+                            // value -- so this adapts its `Result<(), E>`
+                            // into `through_slice`'s `Result<bool, E>` by
+                            // always reporting `true` (#1877/#1894).
                             |sub| {
                                 set_path::<S>(
                                     sub,
@@ -17329,8 +17334,10 @@ fn set_path<S: EvalSemantics>(
                                     scalar_noop,
                                     container_noop,
                                 )
+                                .map(|()| true)
                             },
                         )
+                        .map(|_| ())
                     })?
                 {
                     return Ok(());
@@ -17353,10 +17360,14 @@ fn set_path<S: EvalSemantics>(
                             // arm reached it (#1321).
                             terminal_write: matches!(split.tail, Expr::Identity),
                         },
+                        // See the probe closure above for why this always
+                        // reports `true`.
                         |sub| {
                             set_path::<S>(sub, &split.tail, new_value, scalar_noop, container_noop)
+                                .map(|()| true)
                         },
-                    ),
+                    )
+                    .map(|_| ()),
                 }
             } else {
                 // Navigate to parent
@@ -17461,11 +17472,13 @@ fn set_path<S: EvalSemantics>(
                 container_noop,
                 terminal_write: true,
             },
+            // Always `true` -- see the sibling call sites above.
             |sub| {
                 *sub = new_value;
-                Ok(())
+                Ok(true)
             },
-        ),
+        )
+        .map(|_| ()),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -17588,13 +17601,23 @@ struct SliceEditFlags {
     terminal_write: bool,
 }
 
+/// `edit`'s `bool` payload (#1877/#1894): whether a real value reached this
+/// slot, as opposed to `|= empty` running out with nothing to write. `true`
+/// covers both an ordinary value and an already-completed nested delete
+/// (the sub-value it leaves behind is real content either way, to be
+/// spliced back normally); `false` means "there was never anything here to
+/// begin with," which only the terminal `Array`/`String`/`Null` arms below
+/// ever act on -- every other caller of `through_slice` (`set_path`'s three
+/// call sites, `delete_at_path`'s one) has no `|= empty` concept at all and
+/// adapts its own `Result<(), E>` edit into this shape by always reporting
+/// `true`.
 fn through_slice<E: From<EvalError>>(
     root: &mut OwnedValue,
     start: Option<i64>,
     end: Option<i64>,
     flags: SliceEditFlags,
-    edit: impl FnOnce(&mut OwnedValue) -> Result<(), E>,
-) -> Result<(), E> {
+    edit: impl FnOnce(&mut OwnedValue) -> Result<bool, E>,
+) -> Result<bool, E> {
     let SliceEditFlags {
         optional,
         scalar_noop,
@@ -17632,17 +17655,31 @@ fn through_slice<E: From<EvalError>>(
             let mut throwaway = slice_owned_value(root, start, end, optional)?
                 .expect("Array/String target always yields Some from slice_owned_value");
             edit(&mut throwaway)?;
-            Ok(())
+            Ok(true)
         }
         OwnedValue::Array(arr) => {
             let range = SliceBounds::from_literals(start, end).resolve(arr.len());
             let mut sub = OwnedValue::Array(arr[range.clone()].to_vec());
-            edit(&mut sub)?;
+            let wrote = edit(&mut sub)?;
+            // `|= empty` (#1894): jq's `_modify` falls back to `delpaths`
+            // when the update filter produces no output at all, and
+            // deleting a slice-shaped path removes that whole range --
+            // splicing in nothing is exactly that (`[1,2,3] | .[0:2] |=
+            // empty` is `[3]`, confirmed live). Only trusted when this
+            // call's own edit *is* the write (`terminal_write`): a `false`
+            // surfacing from further down a chain already reflects a real,
+            // completed splice at that inner level (reported back as
+            // `true`, since `sub` now holds genuine content to propagate),
+            // so it never reaches here as `false` in the first place.
+            if terminal_write && !wrote {
+                arr.splice(range, core::iter::empty());
+                return Ok(true);
+            }
             let OwnedValue::Array(items) = sub else {
                 return Err(EvalError::slice_assign_non_array().into());
             };
             arr.splice(range, items);
-            Ok(())
+            Ok(true)
         }
         // jq reads a string slice but will not write one back, whatever the
         // replacement -- but that refusal (`terminal_write: true`) is only
@@ -17671,11 +17708,22 @@ fn through_slice<E: From<EvalError>>(
         OwnedValue::String(_) => {
             let mut throwaway = slice_owned_value(root, start, end, optional)?
                 .expect("Array/String target always yields Some from slice_owned_value");
-            edit(&mut throwaway)?;
+            let wrote = edit(&mut throwaway)?;
             if terminal_write {
-                Err(EvalError::cannot_update_string_slices().into())
+                if wrote {
+                    Err(EvalError::cannot_update_string_slices().into())
+                } else {
+                    // `|= empty` (#1894): jq's `_modify` falls back to
+                    // `delpaths` on empty output, and deleting a string
+                    // slice raises a different sentence than writing one
+                    // does -- confirmed live, `"hello" | .[0:2] |= empty`
+                    // and `del(.[0:2])` both raise this, not "Cannot
+                    // update string slices" (which is what a *non-empty*
+                    // `|=`/`=` still raises, unaffected above).
+                    Err(EvalError::cannot_delete_fields_from("string").into())
+                }
             } else {
-                Ok(())
+                Ok(true)
             }
         }
         // yq's slice-assignment no-op (#1101, generalized to any nesting
@@ -17701,7 +17749,7 @@ fn through_slice<E: From<EvalError>>(
         _ if scalar_noop && is_yq_slice_empty_container_scalar(root) => {
             let mut throwaway = OwnedValue::Array(Vec::new());
             edit(&mut throwaway)?;
-            Ok(())
+            Ok(true)
         }
         // A `Null` target that reaches here in *jq* mode still needs a
         // real attempt, not a silent skip: real jq auto-vivifies a null
@@ -17774,25 +17822,39 @@ fn through_slice<E: From<EvalError>>(
         // arm's array-required error (real jq no-ops), and `null |
         // .a[0:1][0]?.c[]? = 9` wrongly *commits* a write real jq no-ops
         // (`{"a":[{"c":null}]}` vs jq's `null`) -- both identical before and
-        // after this fix. That's the same family of bug #1428 tracks (a
-        // write-time decision inferred from what navigation left behind
-        // rather than from an explicit "did anything actually get written"
-        // signal), just one nesting level deeper than what this fix
-        // narrowly closes; not attempted here since #1428 is already being
-        // worked as its own, more structural fix.
+        // after this fix. That's the same family of bug #1428 fixed for
+        // `Field`/`Index` (a write-time decision inferred from what
+        // navigation left behind rather than from an explicit "did
+        // anything actually get written" signal), just one nesting level
+        // deeper than what this fix narrowly closes; not attempted here.
+        //
+        // `edit`'s own `bool` (#1877/#1894), checked first: when this
+        // call's edit *is* the write (`terminal_write`) and it reports
+        // `false` -- the update filter was `|= empty`, not a literal
+        // `null` -- there is nothing to create just to immediately delete
+        // it (`null | .a[0:1][0:2]? |= empty` stays `null`, confirmed
+        // live), so `root` is left untouched rather than materialized into
+        // `[]`. This is a different, more precise signal than the
+        // pre-existing `!terminal_write && matches!(sub, Null)` check
+        // below: that one infers "nothing written" from what a *tail*
+        // left behind, which can't tell an explicit `null` apart from an
+        // empty filter at the point the slice itself is the write.
         OwnedValue::Null if !container_noop => {
             let mut sub = OwnedValue::Null;
-            edit(&mut sub)?;
+            let wrote = edit(&mut sub)?;
+            if terminal_write && !wrote {
+                return Ok(false);
+            }
             if !terminal_write && matches!(sub, OwnedValue::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let OwnedValue::Array(items) = sub else {
                 return Err(EvalError::slice_assign_non_array().into());
             };
             *root = OwnedValue::Array(items);
-            Ok(())
+            Ok(true)
         }
-        _ if optional => Ok(()),
+        _ if optional => Ok(true),
         other => Err(EvalError::cannot_index_with_type(owned_type_name(other), "object").into()),
     }
 }
@@ -18206,13 +18268,23 @@ fn get_path_mut<'a>(
 }
 
 /// Update a value at a path by applying a filter.
+///
+/// Returns whether a real value reached `root` (#1877/#1894): `false` only
+/// ever originates at the terminal [`Expr::Identity`] arm, when
+/// `filter_expr` produced no output at all (`|= empty`) -- every other arm
+/// either forwards its single recursive call's answer unchanged, or, where
+/// it can suppress a write itself (an `optional`/yq-no-op branch, or an
+/// `Iterate`/mid-chain arm that legitimately touches zero or many
+/// elements), reports its own outcome directly. The only consumer today is
+/// `through_slice`'s `Null`/`Array`/`String` arms, which use it to
+/// distinguish `|= empty` from a literal `null` write.
 fn update_path<S: EvalSemantics>(
     root: &mut OwnedValue,
     path_expr: &Expr,
     filter_expr: &Expr,
     optional: bool,
     scalar_noop: bool,
-) -> Result<(), EvalEscape> {
+) -> Result<bool, EvalEscape> {
     // #1428 is a jq-mode divergence, and deliberately stays one: real yq
     // *wants* the chain a suppressed write leaves behind (`null | .a[] = 99`
     // is `{"a": []}` there, #1181), so undoing it in yq mode would trade one
@@ -18263,12 +18335,18 @@ fn update_path<S: EvalSemantics>(
             // output, so a trailing `error(...)`/`break` after it must not
             // surface -- `.a |= (1, error("x"))` is `{"a":1}` in jq 1.7.1,
             // not an error.
-            let v = eval_owned_multi_first::<S>(filter_expr, root)?
-                .into_iter()
-                .next()
-                .unwrap_or(OwnedValue::Null);
-            *root = v;
-            Ok(())
+            //
+            // A zero-output filter still falls back to `Null` here -- `.a
+            // |= empty` leaves `"a":null` rather than deleting the key the
+            // way real jq does, a separate, pre-existing bug this fix does
+            // not change (#1877/#1894 are scoped to `through_slice`'s own
+            // arms, not this general field/index case). The `false`
+            // returned alongside it is the one place that signal
+            // originates -- see this function's own doc comment.
+            let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
+            let wrote = !outputs.is_empty();
+            *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
+            Ok(wrote)
         }
         Expr::Field(name) => {
             autovivify_object(root);
@@ -18285,7 +18363,7 @@ fn update_path<S: EvalSemantics>(
                 // doesn't implement yet (#1340's own follow-up).
                 || noop_scalar
             {
-                Ok(())
+                Ok(false)
             } else {
                 Err(EvalError::cannot_index_with_field(owned_type_name(root), name).into())
             }
@@ -18301,7 +18379,7 @@ fn update_path<S: EvalSemantics>(
                     scalar_noop,
                 )
             } else if optional || noop_scalar {
-                Ok(())
+                Ok(false)
             } else {
                 Err(EvalError::cannot_index_with_type(owned_type_name(root), "number").into())
             }
@@ -18327,7 +18405,7 @@ fn update_path<S: EvalSemantics>(
                             scalar_noop,
                         )?;
                     }
-                    Ok(())
+                    Ok(true)
                 }
                 OwnedValue::Object(map) => {
                     for value in map.values_mut() {
@@ -18339,9 +18417,9 @@ fn update_path<S: EvalSemantics>(
                             scalar_noop,
                         )?;
                     }
-                    Ok(())
+                    Ok(true)
                 }
-                _ if optional || noop_scalar => Ok(()),
+                _ if optional || noop_scalar => Ok(false),
                 _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
             }
         }
@@ -18395,11 +18473,19 @@ fn update_path<S: EvalSemantics>(
                                 // created, so only there does "still `Null`"
                                 // mean "never written". Without it, a
                                 // legitimate `null` write (`(.a|.) |= null`)
-                                // is undone.
+                                // is undone. OR'd with `result == Ok(false)`
+                                // (#1877/#1894): the more precise signal from
+                                // an update filter that genuinely produced no
+                                // output anywhere in `rest` (e.g. a nested
+                                // slice's own `|= empty`, which `reaches_
+                                // iterate` doesn't recognize at all since no
+                                // `Iterate` is involved) -- both answer the
+                                // same question, "was anything really
+                                // written," just via different evidence.
                                 let stranded = created
-                                    && result.is_ok()
                                     && undo_stranded
-                                    && reaches_iterate(&rest)
+                                    && (reaches_iterate(&rest) || matches!(result, Ok(false)))
+                                    && result.is_ok()
                                     && matches!(*current, OwnedValue::Null);
                                 (result, stranded)
                             };
@@ -18419,7 +18505,7 @@ fn update_path<S: EvalSemantics>(
                             // on a scalar root) no-ops instead of erroring.
                             || noop_scalar
                         {
-                            Ok(())
+                            Ok(false)
                         } else {
                             Err(
                                 EvalError::cannot_index_with_field(owned_type_name(root), name)
@@ -18445,10 +18531,11 @@ fn update_path<S: EvalSemantics>(
                                     optional,
                                     scalar_noop,
                                 );
-                                // See the `Field` arm above.
-                                let stranded = result.is_ok()
-                                    && undo_stranded
-                                    && reaches_iterate(&rest)
+                                // See the `Field` arm above, including the
+                                // `Ok(false)` OR-clause (#1877/#1894).
+                                let stranded = undo_stranded
+                                    && (reaches_iterate(&rest) || matches!(result, Ok(false)))
+                                    && result.is_ok()
                                     && matches!(*current, OwnedValue::Null);
                                 (result, stranded)
                             };
@@ -18460,7 +18547,7 @@ fn update_path<S: EvalSemantics>(
                             }
                             result
                         } else if here || noop_scalar {
-                            Ok(())
+                            Ok(false)
                         } else {
                             Err(
                                 EvalError::cannot_index_with_type(owned_type_name(root), "number")
@@ -18473,15 +18560,15 @@ fn update_path<S: EvalSemantics>(
                             for elem in arr.iter_mut() {
                                 update_path::<S>(elem, &rest, filter_expr, optional, scalar_noop)?;
                             }
-                            Ok(())
+                            Ok(true)
                         }
                         OwnedValue::Object(map) => {
                             for value in map.values_mut() {
                                 update_path::<S>(value, &rest, filter_expr, optional, scalar_noop)?;
                             }
-                            Ok(())
+                            Ok(true)
                         }
-                        _ if here || noop_scalar => Ok(()),
+                        _ if here || noop_scalar => Ok(false),
                         _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
                     },
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
@@ -31082,8 +31169,15 @@ fn delete_at_path(
                                 container_noop: false,
                                 terminal_write: yq_mode,
                             },
-                            |sub| delete_at_path(sub, &rest, optional, yq_mode),
+                            // `del()` has its own, already-correct deletion
+                            // mechanism with no `|= empty` concept -- adapt
+                            // its `Result<(), E>` into `through_slice`'s
+                            // `Result<bool, E>` by always reporting `true`
+                            // (#1877/#1894, mirroring `set_path`'s own
+                            // adapters).
+                            |sub| delete_at_path(sub, &rest, optional, yq_mode).map(|()| true),
                         )
+                        .map(|_| ())
                     }
                     _ => delete_at_path(root, first, here, yq_mode),
                 }

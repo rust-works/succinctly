@@ -25964,6 +25964,91 @@ fn test_string_slice_terminal_write_runs_edit_before_refusing_1876_1883() -> Res
     Ok(())
 }
 
+/// #1894: `through_slice`'s `OwnedValue::Array`/`OwnedValue::String`
+/// terminal-write arms didn't special-case an update filter that produced
+/// no output at all (`|= empty`). Real jq's `_modify` falls back to
+/// `delpaths` when the update filter yields nothing, and deleting a
+/// slice-shaped path removes that whole range -- for an array that's
+/// exactly "splice in nothing"; for a string, jq raises a different
+/// sentence than a non-empty write does. Every case confirmed live against
+/// jq 1.7.1.
+#[test]
+fn test_slice_delete_on_empty_update_filter_1894() -> Result<()> {
+    // Array: the sliced range is spliced out, shrinking the array.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[0:2] |= empty"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[3]");
+
+    // String: a different message than a non-empty string-slice write.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:2] |= empty"], Some("\"hello\""))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot delete fields from string"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Cannot update string slices"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // `?` does not suppress this -- it's a write-time application error,
+    // not a navigation failure, confirmed live.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:2]? |= empty"], Some("\"hello\""))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot delete fields from string"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    // Control: a literal `null` write (not an empty filter) still raises
+    // the pre-existing, unaffected error -- the fix distinguishes "no
+    // output" from "output is null".
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:2] |= null"], Some("[1,2,3]"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("A slice of an array can only be assigned another array"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout, "");
+
+    Ok(())
+}
+
+/// #1877: a *nested* terminal slice (reached through another slice, or
+/// through an inline `?`) with `|= empty` used to raise "A slice of an
+/// array can only be assigned another array" on a `null`/absent target,
+/// where real jq leaves the whole document untouched -- confirmed live
+/// against jq 1.7.1. This is the same `|= empty` delete/no-op mechanism as
+/// #1894, just for the case where nothing exists yet to delete from.
+#[test]
+fn test_nested_slice_delete_on_empty_update_filter_noops_on_null_1877() -> Result<()> {
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a[0:1][0:2]? |= empty"], Some("null"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    // Two slices chained directly (no `?`, no absent field) on an existing
+    // array -- the inner slice's own delete-and-splice composes correctly
+    // with the outer one's.
+    let (stdout, _stderr, code) =
+        run_jq_full(&["-c", "(.[0:3] | .[0:1]) |= empty"], Some("[1,2,3,4,5]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2,3,4,5]");
+
+    // Regression guard: a slice followed by a plain `Index` (not another
+    // slice) is a separate, pre-existing, out-of-scope divergence (the
+    // general "`.a |= empty` should delete the key/element, not write
+    // `null`" gap for `Field`/`Index`, #1894's own follow-up territory) --
+    // confirmed unchanged before and after this fix, not newly broken by
+    // it.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".[0:2][0] |= empty"], Some("[1,2,3,4]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[null,2,3,4]");
+
+    Ok(())
+}
+
 /// #1653: `--unbuffered` must actually interleave stdout and stderr in real
 /// time, not merely flush a batch that was already fully evaluated.
 ///
