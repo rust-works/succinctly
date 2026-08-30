@@ -32179,17 +32179,21 @@ pub const fn input_queue_is_active() -> bool {
 /// Code review's own doc-comment-vs-doc-comment cross-check catch (#723):
 /// `jq_runner.rs` is the only CLI driver that calls
 /// [`seed_remaining_inputs`]/[`pop_remaining_input`] before evaluating a
-/// filter -- `yq_runner.rs` never does, yet these three builtins parse and
-/// dispatch unconditionally for `YqSemantics` too (the parser has no
-/// per-mode keyword gating anywhere in this codebase to lean on instead).
-/// Without this check, `succinctly yq` would silently accept `input`/
-/// `inputs`/`input_line_number` syntax that can never produce a correct
-/// result -- confirmed live: `break` on every document for `input`, and
-/// silent empty output for `inputs`, instead of the "undefined function"
-/// parse-time-ish error real yq (and this codebase, pre-#723) gives for a
-/// genuinely unimplemented builtin. Wiring `yq_runner.rs` up to the same
-/// queue for real support is a larger, separate piece of work -- tracked as
-/// a follow-up; this keeps yq mode's failure mode honest in the meantime.
+/// filter -- `yq_runner.rs` never does. #1507 gave the parser per-mode
+/// keyword gating (`--jq-extensions`) for these three, matching the ~65
+/// other jq-only builtins already gated that way, so the *default* yq
+/// dispatch path this function guards is unreachable now (the parser
+/// rejects `input`/`inputs`/`input_line_number` before evaluation ever
+/// starts). This check stays anyway, because `--jq-extensions` only lifts
+/// the *parse*-time gate, not the underlying architectural gap #1507's own
+/// cost analysis identified: yq's document loop is cursor-native
+/// specifically to preserve duplicate mapping keys and ADR-0017's
+/// comment/anchor side-trees, so it cannot share jq's `Vec<(OwnedValue, u32,
+/// u32)>` queue without silently losing all three. Deleting this check
+/// would reopen the exact bug #723 fixed -- `break` on every document for
+/// `input`, silent empty output for `inputs` -- just gated behind an opt-in
+/// flag instead of being the unconditional default. Real cursor-native
+/// queue support remains its own, larger follow-up (#1507's "Option A").
 fn input_builtins_unsupported_in_yq_mode<S: EvalSemantics>(name: &str) -> Option<EvalError> {
     if S::TAG == EvalTag::Yq {
         Some(EvalError::new(format!(
