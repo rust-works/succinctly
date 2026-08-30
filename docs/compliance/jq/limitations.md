@@ -28,16 +28,16 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 219 probes in
+Measured against jq-1.7.1 over the 221 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
-| Dimension                                    | Result               | Meaning                                            |
-|----------------------------------------------|----------------------|----------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **219/219 = 100.0%** | Byte-identical to jq                               |
-| **Wording divergences**                      | **0**                | Every probe that errors in both errors identically |
-| **Behaviour / parser gaps**                  | **0**                | succinctly does not raise the error at all         |
+| Dimension                                    | Result              | Meaning                                                |
+|----------------------------------------------|---------------------|--------------------------------------------------------|
+| **Message text** (both evaluators, verbatim) | **219/221 = 99.1%** | Byte-identical to jq                                   |
+| **Wording divergences**                      | **2**               | Both evaluators raise, but word it differently from jq |
+| **Behaviour / parser gaps**                  | **0**               | succinctly does not raise the error at all             |
 
 These three numbers are asserted, not maintained by hand: `jq_error_message_tests.rs`
 parses them back out of this page and fails if they drift from the corpus (they went stale
@@ -1650,6 +1650,57 @@ already filed as [#1855](https://github.com/rust-works/succinctly/issues/1855) (
 is sticky (any-error) across multi-document input; real jq uses only the last document's
 outcome") before #1830 added this particular error class to the set of things that can trigger
 it. #1830 deliberately did not attempt a fix here, to avoid duplicating #1855's own scope.
+
+### `ascii_downcase`/`ascii_upcase` inside `path()` name the outer value, not jq's inner exploded-array step — no carve-out; recorded on its merits
+
+```console
+$ echo '{"a":"xyz"}' | jq -c 'path(.a | ascii_downcase)'
+jq: error (at <stdin>:1): Invalid path expression near attempt to iterate through [120,121,122]
+$ echo '{"a":"xyz"}' | succinctly jq -c 'path(.a | ascii_downcase)'
+jq: error (at <stdin>:1): Invalid path expression with result "xyz"
+```
+
+(same for `ascii_upcase`; both refuse with the same exit code, `5`, and the same
+`invalid_path_expression` message class -- only the parenthetical detail differs.)
+
+Real jq's `ascii_downcase`/`ascii_upcase` are `builtin.jq` prelude definitions
+(`explode | map(...) | implode`), so the path-expression check fails *inside*
+that definition, at the exploded array's iterate step, naming the codepoint
+array. succinctly implements both natively for performance, so its check
+fails at the outer call boundary and names the original string instead. The
+control case confirms it is the definition boundary and not the wording
+itself: `path(.a | explode)`, where both implementations are a single native
+step, agrees byte-for-byte in both tools.
+
+This does not fit any of ADR-0018 rule 4's four conditions: the output is not
+unreadable (a), nothing is corrupted or discarded (b), no process dies (c),
+and (d) is specifically about a dependency choice -- there is no crate to
+evaluate here, only an internal implementation choice between two options,
+both considered and rejected on cost:
+
+- **Re-derive `ascii_downcase`/`ascii_upcase` from the prelude definition**
+  (`explode | map(...) | implode`) instead of a native implementation.
+  Closes the gap, but degrades *every* ordinary (non-`path()`) call to these
+  two hot-path string builtins -- the common case pays a real performance
+  cost for an edge case that already errors either way.
+- **Special-case `path()` to detect these two builtins and report a
+  synthetic exploded-array step.** Closes the gap, but adds a second,
+  dedicated code path duplicating `explode`'s output just to build an error
+  message on an already-refused expression -- fragile (reports evaluation
+  that didn't actually happen) and only covers these two names, not the
+  general prelude-definition-vs-native-implementation gap other builtins
+  could hit the same way.
+
+Both candidates cost real complexity or a real performance regression to fix
+wording on an expression that already fails identically in both tools (same
+exit code, same error class) -- calling a string-transform builtin inside
+`path()` is already a user error jq itself refuses, so the value of matching
+its exact internal step name is near zero. Recorded here as a divergence
+accepted on its merits, following this page's own "A structurally malformed
+value doesn't abort the rest of a multi-value stream" entry above as
+precedent for a gap that doesn't fit the letter of rule 4 but is kept rather
+than silently left unrecorded. See
+[#1561](https://github.com/rust-works/succinctly/issues/1561).
 
 ## Provenance
 

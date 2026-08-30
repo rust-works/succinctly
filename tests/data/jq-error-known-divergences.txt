@@ -53,3 +53,12 @@
 # at all", which now raises `EvalError::invalid_path_expression`) took
 # `path_non_path_literal`, `path_non_path_builtin` and `path_non_path_arithmetic`
 # with them, emptying the list again.
+#
+# #1561: ascii_downcase/ascii_upcase are jq prelude definitions
+# (explode | map(...) | implode); succinctly implements them natively, so its
+# refusal names the outer value instead of jq's own exploded-array iterate
+# step. Recorded as a permanent divergence, not fixed — see
+# docs/compliance/jq/limitations.md.
+
+path_non_path_ascii_downcase_prelude_step  wording  jq's error names the exploded codepoint array, not the outer string — #1561
+path_non_path_ascii_upcase_prelude_step    wording  jq's error names the exploded codepoint array, not the outer string — #1561
