@@ -25607,11 +25607,16 @@ fn test_slice_update_with_identity_tail_still_raises_1428() -> Result<()> {
 #[test]
 fn test_string_slice_terminal_write_runs_edit_before_refusing_1876_1883() -> Result<()> {
     // `debug`'s stderr side effect still fires even though the write is
-    // ultimately refused -- both jq and succinctly print the debug line,
-    // then refuse with the same generic message.
+    // ultimately refused -- both jq and succinctly print the debug line
+    // (with the *sliced* substring "he", proving `edit` really ran against
+    // the throwaway substring rather than the whole original string), then
+    // refuse with the same generic message.
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:2] |= (debug|9)"], Some("\"hello\""))?;
     assert_ne!(code, 0);
-    assert!(stderr.contains("DEBUG:"), "stderr: {stderr}");
+    assert!(
+        stderr.starts_with("[\"DEBUG:\",\"he\"]\n"),
+        "stderr: {stderr}"
+    );
     assert!(
         stderr.contains("Cannot update string slices"),
         "stderr: {stderr}"

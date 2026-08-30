@@ -17443,40 +17443,38 @@ fn through_slice<E: From<EvalError>>(
             Ok(())
         }
         // jq reads a string slice but will not write one back, whatever the
-        // replacement — the refusal beats the non-array one above. But
-        // that refusal is only correct once the slice itself *is* the
-        // write; a chained path with more path after the slice
-        // (`terminal_write: false`) needs the read-through substring
-        // handed to `edit` instead, so *that* navigation's own outcome —
-        // a genuine failure (`del(.a[0:1].b)` -> "Cannot index string
-        // with string \"b\"", matching `.a[0:1].b = 5`'s identical real-jq
-        // message) or a `?`-suppressed no-op (`del(.a[0:1][0]?)`,
-        // `.a[0:1].b? = 5`) — is the answer, not this refusal (#1321,
-        // confirmed live both ways against real jq for `del()` and `=`).
-        OwnedValue::String(_) if !terminal_write => {
-            let mut throwaway = slice_owned_value(root, start, end, optional)?
-                .expect("Array/String target always yields Some from slice_owned_value");
-            edit(&mut throwaway)
-        }
-        // #1876/#1883: real jq evaluates the update filter's side effects
-        // (and surfaces its own errors) *before* refusing the write --
-        // this arm used to refuse immediately, discarding `edit` entirely,
-        // so a `debug`/`stderr` side effect never fired and a genuine
-        // `error(...)`/arithmetic type error inside the update filter was
-        // replaced by this generic message instead of propagating.
-        // Mirrors the `!terminal_write` arm just above: run `edit` against
-        // the same throwaway substring, propagate whatever it produces via
-        // `?`, and only *then* raise the refusal once `edit` itself has
-        // succeeded (confirmed live against jq 1.7.1: `"hello" | .[0:2] |=
-        // (debug|9)` prints the debug line before still refusing with this
-        // same message; `"hello" | .[0:2] |= error("boom")` raises "boom"
-        // instead; `"s" | .[0:1] += 1` raises the real arithmetic error,
-        // not this one).
+        // replacement -- but that refusal (`terminal_write: true`) is only
+        // correct once the slice itself *is* the write; a chained path with
+        // more path after the slice (`terminal_write: false`) needs the
+        // read-through substring handed to `edit` instead, so *that*
+        // navigation's own outcome -- a genuine failure (`del(.a[0:1].b)`
+        // -> "Cannot index string with string \"b\"", matching
+        // `.a[0:1].b = 5`'s identical real-jq message) or a
+        // `?`-suppressed no-op (`del(.a[0:1][0]?)`, `.a[0:1].b? = 5`) -- is
+        // the answer, not the refusal below (#1321, confirmed live both
+        // ways against real jq for `del()` and `=`).
+        //
+        // Either way, `edit` always runs first against the same throwaway
+        // substring and its outcome is always propagated via `?` before
+        // either disposition is decided (#1876/#1883): an earlier version
+        // of the `terminal_write: true` case refused immediately without
+        // ever calling `edit`, discarding a `debug`/`stderr` side effect
+        // entirely and replacing a genuine `error(...)`/arithmetic type
+        // error inside the update filter with this generic refusal instead
+        // of propagating it (confirmed live against jq 1.7.1: `"hello" |
+        // .[0:2] |= (debug|9)` prints the debug line before *still*
+        // refusing with this same message; `"hello" | .[0:2] |=
+        // error("boom")` raises "boom" instead; `"s" | .[0:1] += 1` raises
+        // the real arithmetic error, not this one).
         OwnedValue::String(_) => {
             let mut throwaway = slice_owned_value(root, start, end, optional)?
                 .expect("Array/String target always yields Some from slice_owned_value");
             edit(&mut throwaway)?;
-            Err(EvalError::cannot_update_string_slices().into())
+            if terminal_write {
+                Err(EvalError::cannot_update_string_slices().into())
+            } else {
+                Ok(())
+            }
         }
         // yq's slice-assignment no-op (#1101, generalized to any nesting
         // depth by #1116): `through_slice` is the single choke point every
@@ -30728,15 +30726,34 @@ fn delete_at_path(
                     // no-ops it (confirmed live, `del(.a[0:1].b)` on
                     // `a: hello` leaves `a: hello` untouched), which this PR
                     // doesn't attempt to fix. Forcing `terminal_write: true`
-                    // in yq mode keeps `through_slice`'s String arm on its
-                    // old, unconditional refusal there -- the exact same
-                    // wrong-but-unchanged "Cannot update string slices"
-                    // message yq mode already raised before this PR --
-                    // instead of trading it for a *different* wrong message
-                    // ("Cannot index string with string \"b\"") that would
-                    // make this string case look fixed relative to #1219's
-                    // own array/object case when it isn't. jq mode is
-                    // unaffected either way.
+                    // in yq mode keeps `through_slice`'s String arm ending
+                    // in its refusal here -- the same wrong-but-unchanged
+                    // "Cannot update string slices" message yq mode already
+                    // raised before this PR -- instead of trading it for a
+                    // *different* wrong message ("Cannot index string with
+                    // string \"b\"") that would make this string case look
+                    // fixed relative to #1219's own array/object case when
+                    // it isn't. jq mode is unaffected either way.
+                    //
+                    // #1876/#1883 code review: that arm now runs `edit`
+                    // (here, `delete_at_path(sub, &rest, ...)`, a real
+                    // recursive delete against the throwaway substring, not
+                    // a no-op) before reaching this refusal, where it used
+                    // to refuse unconditionally without calling `edit` at
+                    // all. A live-verified sweep (`del(.[][0:1].c)`,
+                    // `del(.[][0:1][0])`, `del(.[][0:1][])`,
+                    // `del(.[][0:1][2:3])`, `del(.[][0:1][2:3].c)`, computed
+                    // bounds) found no shape that reaches this call site
+                    // with `rest` still pending and a String `sub` --
+                    // `yq_del_slice_outcome`'s four outcomes either bypass
+                    // `through_slice` entirely (`Noop`, `DropParent`) or
+                    // recurse into `delete_at_path` with a prefix that
+                    // fails before ever reaching a trailing slice -- so
+                    // `edit` here is believed to always no-op/error before
+                    // producing an observable difference, not proven
+                    // structurally impossible. A future change to
+                    // `yq_del_slice_outcome` that makes this reachable
+                    // should re-verify that belief still holds.
                     //
                     // `container_noop: false` unconditionally (#1873 code
                     // review): unlike `set_path`/`update_path`'s call sites,
