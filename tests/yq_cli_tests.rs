@@ -1449,6 +1449,26 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
     Ok(())
 }
 
+/// #1869's `Expr::Iterate` path-context fix (jq_cli_tests.rs's own
+/// `test_iterate_path_context_ambient_optional_keeps_prefix_not_skip_1869`)
+/// lives in `eval_pipe_with_path_context_internal`, generic over
+/// `EvalSemantics` and shared verbatim by both modes -- `key` (a jq-mode
+/// path-context builtin) reaches it in yq mode too, once gated open via
+/// `--jq-extensions`. Confirms the same fixed behavior here: the erroring
+/// element (1) stops the traversal and keeps the pre-error prefix, rather
+/// than the pre-fix bug's silent skip-and-continue.
+#[test]
+fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(
+        "(.a)? | .[] | if key==1 then error(\"boom\") else key end",
+        "a:\n  - 1\n  - 2\n  - 3\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+    Ok(())
+}
+
 /// #1251: `.a` field access on `--input-format json` input with a
 /// duplicate key must resolve to the *last* value, matching real jq /
 /// RFC 8259 convention -- the JSON-side sibling of #174's YAML fix, and
