@@ -398,7 +398,8 @@ surface (#1512):
 | `exp`, `exp2`, `exp10`                               | Exponentials (#1714)                          |
 | `sinh`, `cosh`, `tanh`                               | Hyperbolic trig functions (#1714)             |
 | `atan2(y; x)`                                        | Two-argument arctangent (#1714)               |
-| `asin`, `acos`, `atan`, `sin`, `cos`, `tan`           | Trig functions (#1837)                        |
+| `asin`, `acos`, `atan`                               | Inverse trig functions (#1837)                |
+| `sin`, `cos`, `tan`                                  | Trig functions (#1837)                        |
 | `asinh`, `acosh`, `atanh`                            | Inverse hyperbolic trig functions (#1837)     |
 | `skip(n; f)`                                         | Drop the first `n` outputs of `f` (#1882)     |
 
