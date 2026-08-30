@@ -979,6 +979,31 @@ fn distinct_key_cursors_checked<V: DocumentValue>(
     Ok(out)
 }
 
+/// [`distinct_key_cursors_checked`]'s check-only sibling, for a caller that
+/// needs to know *whether* an object raises without ever reading a single
+/// cursor back -- `try_single_generic`'s `LazyKeys` arm (#1936) hands the
+/// original, still-lazy value back unchanged on success, so collecting a
+/// `Vec<V::Cursor>` there would be a pure O(n)-space cost for an answer
+/// that's thrown away every time. Mirrors `Builtin::Last`'s own inline
+/// walk below (review already caught this exact `distinct_key_cursors_checked`-
+/// for-a-yes/no-answer mistake once there), pulled out since a second call
+/// site now wants the identical check with no cursor to track either.
+fn keys_are_well_formed<V: DocumentValue>(
+    fields: &V::Fields,
+    collapse: bool,
+) -> Result<(), EvalError> {
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (key, _cursor) in cursors.by_ref() {
+        if key_is_malformed(&key) {
+            return Err(fields.malformed_member_error());
+        }
+    }
+    if cursors.ended_unpaired() || cursors.delimiter_fault() {
+        return Err(fields.malformed_member_error());
+    }
+    Ok(())
+}
+
 /// Materialize a `GenericResult::LazyIndexRange` fallback: build the
 /// `[0, 1, ..., len-1]` array exactly as eager array `keys`/`keys_unsorted`
 /// did before it stayed lazy (#684).
@@ -2083,14 +2108,17 @@ fn push_generic_truthiness<V: DocumentValue>(
 /// A bare `Error`/`Break`/`Partial` must never appear in `items` — callers
 /// that build up a per-element batch route those variants to an early return
 /// (folding whatever was already flattened into a `Partial` of their own via
-/// [`partial_generic`]) instead of pushing them here. A `LazySeq` item CAN
-/// still fail once materialized here, though (its failure isn't known until
-/// `materialize_lazy()` actually pulls it) — that's why this returns
-/// `Result`, not a plain `Vec` as it used to before `LazySeq` existed (#725):
-/// unlike `LazyKeys`/`LazyIndexRange`, which can never fail to materialize, a
-/// `LazySeq` runs arbitrary `map(f)` and can be reached here (e.g. via
-/// `.[] | (keys_unsorted | map(f))`) before any materialization has
-/// happened.
+/// [`partial_generic`]) instead of pushing them here. A `LazySeq`/`LazyKeys`
+/// item CAN still fail once materialized here, though (its failure isn't
+/// known until `materialize_lazy()` actually pulls it) — that's why this
+/// returns `Result`, not a plain `Vec` as it used to before `LazySeq`
+/// existed (#725): `LazySeq` runs arbitrary `map(f)`, and `LazyKeys` can
+/// carry a #1194 malformed (non-string) object key (#1936) that only
+/// surfaces on materialization -- both can be reached here (e.g. via
+/// `.[] | (keys_unsorted | map(f))`) before that materialization has
+/// happened. `LazyIndexRange` is the only one of the three that genuinely
+/// can never fail: its value is fully described by the array's length
+/// alone (#684).
 fn flatten_generic_results<V: DocumentValue>(
     items: Vec<GenericResult<V>>,
 ) -> Result<Vec<OwnedValue>, Control> {
@@ -4267,9 +4295,12 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
 /// future change to the catchability rules (another `#1620`-style
 /// exclusion, a new `Control` variant) needs applying to *both*, the same
 /// way `eval.rs`'s and `eval_generic.rs`'s own evaluator pair already needs
-/// any reindex-bridge fix applied in parallel. Currently consistent
-/// (verified: same `is_decode_failure()` exclusion, `Break` bound to
-/// `null`, `catch = None` suppression, `Halt` passthrough).
+/// any reindex-bridge fix applied in parallel. Consistent on the properties
+/// both were built with (verified: same `is_decode_failure()` exclusion,
+/// `Break` bound to `null`, `catch = None` suppression, `Halt` passthrough)
+/// -- but **not** on lazy-variant forcing: this function's own `LazyKeys`
+/// arm below (#1936) has no counterpart in `each_try_generic`, a known,
+/// tracked divergence (#1948), not an oversight in this doc paragraph.
 ///
 /// A decode failure (#1247) is never caught by either spelling, any more
 /// than real jq's own parse-time rejection could ever be caught (#1620) --
@@ -4305,22 +4336,46 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
 /// matching `Control`'s own pass-through guarantee and the `other => other`
 /// wildcard's identical treatment of a bare `GenericResult::Halt`.
 ///
-/// `LazyKeys` is checked via [`distinct_key_cursors_checked`] rather than
+/// `LazyKeys` is checked via [`keys_are_well_formed`] rather than
 /// [`GenericResult::materialize_lazy`]/`materialize_lazy_keys`: the latter
 /// would decode and collect every key into an owned `Vec<String>` even on
 /// the ordinary, non-failing path, permanently forfeiting `fold_pipe_stages`'s
 /// `!sorted` O(1)/no-allocation fast paths (`.[]`, `.[n]`, `first`, `last`)
 /// for any `keys_unsorted` merely *wrapped* in `?`/`try`/`catch` -- a real
 /// cost with no correctness benefit, caught in review before this landed.
-/// `distinct_key_cursors_checked` walks the same fields doing the identical
-/// #1194 check, but only collects cheap `V::Cursor`s, and -- critically --
-/// on success this arm hands back the *original*, still-lazy `LazyKeys`
-/// unchanged, so a downstream `fold_pipe_stages` arm still gets the fast
-/// path it always did. `LazyIndexRange` needs no arm at all: its value is
-/// fully described by `len` alone (#684), so unlike `LazyKeys` it can
-/// never actually fail -- forcing it here would cost real allocation for
-/// zero correctness benefit, so it stays on the `other => other` wildcard,
-/// exactly as before this fix.
+/// `keys_are_well_formed` walks the same fields doing the identical #1194
+/// check but collects nothing (an earlier version of this fix called
+/// [`distinct_key_cursors_checked`] here instead, collecting a `Vec<V::Cursor>`
+/// purely to discard it -- the exact O(n)-space-for-an-O(1)-space-answer
+/// mistake `Builtin::Last` below already hit and fixed once; also caught by
+/// review), and on success this arm hands back the *original*, still-lazy
+/// `LazyKeys` unchanged, so a downstream `fold_pipe_stages` fast-path arm
+/// still gets to run.
+///
+/// **This does not make the check free, only as cheap as it can be while
+/// still being correct.** Handing back a still-lazy `LazyKeys` means
+/// anything downstream that goes on to actually read the keys -- the CLI's
+/// own streaming writer for a bare `keys_unsorted?`, or `fold_lazy_keys_stage`'s
+/// own materializing fallback for any continuation that isn't one of its
+/// narrow `!sorted` fast paths -- walks the object a *second* time to get
+/// there, since nothing here caches or tags the object as already-validated.
+/// That is not avoidable within this fix's scope: this boundary must know
+/// *now* whether the object contains a malformed key, and the only way to
+/// know that is to look at every key once, so a `?`/`try`-wrapped
+/// `keys`/`keys_unsorted` unavoidably costs at least one extra full walk
+/// over the unwrapped form -- the same trade-off `LazySeq` already makes,
+/// just without `LazySeq`'s consolation of retiring laziness for good on
+/// success. Threading an "already validated" fact through `LazyKeys` itself
+/// so a later consumer could skip re-checking is a real follow-up
+/// optimization, tracked as #1951 rather than attempted here to keep this
+/// fix reviewable at the size of a narrow bug fix rather than a `LazyKeys`
+/// redesign.
+///
+/// `LazyIndexRange` needs no arm at all: its value is fully described by
+/// `len` alone (#684), so unlike `LazyKeys` it can never actually fail --
+/// forcing it here would cost real allocation for zero correctness
+/// benefit, so it stays on the `other => other` wildcard, exactly as
+/// before this fix.
 ///
 /// [`each_try_generic`] below, this function's push-model twin, has a
 /// **similar but distinct, still-open gap**: `eval_each_generic`'s own
@@ -4372,8 +4427,8 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
             fields,
             sorted,
             collapse,
-        } => match distinct_key_cursors_checked::<V>(&fields, collapse) {
-            Ok(_) => GenericResult::LazyKeys {
+        } => match keys_are_well_formed::<V>(&fields, collapse) {
+            Ok(()) => GenericResult::LazyKeys {
                 fields,
                 sorted,
                 collapse,
