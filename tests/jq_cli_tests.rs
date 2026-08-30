@@ -26833,7 +26833,6 @@ fn test_seq_adjacent_tokens_never_fabricate_1723() -> Result<()> {
 fn test_seq_partially_readable_record_is_dropped_whole_1723() -> Result<()> {
     for (input, jq_would_emit) in [
         ("\x1e1 {invalid\n", "1"),
-        ("\x1e1[1]\n", "1 and [1]"),
         ("\x1e1,2\n", "2"),
         ("\x1e} 5\n", "5"),
         ("\x1e{\"a\":1} xyz\n", "{\"a\":1}"),
@@ -26887,5 +26886,60 @@ fn test_seq_trailing_unresolved_still_reports_unknown_1723() -> Result<()> {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// #1928: a self-delimiting token needs no separator after it.
+///
+/// The first version of this fix required whitespace after *every* token,
+/// which dropped records real jq reads fully — a review measured 332 such
+/// regressions. A string, object or array carries its own closing
+/// delimiter, so adjacency cannot mis-split it; only a number or bare
+/// literal is "pending" and genuinely ambiguous.
+#[test]
+fn test_seq_self_delimiting_tokens_need_no_separator_1928() -> Result<()> {
+    for (input, expected) in [
+        ("\x1e{\"a\":1}{\"b\":2}\n", "{\"a\":1}\n{\"b\":2}\n"),
+        ("\x1e\"a\"\"b\"\n", "\"a\"\n\"b\"\n"),
+        ("\x1e[1][2]\n", "[1]\n[2]\n"),
+        // A pending token is confirmed by the *start* of a self-delimiting
+        // value just as well as by whitespace.
+        ("\x1e1[1]\n", "1\n[1]\n"),
+        ("\x1e1\"a\"\n", "1\n\"a\"\n"),
+        ("\x1e1{\"b\":2}\n", "1\n{\"b\":2}\n"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1928: a bare `true`/`false`/`null` at a record boundary is truncated,
+/// exactly like a bare number.
+///
+/// Both lack a closing delimiter, so jq's incremental scanner cannot rule
+/// out more input arriving. Checking numbers alone left 92 shapes emitting a
+/// value jq drops.
+#[test]
+fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
+    for (input, expected, why) in [
+        (
+            "\x1etrue\x1e3\n",
+            "3\n",
+            "bare literal before RS is abandoned",
+        ),
+        ("\x1enull\x1e3\n", "3\n", "so is null"),
+        ("\x1e5\x1e3\n", "3\n", "as for a bare number, unchanged"),
+        ("\x1etrue\n\x1e3\n", "true\n3\n", "a newline confirms it"),
+        ("\x1e\"a\"\x1e3\n", "\"a\"\n3\n", "a string self-terminates"),
+        ("\x1e[1]\x1e3\n", "[1]\n3\n", "so does an array"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
     Ok(())
 }
