@@ -15751,6 +15751,68 @@ fn test_skip_positive_and_zero_count_unaffected_983() -> Result<()> {
     Ok(())
 }
 
+/// #1846: `$n > 0`/`$n == 0` are both false for NaN under real jq's own
+/// `skip` definition, so it falls to the `else error(...)` branch -- the
+/// same NaN-satisfies-neither-branch shape #1825 fixed for `nth`/`limit`.
+/// succinctly's Rust `f as usize` cast instead saturated NaN to `0`,
+/// silently skipping nothing.
+#[test]
+fn test_skip_nan_count_errors_1846() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-cn", "[skip(nan; 1,2,3,4)]"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("skip doesn't support negative count"),
+        "unexpected stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #1846 review: unlike `nth`/`limit`, `skip`'s decrement-per-item generator
+/// (`foreach expr as $item ($n; . - 1; if . < 0 then $item else empty end)`)
+/// naturally *floors* a positive fractional `$n` rather than ceiling it --
+/// the first item emitted is the one where `$n - k < 0`, i.e. `k > $n`, so
+/// exactly `floor($n)` items are skipped. #1846/#1849 both suspected the
+/// existing truncating cast was a bug that should ceiling like `limit`/`nth`
+/// instead; hand-tracing the real generator (see `classify_skip_n`'s doc
+/// comment in `src/jq/eval.rs`) shows truncation was already correct.
+#[test]
+fn test_skip_fractional_count_floors_not_ceils_1846() -> Result<()> {
+    // floor(1.5) == 1 skipped -> [2,3,4], not ceil(1.5) == 2 skipped -> [3,4].
+    let (stdout, _, code) = run_jq_full(&["-cn", "[skip(1.5; 1,2,3,4)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[2,3,4]\n");
+
+    // floor(0.4) == 0 skipped -> nothing skipped, not ceil(0.4) == 1.
+    let (stdout, _, code) = run_jq_full(&["-cn", "[skip(0.4; 1,2,3,4)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1,2,3,4]\n");
+
+    // floor(2.5) == 2 skipped -> [3,4].
+    let (stdout, _, code) = run_jq_full(&["-cn", "[skip(2.5; 1,2,3,4)]"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[3,4]\n");
+    Ok(())
+}
+
+/// Same fractional-floors-not-ceils check via the `QueryResult::One`
+/// (document-sourced number, `StandardJson::Number`) extraction branch, not
+/// just the `Owned` (computed-literal) branch the tests above reach --
+/// both arms had their own hand-inlined copy of the classification logic
+/// pre-#1846, so both need coverage independently (see
+/// `test_skip_number_literal_n_387`, which covers this branch's integer
+/// case but not its fractional one).
+#[test]
+fn test_skip_fractional_count_from_document_floors_1846() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[skip(.n; .arr[])]"],
+        Some(r#"{"n": 1.5, "arr": [1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[2,3,4]\n");
+    Ok(())
+}
+
 /// #983 review: `limit`'s path-context resolver (`resolve_limit`, reached
 /// when `limit` appears inside a path/update expression like `|=`) shares
 /// `eval_limit`'s n-conversion rule but wasn't updated by the initial fix
