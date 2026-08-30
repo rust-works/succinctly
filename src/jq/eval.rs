@@ -20181,8 +20181,21 @@ fn resolve_node<'a, S: EvalSemantics>(
         // is a second, older representation reachable from a different
         // parser path. Keeping both arms means it does not matter which one
         // a given call site produces.
+        //
+        // #1935: `repeat(f)` needs the same interception `resolve_limit_one_n`
+        // already applies for `limit` -- `resolve_node` on a bare
+        // `Expr::Repeat` never returns (no natural termination, #1906), so
+        // `take_path_branches`'s truncate-after-the-fact shape cannot work
+        // here either. `resolve_repeat_bounded` is already generic over its
+        // bound; `first(f)` is exactly `limit(1; f)` for this purpose.
+        // Live-verified against jq 1.7.1: `{"a":1} | path(first(repeat(.)))`
+        // is `[]`.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            take_path_branches(resolve_node::<S>(inner, value, trackable, snapshot), 1)
+            if let Expr::Repeat(f) = unwrap_paren(inner) {
+                resolve_repeat_bounded::<S>(f, value, trackable, snapshot, 1)
+            } else {
+                take_path_branches(resolve_node::<S>(inner, value, trackable, snapshot), 1)
+            }
         }
 
         // `if cond then a else b end`: only the branch the runtime actually

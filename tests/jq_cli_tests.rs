@@ -12879,6 +12879,63 @@ fn test_path_repeat_width_budget_matches_value_mode_1933() -> Result<()> {
     Ok(())
 }
 
+/// #1935: `first(f)` needs the identical `Expr::Repeat` interception #1906
+/// gave `limit` -- `first(repeat(f))` is exactly `limit(1; repeat(f))` for
+/// path-tracking purposes, but was routing through the generic (would-never-
+/// return) `resolve_node` call instead. Confirmed live against jq 1.7.1.
+/// `nth(n; repeat(f))` and a `repeat` reached only through an intervening
+/// `if`/`Alternative`/other combinator remain a documented, deliberately
+/// out-of-scope gap (issue #1935's own suggested disposition -- `nth` has no
+/// path-context support at all yet to extend, and the general combinator-
+/// nesting case needs a materially bigger design change).
+#[test]
+fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", "path(first(repeat(.)))"], Some("{\"a\":1}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "path(first(repeat(.a)))"],
+        Some("{\"a\":{\"a\":2}}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n");
+
+    // A non-path-shaped body still raises immediately.
+    let (_, stderr, code) = run_jq_full(&["-c", "path(first(repeat(1)))"], Some("null"))?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Invalid path expression with result 1"),
+        "stderr: {stderr}"
+    );
+
+    // Regression guard: ordinary (non-`repeat`) `first(f)` is unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(first(.a,.b))"], Some("{\"a\":1,\"b\":2}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n");
+
+    Ok(())
+}
+
+/// #1935: `nth(n; repeat(f))` is a documented, deliberately unfixed gap --
+/// `nth` has no `resolve_node` arm at all yet (a pre-existing gap
+/// independent of `repeat`), so `repeat`-specific interception there has
+/// nothing to extend. Pins the current (wrong) behavior as a known-gap
+/// regression guard rather than leaving it silently unverified.
+#[test]
+fn test_path_nth_repeat_known_gap_1935() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &["-c", "path(nth(2; repeat(.a)))"],
+        Some("{\"a\":{\"a\":2}}"),
+    )?;
+    assert_ne!(code, 0, "known gap: nth has no path-context support yet");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_walk_nested_break_reaches_its_enclosing_label() -> Result<()> {
     // Before this fix, a nested `f` application collapsed a `Control::Break`
