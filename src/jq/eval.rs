@@ -5494,15 +5494,16 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate boolean NOT.
 fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
-    // #1820: to_owned_checked, not to_owned -- an undecodable string is
-    // truthy either way (`is_truthy` never treats a string as falsy), so
-    // unchecked `to_owned`'s silent `""` substitution used to make
-    // `!"<bad-string>"` quietly answer `!true` instead of raising.
-    let owned = match to_owned_checked(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
-    QueryResult::Owned(OwnedValue::Bool(!owned.is_truthy()))
+    // Not one of #1820's actual bugs, despite `to_owned`'s silent `""`
+    // substitution touching this function too: truthiness never depends on
+    // a string's *content* (`json_is_truthy`/`OwnedValue::is_truthy` both
+    // only exclude `Null`/`Bool(false)`), so a corrupted string still
+    // produces the correct verdict either way. Recursively decoding via
+    // `to_owned_checked` doesn't just waste work -- for a container that
+    // merely *contains* an undecodable string (always truthy, regardless
+    // of what's inside), it wrongly raises where jq would just answer
+    // `false`. Use the O(1), non-recursive check instead.
+    QueryResult::Owned(OwnedValue::Bool(!json_is_truthy(&value)))
 }
 
 /// Evaluate alternative operator (`//`).
@@ -11930,8 +11931,20 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
                 Err(e) => QueryResult::Error(e),
             }
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::type_error("array", type_name(&value))),
+        // #1820: the Array arm above already raises on a corrupted
+        // *element*; this scalar fallback still needs its own
+        // `scalar_decode_failure` guard so a corrupted top-level scalar
+        // raises an uncatchable decode failure (#1247/#1620) instead of
+        // an ordinary, `?`-suppressible "not an array" type error.
+        _ => {
+            if let Some(e) = scalar_decode_failure(&value) {
+                return QueryResult::Error(e);
+            }
+            if optional {
+                return QueryResult::None;
+            }
+            QueryResult::Error(EvalError::type_error("array", type_name(&value)))
+        }
     }
 }
 
@@ -28963,14 +28976,20 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1820: to_owned_checked, not to_owned -- `.` (here `value`) becomes
-    // the truncation depth compared against every event's own path length
-    // below; an undecodable string used as `.` silently became `""`
-    // instead of raising.
-    let depth = match to_owned_checked(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // Not one of #1820's actual bugs, despite `to_owned`'s silent `""`
+    // substitution touching `depth` too: `depth` is only ever compared
+    // against `path_len` (always a plain `Int`) via `compare_values`'s
+    // cross-type ordering below, which -- per the comment a few lines
+    // down -- only takes its content-reading branch for a null/bool
+    // depth. A string/array/object depth's *content* never reaches
+    // `.as_f64()` either way (string/array/object always sort above a
+    // number, so the branch that reads content is unreachable for them),
+    // so a corrupted string standing in for `depth` produces the exact
+    // same outcome as a valid one. `to_owned_checked` doesn't just waste
+    // a decode nothing here needs -- like `eval_not`, it wrongly raises
+    // for a *container* `depth` that merely contains an undecodable
+    // string, where jq would just proceed unaffected.
+    let depth = to_owned(&value);
 
     // A `Partial`'s trailing control is not intercepted here (#694): its
     // prefix of events is processed below like any other, and the control
@@ -31679,15 +31698,23 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1820: to_owned_checked, not to_owned -- converts before checking
-    // type, so an undecodable top-level string used to silently become
-    // `""` and get misreported as "not an array" instead of raising its
-    // own decode failure (never suppressed by `?`, #1247/#1620).
-    let arr = match to_owned_checked(&value) {
-        Ok(OwnedValue::Array(a)) => a,
-        Ok(_) if optional => return QueryResult::None,
-        Ok(_) => return QueryResult::Error(EvalError::mktime_requires_array()),
-        Err(e) => return QueryResult::Error(e),
+    // #1820: `scalar_decode_failure` first, not a full `to_owned_checked`
+    // -- an undecodable top-level string used to silently become `""` via
+    // plain `to_owned` and get misreported as "not an array" instead of
+    // raising its own decode failure (never suppressed by `?`,
+    // #1247/#1620). But `get_int` below only ever extracts *numbers* from
+    // the array (never a `String` arm), so a corrupted string in an
+    // unread element -- e.g. a `gmtime`-shaped 8-element array's unused
+    // weekday/yearday tail -- must not fail a conversion that would
+    // otherwise succeed; recursively checking the whole array like
+    // `to_owned_checked` does was confirmed to regress exactly that case.
+    if let Some(e) = scalar_decode_failure(&value) {
+        return QueryResult::Error(e);
+    }
+    let arr = match to_owned(&value) {
+        OwnedValue::Array(a) => a,
+        _ if optional => return QueryResult::None,
+        _ => return QueryResult::Error(EvalError::mktime_requires_array()),
     };
 
     // Need at least 6 elements: [year, month, day, hour, minute, second]
@@ -31917,71 +31944,80 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         t.year, t.month, t.day, t.hour, t.minute, t.second, t.weekday, t.yearday,
                     )
                 }
-                // #1820: to_owned_checked, not to_owned -- converts before
-                // checking type, same "convert before type-check" shape as
-                // `builtin_mktime`'s own fix above.
-                _ => match to_owned_checked(&value) {
-                    Err(e) => return QueryResult::Error(e),
-                    Ok(OwnedValue::Array(arr)) => {
-                        // Real jq requires the full 8-element array — weekday and
-                        // yearday included — not just the 6 fields mktime needs.
-                        // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
-                        // errors in real jq for every length 1-7, only succeeding at
-                        // 8. Below 8, this codebase used to default weekday/yearday
-                        // to 0 instead of erroring, which was harmless before this
-                        // PR added specifiers that read those fields (#760) — now it
-                        // would silently produce a wrong date instead of matching
-                        // jq's error.
-                        if arr.len() < 8 {
-                            if optional {
-                                return QueryResult::None;
+                // #1820: `scalar_decode_failure` first, same shape as
+                // `builtin_mktime`'s own fix above -- and for the same
+                // reason, plain `to_owned` (not `to_owned_checked`) for the
+                // array itself: `get_int` below only ever extracts numbers
+                // (defaulting to 0 for anything else, never a `String`
+                // arm), so a corrupted string in an element it happens not
+                // to need must not fail a conversion that would otherwise
+                // succeed.
+                _ => {
+                    if let Some(e) = scalar_decode_failure(&value) {
+                        return QueryResult::Error(e);
+                    }
+                    match to_owned(&value) {
+                        OwnedValue::Array(arr) => {
+                            // Real jq requires the full 8-element array — weekday and
+                            // yearday included — not just the 6 fields mktime needs.
+                            // Confirmed empirically: `[2024,0,15,0,0,0] | strftime(...)`
+                            // errors in real jq for every length 1-7, only succeeding at
+                            // 8. Below 8, this codebase used to default weekday/yearday
+                            // to 0 instead of erroring, which was harmless before this
+                            // PR added specifiers that read those fields (#760) — now it
+                            // would silently produce a wrong date instead of matching
+                            // jq's error.
+                            if arr.len() < 8 {
+                                if optional {
+                                    return QueryResult::None;
+                                }
+                                return QueryResult::Error(
+                                    EvalError::strftime_requires_parsed_datetime_inputs(),
+                                );
                             }
+
+                            let get_int = |idx: usize| -> i64 {
+                                match arr.get(idx) {
+                                    Some(OwnedValue::Int(n)) => *n,
+                                    Some(OwnedValue::Float(f)) => *f as i64,
+                                    Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
+                                    Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
+                                        *f as i64
+                                    }
+                                    _ => 0,
+                                }
+                            };
+
+                            // `checked_month_index` (jq's 0-indexed month -> this
+                            // function's 1-indexed month) overflows for an adversarial
+                            // `i64::MAX` array element (#893's panic class, reachable
+                            // here independently of `%s`/`unix_secs_from_broken_down_time`:
+                            // every format path eagerly computes `month`, not just `%s`).
+                            let month = match checked_month_index(get_int(1)) {
+                                Ok(m) => m,
+                                Err(_) if optional => return QueryResult::None,
+                                Err(e) => return QueryResult::Error(e),
+                            };
+
+                            (
+                                get_int(0),
+                                month,
+                                get_int(2),
+                                get_int(3),
+                                get_int(4),
+                                get_int(5),
+                                get_int(6),
+                                get_int(7),
+                            )
+                        }
+                        _ if optional => return QueryResult::None,
+                        _ => {
                             return QueryResult::Error(
                                 EvalError::strftime_requires_parsed_datetime_inputs(),
-                            );
+                            )
                         }
-
-                        let get_int = |idx: usize| -> i64 {
-                            match arr.get(idx) {
-                                Some(OwnedValue::Int(n)) => *n,
-                                Some(OwnedValue::Float(f)) => *f as i64,
-                                Some(OwnedValue::NumberLiteral(NumberRepr::Int(n), _)) => *n,
-                                Some(OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
-                                    *f as i64
-                                }
-                                _ => 0,
-                            }
-                        };
-
-                        // `checked_month_index` (jq's 0-indexed month -> this
-                        // function's 1-indexed month) overflows for an adversarial
-                        // `i64::MAX` array element (#893's panic class, reachable
-                        // here independently of `%s`/`unix_secs_from_broken_down_time`:
-                        // every format path eagerly computes `month`, not just `%s`).
-                        let month = match checked_month_index(get_int(1)) {
-                            Ok(m) => m,
-                            Err(_) if optional => return QueryResult::None,
-                            Err(e) => return QueryResult::Error(e),
-                        };
-
-                        (
-                            get_int(0),
-                            month,
-                            get_int(2),
-                            get_int(3),
-                            get_int(4),
-                            get_int(5),
-                            get_int(6),
-                            get_int(7),
-                        )
                     }
-                    Ok(_) if optional => return QueryResult::None,
-                    Ok(_) => {
-                        return QueryResult::Error(
-                            EvalError::strftime_requires_parsed_datetime_inputs(),
-                        )
-                    }
-                },
+                }
             };
 
             let result = match format_strftime(
@@ -39457,6 +39493,13 @@ mod tests {
     /// fixed by #1829, an unrelated PR that landed between #1820's filing
     /// and this pickup; not re-tested here since #1829's own tests already
     /// cover them.
+    ///
+    /// `eval_not` and `builtin_truncate_stream`'s depth conversion are also
+    /// not covered here despite being two of the sixteen named sites: a
+    /// multi-round review found both were never actually #1755-shaped bugs
+    /// in the first place (see `test_not_and_truncate_stream_depth_never_
+    /// need_decoding_1820` below for why, and for the container-shaped
+    /// regression an initial `to_owned_checked`-based fix introduced).
     #[test]
     fn test_to_owned_decode_failure_sweep_1820() {
         // eval_single, Expr::Iterate arm: `.[]` on an undecodable-string
@@ -39464,12 +39507,6 @@ mod tests {
         query!(
             b"{\"a\": \"\xff\xfe\"}",
             ".a[]",
-            QueryResult::Error(e) if e.is_decode_failure() => {}
-        );
-        // eval_not: `not` (jq has no `!` operator -- this is a keyword).
-        query!(
-            b"\"\xff\xfe\"",
-            "not",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
         // eval_error: bare `error` raises `.` itself as the payload.
@@ -39530,24 +39567,93 @@ mod tests {
             "fromjsonstream",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
-        // builtin_truncate_stream: `.` (here an undecodable string) is the
-        // truncation depth.
+        // builtin_fromjsonstream: scalar fallback (a top-level undecodable
+        // string must raise uncatchably, not fall into the ordinary
+        // `?`-suppressible "not an array" type error).
         query!(
             b"\"\xff\xfe\"",
-            "truncate_stream(tostream)",
+            "fromjsonstream",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
-        // builtin_mktime: converts before checking type.
+        // builtin_mktime: converts before checking type -- a top-level
+        // undecodable string must still raise (it fails the Array check
+        // either way; the fix is which *kind* of error that becomes).
         query!(
             b"\"\xff\xfe\"",
             "mktime",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
-        // builtin_strftime: non-Number arm, converts before checking type.
+        // builtin_strftime: non-Number arm, same top-level shape.
         query!(
             b"\"\xff\xfe\"",
             "strftime(\"%Y\")",
             QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1820: `eval_not` and `builtin_truncate_stream`'s depth conversion
+    /// were both initially "fixed" by swapping their `to_owned` for
+    /// `to_owned_checked`, matching every other site in this sweep -- but a
+    /// multi-round review found neither is actually reachable through
+    /// #1755's bug shape at all, and the naive swap introduced a *new*
+    /// regression instead: both only ever consult a value's outer type,
+    /// never its decoded content (`is_truthy`/`json_is_truthy` exclude only
+    /// `Null`/`Bool(false)`; `compare_values`'s cross-type ordering never
+    /// reads a String/Array/Object operand's content), so recursively
+    /// decode-checking the *whole* value made a container merely
+    /// *containing* an undecodable string wrongly fail an operation whose
+    /// correct answer never depended on that content.
+    #[test]
+    fn test_not_and_truncate_stream_depth_never_need_decoding_1820() {
+        // A non-empty array is truthy regardless of what's inside it.
+        query!(
+            b"[\"\xff\xfe\"]",
+            "not",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // An object is truthy regardless of what's inside it.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "not",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // A non-numeric depth (here an array containing an undecodable
+        // string) always sorts above `path_len` (a plain `Int`), so every
+        // event is unconditionally dropped without ever needing to read
+        // the depth's content -- confirmed by using `halt` as the stream
+        // generator: if this were treated as an ordinary conversion error,
+        // it would raise here and never reach `halt` at all.
+        query!(
+            b"[\"\xff\xfe\"]",
+            "truncate_stream(halt)",
+            QueryResult::Halt(0) => {}
+        );
+    }
+
+    /// #1820: `builtin_mktime`/`builtin_strftime` only ever read a fixed
+    /// prefix of their input array as numbers (`get_int` never has a
+    /// `String` arm), so an undecodable string sitting in an element
+    /// neither function reads at all -- e.g. a `gmtime`-shaped array's
+    /// unused weekday/yearday tail -- must not fail a conversion that
+    /// would otherwise succeed. An initial fix recursively decode-checked
+    /// the whole array via `to_owned_checked` and regressed exactly this;
+    /// both now use `scalar_decode_failure` (checks only the top-level
+    /// value itself) ahead of a plain, unchecked `to_owned`.
+    #[test]
+    fn test_mktime_strftime_ignore_undecodable_unread_tail_elements_1820() {
+        // mktime only reads indices 0..=5; index 6 (an 8-element,
+        // gmtime-shaped array's weekday slot) is never inspected.
+        query!(
+            b"[2024,0,15,0,0,0,0,\"\xff\xfe\"]",
+            "mktime",
+            QueryResult::Owned(OwnedValue::Int(_) | OwnedValue::Float(_)) => {}
+        );
+        // strftime reads indices 0..=7 but only as numbers -- an
+        // undecodable string past index 7 is never reached.
+        query!(
+            b"[2024,0,15,0,0,0,0,0,\"\xff\xfe\"]",
+            "strftime(\"%Y\")",
+            QueryResult::Owned(OwnedValue::String(s)) => { assert_eq!(s, "2024"); }
         );
     }
 
@@ -39581,6 +39687,9 @@ mod tests {
         );
         query!(br#"["x"]"#, "fromjsonstream",
             QueryResult::Owned(OwnedValue::Array(_)) => {}
+        );
+        query!(br#""x""#, "fromjsonstream",
+            QueryResult::Error(e) => { assert!(!e.is_decode_failure()); }
         );
         {
             let json_bytes: &[u8] = b"0";
