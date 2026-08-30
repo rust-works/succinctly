@@ -2275,7 +2275,21 @@ pub enum GenericResult<V: DocumentValue> {
     /// further `| map(g)` stages pushed onto the same chain by the `Pipe`
     /// fold's composability arm below. See `LazySeq`'s own docs for the
     /// mechanism and `docs/plan/jq-lazy-map-select.md` for the design.
-    LazySeq(LazySeq<V>),
+    ///
+    /// Boxed (#789): `LazySeq<V>` embedded directly grew `GenericResult<V>`
+    /// from 120 to 184 bytes (measured via `size_of_val`, x86_64), and every
+    /// arm of this enum -- `select`'s own trivial boolean-test result
+    /// included -- pays that larger copy on every return, since Rust enum
+    /// size is the discriminant plus the *widest* variant regardless of
+    /// which one is active. That extra copying is flat per call, not
+    /// size-scaling, matching the issue's own "flat ~6-7% slower across
+    /// 100kb-100mb" measurement on AMD Ryzen 9 7950X exactly (Apple M4 Pro
+    /// showed no effect, consistent with #106's precedent that small
+    /// constant-factor costs don't always port between architectures).
+    /// Boxing this one variant is the minimal fix: every other variant's own
+    /// size is unaffected, and `LazySeq<V>` itself only grows a single
+    /// pointer wherever it's already handled by reference/move.
+    LazySeq(Box<LazySeq<V>>),
 
     /// No result (optional that was missing).
     None,
@@ -3479,7 +3493,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // materializes once (`materialize_atomic`) and hands off
             // to the full evaluator — still one pass, not the
             // original four-pass round trip.
-            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(*seq, expr, optional),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => return GenericResult::Error(e),
             GenericResult::Owned(o) => {
@@ -3698,9 +3712,9 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // first. `LazySource::keys` carries the collapse rule
         // into the pull itself (#1514), so no probe runs here
         // either.
-        Expr::Builtin(Builtin::Map(f)) if !sorted => GenericResult::LazySeq(
+        Expr::Builtin(Builtin::Map(f)) if !sorted => GenericResult::LazySeq(Box::new(
             LazySeq::new(LazySource::keys(fields, collapse)).push_map(f, S::TAG),
-        ),
+        )),
         // No probe: `materialize_lazy_keys` applies the
         // collapse rule itself, through `effective_keys`.
         _ => match materialize_lazy_keys::<V>(&fields, sorted, collapse) {
@@ -3763,9 +3777,9 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
         // Slice 1 (#724), array counterpart of `LazyKeys`'s
         // own `Builtin::Map` arm above. No `!sorted` guard —
         // array "keys" are never sorted.
-        Expr::Builtin(Builtin::Map(f)) => GenericResult::LazySeq(
+        Expr::Builtin(Builtin::Map(f)) => GenericResult::LazySeq(Box::new(
             LazySeq::new(LazySource::IndexRange { next: 0, len }).push_map(f, S::TAG),
-        ),
+        )),
         _ => eval_on_owned::<S, _>(expr, materialize_lazy_index_range(len), optional),
     }
 }
@@ -3785,7 +3799,7 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> GenericResult<V> {
     match unwrap_paren(expr) {
-        Expr::Builtin(Builtin::Map(h)) => GenericResult::LazySeq(seq.push_map(h, S::TAG)),
+        Expr::Builtin(Builtin::Map(h)) => GenericResult::LazySeq(Box::new(seq.push_map(h, S::TAG))),
 
         // Count-and-discard: every element still runs (so a
         // `map(f)` that errors partway still errors), but no
@@ -4223,9 +4237,9 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
                 fold_lazy_index_range_stage::<S, V>(len, expr, optional)
             }
             GenericResult::LazySeq(seq) if is_iterate => {
-                return each_lazy_seq_iterate_sink::<S, V>(seq, rest, optional, sink);
+                return each_lazy_seq_iterate_sink::<S, V>(*seq, rest, optional, sink);
             }
-            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(*seq, expr, optional),
             // Resolved to a genuinely single value/cursor -- hand off to the
             // already-correct, arbitrary-length-pipe-aware demand driver
             // rather than re-deriving its cursor-threading logic here
@@ -5058,7 +5072,7 @@ fn drain_result_generic<V: DocumentValue>(
         GenericResult::LazyIndexRange(len) => {
             push_one_generic(GenericItem::LazyIndexRange(len), sink)
         }
-        GenericResult::LazySeq(seq) => push_one_generic(GenericItem::LazySeq(seq), sink),
+        GenericResult::LazySeq(seq) => push_one_generic(GenericItem::LazySeq(*seq), sink),
         GenericResult::Many(vs) => push_many_generic(vs.into_iter().map(GenericItem::One), sink),
         GenericResult::ManyCursor(cs) => {
             push_many_generic(cs.into_iter().map(GenericItem::OneCursor), sink)
@@ -5980,7 +5994,7 @@ fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResu
             collapse,
         },
         GenericItem::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
-        GenericItem::LazySeq(seq) => GenericResult::LazySeq(seq),
+        GenericItem::LazySeq(seq) => GenericResult::LazySeq(Box::new(seq)),
     }
 }
 
@@ -7536,9 +7550,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // non-goal and stays on the wildcard fallback below.
         Builtin::Map(f) => {
             if let Some(elements) = value.as_array() {
-                GenericResult::LazySeq(
+                GenericResult::LazySeq(Box::new(
                     LazySeq::new(LazySource::Elements(elements)).push_map(f, S::TAG),
-                )
+                ))
             } else if let Some(fields) = value.as_object() {
                 // `.[]` collapses a repeated key to its first position but
                 // last-seen value in both modes (#1398), which needs every
@@ -7558,7 +7572,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     },
                     None => LazySource::Values(fields),
                 };
-                GenericResult::LazySeq(LazySeq::new(source).push_map(f, S::TAG))
+                GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))
             } else if S::TAG == EvalTag::Yq && value.is_null() {
                 // #1907: real yq no-ops a scalar target for `map` entirely
                 // -- `f` never even runs (confirmed live, v4.53.3: `5 |
@@ -8597,6 +8611,28 @@ mod tests {
         assert_eq!(
             empty_result.collect_owned().unwrap(),
             vec![OwnedValue::Array(vec![])]
+        );
+    }
+
+    /// #789: embedding `LazySeq<V>` directly in `GenericResult::LazySeq`
+    /// grew the enum from 120 to 184 bytes (`size_of_val`, x86_64) -- every
+    /// arm pays the widest variant's size on every return, so `select`'s own
+    /// trivial boolean-test result got 64 bytes heavier to copy on every
+    /// call, a flat per-call cost matching the issue's measured "flat ~6-7%
+    /// slower across all sizes on AMD Ryzen 9 7950X" regression exactly.
+    /// Boxing the variant recovered the original 120 bytes. Pinned here as a
+    /// permanent regression guard against a future variant doing the same
+    /// thing silently -- Rust enum size is easy to grow by accident one
+    /// field at a time with no compiler warning.
+    #[test]
+    fn test_generic_result_size_stays_bounded_789() {
+        let size =
+            core::mem::size_of::<GenericResult<crate::json::light::StandardJson<'_, Vec<u64>>>>();
+        assert!(
+            size <= 128,
+            "GenericResult<V> grew to {size} bytes (was 120 pre-#740, 184 with the #789 \
+             regression, 120 again after boxing LazySeq) -- every variant now pays this on \
+             every return; investigate before accepting a bigger enum"
         );
     }
 
