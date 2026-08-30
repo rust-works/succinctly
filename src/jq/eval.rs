@@ -3482,6 +3482,48 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     }
 }
 
+/// `skip($n; expr)`'s own `$n` classification, shared by [`builtin_skip`]'s
+/// `QueryResult::One`/`QueryResult::Owned` arms so the two hand-inlined
+/// copies can't independently drift the way `nth`/`limit`'s once did (#1313,
+/// the reason [`classify_limit_n`]/[`classify_nth_n`] exist).
+///
+/// Takes the already-extracted `f64` rather than an `OwnedValue`/`StandardJson`
+/// -- unlike `classify_limit_n`/`classify_nth_n`, both call sites already do
+/// their own (unchanged, out of scope here) type check on `$n` before this
+/// runs, so there is no non-numeric case for this function to classify.
+///
+/// Real jq's own definition (`builtin.jq`, confirmed against jq's current
+/// source -- `skip/2` postdates the pinned 1.7.1 oracle, so a live repro
+/// isn't possible; verified by hand-tracing the generator below instead):
+/// ```jq
+/// def skip($n; expr):
+///   if $n > 0 then foreach expr as $item ($n; . - 1; if . < 0 then $item else empty end)
+///   elif $n == 0 then expr
+///   else error("skip doesn't support negative count") end;
+/// ```
+/// `$n > 0` and `$n == 0` are both false for NaN, so real jq falls to the
+/// `else error(...)` branch -- this must be checked explicitly, since Rust's
+/// saturating float-to-int cast turns NaN into `0` instead of raising
+/// (`skip(nan; ...)` silently skipped nothing, #1846).
+///
+/// Unlike `limit`/`nth`, this decrement-per-item generator does **not** need
+/// [`ceil_positive_float_to_usize`]: the first item emitted is the one where
+/// `$n - k < 0`, i.e. `k > $n`, so a non-integer positive `$n` skips exactly
+/// `floor($n)` items -- which a plain truncating `f as usize` cast already
+/// gives. Hand-traced against the real definition above:
+/// `skip(1.5; 1,2,3,4)` decrements `1.5 -> 0.5 -> -0.5`, first emitting on
+/// item 2, i.e. skips 1 (`floor(1.5)`); `skip(0.4; ...)` decrements
+/// `0.4 -> -0.6`, first emitting on item 1, i.e. skips 0 (`floor(0.4)`).
+/// #1846/#1849 both suspected this should ceiling like `limit`/`nth` instead
+/// -- it should not; adding a ceiling here would be a regression, not a fix.
+fn classify_skip_n(f: f64) -> Result<usize, EvalError> {
+    if f.is_nan() || f < 0.0 {
+        Err(EvalError::new("skip doesn't support negative count"))
+    } else {
+        Ok(f as usize)
+    }
+}
+
 /// Demand-forwarding twin of [`eval_limit`] (#1462, Stage 5): forwards every
 /// output of `expr` straight to `sink`, stopping the generator as soon as
 /// *either* `n` outputs have been forwarded or `sink` itself says to stop --
@@ -10633,12 +10675,10 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
                 let f = num.as_f64().unwrap_or(0.0);
-                if f < 0.0 {
-                    return QueryResult::Error(EvalError::new(
-                        "skip doesn't support negative count",
-                    ));
+                match classify_skip_n(f) {
+                    Ok(n) => n,
+                    Err(e) => return QueryResult::Error(e),
                 }
-                num.as_i64().map_or(f as usize, |i| i as usize)
             } else {
                 return QueryResult::Error(EvalError::type_error("number", type_name(&v)));
             }
@@ -10647,10 +10687,10 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ref owned @ (OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)),
         ) => {
             let f = owned.as_f64().unwrap_or(0.0);
-            if f < 0.0 {
-                return QueryResult::Error(EvalError::new("skip doesn't support negative count"));
+            match classify_skip_n(f) {
+                Ok(n) => n,
+                Err(e) => return QueryResult::Error(e),
             }
-            f as usize
         }
         QueryResult::Error(e) => return QueryResult::Error(e),
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
@@ -57361,6 +57401,34 @@ mod tests {
             ),
             ["[30,40,50]"]
         );
+    }
+
+    #[test]
+    fn test_classify_skip_n_nan_errors_1846() {
+        assert!(classify_skip_n(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn test_classify_skip_n_floors_positive_fractional_1846() {
+        // See classify_skip_n's own doc comment for the hand-traced
+        // derivation: skip's decrement-per-item generator floors, unlike
+        // limit/nth's ceiling classify_limit_n/classify_nth_n use.
+        assert_eq!(classify_skip_n(1.5).unwrap(), 1);
+        assert_eq!(classify_skip_n(0.4).unwrap(), 0);
+        assert_eq!(classify_skip_n(2.5).unwrap(), 2);
+        assert_eq!(classify_skip_n(2.0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_classify_skip_n_negative_errors_1846() {
+        assert!(classify_skip_n(-1.0).is_err());
+        assert!(classify_skip_n(-0.5).is_err());
+    }
+
+    #[test]
+    fn test_classify_skip_n_zero_is_zero_1846() {
+        assert_eq!(classify_skip_n(0.0).unwrap(), 0);
+        assert_eq!(classify_skip_n(-0.0).unwrap(), 0);
     }
 
     #[test]
