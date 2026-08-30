@@ -19667,39 +19667,13 @@ fn resolve_node<'a, S: EvalSemantics>(
                     EvalError::invalid_path_expression_near_iterate(value).into(),
                 ));
             }
-            match value {
-                OwnedValue::Array(items) => {
-                    let root = PathPrefix::root();
-                    Ok(items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            PathBranch::new(
-                                PathPrefix::extend(&root, Expr::Index(i as i64)),
-                                Cow::Borrowed(v),
-                                true,
-                            )
-                        })
-                        .collect())
-                }
-                OwnedValue::Object(map) => {
-                    let root = PathPrefix::root();
-                    Ok(map
-                        .iter()
-                        .map(|(k, v)| {
-                            PathBranch::new(
-                                PathPrefix::extend(&root, Expr::Field(k.clone())),
-                                Cow::Borrowed(v),
-                                true,
-                            )
-                        })
-                        .collect())
-                }
-                other => Err((
-                    Vec::new(),
-                    EvalError::cannot_iterate_with(S::TAG, other).into(),
-                )),
-            }
+            // #1850 code review: delegates to `resolve_iterate_bounded`
+            // (`resolve_limit_one_n`'s own fast path) with `n = usize::MAX`
+            // -- a transparent no-op bound -- instead of keeping a second
+            // copy of this Array/Object/other match. One definition means a
+            // future change to how `.[]` builds path branches can't apply
+            // to only one of the two call sites.
+            resolve_iterate_bounded::<S>(value, usize::MAX)
         }
 
         Expr::IndexExpr { target, key } => {
@@ -20483,15 +20457,24 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n)
 }
 
-/// `.[]` bounded to at most `n` branches (#1850) -- mirrors `resolve_node`'s
-/// own `Expr::Iterate` arm exactly (same `PathBranch`/`PathPrefix`
-/// construction, same [`EvalError::cannot_iterate_with`] for every other
-/// value shape), with `.take(n)` inserted into each container's iterator so
-/// [`resolve_limit_one_n`] never visits more than `n` elements. `items.iter()`/
-/// `map.iter()` are already lazy; the only change from the unbounded arm is
-/// stopping the walk early, not the values or error it produces -- confirmed
-/// live to be byte-identical to the old eager-then-truncate path for `n`
-/// under, at, and over the container's length.
+/// `.[]`'s own path-branch construction (#1850), bounded to at most `n`
+/// branches -- both `resolve_node`'s `Expr::Iterate` arm (`n = usize::MAX`,
+/// a transparent no-op bound) and [`resolve_limit_one_n`]'s fast path
+/// (`n` from `limit`) call this instead of keeping two copies of the
+/// `Array`/`Object`/`other` match. `items.iter()`/`map.iter()` are already
+/// lazy; `.take(n)` is the only change from the old unbounded form -- same
+/// `PathBranch`/`PathPrefix` construction, same
+/// [`EvalError::cannot_iterate_with`] for every other value shape,
+/// confirmed live to be byte-identical to the old eager-then-truncate path
+/// for `n` under, at, and over the container's length.
+///
+/// **Precondition, not re-checked here:** the caller must already know
+/// `value` is trackable (#843) before calling this -- both call sites gate
+/// on `trackable` first and raise `invalid_path_expression_near_iterate`
+/// themselves when it's false, exactly mirroring what the single combined
+/// arm used to do inline. This function has no `trackable` parameter of its
+/// own and never raises that error; a future third call site must add its
+/// own gate rather than assuming this function covers it.
 fn resolve_iterate_bounded<S: EvalSemantics>(
     value: &OwnedValue,
     n: usize,
