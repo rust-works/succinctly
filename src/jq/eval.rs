@@ -1019,37 +1019,32 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             )),
         },
 
-        // #1820: `scalar_decode_failure` before the `optional`/type-error
-        // fallback -- an undecodable-string scalar must raise its own
-        // decode failure, not the generic `cannot_iterate_with` message
-        // built from an unchecked `to_owned` (which silently substitutes
-        // `""` into the message and, worse, would still report "cannot
-        // iterate" instead of the real reason, even under `?`, where a
-        // decode failure must never be suppressed, #1247/#1620).
-        Expr::Iterate => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
+        // #1820/#1907: `scalar_fallback` -- an undecodable-string scalar must
+        // raise its own decode failure, not the generic `cannot_iterate_with`
+        // message built from an unchecked `to_owned` (which silently
+        // substitutes `""` into the message and, worse, would still report
+        // "cannot iterate" instead of the real reason, even under `?`, where
+        // a decode failure must never be suppressed, #1247/#1620).
+        Expr::Iterate => match value {
+            StandardJson::Array(elements) => {
+                let results: Vec<_> = elements.collect();
+                QueryResult::Many(results)
             }
-            match value {
-                StandardJson::Array(elements) => {
-                    let results: Vec<_> = elements.collect();
-                    QueryResult::Many(results)
-                }
-                // Duplicate keys collapse here in jq mode (#1385): the object
-                // jq iterates has already had a repeated key reduced to one
-                // member. yq keeps every occurrence, so `effective_fields`
-                // degenerates to the plain walk this used to do inline.
-                StandardJson::Object(fields) => {
-                    let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
-                        .into_iter()
-                        .map(|f| f.value)
-                        .collect();
-                    QueryResult::Many(results)
-                }
-                _ if optional => QueryResult::None,
-                _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+            // Duplicate keys collapse here in jq mode (#1385): the object
+            // jq iterates has already had a repeated key reduced to one
+            // member. yq keeps every occurrence, so `effective_fields`
+            // degenerates to the plain walk this used to do inline.
+            StandardJson::Object(fields) => {
+                let results: Vec<_> = effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS)
+                    .into_iter()
+                    .map(|f| f.value)
+                    .collect();
+                QueryResult::Many(results)
             }
-        }
+            _ => scalar_fallback(&value, optional, || {
+                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            }),
+        },
 
         // `.[EXPR]?`/`.[S:E]?`: jq's `?` here guards only the *final*
         // indexing/slicing operation, not evaluation of the bracket's own
@@ -5676,17 +5671,22 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `{"x":1}`, not `null`.
     let payload = match msg {
         // #1907: `to_owned_checked` on the materialized `One`/`OneCursor`
-        // case, not the plain `to_owned` `result_to_owned` uses internally --
-        // the same asymmetry the `None` arm below was already fixed for by
-        // #1820. `result_to_owned`/`result_to_owned_ctrl`/`result_to_owned_full`
+        // case and on `Many`'s first element, not the plain `to_owned`
+        // `result_to_owned` uses internally -- the same asymmetry the `None`
+        // arm below was already fixed for by #1820.
+        // `result_to_owned`/`result_to_owned_ctrl`/`result_to_owned_full`
         // back ~47 other call sites across this file, each with its own
         // optional/catchability contract, so this fixes only `error(msg)`'s
         // own materialization here rather than touching the shared helper
-        // (#1907's own "Category 2 territory" scope note). `Owned`/`ManyOwned`/
-        // `Many` arms of `result_to_owned` need no equivalent guard: a
-        // computed/collected `OwnedValue` is already valid UTF-8 by
-        // construction, so only the still-lazy `One`/`OneCursor` case can
-        // carry an undecoded string through to here.
+        // (#1907's own "Category 2 territory" scope note). `Owned`/`ManyOwned`
+        // need no equivalent guard: a computed/collected `OwnedValue` is
+        // already valid UTF-8 by construction. `Many` does need one --
+        // unlike `ManyOwned`, it holds still-lazy, undecoded `StandardJson`
+        // values (e.g. `error((.a, .b))`'s comma keeps both operands
+        // borrowed when neither forces owned promotion), so only its first
+        // element (the one a generator-argument caller actually consumes,
+        // per `result_to_owned_ctrl`'s own doc comment) is checked here,
+        // mirroring `result_to_owned_full`'s own `vs.first()` semantics.
         //
         // Not reachable via any query this CLI can currently parse:
         // `Expr::Error` has no native arm in `eval_generic::eval_single`, so
@@ -5703,6 +5703,10 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
             let owned = match msg_result {
                 QueryResult::One(v) => to_owned_checked(&v).map_err(EvalEscape::from),
+                QueryResult::Many(vs) => match vs.first() {
+                    Some(v) => to_owned_checked(v).map_err(EvalEscape::from),
+                    None => result_to_owned(QueryResult::Many(vs)),
+                },
                 other => result_to_owned(other),
             };
             match owned {
@@ -44097,6 +44101,30 @@ mod tests {
         // suppressed by `?` -- `error(.a)?` must still raise uncaught, the
         // same rule bare `error?` on an undecodable value already follows.
         query!(br#"{"a": "\uXXXX"}"#, "error(.a)?",
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+            }
+        );
+    }
+
+    #[test]
+    fn eval_error_msg_expr_raises_decode_failure_through_comma_1907() {
+        // A comma expression (`(.a, .b)`) keeps both operands lazily
+        // borrowed when neither forces owned promotion (`eval_comma`'s
+        // `borrowed_vec_to_result`), so `msg_result` here is
+        // `QueryResult::Many`, not `One` -- a case the initial version of
+        // this fix missed (only special-casing `One`), letting a `Many`
+        // whose first element is undecodable fall through to
+        // `result_to_owned`'s own unchecked `to_owned` (#1907 review).
+        // `error`'s generator-argument semantics only ever consume the
+        // *first* output (see `result_to_owned_ctrl`'s doc comment), so
+        // checking `Many`'s first element is the correct, matching fix.
+        query!(br#"{"a": "\uXXXX", "b": "ok"}"#, "error((.a, .b))",
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+            }
+        );
+        query!(br#"{"a": "\uXXXX", "b": "ok"}"#, "error((.a, .b))?",
             QueryResult::Error(e) => {
                 assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
             }
