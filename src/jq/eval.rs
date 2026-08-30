@@ -16837,6 +16837,25 @@ fn write_index(arr: &mut Vec<OwnedValue>, idx: i64) -> Result<&mut OwnedValue, E
 /// indistinguishable from no write at all by looking at the target: an earlier
 /// version of this fix inferred "unwritten" from "still `Null`" and so dropped
 /// `null | (.a|.) = null` to `null` (jq, and yq, keep `{"a": null}`).
+/// #1428: is this remaining path effectively `Identity` -- i.e. does the
+/// caller's `edit` closure *itself* perform the write, rather than navigating
+/// further inside it?
+///
+/// [`SliceEditFlags::terminal_write`] draws exactly this distinction, and
+/// `set_path`'s slice arm has always computed it (`matches!(split.tail,
+/// Expr::Identity)`). `update_path`'s own slice arm hardcoded `false`, which
+/// was harmless while `through_slice`'s `Null` arm treated every unwritten
+/// `Null` as an error -- but once that arm learned to no-op for a genuine
+/// read-through, the hardcoded `false` started swallowing the real error for
+/// `null | (.a[0:1]|.) |= null`, which jq raises.
+fn is_effectively_identity(expr: &Expr) -> bool {
+    match unwrap_path_component(expr).0 {
+        Expr::Identity => true,
+        Expr::Pipe(inner) => inner.iter().all(is_effectively_identity),
+        _ => false,
+    }
+}
+
 fn reaches_iterate(expr: &Expr) -> bool {
     match unwrap_path_component(expr).0 {
         Expr::Iterate => true,
@@ -18209,7 +18228,13 @@ fn update_path<S: EvalSemantics>(
                                 optional: here,
                                 scalar_noop,
                                 container_noop,
-                                terminal_write: false,
+                                // #1428: computed, not hardcoded `false` --
+                                // mirroring `set_path`'s own slice arm. When
+                                // `rest` is effectively `Identity` the filter
+                                // applies straight to the slice, so this call
+                                // *is* the write and a resulting `Null` must
+                                // still raise (`(.a[0:1]|.) |= null`).
+                                terminal_write: is_effectively_identity(&rest),
                             },
                             |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
                         )
