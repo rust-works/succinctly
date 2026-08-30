@@ -584,8 +584,9 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
 /// Used only at this file's primary result-value materialization points
 /// (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
 /// `builtin_setpath`, `builtin_del`, `delpaths_one`,
-/// `map_over`/`builtin_map_values`, `builtin_to_entries`) rather than
-/// replacing [`to_owned`] everywhere: this file has on the order of 150
+/// `map_over`/`builtin_map_values`, `builtin_to_entries`, `eval_slice_expr`
+/// (#1943) -- not exhaustive, see #1908/#1953 for the remaining audit)
+/// rather than replacing [`to_owned`] everywhere: this file has on the order of 150
 /// other `to_owned` call sites, roughly 50 of them a real instance of the
 /// same #1746 bug shape (filed as #1755) and the rest `QueryResult`
 /// collector boilerplate or error-message rendering -- changing the
@@ -39599,11 +39600,16 @@ mod tests {
     /// function's own consumer of that `QueryResult::One(v)` used the
     /// unchecked `to_owned` instead of `to_owned_checked`.
     ///
-    /// Exercised via `eval.rs`'s own library-API dispatch (`query!`), not
-    /// the CLI -- `succinctly jq`/`yq`'s real dynamic-slice dispatch is
+    /// Exercised via `eval.rs`'s own library-API dispatch (`query!`).
+    /// `succinctly jq`/`yq`'s primary dynamic-slice dispatch is
     /// `eval_generic.rs`'s own, separately-implemented `eval_slice_expr`,
     /// which converts via already-checked helpers and doesn't share this
-    /// bug, same CLI-unreachability shape #1932/#1755 established for this
+    /// bug -- `yq_runner.rs`'s `--slurp`/`--null-input`/`--eval-all`/
+    /// multi-file paths do call into *this* file's `jq::eval` directly, but
+    /// always on an already-materialized `OwnedValue` re-serialized to
+    /// fresh, valid-UTF8 JSON first (`to_json_for_reindex`), so this
+    /// function's own new `Err` branch can't actually fire through that
+    /// bridge in practice -- same shape #1932/#1755 established for this
     /// bug family already.
     #[test]
     fn test_slice_expr_raises_on_element_decode_failure_1943() {
