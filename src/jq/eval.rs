@@ -14444,8 +14444,10 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
 /// `Owned`/`ManyOwned` sibling in `eval_pipe`'s `Many`-branch loop (or
 /// `eval_comma`'s identical shape, #1790) forces the whole batch out of
 /// its lazy borrowed state for the first time (see [`push_promoted`]'s
-/// identical #1755 reasoning). Returns whatever converted successfully so
-/// far as the `Err` payload's own prefix.
+/// identical #1755 reasoning). Also used directly by [`prepend`]'s own
+/// `Many` arm (#1908), whose catch-handler result has no `Owned`/`ManyOwned`
+/// sibling to wait for. Returns whatever converted successfully so far as
+/// the `Err` payload's own prefix.
 fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
     borrowed: Vec<StandardJson<'_, W>>,
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
