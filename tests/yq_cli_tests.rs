@@ -1333,7 +1333,10 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
 /// `bsearch`), and the 21 names #1714 found still ungated (`add`, `min_by`,
 /// `max_by`, `implode`, `INDEX`, `walk`, `floor`, `ceil`, `round`, `sqrt`,
 /// `fabs`, `log`, `log2`, `log10`, `exp`, `exp2`, `exp10`, `sinh`, `cosh`,
-/// `tanh`, `atan2`).
+/// `tanh`, `atan2`), and #1837/#1882's own 10 names -- the adjacent trig
+/// functions #1714 left untouched (`asin`, `acos`, `atan`, `sin`, `cos`,
+/// `tan`, `asinh`, `acosh`, `atanh`) plus `skip`, a #983-lineage builtin
+/// that (unlike its siblings `limit`/`nth`) was never gated at all.
 #[test]
 fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     for filter in [
@@ -1375,6 +1378,16 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "cosh",
         "tanh",
         "atan2(1;1)",
+        "asin(0.5)",
+        "acos(0.5)",
+        "atan(0.5)",
+        "sin(0.5)",
+        "cos(0.5)",
+        "tan(0.5)",
+        "asinh(0.5)",
+        "acosh(1.5)",
+        "atanh(0.5)",
+        "skip(1; .)",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -1438,6 +1451,16 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "0 | cosh",
         "0 | tanh",
         "atan2(1;1)",
+        "0.5 | asin",
+        "0.5 | acos",
+        "0.5 | atan",
+        "0.5 | sin",
+        "0.5 | cos",
+        "0.5 | tan",
+        "0.5 | asinh",
+        "1.5 | acosh",
+        "0.5 | atanh",
+        "[1,2,3] | [skip(1; .[])]",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
