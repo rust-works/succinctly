@@ -15266,15 +15266,29 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         // generator ever produces the `halt` key). The already
                         // -indexed prefix must still survive as `Partial`,
                         // matching real jq's output instead of vanishing.
+                        //
+                        // `resolve_terminal_prefix`, not unchecked `to_owned`
+                        // (#1897): an undecodable string already accumulated
+                        // in `out` must raise `EvalError::decode_failure`
+                        // here, not silently become `""` -- the same
+                        // #1746/#1755/#1790/#1832 shape this file's other
+                        // terminal-control prefixes already guard against.
                         QueryResult::Error(e) => {
-                            return partial(out.iter().map(to_owned).collect(), Control::Error(e));
+                            let (prefix, control) =
+                                resolve_terminal_prefix(out, None, Vec::new(), Control::Error(e));
+                            return partial(prefix, control);
                         }
                         _ => unreachable!("index_one yields only One/None/Error"),
                     }
                 }
             }
             match pending_halt {
-                Some(code) => partial(out.iter().map(to_owned).collect(), Control::Halt(code)),
+                Some(code) => {
+                    // Same #1897 fix as the `Error` arm above.
+                    let (prefix, control) =
+                        resolve_terminal_prefix(out, None, Vec::new(), Control::Halt(code));
+                    partial(prefix, control)
+                }
                 None => borrowed_vec_to_result(out),
             }
         }
@@ -39329,6 +39343,64 @@ mod tests {
         query!(
             b"{\"a\": \"ok\", \"b\": \"\xff\xfe\"}",
             ".a, .b, halt",
+            QueryResult::Partial(vs, Control::Halt(0)) => {
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+            }
+        );
+    }
+
+    /// #1897: `eval_index_expr`'s `Targets::Borrowed` arm had the same
+    /// unchecked-`to_owned` shape as #1832 already fixed elsewhere -- an
+    /// undecodable value already accumulated in `out` from an earlier key
+    /// must raise `EvalError::decode_failure` when a later key's own index
+    /// error forces the prefix, not silently become `""`.
+    #[test]
+    fn test_eval_index_expr_error_path_prefix_raises_on_decode_failure_1897() {
+        // The `"a"` key's indexed value is undecodable and sits unchecked
+        // in `out` until the `5` key's "Cannot index object with number"
+        // error forces the prefix -- nothing decodable came before it, so
+        // the decode failure wins outright (same shape as
+        // `test_eval_comma_error_path_prefix_raises_on_decode_failure_1832`).
+        query!(
+            b"{\"a\": \"\xff\xfe\", \"b\": 5}",
+            ".[(\"a\", 5)]",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1897 positive control: valid data through the same computed-index
+    /// terminal-control shape is unaffected by routing through the checked
+    /// resolution.
+    #[test]
+    fn test_eval_index_expr_error_path_prefix_valid_data_unaffected_1897() {
+        query!(
+            br#"{"a":"x","b":5}"#,
+            ".[(\"a\", 5)]",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("x".to_string())]);
+                assert_eq!(e.message, "Cannot index object with number");
+            }
+        );
+    }
+
+    /// #1897, mirroring #1832's own halt rule (#987): a decode failure
+    /// discovered only while resolving the prefix for a `halt` signal must
+    /// not downgrade the halt into a catchable error -- the corrupted
+    /// element is dropped from the reported prefix instead.
+    #[test]
+    fn test_eval_index_expr_halt_is_not_downgraded_by_decode_failure_1897() {
+        // Nothing decodable came before the corrupted element, so the
+        // prefix collapses to a bare `Halt`.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            ".[(\"a\", halt)]",
+            QueryResult::Halt(0) => {}
+        );
+        // A decodable key's indexed value before the corrupted one
+        // survives as the `Partial` prefix.
+        query!(
+            b"{\"a\": \"ok\", \"b\": \"\xff\xfe\"}",
+            ".[(\"a\", \"b\", halt)]",
             QueryResult::Partial(vs, Control::Halt(0)) => {
                 assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
             }
