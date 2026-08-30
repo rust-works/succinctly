@@ -1511,25 +1511,26 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // moves it -- and once it does, jq names where the parser
                 // ended up. `printf '' | jq -n 'input'` reports `<stdin>:0`,
                 // not `<unknown>` (#1309, item 5).
-                let results = evaluate_input(
+                // Streaming, not collect-then-write (#1653) -- see
+                // `evaluate_input_streaming`.
+                evaluate_input_streaming(
                     &OwnedValue::Null,
                     &expr,
                     &context,
                     &ErrorAt::Live(&locations),
                     &mut sink,
+                    &mut |sink, result| {
+                        had_output = true;
+                        last_output = Some(result.clone());
+                        let stop = route_write_error(
+                            sink,
+                            &mut out,
+                            || ErrorAt::Live(&locations).resolve(),
+                            |o| write_output(o, &result, &output_config),
+                        )?;
+                        Ok(!stop)
+                    },
                 )?;
-                for result in results {
-                    had_output = true;
-                    last_output = Some(result.clone());
-                    if route_write_error(
-                        &mut sink,
-                        &mut out,
-                        || ErrorAt::Live(&locations).resolve(),
-                        |o| write_output(o, &result, &output_config),
-                    )? {
-                        break;
-                    }
-                }
                 if let Some(code) = sink.halted() {
                     out.flush()?;
                     return Ok(code);
@@ -1547,25 +1548,26 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // names where the parser ended up, not where this document
                 // started (#1309, item 4).
                 while let Some(input) = jq::pop_remaining_input() {
-                    let results = evaluate_input(
+                    // Streaming, not collect-then-write (#1653) -- see
+                    // `evaluate_input_streaming`.
+                    evaluate_input_streaming(
                         &input,
                         &expr,
                         &context,
                         &ErrorAt::Live(&locations),
                         &mut sink,
+                        &mut |sink, result| {
+                            had_output = true;
+                            last_output = Some(result.clone());
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || ErrorAt::Live(&locations).resolve(),
+                                |o| write_output(o, &result, &output_config),
+                            )?;
+                            Ok(!stop)
+                        },
                     )?;
-                    for result in results {
-                        had_output = true;
-                        last_output = Some(result.clone());
-                        if route_write_error(
-                            &mut sink,
-                            &mut out,
-                            || ErrorAt::Live(&locations).resolve(),
-                            |o| write_output(o, &result, &output_config),
-                        )? {
-                            break;
-                        }
-                    }
                     if let Some(code) = sink.halted() {
                         out.flush()?;
                         return Ok(code);
@@ -1577,20 +1579,28 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // Nothing on this branch can consume an input document, so
                 // the per-value location is fixed before evaluation.
                 let at = ErrorAt::Fixed(locations.get(idx));
-                let results = evaluate_input(input, &expr, &context, &at, &mut sink)?;
-
-                for result in results {
-                    had_output = true;
-                    last_output = Some(result.clone());
-                    if route_write_error(
-                        &mut sink,
-                        &mut out,
-                        || at.resolve(),
-                        |o| write_output(o, &result, &output_config),
-                    )? {
-                        break;
-                    }
-                }
+                // Streaming, not collect-then-write (#1653): each output has
+                // to reach stdout before the *next* one is evaluated, or a
+                // mid-stream `debug`/`stderr`/`error` side effect lands ahead
+                // of output that logically preceded it.
+                evaluate_input_streaming(
+                    input,
+                    &expr,
+                    &context,
+                    &at,
+                    &mut sink,
+                    &mut |sink, result| {
+                        had_output = true;
+                        last_output = Some(result.clone());
+                        let stop = route_write_error(
+                            sink,
+                            &mut out,
+                            || at.resolve(),
+                            |o| write_output(o, &result, &output_config),
+                        )?;
+                        Ok(!stop)
+                    },
+                )?;
                 if let Some(code) = sink.halted() {
                     out.flush()?;
                     return Ok(code);
@@ -3495,6 +3505,154 @@ fn strip_quotes_and_decode(field: &[u8]) -> String {
 /// An uncaught error is reported to `sink` and yields no values, so evaluation
 /// continues with the next input the way jq does; `sink` then drives the exit
 /// code (#355).
+/// Streaming twin of [`evaluate_input`] (#1653): hand each output to
+/// `on_value` the moment the evaluator produces it, instead of collecting a
+/// whole input's results and writing them afterwards.
+///
+/// Real jq is a lazy generator, so a filter that writes to stdout *and*
+/// triggers a stderr side effect (`debug`, `stderr`, `halt_error`) or raises
+/// mid-stream interleaves the two in real time. Collecting first cannot
+/// reproduce that ordering however the writes are buffered -- every stderr
+/// write has already happened before the first stdout write runs -- which is
+/// why `--unbuffered`'s per-write `flush()` alone never fixed it.
+///
+/// `on_value` is handed the same `&mut ErrorSink` this function holds, rather
+/// than capturing it: the writer needs it for `route_write_error`, and the
+/// borrow checker cannot see that the two uses never overlap in time.
+///
+/// `on_value` returns `false` to stop the generator (a write error the caller
+/// is already reporting). Errors reach `sink` exactly as in `evaluate_input`,
+/// but *after* the outputs that preceded them have been written, which is
+/// what makes `1, error("x"), 3` print `1` before its diagnostic like jq.
+fn evaluate_input_streaming(
+    input: &OwnedValue,
+    expr: &jq::Expr,
+    _context: &EvalContext,
+    at: &ErrorAt<'_>,
+    sink: &mut ErrorSink,
+    on_value: &mut dyn FnMut(&mut ErrorSink, OwnedValue) -> Result<bool>,
+) -> Result<()> {
+    let json_str = input.to_json();
+    let json_bytes = json_str.as_bytes();
+    let index = JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
+
+    let mut write_err: Option<anyhow::Error> = None;
+    let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
+        match materialize_stream_item(result, sink, at) {
+            // Nothing to write: either genuinely no value, or a failure this
+            // call already reported to `sink` (same "report and keep going"
+            // contract `evaluate_input`'s own arms follow, #355).
+            None => true,
+            Some(v) => match on_value(sink, v) {
+                Ok(keep_going) => keep_going,
+                Err(e) => {
+                    write_err = Some(e);
+                    false
+                }
+            },
+        }
+    });
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    match control {
+        None => {}
+        Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, &at.resolve()),
+        Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, &at.resolve()),
+        // `halt`/`halt_error` (#791): not a diagnostic, so no `sink.report*`
+        // call -- matching `evaluate_input`'s own `Halt` arm.
+        Some(jq::Control::Halt(code)) => sink.request_halt(code),
+    }
+    Ok(())
+}
+
+/// One streamed output as an `OwnedValue`, or `None` when there is nothing to
+/// write (a decode failure already reported to `sink`, or an empty result).
+///
+/// Mirrors [`evaluate_input`]'s per-variant materialization for exactly the
+/// variants a *single* sink item can be. `Many`/`ManyCursor`/`ManyOwned`/
+/// `Partial` are unreachable here by construction -- the sink is fed one item
+/// at a time, and `drain_result_generic` is what splits those multi-value
+/// shapes into individual items before they ever arrive.
+fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
+    result: GenericResult<V>,
+    sink: &mut ErrorSink,
+    at: &ErrorAt<'_>,
+) -> Option<OwnedValue> {
+    match result {
+        GenericResult::One(v) => {
+            sink.materialize(DiagStyle::Jq, generic_to_owned(&v), &at.resolve())
+        }
+        GenericResult::OneCursor(c) => sink.materialize(
+            DiagStyle::Jq,
+            generic_to_owned(&succinctly::jq::document::DocumentCursor::value(&c)),
+            &at.resolve(),
+        ),
+        GenericResult::Owned(v) => Some(v),
+        // Same fallback reasoning as `evaluate_input`'s own `LazyKeys` arm:
+        // a fast-pathed `keys | length` never reaches this boundary, so this
+        // only fires for bare `keys`/`keys_unsorted`. Sort iff `sorted`
+        // (#683), matching eager `Keys`.
+        GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => {
+            let mut keys = sink.materialize(
+                DiagStyle::Jq,
+                effective_keys(&fields, collapse),
+                &at.resolve(),
+            )?;
+            if sorted {
+                keys.sort();
+            }
+            Some(OwnedValue::Array(
+                keys.into_iter().map(OwnedValue::String).collect(),
+            ))
+        }
+        GenericResult::LazyIndexRange(len) => Some(OwnedValue::Array(
+            (0..len).map(|i| OwnedValue::Int(i as i64)).collect(),
+        )),
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(v) => Some(v),
+            Err(jq::Control::Error(e)) => {
+                sink.report(DiagStyle::Jq, &e, &at.resolve());
+                None
+            }
+            Err(jq::Control::Break(label)) => {
+                sink.report_break(DiagStyle::Jq, &label, &at.resolve());
+                None
+            }
+            Err(jq::Control::Halt(code)) => {
+                sink.request_halt(code);
+                None
+            }
+        },
+        GenericResult::None => None,
+        GenericResult::Error(e) => {
+            sink.report(DiagStyle::Jq, &e, &at.resolve());
+            None
+        }
+        GenericResult::Break(label) => {
+            sink.report_break(DiagStyle::Jq, &label, &at.resolve());
+            None
+        }
+        GenericResult::Halt(code) => {
+            sink.request_halt(code);
+            None
+        }
+        // Unreachable per this function's doc comment; materialized rather
+        // than `unreachable!()` so a future sink that *does* hand back a
+        // multi-value item degrades into correct-but-eager output instead of
+        // taking the process down.
+        GenericResult::Many(_)
+        | GenericResult::ManyCursor(_)
+        | GenericResult::ManyOwned(_)
+        | GenericResult::Partial(..) => None,
+    }
+}
+
 fn evaluate_input(
     input: &OwnedValue,
     expr: &jq::Expr,
