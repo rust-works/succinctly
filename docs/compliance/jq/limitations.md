@@ -1920,7 +1920,7 @@ protocol for `resolve_node`, the same shape `eval_each_owned` already gives valu
 evaluation) rather than attempted here; the narrow `first`/`limit` fixes already close
 the two shapes named in #1906/#1935's own repros.
 
-### A generator-argument expression fans out normally, then silently narrows to its first output the moment `key`/`parent`/`file_index` shows up anywhere else in the same pipe
+### A generator-argument expression fans out normally, then silently narrows to a single array the moment `key`/`parent`/`file_index` shows up anywhere else in the same pipe
 
 [#1277](https://github.com/rust-works/succinctly/issues/1277)'s clusters 1-3
 (closed by [#1522](https://github.com/rust-works/succinctly/issues/1522)/[#1279](https://github.com/rust-works/succinctly/issues/1279))
@@ -1932,9 +1932,8 @@ arm, the `Expr::Object`/`Array`/`Literal` arm, and the generic `_` fallback
 -- were an explicit non-goal of that fix, since giving them the same real
 fan-out is a materially larger change (`docs/plan/jq-generator-argument-fanout.md`).
 Those 4 sites route through `eval_owned_expr_opt`/`eval_owned_expr_full`,
-which -- until [#1937](https://github.com/rust-works/succinctly/issues/1937)
--- array-collapsed a multi-output expression into a single
-`OwnedValue::Array` instead of fanning out or taking the first output.
+which array-collapses a multi-output expression into a single
+`OwnedValue::Array` instead of fanning out.
 
 ```console
 $ echo '{"a":"xax"}' | succinctly jq -c '.a | ltrimstr(("x","z"))'
@@ -1952,19 +1951,57 @@ except for the trailing `key`, which forces the whole pipe through
 `key` itself has no jq oracle (succinctly extension), so this specific
 combination can't be demonstrated as a *jq* divergence in isolation, but it
 is a genuine, demonstrated internal inconsistency: the same sub-expression
-fans out correctly or silently narrows to one value depending on whether an
-unrelated path-tracking builtin happens to be anywhere else in the pipe.
+fans out correctly or silently collapses into one array-shaped value
+depending on whether an unrelated path-tracking builtin happens to be
+anywhere else in the pipe.
 
-#1937 changed the narrowing from array-collapse to take-first (matching
-`result_to_owned_full`'s identical policy for the same shapes, and its
-`x as $b | ...` rationale for why real jq's own generator-argument
-desugaring only ever drives the rest of a computation off the *first*
-output) -- internally consistent with that sibling function's behavior now,
-rather than being a second, differently-wrong answer. This is **not** a fix
-to full fidelity: real jq still produces every output here, and neither
-take-first nor array-collapse matches that. Left as a known, documented gap
-rather than the larger fan-out rework #1522's design doc already declined
-for these 4 sites.
+**[#1937](https://github.com/rust-works/succinctly/issues/1937) fixed one
+narrow, safe piece of this**: a *zero*-output generator (`(empty)`-style)
+now correctly contributes zero outputs to the enclosing computation, rather
+than an `OwnedValue::Array([])` value -- matching `result_to_owned_full`'s
+identical `#1045` rule for the same `Many`/`ManyOwned` shapes, and with no
+downside, since there is nothing to lose by treating "zero outputs" as "zero
+outputs" instead of manufacturing an empty-array value.
+
+**A first attempt at #1937 also tried taking the *first* output instead of
+array-collapsing for the 2+-output case (matching `result_to_owned_full`'s
+policy for that shape too) -- this was implemented, tested, and then
+rejected during `/code-review` before merging, because it introduced a
+strictly worse regression than the one it fixed.** `result_to_owned_full`'s
+take-first policy is correct for *its* callers -- a builtin's single
+generator argument, always consumed exactly once by the builtin's own body.
+But `eval_owned_expr_full` is not scoped that narrowly: its
+`Expr::Builtin(_)` arm also evaluates *zero-arg* generator builtins
+(`recurse`, `range`, `inputs`, ...) whenever they're reached through
+path-context routing, and its generic `_` fallback evaluates arbitrary
+comma branches, `..`, `paths`, `limit`, and anything else with no dedicated
+arm. Live-verified before rejecting the approach:
+
+```console
+$ echo '{"a":{"b":{"c":1}}}' | succinctly jq -c '.a | (recurse, key)'
+# with array-collapse (both before and after this issue):
+[{"b":{"c":1}},{"c":1},1]
+"a"
+# with the rejected take-first attempt:
+{"b":{"c":1}}
+"a"
+```
+
+Array-collapse produces the wrong *shape* (an array instead of 3 fanned-out
+outputs) but keeps every value inspectable. Take-first silently and
+permanently discarded 2 of the 3 `recurse` outputs with no error and no
+trace -- a materially larger, harder-to-notice correctness gap than the one
+narrow `ltrimstr`+`key` example this section documents, reachable through
+two everyday builtins (`recurse`/`range`-style generators, and `..`) rather
+than only the argument-fan-out case #1937 was filed against. Reverted;
+`tests/jq_cli_tests.rs`'s `test_path_context_builtin_arm_multi_output_still_array_collapses_1937`
+and `test_path_context_generic_fallback_recurse_still_array_collapses_1937`
+pin the current (still wrong-shaped, but not lossy) array-collapse behavior
+as a regression guard against re-attempting take-first without also solving
+the zero-arg-generator/generic-fallback exposure.
+
+Full fan-out for all 4 sites remains the only fix that would actually match
+real jq here, and remains out of scope per #1522's design doc.
 
 ## Provenance
 

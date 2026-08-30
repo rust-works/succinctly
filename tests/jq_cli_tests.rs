@@ -20147,21 +20147,47 @@ fn test_path_context_builtin_arm_non_swallowed_result_unaffected_1280() -> Resul
 /// jq's own generator-argument fan-out for the isolated `ltrimstr` call,
 /// confirmed against jq 1.7.1) through the `Expr::Builtin(_)` arm's
 /// `eval_owned_expr_opt` call, since the trailing `key` needs path tracking.
-/// Before this fix, that call array-collapsed the two outputs into
-/// `["", "ax"]` before continuing, so `length` measured the *array* (always
-/// 2, matching the fixed comma-branch count regardless of the actual string
-/// values) rather than the real first string's own length (0). `key` itself
-/// has no jq oracle (succinctly extension) and is content-independent, so
-/// it's included only to force path-context routing -- `length`'s value is
-/// what actually distinguishes take-first from array-collapse here.
+/// That call array-collapses the two outputs into `["", "ax"]` before
+/// continuing, so `length` measures the *array* (2, the comma-branch count)
+/// rather than either individual string's own length. `key` itself has no
+/// jq oracle (succinctly extension) and is content-independent, so it's
+/// included only to force path-context routing.
+///
+/// This is a known, documented gap (`docs/compliance/jq/limitations.md`),
+/// not a fix -- #1937's own investigation found the alternative (take the
+/// *first* output instead of collapsing) is a strictly worse regression for
+/// this helper's other call sites (silently drops every `recurse`/`..`/
+/// `paths` output but the first, with no error), so array-collapse remains.
+/// Pinned here as a regression guard against re-introducing that regression.
 #[test]
-fn test_path_context_builtin_arm_multi_output_takes_first_not_array_collapse_1937() -> Result<()> {
+fn test_path_context_builtin_arm_multi_output_still_array_collapses_1937() -> Result<()> {
     let (out, err, code) = run_jq_full(
         &["-c", r#".a | ltrimstr(("xax","x")) | [length, key]"#],
         Some(r#"{"a":"xax"}"#),
     )?;
     assert_eq!(code, 0, "err={err}");
-    assert_eq!(out, "[0,\"a\"]\n");
+    assert_eq!(out, "[2,\"a\"]\n");
+    Ok(())
+}
+
+/// #1937: the generic `_` fallback arm (`eval_pipe_with_path_context_internal`)
+/// backs far more than argument-fan-out builtins -- it's also how a
+/// zero-arg generator (`recurse`, `range`, `..`) or an arbitrary comma
+/// branch gets evaluated whenever a sibling `key`/`parent`/`file_index`
+/// forces the whole pipe through path-context routing. An earlier fix
+/// attempt (round 1, take-first) silently discarded every `recurse` output
+/// but the first here with no error at all -- confirmed live during
+/// `/code-review` before merging. Array-collapse, while still the wrong
+/// shape relative to real jq's own fan-out, at least keeps every value
+/// visible; pinned here as a regression guard.
+#[test]
+fn test_path_context_generic_fallback_recurse_still_array_collapses_1937() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", ".a | (recurse, key)"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out, "[{\"b\":{\"c\":1}},{\"c\":1},1]\n\"a\"\n");
     Ok(())
 }
 
