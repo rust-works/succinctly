@@ -31964,21 +31964,28 @@ pub const fn input_queue_is_active() -> bool {
 /// Code review's own doc-comment-vs-doc-comment cross-check catch (#723):
 /// `jq_runner.rs` is the only CLI driver that calls
 /// [`seed_remaining_inputs`]/[`pop_remaining_input`] before evaluating a
-/// filter -- `yq_runner.rs` never does. #1507 gave the parser per-mode
-/// keyword gating (`--jq-extensions`) for these three, matching the ~65
-/// other jq-only builtins already gated that way, so the *default* yq
-/// dispatch path this function guards is unreachable now (the parser
-/// rejects `input`/`inputs`/`input_line_number` before evaluation ever
-/// starts). This check stays anyway, because `--jq-extensions` only lifts
-/// the *parse*-time gate, not the underlying architectural gap #1507's own
-/// cost analysis identified: yq's document loop is cursor-native
-/// specifically to preserve duplicate mapping keys and ADR-0017's
-/// comment/anchor side-trees, so it cannot share jq's `Vec<(OwnedValue, u32,
-/// u32)>` queue without silently losing all three. Deleting this check
-/// would reopen the exact bug #723 fixed -- `break` on every document for
-/// `input`, silent empty output for `inputs` -- just gated behind an opt-in
-/// flag instead of being the unconditional default. Real cursor-native
-/// queue support remains its own, larger follow-up (#1507's "Option A").
+/// filter -- `yq_runner.rs` never does. #1507 moved the *CLI-reachable*
+/// rejection into the parser (`reject_in_yq_mode`, `src/jq/parser.rs`),
+/// unconditionally and regardless of `--jq-extensions` -- unlike the ~65
+/// other jq-only builtins that flag *does* unlock, these three still need
+/// real per-document driver-loop coordination yq mode's cursor-native
+/// document loop doesn't have (it exists specifically to preserve
+/// duplicate mapping keys and ADR-0017's comment/anchor side-trees, so it
+/// cannot share jq's `Vec<(OwnedValue, u32, u32)>` queue without silently
+/// losing all three), so no flag value would ever make them work.
+///
+/// This function itself is therefore unreachable through `succinctly yq`
+/// today -- the parser now rejects the keyword before evaluation starts,
+/// flag or no flag. It stays anyway because `Expr`, `Builtin`, `eval`, and
+/// `YqSemantics` are all public (`succinctly::jq`, `src/jq/mod.rs`): a
+/// downstream Rust crate can construct `Expr::Builtin(Builtin::Input)`
+/// directly and evaluate it with `YqSemantics`, bypassing the parser (and
+/// any CLI flag) entirely. Deleting this function would reopen the exact
+/// bug #723 fixed -- `break` on every document for `input`, silent empty
+/// output for `inputs` -- for that API surface specifically, with no
+/// parser standing between the caller and evaluation to catch it. Real
+/// cursor-native queue support remains its own, larger follow-up (#1507's
+/// "Option A").
 fn input_builtins_unsupported_in_yq_mode<S: EvalSemantics>(name: &str) -> Option<EvalError> {
     if S::TAG == EvalTag::Yq {
         Some(EvalError::new(format!(

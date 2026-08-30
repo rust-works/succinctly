@@ -343,6 +343,31 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Unlike [`reject_unless_jq_extensions`], `--jq-extensions` never
+    /// rescues this rejection: `input`/`inputs`/`input_line_number` (#1507)
+    /// need real per-document driver-loop coordination yq mode's
+    /// cursor-native document loop doesn't have (see
+    /// `input_builtins_unsupported_in_yq_mode`, `src/jq/eval.rs`), unlike
+    /// every other jq-only builtin the flag actually unlocks. Routing them
+    /// through `reject_unless_jq_extensions` instead of this function once
+    /// reopened the exact bug #1507 fixed, one layer down: passing the flag
+    /// let the keyword parse, so an *unreached* branch (`if false then
+    /// input else . end`) went right back to silently succeeding, since the
+    /// eval-time-only dispatch check in `eval.rs` never runs for a branch
+    /// that's never evaluated. Rejecting unconditionally here, regardless
+    /// of the flag, is reachability-independent by construction -- the same
+    /// property that made the flag-gated fix work for every *other* jq-only
+    /// builtin in the first place.
+    fn reject_in_yq_mode(&self, name: &str) -> Result<(), ParseError> {
+        if self.mode == ParserMode::Yq {
+            return Err(ParseError::new(
+                format!("{name} is not supported in yq mode"),
+                self.pos,
+            ));
+        }
+        Ok(())
+    }
+
     /// Scan a run of yq merge-flag characters (`+ ? n d c`, any order,
     /// repeats allowed) starting at the current position. Matches real yq's
     /// lexer, which greedily consumes these characters with no regard for
@@ -3583,17 +3608,17 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Builtins));
         }
         if self.matches_keyword("inputs") {
-            self.reject_unless_jq_extensions("inputs")?;
+            self.reject_in_yq_mode("inputs")?;
             self.consume_keyword("inputs");
             return Ok(Some(Builtin::Inputs));
         }
         if self.matches_keyword("input_line_number") {
-            self.reject_unless_jq_extensions("input_line_number")?;
+            self.reject_in_yq_mode("input_line_number")?;
             self.consume_keyword("input_line_number");
             return Ok(Some(Builtin::InputLineNumber));
         }
         if self.matches_keyword("input") {
-            self.reject_unless_jq_extensions("input")?;
+            self.reject_in_yq_mode("input")?;
             self.consume_keyword("input");
             return Ok(Some(Builtin::Input));
         }
@@ -6711,12 +6736,11 @@ mod tests {
     /// them. jq mode is unaffected either way -- it already accepts this
     /// whole surface unconditionally, gate or no gate.
     ///
-    /// #1507 adds `input`/`inputs`/`input_line_number` -- this test only
-    /// covers parsing, so it doesn't distinguish them from the rest here:
-    /// unlike every other name in this list, they still error once
-    /// evaluated even with the gate open (see
-    /// `input_builtins_unsupported_in_yq_mode`, `src/jq/eval.rs`), since
-    /// yq mode's document loop has no real support for them yet.
+    /// `input`/`inputs`/`input_line_number` (#1507) are deliberately *not*
+    /// in this list: unlike everything here, `--jq-extensions` never makes
+    /// them parse in yq mode -- see
+    /// `test_yq_input_builtins_rejected_in_yq_mode_regardless_of_extensions_1507`
+    /// below.
     #[test]
     fn test_yq_mode_rejects_jq_only_builtins_unless_jq_extensions_1512() {
         let cases: &[(&str, &str)] = &[
@@ -6743,9 +6767,6 @@ mod tests {
             ("trunc", "1.5 | trunc"),
             ("isinfinite", "1 | isinfinite"),
             ("nan", "nan"),
-            ("input", "input"),
-            ("inputs", "inputs"),
-            ("input_line_number", "input_line_number"),
         ];
 
         for (name, filter) in cases {
@@ -6768,6 +6789,48 @@ mod tests {
             assert!(
                 parse_program_with_mode(filter, ParserMode::Jq).is_ok(),
                 "`{name}` should parse in jq mode regardless of the yq-only gate"
+            );
+        }
+    }
+
+    /// #1507: `input`/`inputs`/`input_line_number` are the one jq-only
+    /// class `--jq-extensions` does not unlock, unlike every name in
+    /// [`test_yq_mode_rejects_jq_only_builtins_unless_jq_extensions_1512`]
+    /// above. Routing them through that same flag-gated mechanism once
+    /// reopened #1507's own bug one layer down: passing the flag let the
+    /// keyword parse, so an *unreached* branch went right back to silently
+    /// succeeding, since `input_builtins_unsupported_in_yq_mode`
+    /// (`src/jq/eval.rs`) only fires when the builtin is actually
+    /// evaluated. Rejecting in the parser unconditionally, regardless of
+    /// the flag, closes that gap by construction.
+    #[test]
+    fn test_yq_input_builtins_rejected_in_yq_mode_regardless_of_extensions_1507() {
+        for (name, filter) in [
+            ("input", "input"),
+            ("inputs", "inputs"),
+            ("input_line_number", "input_line_number"),
+        ] {
+            for extensions in [false, true] {
+                let rejected =
+                    parse_program_with_mode_and_extensions(filter, ParserMode::Yq, extensions);
+                assert!(
+                    rejected.is_err(),
+                    "`{name}` should be rejected in yq mode (extensions={extensions}), got: {rejected:?}"
+                );
+                let message = &rejected.unwrap_err().message;
+                assert!(
+                    message.contains("not supported in yq mode"),
+                    "`{name}`'s rejection message should say it's not supported in yq mode, got: {message}"
+                );
+                assert!(
+                    !message.contains("--jq-extensions"),
+                    "`{name}`'s rejection should not suggest --jq-extensions, since it never helps: {message}"
+                );
+            }
+
+            assert!(
+                parse_program_with_mode(filter, ParserMode::Jq).is_ok(),
+                "`{name}` should still parse in jq mode"
             );
         }
     }

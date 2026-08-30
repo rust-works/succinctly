@@ -1341,11 +1341,12 @@ fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
 /// `nan`) found by
 /// #1885's own code review tracing this same "Phase 10"/"Phase 12" gap
 /// further -- see #1887 for the still-unaudited remainder of this surface.
-/// #1507 adds `input`/`inputs`/`input_line_number` -- unlike every other
-/// name here, these three still error even once gated open (see
-/// `test_yq_input_not_supported_723` and friends below), since gating only
-/// lifts the parse-time refusal, not the separate architectural gap that
-/// keeps them from actually working in yq mode.
+///
+/// `input`/`inputs`/`input_line_number` (#1507) are deliberately *not* in
+/// this list, even though real yq's lexer lacks them too: unlike every name
+/// here, `--jq-extensions` never makes them work in yq mode, so they're
+/// rejected unconditionally instead of through this flag-gated mechanism --
+/// see `test_yq_input_not_supported_723` and friends below.
 #[test]
 fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     for filter in [
@@ -1403,9 +1404,6 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "isnormal",
         "isfinite",
         "nan",
-        "input",
-        "inputs",
-        "input_line_number",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -21709,21 +21707,20 @@ fn test_destructuring_pattern_null_propagates_through_nested_object_1239() -> Re
 // #723 review round: input/inputs/input_line_number are jq-only -- the
 // CLI driver behind `succinctly yq` (yq_runner.rs) never seeds their shared
 // document queue, since they need real per-document loop coordination that
-// yq mode doesn't have. #1507 later gave the parser per-mode keyword gating
-// (`--jq-extensions`), so by default these three are now rejected at parse
-// time before dispatch ever runs (see `test_yq_default_rejects_jq_only_builtins_1512`
-// and `test_yq_unreached_input_builtin_now_rejected_1507` below) -- these
-// three tests now cover what happens once `--jq-extensions` lifts that
-// parse-time gate: dispatch still refuses them with a clear "not supported
-// in yq mode" error rather than silently misbehaving (`input` reporting a
-// spurious "break" on every document instead of only true exhaustion,
-// `inputs` silently producing no output at all) -- restoring the pre-#723
-// "undefined function"-equivalent failure mode for the one case
-// (`--jq-extensions`) where the parser still lets the syntax through.
+// yq mode doesn't have. #1507 moved this rejection from eval.rs's dispatch
+// (which only fired for a *reached* call site -- see the divergence
+// `test_yq_unreached_input_builtin_now_rejected_1507` below used to pin)
+// into the parser's `reject_in_yq_mode`, unconditionally and regardless of
+// `--jq-extensions` (unlike every other jq-only builtin that flag *does*
+// unlock -- these three still need real per-document driver-loop
+// coordination yq mode doesn't have, so the flag would never make them
+// work). These three tests now exercise the parse-time rejection directly
+// (message text carried over verbatim from the original dispatch-time
+// check) rather than the CLI ever reaching evaluation at all.
 
 #[test]
 fn test_yq_input_not_supported_723() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr("input", "a: 1\n", &["--jq-extensions"])?;
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("input", "a: 1\n", &[])?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(
         stderr.contains("input is not supported in yq mode"),
@@ -21734,7 +21731,7 @@ fn test_yq_input_not_supported_723() -> Result<()> {
 
 #[test]
 fn test_yq_inputs_not_supported_723() -> Result<()> {
-    let (_out, stderr, code) = run_yq_stdin_with_stderr("inputs", "a: 1\n", &["--jq-extensions"])?;
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("inputs", "a: 1\n", &[])?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(
         stderr.contains("inputs is not supported in yq mode"),
@@ -21745,8 +21742,7 @@ fn test_yq_inputs_not_supported_723() -> Result<()> {
 
 #[test]
 fn test_yq_input_line_number_not_supported_723() -> Result<()> {
-    let (_out, stderr, code) =
-        run_yq_stdin_with_stderr("input_line_number", "a: 1\n", &["--jq-extensions"])?;
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("input_line_number", "a: 1\n", &[])?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(
         stderr.contains("input_line_number is not supported in yq mode"),
@@ -21755,14 +21751,18 @@ fn test_yq_input_line_number_not_supported_723() -> Result<()> {
     Ok(())
 }
 
-/// #1507: the dispatch-time gate above used to fire too late to catch a call
-/// site that's never reached (`if false then input else . end` used to exit
-/// 0, printing `a: 1`, where real yq's lexer rejects unconditionally). Now
-/// fixed the same way the other ~65 jq-only builtins already are: `input`/
-/// `inputs`/`input_line_number` are gated in the parser behind
-/// `--jq-extensions`, so this shape is rejected before evaluation starts
-/// regardless of whether the branch would ever run, matching real yq's own
-/// unconditional lex-time rejection. See
+/// #1507: the dispatch-time gate these three used to go through only fired
+/// for a call site that's actually *reached* -- `if false then input else .
+/// end` used to exit 0, printing `a: 1`, where real yq's lexer rejects
+/// unconditionally. Fixed by rejecting in the parser instead (`reject_in_yq_mode`),
+/// which runs before evaluation regardless of which branch would ever run,
+/// matching real yq's own unconditional lex-time rejection. Also confirms
+/// this holds under `--jq-extensions` too: an earlier version of this fix
+/// routed these three through the same flag-gated mechanism as every other
+/// jq-only builtin, which reopened this exact divergence one layer down --
+/// the flag let the keyword parse, so the still-reachability-dependent
+/// dispatch-time check went right back to missing the unreached branch.
+/// Rejecting unconditionally, flag or no flag, closes it for good. See
 /// `docs/compliance/yq/limitations.md`.
 #[test]
 fn test_yq_unreached_input_builtin_now_rejected_1507() -> Result<()> {
@@ -21771,13 +21771,33 @@ fn test_yq_unreached_input_builtin_now_rejected_1507() -> Result<()> {
         "if false then inputs else . end",
         "if false then input_line_number else . end",
     ] {
-        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
-        assert_ne!(code, 0, "{filter} should now be rejected");
-        assert!(
-            stderr.contains("--jq-extensions"),
-            "{filter} stderr should mention --jq-extensions, got: {stderr}"
-        );
+        for extra_args in [[].as_slice(), ["--jq-extensions"].as_slice()] {
+            let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", extra_args)?;
+            assert_eq!(code, 1, "{filter} ({extra_args:?}) stderr: {stderr}");
+            assert!(
+                stderr.contains("is not supported in yq mode"),
+                "{filter} ({extra_args:?}) stderr: {stderr}"
+            );
+        }
     }
+    Ok(())
+}
+
+/// Companion to the fix above, for a builtin `--jq-extensions` *does*
+/// unlock: an unreached branch containing one still parses and evaluates
+/// fine once the flag is on, exactly like before `input`/`inputs`/
+/// `input_line_number` needed the stricter, unconditional treatment. Pins
+/// that `reject_in_yq_mode`'s addition didn't change `reject_unless_jq_extensions`'s
+/// own, correctly flag-gated behavior for everything else in that class.
+#[test]
+fn test_yq_unreached_jq_extensions_builtin_still_works_with_flag() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "if false then paths else . end",
+        "a: 1\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a: 1\n");
     Ok(())
 }
 
