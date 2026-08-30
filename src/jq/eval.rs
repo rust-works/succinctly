@@ -930,12 +930,25 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 if matches!(start, None | Some(0)) && end.is_none() {
                     return QueryResult::One(value);
                 }
-                // jq array slicing yields a single sub-array, not a stream of elements
-                let items: Vec<OwnedValue> = slice_elements::<W>(elements, *start, *end)
-                    .iter()
-                    .map(to_owned)
-                    .collect();
-                QueryResult::Owned(OwnedValue::Array(items))
+                // jq array slicing yields a single sub-array, not a stream of
+                // elements. #1932: `promote_borrowed_checked`, not an
+                // unchecked `to_owned` per element -- an undecodable
+                // element's string content must raise `decode_failure`, not
+                // silently become `""` (the same #1755 shape the adjacent
+                // `StandardJson::Object` arm below already guards against;
+                // this arm was apparently missed when #1755 patched that
+                // one). The partial prefix `promote_borrowed_checked`'s
+                // `Err` carries is discarded, not threaded into a `Partial`
+                // result: unlike a fan-out stream, this arm always produces
+                // exactly one aggregate `Array` value, so there is nothing
+                // for a caller to consume before the failure -- matching
+                // the `Object` arm's own `to_owned_checked` call just below,
+                // which discards its own error's prefix the same way.
+                let sliced = slice_elements::<W>(elements, *start, *end);
+                match promote_borrowed_checked(sliced) {
+                    Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
+                    Err((_, e)) => QueryResult::Error(e),
+                }
             }
             // yq treats a null/number/boolean target as an empty container
             // for slicing purposes (#1065, verified live against real yq
@@ -39317,6 +39330,53 @@ mod tests {
             br#"[{"a":2},{"a":1}]"#,
             "max_by(.a)",
             QueryResult::Owned(OwnedValue::Object(_)) => {}
+        );
+    }
+
+    /// #1932: `eval_single`'s `Expr::Slice`/`Expr::SliceNumber` arm, in the
+    /// `StandardJson::Array` case, used an unchecked `to_owned` per element
+    /// instead of `promote_borrowed_checked` -- the same #1755 bug shape
+    /// already fixed for the adjacent `StandardJson::Object` arm a few
+    /// lines below, missed on the array arm at the time. Exercised via
+    /// `eval.rs`'s own library-API dispatch (`query!`), not the CLI, same as
+    /// #1755's sort/unique family above (see that test's own comment) --
+    /// `eval_generic.rs` has no native arm for a bare `Expr::Slice`/
+    /// `Expr::SliceNumber` either, so its own catch-all fallback reaches
+    /// this exact function too, but only *after* first materializing the
+    /// whole target via its own already-checked `to_owned_with_cursor` and
+    /// re-serializing it to fresh JSON bytes (`eval_generic.rs`'s `_ =>` arm
+    /// in its own `eval_single`) -- so any undecodable element in the
+    /// *original* document is already caught upstream of this arm on that
+    /// route, never reaching it with malformed bytes to reproduce the bug.
+    #[test]
+    fn test_array_slice_raises_on_element_decode_failure_1932() {
+        query!(
+            &b"[1,2,\"\xff\xfe\",4]"[..],
+            ".[0:3]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Fails on the second element of the (post-slice) range, not just
+        // the first -- confirms the whole sliced range is checked, not only
+        // the initial element.
+        query!(
+            &b"[1,\"\xff\xfe\",3,4]"[..],
+            ".[0:3]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data through the same arm is unaffected.
+        query!(
+            br#"[1,2,"ok",4]"#,
+            ".[0:3]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(
+                    v,
+                    vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::String("ok".into())]
+                );
+            }
         );
     }
 
