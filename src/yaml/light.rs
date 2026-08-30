@@ -2004,13 +2004,26 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 // occupies the `- ` slot on its own line, but
                                 // that doesn't change how deep its value nests).
                                 //
-                                // #1485: the recursive call's own
-                                // `recursion_base` is this item's *pre-compact*
-                                // `indent`, not `child_indent` -- any further
-                                // nesting inside this element's value steps
-                                // from there, not from its 2-column-wider
-                                // visual column (see `stream_yaml_value`'s own
-                                // doc comment on `recursion_base`).
+                                // #1485 (code review): the recursive call's
+                                // own `recursion_base` is *this invocation's
+                                // own* `recursion_base`, not `indent` --
+                                // forwarded unchanged, not reset to this
+                                // item's own pre-compact position. A stacked
+                                // compact chain (a sequence directly inside
+                                // another compact sequence element, `- - b:
+                                // ...`) must keep propagating the *original*
+                                // pre-compact base all the way down through
+                                // every compact level, or a compact step
+                                // nested inside another compact step
+                                // silently loses it and mis-indents
+                                // everything below (confirmed live against
+                                // yq v4.53.3: `- - b:\n      c:\n        d:
+                                // 1` at `-I=4` needs `c`/`d` at columns
+                                // 8/12, not 6/10 -- an earlier version of
+                                // this fix passed `indent` here, which is
+                                // only correct when this sequence itself was
+                                // never itself compact-positioned, i.e.
+                                // `recursion_base == indent` already).
                                 let child_indent = compact_yaml_indent(indent);
                                 out.write_str(&child_indent)?;
                                 cursor.stream_yaml_value(
@@ -2020,7 +2033,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                     true,
-                                    indent,
+                                    recursion_base,
                                 )?;
                             } else {
                                 out.write_str("- ")?;
@@ -2032,7 +2045,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                     true,
-                                    indent,
+                                    recursion_base,
                                 )?;
                             }
                             write_line_comment(out, cursor.line_comment_raw())?;

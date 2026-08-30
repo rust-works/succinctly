@@ -2727,6 +2727,50 @@ fn test_compact_seq_item_deferred_block_scalar_indent_1485() -> Result<()> {
     Ok(())
 }
 
+/// #1485 (code review regression): a block sequence directly nested inside
+/// *another* compact sequence element (`- - b: ...`) is a *stacked* compact
+/// chain -- the inner sequence's own compact branch must keep forwarding
+/// the outer sequence's true pre-compact `recursion_base` all the way down,
+/// not reset it to its own (already compact-adjusted) `indent`. An earlier
+/// version of this fix did the latter, which happened to still match real
+/// yq at `-I=2`/`-I=4` (where it coincided with the correct value) but
+/// diverged at `-I=5`/`-I=6` -- caught only by probing a range of widths,
+/// not the issue's own single `-I=4` example. Verified live against yq
+/// v4.53.3.
+///
+/// `-I=3` is deliberately not covered here: real yq itself renders this
+/// exact shape inconsistently across indent widths for a stacked compact
+/// chain (non-monotonic in `-I`, confirmed identical in behaviour on
+/// pre-#1485 `main`), so `-I=3` here reproduces a narrow, pre-existing
+/// upstream quirk this fix does not newly introduce -- see
+/// `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_compact_seq_item_stacked_nested_indent_does_not_reset_1485() -> Result<()> {
+    let yaml = "- - b:\n      c:\n        d: 1\n";
+
+    let (streamed_2, code) = run_yq_stdin(".", yaml, &["-I=2"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed_2, "- - b:\n      c:\n        d: 1\n");
+
+    let (streamed_4, code) = run_yq_stdin(".", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed_4, "- - b:\n        c:\n            d: 1\n");
+
+    let (streamed_5, code) = run_yq_stdin(".", yaml, &["-I=5"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed_5, "- - b:\n     c:\n          d: 1\n");
+
+    let (streamed_6, code) = run_yq_stdin(".", yaml, &["-I=6"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed_6, "- - b:\n      c:\n            d: 1\n");
+
+    let (dom, code) = run_yq_stdin(".[0][0].b.c.d = 1", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom, "- - b:\n        c:\n            d: 1\n");
+
+    Ok(())
+}
+
 /// #1486: `-I=1`'s YAML output clamps to the same 2-column step as `-I=2`
 /// in real yq (verified live against v4.53.3, byte-identical at every
 /// level -- mappings, sequences, and compact/anchor-deferred sequence
