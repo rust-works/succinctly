@@ -12,6 +12,8 @@
 #[cfg(not(test))]
 use alloc::boxed::Box;
 #[cfg(not(test))]
+use alloc::collections::BTreeSet;
+#[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
 use alloc::rc::Rc;
@@ -21,6 +23,8 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 #[cfg(not(test))]
 use alloc::vec::Vec;
+#[cfg(test)]
+use std::collections::BTreeSet;
 #[cfg(test)]
 use std::rc::Rc;
 
@@ -1959,7 +1963,40 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// side (no `OwnedValue`/`Vec` payload) -- not a claim that a
 /// container-shaped condition is free.
 fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
+    push_generic_truthiness_cursor_error_memo(c, depth, &mut BTreeSet::new())
+}
+
+/// [`push_generic_truthiness_cursor_error`]'s worker, carrying the set of
+/// node positions already proven clean.
+///
+/// **Without the memo this walk is exponential on an aliased document**
+/// (#1804). A YAML alias makes one node reachable by many paths, so a
+/// billion-laughs shape -- `aN: &aN [*a(N-1), *a(N-1)]` -- has 2^N reachable
+/// nodes while occupying O(N) bytes on disk. Re-walking each reference from
+/// scratch turned a ~450-byte file into 0.4s of work for a two-byte answer,
+/// against real yq's flat 7ms (measured across N=12..20, where succinctly
+/// went 6ms -> 425ms and yq did not move).
+///
+/// Memoizing on `text_position` is sound because this check is a pure
+/// function of the subtree at a node: a position is inserted only on the
+/// path that returns `None`, since any error returns before the recursion
+/// continues -- so "already seen" can only ever mean "already proven
+/// clean". A node with no position is simply never memoized.
+///
+/// The aliases themselves sit at distinct positions and do not collide; what
+/// collides is their *children*, which resolve to the same target node, and
+/// that is where the fan-out is cut.
+fn push_generic_truthiness_cursor_error_memo<C: DocumentCursor>(
+    c: &C,
+    depth: usize,
+    seen: &mut BTreeSet<usize>,
+) -> Option<Control> {
     assert_nesting_depth(depth);
+    if let Some(pos) = c.text_position() {
+        if !seen.insert(pos) {
+            return None;
+        }
+    }
     let value = c.value();
     if let Some(fields) = value.as_object() {
         let mut map: IndexMap<String, ()> = IndexMap::new();
@@ -1974,7 +2011,7 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
                 Err(e) => return Some(Control::Error(e)),
             }
             if let Some(control) =
-                push_generic_truthiness_cursor_error(&field.value_cursor, depth + 1)
+                push_generic_truthiness_cursor_error_memo(&field.value_cursor, depth + 1, seen)
             {
                 return Some(control);
             }
@@ -1987,7 +2024,9 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
     } else if let Some(elements) = value.as_array() {
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            if let Some(control) = push_generic_truthiness_cursor_error(&elem_cursor, depth + 1) {
+            if let Some(control) =
+                push_generic_truthiness_cursor_error_memo(&elem_cursor, depth + 1, seen)
+            {
                 return Some(control);
             }
             elems = rest;

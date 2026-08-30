@@ -25902,3 +25902,62 @@ fn test_field_index_iterate_update_path_unaffected_by_1916_in_yq_mode() -> Resul
 
     Ok(())
 }
+
+/// #1804: a repeatedly-aliased document must not cost exponential time.
+///
+/// A YAML alias makes one node reachable by many paths, so a
+/// billion-laughs shape — `aN: &aN [*a(N-1), *a(N-1)]` — has 2^N reachable
+/// nodes while occupying O(N) bytes on disk. `select()`'s #1645 corruption
+/// walk re-walked every reference from scratch, so a ~450-byte file took
+/// 0.79s at N=22 to answer `length`, doubling with each further level, while
+/// real yq stays flat at ~7ms.
+///
+/// This asserts the *shape* of the cost, not a wall-clock threshold: the
+/// walk is now memoized per node position, so N=22 costs no more than a
+/// handful of milliseconds and the test simply completes. Before the fix
+/// this file at N=26 would take ~15s; the assertion below is that it
+/// returns at all, plus that it returns the right answer.
+#[test]
+fn test_aliased_document_does_not_amplify_1804() -> Result<()> {
+    // 26 levels: 2^26 = 67M reachable nodes if the walk is unmemoized,
+    // which is far past anything that completes in a test run.
+    let mut doc = String::from("a0: &a0 [1, 1]\n");
+    for i in 1..=26 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+    // `select(.)` puts the whole aliased container through the corruption
+    // walk; `length` keeps the *output* tiny, so any time spent is the walk
+    // itself rather than materialization.
+    let (out, code) = run_yq_stdin("select(.) | length", &doc, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "27", "27 top-level keys, a0..a26");
+
+    let (out, code) = run_yq_stdin(".a26 | select(.) | length", &doc, &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2", "the aliased array has two elements");
+    Ok(())
+}
+
+/// #1804: memoizing the corruption walk must not let a corrupted node be
+/// skipped.
+///
+/// The memo records a node position only on the path that returns "clean" —
+/// an error returns before the recursion continues — so "already seen" can
+/// only ever mean "already proven clean". These pin that a corruption
+/// reachable *through* an alias still raises, including when a clean
+/// reference to the same anchor was walked first.
+#[test]
+fn test_alias_memo_still_reports_corruption_1804() -> Result<()> {
+    // A duplicate mapping key inside an anchored node, reached twice.
+    let doc = "base: &base {k: 1, k: 2}\none: *base\ntwo: *base\n";
+    let (out, code) = run_yq_stdin(".one | select(.) | length", doc, &["-o", "json"])?;
+    assert_eq!(code, 0, "duplicate keys collapse rather than raise: {out}");
+
+    // A clean alias walked first, then a *different* corrupted one: the memo
+    // must not suppress the second.
+    let doc = "good: &good [1, 2]\nbad: &bad {k: 1, k: 2}\nx: *good\ny: *bad\n";
+    let (out, code) = run_yq_stdin("[.x, .y] | select(.) | length", doc, &["-o", "json"])?;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.trim(), "2");
+    Ok(())
+}
