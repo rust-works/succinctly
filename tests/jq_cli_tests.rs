@@ -25299,11 +25299,12 @@ fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -
 }
 
 /// #1936 companion: `GenericResult::LazyIndexRange` (`keys`/`keys_unsorted`
-/// on an *array*, not an object) rides the same new `materialize_lazy()`
-/// forcing this fix added, but -- unlike `LazyKeys` -- can never actually
-/// fail (its value is fully described by the array's length alone, #684).
-/// Pins that forcing it through the `?`/`try` boundary is still a no-op for
-/// valid data, on both the array and object shapes.
+/// on an *array*, not an object) needs no arm at all in `try_single_generic`
+/// -- unlike `LazyKeys`, it can never actually fail (its value is fully
+/// described by the array's length alone, #684), so it stays on the
+/// `other => other` wildcard exactly as before this fix. Pins that both it
+/// and the new `LazyKeys` check are still a no-op for valid data, on both
+/// the array and object shapes.
 #[test]
 fn test_optional_and_try_catch_unaffected_by_lazykeys_lazyindexrange_forcing_1936() -> Result<()> {
     for (doc, filter, want) in [
@@ -25324,6 +25325,48 @@ fn test_optional_and_try_catch_unaffected_by_lazykeys_lazyindexrange_forcing_193
             "`{filter}` on `{doc}` -- stderr: {stderr}"
         );
     }
+    Ok(())
+}
+
+/// #1936 review found a related, still-open gap: `try_single_generic`
+/// (fixed above) only covers the *pull*-model `?`/`try`/`catch` dispatch
+/// (reached via plain `eval_single`). `each_try_generic`, the *push*-model
+/// twin reached via `eval_each_generic` for `first`/`limit`, has the
+/// identical bug class -- a lazy `LazyKeys`/`LazySeq` still escapes past a
+/// `?`/`try`/`catch` boundary once it's wrapped in one more layer of
+/// demand-aware consumer, since `eval_each_generic`'s wildcard fallback
+/// forwards the lazy result straight to `sink` unmaterialized. Deliberately
+/// not folded into #1936 (tracked separately as #1948): closing it needs
+/// `eval_each_generic` itself to carry a "must materialize now" signal
+/// through arbitrarily nested push-model consumers, not just a new arm in
+/// `each_try_generic`'s own dispatch. Pinned as a known, documented
+/// divergence (`docs/compliance/jq/limitations.md`) -- if this starts
+/// suppressing/catching correctly, that is a deliberate future fix (closing
+/// #1948), not a regression, and this test should be updated alongside it.
+#[test]
+fn test_first_limit_wrapped_optional_try_catch_still_known_gap_1948() -> Result<()> {
+    // LazyKeys (#1936's own target), one push-model layer further out.
+    for filter in ["first(keys_unsorted?)", r#"first(try (keys) catch "c")"#] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_ne!(code, 0, "`{filter}` should still fail\nstdout: {stdout}");
+        assert!(
+            !stdout.contains('c'),
+            "`{filter}` should not have run the catch handler\nstdout: {stdout}"
+        );
+        assert!(!stderr.is_empty(), "`{filter}` should carry a diagnostic");
+    }
+
+    // LazySeq (#1812's own target), predating #1936 entirely.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"first(try (map(error("x"))) catch "c")"#],
+        Some("[1,2,3]"),
+    )
+    .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0, "should still fail\nstdout: {stdout}");
+    assert!(!stdout.contains('c'), "stdout: {stdout}");
+    assert!(!stderr.is_empty());
+
     Ok(())
 }
 
