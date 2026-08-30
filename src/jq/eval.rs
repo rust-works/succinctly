@@ -15582,13 +15582,71 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
     !is_owned_container(target) && !matches!(target, OwnedValue::Null)
 }
 
-/// Whether writing `path` (a single *resolved* assignment-target path, one
-/// `resolve_dynamic_indexes` entry) into `root` would be real yq's
-/// field/index/iterate scalar-target no-op (#1181): navigating every
-/// component *before* the last reaches a genuine scalar. When true for
-/// every resolved path, real yq discards the RHS/filter entirely rather
-/// than merely skipping the write (#1233, live-verified v4.53.3) --
-/// `eval_assign`'s own caller is what actually skips RHS evaluation; this
+/// The outcome of walking a resolved static path against `set_path`'s own
+/// write semantics, without actually performing the write. Replaces two
+/// independently-hand-synced boolean predicates that used to exist here
+/// (`assign_path_all_noop`/`assign_path_rhs_unused`, and their outer
+/// wrappers, the current [`yq_assign_is_total_noop`]/[`yq_assign_rhs_unused`])
+/// -- #1920 review (round 2) found the split cost a full second tree-walk
+/// on every non-total-noop yq-mode assignment, and risked exactly the
+/// "duplicated predicates diverge silently" failure this codebase has
+/// already hit once (#106): the two boolean walks were near-identical
+/// copies whose *only* intentional difference (an `Expr::Iterate` reaching
+/// `Null`) had to be applied by hand to one and not the other. One walk
+/// producing a 3-way answer removes that risk structurally instead of by
+/// doc-comment discipline; the two outer functions are now thin wrappers
+/// over [`yq_assign_classify`], keeping their own names/signatures
+/// unchanged so every existing cross-reference to them elsewhere in this
+/// file stays accurate.
+enum PathAssignOutcome {
+    /// Every write this path reaches is a no-op: the document doesn't
+    /// change at all.
+    TotalNoop,
+    /// Not a total no-op (the document does change), but the RHS value is
+    /// never actually read anywhere along it -- a mid-chain `Iterate`
+    /// autovivifying `Null` into an empty array, most commonly (#1857).
+    RhsUnusedButChanges,
+    /// A real, RHS-dependent write happens somewhere along this path.
+    NeedsRhs,
+}
+
+impl PathAssignOutcome {
+    fn is_total_noop(&self) -> bool {
+        matches!(self, Self::TotalNoop)
+    }
+
+    fn rhs_unused(&self) -> bool {
+        !matches!(self, Self::NeedsRhs)
+    }
+}
+
+fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
+    yq_assign_classify(path, root).is_total_noop()
+}
+
+/// [`yq_assign_is_total_noop`]'s twin for the narrower #1857 gap -- see
+/// [`PathAssignOutcome`]'s own doc comment for why both are now thin
+/// wrappers over one shared walk rather than independent ones.
+///
+/// Deliberately does **not** cover a *terminal* `Iterate` (`.a[] = v`, the
+/// `Iterate` itself is `last`, stripped into the flattened `prefix` before
+/// [`classify_yq_assign_prefix`] is ever reached) reaching an already-empty
+/// container or `Null` -- that shape needs the terminal step's own type
+/// available at the point its target is examined, which this prefix-only
+/// design structurally can't see (same reason the total-noop check never
+/// covered it either). Filed separately as #1921 rather than folded in
+/// here.
+fn yq_assign_rhs_unused(path: &Expr, root: &OwnedValue) -> bool {
+    yq_assign_classify(path, root).rhs_unused()
+}
+
+/// Shared implementation behind [`yq_assign_is_total_noop`] and
+/// [`yq_assign_rhs_unused`]: whether writing `path` (a single *resolved*
+/// assignment-target path, one `resolve_dynamic_indexes` entry) into `root`
+/// is a total no-op, RHS-unused-but-changing, or a real RHS-dependent write
+/// (#1181/#1233/#1857 -- see [`PathAssignOutcome`]'s own doc comment for
+/// the three-way split's own history). `eval_assign`'s own caller is what
+/// actually skips RHS evaluation on `TotalNoop`/`RhsUnusedButChanges`; this
 /// only answers the per-path question.
 ///
 /// `path` is flattened via [`push_path_components`] first -- the same
@@ -15619,14 +15677,35 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
 /// so `.[] = v` stays `Expr::Iterate` verbatim, same as `.a`/`.a.b` stay
 /// `Expr::Field`. Treated identically to a terminal `Field`/`Index` here,
 /// matching `set_path`'s own `Expr::Iterate` arm, which applies the
-/// identical `is_yq_field_index_noop_scalar` check for exactly this case.
-fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
+/// identical `is_yq_field_index_noop_scalar` check for exactly this case
+/// -- and, per [`classify_yq_assign_prefix`]'s own scope, only for a
+/// *mid-chain* `Iterate`: `last` itself is stripped off into `prefix`
+/// below before that function ever runs, so a *terminal* `Iterate` never
+/// reaches this classification at all (#1921).
+///
+/// Applies every gate needed before delegating to
+/// [`classify_yq_assign_prefix`] for the actual walk: the empty-flattened-
+/// list bail (bare `Expr::Identity`, `. = v` -- a direct overwrite, not
+/// indexing into anything), the slice-anywhere exclusion (`.[0:1] = v`'s
+/// own no-op, #1101/#1116, only ever skips the *write*, not the RHS --
+/// `.[0:1] = error("boom")` still genuinely errors, confirmed live and
+/// pinned by `test_slice_assign_scalar_noop_still_propagates_rhs_errors_1101`
+/// -- so a slice anywhere in the chain must never reach this fast path),
+/// and a defensive terminal-shape check (not currently reachable: every
+/// leaf `push_path_components` can push is one of `needs_path_prepass`'s
+/// own static-classified variants, and the slice check above already
+/// excludes `Slice`/`SliceNumber`, so by this point `last` can only be
+/// `Field`/`Index`/`IndexNumber`/`Iterate` -- confirmed via patch-coverage
+/// output, not just assumed; kept as the one thing standing between a
+/// future new static-classified `Expr` variant and this function silently
+/// treating an unrelated shape as a valid no-op terminal).
+fn yq_assign_classify(path: &Expr, root: &OwnedValue) -> PathAssignOutcome {
     let mut flat = Vec::new();
     push_path_components(&mut flat, path);
     // An empty flattened list is bare `Expr::Identity` (`. = v`) -- a
     // direct overwrite, not indexing into anything.
     let Some((last, prefix)) = flat.split_last() else {
-        return false;
+        return PathAssignOutcome::NeedsRhs;
     };
     // Deliberately excludes a path whose terminal component is a slice --
     // `.[0:1] = v`'s own no-op (#1101/#1116) only ever skips the *write*,
@@ -15635,7 +15714,7 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
     // `test_slice_assign_scalar_noop_still_propagates_rhs_errors_1101`) --
     // so a slice anywhere in the chain must never reach this fast path.
     if flat.iter().any(|e| unwrap_path_component(e).0.is_slice()) {
-        return false;
+        return PathAssignOutcome::NeedsRhs;
     }
     // Defensive, not currently reachable: every leaf `push_path_components`
     // can push here is one of `needs_path_prepass`'s own static-classified
@@ -15655,182 +15734,96 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
         unwrap_path_component(last).0,
         Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate
     ) {
-        return false;
+        return PathAssignOutcome::NeedsRhs;
     }
-    assign_path_all_noop(root, prefix)
+    classify_yq_assign_prefix(root, prefix)
 }
 
-/// [`yq_assign_is_total_noop`]'s twin for the narrower #1857 gap: a path is
-/// not a *total* no-op (the document does change) but still never actually
-/// reads the RHS value, because every write it reaches is either already a
-/// no-op (`assign_path_all_noop`'s own shape) or a *mid-chain* `Iterate`
-/// that autovivifies `Null` into an empty array -- zero elements, so
-/// whatever `set_path` gets handed as the value is never written anywhere.
-/// Shares every gate `yq_assign_is_total_noop` has (empty-flattened-list
-/// bail, slice-anywhere exclusion, terminal-shape check) since none of that
-/// reasoning changes here -- only the final predicate call differs.
-///
-/// Deliberately does **not** cover a *terminal* `Iterate` (`.a[] = v`, the
-/// `Iterate` itself is `last`, stripped into the caller's own `prefix`
-/// before this is ever reached) reaching an already-empty container or
-/// `Null` -- that shape needs the terminal step's own type available at the
-/// point its target is examined, which this prefix-only design structurally
-/// can't see (same reason `assign_path_all_noop` never covered it either).
-/// Filed separately as #1921 rather than folded in here.
-fn yq_assign_rhs_unused(path: &Expr, root: &OwnedValue) -> bool {
-    let mut flat = Vec::new();
-    push_path_components(&mut flat, path);
-    let Some((last, prefix)) = flat.split_last() else {
-        return false;
-    };
-    if flat.iter().any(|e| unwrap_path_component(e).0.is_slice()) {
-        return false;
-    }
-    if !matches!(
-        unwrap_path_component(last).0,
-        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate
-    ) {
-        return false;
-    }
-    assign_path_rhs_unused(root, prefix)
-}
-
-/// [`assign_path_all_noop`]'s twin for [`yq_assign_rhs_unused`]: same
-/// Field/Index/Iterate walk, but an `Expr::Iterate` reaching `Null`
-/// answers `true` here (RHS never read) where `assign_path_all_noop`
-/// answers `false` (document changes, so not a total no-op) -- `Null`
-/// autovivifies to `[]`, and iterating zero elements is vacuously true
-/// regardless of what `rest` still has left to say, exactly like the
-/// existing empty-`Array`/`Object` arms just below it. Every other arm is
-/// unchanged from `assign_path_all_noop`, including its own base case:
-/// `is_yq_field_index_noop_scalar` already answers "RHS unused" for a
-/// true no-op, which is a subset of what this function reports.
-fn assign_path_rhs_unused(current: &OwnedValue, steps: &[Expr]) -> bool {
-    let (step, rest) = match steps.split_first() {
-        None => return is_yq_field_index_noop_scalar(current),
-        Some(pair) => pair,
-    };
-    let (step, _optional) = unwrap_path_component(step);
-    match step {
-        Expr::Field(name) => match current {
-            OwnedValue::Object(map) => match map.get(name) {
-                Some(v) => assign_path_rhs_unused(v, rest),
-                None => false,
-            },
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
-        },
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
-            OwnedValue::Array(arr) => {
-                let len = arr.len() as i64;
-                let actual = if *idx < 0 { len + idx } else { *idx };
-                if actual >= 0 && (actual as usize) < arr.len() {
-                    assign_path_rhs_unused(&arr[actual as usize], rest)
-                } else {
-                    false
-                }
-            }
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
-        },
-        Expr::Iterate => match current {
-            OwnedValue::Array(arr) => arr.iter().all(|elem| assign_path_rhs_unused(elem, rest)),
-            OwnedValue::Object(map) => map.values().all(|elem| assign_path_rhs_unused(elem, rest)),
-            // Autovivifies to `[]` -- zero elements, so `rest` is never
-            // actually applied to anything, whatever it still contains.
-            OwnedValue::Null => true,
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Whether writing through `steps` (a `yq_assign_is_total_noop` prefix --
-/// its own flattened path minus the terminal component) into `current` is
-/// a total no-op. Subsumes `navigate_read_only`'s three-way
-/// `Resolved`/`HitScalar`/`Absent` outcome as its own base case (`steps`
-/// exhausted -- `current` is the terminal component's parent, so
-/// `is_yq_field_index_noop_scalar` decides exactly as it always did) but
-/// additionally recurses into `.iter().all(...)`/`.values().all(...)`
-/// whenever a mid-chain `Expr::Iterate` fans into a real `Array`/`Object`,
-/// instead of `navigate_read_only`'s own unconditional `Absent` for that
-/// case (#1432) -- a read-only, non-mutating dry run of
+/// Whether writing through `steps` (a `yq_assign_classify` prefix -- its
+/// own flattened path minus the terminal component) into `current` is a
+/// total no-op, RHS-unused-but-changing, or a real RHS-dependent write.
+/// Subsumes `navigate_read_only`'s three-way `Resolved`/`HitScalar`/
+/// `Absent` outcome as its own base case (`steps` exhausted -- `current` is
+/// the terminal component's parent, so `is_yq_field_index_noop_scalar`
+/// decides exactly as it always did) but additionally recurses into
+/// `Array`/`Object` elements whenever a mid-chain `Expr::Iterate` fans into
+/// a real container, instead of `navigate_read_only`'s own unconditional
+/// `Absent` for that case (#1432) -- a read-only, non-mutating dry run of
 /// `set_path_through_iterate`'s own per-element recursion, restricted to
 /// the `Field`/`Index`/`IndexNumber`/`Iterate` step vocabulary that's all
-/// `yq_assign_is_total_noop`'s caller ever hands it (its own slice check
-/// already excludes anything else before this is reached). Vacuously true
-/// whenever a fanned-into container is empty -- `set_path_through_iterate`
-/// itself does nothing when there are no elements to iterate. Live-verified
-/// against yq v4.53.3: `a: []`/`a: {}` (empty), `a: [1, 2]`/`a: {x: 1, y:
-/// 1}` (all-scalar), and a nested `a: [[1,2],[3]]` under `.a[][].b` all
-/// agree with the oracle in both directions (RHS discarded and the final
-/// document byte-identical to a safe, always-evaluated RHS), while a
-/// single non-scalar element anywhere in the fan-out (`a: [1, {}]`) still
-/// correctly evaluates the RHS.
-///
-/// Deliberately excludes `Null`: real yq's `.a[].b = v` on `a: null`
-/// autovivifies `null` to `[]` as part of the write itself (confirmed live
-/// -- and confirmed already correct on this codebase's own write path
-/// too, independent of this predicate: a safe, non-erroring RHS,
+/// `yq_assign_classify`'s own slice/terminal-shape gates ever let through.
+/// `TotalNoop` whenever a fanned-into container is empty --
+/// `set_path_through_iterate` itself does nothing when there are no
+/// elements to iterate -- and `RhsUnusedButChanges` (not `TotalNoop`)
+/// whenever a mid-chain `Iterate` reaches `Null`: real yq's `.a[].b = v` on
+/// `a: null` autovivifies `null` to `[]` as part of the write itself
+/// (confirmed live, and confirmed already correct on this codebase's own
+/// write path too, independent of this walk: a safe, non-erroring RHS,
 /// `yq '.a[].b = 5'` on `a: null`, already produces `a: []` here exactly
-/// like the oracle). So `Null` is not a *total* no-op the way an empty or
-/// all-scalar container is -- the document still changes -- but the
-/// reason this predicate can't simply report it as one isn't a write bug:
-/// it's that this predicate's only caller (`yq_assign_noop_check`) has an
-/// all-or-nothing `Skip`/`Continue` split, and `Skip` means "return the
-/// *unmodified* pristine document, evaluate nothing at all." Reporting
-/// `Null` as a no-op here would route through `Skip` and discard the
-/// legitimate `null` -> `[]` write that already happens correctly on the
-/// normal `Continue` path -- there is no way to express "skip the RHS,
-/// but still perform the write" through this predicate's boolean answer
-/// alone. That narrower gap (the RHS still evaluates eagerly for `Null`
-/// reached via a *mid-chain* `Iterate`, where real yq's own equivalent
-/// write never needs it) was filed as #1857 and is now handled by this
-/// function's own twin, [`assign_path_rhs_unused`], through the separate
-/// `yq_assign_noop_check` branch that calls it -- see that function's doc
-/// comment. A *terminal* `Iterate` reaching `Null` (`.a[] = v` with no
-/// further path after it) is a different, still-open case neither twin
-/// covers -- filed as #1921 for that shape.
-fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
+/// like the oracle) -- so the document does change, but the RHS this
+/// autovivify-only write receives is never actually read (#1857, zero
+/// elements to write into). `NeedsRhs` for a *terminal* `Iterate` (`.a[] =
+/// v`, no further steps) reaching an already-empty container or `Null` is
+/// a separate, still-open gap this walk doesn't attempt: a terminal
+/// `Iterate`'s own semantics (overwrite every real element, regardless of
+/// its type) genuinely differ from a mid-chain one's, and the terminal
+/// step is stripped into `yq_assign_classify`'s own `prefix` before this
+/// function ever sees it -- filed as #1921. Live-verified against yq
+/// v4.53.3 for every other case: `a: []`/`a: {}` (empty), `a: [1, 2]`/`a:
+/// {x: 1, y: 1}` (all-scalar), `a: null` under a mid-chain `Iterate`, and a
+/// nested `a: [[1,2],[3]]` under `.a[][].b` all agree with the oracle in
+/// both directions (RHS discarded and the final document byte-identical to
+/// a safe, always-evaluated RHS), while a single non-scalar element
+/// anywhere in the fan-out (`a: [1, {}]`) still correctly needs the RHS.
+fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssignOutcome {
     let (step, rest) = match steps.split_first() {
-        None => return is_yq_field_index_noop_scalar(current),
+        None => {
+            return if is_yq_field_index_noop_scalar(current) {
+                PathAssignOutcome::TotalNoop
+            } else {
+                PathAssignOutcome::NeedsRhs
+            };
+        }
         Some(pair) => pair,
     };
     let (step, _optional) = unwrap_path_component(step);
     match step {
         Expr::Field(name) => match current {
             OwnedValue::Object(map) => match map.get(name) {
-                Some(v) => assign_path_all_noop(v, rest),
-                None => false,
+                Some(v) => classify_yq_assign_prefix(v, rest),
+                None => PathAssignOutcome::NeedsRhs,
             },
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
+            _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
+            _ => PathAssignOutcome::NeedsRhs,
         },
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
             OwnedValue::Array(arr) => {
                 let len = arr.len() as i64;
                 let actual = if *idx < 0 { len + idx } else { *idx };
                 if actual >= 0 && (actual as usize) < arr.len() {
-                    assign_path_all_noop(&arr[actual as usize], rest)
+                    classify_yq_assign_prefix(&arr[actual as usize], rest)
                 } else {
-                    false
+                    PathAssignOutcome::NeedsRhs
                 }
             }
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
+            _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
+            _ => PathAssignOutcome::NeedsRhs,
         },
         Expr::Iterate => match current {
-            OwnedValue::Array(arr) => arr.iter().all(|elem| assign_path_all_noop(elem, rest)),
-            OwnedValue::Object(map) => map.values().all(|elem| assign_path_all_noop(elem, rest)),
-            // Not `Null` -- reporting a no-op here would route through
-            // `Skip` and discard `Null`'s own legitimate autovivify write
-            // (see this function's own doc comment, #1857).
-            _ if is_yq_field_index_noop_scalar(current) => true,
-            _ => false,
+            OwnedValue::Array(arr) => classify_yq_assign_fanout(arr.iter(), rest),
+            OwnedValue::Object(map) => classify_yq_assign_fanout(map.values(), rest),
+            // Autovivifies to `[]` -- zero elements, so `rest` is never
+            // actually applied to anything, whatever it still contains.
+            // Changes the document (`Null` -> `[]`), so not `TotalNoop`,
+            // but the RHS is never read either way -- see this function's
+            // own doc comment for why that's `RhsUnusedButChanges`, not
+            // `TotalNoop`.
+            OwnedValue::Null => PathAssignOutcome::RhsUnusedButChanges,
+            _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
+            _ => PathAssignOutcome::NeedsRhs,
         },
         // Defensive, not currently reachable: `steps` only ever contains
-        // `yq_assign_is_total_noop`'s own flattened `prefix`, whose every
+        // `yq_assign_classify`'s own flattened `prefix`, whose every
         // component is already provably one of `Field`/`Index`/
         // `IndexNumber`/`Iterate` by the time it reaches here -- see that
         // function's own identical "Defensive, not currently reachable"
@@ -15839,7 +15832,34 @@ fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
         // fires). Kept for the same reason: the one thing standing between
         // a future new static-classified `Expr` variant and this function
         // silently mishandling it instead of falling to a safe default.
-        _ => false,
+        _ => PathAssignOutcome::NeedsRhs,
+    }
+}
+
+/// The `Expr::Iterate` fan-out shared by both `Array`/`Object` arms of
+/// [`classify_yq_assign_prefix`]: walks every element once, short-circuits
+/// the instant any one needs the RHS for real (matching the old
+/// `.all()`-based walks' own short-circuit), and otherwise aggregates
+/// `TotalNoop`/`RhsUnusedButChanges` across all of them -- `TotalNoop` only
+/// if every element was (vacuously true for zero elements, matching
+/// `set_path_through_iterate`'s own no-op-on-empty behavior), the wider
+/// `RhsUnusedButChanges` as soon as even one element autovivified.
+fn classify_yq_assign_fanout<'a>(
+    elements: impl Iterator<Item = &'a OwnedValue>,
+    rest: &[Expr],
+) -> PathAssignOutcome {
+    let mut any_change = false;
+    for elem in elements {
+        match classify_yq_assign_prefix(elem, rest) {
+            PathAssignOutcome::TotalNoop => {}
+            PathAssignOutcome::RhsUnusedButChanges => any_change = true,
+            PathAssignOutcome::NeedsRhs => return PathAssignOutcome::NeedsRhs,
+        }
+    }
+    if any_change {
+        PathAssignOutcome::RhsUnusedButChanges
+    } else {
+        PathAssignOutcome::TotalNoop
     }
 }
 
@@ -16109,7 +16129,7 @@ enum PrefixNavOutcome {
     /// Every prefix step navigated an existing value. Carries no payload:
     /// `yq_assign_is_total_noop` used to read the resolved parent off this
     /// variant for its own terminal scalar check, but that check now lives
-    /// inside `assign_path_all_noop`'s own base case (#1432), so the only
+    /// inside `classify_yq_assign_prefix`'s own base case (#1432), so the only
     /// remaining reader (`yq_del_slice_outcome`) only ever matches the
     /// variant itself via `matches!(..., Resolved(_))`.
     Resolved,
@@ -16528,8 +16548,11 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
 /// internally consistent reading of that same premise.
 ///
 /// `None` means "doesn't apply" for any reason (jq mode, a dynamic path, a
-/// resolve error, or a path that isn't a total no-op) -- the caller falls
-/// through to its own unchanged RHS-evaluation flow either way.
+/// resolve error, or a path where the RHS is genuinely needed -- either a
+/// total no-op, per this function's own name, or (#1857) a path that
+/// changes the document but never reads the RHS, both routed through
+/// `YqAssignNoopCheck::Skip`) -- the caller falls through to its own
+/// unchanged RHS-evaluation flow either way.
 fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: &StandardJson<'_, W>,
