@@ -16990,6 +16990,58 @@ fn set_path(
                     ),
                 }
             } else if let Some(split) = split_at_slice(exprs) {
+                // #1428, the slice twin of the `split_at_iterate` guard above.
+                // A slice write on a missing parent usually *does* write
+                // (`null | .a[0:1] = [9]` is `{"a":[9]}`), which is why this
+                // arm was originally left alone -- but a slice can also be a
+                // read-through step whose own tail declines to write
+                // (`null | .a[0:1][]? = 9`), and then the `.a` built to reach
+                // it is stranded exactly as before.
+                //
+                // No `reaches_iterate` test is needed here: `through_slice`'s
+                // `Null` arm returns `Ok` with the probe still `Null` only
+                // when nothing was written at all, and a terminal slice
+                // assignment of `null` raises rather than landing there. So
+                // "the probe is still `Null`" is an exact reading on this
+                // path.
+                //
+                // jq mode only (`container_noop` is `S::TAG == EvalTag::Yq`
+                // at every call site, the same reading `through_slice`'s own
+                // `Null` arm relies on). Real yq keeps the chain here even
+                // though its container no-op discards the write itself:
+                // `null | .a[0:1] = 9` is `a: null` in yq v4.53.3, so the
+                // probe -- which sees only that nothing was written -- would
+                // wrongly skip creating `.a`.
+                let mut would_create = false;
+                if !container_noop
+                    && get_path_mut(root, &split.before, scalar_noop, false, &mut would_create)?
+                        .is_none()
+                    && would_create
+                    && !tail_writes_from_fresh_parent(|probe| {
+                        through_slice(
+                            probe,
+                            split.start,
+                            split.end,
+                            SliceEditFlags {
+                                optional: split.optional,
+                                scalar_noop,
+                                container_noop,
+                                terminal_write: matches!(split.tail, Expr::Identity),
+                            },
+                            |sub| {
+                                set_path(
+                                    sub,
+                                    &split.tail,
+                                    new_value.clone(),
+                                    scalar_noop,
+                                    container_noop,
+                                )
+                            },
+                        )
+                    })?
+                {
+                    return Ok(());
+                }
                 match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
                     None => Ok(()),
                     Some(parent) => through_slice(
