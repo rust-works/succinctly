@@ -1424,6 +1424,20 @@ $ printf '[1,,3]' | succinctly jq -c 'first(.[])'   # 1, exit 0    (malformed co
 $ printf '[1,,3]' | succinctly jq -c '.[]'          # error, exit 5 (unaffected -- always exhausts)
 ```
 
+A bound *larger* than what the array can supply before the defect still reaches it, and
+still streams whatever was already confirmed good first — the same shape the
+`keys_unsorted[]` entry above already documents for `limit(2; keys_unsorted[])`:
+
+```
+$ printf '[1,2,,4]' | succinctly jq -c 'limit(3;.[])'   # 1, 2, then error, exit 5
+```
+
+This is not a separate divergence from the one above — it is the same "only checked as
+far as the sink actually pulled" rule, just landing on a bound the sink *did* need rather
+than one it stopped short of. The `keys_unsorted[]` entry's own `limit(2; ...)` example
+already established this exact shape for objects; this is its array counterpart, not a new
+kind of gap.
+
 Deliberate, for the same reason the two divergences above are: restoring the check here
 would mean walking past the point the demand-aware sink stopped, defeating the reason
 `each_lazy_array_iterate_sink` exists rather than routing through the always-eager
@@ -1431,6 +1445,13 @@ would mean walking past the point the demand-aware sink stopped, defeating the r
 over an object still takes the original eager path (`.[]`'s duplicate-key collapse
 semantics need `DistinctKeyCursors`'s streaming-collapse machinery extended to also carry
 value cursors, deferred as separate, larger remaining scope on #1597).
+
+Format-generic, not jq-mode-specific: `each_lazy_array_iterate_sink` takes no
+`S: EvalSemantics` and is reached identically via `succinctly yq`. Currently inert for
+YAML, though — every YAML cursor's `preceding_delimiter_ok` uses the trait default (always
+`true`), since YAML's own parser validates delimiters while parsing rather than deferring
+to this evaluator-level check the way JSON's semi-index does — so there is no YAML input
+this gap check can actually catch or skip either way, today.
 
 ## `limit`'s own `n` argument is not demand-aware when it is itself a generator
 

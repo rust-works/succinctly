@@ -23463,9 +23463,47 @@ fn test_array_iterate_lazy_skips_later_malformed_comma_1597() -> Result<()> {
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
 
     // Plain `.[]` (no truncation) still walks the whole array and always
-    // catches it, unaffected by this change.
+    // catches it, unaffected by this change -- and produces no output at
+    // all, not just a nonzero exit, since it never routes through the new
+    // lazy arm in the first place (`evaluate_bytes_lazy`'s bare `.[]` path
+    // calls `eval_single` directly). Asserting `stdout` too, not just
+    // `code`, so this stays a real regression guard if a future change
+    // ever does route a top-level bare `.[]` through `eval_each_generic`.
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1,,3]"))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1597 code review: `limit`/`first` *reaching into* a malformed comma
+/// while trying to satisfy a bound greater than what the array can supply
+/// still streams whatever was already confirmed good before erroring --
+/// unlike `test_array_iterate_lazy_skips_later_malformed_comma_1597` above
+/// (which never needed the defective element at all), `limit(3; .[])` on
+/// `[1,2,,4]` *did* want a 3rd element, and discovering the defect while
+/// trying to produce it happens only after 1 and 2 have already been sunk.
+///
+/// This is not a new class of divergence: it is the array counterpart of
+/// the already-shipped, already-tested `keys_unsorted[]` behavior
+/// (`test_jq_keys_unsorted_demand_aware_raises_on_pulled_malformed_key_1770`'s
+/// `limit(2; keys_unsorted[])` case, which streams `"a"` before erroring on
+/// a malformed key past it the same way). Pinning it explicitly here so a
+/// future reviewer sees it as a deliberate, precedented decision rather
+/// than an unexamined side effect of #1597's own laziness.
+#[test]
+fn test_array_iterate_lazy_limit_streams_confirmed_prefix_before_reaching_malformed_comma_1597(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "limit(3;.[])"], Some("[1,2,,4]"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n2\n");
+
+    // Control: a well-formed array satisfies the same bound cleanly.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "limit(3;.[])"], Some("[1,2,3,4]"))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("1\n2\n3\n", 0),
+        "stderr: {stderr}"
+    );
 
     Ok(())
 }
