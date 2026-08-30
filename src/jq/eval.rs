@@ -25421,32 +25421,35 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// trailing error/break behind values already produced (#855). Same fix
 /// [`eval_slice_bound`] already applies to slice bounds.
 ///
-/// #1559 (code review): a `QueryResult::Partial`'s own trailing `Control`
-/// must propagate here too, same as `eval_owned_expr_opt` above -- live
-/// testing found the sole caller's root pre-check *did* reproduce this for a
-/// root with no non-root paths to independently re-check it (`1 |
-/// [paths(true, error("boom"))]` silently returned `[]` instead of raising,
-/// where jq 1.7.1 raises `boom`); an earlier draft of this fix wrongly
-/// concluded the caller was unaffected based on a probe (`[1] | ...`) whose
-/// one non-root path happened to mask the root-level bug.
+/// #1559 (code review): a thin wrapper over [`eval_owned_expr_opt`] rather
+/// than its own copy of that function's "propagate a `QueryResult::Partial`'s
+/// trailing `Control`" match -- the sole caller (`each_paths_filter`'s root
+/// pre-check) *did* have this bug: live testing found a root with no
+/// non-root paths to independently re-check it (`1 | [paths(true,
+/// error("boom"))]`) silently returned `[]` instead of raising, where jq
+/// 1.7.1 raises `boom`. Converging on one implementation instead of two
+/// keeps that fix (and its own doc comment) in exactly one place; `Control`
+/// and `EvalEscape` already convert losslessly both ways (`error.rs`), so
+/// nothing is lost collapsing `EvalEscape` back to `Control` here.
 fn eval_owned_expr_ctrl<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, Control> {
-    match eval_owned_expr_ctrl_full::<S>(expr, input, optional)? {
-        (v, None) => Ok(v),
-        (_, Some(control)) => Err(control),
-    }
+    eval_owned_expr_opt::<S>(expr, input, optional)
+        .map(|opt| opt.unwrap_or(OwnedValue::Null))
+        .map_err(Control::from)
 }
 
 /// Like [`eval_owned_expr_ctrl`], but also returns whether the result
 /// carried a trailing [`Control`] after its first/only value -- a
-/// `QueryResult::Partial`'s own control, which the plain version silently
-/// drops (#1164). See [`result_to_owned_ctrl`]'s doc comment for the
-/// live-verified jq semantics this preserves for a caller that can re-wrap
-/// its own successful final result via [`partial`]/[`finish_result`] when
-/// this is `Some`.
+/// `QueryResult::Partial`'s own control, which `eval_owned_expr_ctrl` (#1559)
+/// now propagates as an `Err` rather than dropping; this function keeps it
+/// distinguishable instead, for a caller (`builtin_envvar`) that needs to
+/// inspect it itself rather than have it auto-converted. See
+/// [`result_to_owned_ctrl`]'s doc comment for the live-verified jq semantics
+/// this preserves for a caller that can re-wrap its own successful final
+/// result via [`partial`]/[`finish_result`] when this is `Some`.
 ///
 /// A thin wrapper over [`eval_owned_expr_full`]: this function's own
 /// contract is "callers need exactly one owned value", so a genuinely empty
@@ -63300,6 +63303,19 @@ mod tests {
         let expr = parse("(1, halt)").unwrap();
         match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, false) {
             Err(EvalEscape::Halt(0)) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        // #1559 (code review): `optional: true` catches the trailing error
+        // *upstream* of this function, inside `eval_single`'s own Comma
+        // dispatch (matching real jq: `jq -cn '(1, error("boom"))?'` is `1`,
+        // confirmed live) -- `eval_owned_expr_full` never even sees a
+        // `Partial` here, since the interior error was already caught before
+        // reaching it. Pins that this function's own new match arms don't
+        // additionally interfere with (or duplicate) that upstream catch.
+        let expr = parse("(1, error(\"boom\"))").unwrap();
+        match eval_owned_expr_opt::<JqSemantics>(&expr, &OwnedValue::Null, true) {
+            Ok(Some(v)) => assert_eq!(v.to_json(), "1"),
             other => panic!("unexpected result: {other:?}"),
         }
     }

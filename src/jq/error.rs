@@ -146,12 +146,13 @@ pub enum Control {
 /// precedent: a `_ctrl`-suffixed twin that preserves [`Control`] losslessly
 /// exists at the few call sites that need it). One shape is still open,
 /// though: when the argument generator produces one or more values *before*
-/// breaking/erroring (`QueryResult::Partial`), `result_to_owned` and
-/// `eval_owned_expr_ctrl` both still silently take the first value and drop
-/// the trailing escape — tracked as #1164, since fixing it means every
-/// caller becoming `Partial`-aware itself, not something these two
-/// functions can solve alone; see their own `Partial(vs, _control)` arms in
-/// `eval.rs` for the full rationale.
+/// breaking/erroring (`QueryResult::Partial`), `result_to_owned` still
+/// silently takes the first value and drops the trailing escape — tracked as
+/// #1164, since fixing it means every caller becoming `Partial`-aware itself,
+/// not something this function can solve alone; see its own
+/// `Partial(vs, _control)` arm in `eval.rs` for the full rationale.
+/// `eval_owned_expr_ctrl` used to share this gap too, but #1559 fixed it to
+/// propagate the trailing escape as its own `Err` instead.
 ///
 /// Consumers should write `Err(EvalEscape::Error(e))` for the catchable case
 /// and let everything else flow through the `From` conversions into
