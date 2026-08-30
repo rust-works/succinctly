@@ -26892,98 +26892,68 @@ fn test_seq_value_error_location_marker_1723() -> Result<()> {
     Ok(())
 }
 
-/// #1723: a `--seq` record that is well-formed up to a malformed *suffix*
-/// still yields the values real jq managed to read.
+/// #1723: `--seq` must never emit a value real jq does not.
 ///
-/// Previously the whole record was dropped, so `\x1e1 {invalid` printed
-/// nothing where jq prints `1`. Three oracle-derived rules together
-/// reproduce every shape found:
+/// #1914 taught the record reader to split a record into several values,
+/// which is right for a cleanly separated record but wrong the moment tokens
+/// are *adjacent*: a scanner splits `1-2` into `1` and `-2`, while jq lexes
+/// it as one malformed number and prints nothing. That shipped, and it made
+/// `succinctly jq --seq` **fabricate output** on 205 of 1500 randomly
+/// generated records.
 ///
-/// 1. A token that *scans* is validated and dropped if invalid -- never
-///    resynced into. `{"a":1 xyz}` scans as one token (braces match), so jq
-///    emits nothing rather than picking the `"a"` out of its middle.
-/// 2. An **unterminated** `"`/`{`/`[` swallows the rest of the record;
-///    other junk resyncs -- structural punctuation by one byte, a bad token
-///    up to the next whitespace (so `-e5 7` is `7`, not `5` and `7`).
-/// 3. A number is complete only when whitespace follows it.
+/// A first attempt at this issue tried to imitate jq's resync instead
+/// (emit the prefix, skip the bad token, continue) and fabricated *more*,
+/// because jq's `--seq` reader is a streaming lexer/parser with error
+/// recovery and a token scanner cannot imitate one. Requiring whitespace
+/// after every token is what makes fabrication structurally impossible: the
+/// adjacency a scanner mis-splits is exactly what is now rejected.
+///
+/// Each row here emits nothing, matching jq. Before this fix every one of
+/// them emitted values.
 #[test]
-fn test_seq_malformed_suffix_keeps_the_prefix_1723() -> Result<()> {
-    for (input, expected, why) in [
+fn test_seq_adjacent_tokens_never_fabricate_1723() -> Result<()> {
+    for (input, why) in [
+        ("\x1e1-2\n", "one malformed number, not `1` and `-2`"),
+        ("\x1e1null\n", "not `1` and `null`"),
+        ("\x1e12true\n", "not `12` and `true`"),
+        ("\x1etrue1\n", "not `true` and `1`"),
         (
-            "\x1e1 {invalid\n",
-            "1\n",
-            "values before the malformed suffix survive",
+            "\x1e5-3 7\n",
+            "must not print `-3` out of the middle of a bad token",
         ),
-        (
-            "\x1e1 2 {invalid\n",
-            "1\n2\n",
-            "all of them, not just the first",
-        ),
-        (
-            "\x1e{\"a\":1} xyz\n",
-            "{\"a\":1}\n",
-            "a bad token after a good value",
-        ),
-        (
-            "\x1e1 \"a\n",
-            "1\n",
-            "unterminated string swallows only what follows it",
-        ),
-        ("\x1e1 [1,2\n", "1\n", "unterminated array likewise"),
-        // Rule 1: scanned-but-invalid containers are never resynced into.
-        (
-            "\x1e{\"a\":1 xyz}\n",
-            "",
-            "braces match, so it is one invalid token",
-        ),
-        ("\x1e[1,2 3]\n", "", "same for brackets"),
-        ("\x1e[1 2]\n", "", "same"),
-        // Rule 2: what resyncs, and by how much.
-        ("\x1e} 5\n", "5\n", "stray structural byte skips one"),
-        ("\x1e,2\n", "2\n", "so does a comma"),
-        ("\x1e{\"a\":1} } 7\n", "{\"a\":1}\n7\n", "and mid-record"),
-        (
-            "\x1e-e5 7\n",
-            "7\n",
-            "a bad token is consumed whole, not byte by byte",
-        ),
-        (
-            "\x1exy5 7\n",
-            "7\n",
-            "otherwise the 5 inside it would be emitted",
-        ),
-        (
-            "\x1etru5 7\n",
-            "7\n",
-            "including one that scans as a short literal run",
-        ),
-        ("\x1e@ 7\n", "7\n", "and punctuation that starts nothing"),
-        ("\x1efals 7\n", "7\n", "a failed literal"),
-        ("\x1exyz\n", "", "with nothing to resync onto"),
-        // Rule 3, now general rather than a last-value special case.
-        (
-            "\x1e1,2\n",
-            "2\n",
-            "a number before a comma is not terminated",
-        ),
-        ("\x1e1 2,3\n", "1\n3\n", "only the unterminated one is lost"),
-        (
-            "\x1e{\"a\":1},2\n",
-            "{\"a\":1}\n2\n",
-            "non-numbers self-terminate",
-        ),
-        ("\x1e\"a\",2\n", "\"a\"\n2\n", "including strings"),
-        ("\x1e1,\n", "", "nothing left to resync onto"),
-        (
-            "\x1e1,2,3\n",
-            "3\n",
-            "each unterminated number is dropped in turn",
-        ),
-        ("\x1e1 2 3,4\n", "1\n2\n4\n", "mixed"),
+        ("\x1e1.5true\n", "a fractional number is no different"),
+        ("\x1e0007null\n", "nor is a leading-zero one"),
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
         let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
-        assert_eq!(stripped, expected, "input {input:?} -- {why}");
+        assert_eq!(stripped, "", "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1723: the cost of never fabricating is that a record jq can *partially*
+/// read is dropped whole.
+///
+/// Recorded as a test, not just prose, so the divergence is visible and its
+/// direction is pinned: succinctly's output is always a subset of jq's here,
+/// never a superset. Reaching jq's own answer needs its incremental parser's
+/// failure classification, which is what #1723 still tracks.
+#[test]
+fn test_seq_partially_readable_record_is_dropped_whole_1723() -> Result<()> {
+    for (input, jq_would_emit) in [
+        ("\x1e1 {invalid\n", "1"),
+        ("\x1e1[1]\n", "1 and [1]"),
+        ("\x1e1,2\n", "2"),
+        ("\x1e} 5\n", "5"),
+        ("\x1e{\"a\":1} xyz\n", "{\"a\":1}"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(
+            stripped, "",
+            "input {input:?}: dropped whole; real jq emits {jq_would_emit}"
+        );
         assert_eq!(code, 0, "input {input:?}");
     }
     Ok(())
