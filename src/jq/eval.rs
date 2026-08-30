@@ -15660,6 +15660,84 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
     assign_path_all_noop(root, prefix)
 }
 
+/// [`yq_assign_is_total_noop`]'s twin for the narrower #1857 gap: a path is
+/// not a *total* no-op (the document does change) but still never actually
+/// reads the RHS value, because every write it reaches is either already a
+/// no-op (`assign_path_all_noop`'s own shape) or a mid-chain `Iterate` that
+/// autovivifies `Null` into an empty array -- zero elements, so whatever
+/// `set_path` gets handed as the value is never written anywhere. Shares
+/// every gate `yq_assign_is_total_noop` has (empty-flattened-list bail,
+/// slice-anywhere exclusion, terminal-shape check) since none of that
+/// reasoning changes here -- only the final predicate call differs.
+fn yq_assign_rhs_unused(path: &Expr, root: &OwnedValue) -> bool {
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, path);
+    let Some((last, prefix)) = flat.split_last() else {
+        return false;
+    };
+    if flat.iter().any(|e| unwrap_path_component(e).0.is_slice()) {
+        return false;
+    }
+    if !matches!(
+        unwrap_path_component(last).0,
+        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate
+    ) {
+        return false;
+    }
+    assign_path_rhs_unused(root, prefix)
+}
+
+/// [`assign_path_all_noop`]'s twin for [`yq_assign_rhs_unused`]: same
+/// Field/Index/Iterate walk, but an `Expr::Iterate` reaching `Null`
+/// answers `true` here (RHS never read) where `assign_path_all_noop`
+/// answers `false` (document changes, so not a total no-op) -- `Null`
+/// autovivifies to `[]`, and iterating zero elements is vacuously true
+/// regardless of what `rest` still has left to say, exactly like the
+/// existing empty-`Array`/`Object` arms just below it. Every other arm is
+/// unchanged from `assign_path_all_noop`, including its own base case:
+/// `is_yq_field_index_noop_scalar` already answers "RHS unused" for a
+/// true no-op, which is a subset of what this function reports.
+fn assign_path_rhs_unused(current: &OwnedValue, steps: &[Expr]) -> bool {
+    let (step, rest) = match steps.split_first() {
+        None => return is_yq_field_index_noop_scalar(current),
+        Some(pair) => pair,
+    };
+    let (step, _optional) = unwrap_path_component(step);
+    match step {
+        Expr::Field(name) => match current {
+            OwnedValue::Object(map) => match map.get(name) {
+                Some(v) => assign_path_rhs_unused(v, rest),
+                None => false,
+            },
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
+            OwnedValue::Array(arr) => {
+                let len = arr.len() as i64;
+                let actual = if *idx < 0 { len + idx } else { *idx };
+                if actual >= 0 && (actual as usize) < arr.len() {
+                    assign_path_rhs_unused(&arr[actual as usize], rest)
+                } else {
+                    false
+                }
+            }
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        Expr::Iterate => match current {
+            OwnedValue::Array(arr) => arr.iter().all(|elem| assign_path_rhs_unused(elem, rest)),
+            OwnedValue::Object(map) => map.values().all(|elem| assign_path_rhs_unused(elem, rest)),
+            // Autovivifies to `[]` -- zero elements, so `rest` is never
+            // actually applied to anything, whatever it still contains.
+            OwnedValue::Null => true,
+            _ if is_yq_field_index_noop_scalar(current) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Whether writing through `steps` (a `yq_assign_is_total_noop` prefix --
 /// its own flattened path minus the terminal component) into `current` is
 /// a total no-op. Subsumes `navigate_read_only`'s three-way
@@ -16471,7 +16549,13 @@ fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// mean widening its signature for every caller, not just these two.
 /// Filed as #1414 rather than done here.
 enum YqAssignNoopCheck {
-    /// Total no-op -- return this value unchanged, skip the RHS entirely.
+    /// Skip the RHS entirely and return this value as-is. Two shapes reach
+    /// here: a true total no-op (the document really is unchanged), and
+    /// (#1857) a document that *does* change -- a mid-chain `Iterate`
+    /// autovivifying `Null` into an empty array -- but whose write is
+    /// already fully computed, since it never needed the RHS value to
+    /// begin with. Either way the caller's job is the same: return this,
+    /// evaluate nothing.
     Skip(OwnedValue),
     /// Not a no-op, but the static-path resolution already ran to answer
     /// that question -- reuse instead of re-deriving.
@@ -16503,13 +16587,25 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(paths) => paths,
         Err(_) => return Ok(YqAssignNoopCheck::NotChecked),
     };
-    Ok(
-        if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
-            YqAssignNoopCheck::Skip(pristine)
-        } else {
-            YqAssignNoopCheck::Continue { pristine, paths }
-        },
-    )
+    if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
+        return Ok(YqAssignNoopCheck::Skip(pristine));
+    }
+    // #1857: not a total no-op (the document does change), but every
+    // resolved path still never reads the RHS value -- a mid-chain
+    // `Iterate` autovivifying `Null` into an empty array, most commonly.
+    // Perform the write now with a placeholder value and route it through
+    // the same `Skip` channel: `set_path` can't fail here and the
+    // placeholder is never actually read, since `yq_assign_rhs_unused`
+    // already proved every write this path reaches is either a no-op or an
+    // autovivify-only step with zero elements to write into.
+    if paths.iter().all(|p| yq_assign_rhs_unused(p, &pristine)) {
+        let mut result = pristine;
+        for path in &paths {
+            set_path::<S>(&mut result, path, OwnedValue::Null, true, true)?;
+        }
+        return Ok(YqAssignNoopCheck::Skip(result));
+    }
+    Ok(YqAssignNoopCheck::Continue { pristine, paths })
 }
 
 /// `optional` is `=`'s own `?` (`(.a = 1)?`) -- see `eval_update`'s matching

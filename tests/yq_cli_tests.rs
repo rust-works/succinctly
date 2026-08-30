@@ -22202,9 +22202,10 @@ fn test_yq_nonterminal_iterate_in_assign_path_fans_out_1298() -> Result<()> {
 /// -- zero elements to check). That broader fan-out rule is now
 /// implemented too (#1432, `assign_path_all_noop`) -- see
 /// `test_yq_nonterminal_iterate_container_fanout_noop_1432` below.
-/// (A `Null` target is a separate case, deliberately still excluded --
-/// see `test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298`'s
-/// own updated doc comment.) The second case below (`a: [1, {}]`, a
+/// (A `Null` target was a separate case, once deliberately excluded here
+/// and fixed by a different mechanism -- see
+/// `test_yq_nonterminal_iterate_null_target_skips_rhs_1298`'s own doc
+/// comment for why.) The second case below (`a: [1, {}]`, a
 /// genuinely *mixed* target where one element really does write) is the
 /// regression guard for what this fix must *not* accidentally suppress.
 #[test]
@@ -22227,42 +22228,76 @@ fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
 
 /// #1298 (code review, #1432): a `Null` target for the `Iterate` -- neither
 /// a real container nor a genuine scalar -- falls to `assign_path_all_noop`'s
-/// final `_ => false` catch-all, so the RHS still evaluates here even
-/// though real yq's own null-autovivify-to-`[]` behavior means the fan-out
-/// ends up empty and real yq discards the RHS too (`a: null` becomes
-/// `a: []` there, with the RHS never running -- live-verified against yq
-/// v4.53.3). #1432 deliberately leaves this excluded rather than folding it
-/// in: this predicate's only caller has an all-or-nothing `Skip`/`Continue`
-/// split, and `Skip` means "return the document completely unchanged" --
-/// reporting `Null` as a no-op would discard the legitimate `null` -> `[]`
-/// write, which this codebase's own write path already performs correctly
-/// (confirmed live with a safe RHS, independent of this predicate: `.a[].b
-/// = 5` on `a: null` already produces `a: []` here, matching the oracle --
-/// an earlier version of this comment wrongly claimed that autovivification
-/// was itself broken; it isn't, see #1857's correction). The real, narrower
-/// gap this leaves is exactly what this test pins: the RHS still evaluates
+/// final `_ => false` catch-all, so the document is correctly reported as
+/// *not* a total no-op (real yq's own null-autovivify-to-`[]` behavior does
+/// change the document: `a: null` becomes `a: []`, matching this codebase's
+/// own write path, confirmed live with a safe RHS independent of this
+/// predicate -- an earlier version of this comment wrongly claimed
+/// autovivification itself was broken; it isn't). #1432 deliberately
+/// stopped there rather than also skipping the RHS: `assign_path_all_noop`'s
+/// only caller at the time had an all-or-nothing `Skip`/`Continue` split,
+/// and `Skip` meant "return the document completely unchanged" -- reporting
+/// `Null` as a no-op there would have discarded the legitimate `null` ->
+/// `[]` write. The narrower gap that left -- the RHS still evaluating
 /// eagerly for `Null`, where real yq's own equivalent write never needs it
-/// at all. Filed as #1857; pinned here as a known-divergent case, not a
-/// regression to fix in this PR. The second case below shows the same gap
-/// reached through #1432's own new recursion (a `Null` nested inside a
-/// fanned-into array), not just a bare top-level target.
+/// at all -- was filed as #1857 and is fixed here:
+/// [`yq_assign_rhs_unused`]/[`assign_path_rhs_unused`] recognize this exact
+/// shape (RHS unused, document still changes) and route it through the same
+/// `Skip` channel with the autovivify write already applied. The second
+/// case below is the same gap reached through #1432's own recursion (a
+/// `Null` nested inside a fanned-into array), not just a bare top-level
+/// target.
 #[test]
-fn test_yq_nonterminal_iterate_null_target_still_evaluates_rhs_1298() -> Result<()> {
-    let (_out, err, code) =
+fn test_yq_nonterminal_iterate_null_target_skips_rhs_1298() -> Result<()> {
+    let (out, err, code) =
         run_yq_stdin_with_stderr(".a[].b = error(\"boom\")", "a: null\n", &["-o", "json"])?;
-    assert_ne!(code, 0);
-    assert!(err.contains("boom"), "err={err}");
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(out.trim(), "{\n  \"a\": []\n}");
 
     // Same gap, reached through #1432's recursive fan-out rather than as
     // the direct top-level target.
-    let (_out, err, code) = run_yq_stdin_with_stderr(
+    let (out, err, code) = run_yq_stdin_with_stderr(
         ".a[][].b = error(\"boom\")",
         "a:\n  - null\n  - [1]\n",
         &["-o", "json"],
     )?;
+    assert_eq!(code, 0, "err={err}");
+    assert_eq!(
+        out.trim(),
+        "{\n  \"a\": [\n    [],\n    [\n      1\n    ]\n  ]\n}"
+    );
+
+    Ok(())
+}
+
+/// #1857 regression guard: a `Null` element alongside one that genuinely
+/// needs the RHS (a fresh `b` key being inserted into `{}`) must still
+/// evaluate it -- `yq_assign_rhs_unused`'s `paths.iter().all(...)` has to
+/// require *every* resolved path to be RHS-unused, not just skip the RHS
+/// because *some* element happened to be `Null`.
+#[test]
+fn test_yq_nonterminal_iterate_null_mixed_with_real_write_still_evaluates_rhs_1857() -> Result<()> {
+    let (_out, err, code) = run_yq_stdin_with_stderr(
+        ".a[][].b = error(\"boom\")",
+        "a:\n  - null\n  - [{}]\n",
+        &["-o", "json"],
+    )?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
 
+/// #1857: the same autovivify-skips-RHS fix applies to every yq-mode
+/// assignment operator that routes through `yq_assign_skip_rhs`
+/// (`eval_compound_assign`/`eval_alternative_assign`), not just plain `=`.
+#[test]
+fn test_yq_nonterminal_iterate_null_target_skips_rhs_compound_operators_1857() -> Result<()> {
+    for op in ["+=", "-=", "*=", "/=", "%=", "//="] {
+        let filter = format!(".a[].b {op} error(\"boom\")");
+        let (out, err, code) = run_yq_stdin_with_stderr(&filter, "a: null\n", &["-o", "json"])?;
+        assert_eq!(code, 0, "op={op:?} err={err}");
+        assert_eq!(out.trim(), "{\n  \"a\": []\n}", "op={op:?}");
+    }
     Ok(())
 }
 
