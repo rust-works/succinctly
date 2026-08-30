@@ -2497,36 +2497,8 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
         }
 
         let start = pos;
-        let first_byte = bytes[pos];
 
-        // Determine end of this JSON value
-        let end = match first_byte {
-            b'{' | b'[' => {
-                // Object or array - find matching close
-                find_matching_close(bytes, pos)
-            }
-            b'"' => {
-                // String - find end quote
-                find_string_end(bytes, pos)
-            }
-            b't' | b'f' | b'n' => {
-                // true, false, null
-                find_literal_end(bytes, pos)
-            }
-            // Number. `number_literal_end` (shared with `light.rs`'s own
-            // materializer, #1171 review -- one validated implementation
-            // instead of independently-maintained copies) both finds the
-            // end of and validates the token: a `.` is accepted as a
-            // leading byte when at least one digit follows (`.5` -> `0.5`,
-            // matching real jq's own leniency beyond strict JSON), and a
-            // byte sequence that only *looks* number-shaped (`-e5`, `1e`,
-            // a bare `.`) is rejected outright rather than silently
-            // accepted as a truncated or zero-length span.
-            b'-' | b'.' | b'0'..=b'9' => succinctly::json::light::number_literal_end(bytes, pos),
-            _ => None,
-        };
-
-        match end {
+        match scan_one_json_token(bytes, pos) {
             Some(end) => {
                 values.push((start, end));
                 pos = end;
@@ -2536,6 +2508,40 @@ fn find_json_values(bytes: &[u8]) -> core::result::Result<Vec<(usize, usize)>, u
     }
 
     Ok(values)
+}
+
+/// Where the JSON token starting at `pos` ends, or `None` if no token can
+/// start there.
+///
+/// Extracted from [`find_json_values`] so `--seq`'s own lenient scanner
+/// (#1723) can ask the identical per-token question without a second copy of
+/// this dispatch drifting from it.
+///
+/// "Ends" is structural, not a validity verdict: `{"a":1 xyz}` scans as one
+/// token because its braces match, and only validation rejects it. That
+/// distinction is what makes real jq's resync behaviour reproducible -- it
+/// never resyncs *into* a container that scanned but failed to validate, and
+/// this function is where "scanned" is decided.
+fn scan_one_json_token(bytes: &[u8], pos: usize) -> Option<usize> {
+    match bytes[pos] {
+        // Object or array - find matching close
+        b'{' | b'[' => find_matching_close(bytes, pos),
+        // String - find end quote
+        b'"' => find_string_end(bytes, pos),
+        // true, false, null
+        b't' | b'f' | b'n' => find_literal_end(bytes, pos),
+        // Number. `number_literal_end` (shared with `light.rs`'s own
+        // materializer, #1171 review -- one validated implementation
+        // instead of independently-maintained copies) both finds the
+        // end of and validates the token: a `.` is accepted as a
+        // leading byte when at least one digit follows (`.5` -> `0.5`,
+        // matching real jq's own leniency beyond strict JSON), and a
+        // byte sequence that only *looks* number-shaped (`-e5`, `1e`,
+        // a bare `.`) is rejected outright rather than silently
+        // accepted as a truncated or zero-length span.
+        b'-' | b'.' | b'0'..=b'9' => succinctly::json::light::number_literal_end(bytes, pos),
+        _ => None,
+    }
 }
 
 /// Find the end of an object or array starting at `pos`.
@@ -3287,8 +3293,9 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         // Scanned once here and reused for both the drop decision and the
         // value extraction below -- a review found this record being
         // re-scanned up to three times, each pass allocating and
-        // re-tokenizing.
-        let scanned = seq_record_scan(segment);
+        // re-tokenizing. The *untrimmed* text, so the number-terminator
+        // rule can see the whitespace that trimming would remove.
+        let ranges = seq_record_scan(raw_segment).values;
         // Two different conditions reach `drop_trailing`, and #1723 only
         // relaxes one of them.
         //
@@ -3304,34 +3311,35 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         // an ambiguous bare number, but the values before it are real
         // output real jq emits (`\x1e1 2` => `1`), so that decision moved
         // into `seq_record_values`, per value.
-        if i == last_idx && drop_trailing && (!has_rs || scanned.is_none()) {
+        if i == last_idx && drop_trailing && (!has_rs || ranges.is_empty()) {
             continue;
         }
 
-        // Try to parse as JSON, silently ignore failures
-        if let Some(ranges) = scanned {
-            // One RFC 7464 record can hold *more than one* JSON value, and
-            // real jq emits every one of them (#1723): `\x1e1 "x" [2]\n`
-            // is three outputs, not a malformed record. `seq_record_scan`
-            // above only answers "does this record parse at all", so the
-            // split into individual values happens here, reusing the same
-            // `find_json_values` scanner the ordinary document path uses.
-            //
-            // Before this, a multi-value record failed whole-segment
-            // validation and was dropped in full -- silent data loss on a
-            // record real jq reads fine, not merely a missing diagnostic.
-            // `trimmed_start`, not `start`: the ranges index the *trimmed*
-            // segment, so pairing them with the untrimmed record start
-            // reported offsets that were short by the leading whitespace --
-            // enough to name the wrong line, and across files the wrong
-            // file (a review found `\x1e  "a"\n"b"\n` naming lines 0/2
-            // where jq names 1/2).
-            let trimmed_start = start + (raw_segment.len() - raw_segment.trim_start().len());
-            for (v, value_end) in
-                seq_record_values(segment, raw_segment, &ranges, trimmed_start, end)
-            {
-                results.push((v, value_end));
-            }
+        // Real jq emits every value it managed to read out of a record and
+        // resyncs past what it could not (#1723) -- a record is not
+        // all-or-nothing, so there is no "does this parse" gate here any
+        // more. `ranges` is already exactly the set of values that survived
+        // `seq_record_scan`'s three rules.
+        for &(vs, ve) in &ranges {
+            let Ok(v) = crate::output::json_bytes_to_owned_value(&raw_segment.as_bytes()[vs..ve])
+            else {
+                // Parses but will not decode (#1247): dropped, exactly as
+                // the pre-#1723 path dropped it.
+                continue;
+            };
+            // The record's own trimmed end for its last value, so a
+            // one-value record reports the identical line it always did;
+            // earlier values report their own end, which is what jq's
+            // per-value line reporting needs. Ranges index the untrimmed
+            // record, so `start` is the right base (an earlier pass mixed
+            // trimmed ranges with the untrimmed start and named the wrong
+            // line, and across files the wrong file).
+            let value_end = if (vs, ve) == ranges[ranges.len() - 1] {
+                end
+            } else {
+                start + ve
+            };
+            results.push((v, value_end));
         }
         // Genuine parse failures are silently ignored per RFC 7464
     }
@@ -3339,101 +3347,134 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     results
 }
 
-/// Every JSON value inside one `--seq` record, paired with the absolute end
-/// offset each value should report (#1723).
+/// Every JSON value a `--seq` record yields, as byte ranges into the record's
+/// *untrimmed* text, plus the offset of the first thing that went wrong.
 ///
-/// `segment` is the trimmed record text and `ranges` its values' byte ranges
-/// within it (from [`seq_record_scan`], computed once by the caller rather
-/// than re-derived here -- a review found this function re-scanning a record
-/// the caller had already scanned twice). `trimmed_start`/`trimmed_end` are
-/// that trimmed text's own absolute bounds, so an earlier value's reported
-/// offset lands on the value itself; the last value keeps `trimmed_end`
-/// exactly, so a one-value record's reported line stays byte-identical to
-/// the pre-#1723 single-value path.
+/// Real jq's `--seq` reader does not treat a record as all-or-nothing: it
+/// emits every value it managed to read and resyncs past what it could not
+/// (#1723). Three rules, each oracle-derived, together reproduce every shape
+/// I could find:
 ///
-/// **The last value can still be dropped.** Real jq's incremental number
-/// scanner cannot rule out more digits arriving while a bare number is the
-/// last thing before a record boundary with no terminating byte after it,
-/// so it abandons that value -- the same ambiguity
-/// [`seq_trailing_record_is_dropped`] already encoded for the *stream's*
-/// final record, which turns out to apply per *record*, oracle-verified:
+/// 1. **A token that scans is validated, and dropped if invalid -- never
+///    resynced into.** `{"a":1 xyz}` scans as one token (its braces match),
+///    fails validation, and jq emits *nothing* -- it does not go back and
+///    pick the `"a"` out of the middle. Scanning past it is what prevents
+///    that.
+/// 2. **A byte that cannot start a token is skipped, one byte at a time.**
+///    `} 5` emits `5`; `tru 5` emits `5`.
+/// 3. **A number is only complete when whitespace follows it.** jq's
+///    incremental scanner cannot rule out more digits arriving otherwise, so
+///    `1,2` emits only `2` (the `1` is lost to the `,`), `1 2,3` emits `1`
+///    and `3`, and `\x1e1 2\x1e3` emits `1` and `3`. This *subsumes* the
+///    trailing-bare-number rule an earlier pass at #1723 wrote as a separate
+///    last-value special case -- same rule, applied per value instead of
+///    once at the end.
 ///
-/// ```text
-/// printf '\x1e1 2\x1e3\n'   | jq --seq -c .   =>  1, 3      (the `2` is dropped)
-/// printf '\x1e1 2\n\x1e3\n' | jq --seq -c .   =>  1, 2, 3   (a newline disambiguates it)
-/// ```
-///
-/// Without this, adding multi-value support would have *introduced* a
-/// divergence on the first shape while fixing the second.
-fn seq_record_values(
-    segment: &str,
-    raw_segment: &str,
-    ranges: &[(usize, usize)],
-    trimmed_start: usize,
-    trimmed_end: usize,
-) -> Vec<(OwnedValue, usize)> {
-    let mut out = Vec::new();
-    let last = ranges.len().saturating_sub(1);
-    for (i, &(vs, ve)) in ranges.iter().enumerate() {
-        let is_last = i == last;
-        let value_text = &segment[vs..ve];
-        if is_last && seq_record_last_value_is_ambiguous(value_text, raw_segment) {
-            continue;
+/// Scanning the untrimmed text is what makes rule 3 expressible: the
+/// whitespace that terminates the final number is exactly what trimming
+/// removes.
+fn seq_record_scan(raw_segment: &str) -> SeqRecordScan {
+    let bytes = raw_segment.as_bytes();
+    let mut values = Vec::new();
+    // Whether the *last* thing the scan looked at failed. Distinct from
+    // "any failure": `\x1e"a" 2` yields a value AND ends unresolved, and
+    // that combination is exactly what leaves real jq's incremental parser
+    // with no EOF position to report (`<unknown>`, #1542).
+    let mut trailing_unresolved = false;
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
         }
-        let Ok(v) = crate::output::json_bytes_to_owned_value(value_text.as_bytes()) else {
-            // Parses but will not decode (#1247): dropped, exactly as the
-            // pre-#1723 single-value path dropped it.
-            continue;
-        };
-        out.push((
-            v,
-            if is_last {
-                trimmed_end
-            } else {
-                trimmed_start + ve
-            },
-        ));
+        if pos >= bytes.len() {
+            break;
+        }
+        match scan_one_json_token(bytes, pos) {
+            Some(end) => {
+                let text = &raw_segment[pos..end];
+                if !seq_value_is_valid(text) {
+                    trailing_unresolved = true;
+                    // A token that scanned but is not legal JSON is a *bad
+                    // token*: the rest of its non-whitespace run belongs to
+                    // it too, and must not be re-read as a value. `tru5`
+                    // scans only as far as `tru`, and resuming at the `5`
+                    // emitted a `5` real jq never does.
+                    pos = end;
+                    while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                } else if seq_number_is_terminated(bytes, pos, end) {
+                    values.push((pos, end));
+                    trailing_unresolved = false;
+                    pos = end;
+                } else {
+                    // Legal JSON, but an unterminated number (rule 3). Only
+                    // *this* value is dropped -- what follows is still read,
+                    // which is why this cannot consume the run the way an
+                    // invalid token does (`\x1e1,2\n` must still emit `2`).
+                    trailing_unresolved = true;
+                    pos = end;
+                }
+            }
+            None => {
+                trailing_unresolved = true;
+                // An *unterminated* `"`/`{`/`[` swallows the rest of the
+                // record -- jq never resyncs out of one, oracle-verified:
+                // `\x1e[1,2\n` and `\x1e"a 5\n` emit nothing at all, while
+                // `\x1e1 [1,2\n` still emits the `1` that preceded it. A
+                // byte that merely cannot *start* a value is different and
+                // does resync (`\x1e} 5\n`, `\x1efals 7\n`, `\x1e-e5 7\n`
+                // all emit `7`/`5`), which is why this is keyed on the
+                // opener rather than on "the token failed".
+                if matches!(bytes[pos], b'"' | b'{' | b'[') {
+                    break;
+                }
+                // Everything else resyncs, but by how much depends on what
+                // it is. Structural punctuation is a single stray byte and
+                // jq resumes right after it (`\x1e,2\n` emits `2`); any
+                // other junk is a *bad token*, consumed whole up to the next
+                // whitespace, so its interior is never re-read as a value.
+                // Oracle-verified: `\x1e-e5 7\n`, `\x1exy5 7\n`,
+                // `\x1etru5 7\n` and `\x1e@ 7\n` all emit only `7` -- a
+                // one-byte skip would have found the `5` inside `-e5`.
+                if matches!(bytes[pos], b',' | b'}' | b']' | b':') {
+                    pos += 1;
+                } else {
+                    while pos < bytes.len() && !bytes[pos].is_ascii_whitespace() {
+                        pos += 1;
+                    }
+                }
+            }
+        }
     }
-    out
+    SeqRecordScan {
+        values,
+        trailing_unresolved,
+    }
 }
 
-/// Whether a record's final value is a bare number real jq would abandon as
-/// potentially truncated -- the per-record form of
-/// [`seq_trailing_record_is_dropped`]'s own third case, sharing its exact
-/// predicate: a leading `-`/digit, and no trailing whitespace in the
-/// *untrimmed* record after it.
-fn seq_record_last_value_is_ambiguous(value_text: &str, raw_segment: &str) -> bool {
-    let is_bare_number = matches!(value_text.as_bytes().first(), Some(b'-' | b'0'..=b'9'));
-    is_bare_number && raw_segment.trim_end() == raw_segment
+/// What [`seq_record_scan`] found in one `--seq` record.
+struct SeqRecordScan {
+    /// Byte ranges, into the record's *untrimmed* text, of every value the
+    /// record yields.
+    values: Vec<(usize, usize)>,
+    /// Whether the record *ends* unresolved -- see the field's own note in
+    /// `seq_record_scan`.
+    trailing_unresolved: bool,
 }
 
-/// Split a trimmed, non-empty `--seq` record into its JSON values' byte
-/// ranges, or `None` if it is malformed.
+/// Rule 3 above: a number token counts as complete only when whitespace
+/// follows it inside the record.
 ///
-/// One record can hold more than one value (#1723), so this cannot be the
-/// single whole-segment `validate::validate` call it was before -- that call
-/// is what made `\x1e1 2\n` look malformed and silently dropped both values.
-/// Each range is *still* validated strictly and individually, so the scanner
-/// (a tokenizer, not a validator) cannot widen what `--seq` accepts:
-/// `find_json_values` locates the boundaries, `validate::validate` decides
-/// whether each one is legal JSON.
-///
-/// **Ranges index `segment` itself, never a normalized copy.** #1243's
-/// leading-zero retry is applied per value instead, to decide validity and
-/// again to build the value. Re-scanning a normalized string was an offset
-/// bug a review caught: `normalize_leading_zero_numbers` *deletes* leading
-/// zeros rather than rewriting in place, so ranges taken from the normalized
-/// text are shorter than the original and name the wrong line
-/// (`\x1e0007\n"b"\n` reported lines 0/2 where jq reports 1/2).
-fn seq_record_scan(segment: &str) -> Option<Vec<(usize, usize)>> {
-    let ranges = find_json_values(segment.as_bytes()).ok()?;
-    if ranges.is_empty() {
-        return None;
+/// Non-numbers self-terminate (`"`, `}`, `]`, the last letter of
+/// `true`/`false`/`null`) and are unaffected -- oracle-verified:
+/// `\x1e{"a":1},2\n` keeps the object, while `\x1e1,2\n` loses the `1`.
+fn seq_number_is_terminated(bytes: &[u8], start: usize, end: usize) -> bool {
+    if !matches!(bytes[start], b'-' | b'.' | b'0'..=b'9') {
+        return true;
     }
-    ranges
-        .iter()
-        .all(|&(a, b)| seq_value_is_valid(&segment[a..b]))
-        .then_some(ranges)
+    bytes.get(end).is_some_and(u8::is_ascii_whitespace)
 }
 
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
@@ -3442,8 +3483,7 @@ fn seq_record_scan(segment: &str) -> Option<Vec<(usize, usize)>> {
 /// Normalization is needed *here* and only here: `validate::validate` is
 /// strict RFC 8259 and rejects a leading zero, while the semi-indexer behind
 /// `json_bytes_to_owned_value` already reads `0007` as `7` on its own -- so
-/// the value-building side needs no fallback (an earlier draft had one, and
-/// coverage showed it could never run).
+/// the value-building side needs no fallback.
 fn seq_value_is_valid(value_text: &str) -> bool {
     if validate::validate(value_text.as_bytes()).is_ok() {
         return true;
@@ -3492,21 +3532,19 @@ fn seq_trailing_record_is_dropped(raw: &str) -> bool {
     let Some((_, tail)) = raw.rsplit_once('\u{1e}') else {
         return !raw.trim().is_empty();
     };
-    let segment = tail.trim();
-    if segment.is_empty() {
+    if tail.trim().is_empty() {
         return false;
     }
-    let Some(ranges) = seq_record_scan(segment) else {
-        return true;
-    };
-    // The record's *last* value decides this, not its first byte. Before
-    // #1723 a record was always exactly one value, so the two were the same
-    // question; now they are not, and asking the first byte gets both
-    // multi-value shapes wrong in opposite directions -- a review found
-    // `\x1e"a" 2` reporting a line where jq reports `<unknown>`, and
-    // `\x1e1 "a"` the reverse.
-    let (vs, ve) = ranges[ranges.len() - 1];
-    seq_record_last_value_is_ambiguous(&segment[vs..ve], tail)
+    // Dropped when the record ends *unresolved* -- not merely when it
+    // yields nothing. `\x1e"a" 2` yields `"a"` and still leaves real jq
+    // without an EOF position, because its trailing `2` never resolved
+    // (#1542); asking "did it yield anything" got that backwards and broke
+    // two location tests. `seq_record_scan`'s rules decide both, including
+    // the ambiguous trailing bare number this function used to ask about
+    // separately -- now rule 3, applied per value. Scanned on `tail`
+    // (untrimmed) so that rule can see the terminating whitespace.
+    let scan = seq_record_scan(tail);
+    scan.trailing_unresolved || scan.values.is_empty()
 }
 
 /// Whether `--seq -s`'s trailing record, read across every file on the

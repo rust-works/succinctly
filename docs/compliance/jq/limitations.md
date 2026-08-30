@@ -1556,22 +1556,23 @@ $ printf '\x1exyz\n'           | jq --seq -c '.'
 jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)
 ```
 
-`succinctly jq --seq` emits nothing on stderr for any of these. Output-wise a *wholly*
-malformed record is already correct (RFC 7464's own recommended failure mode,
-#1093/#1267/#1243: it is dropped either way), but a record that is well-formed up to a
-malformed suffix is not: real jq emits the values it managed to read first, and succinctly
-drops the record entire.
+`succinctly jq --seq` emits nothing on stderr for any of these — the gap is now **purely the
+diagnostic**. The output side matches real jq, including a record that is well-formed up to a
+malformed suffix, which #1723 fixed:
 
 ```
-$ printf '\x1e1 {invalid\n' | jq --seq -c '.'          # jq:         warns, then prints 1
-$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'  # succinctly: prints nothing
+$ printf '\x1e1 {invalid\n' | jq            --seq -c '.'   # warns, then prints 1
+$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'   # prints 1, silently
 ```
 
-That prefix-emission gap is the same problem as the missing diagnostic, not a separate one:
-both need to know *where* in the record jq's parser gave up. (jq's own answer here is not
-always "everything before the error" either — `\x1e1,2\n` prints `2`, not `1`.)
+Reproducing jq's *values* here needed three rules, all oracle-derived and pinned by
+`test_seq_malformed_suffix_keeps_the_prefix_1723`: a token that scans is validated and
+dropped if invalid but never resynced into (`{"a":1 xyz}` yields nothing, not `"a"`); an
+unterminated `"`/`{`/`[` swallows the rest of the record while other junk resyncs (structural
+punctuation by one byte, a bad token up to the next whitespace); and a number is complete
+only when whitespace follows it, which is why `\x1e1,2\n` yields `2` alone.
 
-A record holding several *well-formed* values is no longer affected: #1723 fixed
+A record holding several *well-formed* values is likewise unaffected: #1723 fixed
 `succinctly jq --seq` dropping those in full (`\x1e1 "x" [2]\n` is three outputs, as in real
 jq), which was silent data loss rather than a diagnostic gap. Matching these needs enough
 of jq's own incremental-parser failure classification to know which of its internal states a
