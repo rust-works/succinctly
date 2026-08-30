@@ -3216,10 +3216,20 @@ fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
     bound_result: QueryResult<'_, W>,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
+    // #1902: to_owned_checked/promote_borrowed_checked, not to_owned -- the
+    // lazy twin of the same bug `eval_as`'s own bound-value conversion had.
+    // A checked-conversion failure folds into the trailing control exactly
+    // like an ordinary `Partial`'s control (the `Partial` arm below).
     match bound_result.materialize_cursor() {
-        QueryResult::One(v) => Ok((vec![to_owned(&v)], None)),
+        QueryResult::One(v) => match to_owned_checked(&v) {
+            Ok(v) => Ok((vec![v], None)),
+            Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
+        },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => Ok((vs.iter().map(to_owned).collect(), None)),
+        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+            Ok(vs) => Ok((vs, None)),
+            Err((prefix, e)) => Ok((prefix, Some(Control::Error(e)))),
+        },
         QueryResult::Owned(v) => Ok((vec![v], None)),
         QueryResult::ManyOwned(vs) => Ok((vs, None)),
         QueryResult::None => Err(Flow::Exhausted),
@@ -25913,19 +25923,42 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => (vec![v], None),
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => (Vec::new(), None),
-            // Same missing-guard fix as the source stream above, mirroring
-            // `eval_reduce`'s INIT handling.
-            QueryResult::Error(_) if optional => return QueryResult::None,
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
+            // #1902 review: routed through `finish_fork` (not a bare
+            // `return`) so `input_control` -- evaluated earlier than INIT,
+            // per the source order above -- isn't silently dropped if it
+            // also holds a control (most importantly a decode failure,
+            // which `finish_fork` never suppresses regardless of
+            // `optional`). Same precedence as the fork loop's own
+            // `aborted.or_else(|| input_control.clone())` below.
+            QueryResult::Error(e) => {
+                return finish_fork(
+                    Vec::new(),
+                    input_control.or(Some(Control::Error(e))),
+                    optional,
+                )
+            }
+            QueryResult::Break(label) => {
+                return finish_fork(
+                    Vec::new(),
+                    input_control.or(Some(Control::Break(label))),
+                    optional,
+                )
+            }
             QueryResult::Halt(code) => return QueryResult::Halt(code),
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
     // Same hoist as `eval_reduce`: skipped entirely when there are no
     // INIT forks to consume it.
+    //
+    // #1902 review: with zero forks to run, `input_control` (which can now
+    // carry a decode failure, per this function's own checked conversion
+    // above) never gets the chance the loop below gives it via
+    // `aborted.or_else(|| input_control.clone())` -- surface it here
+    // first, same precedence, so a corrupted `input` doesn't go silently
+    // unnoticed just because INIT happened to produce nothing.
     if init_values.is_empty() {
-        return finish_fork(Vec::new(), init_control, optional);
+        return finish_fork(Vec::new(), input_control.clone().or(init_control), optional);
     }
 
     // Every name any alternative could bind (#1365) -- same convention as
@@ -26240,9 +26273,12 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // #1755: to_owned_checked, not to_owned -- an undecodable starting
-    // value must raise unconditionally, before it ever reaches
-    // `finish_fork`'s own `Some(Control::Error(_)) if optional` arm,
-    // which would otherwise silently suppress it.
+    // value must raise unconditionally, matching this crate's own
+    // "decode failure is never suppressed by `?`" rule directly rather
+    // than relying on ever reaching `finish_fork` (which #1902 also made
+    // exempt decode failures from its own `optional` suppression, but
+    // that's this comment's own sibling function, not a guarantee this
+    // early return depends on).
     let initial = match to_owned_checked(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
@@ -36850,11 +36886,23 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // A `Partial` bind expression (#400, #494) still has its produced prefix
     // destructured and run through the body below, same as `eval_as`; the
     // bind's own control is held until that loop has run its course.
+    //
+    // #1902: to_owned_checked/promote_borrowed_checked, not to_owned -- the
+    // destructuring twin of the same bug `eval_as`'s own bound-value
+    // conversion had (`. as [$a] | ...`/`. as {k: $a} | ...`, not just
+    // `. as $a | ...`). A checked-conversion failure folds into
+    // `bound_control` exactly like an ordinary `Partial`'s control.
     let (bound_values, bound_control): (Vec<OwnedValue>, Option<Control>) =
         match bound_result.materialize_cursor() {
-            QueryResult::One(v) => (vec![to_owned(&v)], None),
+            QueryResult::One(v) => match to_owned_checked(&v) {
+                Ok(v) => (vec![v], None),
+                Err(e) => (Vec::new(), Some(Control::Error(e))),
+            },
             QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => (vs.iter().map(to_owned).collect(), None),
+            QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+                Ok(vs) => (vs, None),
+                Err((prefix, e)) => (prefix, Some(Control::Error(e))),
+            },
             QueryResult::Owned(v) => (vec![v], None),
             QueryResult::ManyOwned(vs) => (vs, None),
             QueryResult::None => return QueryResult::None,
@@ -40685,9 +40733,14 @@ mod tests {
             "reduce .[] as $x (0; . + 1)",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
+        // Review: `[.]` (array construction) already raises via its own
+        // pre-existing #1755 check before `eval_reduce`'s own INIT
+        // conversion ever sees a `One`/`Many` shape to convert -- bare `.`
+        // (still lazy, not yet decoded) is the genuine repro for this
+        // function's own new `QueryResult::One` arm.
         query!(
             b"\"\xff\xfe\"",
-            "reduce (1,2) as $x ([.]; . + [$x])",
+            "reduce (1,2) as $x (.; . + [$x])",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
     }
@@ -40704,9 +40757,24 @@ mod tests {
             "[foreach .[] as $x (0; . + 1)]",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
+        // Review: the `[...]`-wrapped assertion above collapses a
+        // `Partial` prefix into a bare `Error` on its own, which cannot
+        // distinguish "prefix retained" from "prefix dropped". Unwrapped,
+        // this pins the doc comment's actual claim: `1`'s real output
+        // survives ahead of the terminal decode failure.
+        query!(
+            b"[1, \"\xff\xfe\"]",
+            "foreach .[] as $x (0; . + 1)",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.is_decode_failure());
+            }
+        );
+        // Same `[.]` -> bare `.` correction as `eval_reduce`'s equivalent
+        // test above.
         query!(
             b"\"\xff\xfe\"",
-            "[foreach (1,2) as $x ([.]; . + [$x])]",
+            "[foreach (1,2) as $x (.; . + [$x])]",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
     }
@@ -40716,7 +40784,7 @@ mod tests {
     #[test]
     fn test_eval_as_reduce_foreach_valid_data_unaffected_1902() {
         query!(br#"{"a":"x","b":5}"#, "(.a, .b) as $v | $v",
-            QueryResult::Partial(vs, Control::Halt(_)) | QueryResult::ManyOwned(vs) => {
+            QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs, vec![OwnedValue::String("x".to_string()), OwnedValue::Int(5)]);
             }
         );
@@ -40730,11 +40798,92 @@ mod tests {
         );
     }
 
+    /// #1902 review: `eval_as`'s eager bound-value fix has three siblings
+    /// sharing the identical unpacking shape that were initially missed --
+    /// `materialize_bound_values` (the lazy twin backing `first`/`limit`/
+    /// `isempty` over an `as` bind, via `each_as`) and `eval_as_pattern`
+    /// (the destructuring spelling, `. as [$v] | ...` / `. as {k:$v} | ...`)
+    /// -- confirmed live during review to still silently substitute `""`
+    /// after the initial fix, since `.a as $v | $v` alone doesn't exercise
+    /// either path.
+    #[test]
+    fn test_eval_as_lazy_and_destructuring_siblings_raise_on_decode_failure_1902() {
+        // `each_as`, via `first`'s lazy sink -- `materialize_bound_values`'s
+        // `QueryResult::One` arm.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "first(.a as $v | $v)",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // `each_as`, via `limit`'s lazy sink.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[limit(1; .a as $v | $v)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // `each_as`, via `isempty`'s lazy sink.
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "isempty(.a as $v | $v)",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // `eval_as_pattern`: array-destructuring bind.
+        query!(
+            b"{\"arr\": [\"\xff\xfe\"]}",
+            ".arr as [$v] | $v",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // `eval_as_pattern`: object-destructuring bind.
+        query!(
+            b"{\"obj\": {\"k\": \"\xff\xfe\"}}",
+            ".obj as {k: $v} | $v",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+    }
+
+    /// #1902 review: `eval_foreach`'s `init_values.is_empty()` early return
+    /// used to hand `finish_fork` only `init_control`, dropping
+    /// `input_control` (and the decode failure it can now carry) entirely
+    /// whenever INIT produces nothing -- confirmed live during review:
+    /// `reduce`'s equivalent already raised unconditionally (its `input`
+    /// never depends on INIT), so the two constructs disagreed on the same
+    /// input.
+    #[test]
+    fn test_eval_foreach_input_control_not_dropped_when_init_is_empty_1902() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "[foreach .a as $x (empty; . + 1)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        // Positive control: a genuinely empty INIT with valid input still
+        // correctly produces no output and no error.
+        query!(
+            br#"{"a": "x"}"#,
+            "[foreach .a as $x (empty; . + 1)]",
+            QueryResult::Owned(OwnedValue::Array(vs)) => assert_eq!(vs, Vec::<OwnedValue>::new())
+        );
+        // Same class of bug, different trigger: INIT's own bare `Error`
+        // (not "produced nothing") used to `return` immediately, dropping
+        // `input_control` the same way -- `try (...) catch "C"` proved it
+        // catchable before this fix, since the decode failure never
+        // reached `finish_fork`'s own uncatchable-for-decode-failure logic.
+        query!(
+            b"{\"arr\": [\"\xff\xfe\"]}",
+            "[foreach .arr[] as $x (error(\"boom\"); . + 1)]",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+        query!(
+            b"{\"arr\": [\"\xff\xfe\"]}",
+            "try ([foreach .arr[] as $x (error(\"boom\"); . + 1)]) catch \"CAUGHT\"",
+            QueryResult::Error(e) => assert!(e.is_decode_failure())
+        );
+    }
+
     /// #1902: the `QueryResult::One` (single, not multi-output) arms of
     /// each of the three fixed sites, plus the `Many` partial-prefix arms
-    /// -- the sweep test above only ever hit the `Many`-with-empty-prefix
-    /// shape, since the corrupted value was always first in a 2-element
-    /// stream.
+    /// on the *INIT* side specifically -- the sweep test above only
+    /// exercises `input`'s own `Many` arm with a non-empty prefix (the
+    /// corrupted value there is second), but never INIT's.
     #[test]
     fn test_eval_as_reduce_foreach_single_and_partial_prefix_shapes_1902() {
         // eval_as: bound-value conversion, `QueryResult::One` arm.
@@ -40768,16 +40917,20 @@ mod tests {
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
         // eval_reduce: INIT, `QueryResult::Many` arm with a non-empty
-        // prefix -- `.arr[]` (`Expr::Iterate`) reaches `eval_reduce`'s own
-        // `materialize_cursor()` as one un-promoted `Many` of borrowed
-        // cursors (unlike a comma of separate sub-expressions, which
-        // `eval_comma`'s own #1832 promotion would already have converted
-        // -- and already caught the decode failure on -- before it ever
-        // reaches here). INIT's first element (`0`) succeeds before its
-        // second (corrupted) fails; the fork over the successfully
-        // converted `0` still completes and contributes its own real
-        // output (`1`) before the decode failure surfaces as
-        // `finish_fork`'s trailing control.
+        // prefix -- `.arr[]` (`Expr::Iterate`) is a single expression that
+        // reaches `eval_reduce`'s own `materialize_cursor()` directly as
+        // one `Many` of still-borrowed cursors, isolating this function's
+        // own conversion from any other combinator's. (A homogeneous
+        // borrowed comma like `(.a, .b)` would reach here the same
+        // un-promoted way too -- `eval_comma`'s own #1832 promotion only
+        // triggers once an `Owned`/`ManyOwned` sibling forces the whole
+        // batch out of its lazy state, per `push_promoted`'s own doc
+        // comment -- `.arr[]` is just the more direct repro of the same
+        // shape.) INIT's first element (`0`) succeeds before its second
+        // (corrupted) fails; the fork over the successfully converted `0`
+        // still completes and contributes its own real output (`1`)
+        // before the decode failure surfaces as `finish_fork`'s trailing
+        // control.
         query!(
             b"{\"arr\": [0, \"\xff\xfe\"]}",
             "reduce 1 as $x (.arr[]; . + $x)",
@@ -40826,20 +40979,53 @@ mod tests {
         );
     }
 
-    /// #1902: `finish_fork`'s own fix -- an *ordinary* trailing error is
-    /// still suppressed by an ambient `optional`, unlike a decode failure.
-    /// `reduce`/`foreach` don't have direct `EXPR?` surface on their own
-    /// input/INIT sub-expressions, so this drives `optional` in through the
-    /// `?`-suffixed builtin argument path (`limit`'s generator argument),
-    /// which routes through `eval_single(..., optional)` the same way
-    /// `eval_reduce`/`eval_foreach`'s own input/INIT calls do.
+    /// #1902 review: the fixed `finish_fork` guard (`optional &&
+    /// !e.is_decode_failure()`) is exercised here by calling the function
+    /// directly, not through a parsed query -- verified live that no
+    /// current jq/yq syntax reaches `finish_fork` with `optional == true`
+    /// (post-#693, `Expr::Optional` forwards the *ambient* optional rather
+    /// than forcing `true`; the only two call sites that force `true`,
+    /// `.[EXPR]?`/`.[S:E]?`, hard-code `false` for their own sub-expression
+    /// evaluations, so it never reaches this deep). Same "live-unreachable
+    /// today, pinned against the function's own contract regardless"
+    /// precedent as `eval_rs_delpaths_decode_failure_bypasses_optional_1746`
+    /// above. An earlier version of this test used a parsed
+    /// `(reduce ... )?` query and appeared to pass, but its `QueryResult::None`
+    /// actually came from `eval_try`'s own independent catch one layer up
+    /// (with `optional == false` reaching `finish_fork`) -- confirmed by
+    /// reverting the `finish_fork` guard entirely and finding the whole
+    /// suite still green, which is exactly the false-coverage this direct
+    /// call closes.
     #[test]
-    fn test_finish_fork_still_suppresses_ordinary_error_under_optional_1902() {
-        query!(
-            br"0",
-            "(reduce (1, error(\"boom\")) as $x (0; . + $x))?",
-            QueryResult::None => {}
-        );
+    fn test_finish_fork_ordinary_error_suppressed_decode_failure_is_not_1902() {
+        let ordinary = EvalError::new("boom");
+        assert!(!ordinary.is_decode_failure());
+        match finish_fork::<Vec<u64>>(
+            vec![OwnedValue::Int(1)],
+            Some(Control::Error(ordinary)),
+            true,
+        ) {
+            // A single-element `outputs` collapses to `Owned` (not an
+            // `Array`), matching `owned_vec_to_result`'s own collapse rule.
+            QueryResult::Owned(v) => assert_eq!(v, OwnedValue::Int(1)),
+            other => {
+                panic!("expected the ordinary error suppressed under optional, got: {other:?}")
+            }
+        }
+
+        let decode_failure = EvalError::decode_failure("invalid UTF-8 in string");
+        assert!(decode_failure.is_decode_failure());
+        match finish_fork::<Vec<u64>>(
+            vec![OwnedValue::Int(1)],
+            Some(Control::Error(decode_failure)),
+            true,
+        ) {
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.is_decode_failure());
+            }
+            other => panic!("expected the decode failure to survive optional, got: {other:?}"),
+        }
     }
 
     /// #1755: the "misc bucket" slice -- `INDEX`/`INDEX(stream;...)`,
