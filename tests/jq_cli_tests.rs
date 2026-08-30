@@ -6929,34 +6929,35 @@ fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
     Ok(())
 }
 
-/// Documents three deliberate, narrow gaps #1663 leaves open rather than
+/// Documents two deliberate, narrow gaps #1663 leaves open rather than
 /// silently missing: `needs_path_context` still has no dedicated evaluation
-/// arm for `Expr::Reduce`, `Expr::Foreach`, or `Expr::Limit`, so a
-/// path-context builtin inside any of these three still falls through to the
-/// generic fallback and stubs to its zero default, exactly as before this
-/// fix. `Expr::Object` has the identical gap but is tracked separately as
-/// #1332 (already true before #1663, per the `Array` arm's own doc comment).
+/// arm for `Expr::Reduce` or `Expr::Foreach`, so a path-context builtin
+/// inside either still falls through to the generic fallback and stubs to
+/// its zero default, exactly as before this fix. `Expr::Object` has the
+/// identical gap but is tracked separately as #1332 (already true before
+/// #1663, per the `Array` arm's own doc comment).
 ///
-/// `Expr::As` (#1663) and the single-pattern case of `Expr::AsPattern`
-/// (#1765) -- the two most consequential shapes, since they're the ordinary
-/// `EXPR as $v | body` / `EXPR as PATTERN | body` idioms -- are both fixed;
-/// see `test_as_pattern_single_pattern_path_context_resolves_1765` for that
-/// coverage. A `?//`-chained `AsPattern` (2+ alternatives) is intentionally
-/// still a known gap alongside the three below -- its retry-on-failure
-/// semantics are real complexity #1765 didn't attempt to replicate, per that
-/// issue's own scoping.
+/// `Expr::As` (#1663), the single-pattern case of `Expr::AsPattern` (#1765),
+/// and `Expr::Limit` (#1765) -- the most consequential shapes, since the
+/// first two are the ordinary `EXPR as $v | body` / `EXPR as PATTERN | body`
+/// idioms -- are all fixed; see `test_as_pattern_single_pattern_path_context_resolves_1765`
+/// and `test_limit_path_context_resolves_1765` for that coverage. A
+/// `?//`-chained `AsPattern` (2+ alternatives) is intentionally still a known
+/// gap alongside the two below -- its retry-on-failure semantics are real
+/// complexity #1765 didn't attempt to replicate, per that issue's own
+/// scoping.
 ///
-/// None of the remaining four shapes (reduce/foreach/limit, plus `?//`) have
-/// a real-yq oracle to verify a fix against (yq's lexer rejects destructuring
-/// `as`, `reduce`, `foreach`, and `limit` outright), and `Reduce`/`Foreach`
-/// in particular raise a real semantic question (what should `key` mean
-/// while evaluating the fold's own accumulator, which has no document
-/// position?) that #1663's own investigation didn't settle. Filed as a
-/// follow-up rather than guessed at here. Pinned so a future regression or
-/// accidental fix is visible either way, matching #1306's identical "known
-/// gap" precedent (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
+/// None of the remaining three shapes (reduce/foreach, plus `?//`) have a
+/// real-yq oracle to verify a fix against (yq's lexer rejects destructuring
+/// `as`, `reduce`, and `foreach` outright), and `Reduce`/`Foreach` in
+/// particular raise a real semantic question (what should `key` mean while
+/// evaluating the fold's own accumulator, which has no document position?)
+/// that #1663's own investigation didn't settle. Filed as a follow-up rather
+/// than guessed at here. Pinned so a future regression or accidental fix is
+/// visible either way, matching #1306's identical "known gap" precedent
+/// (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
 #[test]
-fn test_reduce_foreach_limit_path_context_still_known_gaps_1663() -> Result<()> {
+fn test_reduce_foreach_path_context_still_known_gaps_1663() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | reduce .[] as $x (key; .)"],
         Some(r#"{"a":[1,2]}"#),
@@ -6971,16 +6972,55 @@ fn test_reduce_foreach_limit_path_context_still_known_gaps_1663() -> Result<()> 
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "[null,null]");
 
-    let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(1; key)]"], Some(r#"{"a":1}"#))?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[null]");
-
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | . as [$x] ?// {b:$x} | key"],
         Some(r#"{"a":[1]}"#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "null");
+
+    Ok(())
+}
+
+/// #1765 item 2: `Expr::Limit`'s body expression now resolves
+/// `key`/`parent`/`file_index` against the caller's own ambient position,
+/// via a hybrid dispatch (mirrors `eval_binary_fanout_with_path_context`'s
+/// existing per-operand hybrid) that only routes through the eager
+/// path-context evaluator when the body actually needs it -- the common
+/// case (no path-context builtin in the body) stays on `each_take_n`'s
+/// existing lazy "pull at most n, then stop" path (#820), untouched.
+#[test]
+fn test_limit_path_context_resolves_1765() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(1; key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[\"a\"]");
+
+    // Multiple outputs: only the first `n` are taken, matching `limit`'s
+    // own established semantics.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [limit(2; .[] | key)]"],
+        Some(r#"{"a":[10,20,30]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[0,1]");
+
+    // `limit(0; ...)` still short-circuits to no output at all, even with a
+    // path-context body.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(0; key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
+
+    // A negative/`null` `n` means "no limit at all" (#983) -- still resolves
+    // through the path-context arm's `LimitN::Unlimited` case.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [limit(-1; key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[\"a\"]");
+
+    // The common case (no path-context builtin in the body) is unaffected --
+    // still routes through the existing lazy `each_take_n` path.
+    let (stdout, _, code) = run_jq_full(&["-c", "[limit(2; .[])]"], Some(r"[1,2,3,4,5]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,2]");
 
     Ok(())
 }
