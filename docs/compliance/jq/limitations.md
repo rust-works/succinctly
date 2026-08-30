@@ -703,6 +703,34 @@ rather than folded into #1629's own scope.
 `keys_unsorted | length` is not in this set at all — it reaches `effective_len`, which walks, and
 so has carried the check for free since #1628.
 
+**A separate catchability dimension, fixed for the pull model, still open for the push
+model (#1936/#1948).** Whether a malformed key *raises* (documented above) is distinct from
+whether `?`/`try`/`catch` can *suppress or catch* that raise — `keys`/`keys_unsorted` stay
+lazy (`GenericResult::LazyKeys`) until something actually materializes them, so wrapping a
+bare `keys_unsorted` in `?` used to let the error escape past a boundary that had already
+closed by the time materialization happened. #1936 fixed this for the pull-model dispatch
+(`try_single_generic`, reached via plain `eval_single`) by checking for a malformed key
+before the boundary's match runs, without forcing a full decode on success (preserving
+`fold_pipe_stages`'s lazy fast paths for `.[]`/`.[n]`/`first`/`last`/`length`):
+
+```
+$ echo '{123: 1}' | sjq -c 'keys_unsorted?'                      # suppressed, exit 0 (fixed)
+$ echo '{123: 1}' | sjq -c 'try (keys_unsorted) catch "c"'       # "c", exit 0 (fixed)
+```
+
+The push-model dispatch (`each_try_generic`, reached via `eval_each_generic` for
+`first`/`limit`) has the identical bug class and remains open — tracked as #1948 rather
+than folded into #1936, since closing it needs `eval_each_generic` itself to carry a "must
+materialize now" signal through arbitrarily nested push-model consumers, not just a new
+arm in `each_try_generic`'s own dispatch. It also affects `LazySeq` (`map(f)`), not just
+`LazyKeys` — a gap that predates #1936 entirely, since #1812 only fixed `LazySeq`'s
+pull-model catchability:
+
+```
+$ echo '{123: 1}' | sjq -c 'first(keys_unsorted?)'                       # exit 5 -- unfixed
+$ echo '[1,2,3]' | sjq -c 'first(try (map(error("x"))) catch "c")'       # exit 5 -- unfixed
+```
+
 Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
 and finds a non-string key once its `[` is already out, so a **truncated** array can reach
 stdout beside the exit 5. Pre-checking would mean a second walk over every key on a path

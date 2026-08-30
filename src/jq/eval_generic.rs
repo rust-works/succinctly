@@ -4287,31 +4287,54 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
 /// regardless (#1067): a future change that ever violates that invariant
 /// degrades gracefully instead of silently misbehaving.
 ///
-/// None of `LazyKeys`/`LazyIndexRange`/`LazySeq` have necessarily failed
-/// *yet* -- all three are lazy, so none of them matches the
-/// `Error`/`Break`/`Partial` arms above even when pulling one would fail
-/// (#724, #725, #683, #684). This boundary needs to know *now* whether
-/// `inner` fails, so force all three via [`GenericResult::materialize_lazy`]
-/// before the match below runs -- same one-pass cost every other
-/// materializing boundary in this file already pays. Without this,
-/// `inner`'s lazy result falls through to `other => other` and escapes the
-/// boundary entirely: the error only surfaces later, at whatever downstream
-/// site finally pulls it, by which point this `try`/`catch`/`?` is long
-/// gone (confirmed against real jq for `LazySeq`: `[1,2,"x"]|map(.+1)?` is
-/// empty/exit-0 in jq, but errored/exit-5 here before that arm existed;
-/// `LazyKeys`' own #1936 case has no jq oracle -- `keys_unsorted` on a
-/// non-string key is a document real jq's own parser rejects outright -- so
-/// it's pinned by comparing against this same boundary's already-correct
-/// `sort?`/`try (sort) catch` handling of the identical document instead).
-/// `halt` is never caught here either way, matching `Control`'s own
-/// pass-through guarantee and the `other => other` wildcard's identical
-/// treatment of a bare `GenericResult::Halt`.
+/// Neither `LazyKeys` nor `LazySeq` have necessarily failed *yet* -- both
+/// are lazy, so neither matches the `Error`/`Break`/`Partial` arms above
+/// even when pulling one would fail (#724, #725, #683). This boundary needs
+/// to know *now* whether `inner` fails, so force both here -- same one-pass
+/// cost every other materializing boundary in this file already pays.
+/// Without this, `inner`'s lazy result falls through to `other => other`
+/// and escapes the boundary entirely: the error only surfaces later, at
+/// whatever downstream site finally pulls it, by which point this
+/// `try`/`catch`/`?` is long gone (confirmed against real jq for `LazySeq`:
+/// `[1,2,"x"]|map(.+1)?` is empty/exit-0 in jq, but errored/exit-5 here
+/// before that arm existed; `LazyKeys`' own #1936 case has no jq oracle --
+/// `keys_unsorted` on a non-string key is a document real jq's own parser
+/// rejects outright -- so it's pinned by comparing against this same
+/// boundary's already-correct `sort?`/`try (sort) catch` handling of the
+/// identical document instead). `halt` is never caught here either way,
+/// matching `Control`'s own pass-through guarantee and the `other => other`
+/// wildcard's identical treatment of a bare `GenericResult::Halt`.
 ///
-/// [`each_try_generic`] below, this function's push-model twin, does *not*
-/// need the equivalent fix: its `keys`/`keys_unsorted` dispatch already
-/// forces each key through `each_lazy_keys_iterate_sink`'s own, separately
-/// fixed catchability path (#1770) rather than ever producing a
-/// `GenericResult::LazyKeys` in the first place.
+/// `LazyKeys` is checked via [`distinct_key_cursors_checked`] rather than
+/// [`GenericResult::materialize_lazy`]/`materialize_lazy_keys`: the latter
+/// would decode and collect every key into an owned `Vec<String>` even on
+/// the ordinary, non-failing path, permanently forfeiting `fold_pipe_stages`'s
+/// `!sorted` O(1)/no-allocation fast paths (`.[]`, `.[n]`, `first`, `last`)
+/// for any `keys_unsorted` merely *wrapped* in `?`/`try`/`catch` -- a real
+/// cost with no correctness benefit, caught in review before this landed.
+/// `distinct_key_cursors_checked` walks the same fields doing the identical
+/// #1194 check, but only collects cheap `V::Cursor`s, and -- critically --
+/// on success this arm hands back the *original*, still-lazy `LazyKeys`
+/// unchanged, so a downstream `fold_pipe_stages` arm still gets the fast
+/// path it always did. `LazyIndexRange` needs no arm at all: its value is
+/// fully described by `len` alone (#684), so unlike `LazyKeys` it can
+/// never actually fail -- forcing it here would cost real allocation for
+/// zero correctness benefit, so it stays on the `other => other` wildcard,
+/// exactly as before this fix.
+///
+/// [`each_try_generic`] below, this function's push-model twin, has a
+/// **similar but distinct, still-open gap**: `eval_each_generic`'s own
+/// wildcard fallback pushes a `GenericResult::LazyKeys`/`LazyIndexRange`/
+/// `LazySeq` straight to `sink` unmaterialized whenever the immediate
+/// consumer isn't the narrow `keys_unsorted | .[]` shape
+/// `each_lazy_keys_iterate_sink` (#1770) covers -- confirmed live:
+/// `first(keys_unsorted?)` and `first(try (map(error("x"))) catch "c")`
+/// both still raise uncaught on `main` (the latter predates this fix
+/// entirely, since it's `LazySeq`, not `LazyKeys`). Tracked separately as
+/// #1948 rather than folded in here: closing it needs `eval_each_generic`
+/// itself to carry a "must materialize now" signal through arbitrarily
+/// nested push-model consumers (`first`, `limit`, ...), not just a new arm
+/// in this function's own dispatch.
 fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     inner: &Expr,
     catch: Option<&Expr>,
@@ -4325,7 +4348,7 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
             None => GenericResult::None,
         }
     };
-    match eval_single::<S, _>(inner, value, optional, cursor).materialize_lazy() {
+    match eval_single::<S, _>(inner, value, optional, cursor) {
         GenericResult::Error(e) if e.is_decode_failure() => GenericResult::Error(e),
         GenericResult::Error(e) => run_catch(&e.payload()),
         GenericResult::Break(_) => run_catch(&OwnedValue::Null),
@@ -4338,6 +4361,26 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         GenericResult::Partial(prefix, Control::Break(_)) => {
             prepend_generic(prefix, run_catch(&OwnedValue::Null))
         }
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(owned) => GenericResult::Owned(owned),
+            Err(Control::Error(e)) if e.is_decode_failure() => GenericResult::Error(e),
+            Err(Control::Error(e)) => run_catch(&e.payload()),
+            Err(Control::Break(_)) => run_catch(&OwnedValue::Null),
+            Err(Control::Halt(code)) => GenericResult::Halt(code),
+        },
+        GenericResult::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => match distinct_key_cursors_checked::<V>(&fields, collapse) {
+            Ok(_) => GenericResult::LazyKeys {
+                fields,
+                sorted,
+                collapse,
+            },
+            Err(e) if e.is_decode_failure() => GenericResult::Error(e),
+            Err(e) => run_catch(&e.payload()),
+        },
         other => other,
     }
 }
