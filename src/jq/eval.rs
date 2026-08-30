@@ -15588,7 +15588,18 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     let slice_expr = Expr::Slice { start: *s, end: *e };
                     for t in ts {
                         match eval_single::<W, S>(&slice_expr, t.clone(), optional) {
-                            QueryResult::One(v) => out.push(to_owned(&v)),
+                            // #1943: to_owned_checked, not to_owned -- the
+                            // `Expr::Slice` fast path for a fully-open
+                            // bound (`matches!(start, None|Some(0)) &&
+                            // end.is_none()`) returns the target's original
+                            // borrowed, undecoded value unchanged (#1932's
+                            // own finding for `eval_single`'s array arm),
+                            // so an undecodable string here used to
+                            // silently become `""` instead of raising.
+                            QueryResult::One(v) => match to_owned_checked(&v) {
+                                Ok(v) => out.push(v),
+                                Err(e) => return QueryResult::Error(e),
+                            },
                             QueryResult::Owned(v) => out.push(v),
                             QueryResult::None => {}
                             QueryResult::Error(e) => return QueryResult::Error(e),
@@ -39573,6 +39584,49 @@ mod tests {
                 assert_eq!(
                     v,
                     vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::String("ok".into())]
+                );
+            }
+        );
+    }
+
+    /// #1943: `eval_slice_expr` (computed slice bounds, e.g. `.[$a:$b]`) has
+    /// the identical bug shape #1932 fixed above, via a different call path.
+    /// A bound that resolves to `null` folds to `None` ("open"), and this
+    /// function builds an internal `Expr::Slice{start:None,end:None}` per
+    /// borrowed target -- `eval_single`'s own fast path for that exact shape
+    /// (`matches!(start, None|Some(0)) && end.is_none()`) returns the
+    /// target's original borrowed, undecoded array unchanged, so this
+    /// function's own consumer of that `QueryResult::One(v)` used the
+    /// unchecked `to_owned` instead of `to_owned_checked`.
+    ///
+    /// Exercised via `eval.rs`'s own library-API dispatch (`query!`), not
+    /// the CLI -- `succinctly jq`/`yq`'s real dynamic-slice dispatch is
+    /// `eval_generic.rs`'s own, separately-implemented `eval_slice_expr`,
+    /// which converts via already-checked helpers and doesn't share this
+    /// bug, same CLI-unreachability shape #1932/#1755 established for this
+    /// bug family already.
+    #[test]
+    fn test_slice_expr_raises_on_element_decode_failure_1943() {
+        query!(
+            &b"[1,2,\"\xff\xfe\",4]"[..],
+            ".[null:null]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data through the same arm is unaffected.
+        query!(
+            br#"[1,2,"ok",4]"#,
+            ".[null:null]",
+            QueryResult::Owned(OwnedValue::Array(v)) => {
+                assert_eq!(
+                    v,
+                    vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::String("ok".into()),
+                        OwnedValue::Int(4)
+                    ]
                 );
             }
         );
