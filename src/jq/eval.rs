@@ -27104,9 +27104,38 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // next instead of aborting the traversal -- confirmed live:
             // `(.a)? | .[] | if key==1 then error("boom") else key end` on
             // `{"a":[1,2,3]}` produced `0`/`2` (element 1 silently
-            // skipped), where real jq's own equivalent (`.a | .[] | ...`,
-            // no `?` -- an ordinary generator error always aborts
-            // everything downstream, `?` or not) emits `0` then errors.
+            // skipped, element 2 wrongly still ran). This fix stops that:
+            // the same query now produces only `0`, matching every sibling
+            // arm's existing (#1302/#1826) response to this exact ambient
+            // shape.
+            //
+            // That still isn't full jq parity for this exact query, and
+            // isn't meant to be: real jq's equivalent (`.a | .[] | if
+            // .==2 then error("boom") else . end` on `[1,2,3]`, confirmed
+            // live against jq 1.7.1) emits `1` then *errors*, whether or
+            // not an unrelated `?` sits earlier in the pipe, because `?`
+            // only catches an error raised *inside* what it directly
+            // wraps. Here, `(.a)?` only wraps `.a`; `.[] | ...` is a
+            // separate downstream stage `?` was never meant to reach. It
+            // reaches this arm's `optional=true` only because `key` makes
+            // `needs_path_context(rest)` true, routing through the
+            // `Expr::Optional` arm's slower "combine `[inner, ...rest]`,
+            // evaluate under a forced ambient `optional=true`" fallback a
+            // few arms below (rather than its faster, correct, isolated
+            // path) -- the same pre-existing #1335 "rest inherits
+            // suppression" gap already present, unchanged, in `Array`'s
+            // and `Map`'s own #1302/#1826 fixes (confirmed live: both
+            // `(.a)? | [.[] | if key==1 then error("boom") end]` and
+            // `(.a)? | map(if key==1 then error("boom") else key end)`
+            // also silently exit 0 with no error, on the same input).
+            // Closing that gap needs #1335's own architecture fix (a way
+            // to tell "there's a literal `?` right here" apart from
+            // "`optional` merely bled in from an unrelated earlier
+            // stage"), not another per-construct patch here -- this fix's
+            // job is only to make `Iterate`'s *response* to `optional`
+            // (however it arrived) consistent with every sibling arm's,
+            // not to independently re-litigate whether it should have
+            // arrived at all.
             //
             // Unlike `Array`/`Map`, `Iterate` is not a constructor -- there
             // is no atomic "discard the whole in-progress collection"
@@ -27120,12 +27149,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // (which only ever runs when there's a literal `?` right here,
             // so unconditional catching is correct there), an ambient
             // `optional` reaching `Iterate` can come from an *unrelated*
-            // enclosing `?` bleeding through `rest` (the pre-existing,
-            // documented #1335 "rest inherits suppression" gap) -- and a
-            // `break`'s label target is lexically scoped, never something
-            // an unrelated ancestor's `?` may intercept. Both fall through
-            // `Some(other) => other` unchanged, preserving whatever prefix
-            // `accumulate_path_context_step` already attached (#400/#494).
+            // enclosing `?` bleeding through `rest` (the same #1335 gap
+            // above), and a `break`'s label target is lexically scoped,
+            // never something an unrelated ancestor's `?` may intercept.
+            // Both fall through `Some(other) => other` unchanged,
+            // preserving whatever prefix `accumulate_path_context_step`
+            // already attached (#400/#494).
             let mut results = Vec::new();
             let mut stopped = None;
             match value {
@@ -27168,19 +27197,16 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             match stopped {
                 None => owned_vec_to_result(results),
-                Some(QueryResult::Error(e)) => {
-                    if optional {
-                        QueryResult::None
-                    } else {
-                        QueryResult::Error(e)
-                    }
-                }
-                Some(QueryResult::Partial(prefix, Control::Error(e))) => {
-                    if optional {
-                        owned_vec_to_result(prefix)
-                    } else {
-                        partial(prefix, Control::Error(e))
-                    }
+                // Guard-gated on `optional`, mirroring the path-context
+                // `Expr::Array` arm's own idiom: when it doesn't match (no
+                // ambient `optional`, or a non-`Error` control signal), the
+                // shared `Some(other) => other` arm below returns the
+                // original `stopped` value unchanged -- for the `Partial`
+                // shape that's already exactly `partial()`'s own
+                // non-empty-prefix output, so there's nothing to rebuild.
+                Some(QueryResult::Error(_)) if optional => QueryResult::None,
+                Some(QueryResult::Partial(prefix, Control::Error(_))) if optional => {
+                    owned_vec_to_result(prefix)
                 }
                 Some(other) => other,
             }
