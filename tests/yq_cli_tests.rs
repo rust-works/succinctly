@@ -22240,11 +22240,11 @@ fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
 /// `Null` as a no-op there would have discarded the legitimate `null` ->
 /// `[]` write. The narrower gap that left -- the RHS still evaluating
 /// eagerly for `Null`, where real yq's own equivalent write never needs it
-/// at all -- was filed as #1857 and is fixed here:
-/// [`yq_assign_rhs_unused`]/[`assign_path_rhs_unused`] recognize this exact
-/// shape (RHS unused, document still changes) and route it through the same
-/// `Skip` channel with the autovivify write already applied. The second
-/// case below is the same gap reached through #1432's own recursion (a
+/// at all -- was filed as #1857 and is fixed here: `PathAssignOutcome`'s
+/// `RhsUnusedButChanges` case recognizes this exact shape (RHS unused,
+/// document still changes) and `yq_assign_noop_check` routes it through
+/// the same `Skip` channel with the autovivify write already applied. The
+/// second case below is the same gap reached through #1432's own recursion (a
 /// `Null` nested inside a fanned-into array), not just a bare top-level
 /// target.
 ///
@@ -22277,9 +22277,9 @@ fn test_yq_nonterminal_iterate_null_target_skips_rhs_1298() -> Result<()> {
 
 /// #1857 regression guard: a `Null` element alongside one that genuinely
 /// needs the RHS (a fresh `b` key being inserted into `{}`) must still
-/// evaluate it -- `yq_assign_rhs_unused`'s `paths.iter().all(...)` has to
-/// require *every* resolved path to be RHS-unused, not just skip the RHS
-/// because *some* element happened to be `Null`.
+/// evaluate it -- `yq_assign_noop_check`'s `outcomes.iter().all(...)` has
+/// to require *every* resolved path to be RHS-unused, not just skip the
+/// RHS because *some* element happened to be `Null`.
 #[test]
 fn test_yq_nonterminal_iterate_null_mixed_with_real_write_still_evaluates_rhs_1857() -> Result<()> {
     let (_out, err, code) = run_yq_stdin_with_stderr(
@@ -22287,6 +22287,42 @@ fn test_yq_nonterminal_iterate_null_mixed_with_real_write_still_evaluates_rhs_18
         "a:\n  - null\n  - [{}]\n",
         &["-o", "json"],
     )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1857 (round-3 review): an *absent* field autovivifies exactly like an
+/// explicit `Null` value would -- `classify_yq_assign_prefix`'s `Field`
+/// arm used to give up immediately on a missing key (`None =>
+/// PathAssignOutcome::NeedsRhs`), never letting a later mid-chain
+/// `Iterate` in `rest` answer `RhsUnusedButChanges` for its own empty
+/// fan-out. Both the absent-key and explicit-`Null` spellings must behave
+/// identically -- confirmed live against yq v4.53.3.
+#[test]
+fn test_yq_absent_field_before_iterate_skips_rhs_like_null_1857() -> Result<()> {
+    for input in ["{}\n", "a: null\n"] {
+        let (out, err, code) =
+            run_yq_stdin_with_stderr(".a.b[].z = error(\"boom\")", input, &["-o", "json"])?;
+        assert_eq!(code, 0, "input={input:?} err={err}");
+        assert_eq!(
+            out.trim(),
+            "{\n  \"a\": {\n    \"b\": []\n  }\n}",
+            "input={input:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1857 regression guard: an absent field followed by a *terminal* write
+/// (not a further `Iterate`) still needs the RHS -- a genuine key
+/// insertion, not an empty fan-out. Distinguishes this from the sibling
+/// test above, where the same absent-field shape *does* skip the RHS
+/// because what follows is an `Iterate` into nothing.
+#[test]
+fn test_yq_absent_field_terminal_write_still_evaluates_rhs_1857() -> Result<()> {
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a.b = error(\"boom\")", "a: null\n", &["-o", "json"])?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
     Ok(())

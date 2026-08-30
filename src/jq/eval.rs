@@ -15585,19 +15585,19 @@ fn is_yq_field_index_noop_scalar(target: &OwnedValue) -> bool {
 /// The outcome of walking a resolved static path against `set_path`'s own
 /// write semantics, without actually performing the write. Replaces two
 /// independently-hand-synced boolean predicates that used to exist here
-/// (`assign_path_all_noop`/`assign_path_rhs_unused`, and their outer
-/// wrappers, the current [`yq_assign_is_total_noop`]/[`yq_assign_rhs_unused`])
-/// -- #1920 review (round 2) found the split cost a full second tree-walk
-/// on every non-total-noop yq-mode assignment, and risked exactly the
-/// "duplicated predicates diverge silently" failure this codebase has
-/// already hit once (#106): the two boolean walks were near-identical
-/// copies whose *only* intentional difference (an `Expr::Iterate` reaching
-/// `Null`) had to be applied by hand to one and not the other. One walk
-/// producing a 3-way answer removes that risk structurally instead of by
-/// doc-comment discipline; the two outer functions are now thin wrappers
-/// over [`yq_assign_classify`], keeping their own names/signatures
-/// unchanged so every existing cross-reference to them elsewhere in this
-/// file stays accurate.
+/// (`yq_assign_is_total_noop`/`yq_assign_rhs_unused`, plus their own inner
+/// twins `assign_path_all_noop`/`assign_path_rhs_unused`) -- #1920 review
+/// (round 2) found the split cost a full second tree-walk on every
+/// non-total-noop yq-mode assignment, and risked exactly the "duplicated
+/// predicates diverge silently" failure this codebase has already hit once
+/// (#106): the two boolean walks were near-identical copies whose *only*
+/// intentional difference (an `Expr::Iterate` reaching `Null`) had to be
+/// applied by hand to one and not the other. One walk producing a 3-way
+/// answer removes that risk structurally instead of by doc-comment
+/// discipline. All four of the old names are gone -- [`yq_assign_classify`]
+/// (path-level) and [`classify_yq_assign_prefix`] (prefix-level) are their
+/// sole replacements, called directly by this classification's one real
+/// consumer, `yq_assign_noop_check`.
 enum PathAssignOutcome {
     /// Every write this path reaches is a no-op: the document doesn't
     /// change at all.
@@ -15620,28 +15620,7 @@ impl PathAssignOutcome {
     }
 }
 
-fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
-    yq_assign_classify(path, root).is_total_noop()
-}
-
-/// [`yq_assign_is_total_noop`]'s twin for the narrower #1857 gap -- see
-/// [`PathAssignOutcome`]'s own doc comment for why both are now thin
-/// wrappers over one shared walk rather than independent ones.
-///
-/// Deliberately does **not** cover a *terminal* `Iterate` (`.a[] = v`, the
-/// `Iterate` itself is `last`, stripped into the flattened `prefix` before
-/// [`classify_yq_assign_prefix`] is ever reached) reaching an already-empty
-/// container or `Null` -- that shape needs the terminal step's own type
-/// available at the point its target is examined, which this prefix-only
-/// design structurally can't see (same reason the total-noop check never
-/// covered it either). Filed separately as #1921 rather than folded in
-/// here.
-fn yq_assign_rhs_unused(path: &Expr, root: &OwnedValue) -> bool {
-    yq_assign_classify(path, root).rhs_unused()
-}
-
-/// Shared implementation behind [`yq_assign_is_total_noop`] and
-/// [`yq_assign_rhs_unused`]: whether writing `path` (a single *resolved*
+/// Whether writing `path` (a single *resolved*
 /// assignment-target path, one `resolve_dynamic_indexes` entry) into `root`
 /// is a total no-op, RHS-unused-but-changing, or a real RHS-dependent write
 /// (#1181/#1233/#1857 -- see [`PathAssignOutcome`]'s own doc comment for
@@ -15791,8 +15770,25 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
         Expr::Field(name) => match current {
             OwnedValue::Object(map) => match map.get(name) {
                 Some(v) => classify_yq_assign_prefix(v, rest),
-                None => PathAssignOutcome::NeedsRhs,
+                // An absent key autovivifies exactly like an explicit
+                // `Null` value would (real yq's `.a.b[].z = v` on `a: {}`
+                // and on `a: {b: null}` behave identically, confirmed
+                // live) -- recurse the same way rather than giving up
+                // immediately, so a later `Iterate` in `rest` still gets
+                // to answer `RhsUnusedButChanges` for its own empty
+                // fan-out (round-3 review of #1920 found this gap: the
+                // old unconditional `NeedsRhs` here meant `.a.b[].z =
+                // error("boom")` on `a: {}`/`a: null` both still
+                // evaluated the RHS, where real yq needs it for neither).
+                None => classify_yq_assign_prefix(&OwnedValue::Null, rest),
             },
+            // Same reasoning as the `None` case just above -- an explicit
+            // `Null` here (as opposed to one this function itself just
+            // synthesized from an absent key) autovivifies identically,
+            // so it recurses the same way instead of falling into the
+            // catch-all below (which is reserved for a genuine type
+            // mismatch, e.g. `Field` against an `Array`).
+            OwnedValue::Null => classify_yq_assign_prefix(current, rest),
             _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
             _ => PathAssignOutcome::NeedsRhs,
         },
@@ -16623,7 +16619,17 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(paths) => paths,
         Err(_) => return Ok(YqAssignNoopCheck::NotChecked),
     };
-    if paths.iter().all(|p| yq_assign_is_total_noop(p, &pristine)) {
+    // Classified once per path and reused for both the total-noop and
+    // rhs-unused decisions below, instead of walking each path twice via
+    // separately-called `yq_assign_is_total_noop`/`yq_assign_rhs_unused`
+    // (#1920 round 3: an earlier version of this fix built the merged
+    // `classify_yq_assign_prefix` walk but never actually updated this,
+    // its only caller, to stop invoking it twice).
+    let outcomes: Vec<PathAssignOutcome> = paths
+        .iter()
+        .map(|p| yq_assign_classify(p, &pristine))
+        .collect();
+    if outcomes.iter().all(PathAssignOutcome::is_total_noop) {
         return Ok(YqAssignNoopCheck::Skip(pristine));
     }
     // #1857: not a total no-op (the document does change), but every
@@ -16631,10 +16637,11 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Iterate` autovivifying `Null` into an empty array, most commonly.
     // Perform the write now with a placeholder value and route it through
     // the same `Skip` channel: `set_path` can't fail here and the
-    // placeholder is never actually read, since `yq_assign_rhs_unused`
-    // already proved every write this path reaches is either a no-op or an
-    // autovivify-only step with zero elements to write into.
-    if paths.iter().all(|p| yq_assign_rhs_unused(p, &pristine)) {
+    // placeholder is never actually read, since every outcome above is
+    // already known to be `TotalNoop`/`RhsUnusedButChanges`, proving every
+    // write this path reaches is either a no-op or an autovivify-only step
+    // with zero elements to write into.
+    if outcomes.iter().all(PathAssignOutcome::rhs_unused) {
         let mut result = pristine;
         for path in &paths {
             set_path::<S>(&mut result, path, OwnedValue::Null, true, true)?;
