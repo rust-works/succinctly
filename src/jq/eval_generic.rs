@@ -966,16 +966,7 @@ fn distinct_key_cursors_checked<V: DocumentValue>(
     collapse: bool,
 ) -> Result<Vec<V::Cursor>, EvalError> {
     let mut out = Vec::new();
-    let mut cursors = DistinctKeyCursors::new(fields, collapse);
-    for (key, cursor) in cursors.by_ref() {
-        if key_is_malformed(&key) {
-            return Err(fields.malformed_member_error());
-        }
-        out.push(cursor);
-    }
-    if cursors.ended_unpaired() || cursors.delimiter_fault() {
-        return Err(fields.malformed_member_error());
-    }
+    walk_distinct_keys_checked::<V>(fields, collapse, |cursor| out.push(cursor))?;
     Ok(out)
 }
 
@@ -984,19 +975,39 @@ fn distinct_key_cursors_checked<V: DocumentValue>(
 /// cursor back -- `try_single_generic`'s `LazyKeys` arm (#1936) hands the
 /// original, still-lazy value back unchanged on success, so collecting a
 /// `Vec<V::Cursor>` there would be a pure O(n)-space cost for an answer
-/// that's thrown away every time. Mirrors `Builtin::Last`'s own inline
-/// walk below (review already caught this exact `distinct_key_cursors_checked`-
-/// for-a-yes/no-answer mistake once there), pulled out since a second call
-/// site now wants the identical check with no cursor to track either.
+/// that's thrown away every time (review already caught this exact
+/// `distinct_key_cursors_checked`-for-a-yes/no-answer mistake once, on the
+/// first version of this fix). `on_cursor` is a no-op closure here, which
+/// monomorphizes away to nothing -- no `Vec`, no allocation.
 fn keys_are_well_formed<V: DocumentValue>(
     fields: &V::Fields,
     collapse: bool,
 ) -> Result<(), EvalError> {
+    walk_distinct_keys_checked::<V>(fields, collapse, |_cursor| {})
+}
+
+/// Shared walk behind [`distinct_key_cursors_checked`] and
+/// [`keys_are_well_formed`]: both need the identical `DistinctKeyCursors`
+/// walk and #1194/#1677 exhaustion check, differing only in whether the
+/// caller wants each cursor or just the pass/fail verdict -- `on_cursor`
+/// is that difference, not a new allocation (a `Vec::push` for the former,
+/// a no-op for the latter). Pulled out so the check itself has exactly one
+/// definition instead of two copies that could silently drift apart (the
+/// codebase's own precedent for why this matters: `Builtin::Last`'s inline
+/// walk below already diverged from both of these by omitting the
+/// `delimiter_fault()` half of the check -- tracked as #1956, not fixed
+/// here since it predates and is independent of this fix).
+fn walk_distinct_keys_checked<V: DocumentValue>(
+    fields: &V::Fields,
+    collapse: bool,
+    mut on_cursor: impl FnMut(V::Cursor),
+) -> Result<(), EvalError> {
     let mut cursors = DistinctKeyCursors::new(fields, collapse);
-    for (key, _cursor) in cursors.by_ref() {
+    for (key, cursor) in cursors.by_ref() {
         if key_is_malformed(&key) {
             return Err(fields.malformed_member_error());
         }
+        on_cursor(cursor);
     }
     if cursors.ended_unpaired() || cursors.delimiter_fault() {
         return Err(fields.malformed_member_error());
@@ -3666,6 +3677,10 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 }
                 last_cursor = Some(cursor);
             }
+            // Missing `|| cursors.delimiter_fault()` here (unlike this
+            // function's own `distinct_key_cursors_checked`/
+            // `keys_are_well_formed` siblings) is a pre-existing, tracked
+            // gap (#1956), not addressed in this pass.
             if cursors.ended_unpaired() {
                 return GenericResult::Error(fields.malformed_member_error());
             }
@@ -4433,6 +4448,12 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
                 sorted,
                 collapse,
             },
+            // Unreachable for every format shipped today: `malformed_member_error`
+            // (the default and JSON's override alike) always builds a plain,
+            // catchable `EvalError::new(...)`, never a `DecodeFailure`-kind
+            // error, so this arm's condition is never true. Kept anyway,
+            // matching the `LazySeq` arm above -- defensive symmetry for a
+            // future format whose `malformed_member_error` ever does tag one.
             Err(e) if e.is_decode_failure() => GenericResult::Error(e),
             Err(e) => run_catch(&e.payload()),
         },
