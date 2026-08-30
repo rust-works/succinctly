@@ -906,7 +906,7 @@ RHS-discard predicate tweak like its siblings above):
   $ printf 'a:\n  - 1\n  - 2\n' | yq            -o=json '.a.b[].c = error("boom")'
   Error: cannot index array with 'b' (strconv.ParseInt: parsing "b": invalid syntax)
   $ printf 'a:\n  - 1\n  - 2\n' | succinctly yq -o=json '.a.b[].c = error("boom")'
-  jq: error: boom
+  Error: boom
   ```
 - **An `Index` step mid-chain is out of range on a real `Array`.** Real yq autovivifies the
   array out to that length (padding with `null`), then continues the write into the
@@ -916,7 +916,7 @@ RHS-discard predicate tweak like its siblings above):
   $ printf 'a:\n  - 1\n  - 2\n' | yq            -o=json -I=0 '.a[5][].b = error("boom")'
   {"a":[1,2,null,null,null,[]]}
   $ printf 'a:\n  - 1\n  - 2\n' | succinctly yq -o=json -I=0 '.a[5][].b = error("boom")'
-  jq: error: boom
+  Error: boom
   ```
 - **An `Index` step mid-chain hits a real `Object`.** Real yq coerces the numeric index to a
   string key and inserts it; succinctly has no such coercion and evaluates the RHS instead:
@@ -924,7 +924,7 @@ RHS-discard predicate tweak like its siblings above):
   $ printf 'a: {}\n' | yq            -o=json -I=0 '.a[0][].b = error("boom")'
   {"a":{"0":[]}}
   $ printf 'a: {}\n' | succinctly yq -o=json -I=0 '.a[0][].b = error("boom")'
-  jq: error: boom
+  Error: boom
   ```
 
 Pinned as known-divergent by `test_yq_assign_all_noop_mismatched_element_type_1432`
