@@ -26891,3 +26891,141 @@ fn test_seq_value_error_location_marker_1723() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }
+
+/// #1723: a `--seq` record that is well-formed up to a malformed *suffix*
+/// still yields the values real jq managed to read.
+///
+/// Previously the whole record was dropped, so `\x1e1 {invalid` printed
+/// nothing where jq prints `1`. Three oracle-derived rules together
+/// reproduce every shape found:
+///
+/// 1. A token that *scans* is validated and dropped if invalid -- never
+///    resynced into. `{"a":1 xyz}` scans as one token (braces match), so jq
+///    emits nothing rather than picking the `"a"` out of its middle.
+/// 2. An **unterminated** `"`/`{`/`[` swallows the rest of the record;
+///    other junk resyncs -- structural punctuation by one byte, a bad token
+///    up to the next whitespace (so `-e5 7` is `7`, not `5` and `7`).
+/// 3. A number is complete only when whitespace follows it.
+#[test]
+fn test_seq_malformed_suffix_keeps_the_prefix_1723() -> Result<()> {
+    for (input, expected, why) in [
+        (
+            "\x1e1 {invalid\n",
+            "1\n",
+            "values before the malformed suffix survive",
+        ),
+        (
+            "\x1e1 2 {invalid\n",
+            "1\n2\n",
+            "all of them, not just the first",
+        ),
+        (
+            "\x1e{\"a\":1} xyz\n",
+            "{\"a\":1}\n",
+            "a bad token after a good value",
+        ),
+        (
+            "\x1e1 \"a\n",
+            "1\n",
+            "unterminated string swallows only what follows it",
+        ),
+        ("\x1e1 [1,2\n", "1\n", "unterminated array likewise"),
+        // Rule 1: scanned-but-invalid containers are never resynced into.
+        (
+            "\x1e{\"a\":1 xyz}\n",
+            "",
+            "braces match, so it is one invalid token",
+        ),
+        ("\x1e[1,2 3]\n", "", "same for brackets"),
+        ("\x1e[1 2]\n", "", "same"),
+        // Rule 2: what resyncs, and by how much.
+        ("\x1e} 5\n", "5\n", "stray structural byte skips one"),
+        ("\x1e,2\n", "2\n", "so does a comma"),
+        ("\x1e{\"a\":1} } 7\n", "{\"a\":1}\n7\n", "and mid-record"),
+        (
+            "\x1e-e5 7\n",
+            "7\n",
+            "a bad token is consumed whole, not byte by byte",
+        ),
+        (
+            "\x1exy5 7\n",
+            "7\n",
+            "otherwise the 5 inside it would be emitted",
+        ),
+        (
+            "\x1etru5 7\n",
+            "7\n",
+            "including one that scans as a short literal run",
+        ),
+        ("\x1e@ 7\n", "7\n", "and punctuation that starts nothing"),
+        ("\x1efals 7\n", "7\n", "a failed literal"),
+        ("\x1exyz\n", "", "with nothing to resync onto"),
+        // Rule 3, now general rather than a last-value special case.
+        (
+            "\x1e1,2\n",
+            "2\n",
+            "a number before a comma is not terminated",
+        ),
+        ("\x1e1 2,3\n", "1\n3\n", "only the unterminated one is lost"),
+        (
+            "\x1e{\"a\":1},2\n",
+            "{\"a\":1}\n2\n",
+            "non-numbers self-terminate",
+        ),
+        ("\x1e\"a\",2\n", "\"a\"\n2\n", "including strings"),
+        ("\x1e1,\n", "", "nothing left to resync onto"),
+        (
+            "\x1e1,2,3\n",
+            "3\n",
+            "each unterminated number is dropped in turn",
+        ),
+        ("\x1e1 2 3,4\n", "1\n2\n4\n", "mixed"),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
+        let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
+        assert_eq!(stripped, expected, "input {input:?} -- {why}");
+        assert_eq!(code, 0, "input {input:?}");
+    }
+    Ok(())
+}
+
+/// #1723: a record that *ends* unresolved leaves real jq with no EOF
+/// position, even when it yielded values first.
+///
+/// `\x1e"a" 2` emits `"a"` and still reports `<unknown>`, because its
+/// trailing `2` never resolved. Defining "dropped" as "yielded nothing"
+/// instead got this backwards and broke #1542's own location test — pinned
+/// here so the two questions cannot be conflated again.
+#[test]
+fn test_seq_trailing_unresolved_still_reports_unknown_1723() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!("sjq-seq-unres-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join("z.json");
+    let path = file.to_str().expect("temp path is utf-8");
+
+    for (input, expected_marker, why) in [
+        (
+            "\x1e\"a\" 2",
+            "<unknown>",
+            "yields \"a\", but ends unresolved",
+        ),
+        ("\x1e1 \"a\"", "z.json:0", "ends resolved"),
+        ("\x1e\"a\"", "z.json:0", "single resolved value"),
+        ("\x1e1", "<unknown>", "single unresolved bare number"),
+        ("\x1e{\"a\":1", "<unknown>", "unterminated container"),
+    ] {
+        std::fs::write(&file, input)?;
+        let (_out, stderr, _code) =
+            run_jq_full(&["--seq", "-s", "-c", "error(\"x\")", path], None)?;
+        let marker = stderr
+            .lines()
+            .find(|l| l.starts_with("jq: error"))
+            .unwrap_or_default();
+        assert!(
+            marker.contains(expected_marker),
+            "input {input:?} -- {why}: expected {expected_marker:?} in {marker:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
