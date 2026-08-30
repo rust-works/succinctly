@@ -2295,6 +2295,31 @@ fn is_flow_safe(value: &OwnedValue, comments: &CommentTree) -> bool {
 /// renders as `*name`, so it is inline no matter how large the anchored
 /// value it points at happens to be. Getting that wrong renders `b: *x` as
 /// a block mapping with `*x` dangling above it.
+/// DOM twin of `light.rs`'s `compact_child_indent` (#1485): the indent for
+/// content nested one level inside a compact-rendered field/element's own
+/// value. An ordinary `{recursion_base}{indent_str}` step, *unless* that
+/// step wouldn't land past `indent` (the field's own compact-adjusted
+/// indent) -- real yq's own rule, which only bites when `indent_str`'s
+/// width is `<=` the compact `- `/first-field offset (2 columns) --
+/// real yq's own default, `-I=2`, is exactly that boundary. See
+/// `light.rs`'s `compact_child_indent` for the full live-verified
+/// rationale (both writers are pinned against the same oracle behavior,
+/// #763).
+///
+/// Reduces to the pre-existing, always-correct `format!("{indent}{step}")`
+/// whenever `recursion_base == indent` (the non-compact case, the vast
+/// majority of calls): the "normal" candidate is then always longer than
+/// `indent` itself (appending at least one character), so the `if` always
+/// takes that branch.
+fn compact_child_indent(recursion_base: &str, indent: &str, indent_str: &str) -> String {
+    let normal = format!("{recursion_base}{indent_str}");
+    if normal.chars().count() > indent.chars().count() {
+        normal
+    } else {
+        format!("{indent}{indent_str}")
+    }
+}
+
 fn defers_to_own_block(value: &OwnedValue, comments: &CommentTree) -> bool {
     comments.alias_name().is_none()
         && !is_flow_safe(value, comments)
@@ -2364,7 +2389,7 @@ fn emit_yaml_value(
     indent: &str,
     in_flow: bool,
 ) -> String {
-    emit_yaml_value_at_depth(value, comments, config, indent, in_flow, 0)
+    emit_yaml_value_at_depth(value, comments, config, indent, in_flow, 0, indent)
 }
 
 /// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
@@ -2374,6 +2399,16 @@ fn emit_yaml_value(
 /// guarded by #1015; this is YAML-target's own copy), reachable on a
 /// value constructed via `reduce`/`foreach`/etc. with no adversarial
 /// document on either side.
+///
+/// `recursion_base` (#1485): the indent a *nested* container reached from
+/// this value should step deeper from -- equal to `indent` everywhere
+/// except right after a real-yq "compact" positioning (the `Array` arm's
+/// two compact branches below, which pass this call's own pre-compact
+/// `indent` rather than the compact-adjusted one they pass as `indent`
+/// itself). See `light.rs`'s `stream_yaml_value` doc comment on its own
+/// identical parameter, and `compact_child_indent` just above, for the
+/// full live-verified rationale -- this DOM writer and that streaming one
+/// are pinned against the same oracle behavior (#763).
 fn emit_yaml_value_at_depth(
     value: &OwnedValue,
     comments: &CommentTree,
@@ -2381,6 +2416,7 @@ fn emit_yaml_value_at_depth(
     indent: &str,
     in_flow: bool,
     depth: usize,
+    recursion_base: &str,
 ) -> String {
     assert_value_tree_depth(depth);
     // An alias renders as `*name` and never writes the value it resolves
@@ -2442,6 +2478,7 @@ fn emit_yaml_value_at_depth(
                             indent,
                             true,
                             depth + 1,
+                            indent,
                         );
                         // `[&x 1, *x]` — a flow item's own anchor sits
                         // immediately before it (#763), the DOM twin of
@@ -2486,6 +2523,10 @@ fn emit_yaml_value_at_depth(
                                 // slot, so its value nests exactly as deep as an
                                 // unanchored element's would).
                                 let val_indent = compact_indent;
+                                // #1485: `recursion_base` is this element's
+                                // own pre-compact `indent`, not `val_indent`
+                                // -- any further nesting inside this
+                                // element's value steps from there.
                                 let val = emit_yaml_value_at_depth(
                                     v,
                                     elem_comments,
@@ -2493,6 +2534,7 @@ fn emit_yaml_value_at_depth(
                                     &val_indent,
                                     false,
                                     depth + 1,
+                                    indent,
                                 );
                                 let val =
                                     append_own_comment_line(val, elem_comments.own(), &val_indent);
@@ -2519,6 +2561,8 @@ fn emit_yaml_value_at_depth(
                             // effect `stream_yaml_value`'s cursor-based
                             // sibling gets for free from its per-field/
                             // per-element loop only indenting 2nd+ items.
+                            // #1485: `recursion_base` is this element's
+                            // own pre-compact `indent`, not `compact_indent`.
                             let rendered = emit_yaml_value_at_depth(
                                 v,
                                 elem_comments,
@@ -2526,6 +2570,7 @@ fn emit_yaml_value_at_depth(
                                 &compact_indent,
                                 false,
                                 depth + 1,
+                                indent,
                             );
                             // The element's own comment goes on its own
                             // line rather than glued onto its last
@@ -2548,6 +2593,7 @@ fn emit_yaml_value_at_depth(
                                 &val_indent,
                                 false,
                                 depth + 1,
+                                &val_indent,
                             );
                             let comment_suffix = trailing_comment_suffix(elem_comments);
                             let anchor = anchor_decl_prefix(elem_comments);
@@ -2575,6 +2621,7 @@ fn emit_yaml_value_at_depth(
                             indent,
                             true,
                             depth + 1,
+                            indent,
                         );
                         // `{x: &y 1, z: *y}` (#763).
                         let anchor = anchor_decl_prefix(field_comments);
@@ -2598,7 +2645,10 @@ fn emit_yaml_value_at_depth(
                         let key = yaml_quote_key(k);
                         let field_comments = comments.field(k);
                         let comment_suffix = trailing_comment_suffix(field_comments);
-                        let val_indent = format!("{indent}{}", config.indent_str);
+                        // #1485: steps from `recursion_base`, not `indent`
+                        // -- see `compact_child_indent`'s own doc comment.
+                        let val_indent =
+                            compact_child_indent(recursion_base, indent, &config.indent_str);
                         let anchor = anchor_decl_prefix(field_comments);
                         // Check if value needs to be on next line - a
                         // flow-styled container stays on the key's own line
@@ -2623,6 +2673,7 @@ fn emit_yaml_value_at_depth(
                                 &val_indent,
                                 false,
                                 depth + 1,
+                                &val_indent,
                             );
                             let val =
                                 append_own_comment_line(val, field_comments.own(), &val_indent);
@@ -2648,6 +2699,7 @@ fn emit_yaml_value_at_depth(
                                 &val_indent,
                                 false,
                                 depth + 1,
+                                &val_indent,
                             );
                             // The value's own comment takes priority; fall
                             // back to the key's own comment when the value

@@ -2626,6 +2626,107 @@ fn test_seq_item_anchor_deferred_indent_at_non_default_width_slurp_1484() -> Res
     Ok(())
 }
 
+/// #1485: a compact sequence-item's own visual +2 offset doesn't compound
+/// at every level below it -- only the item's own first field/element sits
+/// at `dash_indent + 2`; everything nested *inside* that field's own value
+/// steps by an ordinary `indent_spaces` from `dash_indent` itself, not
+/// from the 2-column-wider column `p`'s own key visually occupies. Covers
+/// the streaming path (identity) at `-I=4` (the issue's own headline
+/// repro) and the DOM path (forced via a write) at the same width.
+/// Expected output verified live against real yq v4.53.3.
+#[test]
+fn test_compact_seq_item_nested_indent_does_not_compound_streaming_1485() -> Result<()> {
+    let yaml = "l:\n  - p:\n      q:\n        r: 1\n  - x\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        streamed,
+        "l:\n    - p:\n        q:\n            r: 1\n    - x\n"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_compact_seq_item_nested_indent_does_not_compound_dom_1485() -> Result<()> {
+    let yaml = "l:\n  - p:\n      q:\n        r: 1\n";
+
+    let (dom, code) = run_yq_stdin(".l[0].p.q.r = 1", yaml, &["-I=4"])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom, "l:\n    - p:\n        q:\n            r: 1\n");
+
+    Ok(())
+}
+
+/// #1485: the same fix at real yq's *default* indent (`-I=2`, the width
+/// every un-flagged invocation actually uses) hits a genuinely different
+/// arithmetic branch than `-I=4` above -- `indent_spaces` (2) equals
+/// `COMPACT_DASH_WIDTH` (also 2) exactly, so a single ordinary step from
+/// the sequence item's own indent would land `q` at the *same* column
+/// `p`'s own key already visually occupies (an invalid YAML nesting).
+/// Real yq instead steps an extra `indent_spaces` past that column in
+/// this one case; `-I=3` and up never hit it, since a single ordinary
+/// step already clears it there. Live-verified against yq v4.53.3 across
+/// `-I=2` through `-I=6` before writing this pin.
+#[test]
+fn test_compact_seq_item_nested_indent_at_default_width_1485() -> Result<()> {
+    let yaml = "l:\n  - p:\n      q:\n        r: 1\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, "l:\n  - p:\n      q:\n        r: 1\n");
+
+    let (dom, code) = run_yq_stdin(".l[0].p.q.r = 1", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(dom, "l:\n  - p:\n      q:\n        r: 1\n");
+
+    Ok(())
+}
+
+/// #1485: a *second*, non-first field of the same compact-rendered
+/// mapping (`p2`, a sibling of `p`) needs the identical correction for
+/// its own nested value -- the fix lives in the mapping-field loop shared
+/// by every field, not just the one sharing the dash's line. Verified at
+/// the default width, where the correction actually changes the answer.
+#[test]
+fn test_compact_seq_item_sibling_field_nested_indent_1485() -> Result<()> {
+    let yaml = "l:\n  - p: 1\n    p2:\n      q2: 2\n";
+
+    let (streamed, code) = run_yq_stdin(".", yaml, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, "l:\n  - p: 1\n    p2:\n      q2: 2\n");
+
+    Ok(())
+}
+
+/// #1485: a block scalar deferred to its own line under a sequence item
+/// (`- |`) is compact-positioned too -- every `- ` is individually
+/// compact in real yq, deferred scalars included -- where the analogous
+/// mapping-field position (`k: |`) is an ordinary, non-compact step.
+/// `write_deferred_value` used to compute an ordinary step unconditionally
+/// for both, since it's shared between the two callers.
+#[test]
+fn test_compact_seq_item_deferred_block_scalar_indent_1485() -> Result<()> {
+    let (seq_item, code) = run_yq_stdin(".", "l:\n  - |\n    hello\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(seq_item, "l:\n  - |\n    hello\n");
+
+    // Control: the mapping-field position is unaffected, still an
+    // ordinary step.
+    let (mapping_field, code) = run_yq_stdin(".", "l:\n  k: |\n    hello\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(mapping_field, "l:\n  k: |\n    hello\n");
+
+    // The two compose correctly together too: a block scalar that is
+    // itself the compact-shared field's own deferred value.
+    let (compact_field, code) = run_yq_stdin(".", "l:\n  - k: |\n      hello\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(compact_field, "l:\n  - k: |\n      hello\n");
+
+    Ok(())
+}
+
 /// #1486: `-I=1`'s YAML output clamps to the same 2-column step as `-I=2`
 /// in real yq (verified live against v4.53.3, byte-identical at every
 /// level -- mappings, sequences, and compact/anchor-deferred sequence

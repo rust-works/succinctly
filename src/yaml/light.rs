@@ -1360,7 +1360,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // `Mapping` arm to notice on every recursive call (#835).
         let self_ = self.resolve_bare_seq_item();
         self_.write_leading_anchor(out)?;
-        self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)
+        self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false, "")
     }
 
     /// Like [`Self::stream_yaml`], but also appends this cursor's own
@@ -1452,7 +1452,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             }
             out.write_str(&str_val)?;
         } else {
-            self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)?;
+            self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false, "")?;
         }
         if matches!(value, YamlValue::Mapping(_) | YamlValue::Sequence(_)) {
             write_line_comment(out, self_.line_comment_raw())?;
@@ -1490,7 +1490,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // `stream_yaml` (#835): resolve once, reuse for both calls.
         let self_ = self.resolve_bare_seq_item();
         self_.write_leading_anchor(out)?;
-        self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false)
+        self_.stream_yaml_value(out, "", indent.width, indent.unit, sort_keys, false, "")
     }
 
     /// Write this cursor's own `&anchor` before streaming it as a YAML root.
@@ -1565,6 +1565,25 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     ///   (`bp_to_text_pos`) plus a byte scan, not free work to repeat
     ///   twice per element on this crate's flagship streaming path.
     ///   `false` everywhere else, which re-derives it as before.
+    /// - `recursion_base`: the indent string a *nested* container reached
+    ///   from this value should step deeper from — equal to `indent`
+    ///   everywhere except right after a real-yq "compact" positioning
+    ///   (#1485). Real YAML's own indentation rule is that once `- `'s
+    ///   compact offset ([`COMPACT_DASH_WIDTH`]) sets a mapping's
+    ///   structural indent level, every level nested *underneath* it steps
+    ///   by an ordinary `indent_spaces` amount from the *pre-compact*
+    ///   indent, not from that mapping's own (2-column-wider) visual
+    ///   column — confirmed live against yq v4.53.3 across 3+ nesting
+    ///   levels: `l:\n  - p:\n      q:\n        r: 1` puts `p`/`q`/`r` at
+    ///   columns 6/8/12 (a one-time `+2`, then plain `+4` steps under
+    ///   `-I=4`), not the naive 6/10/14 a uniform step from each level's
+    ///   own visual column would give. The two callers that pass a
+    ///   `recursion_base` different from `indent` (the `Sequence` arm's
+    ///   compact branches below) are the only place this ever needs to
+    ///   differ; every other call site — including this function's own
+    ///   recursive calls one level further down — passes the same string
+    ///   for both, since the discount is a one-time correction that
+    ///   resets the moment an ordinary (non-compact) step is taken.
     #[allow(clippy::too_many_arguments)] // STYLE-0004: every param is threaded through this function's own recursion; a struct would hide the 1:1 relationship each has to a specific rendering decision
     fn stream_yaml_value<Out: core::fmt::Write>(
         &self,
@@ -1574,6 +1593,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         unit: char,
         sort_keys: bool,
         known_not_flow: bool,
+        recursion_base: &str,
     ) -> StreamResult {
         match self.value() {
             YamlValue::Null => Ok(out.write_str("null")?),
@@ -1834,7 +1854,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 write_anchor_tag(out, value.anchor(), value.explicit_tag())?;
                             }
                             out.write_char('\n')?;
-                            let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
+                            // #1485: steps from `recursion_base`, not
+                            // `indent` (see this function's own doc
+                            // comment), via `compact_child_indent`'s own
+                            // "must clear the compact visual column" rule.
+                            let child_indent =
+                                compact_child_indent(recursion_base, indent, indent_spaces, unit);
                             out.write_str(&child_indent)?;
                             value.stream_yaml_value(
                                 out,
@@ -1843,6 +1868,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                                 true,
+                                &child_indent,
                             )?;
                             write_line_comment(out, value.line_comment_raw())?;
                         } else {
@@ -1861,10 +1887,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // path about anchors/tags, the special case
                             // became redundant with it (verified: deleting
                             // it changes no test outcome) and was removed.
+                            //
+                            // #1485: steps from `recursion_base`, not
+                            // `indent` -- same reasoning as the container
+                            // branch above, via `compact_child_indent`.
+                            let child_indent =
+                                compact_child_indent(recursion_base, indent, indent_spaces, unit);
                             write_deferred_value(
                                 out,
                                 &value,
-                                indent,
+                                &child_indent,
                                 indent_spaces,
                                 unit,
                                 sort_keys,
@@ -1971,6 +2003,14 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 // indent step (#1362 -- the anchor/tag prefix
                                 // occupies the `- ` slot on its own line, but
                                 // that doesn't change how deep its value nests).
+                                //
+                                // #1485: the recursive call's own
+                                // `recursion_base` is this item's *pre-compact*
+                                // `indent`, not `child_indent` -- any further
+                                // nesting inside this element's value steps
+                                // from there, not from its 2-column-wider
+                                // visual column (see `stream_yaml_value`'s own
+                                // doc comment on `recursion_base`).
                                 let child_indent = compact_yaml_indent(indent);
                                 out.write_str(&child_indent)?;
                                 cursor.stream_yaml_value(
@@ -1980,6 +2020,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                     true,
+                                    indent,
                                 )?;
                             } else {
                                 out.write_str("- ")?;
@@ -1991,6 +2032,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     unit,
                                     sort_keys,
                                     true,
+                                    indent,
                                 )?;
                             }
                             write_line_comment(out, cursor.line_comment_raw())?;
@@ -1998,11 +2040,17 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // #1077: mirrors the mapping-field branch above
                             // -- see `write_deferred_value`'s own doc
                             // comment for the byte-for-byte spacing rule.
+                            //
+                            // #1485: every `- ` item is individually
+                            // "compact" in real yq, deferred scalar values
+                            // included -- `compact_yaml_indent`, not
+                            // `deeper_yaml_indent`, is the right step here.
                             out.write_char('-')?;
+                            let child_indent = compact_yaml_indent(indent);
                             write_deferred_value(
                                 out,
                                 &cursor,
-                                indent,
+                                &child_indent,
                                 indent_spaces,
                                 unit,
                                 sort_keys,
@@ -6790,10 +6838,20 @@ fn write_anchor_tag<Out: core::fmt::Write>(
 /// this is what an earlier draft of #1077's fix got wrong, silently
 /// dropping a no-anchor explicit tag on an absent value instead (found by
 /// review before merge).
+///
+/// `child_indent` is pre-computed by the caller rather than derived here
+/// from a bare `indent` (#1485): a mapping field's own deferred value
+/// steps by an ordinary `deeper_yaml_indent`, but a sequence item's steps
+/// by `compact_yaml_indent` instead -- every `- ` item is individually
+/// "compact" in real yq, deferred scalar values included (confirmed live:
+/// `- |\n    hello` puts `hello` 2 columns past the dash's own indent, not
+/// a full `indent_spaces` step past it) -- and this one function is
+/// shared by both callers, so it takes whichever its caller already knows
+/// is right instead of guessing.
 fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     out: &mut Out,
     value: &YamlCursor<'_, W>,
-    indent: &str,
+    child_indent: &str,
     indent_spaces: usize,
     unit: char,
     sort_keys: bool,
@@ -6809,8 +6867,15 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
         // present (`: value` or `: &anchor value`), matching the original,
         // un-extracted logic's `|| !absent` conditions byte-for-byte.
         out.write_char(' ')?;
-        let child_indent = deeper_yaml_indent(indent, indent_spaces, unit);
-        value.stream_yaml_value(out, &child_indent, indent_spaces, unit, sort_keys, false)?;
+        value.stream_yaml_value(
+            out,
+            child_indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            false,
+            child_indent,
+        )?;
     }
     Ok(())
 }
@@ -6860,6 +6925,39 @@ fn compact_yaml_indent(indent: &str) -> String {
         next.push(' ');
     }
     next
+}
+
+/// The indent for content nested one level inside a compact-rendered
+/// mapping field's own value -- an ordinary `deeper_yaml_indent` step from
+/// `recursion_base` (the pre-compact indent), *unless* that step wouldn't
+/// land past `compact_indent` (the field's own compact-adjusted `indent`),
+/// in which case real yq instead steps from `compact_indent` itself
+/// (#1485).
+///
+/// This matters only when `indent_spaces <= COMPACT_DASH_WIDTH` -- real
+/// yq's own default, `-I=2`, is exactly that boundary. Live-verified
+/// against yq v4.53.3 across `-I=2` through `-I=6` on
+/// `l:\n  - p:\n      q:\n        r: 1`: `q` (the first nested child) sits
+/// at `recursion_base + 2*indent_spaces` for `-I=2` (a naive single step
+/// would land it at the *same* column `p`'s own key already occupies --
+/// invalid YAML nesting) but at plain `recursion_base + indent_spaces` for
+/// `-I=3` and up, where a single step already clears `p`'s column. `r`
+/// (one level deeper still) is always a plain, ordinary step from
+/// whatever `q` resolved to either way -- this correction only ever
+/// applies at the one boundary where a compact field's own visual column
+/// could otherwise collide with its child's.
+fn compact_child_indent(
+    recursion_base: &str,
+    compact_indent: &str,
+    indent_spaces: usize,
+    unit: char,
+) -> String {
+    let normal = deeper_yaml_indent(recursion_base, indent_spaces, unit);
+    if normal.chars().count() > compact_indent.chars().count() {
+        normal
+    } else {
+        deeper_yaml_indent(compact_indent, indent_spaces, unit)
+    }
 }
 
 /// Write a mapping field's key.
@@ -6951,7 +7049,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     if absent {
         return Ok(out.write_str("''")?);
     }
-    value.stream_yaml_value(out, "", 0, unit, sort_keys, false)
+    value.stream_yaml_value(out, "", 0, unit, sort_keys, false, "")
 }
 
 /// Write a trailing same-line comment after a value, if present (issue
@@ -7161,6 +7259,10 @@ where
                     // `stream_yaml_value`'s own Sequence arm -- the anchor/
                     // tag prefix occupies the `- ` slot on its own line, but
                     // that doesn't change how deep its value nests).
+                    //
+                    // #1485: `recursion_base` is `own_indent` (pre-compact),
+                    // not `child_indent` -- see `stream_yaml_value`'s own
+                    // doc comment on `recursion_base`.
                     out.write_str(&child_indent)?;
                     cursor.stream_yaml_value(
                         out,
@@ -7169,6 +7271,7 @@ where
                         unit,
                         sort_keys,
                         true,
+                        &own_indent,
                     )?;
                 } else {
                     out.write_str("- ")?;
@@ -7179,6 +7282,7 @@ where
                         unit,
                         sort_keys,
                         true,
+                        &own_indent,
                     )?;
                 }
                 write_line_comment(out, cursor.line_comment_raw())?;
@@ -7197,8 +7301,12 @@ where
                 // live (`- &anc null` instead of `- &anc !!mytag`), so this
                 // now routes through the same `write_deferred_value` helper
                 // instead of hand-writing the anchor.
+                // #1485: every `- ` item is individually "compact" in real
+                // yq -- `child_indent` (already computed above), not a
+                // fresh normal step off `own_indent`, is the right value
+                // here.
                 out.write_char('-')?;
-                write_deferred_value(out, &cursor, &own_indent, indent_spaces, unit, sort_keys)?;
+                write_deferred_value(out, &cursor, &child_indent, indent_spaces, unit, sort_keys)?;
                 write_line_comment(out, cursor.line_comment_raw())?;
             }
         }
