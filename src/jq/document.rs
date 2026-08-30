@@ -1299,9 +1299,16 @@ impl KeyHashes {
     /// `true` means "these keys may be the same" -- see the type's note on
     /// conservatism.
     pub fn insert(&mut self, hash: u64) -> bool {
-        // Grow before inserting so the load factor never exceeds one half;
-        // past that, linear probing's run lengths climb sharply.
-        if (self.len + 1) * 2 > self.slots.len() {
+        // Grow before inserting so the load factor never exceeds three
+        // quarters. It was one half until #1588: linear probing's run
+        // lengths do climb past that, but the table also halves, and on a
+        // wide object the locality wins outright -- measured on `wide/10mb`
+        // (629,881 keys), `keys_unsorted` went 52.8 -> 36.9 MiB peak RSS and
+        // *also* 0.106 -> 0.099s. A sweep says 3/4 is the point: 7/8 and
+        // 15/16 buy no further memory (the same power-of-two table serves
+        // all three at this key count) and only pay more probing, measuring
+        // 0.114s and 0.115s respectively.
+        if (self.len + 1) * 4 > self.slots.len() * 3 {
             self.grow();
         }
         let hash = if hash == 0 { 1 } else { hash };
