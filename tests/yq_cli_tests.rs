@@ -25849,3 +25849,56 @@ fn test_nth_limit_float_classification_matches_jq_mode_1825() -> Result<()> {
 
     Ok(())
 }
+
+/// #1916 is jq-mode only: `.a |= empty`'s "delete when the update filter
+/// wrote nothing" behavior does not apply in yq mode (`empty` itself isn't
+/// even valid yq syntax -- its lexer rejects the bare keyword, confirmed
+/// live against yq v4.53.3). `select(false)` reaches the same
+/// zero-output-filter shape through ordinary yq syntax, and real yq's own
+/// behavior for it is neither "delete" nor "always leave `null`" -- an
+/// already-existing key/element is left completely untouched, while one
+/// only reached through autovivification still lands `null`. This test
+/// locks in that `update_path`'s `Field`/`Index`/`Iterate` arms keep their
+/// pre-#1916 shape (still-`null`, not deleted) for an *existing* target in
+/// yq mode, guarding against the #1916 fix regressing yq the way an
+/// unconditional (non-`S::TAG`-gated) version of it did during review: it
+/// deleted the key/element outright there instead, which real yq does not
+/// do at all.
+#[test]
+fn test_field_index_iterate_update_path_unaffected_by_1916_in_yq_mode() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+
+    // Field: the key stays present (still `null`, matching this arm's
+    // pre-#1916 shape), not deleted.
+    let (out, code) = run_yq_stdin(".a |= select(false)", "a: 1\nb: 2\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":null,"b":2}"#);
+
+    // Index: the array keeps its length, not shrunk.
+    let (out, code) = run_yq_stdin(".[0] |= select(false)", "[1, 2, 3]\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[null,2,3]");
+
+    // Iterate over an array: no element removed.
+    let (out, code) = run_yq_stdin(".[] |= select(. != 2)", "[1, 2, 3]\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,null,3]");
+
+    // Iterate over an object: no key removed.
+    let (out, code) = run_yq_stdin(".[] |= select(. != 2)", "a: 1\nb: 2\nc: 3\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":1,"b":null,"c":3}"#);
+
+    // A negative out-of-range index still raises yq's own eager bounds
+    // error, not jq mode's deferred one -- unaffected by whether the
+    // update filter would have written anything.
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr(".[-10] |= select(false)", "[1, 2, 3]\n", args)?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Out of bounds negative array index"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
