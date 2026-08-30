@@ -910,23 +910,22 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return QueryResult::One(value);
                 }
                 // jq array slicing yields a single sub-array, not a stream of
-                // elements. #1932: `promote_borrowed_checked`, not an
-                // unchecked `to_owned` per element -- an undecodable
-                // element's string content must raise `decode_failure`, not
-                // silently become `""` (the same #1755 shape the adjacent
-                // `StandardJson::Object` arm below already guards against;
-                // this arm was apparently missed when #1755 patched that
-                // one). The partial prefix `promote_borrowed_checked`'s
-                // `Err` carries is discarded, not threaded into a `Partial`
-                // result: unlike a fan-out stream, this arm always produces
-                // exactly one aggregate `Array` value, so there is nothing
-                // for a caller to consume before the failure -- matching
-                // the `Object` arm's own `to_owned_checked` call just below,
-                // which discards its own error's prefix the same way.
+                // elements. #1932: `to_owned_checked`, not an unchecked
+                // `to_owned`, per element -- an undecodable element's string
+                // content must raise `decode_failure`, not silently become
+                // `""` (the same #1755 shape the adjacent `StandardJson::
+                // Object` arm below already guards against; this arm was
+                // apparently missed when #1755 patched that one). Mirrors
+                // that `Object` arm's own single `to_owned_checked` call
+                // (code review, #1941: an earlier version of this fix used
+                // `promote_borrowed_checked` instead, built for a different
+                // shape -- accumulating a partial prefix for a fan-out
+                // stream to report on error -- that this single-aggregate-
+                // value arm has no use for and was discarding unconditionally).
                 let sliced = slice_elements::<W>(elements, *start, *end);
-                match promote_borrowed_checked(sliced) {
+                match sliced.iter().map(to_owned_checked).collect() {
                     Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
-                    Err((_, e)) => QueryResult::Error(e),
+                    Err(e) => QueryResult::Error(e),
                 }
             }
             // yq treats a null/number/boolean target as an empty container
@@ -39280,9 +39279,9 @@ mod tests {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
         );
-        // Fails on the second element of the (post-slice) range, not just
-        // the first -- confirms the whole sliced range is checked, not only
-        // the initial element.
+        // The undecodable element is at index 1 here (vs. index 2 above) --
+        // confirms every position in the sliced range is checked, not only
+        // the first or the last.
         query!(
             &b"[1,\"\xff\xfe\",3,4]"[..],
             ".[0:3]",
