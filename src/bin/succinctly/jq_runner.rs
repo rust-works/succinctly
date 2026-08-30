@@ -3380,7 +3380,7 @@ fn seq_record_values(
         if is_last && seq_record_last_value_is_ambiguous(value_text, raw_segment) {
             continue;
         }
-        let Some(v) = seq_value_to_owned(value_text) else {
+        let Ok(v) = crate::output::json_bytes_to_owned_value(value_text.as_bytes()) else {
             // Parses but will not decode (#1247): dropped, exactly as the
             // pre-#1723 single-value path dropped it.
             continue;
@@ -3438,25 +3438,18 @@ fn seq_record_scan(segment: &str) -> Option<Vec<(usize, usize)>> {
 
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
 /// same leading-zero form (`007e5`) `--seq` has accepted since #1243.
+///
+/// Normalization is needed *here* and only here: `validate::validate` is
+/// strict RFC 8259 and rejects a leading zero, while the semi-indexer behind
+/// `json_bytes_to_owned_value` already reads `0007` as `7` on its own -- so
+/// the value-building side needs no fallback (an earlier draft had one, and
+/// coverage showed it could never run).
 fn seq_value_is_valid(value_text: &str) -> bool {
     if validate::validate(value_text.as_bytes()).is_ok() {
         return true;
     }
     let normalized = normalize_leading_zero_numbers(value_text);
     normalized != value_text && validate_json_str(&normalized).is_ok()
-}
-
-/// One `--seq` record value as an `OwnedValue`, applying #1243's
-/// leading-zero normalization to that value alone.
-fn seq_value_to_owned(value_text: &str) -> Option<OwnedValue> {
-    if let Ok(v) = crate::output::json_bytes_to_owned_value(value_text.as_bytes()) {
-        return Some(v);
-    }
-    let normalized = normalize_leading_zero_numbers(value_text);
-    if normalized == value_text {
-        return None;
-    }
-    crate::output::json_bytes_to_owned_value(normalized.as_bytes()).ok()
 }
 
 /// Whether `raw`'s trailing `--seq` record (RFC 7464, everything after the
