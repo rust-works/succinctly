@@ -17241,9 +17241,38 @@ fn through_slice<E: From<EvalError>>(
         // `-=`/`*=` on a null slice target exactly as unaffected by this
         // fix as `#1340`'s own issue text was ever scoped to be (jq mode
         // only) — not newly right, but not newly wrong either.
+        //
+        // `!terminal_write` no-op (#1873): the doc comment above described
+        // `edit`'s result as always having to become an array once it's
+        // done, but that's only true when the slice itself is the write.
+        // When there's a real tail after it (`.a[0:1][]? = 9` on missing
+        // `.a`), `edit` is `set_path`'s own recursion into that tail
+        // against a fresh `Null` -- and if the tail's navigation
+        // determines there's nothing to write (here, iterating zero
+        // elements over nothing, with the `cannot_iterate` error swallowed
+        // by `?`), it leaves `sub` untouched at `Null` and returns `Ok`
+        // without ever attempting a real write. Forcing that case through
+        // the array requirement raises "A slice of an array can only be
+        // assigned another array" where real jq leaves the whole document
+        // unchanged (confirmed live for `.a[0:1][]? = 9` and its `|=`
+        // twin, on `null`/`{}`/`{"a":null}`). A tail that *does* write
+        // something -- autovivifying a field (`.a[0:1].b = 9` -> `sub`
+        // becomes an `Object`) or an element (`.a[0:1][0] = 9` -> `sub`
+        // becomes an `Array`) -- never leaves `sub` as `Null`, so it still
+        // falls through to the same array requirement below, matching jq
+        // still erroring on the first of those two (an object can't splice
+        // into a slice) and succeeding on the second (already an array).
+        // Only reachable when `terminal_write` is false in the first
+        // place: `.a[0:1] = null` (a literal-`null` RHS as the slice's own
+        // terminal write) still has to raise the same error, since there
+        // `sub` staying `Null` reflects the RHS itself, not a swallowed
+        // no-op -- confirmed live it still errors in real jq.
         OwnedValue::Null if !container_noop => {
             let mut sub = OwnedValue::Null;
             edit(&mut sub)?;
+            if !terminal_write && matches!(sub, OwnedValue::Null) {
+                return Ok(());
+            }
             let OwnedValue::Array(items) = sub else {
                 return Err(EvalError::slice_assign_non_array().into());
             };
@@ -55464,6 +55493,111 @@ mod tests {
         query!(br#"{"b":[10,20,30]}"#, r".b[0:1].c = 9",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, r#"Cannot index array with string "c""#);
+            }
+        );
+    }
+
+    /// #1873: `through_slice`'s `Null` arm (added by #1340 above) required
+    /// `edit`'s result to become an `Array` unconditionally, even for a
+    /// mid-chain tail (`terminal_write: false`) whose own navigation
+    /// determines there's nothing to write at all -- a `?`-suppressed
+    /// `cannot_iterate` over the empty slice range leaves `edit`'s `sub`
+    /// untouched at `Null`, which used to be forced through the array
+    /// check and raise "A slice of an array can only be assigned another
+    /// array" where real jq leaves the whole document unchanged. Every
+    /// case here is oracle-verified against real jq 1.7.1. The residual
+    /// `.a: null` stub #1428 already tracks (eager `Field` autovivification
+    /// during navigation, unrelated to slices) is a separate, pre-existing,
+    /// broader issue -- out of scope here, and not asserted against below.
+    #[test]
+    fn test_assign_slice_mid_chain_iterate_over_null_noops_1873() {
+        // The trailing `.a: null` stub in every one of these outputs is
+        // #1428's separate, pre-existing, broader bug (eager `Field`
+        // autovivification during navigation, reachable with no slice
+        // involved at all -- `null | .a[]? = 9` already leaves the same
+        // stub behind on unmodified `main`) -- not something this fix
+        // touches. What this fix removes is the write-time error that
+        // used to fire instead of reaching that (separately imperfect)
+        // no-op at all.
+        query!(br"null", r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#);
+            }
+        );
+        query!(br"{}", r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#);
+            }
+        );
+        query!(br#"{"a":null}"#, r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#);
+            }
+        );
+        query!(br#"{"b":1}"#, r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"b":1,"a":null}"#);
+            }
+        );
+        // `|=` shares `through_slice`, so it shares the bug and the fix.
+        query!(br"null", r".a[0:1][]? |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#);
+            }
+        );
+        query!(br"{}", r".a[0:1][]? |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#);
+            }
+        );
+        // A non-optional `Iterate` tail still raises the ordinary
+        // navigation failure -- unaffected by this fix since `edit`
+        // propagates the error before `sub` is ever inspected.
+        query!(br"null", r".a[0:1][] = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot iterate over null (null)");
+            }
+        );
+        // A `Field` tail after the slice still has to raise the array
+        // requirement -- `edit` autovivifies `sub` into an `Object`, never
+        // leaving it `Null`, so it still falls through to the existing
+        // check (matching real jq erroring here too, `?` or not).
+        query!(br"null", r".a[0:1].b = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        query!(br"null", r".a[0:1].b? = 9",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        // A literal `null` RHS on the terminal slice write itself is a
+        // different shape (`terminal_write: true`) and must still error --
+        // `sub` staying `Null` there reflects the RHS, not a swallowed
+        // no-op.
+        query!(br"null", r".a[0:1] = null",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "A slice of an array can only be assigned another array");
+            }
+        );
+        // An `Index` tail after the slice still auto-vivifies successfully
+        // -- `edit` leaves `sub` as a real `Array`, never `Null`.
+        query!(br"null", r".a[0:1][0]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":[9]}"#);
+            }
+        );
+        // An existing array parent is unaffected either way -- `root`
+        // never reaches the `Null` arm at all for this shape.
+        query!(br#"{"a":[1,2,3]}"#, r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":[9,2,3]}"#);
+            }
+        );
+        query!(br#"{"a":[1,2,3]}"#, r".a[0:1][]? |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":[9,2,3]}"#);
             }
         );
     }
