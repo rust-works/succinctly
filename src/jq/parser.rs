@@ -3329,6 +3329,7 @@ impl<'a> Parser<'a> {
         // Phase 10: Number Classification & Constants
         // Check isinfinite, isnan, isnormal, isfinite before infinite, nan
         if self.matches_keyword("isinfinite") {
+            self.reject_unless_jq_extensions("isinfinite")?;
             self.consume_keyword("isinfinite");
             return Ok(Some(Builtin::IsInfinite));
         }
@@ -3338,10 +3339,12 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::IsNan));
         }
         if self.matches_keyword("isnormal") {
+            self.reject_unless_jq_extensions("isnormal")?;
             self.consume_keyword("isnormal");
             return Ok(Some(Builtin::IsNormal));
         }
         if self.matches_keyword("isfinite") {
+            self.reject_unless_jq_extensions("isfinite")?;
             self.consume_keyword("isfinite");
             return Ok(Some(Builtin::IsFinite));
         }
@@ -3351,6 +3354,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Infinite));
         }
         if self.matches_keyword("nan") {
+            self.reject_unless_jq_extensions("nan")?;
             self.consume_keyword("nan");
             return Ok(Some(Builtin::Nan));
         }
@@ -3570,6 +3574,7 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Now));
         }
         if self.matches_keyword("abs") {
+            self.reject_unless_jq_extensions("abs")?;
             self.consume_keyword("abs");
             return Ok(Some(Builtin::Abs));
         }
@@ -3801,6 +3806,7 @@ impl<'a> Parser<'a> {
 
         // Phase 18: Additional math functions
         if self.matches_keyword("trunc") {
+            self.reject_unless_jq_extensions("trunc")?;
             self.consume_keyword("trunc");
             return Ok(Some(Builtin::Trunc));
         }
@@ -6723,6 +6729,10 @@ mod tests {
             ("skip", "skip(1; .)"),
             ("asin", "0.5 | asin"),
             ("acosh", "1.5 | acosh"),
+            ("abs", "(-1.5) | abs"),
+            ("trunc", "1.5 | trunc"),
+            ("isinfinite", "1 | isinfinite"),
+            ("nan", "nan"),
         ];
 
         for (name, filter) in cases {
