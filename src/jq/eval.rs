@@ -38079,6 +38079,7 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jq::error::EvalErrorPayload;
     use crate::jq::{parse, parse_with_mode_and_extensions, ParserMode};
     use crate::json::JsonIndex;
 
@@ -43555,7 +43556,10 @@ mod tests {
         query!(br"{}", "error",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "{}");
-                assert_eq!(e.value, Some(OwnedValue::Object(IndexMap::new())));
+                assert_eq!(
+                    e.value,
+                    EvalErrorPayload::Value(OwnedValue::Object(IndexMap::new()))
+                );
             }
         );
 
@@ -43565,7 +43569,7 @@ mod tests {
                 assert_eq!(e.message, "something went wrong");
                 assert_eq!(
                     e.value,
-                    Some(OwnedValue::String("something went wrong".into()))
+                    EvalErrorPayload::Value(OwnedValue::String("something went wrong".into()))
                 );
             }
         );
@@ -43574,7 +43578,7 @@ mod tests {
         query!(br"{}", "error(42)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "42");
-                assert_eq!(e.value, Some(OwnedValue::Int(42)));
+                assert_eq!(e.value, EvalErrorPayload::Value(OwnedValue::Int(42)));
             }
         );
     }
