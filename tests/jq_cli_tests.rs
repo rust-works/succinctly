@@ -13,8 +13,7 @@ use tempfile::NamedTempFile;
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
 use cargo_run_exit::{
-    classify_cargo_run_exit, signal_death_error, spawn_with_signal_retry, succinctly_bin,
-    MAX_CARGO_RETRIES,
+    classify_cargo_run_exit, spawn_with_signal_retry, succinctly_bin, MAX_CARGO_RETRIES,
 };
 
 /// #1516: a signal-killed child used to render as an inscrutable
@@ -366,18 +365,9 @@ fn test_arithmetic() -> Result<()> {
 #[test]
 fn test_unary_minus() -> Result<()> {
     // Negate input value - use -- to prevent option parsing of -. filter
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "--", "-."])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"5")?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, code) = spawn_jq(&["--", "-."], Some(b"5"))?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "-5");
     Ok(())
 }
@@ -385,18 +375,9 @@ fn test_unary_minus() -> Result<()> {
 #[test]
 fn test_unary_minus_expression() -> Result<()> {
     // Negate a complex expression
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "--", "-(.a + .b)"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(br#"{"a":3,"b":2}"#)?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, code) = spawn_jq(&["--", "-(.a + .b)"], Some(br#"{"a":3,"b":2}"#))?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "-5");
     Ok(())
 }
@@ -404,18 +385,9 @@ fn test_unary_minus_expression() -> Result<()> {
 #[test]
 fn test_double_negation() -> Result<()> {
     // Double negation should return original value
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "--", "--."])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"5")?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, code) = spawn_jq(&["--", "--."], Some(b"5"))?;
     let stdout = String::from_utf8(output.stdout)?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "5");
     Ok(())
 }
@@ -489,15 +461,20 @@ fn test_slurp_with_raw_input_multiple_files() -> Result<()> {
     let mut file2 = NamedTempFile::new()?;
     writeln!(file2, "b")?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .arg("-R")
-        .arg("-s")
-        .arg("-c")
-        .arg(".")
-        .arg(file1.path())
-        .arg(file2.path())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("jq")
+                .arg("-R")
+                .arg("-s")
+                .arg("-c")
+                .arg(".")
+                .arg(file1.path())
+                .arg(file2.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.trim(), r#""a\nb\n""#);
@@ -1218,12 +1195,17 @@ fn test_from_file() -> Result<()> {
     let mut input_file = NamedTempFile::new()?;
     writeln!(input_file, r#"{{"name":"Alice"}}"#)?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .arg("-f")
-        .arg(filter_file.path())
-        .arg(input_file.path())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("jq")
+                .arg("-f")
+                .arg(filter_file.path())
+                .arg(input_file.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.trim(), r#""Alice""#);
@@ -1446,13 +1428,18 @@ fn test_multiple_file_inputs() -> Result<()> {
     let mut file2 = NamedTempFile::new()?;
     writeln!(file2, r#"{{"name":"Bob"}}"#)?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .arg("-r")
-        .arg(".name")
-        .arg(file1.path())
-        .arg(file2.path())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("jq")
+                .arg("-r")
+                .arg(".name")
+                .arg(file1.path())
+                .arg(file2.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout, "Alice\nBob\n");
@@ -1510,17 +1497,7 @@ fn test_builtin_first_last_on_empty_array_output_null() -> Result<()> {
 fn test_builtin_first_on_non_array_errors() -> Result<()> {
     // jq: 5 | first => error. The error goes to stderr and nothing to stdout,
     // and the process exits 5 so the failure is visible to a shell (#355).
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "first"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"5")?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, code) = spawn_jq(&["first"], Some(b"5"))?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -1533,8 +1510,7 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
         "Should report jq's indexing error for `5 | first`: {stderr}"
     );
     assert_eq!(
-        output.status.code(),
-        Some(5),
+        code, 5,
         "An uncaught eval error must exit 5 like jq: {stderr}"
     );
     Ok(())
@@ -1546,19 +1522,9 @@ fn test_builtin_first_on_non_array_errors() -> Result<()> {
 /// The jq golden corpus cannot host these: it compares stdout only and requires
 /// exit 0.
 fn jq_stderr(filter: &str, input: &str, extra_args: &[&str]) -> Result<String> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-    let output = cmd.wait_with_output()?;
+    let mut args: Vec<&str> = extra_args.to_vec();
+    args.push(filter);
+    let (output, _code) = spawn_jq(&args, Some(input.as_bytes()))?;
     Ok(String::from_utf8(output.stderr)?)
 }
 
@@ -1759,17 +1725,7 @@ fn test_contains_type_mismatch_errors() -> Result<()> {
     // CLI's generic evaluator, which reaches the check by delegating to the full
     // one. Like `first` above, the exit status is not asserted: runtime eval
     // errors still exit 0 rather than jq's 5 (#355).
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-c", r#"contains("a")"#])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"1")?;
-    }
-    let output = cmd.wait_with_output()?;
+    let (output, _code) = spawn_jq(&["-c", r#"contains("a")"#], Some(b"1"))?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -2264,7 +2220,17 @@ fn test_reduce() -> Result<()> {
 #[test]
 fn test_default_identity_filter() -> Result<()> {
     // When no filter is provided, should default to "."
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+    //
+    // #1889: intentionally left off `spawn_with_signal_retry` -- this test
+    // never calls `wait_with_output()` (it drops the spawned `Child`
+    // immediately), so there is no signal-death race to retry against, and
+    // routing it through the shared helper would add a wait this test was
+    // never designed to perform. `spawn()` itself can still transiently
+    // ENOENT (#550), but that's the same low-value tradeoff as leaving this
+    // near-vestigial test's semantics unchanged rather than restructuring
+    // it for a race this specific test doesn't meaningfully protect
+    // against anyway (it asserts nothing about the process's outcome).
+    let output = Command::new(succinctly_bin())
         .arg("jq")
         .arg("-c")
         .stdin(Stdio::piped())
@@ -2284,9 +2250,7 @@ fn test_default_identity_filter() -> Result<()> {
 
 #[test]
 fn test_jq_help() -> Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "--help"])
-        .output()?;
+    let (output, _code) = spawn_jq(&["--help"], None)?;
 
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("jq filter expression"));
@@ -3650,17 +3614,17 @@ fn test_large_integer_literal_prints_like_jq() -> Result<()> {
 fn test_args_positional() -> Result<()> {
     // Test --args: positional args become $ARGS.positional
     // Note: Use pipe syntax since parser doesn't support $VAR.field directly
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq",
+    let (output, _code) = spawn_jq(
+        &[
             "-n",
             "-c",
             "$ARGS | .positional",
             "--args",
             "hello",
             "world",
-        ])
-        .output()?;
+        ],
+        None,
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.trim(), r#"["hello","world"]"#);
     Ok(())
@@ -3669,9 +3633,8 @@ fn test_args_positional() -> Result<()> {
 #[test]
 fn test_jsonargs_positional() -> Result<()> {
     // Test --jsonargs: positional args are parsed as JSON
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq",
+    let (output, _code) = spawn_jq(
+        &[
             "-n",
             "-c",
             "$ARGS | .positional",
@@ -3679,8 +3642,9 @@ fn test_jsonargs_positional() -> Result<()> {
             "123",
             "true",
             r#"{"x":1}"#,
-        ])
-        .output()?;
+        ],
+        None,
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.trim(), r#"[123,true,{"x":1}]"#);
     Ok(())
@@ -3689,9 +3653,8 @@ fn test_jsonargs_positional() -> Result<()> {
 #[test]
 fn test_args_named() -> Result<()> {
     // Test $ARGS.named contains all named args
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq",
+    let (output, _code) = spawn_jq(
+        &[
             "-n",
             "--arg",
             "name",
@@ -3700,8 +3663,9 @@ fn test_args_named() -> Result<()> {
             "age",
             "30",
             "$ARGS | .named",
-        ])
-        .output()?;
+        ],
+        None,
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
     assert_eq!(parsed["name"], "Alice");
@@ -3713,9 +3677,10 @@ fn test_args_named() -> Result<()> {
 fn test_args_combined() -> Result<()> {
     // Test $ARGS with both named and positional args
     // Named args first, then filter, then --args with values
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "--arg", "x", "1", "$ARGS", "--args", "a", "b"])
-        .output()?;
+    let (output, _code) = spawn_jq(
+        &["-n", "--arg", "x", "1", "$ARGS", "--args", "a", "b"],
+        None,
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let parsed: serde_json::Value = serde_json::from_str(&stdout)?;
     assert_eq!(parsed["named"]["x"], "1");
@@ -3732,20 +3697,17 @@ fn test_args_combined() -> Result<()> {
 fn test_no_color_env_var() -> Result<()> {
     // Test that NO_COLOR environment variable disables color output
     // When NO_COLOR is set and no explicit -C/-M flag is given, colors should be disabled.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq", ".", // No -C or -M flag
-        ])
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(b"{\"a\":1}")?;
-    }
-    let result = child.wait_with_output()?;
+    let (result, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args([
+                "jq", ".", // No -C or -M flag
+            ])
+            .env("NO_COLOR", "1");
+            cmd
+        },
+        Some(b"{\"a\":1}"),
+    )?;
     let stdout = String::from_utf8(result.stdout)?;
 
     // Without -C flag and with NO_COLOR set, output should not contain ANSI codes
@@ -3761,14 +3723,18 @@ fn test_jq_colors_env_var() -> Result<()> {
     // Test that JQ_COLORS environment variable customizes colors
     // Format: "null:false:true:numbers:strings:arrays:objects:objectkeys"
     // Use a distinctive color for null (red = 31) to verify it works
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq", "-C", // Force color output
-            "-n", "null",
-        ])
-        .env("JQ_COLORS", "0;31:::::::") // Red null, defaults for rest
-        .stdout(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args([
+                "jq", "-C", // Force color output
+                "-n", "null",
+            ])
+            .env("JQ_COLORS", "0;31:::::::"); // Red null, defaults for rest
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     // Check that the red color code (31) is present for null
@@ -3782,16 +3748,20 @@ fn test_jq_colors_env_var() -> Result<()> {
 #[test]
 fn test_color_output_overrides_no_color() -> Result<()> {
     // Test that -C flag overrides NO_COLOR env var
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq",
-            "-C", // Force color
-            "-n",
-            r#"{"a":1}"#,
-        ])
-        .env("NO_COLOR", "1") // This should be overridden by -C
-        .stdout(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args([
+                "jq",
+                "-C", // Force color
+                "-n",
+                r#"{"a":1}"#,
+            ])
+            .env("NO_COLOR", "1"); // This should be overridden by -C
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     // -C should force colors even with NO_COLOR set
@@ -3805,16 +3775,20 @@ fn test_color_output_overrides_no_color() -> Result<()> {
 #[test]
 fn test_monochrome_overrides_jq_colors() -> Result<()> {
     // Test that -M flag disables colors even if JQ_COLORS is set
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args([
-            "jq",
-            "-M", // Monochrome output
-            "-n",
-            r#"{"a":1}"#,
-        ])
-        .env("JQ_COLORS", "0;31:0;32:0;33:0;34:0;35:0;36:0;37:0;38")
-        .stdout(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args([
+                "jq",
+                "-M", // Monochrome output
+                "-n",
+                r#"{"a":1}"#,
+            ])
+            .env("JQ_COLORS", "0;31:0;32:0;33:0;34:0;35:0;36:0;37:0;38");
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     // -M should disable all colors
@@ -3829,14 +3803,17 @@ fn test_monochrome_overrides_jq_colors() -> Result<()> {
 fn test_jq_colors_invalid_spec_warns_and_uses_defaults() -> Result<()> {
     // A malformed JQ_COLORS spec is rejected as a whole: jq warns on stderr,
     // falls back to the default scheme, and still exits successfully.
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-C", "-n", "null"])
-        .env("JQ_COLORS", "bogus")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-C", "-n", "null"])
+                .env("JQ_COLORS", "bogus");
+            cmd
+        },
+        None,
+    )?;
 
-    assert!(output.status.success());
+    assert_eq!(code, 0);
     let stderr = String::from_utf8(output.stderr)?;
     assert!(
         stderr.contains("Failed to set $JQ_COLORS"),
@@ -3866,12 +3843,9 @@ fn test_color_output_materializes_cursor_values() -> Result<()> {
 #[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "--build-configuration"])
-        .stdout(Stdio::piped())
-        .output()?;
+    let (output, code) = spawn_jq(&["--build-configuration"], None)?;
 
-    assert!(output.status.success());
+    assert_eq!(code, 0);
     let stdout = String::from_utf8(output.stdout)?;
     assert!(
         stdout.starts_with("succinctly jq build configuration:"),
@@ -3893,13 +3867,16 @@ fn test_include_directive() -> Result<()> {
     std::fs::write(&module_path, "def double: . * 2;")?;
 
     // Test include directive
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "-L"])
-        .arg(temp_dir.path())
-        .arg(r#"include "utils"; 21 | double"#)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"include "utils"; 21 | double"#);
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -3920,13 +3897,16 @@ fn test_import_directive() -> Result<()> {
     std::fs::write(&module_path, "def triple: . * 3;")?;
 
     // Test import directive with namespaced function call
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "-L"])
-        .arg(temp_dir.path())
-        .arg(r#"import "mymod" as m; 10 | m::triple"#)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"import "mymod" as m; 10 | m::triple"#);
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -3942,10 +3922,7 @@ fn test_import_directive() -> Result<()> {
 #[test]
 fn test_library_path_option() -> Result<()> {
     // Test -L option with a non-existent path (should still parse)
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "-L", "/nonexistent/path", "."])
-        .stdout(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_jq(&["-n", "-L", "/nonexistent/path", "."], None)?;
 
     let stdout = String::from_utf8(output.stdout)?;
     assert_eq!(stdout.trim(), "null");
@@ -3960,13 +3937,16 @@ fn test_jq_library_path_env() -> Result<()> {
     std::fs::write(&module_path, "def quadruple: . * 4;")?;
 
     // Test JQ_LIBRARY_PATH environment variable
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n"])
-        .arg(r#"include "envmod"; 5 | quadruple"#)
-        .env("JQ_LIBRARY_PATH", temp_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n"])
+                .arg(r#"include "envmod"; 5 | quadruple"#)
+                .env("JQ_LIBRARY_PATH", temp_dir.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -3982,12 +3962,7 @@ fn test_jq_library_path_env() -> Result<()> {
 #[test]
 fn test_module_not_found_error() -> Result<()> {
     // Test that a missing module produces an appropriate error
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n"])
-        .arg(r#"include "nonexistent_module_xyz"; ."#)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_jq(&["-n", r#"include "nonexistent_module_xyz"; ."#], None)?;
 
     let stderr = String::from_utf8(output.stderr)?;
 
@@ -4002,12 +3977,7 @@ fn test_module_not_found_error() -> Result<()> {
 #[test]
 fn test_namespaced_call_parse() -> Result<()> {
     // Test that namespaced calls parse correctly
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n"])
-        .arg("mymod::func")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_jq(&["-n", "mymod::func"], None)?;
 
     let stderr = String::from_utf8(output.stderr)?;
 
@@ -4028,12 +3998,15 @@ fn test_home_jq_file_autoload() -> Result<()> {
     std::fs::write(&jq_file, "def my_custom_func: . * 100;")?;
 
     // Test that function from ~/.jq is available
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "5 | my_custom_func"])
-        .env("HOME", temp_home.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "5 | my_custom_func"])
+                .env("HOME", temp_home.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -4062,13 +4035,16 @@ fn test_home_jq_dir_search_path() -> Result<()> {
     std::fs::write(jq_dir.join("homemod.jq"), "def home_func: . + 1000;")?;
 
     // Test that module from ~/.jq directory can be included
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n"])
-        .arg(r#"include "homemod"; 7 | home_func"#)
-        .env("HOME", temp_home.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n"])
+                .arg(r#"include "homemod"; 7 | home_func"#)
+                .env("HOME", temp_home.path());
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -4089,13 +4065,16 @@ fn test_import_with_namespace() -> Result<()> {
     std::fs::write(&module_path, "def double: . * 2; def triple: . * 3;")?;
 
     // Test import with namespace - should be able to call mymath::double
-    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-n", "-L"])
-        .arg(temp_dir.path())
-        .arg(r#"import "mymath" as mymath; 5 | mymath::double"#)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"import "mymath" as mymath; 5 | mymath::double"#);
+            cmd
+        },
+        None,
+    )?;
 
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
@@ -14247,22 +14226,19 @@ fn test_pattern_duplicate_var_inverts_via_genuine_fallback_1366() -> Result<()> 
 /// too, rather than silently accepting broader syntax than the oracle.
 #[test]
 fn test_as_pattern_alt_rejected_in_yq_mode_720() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("yq")
-        .arg(". as [$a] ?// {a: $a} | $a")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    child.stdin.take().unwrap().write_all(b"a: 5\n")?;
-    let output = child.wait_with_output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // #1546: `.code().unwrap_or(-1)` would coerce a signal-killed child to
-    // `-1`, which still satisfies `assert_ne!(_, 0)` -- a false pass masking
-    // a signal death as a successful correctness check.
-    let Some(code) = output.status.code() else {
-        return Err(signal_death_error(output.status, &stderr));
-    };
+    // #1889: routed through the shared `spawn_with_signal_retry` (which
+    // itself calls `signal_death_error`, #1546) instead of the manual
+    // `status.code()` check this test used to hand-roll -- same signal-death
+    // diagnosis, plus the retry-on-transient-failure every other spawn site
+    // in this file already gets.
+    let (_output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("yq").arg(". as [$a] ?// {a: $a} | $a");
+            cmd
+        },
+        Some(b"a: 5\n"),
+    )?;
     assert_ne!(
         code, 0,
         "yq mode must reject ?// as a parse error, matching real yq"
