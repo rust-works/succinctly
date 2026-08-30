@@ -170,6 +170,26 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         true
     }
 
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok), resolving
+    /// `expected` from `is_first` (`None` for a container's first child,
+    /// `Some(b',')` otherwise) and skipping the check entirely when this
+    /// cursor has no `text_position()` -- the #1677 array-element gap check,
+    /// as one definition shared by every caller that walks elements one at
+    /// a time, instead of each re-deriving `expected`/the `None`-position
+    /// skip itself (#1597 code review: `DocumentElements::collect_cursors_checked`
+    /// below and `eval_generic::each_lazy_array_iterate_sink` had drifted
+    /// into two independent copies of this exact check before this
+    /// extraction).
+    fn element_gap_ok(&self, is_first: bool) -> bool {
+        match self.text_position() {
+            Some(pos) => {
+                let expected = if is_first { None } else { Some(b',') };
+                self.preceding_delimiter_ok(pos, expected)
+            }
+            None => true,
+        }
+    }
+
     /// The error to raise when [`preceding_delimiter_ok`](Self::preceding_delimiter_ok)
     /// answers `false`.
     ///
@@ -2122,11 +2142,8 @@ pub trait DocumentElements: Sized + Copy + Clone {
         let mut elems = *self;
         let mut is_first = true;
         while let Some((cursor, rest)) = elems.uncons_cursor() {
-            if let Some(pos) = cursor.text_position() {
-                let expected = if is_first { None } else { Some(b',') };
-                if !cursor.preceding_delimiter_ok(pos, expected) {
-                    return Err(self.malformed_element_error());
-                }
+            if !cursor.element_gap_ok(is_first) {
+                return Err(self.malformed_element_error());
             }
             cursors.push(cursor);
             elems = rest;
