@@ -25418,23 +25418,17 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// [`eval_slice_bound`] already applies to slice bounds.
 ///
 /// #1559 (code review): a thin wrapper over [`eval_owned_expr_opt`] rather
-/// than its own copy of that function's "propagate a `QueryResult::Partial`'s
-/// trailing `Control`" match -- the sole caller (`each_paths_filter`'s root
-/// pre-check) *did* have this bug: live testing found a root with no
-/// non-root paths to independently re-check it (`1 | [paths(true,
-/// error("boom"))]`) silently returned `[]` instead of raising, where jq
-/// 1.7.1 raises `boom`. Converging on one implementation instead of two
-/// keeps that fix (and its own doc comment) in exactly one place; `Control`
-/// and `EvalEscape` already convert losslessly both ways (`error.rs`), so
-/// nothing is lost collapsing `EvalEscape` back to `Control` here.
+/// than its own copy of that function's own trailing-`Control` fix -- see its
+/// doc comment for the bug this closed here (the sole caller,
+/// `each_paths_filter`'s root pre-check, was independently confirmed
+/// affected). `?` performs the `EvalEscape` -> `Control` conversion via the
+/// existing lossless `From` impl (`error.rs`).
 fn eval_owned_expr_ctrl<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Result<OwnedValue, Control> {
-    eval_owned_expr_opt::<S>(expr, input, optional)
-        .map(|opt| opt.unwrap_or(OwnedValue::Null))
-        .map_err(Control::from)
+    Ok(eval_owned_expr_opt::<S>(expr, input, optional)?.unwrap_or(OwnedValue::Null))
 }
 
 /// Like [`eval_owned_expr_ctrl`], but also returns whether the result
@@ -62824,30 +62818,22 @@ mod tests {
         }
     }
 
-    /// #1559 (code review): `eval_owned_expr_ctrl` has the identical
+    /// #1559 (code review): `eval_owned_expr_ctrl` had the identical
     /// trailing-`Control`-drop bug `eval_owned_expr_opt` was fixed for above
     /// -- caught only once a live probe used a root with *no* non-root paths
     /// (a scalar or empty container), since `each_paths_filter`'s per-node
     /// fan-out loop independently re-checks any non-root path and had been
     /// masking the root pre-check's own bug in an earlier, insufficiently
-    /// probed draft of this fix.
+    /// probed draft of this fix. Now a pure pass-through to
+    /// `eval_owned_expr_opt` (whose own test above already exhaustively pins
+    /// all three escape kinds), so one assertion here is enough to pin the
+    /// wrapper's own `EvalEscape` -> `Control` conversion rather than
+    /// re-deriving escape-handling logic that lives entirely upstream.
     #[test]
     fn eval_owned_expr_ctrl_propagates_trailing_control_after_partial_output_1559() {
         let expr = parse("(1, error(\"boom\"))").unwrap();
         match eval_owned_expr_ctrl::<JqSemantics>(&expr, &OwnedValue::Null, false) {
             Err(Control::Error(e)) => assert_eq!(e.message, "boom"),
-            other => panic!("unexpected result: {other:?}"),
-        }
-
-        let expr = parse("(1, break $out)").unwrap();
-        match eval_owned_expr_ctrl::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(Control::Break(label)) => assert_eq!(label, "out"),
-            other => panic!("unexpected result: {other:?}"),
-        }
-
-        let expr = parse("(1, halt)").unwrap();
-        match eval_owned_expr_ctrl::<JqSemantics>(&expr, &OwnedValue::Null, false) {
-            Err(Control::Halt(0)) => {}
             other => panic!("unexpected result: {other:?}"),
         }
     }
