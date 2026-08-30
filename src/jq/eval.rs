@@ -694,6 +694,27 @@ fn scalar_decode_failure<W: Clone + AsRef<[u64]>>(
     None
 }
 
+/// Collapse the `scalar_decode_failure` / `optional` / type-error triplet
+/// that `#1820`'s scalar-fallback arms duplicated across this file (#1907
+/// item 5): decode failure wins unconditionally, `optional` suppresses the
+/// remaining type error, and otherwise `err()` builds it. `err` is called at
+/// most once and only in the final, un-suppressed case, so a caller whose
+/// constructor itself does real work (`to_owned`, formatting) pays nothing
+/// extra on the two earlier-return paths.
+fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+    err: impl FnOnce() -> EvalError,
+) -> QueryResult<'a, W> {
+    if let Some(e) = scalar_decode_failure(value) {
+        return QueryResult::Error(e);
+    }
+    if optional {
+        return QueryResult::None;
+    }
+    QueryResult::Error(err())
+}
+
 /// Materialize a key/slice-bound candidate just enough to classify it.
 ///
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
@@ -5671,15 +5692,47 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `error` raises the input value, as jq does — `{"x":1} | error` reports
     // `{"x":1}`, not `null`.
     let payload = match msg {
+        // #1907: `to_owned_checked` on the materialized `One`/`OneCursor`
+        // case, not the plain `to_owned` `result_to_owned` uses internally --
+        // the same asymmetry the `None` arm below was already fixed for by
+        // #1820. `result_to_owned`/`result_to_owned_ctrl`/`result_to_owned_full`
+        // back ~47 other call sites across this file, each with its own
+        // optional/catchability contract, so this fixes only `error(msg)`'s
+        // own materialization here rather than touching the shared helper
+        // (#1907's own "Category 2 territory" scope note). `Owned`/`ManyOwned`/
+        // `Many` arms of `result_to_owned` need no equivalent guard: a
+        // computed/collected `OwnedValue` is already valid UTF-8 by
+        // construction, so only the still-lazy `One`/`OneCursor` case can
+        // carry an undecoded string through to here.
+        //
+        // Not reachable via any query this CLI can currently parse:
+        // `Expr::Error` has no native arm in `eval_generic::eval_single`, so
+        // every `error(msg)` call — the only parser construction site for
+        // this function's `Some` branch — falls to that file's wildcard
+        // bridge, which already decode-checks the whole ambient value via
+        // `to_owned_with_cursor`/`owned_or_err!` before `eval::eval` (this
+        // function's caller) ever runs, exactly like the already-documented
+        // `Expr::Try`/`Expr::Optional` case in `eval_generic.rs`. Fixed
+        // anyway since the asymmetry is real and cheap to close, and a
+        // future native `Expr::Error` arm (mirroring #1812's `Try`/`Optional`
+        // ones) would otherwise silently resurrect it.
         Some(msg_expr) => {
-            let msg_result = eval_single::<W, S>(msg_expr, value, optional);
-            match result_to_owned(msg_result) {
+            let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
+            let owned = match msg_result {
+                QueryResult::One(v) => to_owned_checked(&v).map_err(EvalEscape::from),
+                other => result_to_owned(other),
+            };
+            match owned {
                 Ok(v) => v,
-                // `?` swallows only a genuine error in the message
-                // expression; a halt inside it always escapes (#791) —
-                // `isvalid(error(halt_error(3)))` must still halt, not
-                // report `false`.
-                Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
+                // `?` swallows only a genuine, catchable error in the message
+                // expression; a halt inside it always escapes (#791) --
+                // `isvalid(error(halt_error(3)))` must still halt, not report
+                // `false` -- and, per #1247/#1620, a decode failure is never
+                // suppressed by `?` either, matching the `None` arm below's
+                // own unconditional-return contract.
+                Err(EvalEscape::Error(e)) if optional && !e.is_decode_failure() => {
+                    return QueryResult::None;
+                }
                 Err(escape) => return escape.into(),
             }
         }
@@ -6288,13 +6341,9 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             // decode failure, never suppressed by `?` (#1247/#1620),
             // instead of the generic `has_no_keys` message built from an
             // unchecked `to_owned`.
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+            scalar_fallback(&value, optional, || {
+                EvalError::has_no_keys(&to_owned(&value))
+            })
         }
     }
 }
@@ -6723,13 +6772,9 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // must raise its own decode failure, never suppressed by `?`
             // (#1247/#1620), instead of the generic message built from an
             // unchecked `to_owned`.
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
+            scalar_fallback(&value, optional, || {
+                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            })
         }
     }
 }
@@ -6900,15 +6945,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         //
         // #1820: scalar_decode_failure first -- same gap as builtin_map's
         // sibling fallback above.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -6926,13 +6965,9 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
         _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+            return scalar_fallback(&value, optional, || {
+                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            });
         }
     };
     let items = match items {
@@ -7243,18 +7278,9 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, never be suppressed by `optional`/`?` (the
         // #1247/#1620 rule) or misreported as an ordinary type error.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::pair_cannot_be_iterated(
-                &to_owned(&value),
-                &to_owned(&value),
-            ))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::pair_cannot_be_iterated(&to_owned(&value), &to_owned(&value))
+        }),
     }
 }
 
@@ -7281,18 +7307,9 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(max)
         }
         // #1755: same reasoning as builtin_min's own scalar arm above.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::pair_cannot_be_iterated(
-                &to_owned(&value),
-                &to_owned(&value),
-            ))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::pair_cannot_be_iterated(&to_owned(&value), &to_owned(&value))
+        }),
     }
 }
 
@@ -7422,15 +7439,9 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: but a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -7488,15 +7499,9 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         //
         // #1755: same decode-failure precedence as min_by's own scalar arm
         // above.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -8345,18 +8350,9 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
         // `scalar_decode_failure`. Found alongside `last`'s identical
         // fallback arm, though `first` was not itself in scope for this
         // sweep (its own Array arm never materializes at all).
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_index_with_type(
-                type_name(&value),
-                "number",
-            ))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_index_with_type(type_name(&value), "number")
+        }),
     }
 }
 
@@ -8385,18 +8381,9 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_index_with_type(
-                type_name(&value),
-                "number",
-            ))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_index_with_type(type_name(&value), "number")
+        }),
     }
 }
 
@@ -8482,13 +8469,9 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
         _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+            return scalar_fallback(&value, optional, || {
+                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            });
         }
     };
     let items = match items {
@@ -8654,15 +8637,9 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: but a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -8708,15 +8685,9 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -8780,15 +8751,9 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: but a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -8813,15 +8778,9 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_be_sorted(&to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_be_sorted(&to_owned(&value))
+        }),
     }
 }
 
@@ -8881,15 +8840,9 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: but a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+        }),
     }
 }
 
@@ -8996,13 +8949,9 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             // `to_owned_checked`'s own "primary" call site); the residual
             // scalar fallback was missed. Same guard as builtin_keys'
             // sibling fallback.
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::has_no_keys(&to_owned(&value)))
+            scalar_fallback(&value, optional, || {
+                EvalError::has_no_keys(&to_owned(&value))
+            })
         }
     }
 }
@@ -9104,13 +9053,9 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => elements.map(|elem| to_owned_checked(&elem)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
         _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+            return scalar_fallback(&value, optional, || {
+                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            });
         }
     };
     let entries = match entries {
@@ -11953,15 +11898,9 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
         // `scalar_decode_failure` guard so a corrupted top-level scalar
         // raises an uncatchable decode failure (#1247/#1620) instead of
         // an ordinary, `?`-suppressible "not an array" type error.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::type_error("array", type_name(&value)))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::type_error("array", type_name(&value))
+        }),
     }
 }
 
@@ -36395,15 +36334,9 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::new("pick: input must be an object or array"))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::new("pick: input must be an object or array")
+        }),
     }
 }
 
@@ -36559,15 +36492,9 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
-        _ => {
-            if let Some(e) = scalar_decode_failure(&value) {
-                return QueryResult::Error(e);
-            }
-            if optional {
-                return QueryResult::None;
-            }
-            QueryResult::Error(EvalError::new("omit: input must be an object or array"))
-        }
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::new("omit: input must be an object or array")
+        }),
     }
 }
 
@@ -44849,6 +44776,41 @@ mod tests {
         query!(br#"{"msg": "custom error"}"#, "error(.msg)",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "custom error");
+            }
+        );
+    }
+
+    #[test]
+    fn eval_error_msg_expr_raises_decode_failure_1907() {
+        // #1907 item 1: `error(msg)`'s `Some(msg_expr)` branch used to
+        // materialize `msg` via the unchecked `to_owned`, silently
+        // substituting `""` for an undecodable string instead of raising its
+        // own decode failure -- asymmetric with bare `error` (this file's
+        // `None` arm, fixed by #1820), which already used `to_owned_checked`.
+        //
+        // Exercised directly through this macro's own `eval::eval` dispatch,
+        // not the CLI: `Expr::Error` has no native `eval_generic::eval_single`
+        // arm, so every CLI-parsed `error(msg)` query is decode-checked
+        // earlier, by that file's wildcard bridge (`to_owned_with_cursor` /
+        // `owned_or_err!`), before this function ever runs -- confirmed live
+        // against the built CLI binary with the identical `{"a": "\uXXXX"}` /
+        // `error(.a)` repro, which already raised correctly before this fix.
+        query!(br#"{"a": "\uXXXX"}"#, "error(.a)",
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+                assert_eq!(e.message, "invalid unicode escape sequence");
+            }
+        );
+    }
+
+    #[test]
+    fn eval_error_msg_expr_decode_failure_not_suppressed_by_optional_1907() {
+        // Sibling of the above: per #1247/#1620, a decode failure is never
+        // suppressed by `?` -- `error(.a)?` must still raise uncaught, the
+        // same rule bare `error?` on an undecodable value already follows.
+        query!(br#"{"a": "\uXXXX"}"#, "error(.a)?",
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
             }
         );
     }
