@@ -871,6 +871,13 @@ coverage differs:
   `ltrimstr`/`rtrimstr`, the sort family, `min`/`max`/`unique`/`group_by`, `add`, `join`,
   `flatten`, and every assignment RHS, among others) — not the wholesale gap the previous
   revision of this paragraph implied.
+- **#1902 widened this to `. as $var`/`reduce`/`foreach`.** Their bound/INIT/input value and
+  body-output conversions switched from the unchecked `to_owned`/`promote_borrowed` to
+  `to_owned_checked`/`promote_borrowed_checked` — so a #1194 malformed member or #1642
+  collision key that used to be silently dropped (`reduce . as $x (0; .+1)` on `{"a":1,"b"}`
+  used to succeed with `1`) now raises there too, same as the builtins listed above. Not a new
+  divergence unique to #1902: this is `to_owned_checked`'s own established contract from
+  #1755 onward, just newly reached by three more call sites (#1934).
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
