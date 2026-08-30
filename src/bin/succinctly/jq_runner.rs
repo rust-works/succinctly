@@ -843,7 +843,7 @@ fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
     keys: &DistinctKeyCursors<F>,
     doc_text: Option<&[u8]>,
 ) -> Result<()> {
-    match (keys.ended_unpaired() || keys.delimiter_fault(), doc_text) {
+    match (keys.is_malformed(), doc_text) {
         (true, Some(text)) => Err(MalformedJsonError(EvalError::malformed_json_text(text)).into()),
         _ => Ok(()),
     }

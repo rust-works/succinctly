@@ -28,8 +28,8 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    effective_len, key_display_string, resolve_display_key, DisplayKeyGuard, DistinctKeyCursors,
-    DocumentFields,
+    effective_len, key_delimiter_ok, key_display_string, resolve_display_key, value_delimiter_ok,
+    DisplayKeyGuard, DistinctKeyCursors, DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -664,9 +664,8 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 }
                 // #1956: matches `eval_generic.rs`'s own
                 // `distinct_key_cursors_checked`/`keys_are_well_formed`,
-                // which both check `ended_unpaired() || delimiter_fault()`
-                // together.
-                if cursors.ended_unpaired() || cursors.delimiter_fault() {
+                // which both check this via `is_malformed()`.
+                if cursors.is_malformed() {
                     return Err(core::fmt::Error);
                 }
                 out.write_char(']')
@@ -693,7 +692,13 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// For materialized values, serializes to JSON.
     pub fn to_json_string(&self) -> String {
         let mut out = String::new();
-        // Ignore error - writing to String can't fail
+        // Writing to a `String` itself can't fail, but `write_json` can --
+        // a `LazyKeysArray` malformed per #1194/#1677 returns `Err` after
+        // `out` already holds a truncated fragment (#1956; see
+        // `write_json_at_depth`'s own doc comment). No caller of this
+        // function today needs to distinguish "well-formed" from
+        // "truncated on error", so the `Err` is intentionally discarded --
+        // just not for the reason the old comment gave.
         let _ = self.write_json(&mut out);
         out
     }
@@ -723,9 +728,8 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
         keys.push(OwnedValue::String(s.into_owned()));
     }
     // #1956: matches `eval_generic.rs`'s own `distinct_key_cursors_checked`/
-    // `keys_are_well_formed`, which both check
-    // `ended_unpaired() || delimiter_fault()` together.
-    if cursors.ended_unpaired() || cursors.delimiter_fault() {
+    // `keys_are_well_formed`, which both check this via `is_malformed()`.
+    if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
     Ok(OwnedValue::Array(keys))
@@ -790,6 +794,7 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // on an unpaired child" (#1194) -- mirrors
             // `eval_generic::to_owned_at_depth`'s identical shape.
             let mut f = fields;
+            let mut is_first = true;
             while let Some((field, rest)) = f.uncons() {
                 // A key that isn't a `String` token at all is *structurally*
                 // malformed (#1194) and now raises, matching
@@ -800,9 +805,24 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 let Some(key) = resolve_display_key(&field.key(), &map, &mut guard)? else {
                     return Err(f.malformed_member_error());
                 };
+                // #1956: this walk (unlike its `eval_generic::to_owned_at_depth`
+                // sibling it otherwise mirrors) never called `key_delimiter_ok`/
+                // `value_delimiter_ok` -- a missing/doubled `,`/`:` (#1677) with
+                // an otherwise-even member count silently succeeded here.
+                if !key_delimiter_ok::<crate::json::light::JsonFields<'_, W>>(
+                    &field.key(),
+                    &field.key_cursor(),
+                    is_first,
+                ) || !value_delimiter_ok::<crate::json::light::JsonFields<'_, W>>(
+                    Some(&field.value()),
+                    &field.value_cursor(),
+                ) {
+                    return Err(f.malformed_member_error());
+                }
                 let value_cursor = field.value_cursor();
                 map.insert(key, cursor_to_owned_at_depth(&value_cursor, depth + 1)?);
                 f = rest;
+                is_first = false;
             }
             if f.ends_unpaired() {
                 return Err(f.malformed_member_error());
@@ -1719,35 +1739,39 @@ mod tests {
             fields,
             collapse: true,
         };
+
         let mut out = String::new();
         assert!(
             val.write_json(&mut out).is_err(),
             "a missing delimiter must not be written past silently: {out:?}"
         );
+        val.materialize()
+            .expect_err("a missing delimiter is not well-formed JSON");
+        val.into_owned()
+            .expect_err("a missing delimiter is not well-formed JSON");
+    }
+
+    /// #1956: `cursor_to_owned_at_depth`'s `StandardJson::Object` arm (backing
+    /// `JqValue::Cursor`'s own `materialize`/`into_owned`) walked `uncons()`
+    /// and checked only `ends_unpaired()`, never `key_delimiter_ok`/
+    /// `value_delimiter_ok` -- unlike its `eval_generic::to_owned_at_depth`
+    /// sibling, which checks both. An even member count with a missing `:`
+    /// used to materialize cleanly here.
+    #[test]
+    fn test_cursor_to_owned_raises_on_missing_delimiter_1956() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"a\" 1, \"b\": 2}";
 
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let fields = match cursor.value() {
-            StandardJson::Object(fields) => fields,
-            other => panic!("expected object, got {other:?}"),
-        };
-        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
-            fields,
-            collapse: true,
-        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         val.materialize()
             .expect_err("a missing delimiter is not well-formed JSON");
 
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let fields = match cursor.value() {
-            StandardJson::Object(fields) => fields,
-            other => panic!("expected object, got {other:?}"),
-        };
-        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
-            fields,
-            collapse: true,
-        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(cursor);
         val.into_owned()
             .expect_err("a missing delimiter is not well-formed JSON");
     }

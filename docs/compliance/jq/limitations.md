@@ -787,6 +787,14 @@ diagnostic clean; the truncation itself was already the accepted trade, not a ne
 bare `.[]`. Left open by #1641, mirroring the `#1629` precedent above rather than silently
 expanding that PR's scope.
 
+`LazySource::Keys` -- `keys_unsorted | map(f)`, the sibling variant of the same `advance()`
+match, sourcing from a `DistinctKeyCursors` walk rather than raw `uncons` -- is *not* this
+same gap and is not left open: #1956 found it had no check at all (neither
+`ended_unpaired()` nor `delimiter_fault()`, unlike every other `keys_unsorted` consumer,
+which had at least one), confirmed live (`keys_unsorted | map(.)` silently succeeded where
+`keys_unsorted | last` correctly raised), and fixed by threading `is_malformed()` through
+`advance()`'s now-fallible return.
+
 `--preserve-input` is not an exception to any of this: it changes how values are *rendered*
 (number literals and escape sequences kept as written), not whether the document is accepted,
 so a malformed member raises under it exactly as it does without it.
@@ -884,7 +892,8 @@ shared with the CLI printer rather than duplicated) into the object/array walk p
 gets the same protection a CLI user does, not just `sjq -c .`. The residual gaps are exactly
 the ones already named above for the unpaired-member class, since both checks now ride the
 same walks: `obj | map(f)` (`LazySource::Values`, left open by #1641), `keys_unsorted`'s
-positional fast paths (`.[0]`, `first`, `last`, `.[n]`, tracked separately as #1629), and bare
+still-deliberately-unchecked positional fast paths (`.[0]`, `first`, `.[n]`, tracked
+separately as #1629 -- `last` is no longer one of these, see below), and bare
 `keys_unsorted`'s streaming truncation (a partial array can reach stdout beside the exit 5,
 for the same "cannot rewind a byte-at-a-time writer" reason).
 
@@ -922,6 +931,15 @@ coverage differs:
 A library caller who follows the documented `eval()` example and evaluates straight off a
 fresh cursor gets #1677 protection only from `keys`/`keys_unsorted`/`to_entries`; every other
 builtin in this file, checked or not on the decode-failure/#1194 axis, still misses it.
+
+**`keys_unsorted`'s positional fast paths split three ways.** `.[0]`/`first`/`.[n]` (a
+positive index) stay *deliberately* unchecked -- they are the arms built to answer in O(1)
+without walking the rest of the object, and adding this check would cost strictly more than
+the answer itself (#1629's own accounting of that tradeoff, "Option 1"). `last` is not one
+of these: it already walks the whole object regardless (there is no way to find "the last
+field" without reaching the end), so #1956 folded this same check into that arm too, at no
+extra cost -- `keys_unsorted | last` on a malformed `,`/`:` delimiter now raises the same as
+`keys`/`keys_unsorted` themselves.
 
 **#1829 closed the remaining gap** (`map_values` via #1835/#1848/#1854; `with_entries`
 confirmed to inherit `to_entries`'s fix for free, needing no separate change; `paths`,
