@@ -890,6 +890,48 @@ mechanism at all and turned out to have a separate, more severe divergence (a ha
 instead of missing autovivification) — see
 [#1919](https://github.com/rust-works/succinctly/issues/1919).
 
+### A mid-chain `Field`/`Index` step hitting the wrong container type or an out-of-range array index
+
+Found alongside [#1432](https://github.com/rust-works/succinctly/issues/1432)/tracked as
+[#1863](https://github.com/rust-works/succinctly/issues/1863) — three still-open gaps in the
+same mid-chain-`Iterate` write path #1298/#1432/#1857 progressively fixed above, all
+live-verified against v4.53.3, none a quick fix (each needs its own deeper write-path
+change — array bounds-autovivification, index-to-string-key coercion — not just an
+RHS-discard predicate tweak like its siblings above):
+
+- **A `Field` step mid-chain hits a real `Array`.** Real yq raises its own structural error
+  *before* the RHS ever evaluates; succinctly evaluates the RHS first, surfacing its
+  error/side-effect instead of the structural one:
+  ```bash
+  $ printf 'a:\n  - 1\n  - 2\n' | yq            -o=json '.a.b[].c = error("boom")'
+  Error: cannot index array with 'b' (strconv.ParseInt: parsing "b": invalid syntax)
+  $ printf 'a:\n  - 1\n  - 2\n' | succinctly yq -o=json '.a.b[].c = error("boom")'
+  jq: error: boom
+  ```
+- **An `Index` step mid-chain is out of range on a real `Array`.** Real yq autovivifies the
+  array out to that length (padding with `null`), then continues the write into the
+  newly-created tail (empty, so the fan-out RHS never runs) — no error at all; succinctly has
+  no such padding and evaluates the RHS instead:
+  ```bash
+  $ printf 'a:\n  - 1\n  - 2\n' | yq            -o=json -I=0 '.a[5][].b = error("boom")'
+  {"a":[1,2,null,null,null,[]]}
+  $ printf 'a:\n  - 1\n  - 2\n' | succinctly yq -o=json -I=0 '.a[5][].b = error("boom")'
+  jq: error: boom
+  ```
+- **An `Index` step mid-chain hits a real `Object`.** Real yq coerces the numeric index to a
+  string key and inserts it; succinctly has no such coercion and evaluates the RHS instead:
+  ```bash
+  $ printf 'a: {}\n' | yq            -o=json -I=0 '.a[0][].b = error("boom")'
+  {"a":{"0":[]}}
+  $ printf 'a: {}\n' | succinctly yq -o=json -I=0 '.a[0][].b = error("boom")'
+  jq: error: boom
+  ```
+
+Pinned as known-divergent by `test_yq_assign_all_noop_mismatched_element_type_1432`
+(`tests/yq_cli_tests.rs`), which also confirms the one sibling shape that *does* already
+match yq: an `Index` step hitting a genuine scalar mid-chain permanently no-ops the whole
+write (#1232), same as every other position.
+
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
 [#1430](https://github.com/rust-works/succinctly/issues/1430) started as a narrower report

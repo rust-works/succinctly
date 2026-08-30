@@ -15794,15 +15794,10 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
             }
         }
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
-            OwnedValue::Array(arr) => {
-                let len = arr.len() as i64;
-                let actual = if *idx < 0 { len + idx } else { *idx };
-                if actual >= 0 && (actual as usize) < arr.len() {
-                    classify_yq_assign_prefix(&arr[actual as usize], rest)
-                } else {
-                    PathAssignOutcome::NeedsRhs
-                }
-            }
+            OwnedValue::Array(arr) => match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                Some(i) => classify_yq_assign_prefix(&arr[i], rest),
+                None => PathAssignOutcome::NeedsRhs,
+            },
             _ if is_yq_field_index_noop_scalar(current) => PathAssignOutcome::TotalNoop,
             _ => PathAssignOutcome::NeedsRhs,
         },
@@ -16086,10 +16081,7 @@ fn yq_del_slice_outcome(
     // is the only remaining reason to defer to `delete_at_path`'s own
     // absent-path handling instead.
     let prefix_components: Vec<Expr> = prefix.iter().map(|s| s.component.clone()).collect();
-    if !matches!(
-        navigate_read_only(root, &prefix_components),
-        PrefixNavOutcome::Resolved
-    ) {
+    if !navigate_read_only(root, &prefix_components) {
         return YqDelSliceOutcome::NotApplicable;
     }
     let wrap = |s: &DeleteStep| {
@@ -16105,49 +16097,24 @@ fn yq_del_slice_outcome(
     })
 }
 
-/// Outcome of [`navigate_read_only`]'s prefix walk.
+/// Read-only navigation used by [`yq_del_slice_outcome`]'s prefix peek: does
+/// every step of `steps` resolve, through `root`, to an existing value?
+/// Unlike `get_path_mut`, never autovivifies (a peek must not create
+/// structure the caller's own real walker would otherwise leave untouched).
 ///
-/// Three-way rather than [`navigate_read_only`]'s old binary `Option`
-/// (#1232): a step that can't continue splits into two outcomes real yq
-/// treats completely differently. Hitting a genuine scalar (`is_yq_field_
-/// index_noop_scalar`) while trying to `Field`/`Index` into it is a
-/// transitively-permanent no-op — the scalar never becomes a container no
-/// matter what the rest of the path was going to do, matching
-/// `get_path_mut`'s own post-#1232 `Field`/`Index` arms. A missing object
-/// key, an out-of-range array index, or `Null` (autovivifies), by contrast,
-/// is not settled at all — `get_path_mut` autovivifies straight through
-/// those and keeps going. Collapsing both into one `None` was exactly the
-/// gap #1232 found: `yq_assign_is_total_noop` (the only caller that cares
-/// about the distinction) treated a mid-prefix scalar hit the same as an
-/// unresolved parent, deferring to normal RHS evaluation and letting
-/// `.a.b.c = error("boom")` on `a: 5` raise `boom` where real yq no-ops
-/// silently (RHS never runs) — live-verified against yq v4.53.3.
-enum PrefixNavOutcome {
-    /// Every prefix step navigated an existing value. Carries no payload:
-    /// `yq_assign_is_total_noop` used to read the resolved parent off this
-    /// variant for its own terminal scalar check, but that check now lives
-    /// inside `classify_yq_assign_prefix`'s own base case (#1432), so the only
-    /// remaining reader (`yq_del_slice_outcome`) only ever matches the
-    /// variant itself via `matches!(..., Resolved(_))`.
-    Resolved,
-    /// A step tried to index into a real, non-`Null` scalar.
-    HitScalar,
-    /// Missing key, out-of-range index, `Null`, or a container-type
-    /// mismatch (e.g. `Field` on an `Array`) — the real write either
-    /// autovivifies through it or genuinely errors; either way this isn't
-    /// a settled no-op.
-    Absent,
-}
-
-/// Read-only navigation shared by [`yq_del_slice_outcome`]'s prefix peek and
-/// [`yq_assign_is_total_noop`]'s pre-RHS-evaluation check. Unlike
-/// `get_path_mut`, never autovivifies (a peek must not create structure the
-/// caller's own real walker would otherwise leave untouched) — see
-/// [`PrefixNavOutcome`] for what each non-`Resolved` outcome means and why
-/// there are two of them. `yq_del_slice_outcome` doesn't need the
-/// distinction (`del()`'s own scalar-root behavior is a separate, unscoped
-/// gap — #1411) and folds `HitScalar` back into "this rule doesn't apply",
-/// same as it always treated `None`.
+/// Used to return a three-way `Resolved`/`HitScalar`/`Absent` outcome
+/// (#1232) back when `yq_assign_is_total_noop` was also a caller and
+/// needed to tell a genuine scalar hit (a transitively permanent no-op)
+/// apart from a merely-absent step (autovivifies and keeps going) for its
+/// own pre-RHS-evaluation check. #1920 replaced that function -- and its
+/// own inner twin `assign_path_all_noop` -- with `PathAssignOutcome`/
+/// `yq_assign_classify`, leaving `yq_del_slice_outcome` as the only caller
+/// here. It never needed the distinction to begin with (`del()`'s own
+/// scalar-root behavior is a separate, unscoped gap — #1411): it already
+/// folded `HitScalar` back into "this rule doesn't apply", same as it
+/// always treated a missing/absent step. A plain `bool` is enough now; the
+/// three-way `PrefixNavOutcome` enum this used to return is gone with it
+/// (#1863).
 ///
 /// A second, hand-synchronized walker rather than a shared traversal
 /// `get_path_mut` itself could call — code review flagged this against the
@@ -16157,9 +16124,9 @@ enum PrefixNavOutcome {
 /// mutates and autovivifies), so unifying them is a real redesign, not a
 /// mechanical extraction. If a future `Field`/`Index` arm gains a new
 /// container-mismatch case (or `OwnedValue` gains a variant) in one walker,
-/// mirror it here too — a drift would make `yq_assign_is_total_noop`
-/// disagree with what the real write does.
-fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> PrefixNavOutcome {
+/// mirror it here too — a drift would make `yq_del_slice_outcome` disagree
+/// with what the real write does.
+fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> bool {
     let mut current = root;
     for step in steps {
         let (step, _optional) = unwrap_path_component(step);
@@ -16167,59 +16134,29 @@ fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> PrefixNavOutcome {
             Expr::Field(name) => match current {
                 OwnedValue::Object(map) => match map.get(name) {
                     Some(v) => v,
-                    None => return PrefixNavOutcome::Absent,
+                    None => return false,
                 },
-                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
-                _ => return PrefixNavOutcome::Absent,
+                _ => return false,
             },
             Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
                 OwnedValue::Array(arr) => {
-                    let len = arr.len() as i64;
-                    let actual = if *idx < 0 { len + idx } else { *idx };
-                    if actual >= 0 && (actual as usize) < arr.len() {
-                        &arr[actual as usize]
-                    } else {
-                        return PrefixNavOutcome::Absent;
+                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                        Some(i) => &arr[i],
+                        None => return false,
                     }
                 }
-                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
-                _ => return PrefixNavOutcome::Absent,
+                _ => return false,
             },
             // #1298: `Iterate` fans out into every element/value of a real
             // container -- unlike `Field`/`Index`, there is no single next
-            // `current` to continue this loop with, so a real container
-            // here can only ever mean "give up and defer" (`Absent`), same
-            // as this function already does for a component it can't
-            // interpret at all. A genuine scalar, though, is exactly
-            // `set_path_through_iterate`'s own no-op fallback (`.a[].b = v`
-            // on scalar `.a` no-ops the whole write, transitively, whatever
-            // the rest of the path was going to do) -- so that case still
-            // reports `HitScalar`, closing the gap where `yq_assign_is_
-            // total_noop` used to fall through this arm's old absence to
-            // the generic catch-all below and eagerly evaluate an RHS the
-            // real write was always going to discard.
-            //
-            // Deliberately incomplete, not just conservative: live-verified
-            // that real yq's actual rule is broader than "the iterated
-            // value is itself a scalar" -- `a: [1, 2]` (a real container
-            // whose own elements are *all* scalars `.b` would no-op into)
-            // also discards the RHS, and so does an empty or
-            // null-autovivified container (vacuously -- zero elements to
-            // check). Reporting `HitScalar` for those too would need
-            // recursively checking every element against the *rest* of the
-            // path, not just this one step -- effectively a read-only dry
-            // run of `set_path_through_iterate` itself. Left as `Absent`
-            // (correct, just not optimal) rather than attempted here; see
-            // #1432.
-            Expr::Iterate => match current {
-                OwnedValue::Array(_) | OwnedValue::Object(_) => return PrefixNavOutcome::Absent,
-                _ if is_yq_field_index_noop_scalar(current) => return PrefixNavOutcome::HitScalar,
-                _ => return PrefixNavOutcome::Absent,
-            },
-            _ => return PrefixNavOutcome::Absent,
+            // `current` to continue this loop with, so any step here means
+            // "give up", same as every other shape this function can't
+            // interpret.
+            Expr::Iterate => return false,
+            _ => return false,
         };
     }
-    PrefixNavOutcome::Resolved
+    true
 }
 
 /// Apply a resolved slice directly to an owned value.
@@ -18604,43 +18541,43 @@ fn update_path<S: EvalSemantics>(
                     // silently no-ops -- the error exists only on the
                     // write path, never the read/delete one that an
                     // empty update filter takes instead.
-                    let len = arr.len() as i64;
-                    let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                    let in_bounds = actual_idx >= 0 && (actual_idx as usize) < arr.len();
-                    let wrote = if in_bounds {
-                        let wrote = update_path::<S>(
-                            &mut arr[actual_idx as usize],
-                            &Expr::Identity,
-                            filter_expr,
-                            optional,
-                            scalar_noop,
-                        )?;
-                        if !wrote {
-                            arr.remove(actual_idx as usize);
+                    let wrote = match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                        Some(actual_idx) => {
+                            let wrote = update_path::<S>(
+                                &mut arr[actual_idx],
+                                &Expr::Identity,
+                                filter_expr,
+                                optional,
+                                scalar_noop,
+                            )?;
+                            if !wrote {
+                                arr.remove(actual_idx);
+                            }
+                            wrote
                         }
-                        wrote
-                    } else {
-                        // Probe once against a detached `null`, the value
-                        // `getpath` would read here -- never run the
-                        // filter twice (#1428: a real write below reuses
-                        // this scratch's already-computed value rather
-                        // than re-invoking `filter_expr`). A `!wrote`
-                        // here is a true no-op: nothing was ever padded
-                        // in, so there is nothing to undo, matching
-                        // `delpaths` silently skipping an out-of-range
-                        // index either direction.
-                        let mut scratch = OwnedValue::Null;
-                        let wrote = update_path::<S>(
-                            &mut scratch,
-                            &Expr::Identity,
-                            filter_expr,
-                            optional,
-                            scalar_noop,
-                        )?;
-                        if wrote {
-                            *write_index(arr, *idx)? = scratch;
+                        None => {
+                            // Probe once against a detached `null`, the
+                            // value `getpath` would read here -- never run
+                            // the filter twice (#1428: a real write below
+                            // reuses this scratch's already-computed value
+                            // rather than re-invoking `filter_expr`). A
+                            // `!wrote` here is a true no-op: nothing was
+                            // ever padded in, so there is nothing to undo,
+                            // matching `delpaths` silently skipping an
+                            // out-of-range index either direction.
+                            let mut scratch = OwnedValue::Null;
+                            let wrote = update_path::<S>(
+                                &mut scratch,
+                                &Expr::Identity,
+                                filter_expr,
+                                optional,
+                                scalar_noop,
+                            )?;
+                            if wrote {
+                                *write_index(arr, *idx)? = scratch;
+                            }
+                            wrote
                         }
-                        wrote
                     };
                     if !wrote && root_was_null {
                         *root = OwnedValue::Null;
@@ -28019,10 +27956,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 
             // Get the element value
             if let OwnedValue::Array(arr) = value {
-                let len = arr.len() as i64;
-                let actual_idx = if *idx < 0 { len + *idx } else { *idx };
-                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    let v = &arr[actual_idx as usize];
+                if let Some(actual_idx) = resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                    let v = &arr[actual_idx];
                     return continue_rest_with_borrowed_value::<W, S>(
                         v,
                         rest,
@@ -30942,20 +30877,21 @@ fn delete_expr_array_paths(
         for (step, group) in &groups {
             match step {
                 ArrayStep::Index(idx) => {
-                    let len = arr.len() as i64;
-                    let actual = if *idx < 0 { len + idx } else { *idx };
-                    if actual >= 0 && (actual as usize) < arr.len() {
-                        let slot = &mut arr[actual as usize];
-                        let old = core::mem::replace(slot, OwnedValue::Null);
-                        *slot = delete_expr_paths_at(old, group, start + 1)?;
-                    } else {
-                        // An out-of-range index names nothing to delete
-                        // through, so jq's delpaths silently skips the step
-                        // itself, `?` or not (#477) — but the tail still
-                        // decides: `del(.[5].a)` stays a no-op while
-                        // `del(.[5][])` raises `Cannot iterate over null
-                        // (null)` (#527/#529).
-                        delete_expr_paths_through_absent(group, start + 1)?;
+                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                        Some(actual) => {
+                            let slot = &mut arr[actual];
+                            let old = core::mem::replace(slot, OwnedValue::Null);
+                            *slot = delete_expr_paths_at(old, group, start + 1)?;
+                        }
+                        None => {
+                            // An out-of-range index names nothing to delete
+                            // through, so jq's delpaths silently skips the
+                            // step itself, `?` or not (#477) — but the tail
+                            // still decides: `del(.[5].a)` stays a no-op
+                            // while `del(.[5][])` raises `Cannot iterate
+                            // over null (null)` (#527/#529).
+                            delete_expr_paths_through_absent(group, start + 1)?;
+                        }
                     }
                 }
                 // Deleting *through* a slice deletes inside the sub-array and
@@ -31362,10 +31298,8 @@ fn delete_at_path(
         },
         Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
             OwnedValue::Array(arr) => {
-                let len = arr.len() as i64;
-                let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                    arr.remove(actual_idx as usize);
+                if let Some(actual_idx) = resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                    arr.remove(actual_idx);
                 }
                 // An out-of-range index names nothing to delete — jq's
                 // delpaths silently skips it, `?` or not (#477).
@@ -31468,22 +31402,19 @@ fn delete_at_path(
                     },
                     Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
                         OwnedValue::Array(arr) => {
-                            let len = arr.len() as i64;
-                            let actual_idx = if *idx < 0 { len + idx } else { *idx };
-                            if actual_idx >= 0 && (actual_idx as usize) < arr.len() {
-                                delete_at_path(
-                                    &mut arr[actual_idx as usize],
-                                    &rest,
-                                    optional,
-                                    yq_mode,
-                                )
-                            } else {
-                                // An out-of-range index resolves to null, and
-                                // deleting further into null is a no-op for
-                                // most tails, `?` or not (#477) — but not
-                                // `[]`, which still raises `Cannot iterate
-                                // over null (null)` (#527/#529).
-                                delete_at_path_through_absent(&rest, optional, yq_mode)
+                            match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                                Some(actual_idx) => {
+                                    delete_at_path(&mut arr[actual_idx], &rest, optional, yq_mode)
+                                }
+                                None => {
+                                    // An out-of-range index resolves to
+                                    // null, and deleting further into null
+                                    // is a no-op for most tails, `?` or not
+                                    // (#477) — but not `[]`, which still
+                                    // raises `Cannot iterate over null
+                                    // (null)` (#527/#529).
+                                    delete_at_path_through_absent(&rest, optional, yq_mode)
+                                }
                             }
                         }
                         // Same per-step `null` exemption as the `Field` case
