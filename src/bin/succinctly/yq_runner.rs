@@ -2523,10 +2523,16 @@ fn emit_yaml_value_at_depth(
                                 // slot, so its value nests exactly as deep as an
                                 // unanchored element's would).
                                 let val_indent = compact_indent;
-                                // #1485: `recursion_base` is this element's
-                                // own pre-compact `indent`, not `val_indent`
-                                // -- any further nesting inside this
-                                // element's value steps from there.
+                                // #1485 (code review): `recursion_base` is
+                                // *this invocation's own* `recursion_base`,
+                                // forwarded unchanged -- not `indent`, which
+                                // is only correct when this element was
+                                // never itself compact-positioned. A stacked
+                                // compact chain (an array directly inside
+                                // another compact array element) must keep
+                                // propagating the true pre-compact base
+                                // through every level -- see `light.rs`'s
+                                // identical fix for the full rationale.
                                 let val = emit_yaml_value_at_depth(
                                     v,
                                     elem_comments,
@@ -2534,7 +2540,7 @@ fn emit_yaml_value_at_depth(
                                     &val_indent,
                                     false,
                                     depth + 1,
-                                    indent,
+                                    recursion_base,
                                 );
                                 let val =
                                     append_own_comment_line(val, elem_comments.own(), &val_indent);
@@ -2561,8 +2567,10 @@ fn emit_yaml_value_at_depth(
                             // effect `stream_yaml_value`'s cursor-based
                             // sibling gets for free from its per-field/
                             // per-element loop only indenting 2nd+ items.
-                            // #1485: `recursion_base` is this element's
-                            // own pre-compact `indent`, not `compact_indent`.
+                            // #1485 (code review): `recursion_base` is
+                            // *this invocation's own* `recursion_base`,
+                            // forwarded unchanged -- see the anchor branch
+                            // above for the full rationale.
                             let rendered = emit_yaml_value_at_depth(
                                 v,
                                 elem_comments,
@@ -2570,7 +2578,7 @@ fn emit_yaml_value_at_depth(
                                 &compact_indent,
                                 false,
                                 depth + 1,
-                                indent,
+                                recursion_base,
                             );
                             // The element's own comment goes on its own
                             // line rather than glued onto its last
