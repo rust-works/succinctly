@@ -374,8 +374,6 @@ have to be recorded here.
 
 | Filter             | Input   | jq                                  | succinctly                        |
 |--------------------|---------|-------------------------------------|-----------------------------------|
-| `.[1:2] = ["x"]`   | `null`  | `["x"]`                             | `Cannot index null with object`   |
-| `.[1:2] \|= ["x"]` | `null`  | `["x"]`                             | `Cannot index null with object`   |
 | `@uri`             | `[1,2]` | `"%5B1%2C2%5D"`                     | `expected string, got array`      |
 | `@base64`          | `5`     | `"NQ=="`                            | `expected string, got number`     |
 | `flatten("x")`     | `[1,2]` | `[1,2]` (ignores non-integer depth) | `expected number, got non-number` |
@@ -1139,8 +1137,13 @@ probes, so the two-sided manifest check forced them to start matching in the sam
 
 What #366 did *not* build: computed bounds. `.[$a:$b]` is still a parse error, because the
 parser folds slice bounds to integer literals; see
-[docs/reference/jq-language.md](../../reference/jq-language.md). And writing through a
-slice does not vivify `null` — see the table above for why that was deliberate.
+[docs/reference/jq-language.md](../../reference/jq-language.md). Writing through a slice
+against `null` used to raise `Cannot index null with object` instead of auto-vivifying —
+[#1340](https://github.com/rust-works/succinctly/issues/1340) brought that in line with
+jq's own `setpath()` behavior, and [#1873](https://github.com/rust-works/succinctly/issues/1873)
+later fixed a gap in that same auto-vivification for a slice with more path *after* it
+(`.a[0:1][]? = 9` on a missing `.a` now no-ops instead of raising a write-time error, matching
+jq).
 
 ## Reading a path is indexing
 

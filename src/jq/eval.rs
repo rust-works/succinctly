@@ -17267,6 +17267,17 @@ fn through_slice<E: From<EvalError>>(
         // terminal write) still has to raise the same error, since there
         // `sub` staying `Null` reflects the RHS itself, not a swallowed
         // no-op -- confirmed live it still errors in real jq.
+        //
+        // This reads "`sub` is still `Null`" as "nothing was written,"
+        // which is sound only because every tail shape `edit` can recurse
+        // into today either leaves `sub` as something other than `Null`
+        // (`Field`/`Index` always autovivify a container first) or
+        // propagates a real `Err` before `sub` is ever inspected
+        // (`Expr::Optional`'s error classification only swallows a
+        // *non*-write-time-application error). If a future tail shape ever
+        // produced a genuine write that happened to leave `sub` at `Null`,
+        // this check would misread it as a no-op -- there is no compiler-
+        // enforced link between the two, only this invariant.
         OwnedValue::Null if !container_noop => {
             let mut sub = OwnedValue::Null;
             edit(&mut sub)?;
@@ -30213,6 +30224,24 @@ fn delete_at_path(
                     // make this string case look fixed relative to #1219's
                     // own array/object case when it isn't. jq mode is
                     // unaffected either way.
+                    //
+                    // `container_noop: false` unconditionally (#1873 code
+                    // review): unlike `set_path`/`update_path`'s call sites,
+                    // which thread `S::TAG == EvalTag::Yq` so `through_slice`
+                    // can tell the two modes apart, this one hardcodes
+                    // `false` for both -- currently inert only because the
+                    // guarded arm above (`if matches!(root, OwnedValue::
+                    // Null)`) always intercepts a literal-`Null` root before
+                    // the match ever reaches here, in both modes, so
+                    // `through_slice`'s own `Null` arm (gated `!container_
+                    // noop`, and since #1873 also `!terminal_write`) is
+                    // unreachable from this call site regardless of what
+                    // `container_noop` says. A future change to that
+                    // preceding guard's condition, or to this match's arm
+                    // order, would silently let jq-mode `del()` start
+                    // auto-vivifying a `null` slice target through #1873's
+                    // arm -- a semantics never oracle-verified for `del()`
+                    // -- with nothing here to catch it.
                     Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
                         through_slice(
                             root,
@@ -55504,55 +55533,33 @@ mod tests {
     /// `cannot_iterate` over the empty slice range leaves `edit`'s `sub`
     /// untouched at `Null`, which used to be forced through the array
     /// check and raise "A slice of an array can only be assigned another
-    /// array" where real jq leaves the whole document unchanged. Every
-    /// case here is oracle-verified against real jq 1.7.1. The residual
-    /// `.a: null` stub #1428 already tracks (eager `Field` autovivification
-    /// during navigation, unrelated to slices) is a separate, pre-existing,
-    /// broader issue -- out of scope here, and not asserted against below.
+    /// array" where real jq leaves the whole document unchanged (verified
+    /// live against `/usr/bin/jq` 1.7.1: `null | .a[0:1][]? = 9` is `null`).
+    /// This test asserts only the no-error/error split and the shapes whose
+    /// exact output does match jq byte-for-byte -- the sibling test below
+    /// characterizes the one shape whose exact output does not (a separate,
+    /// pre-existing bug, #1428).
     #[test]
     fn test_assign_slice_mid_chain_iterate_over_null_noops_1873() {
-        // The trailing `.a: null` stub in every one of these outputs is
-        // #1428's separate, pre-existing, broader bug (eager `Field`
-        // autovivification during navigation, reachable with no slice
-        // involved at all -- `null | .a[]? = 9` already leaves the same
-        // stub behind on unmodified `main`) -- not something this fix
-        // touches. What this fix removes is the write-time error that
-        // used to fire instead of reaching that (separately imperfect)
-        // no-op at all.
-        query!(br"null", r".a[0:1][]? = 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#);
-            }
-        );
-        query!(br"{}", r".a[0:1][]? = 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#);
-            }
-        );
-        query!(br#"{"a":null}"#, r".a[0:1][]? = 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#);
-            }
-        );
-        query!(br#"{"b":1}"#, r".a[0:1][]? = 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"b":1,"a":null}"#);
-            }
-        );
-        // `|=` shares `through_slice`, so it shares the bug and the fix.
-        query!(br"null", r".a[0:1][]? |= 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#);
-            }
-        );
-        query!(br"{}", r".a[0:1][]? |= 9",
-            QueryResult::Owned(v) => {
-                assert_eq!(v.to_json(), r#"{"a":null}"#);
-            }
-        );
+        // The fix itself: no longer a write-time error. `null`, `{}` and
+        // `{"a":null}` all reach `through_slice` with byte-identical state
+        // (`Field("a")` navigation converges every one of them to a fresh
+        // `&mut Null`), so one representative root suffices here -- the
+        // sibling characterization test below is where the exact resulting
+        // value (which does differ per root, via #1428) is pinned.
+        query!(br"null", r".a[0:1][]? = 9", QueryResult::Owned(_) => {});
+        // `|=` and every compound assignment operator desugar through the
+        // same `through_slice`/`set_path`-or-`update_path` arm, so they
+        // share the bug and the fix identically -- oracle-verified each
+        // one is a no-op on `null` in real jq too (`+=`/`-=`/`*=`/`//=`/
+        // `%=`, not just `|=`).
+        for op in ["|=", "+=", "-=", "*=", "//=", "%="] {
+            query!(br"null", &format!(".a[0:1][]? {op} 9"), QueryResult::Owned(_) => {});
+        }
         // A non-optional `Iterate` tail still raises the ordinary
         // navigation failure -- unaffected by this fix since `edit`
-        // propagates the error before `sub` is ever inspected.
+        // propagates the error before `sub` is ever inspected. Oracle-
+        // verified: `/usr/bin/jq` raises the identical message.
         query!(br"null", r".a[0:1][] = 9",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Cannot iterate over null (null)");
@@ -55561,12 +55568,9 @@ mod tests {
         // A `Field` tail after the slice still has to raise the array
         // requirement -- `edit` autovivifies `sub` into an `Object`, never
         // leaving it `Null`, so it still falls through to the existing
-        // check (matching real jq erroring here too, `?` or not).
-        query!(br"null", r".a[0:1].b = 9",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "A slice of an array can only be assigned another array");
-            }
-        );
+        // check. Oracle-verified this errors identically with or without
+        // `?` on the field (`?` never suppresses this error class), so one
+        // case covers both.
         query!(br"null", r".a[0:1].b? = 9",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "A slice of an array can only be assigned another array");
@@ -55575,21 +55579,25 @@ mod tests {
         // A literal `null` RHS on the terminal slice write itself is a
         // different shape (`terminal_write: true`) and must still error --
         // `sub` staying `Null` there reflects the RHS, not a swallowed
-        // no-op.
+        // no-op. Oracle-verified: `/usr/bin/jq` raises the identical error.
         query!(br"null", r".a[0:1] = null",
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "A slice of an array can only be assigned another array");
             }
         );
         // An `Index` tail after the slice still auto-vivifies successfully
-        // -- `edit` leaves `sub` as a real `Array`, never `Null`.
+        // -- `edit` leaves `sub` as a real `Array`, never `Null`, so this
+        // exact value is oracle-verified against `/usr/bin/jq` (no #1428
+        // stub involved: the result never touches the eager-autovivify
+        // path, since `sub` genuinely becomes the array being spliced in).
         query!(br"null", r".a[0:1][0]? = 9",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), r#"{"a":[9]}"#);
             }
         );
         // An existing array parent is unaffected either way -- `root`
-        // never reaches the `Null` arm at all for this shape.
+        // never reaches the `Null` arm at all for this shape. Exact values
+        // oracle-verified.
         query!(br#"{"a":[1,2,3]}"#, r".a[0:1][]? = 9",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), r#"{"a":[9,2,3]}"#);
@@ -55598,6 +55606,40 @@ mod tests {
         query!(br#"{"a":[1,2,3]}"#, r".a[0:1][]? |= 9",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), r#"{"a":[9,2,3]}"#);
+            }
+        );
+    }
+
+    /// Characterization test (see `.claude/skills/testing/SKILL.md`'s
+    /// "Pinning Known-Wrong Behaviour" section): pins the exact `.a: null`
+    /// stub #1873's fix above leaves behind, which is *not* what real jq
+    /// produces (`/usr/bin/jq` 1.7.1 leaves `null`/`{}`/`{"b":1}` completely
+    /// untouched for these queries). The stub is issue #1428's separate,
+    /// pre-existing, broader defect -- eager `Field` autovivification
+    /// during path navigation, reachable with no slice involved at all
+    /// (`null | .a[]? = 9` already produces the identical `{"a":null}` on
+    /// `main`, before and after #1873's fix). This is not asserting
+    /// desired behaviour -- if #1428 is ever fixed, update these
+    /// expectations to match real jq instead.
+    #[test]
+    fn test_assign_slice_mid_chain_iterate_over_null_leaves_field_stub_characterize_preexisting_bug_1428(
+    ) {
+        query!(br"null", r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#,
+                    "#1428 fixed? update this expectation to match real jq's \"null\"");
+            }
+        );
+        query!(br#"{"b":1}"#, r".a[0:1][]? = 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"b":1,"a":null}"#,
+                    "#1428 fixed? update this expectation to match real jq's {{\"b\":1}}");
+            }
+        );
+        query!(br"null", r".a[0:1][]? |= 9",
+            QueryResult::Owned(v) => {
+                assert_eq!(v.to_json(), r#"{"a":null}"#,
+                    "#1428 fixed? update this expectation to match real jq's \"null\"");
             }
         );
     }
