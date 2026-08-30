@@ -7025,6 +7025,30 @@ fn test_limit_path_context_resolves_1765() -> Result<()> {
     Ok(())
 }
 
+/// #1964 (found in review of this fix): pre-existing, unrelated to `limit`
+/// itself -- `eval_pipe_with_path_context_internal`'s `Expr::Comma` arm
+/// routes every branch through this same evaluator, including a branch that
+/// doesn't need path context at all (`range(0;5)`), which then falls to the
+/// generic `Expr::Builtin(_)` catch-all's single-output `eval_owned_expr_opt`
+/// and collapses the whole multi-output builtin into one array. Reachable on
+/// `main` today without `limit` (`.a | [(range(0;5), key)]` already gives
+/// `[[0,1,2,3,4],"a"]`) -- this fix's own new `Expr::Limit` routing just
+/// makes it reachable through `limit`'s body too, since it evaluates that
+/// body through the identical evaluator. Pinned here rather than fixed,
+/// matching #1964's own scoping (a general fix belongs to that evaluator's
+/// `Comma`/`Builtin` combination, not this narrower `Limit`-specific PR).
+#[test]
+fn test_limit_path_context_inherits_comma_multi_output_collapse_known_gap_1964() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [limit(2; (range(0;5), key))]"],
+        Some(r#"{"a":"x"}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[[0,1,2,3,4],\"a\"]");
+
+    Ok(())
+}
+
 /// #1765: `Expr::AsPattern`'s single-pattern case (no `?//` alternatives)
 /// now resolves `key`/`parent`/`file_index` against the caller's own ambient
 /// position, mirroring #1663's `Expr::As` fix -- both array and object
