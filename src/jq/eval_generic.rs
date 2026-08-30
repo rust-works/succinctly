@@ -1734,6 +1734,46 @@ fn owned_vec_to_generic_result<V: DocumentValue>(vs: Vec<OwnedValue>) -> Generic
     )
 }
 
+/// Splice `prefix` in front of whatever `result` yields (#1812) -- the
+/// `eval_single`/`GenericResult` twin of [`super::eval::prepend`], used by
+/// `Expr::Try`'s own arm above the same way `eval::eval_try` uses its
+/// mirror: the body's outputs before an error/break, then the catch
+/// handler's own result spliced in after them.
+///
+/// `result` here is always [`eval_each_owned_collect`]'s own return value,
+/// whose contract (`owned_vec_to_generic_result`/`partial_generic`, both
+/// called there) only ever produces `None`/`Owned`/`ManyOwned`/`Error`/
+/// `Break`/`Halt`/`Partial` -- never `One`/`OneCursor`/`Many`/`ManyCursor`/
+/// a lazy variant, so this covers exactly that set rather than
+/// `GenericResult`'s full one.
+fn prepend_generic<V: DocumentValue>(
+    mut prefix: Vec<OwnedValue>,
+    result: GenericResult<V>,
+) -> GenericResult<V> {
+    if prefix.is_empty() {
+        return result;
+    }
+    match result {
+        GenericResult::None => owned_vec_to_generic_result(prefix),
+        GenericResult::Owned(v) => {
+            prefix.push(v);
+            owned_vec_to_generic_result(prefix)
+        }
+        GenericResult::ManyOwned(vs) => {
+            prefix.extend(vs);
+            owned_vec_to_generic_result(prefix)
+        }
+        GenericResult::Error(e) => partial_generic(prefix, Control::Error(e)),
+        GenericResult::Break(label) => partial_generic(prefix, Control::Break(label)),
+        GenericResult::Halt(code) => partial_generic(prefix, Control::Halt(code)),
+        GenericResult::Partial(more, control) => {
+            prefix.extend(more);
+            partial_generic(prefix, control)
+        }
+        other => other,
+    }
+}
+
 /// Evaluate `expr` against `input` through `eval.rs`'s demand-driven
 /// `eval_each_owned`, collecting every output instead of stopping after the
 /// first (that's [`each_take_first_generic`]'s job). This is what lets a
@@ -4443,6 +4483,88 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             },
             other => other,
         },
+
+        // `try EXPR catch HANDLER` (#1812): mirrors `Expr::Optional` above
+        // exactly (same dispatch, same #1620 decode-failure exclusion, same
+        // `LazySeq`-forcing arm), but instead of collapsing a caught
+        // `Error`/`Break` to `None`, runs `catch` (if any) against the
+        // raised payload -- `null` for `Break` (#562), matching
+        // `eval::eval_try`'s identical jq-mode arm, which this is the
+        // cursor-native twin of. Without this arm, `Expr::Try` fell to the
+        // wildcard bridge below, which materializes the ambient value via
+        // `owned_or_err!` *before* ever reaching `full_eval`'s own
+        // catchability-aware `eval_try` -- an uncatchable-by-design error
+        // (a decode failure) was already correctly uncaught either way, but
+        // a genuinely catchable one (e.g. a #1194 malformed-key error) was
+        // wrongly left uncaught too, since `owned_or_err!` has no
+        // catchability check of its own at all. Confirmed live: `sort?` on
+        // `{123: 1}` already suppressed cleanly (routes through this same
+        // `Expr::Optional` arm's own `Error` case), while `try (1+1) catch
+        // "x"` raised uncaught before this fix.
+        Expr::Try { expr: inner, catch } => {
+            match eval_single::<S, _>(inner, value, optional, cursor) {
+                GenericResult::Error(e) if e.is_decode_failure() => GenericResult::Error(e),
+                GenericResult::Error(e) => match catch {
+                    Some(catch_expr) => {
+                        eval_each_owned_collect::<S, V>(catch_expr, &e.payload(), optional)
+                    }
+                    None => GenericResult::None,
+                },
+                GenericResult::Break(_) => match catch {
+                    Some(catch_expr) => {
+                        eval_each_owned_collect::<S, V>(catch_expr, &OwnedValue::Null, optional)
+                    }
+                    None => GenericResult::None,
+                },
+                GenericResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+                    GenericResult::Partial(prefix, Control::Error(e))
+                }
+                GenericResult::Partial(prefix, Control::Error(e)) => {
+                    let handled = match catch {
+                        Some(catch_expr) => {
+                            eval_each_owned_collect::<S, V>(catch_expr, &e.payload(), optional)
+                        }
+                        None => GenericResult::None,
+                    };
+                    prepend_generic(prefix, handled)
+                }
+                GenericResult::Partial(prefix, Control::Break(_)) => {
+                    let handled = match catch {
+                        Some(catch_expr) => {
+                            eval_each_owned_collect::<S, V>(catch_expr, &OwnedValue::Null, optional)
+                        }
+                        None => GenericResult::None,
+                    };
+                    prepend_generic(prefix, handled)
+                }
+                // Same reasoning as `Expr::Optional`'s own `LazySeq` arm: `try`
+                // needs to know *now* whether `inner` fails, so force it here
+                // rather than letting the failure surface only once some later
+                // consumer finally pulls the still-lazy sequence, long after
+                // this `try`/`catch` boundary is gone.
+                GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+                    Ok(owned) => GenericResult::Owned(owned),
+                    Err(Control::Error(e)) if e.is_decode_failure() => GenericResult::Error(e),
+                    Err(Control::Error(e)) => match catch {
+                        Some(catch_expr) => {
+                            eval_each_owned_collect::<S, V>(catch_expr, &e.payload(), optional)
+                        }
+                        None => GenericResult::None,
+                    },
+                    Err(Control::Break(_)) => match catch {
+                        Some(catch_expr) => {
+                            eval_each_owned_collect::<S, V>(catch_expr, &OwnedValue::Null, optional)
+                        }
+                        None => GenericResult::None,
+                    },
+                    // `try`/`catch` never catches a `halt`, matching
+                    // `Expr::Optional`'s identical `Err(Control::Halt(code))`
+                    // arm and `Control`'s own pass-through guarantee.
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                },
+                other => other,
+            }
+        }
 
         // Parens are transparent to cursor-based evaluation: handled natively
         // (like `Expr::Optional` above) so `(.)` and friends keep threading

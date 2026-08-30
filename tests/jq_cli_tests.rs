@@ -24918,6 +24918,95 @@ fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
     assert_eq!(stdout.trim(), r#""caught""#);
 }
 
+/// #1812: `eval_generic.rs`'s `eval_single` had no native `Expr::Try` arm,
+/// so it fell to the wildcard fallback, which materializes the ambient
+/// value via `owned_or_err!` *before* ever reaching `full_eval`'s own
+/// catchability-aware dispatch -- no catchability check at all. A #1194
+/// malformed (non-string) object key raised there uncaught, even though
+/// `?` (which does have a native, catchability-aware `Expr::Optional` arm)
+/// already suppressed the identical error correctly. Confirmed live
+/// against unmodified `main` before this fix: `sort?` on `{123: 1}`
+/// succeeded silently while `try (1+1) catch "x"` raised uncaught, exit 5.
+#[test]
+fn test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812() -> Result<()> {
+    let doc = "{123: 1}";
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort?"], Some(doc))?;
+    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"try (1+1) catch "x""#], Some(doc))?;
+    assert_eq!((stdout.as_str(), code), ("\"x\"\n", 0), "stderr: {stderr}");
+
+    // Bare `try`, no `catch` handler: suppresses to no output, same as `?`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "try (1+1)"], Some(doc))?;
+    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+
+    Ok(())
+}
+
+/// #1812 companion: the new `Expr::Try` arm's `Partial`-prefix handling
+/// (outputs produced before the error, then the catch handler's own result
+/// spliced in after them) still matches jq exactly for an *ordinary*,
+/// already-catchable error -- not just the newly-fixed #1194 case above.
+/// Oracle-verified against jq 1.7.1.
+#[test]
+fn test_try_catch_prefix_then_catch_result_matches_jq_1812() -> Result<()> {
+    for (filter, want) in [
+        (r#"try (1,2,error("x")) catch "c""#, "1\n2\n\"c\"\n"),
+        (r#"try error("boom") catch ."#, "\"boom\"\n"),
+        // The label must sit *outside* the `try` -- a `break` whose own
+        // enclosing `label` is inside the `try` never escapes it at all
+        // (the label catches its own break first), so `try`/`catch` never
+        // even sees it. Oracle-verified: `try (label $out | break $out)
+        // catch "caught"` is empty/exit-0 in both jq and succinctly, not
+        // `"caught"`.
+        (
+            r#"label $out | try (break $out) catch "caught""#,
+            "\"caught\"\n",
+        ),
+        (
+            r#"[label $out | try (1,2,break $out) catch "c"]"#,
+            "[1,2,\"c\"]\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #1812 companion: `try`/`catch` must still never catch a `halt`, matching
+/// `Expr::Optional`'s identical exclusion and `Control::Halt`'s own
+/// pass-through guarantee.
+#[test]
+fn test_try_catch_still_does_not_catch_halt_1812() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"try halt_error(7) catch "x""#], Some("null"))?;
+    assert_eq!(code, 7, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #1812 companion: a `LazySeq` (`map(f)`) that fails only once forced must
+/// still be caught -- mirrors `Expr::Optional`'s identical `LazySeq`-forcing
+/// arm, now exercised through `try`/`catch` too.
+#[test]
+fn test_try_catch_forces_and_catches_a_lazyseq_failure_1812() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"[try (map(.+1) | .[]) catch "c"]"#],
+        Some(r#"[1,"x",3]"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"c\"]\n", 0),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 /// #1194 (the half in #1247's scope): a *structurally* malformed value --
 /// one the semi-index accepted as a span but could not classify as any JSON
 /// token -- must not materialize as `null`. `[xyz123]` came back as `[null]`
