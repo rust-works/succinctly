@@ -60,14 +60,21 @@ pub struct EvalError {
 /// `size_of::<Option<OwnedValue>>()`, because `OwnedValue`'s discriminant
 /// already has spare niche capacity beyond `Option`'s single "empty" state.
 /// A plain extra tag *field* on `EvalError` was tried once instead and
-/// reverted (see the `#[cfg(test)]` regression test
-/// `eval_error_kind_variant_does_not_regress_size_or_the_1021_stack_overflow_fix`
-/// below for why that mattered) — this enum avoids that cost entirely by
-/// riding along in the space `Option<OwnedValue>` already used.
+/// reverted (see the `#[cfg(test)]` regression tests
+/// `eval_error_payload_is_no_larger_than_the_option_it_replaces`/
+/// `eval_error_size_is_pinned_for_the_1021_stack_overflow_fix` below for why
+/// that mattered) — this enum avoids that cost entirely by riding along in
+/// the space `Option<OwnedValue>` already used.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalErrorPayload {
+    /// No structured payload -- an ordinary internal error, unclassified.
+    /// [`EvalError::payload`] falls back to the message string for this
+    /// variant.
     None,
+    /// The raw value `error(v)` raised, verbatim -- see
+    /// [`EvalError::from_value_with`].
     Value(OwnedValue),
+    /// A classification tag in place of a payload -- see [`ErrorKind`].
     Kind(ErrorKind),
 }
 
@@ -81,8 +88,12 @@ pub enum EvalErrorPayload {
 /// [`EvalError::is_untracked_navigation_error`]'s own doc comments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// See [`EvalError::is_decode_failure`] -- always uncatchable.
     DecodeFailure,
+    /// See [`EvalError::is_invalid_path_expression`] -- always uncatchable.
     InvalidPathExpression,
+    /// See [`EvalError::is_untracked_navigation_error`] -- ordinarily
+    /// catchable, with one narrow bare-postfix-`?` exception.
     UntrackedNavigation,
 }
 
@@ -1057,13 +1068,14 @@ impl EvalError {
     /// `jq::mod`, so a re-exporting wrapper added an extra hop without
     /// adding any encapsulation.
     pub fn colliding_display_key(key: &str) -> Self {
-        Self::with_kind(
-            format!(
-                "object key \"{key}\" is ambiguous{}",
-                Self::COLLIDING_DISPLAY_KEY_SUFFIX
-            ),
-            ErrorKind::DecodeFailure,
-        )
+        // Delegates to `Self::decode_failure` (not a second `with_kind`
+        // call) so the two constructors can't independently drift out of
+        // sync on which `ErrorKind` a decode failure gets tagged with --
+        // exactly the class of drift #1840 introduced tags to prevent.
+        Self::decode_failure(format!(
+            "object key \"{key}\" is ambiguous{}",
+            Self::COLLIDING_DISPLAY_KEY_SUFFIX
+        ))
     }
 
     const COLLIDING_DISPLAY_KEY_SUFFIX: &'static str = ": an undecodable key's display form \
@@ -1638,12 +1650,21 @@ mod tests {
     /// (see `jq::lazy::tests::into_owned_panics_past_nesting_depth_limit_1021`,
     /// which exercises the actual regression this guards).
     #[test]
-    fn eval_error_kind_variant_does_not_regress_size_or_the_1021_stack_overflow_fix() {
+    fn eval_error_payload_is_no_larger_than_the_option_it_replaces() {
         assert_eq!(
             core::mem::size_of::<EvalErrorPayload>(),
             core::mem::size_of::<Option<OwnedValue>>(),
             "EvalErrorPayload must not be larger than the Option<OwnedValue> it replaces"
         );
+    }
+
+    // 32-bit targets shrink String/OwnedValue's pointer-sized fields, so this
+    // exact byte count doesn't hold there -- matches this crate's existing
+    // convention for exact-size assertions (e.g. `trees::bp`'s own
+    // `#[cfg(target_pointer_width = "64")]`-gated tests).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn eval_error_size_is_pinned_for_the_1021_stack_overflow_fix() {
         assert_eq!(
             core::mem::size_of::<EvalError>(),
             96,
