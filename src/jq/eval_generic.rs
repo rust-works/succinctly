@@ -429,7 +429,7 @@ fn to_owned_with_cursor<V: DocumentValue>(
 /// [`to_owned_with_cursor`] for the one job that must not fail: rendering a
 /// value into the text of an error that is *already* being raised.
 ///
-/// `EvalError::cannot_iterate(&v)` and friends materialize `v` only to quote
+/// `EvalError::cannot_iterate_with(tag, &v)` and friends materialize `v` only to quote
 /// it back to the user. Propagating a decode failure out of those call sites
 /// would mean abandoning a real, correctly-diagnosed error in order to report
 /// "the error message could not be built", which is strictly less useful --
@@ -9226,7 +9226,7 @@ mod tests {
     #[test]
     fn test_generic_plain_map_non_container_errors_725() {
         // Message must match `eval.rs`'s `builtin_map`/`map_over` exactly
-        // (both dispatch through `EvalError::cannot_iterate`).
+        // (both dispatch through `EvalError::cannot_iterate_with`).
         let json = br"1";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -9237,7 +9237,7 @@ mod tests {
         assert!(result.is_error());
 
         let owned = crate::jq::eval_generic::to_owned(&value).unwrap();
-        let expected = EvalError::cannot_iterate(&owned);
+        let expected = EvalError::cannot_iterate_with(EvalTag::Jq, &owned);
         match result {
             GenericResult::Error(e) => assert_eq!(e.message, expected.message),
             other => panic!("expected Error, got {other:?}"),

@@ -705,15 +705,9 @@ impl EvalError {
 
     /// `Cannot iterate over <type> (<value>)`.
     ///
-    /// jq-pinned shim (#1055): delegates to
-    /// [`EvalError::cannot_iterate_with`] fixed at `EvalTag::Jq` — use that
-    /// constructor directly once `S: EvalSemantics` is in scope at the call
-    /// site.
-    pub fn cannot_iterate(value: &OwnedValue) -> Self {
-        Self::cannot_iterate_with(EvalTag::Jq, value)
-    }
-
-    /// Mode-aware sibling of [`EvalError::cannot_iterate`] (#1055).
+    /// The jq-pinned shim this once forwarded from (#1055) is gone: #1494
+    /// finished migrating every production call site to pass its own real
+    /// `S::TAG` instead of a hardcoded `EvalTag::Jq`.
     pub fn cannot_iterate_with(tag: EvalTag, value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe_with(tag, value)))
     }
@@ -1559,7 +1553,7 @@ mod tests {
 
     #[test]
     fn internal_errors_carry_no_payload_but_catch_sees_the_message() {
-        let err = EvalError::cannot_iterate(&OwnedValue::Int(1));
+        let err = EvalError::cannot_iterate_with(EvalTag::Jq, &OwnedValue::Int(1));
         assert_eq!(err.message, "Cannot iterate over number (1)");
         assert_eq!(err.value, None);
         assert_eq!(
