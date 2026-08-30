@@ -1839,8 +1839,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 write_line_comment(out, Some(comment))?;
                                 // Same anchor/tag rendering as the `else`
                                 // arm below, differing only in its leading
-                                // separator: a newline here (the value goes
-                                // on its own line), a space there (#1448).
+                                // separator: a newline here, because the
+                                // key's own `#` comment has just been
+                                // written and the anchor/tag cannot share
+                                // that line; a space there (#1448).
                                 write_anchor_tag_sep(
                                     out,
                                     '\n',

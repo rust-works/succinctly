@@ -25902,3 +25902,31 @@ fn test_field_index_iterate_update_path_unaffected_by_1916_in_yq_mode() -> Resul
 
     Ok(())
 }
+
+/// #1448: a mapping key carrying a trailing `#` comment puts its value's
+/// anchor/tag on the *next* line, at column 0.
+///
+/// The one caller that needs a newline separator rather than a space, and
+/// the reason `write_anchor_tag_sep` is parameterised at all. It had no test
+/// of its own — the shared-helper refactor showed the line uncovered — so
+/// the ordering is pinned here: comment, newline, then `&anchor !!tag`.
+#[test]
+fn test_key_comment_puts_anchor_tag_on_next_line_1448() -> Result<()> {
+    for (input, expected) in [
+        (
+            "k: # c\n  &anc !!mytag\n  a: 1\n",
+            "k: # c\n&anc !!mytag\n  a: 1\n",
+        ),
+        // Anchor alone, and tag alone, take the same path.
+        ("k: # c\n  &anc\n  a: 1\n", "k: # c\n&anc\n  a: 1\n"),
+        ("k: # c\n  !!mytag\n  a: 1\n", "k: # c\n!!mytag\n  a: 1\n"),
+        // No comment: the anchor/tag stays on the key's own line, which is
+        // the sibling arm the separator distinguishes.
+        ("k: &anc !!mytag\n  a: 1\n", "k: &anc !!mytag\n  a: 1\n"),
+    ] {
+        let (out, code) = run_yq_stdin(".", input, &[])?;
+        assert_eq!(code, 0, "input {input:?}");
+        assert_eq!(out, expected, "input {input:?}");
+    }
+    Ok(())
+}
