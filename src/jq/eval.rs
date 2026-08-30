@@ -5718,26 +5718,37 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ones) would otherwise silently resurrect it.
         Some(msg_expr) => {
             let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
-            let owned = match msg_result {
-                QueryResult::One(v) => to_owned_checked(&v).map_err(EvalEscape::from),
-                QueryResult::Many(vs) => match vs.first() {
-                    Some(v) => to_owned_checked(v).map_err(EvalEscape::from),
-                    None => result_to_owned(QueryResult::Many(vs)),
-                },
-                other => result_to_owned(other),
+            // `to_owned_checked`'s own materialization errors (a decode
+            // failure, or a #1194 malformed-member error -- neither is
+            // `is_decode_failure()`-tagged, but `to_owned_checked` raises
+            // both unconditionally at every other call site in this file,
+            // including this function's own `None` arm below) are never
+            // suppressed by `optional`. That's a different, narrower
+            // question than whether `optional` should suppress an ordinary
+            // error surfacing from `msg_expr`'s *own* evaluation (handled
+            // in the `else` branch below) -- conflating the two by gating
+            // only on `is_decode_failure()` here would wrongly let
+            // `optional` swallow a malformed-member error too.
+            let checked = match &msg_result {
+                QueryResult::One(v) => Some(to_owned_checked(v)),
+                QueryResult::Many(vs) => vs.first().map(to_owned_checked),
+                _ => None,
             };
-            match owned {
-                Ok(v) => v,
-                // `?` swallows only a genuine, catchable error in the message
-                // expression; a halt inside it always escapes (#791) --
-                // `isvalid(error(halt_error(3)))` must still halt, not report
-                // `false` -- and, per #1247/#1620, a decode failure is never
-                // suppressed by `?` either, matching the `None` arm below's
-                // own unconditional-return contract.
-                Err(EvalEscape::Error(e)) if optional && !e.is_decode_failure() => {
-                    return QueryResult::None;
+            if let Some(checked) = checked {
+                match checked {
+                    Ok(v) => v,
+                    Err(e) => return QueryResult::Error(e),
                 }
-                Err(escape) => return escape.into(),
+            } else {
+                match result_to_owned(msg_result) {
+                    Ok(v) => v,
+                    // `?` swallows only a genuine, catchable error in the
+                    // message expression; a halt inside it always escapes
+                    // (#791) -- `isvalid(error(halt_error(3)))` must still
+                    // halt, not report `false`.
+                    Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
+                    Err(escape) => return escape.into(),
+                }
             }
         }
         // #1820: to_owned_checked, not to_owned -- bare `error` raises the
@@ -44839,6 +44850,53 @@ mod tests {
         query!(br#"{"a": "\uXXXX", "b": "ok"}"#, "error((.a, .b))?",
             QueryResult::Error(e) => {
                 assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+            }
+        );
+    }
+
+    #[test]
+    fn eval_error_msg_expr_malformed_member_reaches_an_enclosing_catch_1907() {
+        // A more discriminating sibling of the plain-raise test below: `?`
+        // and `try`/`catch` suppression is `eval_try`'s own decision, made
+        // *after* inspecting whatever this function returns -- for a bare
+        // `?` (no catch handler), `eval_try` discards any non-decode-failure
+        // `Error` to `None` regardless of how it got there, so that shape
+        // can't tell an internally-self-suppressing `eval_error` apart from
+        // one that raises and lets `eval_try` decide. Wrapping a *real*
+        // catch handler inside the `?` can: with `optional` forced `true` by
+        // the outer `?`, the inner `eval_try`'s `catch = Some(...)` arm only
+        // ever runs if this function actually returns `Error(e)` rather than
+        // self-suppressing to `None` first. Confirmed this reaches the
+        // handler with the fix, and would return bare `None` (skipping the
+        // handler entirely) without it.
+        query!(br#"{"a":1,"b"}"#, r#"(try error(.) catch "caught")?"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "caught");
+            }
+        );
+    }
+
+    #[test]
+    fn eval_error_msg_expr_malformed_member_raised_1907() {
+        // Sibling to the decode-failure tests above, for the *other* error
+        // class `to_owned_checked` can raise: a #1194 malformed-member error
+        // (a trailing unpaired object member JSON's own semi-index accepts,
+        // e.g. `{"a":1,"b"}`) is not `is_decode_failure()`-tagged, but
+        // `to_owned_checked` raises it unconditionally at every other call
+        // site in this file, including this function's own `None` arm below
+        // -- so `error(.)` must raise it here too, not silently swallow it
+        // into `""` via an unchecked `to_owned`.
+        //
+        // This does *not* assert anything about a *wrapping* `?`/`try`:
+        // that suppression/catch decision belongs to `eval_try`, one level
+        // up, whose own `is_decode_failure()`-only exclusion is a separate,
+        // pre-existing gap (closely related to #1907's own item 3) outside
+        // this fix's scope -- `eval_try` re-decides uniformly from the
+        // `Error` this function returns, regardless of *how* this function
+        // arrived at it.
+        query!(br#"{"a":1,"b"}"#, "error(.)",
+            QueryResult::Error(e) => {
+                assert!(!e.is_decode_failure());
             }
         );
     }
