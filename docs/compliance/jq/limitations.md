@@ -905,7 +905,11 @@ coverage differs:
   collision key that used to be silently dropped (`reduce . as $x (0; .+1)` on `{"a":1,"b"}`
   used to succeed with `1`) now raises there too, same as the builtins listed above. Not a new
   divergence unique to #1902: this is `to_owned_checked`'s own established contract from
-  #1755 onward, just newly reached by three more call sites (#1934).
+  #1755 onward, at three call sites this one just hadn't named yet (documented here per
+  #1934 item 6, which also closed a related gap: five bare, non-`to_owned_checked`
+  `Error`/`Partial` arms across these same three functions' `input`/INIT streams didn't
+  exclude a genuine decode failure from `optional`'s suppression the way `finish_fork`
+  already does — an internal-consistency fix, not a further widening of this policy).
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
