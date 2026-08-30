@@ -27026,15 +27026,31 @@ fn test_seq_self_delimiting_tokens_need_no_separator_1928() -> Result<()> {
     Ok(())
 }
 
-/// #1928: a bare `true`/`false`/`null` at a record boundary is truncated,
-/// exactly like a bare number.
+/// #1928: a bare `true`/`false`/`null` is truncated at an **RS byte** but
+/// not at real **EOF** -- unlike a bare number, which is truncated at both.
 ///
-/// Both lack a closing delimiter, so jq's incremental scanner cannot rule
-/// out more input arriving. Checking numbers alone left 92 shapes emitting a
-/// value jq drops.
+/// | token | at an RS byte | at real EOF |
+/// |-------|---------------|-------------|
+/// | number (`1`) | abandoned | abandoned |
+/// | literal (`true`) | abandoned | **kept** |
+/// | string/array/object | kept | kept |
+///
+/// A number can always take more digits; at EOF jq has seen all the input
+/// there will ever be, so a literal is complete. Both halves are pinned
+/// because each direction was got wrong once: checking numbers alone left 92
+/// shapes emitting a `true` jq drops, and then checking literals at every
+/// boundary dropped `printf '\x1etrue'`, which jq prints.
 #[test]
 fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
     for (input, expected, why) in [
+        // At real EOF a literal is complete -- the half a stricter rule broke.
+        ("\x1etrue", "true\n", "bare literal at EOF is kept"),
+        ("\x1enull", "null\n", "so is null"),
+        ("\x1e\"a\" true", "\"a\"\ntrue\n", "and after another value"),
+        ("\x1e{} null", "{}\nnull\n", "likewise"),
+        // A number is abandoned at EOF, which is the contrast that makes the
+        // rule per-token-kind rather than per-boundary.
+        ("\x1e1", "", "a bare number at EOF is still abandoned"),
         (
             "\x1etrue\x1e3\n",
             "3\n",
