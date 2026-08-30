@@ -7559,6 +7559,22 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     None => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(LazySeq::new(source).push_map(f, S::TAG))
+            } else if S::TAG == EvalTag::Yq && value.is_null() {
+                // #1907: real yq no-ops a scalar target for `map` entirely
+                // -- `f` never even runs (confirmed live, v4.53.3: `5 |
+                // map(error("boom"))` succeeds silently, `5`) -- unlike
+                // jq, which always errors here. `null` gets yq's usual
+                // empty-container treatment instead of a literal
+                // passthrough (matches the `*=` merge rule documented in
+                // CLAUDE.md: "null acts as an empty container on either
+                // side of a yq-mode merge").
+                GenericResult::Owned(OwnedValue::Array(Vec::new()))
+            } else if S::TAG == EvalTag::Yq {
+                // Every other scalar passes through byte-for-byte
+                // unchanged -- no decode-check needed, nothing ever reads
+                // its content (the "uniform fix regressed content-
+                // independent ops" lesson, #1820's own review).
+                GenericResult::One(value)
             } else {
                 decode_failure_or(&value, optional, || {
                     GenericResult::Error(EvalError::cannot_iterate_with(

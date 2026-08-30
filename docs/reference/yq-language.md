@@ -283,7 +283,9 @@ echo '"aaa"' | succinctly yq 'sub("a"; "X"; "g")'
 
 ### Date/Time Extensions
 
-Beyond jq's standard date functions (`now`, `gmtime`, `strftime`, `strptime`), yq adds:
+Beyond jq's standard date functions (`now`, and `gmtime`/`strftime`/`strptime`
+behind `--jq-extensions` -- see [Gated jq Builtins](#gated-jq-builtins---jq-extensions)),
+yq adds:
 
 | Function        | Description                   | Example                             |
 |-----------------|-------------------------------|-------------------------------------|
@@ -389,6 +391,9 @@ surface (#1512):
 | `pow(base; exp)`                                     | Exponentiation                                |
 | `bsearch(target)`                                    | Binary search index in a sorted array         |
 | `strftime(fmt)`, `strptime(fmt)`                     | Broken-down-time formatting / parsing (#1650) |
+| `gmtime`, `localtime`, `mktime`                      | jq's date functions (#1907)                   |
+| `todate`, `fromdate`                                 | ISO 8601 shortcuts (#1907)                    |
+| `todateiso8601`, `fromdateiso8601`                   | ISO 8601, fixed format (#1907)                |
 | `add`                                                | Sum of an array/stream (#1714)                |
 | `min_by(f)`, `max_by(f)`                             | Extremum by a key function (#1714)            |
 | `implode`                                            | Codepoint array to string (#1714)             |
