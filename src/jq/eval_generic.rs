@@ -3702,11 +3702,10 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
                 }
                 last_cursor = Some(cursor);
             }
-            // Missing `|| cursors.delimiter_fault()` here (unlike this
-            // function's own `distinct_key_cursors_checked`/
-            // `keys_are_well_formed` siblings) is a pre-existing, tracked
-            // gap (#1956), not addressed in this pass.
-            if cursors.ended_unpaired() {
+            // #1956: matches this function's own `distinct_key_cursors_checked`/
+            // `keys_are_well_formed` siblings, which both check
+            // `ended_unpaired() || delimiter_fault()` together.
+            if cursors.ended_unpaired() || cursors.delimiter_fault() {
                 return GenericResult::Error(fields.malformed_member_error());
             }
             match last_cursor {

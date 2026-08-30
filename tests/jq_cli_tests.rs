@@ -19167,6 +19167,39 @@ fn test_jq_wellformed_documents_unaffected_by_1677() -> Result<()> {
     Ok(())
 }
 
+/// #1956: `fold_lazy_keys_stage`'s `Builtin::Last if !sorted` arm walks the
+/// whole object regardless (there's no way to find "the last field" without
+/// reaching the end), so the #1194/#1677 check was already meant to ride
+/// along for free -- but it only checked `ended_unpaired()`, missing the
+/// `delimiter_fault()` half every other checked call site in this file
+/// gets right. `keys_unsorted | last` used to silently return the last
+/// well-formed key instead of raising, unlike bare `keys_unsorted` on the
+/// identical document.
+#[test]
+fn test_jq_keys_unsorted_last_raises_on_missing_delimiter_1956() -> Result<()> {
+    let doc = r#"{"a" 1, "b": 2}"#;
+
+    let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(doc))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    let (out, stderr, code) = run_jq_full(
+        &["-c", r#"try (keys_unsorted | last) catch "c""#],
+        Some(doc),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(out.trim(), "\"c\"", "out: {out:?}");
+
+    // Well-formed data is unaffected.
+    let (out, stderr, code) =
+        run_jq_full(&["-c", "keys_unsorted | last"], Some(r#"{"b":1,"a":2}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(out.trim(), "\"a\"");
+
+    Ok(())
+}
+
 /// #1116's yq-only "chained scalar-slice-assign no-ops" / "del() deletes
 /// the parent key" rules must not leak into jq mode: real jq errors on
 /// both `.a[0:1] = 99` and `del(.a[0:1])` for a scalar `.a`, matching

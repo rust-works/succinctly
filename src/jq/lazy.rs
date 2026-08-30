@@ -662,7 +662,11 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                         }
                     }
                 }
-                if cursors.ended_unpaired() {
+                // #1956: matches `eval_generic.rs`'s own
+                // `distinct_key_cursors_checked`/`keys_are_well_formed`,
+                // which both check `ended_unpaired() || delimiter_fault()`
+                // together.
+                if cursors.ended_unpaired() || cursors.delimiter_fault() {
                     return Err(core::fmt::Error);
                 }
                 out.write_char(']')
@@ -718,10 +722,10 @@ fn lazy_keys_array_to_owned<W: Clone + AsRef<[u64]>>(
         };
         keys.push(OwnedValue::String(s.into_owned()));
     }
-    // Missing `|| cursors.delimiter_fault()` here (unlike `eval_generic.rs`'s
-    // `distinct_key_cursors_checked`/`keys_are_well_formed`) is a
-    // pre-existing, tracked gap (#1956), not addressed in this pass.
-    if cursors.ended_unpaired() {
+    // #1956: matches `eval_generic.rs`'s own `distinct_key_cursors_checked`/
+    // `keys_are_well_formed`, which both check
+    // `ended_unpaired() || delimiter_fault()` together.
+    if cursors.ended_unpaired() || cursors.delimiter_fault() {
         return Err(fields.malformed_member_error());
     }
     Ok(OwnedValue::Array(keys))
@@ -1690,6 +1694,62 @@ mod tests {
                 OwnedValue::Array(vec![OwnedValue::String("\u{FFFD}\u{FFFD}".to_string())])
             )]))
         );
+    }
+
+    /// #1956: `lazy_keys_array_to_owned` (backing `materialize`/`into_owned`)
+    /// and `write_json`'s own `LazyKeysArray` arm both used to check only
+    /// `cursors.ended_unpaired()`, missing the `delimiter_fault()` half of
+    /// the #1194/#1677 check that `eval_generic.rs`'s
+    /// `distinct_key_cursors_checked`/`keys_are_well_formed` already get
+    /// right. A missing `,`/`:` delimiter (not a non-string key, not an
+    /// unpaired tail) used to silently succeed here.
+    #[test]
+    fn test_lazy_keys_array_raises_on_missing_delimiter_1956() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"a\" 1, \"b\": 2}";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+        let mut out = String::new();
+        assert!(
+            val.write_json(&mut out).is_err(),
+            "a missing delimiter must not be written past silently: {out:?}"
+        );
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+        val.materialize()
+            .expect_err("a missing delimiter is not well-formed JSON");
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+        val.into_owned()
+            .expect_err("a missing delimiter is not well-formed JSON");
     }
 
     /// #1194: sibling of `jq_runner.rs`'s `standard_json_to_jq_value` and its
