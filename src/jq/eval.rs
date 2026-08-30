@@ -5747,10 +5747,10 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Reduction
         Builtin::Add => builtin_add::<W, S>(value, optional),
-        Builtin::Any => builtin_any::<W>(value, optional),
+        Builtin::Any => builtin_any::<W, S>(value, optional),
         Builtin::AnyF(cond) => builtin_any_f::<W, S>(cond, value, optional),
         Builtin::AnyCond(gen, cond) => builtin_any_cond::<W, S>(gen, cond, value, optional),
-        Builtin::All => builtin_all::<W>(value, optional),
+        Builtin::All => builtin_all::<W, S>(value, optional),
         Builtin::AllF(cond) => builtin_all_f::<W, S>(cond, value, optional),
         Builtin::AllCond(gen, cond) => builtin_all_cond::<W, S>(gen, cond, value, optional),
         Builtin::Min => builtin_min::<W>(value, optional),
@@ -5775,7 +5775,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Last => builtin_last::<W>(value, optional),
         Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
         Builtin::Reverse => builtin_reverse::<W>(value, optional),
-        Builtin::Flatten => builtin_flatten::<W>(value, optional, 1),
+        Builtin::Flatten => builtin_flatten::<W, S>(value, optional, 1),
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
         Builtin::Unique => builtin_unique::<W, S>(value, optional),
@@ -5785,7 +5785,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // Phase 5: Object Functions
         Builtin::ToEntries => builtin_to_entries::<W>(value, optional),
-        Builtin::FromEntries => builtin_from_entries::<W>(value, optional),
+        Builtin::FromEntries => builtin_from_entries::<W, S>(value, optional),
         Builtin::WithEntries(f) => builtin_with_entries::<W, S>(f, value, optional),
 
         // Phase 6: Type Conversions
@@ -6844,7 +6844,7 @@ fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
 /// any is [.[] | .] with an early-exit truthiness check, and .[] over an
 /// object iterates its values, so jq accepts an object here as readily as
 /// an array (#422).
-fn builtin_any<W: Clone + AsRef<[u64]>>(
+fn builtin_any<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -6857,14 +6857,14 @@ fn builtin_any<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => owned_bool(any_all_over(elements, true)),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), true)),
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     }
 }
 
 /// Builtin: all
 ///
 /// Same shape as `any` — see #422.
-fn builtin_all<W: Clone + AsRef<[u64]>>(
+fn builtin_all<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -6877,7 +6877,7 @@ fn builtin_all<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => owned_bool(any_all_over(elements, false)),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), false)),
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     }
 }
 
@@ -8338,7 +8338,7 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
 ///
 /// flatten is defined over [.[]], and .[] over an object iterates its
 /// values, so jq accepts an object here as readily as an array (#422).
-fn builtin_flatten<W: Clone + AsRef<[u64]>>(
+fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
     depth: usize,
@@ -8355,7 +8355,7 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>>(
             if optional {
                 return QueryResult::None;
             }
-            return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value)));
+            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
         }
     };
     let items = match items {
@@ -8431,7 +8431,7 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
             };
-            builtin_flatten::<W>(value.clone(), optional, depth)
+            builtin_flatten::<W, S>(value.clone(), optional, depth)
         },
     )
 }
@@ -8947,7 +8947,7 @@ fn entries_to_object<I: IntoIterator<Item = OwnedValue>>(
 }
 
 /// Builtin: from_entries - [{key:k, value:v}] → {k:v}
-fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
+fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -8966,7 +8966,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>>(
             if optional {
                 return QueryResult::None;
             }
-            return QueryResult::Error(EvalError::cannot_iterate(&to_owned(&value)));
+            return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
         }
     };
     let entries = match entries {
@@ -16473,7 +16473,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // both the scalar and container no-op flags are simply
             // `S::TAG == EvalTag::Yq` here, unlike `eval_update`'s
             // operator-gated `scalar_noop` below).
-            if let Err(e) = set_path(
+            if let Err(e) = set_path::<S>(
                 &mut result,
                 path,
                 value,
@@ -16978,7 +16978,7 @@ fn tail_writes_from_fresh_parent(
 }
 
 /// Set a value at a path in an owned value.
-fn set_path(
+fn set_path<S: EvalSemantics>(
     root: &mut OwnedValue,
     path_expr: &Expr,
     new_value: OwnedValue,
@@ -17021,7 +17021,7 @@ fn set_path(
         Expr::Pipe(exprs) if !exprs.is_empty() => {
             // For chained paths like .a.b.c, navigate to parent and set at last element
             if exprs.len() == 1 {
-                set_path(root, &exprs[0], new_value, scalar_noop, container_noop)
+                set_path::<S>(root, &exprs[0], new_value, scalar_noop, container_noop)
             } else if let Some(split) = split_at_iterate(exprs) {
                 // #1428: walking to `split.before` autovivifies every missing
                 // step along the way, but an `Iterate` over the `Null` that
@@ -17073,7 +17073,7 @@ fn set_path(
                 }
                 match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
                     None => Ok(()),
-                    Some(target) => set_path_through_iterate(
+                    Some(target) => set_path_through_iterate::<S>(
                         target,
                         split.optional,
                         &split.tail,
@@ -17153,7 +17153,9 @@ fn set_path(
                             // arm reached it (#1321).
                             terminal_write: matches!(split.tail, Expr::Identity),
                         },
-                        |sub| set_path(sub, &split.tail, new_value, scalar_noop, container_noop),
+                        |sub| {
+                            set_path::<S>(sub, &split.tail, new_value, scalar_noop, container_noop)
+                        },
                     ),
                 }
             } else {
@@ -17189,13 +17191,13 @@ fn set_path(
                 match get_path_mut(root, parent_path, scalar_noop, true, &mut false)? {
                     None => Ok(()),
                     Some(parent) => {
-                        set_path(parent, last_path, new_value, scalar_noop, container_noop)
+                        set_path::<S>(parent, last_path, new_value, scalar_noop, container_noop)
                     }
                 }
             }
         }
         Expr::Optional(inner) => {
-            match set_path(root, inner, new_value, scalar_noop, container_noop) {
+            match set_path::<S>(root, inner, new_value, scalar_noop, container_noop) {
                 Ok(()) => Ok(()),
                 // jq's `?` suppresses errors raised while *collecting* a
                 // path, but not a write-time application check: a
@@ -17216,7 +17218,7 @@ fn set_path(
         // one, exposing the gap. Mirrors the `Optional` arm just above,
         // minus the swallow-on-error behavior `?` gets and bare parens
         // don't.
-        Expr::Paren(inner) => set_path(root, inner, new_value, scalar_noop, container_noop),
+        Expr::Paren(inner) => set_path::<S>(root, inner, new_value, scalar_noop, container_noop),
         Expr::Iterate => {
             // #1181: yq autovivifies `null` to `[]` for `.[] = v` (an empty
             // set of elements to write, matching real yq: `null | .[] = 99`
@@ -17242,7 +17244,7 @@ fn set_path(
                     Ok(())
                 }
                 _ if scalar_noop && is_yq_field_index_noop_scalar(root) => Ok(()),
-                _ => Err(EvalError::cannot_iterate(root)),
+                _ => Err(EvalError::cannot_iterate_with(S::TAG, root)),
             }
         }
         // `.[a:b] = v` splices `v`'s elements over the range, so `v` has to be
@@ -17795,7 +17797,7 @@ fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
 /// autovivify and the scalar-target no-op — deliberately the same rules, a
 /// mid-chain `.[]` isn't semantically different from a terminal one, just
 /// followed by more path.
-fn set_path_through_iterate(
+fn set_path_through_iterate<S: EvalSemantics>(
     target: &mut OwnedValue,
     optional: bool,
     tail: &Expr,
@@ -17809,18 +17811,18 @@ fn set_path_through_iterate(
     match target {
         OwnedValue::Array(arr) => {
             for elem in arr.iter_mut() {
-                set_path(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
+                set_path::<S>(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
             }
             Ok(())
         }
         OwnedValue::Object(map) => {
             for (_, elem) in map.iter_mut() {
-                set_path(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
+                set_path::<S>(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
             }
             Ok(())
         }
         _ if optional || (scalar_noop && is_yq_field_index_noop_scalar(target)) => Ok(()),
-        _ => Err(EvalError::cannot_iterate(target)),
+        _ => Err(EvalError::cannot_iterate_with(S::TAG, target)),
     }
 }
 
@@ -43878,6 +43880,48 @@ mod tests {
         );
     }
 
+    /// #1494: `builtin_any`/`builtin_all`/`builtin_flatten`/`builtin_from_entries`
+    /// (plus `set_path`/`set_path_through_iterate`, exercised separately)
+    /// used the jq-pinned `EvalError::cannot_iterate` shim unconditionally,
+    /// so a yq-mode error message always carried jq's own value-preview
+    /// convention regardless of the real evaluation mode. Threaded `S:
+    /// EvalSemantics` through instead, matching the 19 call sites #1055
+    /// already migrated.
+    ///
+    /// `(1.0 + 2.0)` is a *computed* float (`OwnedValue::Float(3.0)`, not a
+    /// source-literal-preserving `NumberLiteral`), which is exactly where
+    /// the two conventions provably diverge: jq's own error-message
+    /// convention spells a computed whole-number float without a decimal
+    /// point ("3", matching `1.0 + 2.0 | tostring` in real jq), while
+    /// yq/plain-JSON's convention keeps it ("3.0") -- confirmed against
+    /// `stream_owned_value_json_jq`'s own dedicated unit test
+    /// (`test_stream_json_jq_convention_keeps_shortest_float`). Seeing
+    /// "3.0" in a yq-mode error message is the load-bearing assertion here,
+    /// not incidental — it is only possible once `S::TAG` genuinely reaches
+    /// `cannot_iterate_with` as `EvalTag::Yq`.
+    #[test]
+    fn test_cannot_iterate_call_sites_use_the_real_mode_tag_1494() {
+        for expr in ["any", "all", "flatten", "from_entries"] {
+            let filter = format!("(1.0 + 2.0) | {expr}");
+            yq_query!(br"null", &filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, "Cannot iterate over number (3.0)",
+                        "{filter}: yq mode must use the plain float spelling, not jq's \"3\""
+                    );
+                }
+            );
+            query!(br"null", &filter,
+                QueryResult::Error(e) => {
+                    assert_eq!(
+                        e.message, "Cannot iterate over number (3)",
+                        "{filter}: jq mode must be unchanged from before this fix"
+                    );
+                }
+            );
+        }
+    }
+
     #[test]
     fn test_builtin_all() {
         query!(br"[true, true]", "all",
@@ -50975,7 +51019,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         assert!(matches!(
-            builtin_from_entries::<Vec<u64>>(cursor.value(), true),
+            builtin_from_entries::<Vec<u64>, JqSemantics>(cursor.value(), true),
             QueryResult::None
         ));
 
@@ -55488,7 +55532,7 @@ mod tests {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
         let mut root = OwnedValue::Null;
-        set_path(
+        set_path::<JqSemantics>(
             &mut root,
             &Expr::Field("a".to_string()),
             OwnedValue::Int(1),
@@ -55502,11 +55546,13 @@ mod tests {
         );
 
         let mut root = OwnedValue::Null;
-        set_path(&mut root, &Expr::Index(0), OwnedValue::Int(1), false, false).unwrap();
+        set_path::<JqSemantics>(&mut root, &Expr::Index(0), OwnedValue::Int(1), false, false)
+            .unwrap();
         assert_eq!(root, OwnedValue::Array(vec![OwnedValue::Int(1)]));
 
         let mut root = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        set_path(&mut root, &Expr::Index(4), OwnedValue::Int(9), false, false).unwrap();
+        set_path::<JqSemantics>(&mut root, &Expr::Index(4), OwnedValue::Int(9), false, false)
+            .unwrap();
         assert_eq!(
             root,
             OwnedValue::Array(vec![
@@ -55538,6 +55584,62 @@ mod tests {
                 OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Null)])),
             )]))
         );
+    }
+
+    /// #1494: `set_path`/`set_path_through_iterate` threaded `S:
+    /// EvalSemantics` through to `cannot_iterate_with(S::TAG, ...)`,
+    /// matching the other four call sites this issue covers.
+    ///
+    /// Note on reachability: `eval_assign` -- the only external caller --
+    /// always passes `scalar_noop = (S::TAG == EvalTag::Yq)` for plain `=`
+    /// (no operator-based exception the way `-=`/`*=` have), and
+    /// `is_yq_field_index_noop_scalar` is unconditionally `true` for any
+    /// non-container, non-null value -- exactly what reaches the `_` arm
+    /// these `cannot_iterate_with` calls live in. So with `scalar_noop =
+    /// true`, the no-op guard *always* wins first in real yq-mode usage
+    /// today (confirmed live: `succinctly yq '(1.0+2.0) | .[] = 9'` prints
+    /// `3.0` unchanged, never errors) -- `cannot_iterate_with(EvalTag::Yq,
+    /// ..)` is correctly wired but not yet reachable through that one
+    /// caller. This test calls both functions directly with
+    /// `scalar_noop: false` to verify the wiring itself, independent of
+    /// whether today's one caller happens to exercise it.
+    #[test]
+    fn test_set_path_cannot_iterate_uses_the_real_mode_tag_1494() {
+        let mut root = OwnedValue::Float(3.0);
+        let err =
+            set_path::<YqSemantics>(&mut root, &Expr::Iterate, OwnedValue::Int(9), false, false)
+                .unwrap_err();
+        assert_eq!(err.message, "Cannot iterate over number (3.0)");
+
+        let mut root = OwnedValue::Float(3.0);
+        let err =
+            set_path::<JqSemantics>(&mut root, &Expr::Iterate, OwnedValue::Int(9), false, false)
+                .unwrap_err();
+        assert_eq!(err.message, "Cannot iterate over number (3)");
+
+        let mut target = OwnedValue::Float(3.0);
+        let err = set_path_through_iterate::<YqSemantics>(
+            &mut target,
+            false,
+            &Expr::Identity,
+            OwnedValue::Int(9),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "Cannot iterate over number (3.0)");
+
+        let mut target = OwnedValue::Float(3.0);
+        let err = set_path_through_iterate::<JqSemantics>(
+            &mut target,
+            false,
+            &Expr::Identity,
+            OwnedValue::Int(9),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "Cannot iterate over number (3)");
     }
 
     #[test]
@@ -59363,7 +59465,8 @@ mod tests {
         fn test_set_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
             let err =
-                set_path(&mut root, &unresolved(), OwnedValue::Int(1), false, false).unwrap_err();
+                set_path::<JqSemantics>(&mut root, &unresolved(), OwnedValue::Int(1), false, false)
+                    .unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in assignment path"
@@ -59461,7 +59564,8 @@ mod tests {
         fn test_set_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
             let err =
-                set_path(&mut root, &unresolved(), OwnedValue::Int(1), false, false).unwrap_err();
+                set_path::<JqSemantics>(&mut root, &unresolved(), OwnedValue::Int(1), false, false)
+                    .unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in assignment path"
