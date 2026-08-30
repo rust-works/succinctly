@@ -4168,15 +4168,16 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
         reject_raw_output0_nul(s, config)?;
     }
 
-    // In seq mode, prepend RS (Record Separator) before each *JSON* value
-    // only -- real jq never writes it before a genuinely raw (`-r`/`-j`)
-    // string output, confirmed live against jq 1.7.1 (`--seq -r` produces
-    // no leading `\x1e` at all, #1913). `raw_str` already carries exactly
-    // that distinction: `None` here covers both "not in raw-output mode"
-    // and "`-r`'s value isn't a string," and jq's own `-r` on a non-string
-    // value falls back to JSON output *with* the separator, which this
-    // reuse gets right for free.
-    if config.seq && raw_str.is_none() {
+    // #1913: see `should_write_seq_separator`'s own doc comment. This is
+    // `write_output_jq_value`'s copy of the identical fix in `write_output`
+    // below -- currently dead in practice, since this function's only call
+    // site is gated by `can_use_lazy_path`, which already excludes
+    // `args.seq` entirely (`--seq` always takes the materializing path
+    // through `write_output` instead). Kept anyway as a correctness
+    // guarantee that doesn't depend on that gate staying in place: if a
+    // future change ever let `--seq` reach the lazy path, this would
+    // already be right instead of silently reintroducing #1913.
+    if should_write_seq_separator(config, raw_str.is_some()) {
         out.write_all(&[ASCII_RS])?;
     }
 
@@ -4231,6 +4232,35 @@ fn write_output_jq_value<Out: Write, Wrd: Clone + AsRef<[u64]>>(
 /// ASCII RS (Record Separator) character for JSON sequence format (RFC 7464)
 const ASCII_RS: u8 = 0x1E;
 
+/// Whether `--seq` should prepend the RS separator to this record (#1913).
+///
+/// Real jq writes it before each *JSON* output, but not before a
+/// genuinely raw string produced by `-r`/`-j` -- confirmed live against jq
+/// 1.7.1 (`--seq -r` produces no leading `\x1e` at all). `is_raw_output`
+/// is the caller's own `raw_str.is_some()`, which already distinguishes
+/// "not in raw-output mode" and "`-r`'s value isn't a string" from a
+/// genuine raw write -- reusing it here (rather than checking `config.seq`
+/// alone) gets a real-jq subtlety right for free: when `-r` falls back to
+/// JSON output for a non-string value, `raw_str` is `None` there too, so
+/// the separator is still written, matching jq.
+///
+/// Shared by both `write_output_jq_value` and `write_output` so the
+/// condition can't drift between them -- see `write_output_jq_value`'s own
+/// call site for why one of the two is currently unreachable under
+/// `--seq` regardless.
+///
+/// Caveat this function doesn't attempt to fix: `raw_str`'s `None` can
+/// also mean "the string failed to decode" (e.g. an unpaired UTF-16
+/// surrogate `JqValue::as_str()` gives up on) rather than "genuinely not a
+/// string" -- a separate, pre-existing gap in how undecodable strings are
+/// classified, not a `--seq`-specific one. In practice this particular
+/// codebase's parser already accepts input real jq rejects as a parse
+/// error before either write path is ever reached, so no live divergence
+/// was found for this combination; not investigated further here.
+fn should_write_seq_separator(config: &OutputConfig, is_raw_output: bool) -> bool {
+    config.seq && !is_raw_output
+}
+
 fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig) -> Result<()> {
     // Raw-output string, if any -- resolved and NUL-checked before
     // writing *any* byte of this record, including the `--seq` RS
@@ -4249,10 +4279,8 @@ fn write_output<W: Write>(out: &mut W, value: &OwnedValue, config: &OutputConfig
         reject_raw_output0_nul(s, config)?;
     }
 
-    // In seq mode, prepend RS (Record Separator) before each *JSON* value
-    // only -- see `write_output_jq_value`'s identical fix (#1913) for the
-    // full rationale; `raw_str` already carries the same distinction here.
-    if config.seq && raw_str.is_none() {
+    // #1913: see `should_write_seq_separator`'s own doc comment.
+    if should_write_seq_separator(config, raw_str.is_some()) {
         out.write_all(&[ASCII_RS])?;
     }
 
