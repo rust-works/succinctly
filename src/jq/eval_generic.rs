@@ -3033,6 +3033,96 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
 }
 
+/// Streaming counterpart of [`eval_with_cursor`] (#1653): deliver each output
+/// to `on_value` as soon as it is produced, instead of collecting a whole
+/// input's results into a `Vec` first.
+///
+/// Real jq's evaluator is a lazy generator, so a filter that both writes to
+/// stdout and triggers a stderr side effect (`debug`, `stderr`, `halt_error`)
+/// or raises mid-stream interleaves the two in real time:
+///
+/// ```console
+/// $ jq --unbuffered -cn '1, debug, 2'   2>&1
+/// 1
+/// ["DEBUG:",null]
+/// null
+/// 2
+/// ```
+///
+/// Collecting first cannot reproduce that ordering *however the writes are
+/// buffered*, because every stderr write has already happened by the time the
+/// first stdout write runs -- which is why `--unbuffered`'s per-write
+/// `flush()` alone never fixed it.
+///
+/// `on_value` returns `false` to stop the generator early (the CLI uses this
+/// for a write error). Each output arrives as a single-output
+/// [`GenericResult`], so every consumer's existing per-result handling --
+/// including the lazy `LazyKeys`/`LazyIndexRange`/`LazySeq` variants -- keeps
+/// working unchanged. Items arrive via the same [`generic_item_to_result`]
+/// conversion every other sink consumer uses.
+///
+/// Returns `Some(control)` iff evaluation terminated in a control (an uncaught
+/// error, `break`, or `halt`); everything produced *before* it has already
+/// been delivered, matching jq, which writes `1` to stdout before reporting
+/// the error for `1, error("x"), 3`.
+pub fn eval_each_with_cursor<C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+    on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
+) -> Option<Control> {
+    eval_each_with_cursor_using::<JqSemantics, C>(expr, cursor, on_value)
+}
+
+/// Streaming counterpart of [`eval_with_cursor_using`] (#1653).
+///
+/// Same `takes_input_queue_bridge` gate as the eager entry point (#1504), but
+/// it does *not* cost the streaming: the bridge needs the input owned, not the
+/// outputs collected, so that branch drives `eval_each_owned` -- itself
+/// demand-driven -- with this function's own sink rather than
+/// `eval_each_owned_collect`'s accumulating one. `jq -n 'inputs, debug'`
+/// interleaves like jq because of this branch, not despite it.
+pub fn eval_each_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+    on_value: &mut dyn FnMut(GenericResult<C::Value>) -> bool,
+) -> Option<Control> {
+    if takes_input_queue_bridge(expr) {
+        let owned = match to_owned_cursor(&cursor) {
+            Ok(o) => o,
+            Err(e) => return Some(Control::Error(e)),
+        };
+        let mut owned_sink = |v: OwnedValue| -> Demand {
+            if on_value(GenericResult::Owned(v)) {
+                Demand::Continue
+            } else {
+                Demand::Stop
+            }
+        };
+        return match crate::jq::eval::eval_each_owned::<S>(expr, &owned, false, &mut owned_sink) {
+            Flow::Exhausted => None,
+            Flow::Stopped { .. } => None,
+            Flow::Escaped(c) => Some(c),
+        };
+    }
+
+    let mut sink = |item: GenericItem<C::Value>| -> Demand {
+        if on_value(generic_item_to_result::<C::Value>(item)) {
+            Demand::Continue
+        } else {
+            Demand::Stop
+        }
+    };
+    match eval_each_generic::<S, C::Value>(expr, cursor.value(), false, Some(cursor), &mut sink) {
+        Flow::Exhausted => None,
+        // A `pending` control is one an eager fallback had already raised
+        // before the sink said stop; the CLI's own stop is a write error it
+        // is already reporting, so surfacing the control too would double
+        // report. Dropped, matching every Stage 2 consumer of `Stopped`.
+        Flow::Stopped { .. } => None,
+        Flow::Escaped(c) => Some(c),
+    }
+}
+
 /// Fold an already-evaluated first pipe stage through every remaining stage,
 /// eagerly. Extracted verbatim from `eval_single`'s own `Expr::Pipe` arm
 /// (`current` is `exprs[0]`'s own result, `stages` is `exprs[1..]`) so
