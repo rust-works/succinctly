@@ -5005,7 +5005,13 @@ enum GenericItem<V: DocumentValue> {
         collapse: bool,
     },
     LazyIndexRange(usize),
-    LazySeq(LazySeq<V>),
+    /// Boxed for the same reason as `GenericResult::LazySeq` (#789): this is
+    /// the sibling enum pushed once per *item* through every sink in the
+    /// streaming/demand-driven path (`push_one_generic`,
+    /// `each_*_iterate_sink`, `drain_result_generic`), so an unboxed
+    /// `LazySeq<V>` here pays the same flat oversized-copy tax on an even
+    /// hotter path than `GenericResult`'s own per-stage one.
+    LazySeq(Box<LazySeq<V>>),
 }
 
 /// Push one item to `sink`, translating its `Demand` into a terminal `Flow`.
@@ -5072,7 +5078,7 @@ fn drain_result_generic<V: DocumentValue>(
         GenericResult::LazyIndexRange(len) => {
             push_one_generic(GenericItem::LazyIndexRange(len), sink)
         }
-        GenericResult::LazySeq(seq) => push_one_generic(GenericItem::LazySeq(*seq), sink),
+        GenericResult::LazySeq(seq) => push_one_generic(GenericItem::LazySeq(seq), sink),
         GenericResult::Many(vs) => push_many_generic(vs.into_iter().map(GenericItem::One), sink),
         GenericResult::ManyCursor(cs) => {
             push_many_generic(cs.into_iter().map(GenericItem::OneCursor), sink)
@@ -5994,7 +6000,7 @@ fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResu
             collapse,
         },
         GenericItem::LazyIndexRange(len) => GenericResult::LazyIndexRange(len),
-        GenericItem::LazySeq(seq) => GenericResult::LazySeq(Box::new(seq)),
+        GenericItem::LazySeq(seq) => GenericResult::LazySeq(seq),
     }
 }
 
@@ -8633,6 +8639,26 @@ mod tests {
             "GenericResult<V> grew to {size} bytes (was 120 pre-#740, 184 with the #789 \
              regression, 120 again after boxing LazySeq) -- every variant now pays this on \
              every return; investigate before accepting a bigger enum"
+        );
+    }
+
+    /// #789 (code review follow-up): `GenericItem<V>`'s own `LazySeq`
+    /// variant had the identical unboxed-widest-variant defect as
+    /// `GenericResult`'s -- and on a hotter path, since `GenericItem` is
+    /// pushed once per *item* through every sink in the streaming path
+    /// (`push_one_generic`, `each_*_iterate_sink`), not once per pipe
+    /// stage. Measured at 184 bytes pre-fix (identical to raw `LazySeq<V>`
+    /// itself), 80 bytes after boxing. Pinned as the `GenericItem` twin of
+    /// [`test_generic_result_size_stays_bounded_789`] above.
+    #[test]
+    fn test_generic_item_size_stays_bounded_789() {
+        let size =
+            core::mem::size_of::<GenericItem<crate::json::light::StandardJson<'_, Vec<u64>>>>();
+        assert!(
+            size <= 96,
+            "GenericItem<V> grew to {size} bytes (was 184 with the #789 defect, 80 after \
+             boxing LazySeq) -- every variant now pays this on every push; investigate \
+             before accepting a bigger enum"
         );
     }
 
