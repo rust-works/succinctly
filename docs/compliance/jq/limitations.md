@@ -1764,6 +1764,51 @@ precedent for a gap that doesn't fit the letter of rule 4 but is kept rather
 than silently left unrecorded. See
 [#1561](https://github.com/rust-works/succinctly/issues/1561).
 
+### `repeat(f)` silently caps at 1000 rounds, in both value and path mode
+
+`repeat(f)` (`def repeat(f): f, repeat(f);`) has no base case at all: an `f`
+that never errors and never produces a value on some round recurses forever.
+Confirmed live that real jq itself hangs on this rather than raising or
+terminating:
+
+```console
+$ timeout 3 jq -cn 'limit(3; repeat(empty))'; echo "exit: $?"
+exit: 124                                 # real jq hangs -- 124 is `timeout`'s own code
+```
+
+`eval_repeat` (value mode, `src/jq/eval.rs`) already backstops this with a
+`MAX_ITERATIONS = 1000` round cap, so `limit(3; repeat(empty))` returns no
+output and exits 0 in succinctly instead of hanging the process --
+unquestionably permitted under ADR-0018 rule 4c (matching a reference's hang
+is not something this project attempts). [#1906](https://github.com/rust-works/succinctly/issues/1906)
+added the identical cap to `resolve_repeat_bounded` (path mode, the
+`path(repeat(f))`/`path(limit(n; repeat(f)))` route) for the same reason and
+to keep the two modes consistent with each other.
+
+The cap has a real side effect neither call site's own doc comment
+mentioned before now: it also silently truncates a *legitimate*, `n` greater
+than 1000 request, with no error and no warning, where jq itself handles a
+large `n` trivially:
+
+```console
+$ jq -cn '[limit(1500; repeat(1))] | length'
+1500
+$ succinctly jq -cn '[limit(1500; repeat(1))] | length'
+1000
+```
+
+This half of the behavior doesn't fit any of ADR-0018's four conditions on
+its own (the output is readable, nothing is corrupted, and unlike the
+`repeat(empty)` case this input does not threaten to hang the process) --
+but it is the unavoidable other side of the same guard that rule 4c does
+cover, not a second, separable design choice: a per-round cap cannot
+distinguish "this round produced nothing because `f` is degenerate" from
+"this round produced nothing yet because we haven't gotten to round 1001",
+so raising the cap only moves where a sufficiently large `n` starts silently
+truncating rather than removing the tradeoff. Recorded here rather than left
+implicit in a doc comment that named only the case it was actually written
+to prevent.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |

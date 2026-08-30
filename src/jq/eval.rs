@@ -20937,13 +20937,30 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
 /// value-only semantics (its doc comment: "evaluates `expr` with the
 /// original input each time").
 ///
-/// `MAX_ITERATIONS` mirrors `eval_repeat`'s own identical backstop
-/// (`src/jq/eval.rs`) against exactly the same unbounded-empty-round
-/// case -- a deliberate divergence from real jq's own hang, not new to
-/// this fix: `eval_repeat`'s value-mode sibling already terminates
-/// `limit(3; repeat(empty))` with no output instead of hanging, and this
-/// keeps path-mode consistent with it rather than reintroducing the hang
-/// only here.
+/// `MAX_ITERATIONS` (round count) and `budget` (total branch count, shared
+/// with `reduce`/`foreach` via [`REDUCE_FOREACH_MAX_STEPS`]) together
+/// mirror `eval_repeat`'s own identical two-tier backstop
+/// (`src/jq/eval.rs`) -- documented as a deliberate divergence from real
+/// jq's own hang/unbounded-allocation in
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md),
+/// not new to this fix: `eval_repeat`'s value-mode sibling already
+/// terminates `limit(3; repeat(empty))` with no output instead of hanging
+/// (round cap), and already refuses a wide enough fan-out with "repeat:
+/// maximum iterations exceeded" rather than growing `outputs` unboundedly
+/// (branch-count budget) -- this keeps path-mode consistent with both
+/// rather than reintroducing either gap only here (code review, #1933:
+/// an earlier version of this function had the round cap but not the
+/// branch-count budget, letting `path(limit(50000; repeat(.[])))` on a
+/// wide array allocate 5x what value-mode's identical query allows).
+///
+/// Code review, #1933: an earlier version of the `Err` arm below always
+/// propagated `e`, even when `branches` already satisfied `n` before the
+/// error -- confirmed live to spuriously exit 5 for `path(limit(1;
+/// repeat((., error("boom")))))`, which real jq treats as fully successful
+/// (its own `limit` never asks for a second output once the first
+/// satisfies `n`, so it never reaches the error). Mirrors
+/// [`take_path_branches`]'s own identical `prefix.len() >= n` check for the
+/// same reason.
 fn resolve_repeat_bounded<'a, S: EvalSemantics>(
     f: &Expr,
     value: &'a OwnedValue,
@@ -20952,16 +20969,34 @@ fn resolve_repeat_bounded<'a, S: EvalSemantics>(
     n: usize,
 ) -> PathResolveResult<'a> {
     const MAX_ITERATIONS: usize = 1000;
-    let mut branches = Vec::new();
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    let mut branches: Vec<PathBranch<'a>> = Vec::new();
     for _ in 0..MAX_ITERATIONS {
         if branches.len() >= n {
             break;
         }
         match resolve_node::<S>(f, value, trackable, snapshot) {
-            Ok(mut b) => branches.append(&mut b),
+            Ok(round) => {
+                for branch in round {
+                    if budget == 0 {
+                        let e: EvalEscape =
+                            EvalError::new("repeat: maximum iterations exceeded".to_string())
+                                .into();
+                        return Err((branches, e));
+                    }
+                    budget -= 1;
+                    branches.push(branch);
+                    if branches.len() >= n {
+                        break;
+                    }
+                }
+            }
             Err((mut b, e)) => {
                 branches.append(&mut b);
-                branches.truncate(n);
+                if branches.len() >= n {
+                    branches.truncate(n);
+                    return Ok(branches);
+                }
                 return Err((branches, e));
             }
         }
