@@ -25591,6 +25591,16 @@ fn test_suppressed_write_leaves_no_autovivified_chain_1428() -> Result<()> {
         ("null", ".a[]?.b |= 9", "null\n"),
         // ...and so do the compound operators built on it.
         ("null", ".a[]? += 1", "null\n"),
+        // The probe's out-of-range *index* branch: the array exists, so the
+        // walk gets that far, but the index is past its end -- which is a slot
+        // `write_index` would pad into existence, i.e. "would create". Padding
+        // it and then discovering the iterate writes nothing is exactly the
+        // stranding this fix removes, here as trailing `null`s rather than a
+        // fabricated key.
+        ("{\"a\":[1]}", ".a[5][]? = 9", "{\"a\":[1]}\n"),
+        ("{\"a\":[1]}", ".a[5][]? |= 9", "{\"a\":[1]}\n"),
+        ("{\"a\":[1]}", ".a[5].b[]? = 9", "{\"a\":[1]}\n"),
+        ("[1]", ".[5][]? = 9", "[1]\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "{input} | {filter} -- stderr={stderr}");
