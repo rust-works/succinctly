@@ -1212,15 +1212,26 @@ impl<V: DocumentValue> LazySeq<V> {
         }
     }
 
-    /// Push one more `map(f)` stage onto this chain. `f` is cloned once per
-    /// *stage* (not per element) into a fresh `Rc` — `Builtin::Map` only ever
-    /// hands us a borrowed `&Expr` (from `unwrap_paren` in the `Pipe` fold, or
-    /// `&Builtin` in `eval_builtin`), so there is nothing to move out of.
-    fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
+    /// Push one more `map(f)` stage onto this chain, in place. `f` is cloned
+    /// once per *stage* (not per element) into a fresh `Rc` — `Builtin::Map`
+    /// only ever hands us a borrowed `&Expr` (from `unwrap_paren` in the
+    /// `Pipe` fold, or `&Builtin` in `eval_builtin`), so there is nothing to
+    /// move out of. Split out from [`Self::push_map`] (#789 code review
+    /// follow-up) so `fold_lazy_seq_stage`'s `Map` arm can mutate an
+    /// already-boxed `LazySeq` through `&mut` instead of moving it out of
+    /// its `Box` (freeing the allocation) only to immediately `Box::new` a
+    /// same-size replacement.
+    fn push_map_in_place(&mut self, f: &Expr, tag: EvalTag) {
         Rc::make_mut(&mut self.instructions).push(Instruction {
             f: Rc::new(f.clone()),
             tag,
         });
+    }
+
+    /// Builder-style wrapper around [`Self::push_map_in_place`], for the
+    /// fresh-construction call sites that chain straight off `LazySeq::new`.
+    fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
+        self.push_map_in_place(f, tag);
         self
     }
 
@@ -3493,7 +3504,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // materializes once (`materialize_atomic`) and hands off
             // to the full evaluator — still one pass, not the
             // original four-pass round trip.
-            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(*seq, expr, optional),
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
             GenericResult::None => GenericResult::None,
             GenericResult::Error(e) => return GenericResult::Error(e),
             GenericResult::Owned(o) => {
@@ -3794,12 +3805,19 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
 /// demand-aware callers, since none of them fan out beyond the single `seq`
 /// they were already holding.
 fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
-    mut seq: LazySeq<V>,
+    mut seq: Box<LazySeq<V>>,
     expr: &Expr,
     optional: bool,
 ) -> GenericResult<V> {
     match unwrap_paren(expr) {
-        Expr::Builtin(Builtin::Map(h)) => GenericResult::LazySeq(Box::new(seq.push_map(h, S::TAG))),
+        // In place (#789 code review follow-up): reuses the `Box`'s
+        // existing heap slot instead of freeing it and allocating a
+        // same-size replacement -- the hot path for a chained
+        // `map(f) | map(g) | map(h)`, where this arm runs once per stage.
+        Expr::Builtin(Builtin::Map(h)) => {
+            seq.push_map_in_place(h, S::TAG);
+            GenericResult::LazySeq(seq)
+        }
 
         // Count-and-discard: every element still runs (so a
         // `map(f)` that errors partway still errors), but no
@@ -4239,7 +4257,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
             GenericResult::LazySeq(seq) if is_iterate => {
                 return each_lazy_seq_iterate_sink::<S, V>(*seq, rest, optional, sink);
             }
-            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(*seq, expr, optional),
+            GenericResult::LazySeq(seq) => fold_lazy_seq_stage::<S, V>(seq, expr, optional),
             // Resolved to a genuinely single value/cursor -- hand off to the
             // already-correct, arbitrary-length-pipe-aware demand driver
             // rather than re-deriving its cursor-threading logic here
@@ -5005,12 +5023,11 @@ enum GenericItem<V: DocumentValue> {
         collapse: bool,
     },
     LazyIndexRange(usize),
-    /// Boxed for the same reason as `GenericResult::LazySeq` (#789): this is
-    /// the sibling enum pushed once per *item* through every sink in the
-    /// streaming/demand-driven path (`push_one_generic`,
-    /// `each_*_iterate_sink`, `drain_result_generic`), so an unboxed
-    /// `LazySeq<V>` here pays the same flat oversized-copy tax on an even
-    /// hotter path than `GenericResult`'s own per-stage one.
+    /// Boxed for the same reason as `GenericResult::LazySeq` (#789) -- see
+    /// that variant's doc comment for the mechanism. This sibling enum is
+    /// pushed once per *item* through every sink in the streaming path
+    /// (`push_one_generic`, `each_*_iterate_sink`), an even hotter path than
+    /// `GenericResult`'s own per-stage one.
     LazySeq(Box<LazySeq<V>>),
 }
 
@@ -8629,14 +8646,18 @@ mod tests {
     /// Boxing the variant recovered the original 120 bytes. Pinned here as a
     /// permanent regression guard against a future variant doing the same
     /// thing silently -- Rust enum size is easy to grow by accident one
-    /// field at a time with no compiler warning.
+    /// field at a time with no compiler warning. Exact-value assertion,
+    /// gated to 64-bit, matches this crate's existing size-guard convention
+    /// (`error::tests::eval_error_size_is_pinned_for_the_1021_stack_overflow_fix`);
+    /// 32-bit targets shrink pointer-sized fields, so this exact count
+    /// doesn't hold there.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn test_generic_result_size_stays_bounded_789() {
-        let size =
-            core::mem::size_of::<GenericResult<crate::json::light::StandardJson<'_, Vec<u64>>>>();
-        assert!(
-            size <= 128,
-            "GenericResult<V> grew to {size} bytes (was 120 pre-#740, 184 with the #789 \
+        assert_eq!(
+            core::mem::size_of::<GenericResult<crate::json::light::StandardJson<'_, Vec<u64>>>>(),
+            120,
+            "GenericResult<V>'s size regressed (was 120 pre-#740, 184 with the #789 \
              regression, 120 again after boxing LazySeq) -- every variant now pays this on \
              every return; investigate before accepting a bigger enum"
         );
@@ -8649,14 +8670,15 @@ mod tests {
     /// (`push_one_generic`, `each_*_iterate_sink`), not once per pipe
     /// stage. Measured at 184 bytes pre-fix (identical to raw `LazySeq<V>`
     /// itself), 80 bytes after boxing. Pinned as the `GenericItem` twin of
-    /// [`test_generic_result_size_stays_bounded_789`] above.
+    /// [`test_generic_result_size_stays_bounded_789`] above, same
+    /// exact-value-plus-64-bit-gate convention.
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn test_generic_item_size_stays_bounded_789() {
-        let size =
-            core::mem::size_of::<GenericItem<crate::json::light::StandardJson<'_, Vec<u64>>>>();
-        assert!(
-            size <= 96,
-            "GenericItem<V> grew to {size} bytes (was 184 with the #789 defect, 80 after \
+        assert_eq!(
+            core::mem::size_of::<GenericItem<crate::json::light::StandardJson<'_, Vec<u64>>>>(),
+            80,
+            "GenericItem<V>'s size regressed (was 184 with the #789 defect, 80 after \
              boxing LazySeq) -- every variant now pays this on every push; investigate \
              before accepting a bigger enum"
         );
