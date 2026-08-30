@@ -10956,6 +10956,28 @@ fn test_path_limit_bare_iterate_through_parens_bounded_1850() -> Result<()> {
     Ok(())
 }
 
+/// #1850 code review: an untrackable value (#843) reaching the bare `.[]`
+/// fast path through `limit` must raise the same "near attempt to iterate"
+/// error the plain (non-`limit`) `Expr::Iterate` arm always has -- both call
+/// sites gate on `trackable` themselves before ever calling
+/// `resolve_iterate_bounded`, which has no such check of its own. Oracle-verified
+/// against jq 1.7.1: the caught scalar `5` is the value named, not a
+/// `cannot_iterate_with` "Cannot iterate over number" message.
+#[test]
+fn test_path_limit_bare_iterate_untrackable_value_still_near_attempt_error_1850() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(try (.a, error(5)) catch limit(3; .[]))"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[\"a\"]");
+    assert!(
+        stderr.contains("near attempt to iterate through 5"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 /// #1850 companion: a compound expression (`.[] | select(...)`) is not the
 /// bare `Expr::Iterate` shape the fast path targets, so it still takes the
 /// original eager `resolve_node` + `take_path_branches` route -- confirming
