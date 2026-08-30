@@ -3500,11 +3500,7 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// rather than routing through [`to_owned`], which would box an unused copy
 /// of the source digits for no benefit here (also a #1879 review finding).
 ///
-/// Real jq's own definition (`builtin.jq`, confirmed against jq's current
-/// source -- `skip/2` postdates the pinned 1.7.1 oracle, so a live repro
-/// isn't possible; verified by hand-tracing the generator below instead --
-/// **unverified against a live binary; re-check once the pinned oracle
-/// reaches jq 1.8+, see #1880**):
+/// Real jq's own definition (`builtin.jq`):
 /// ```jq
 /// def skip($n; expr):
 ///   if $n > 0 then foreach expr as $item ($n; . - 1; if . < 0 then $item else empty end)
@@ -3520,13 +3516,18 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// [`ceil_positive_float_to_usize`]: the first item emitted is the one where
 /// `$n - k < 0`, i.e. `k > $n`, so a non-integer positive `$n` skips exactly
 /// `floor($n)` items -- which a plain truncating `f as usize` cast already
-/// gives. Hand-traced against the real definition above:
-/// `skip(1.5; 1,2,3,4)` decrements `1.5 -> 0.5 -> -0.5`, first emitting on
-/// item 2, i.e. skips 1 (`floor(1.5)`); `skip(0.4; ...)` decrements
-/// `0.4 -> -0.6`, first emitting on item 1, i.e. skips 0 (`floor(0.4)`).
+/// gives (test: `test_classify_skip_n_floors_positive_fractional_1846`).
 /// #1846/#1849 both suspected this should ceiling like `limit`/`nth` instead
 /// -- it should not; adding a ceiling here would be a regression, not a fix.
-/// See #1880 for re-verifying this against a live oracle once one exists.
+///
+/// `skip/2` postdates the pinned `jq-1.7.1` oracle (`tests/data/jq-golden/JQ_VERSION`),
+/// so no golden fixture exists for it and the floor-vs-ceiling conclusion above
+/// was not captured by `scripts/sync-jq-golden.sh`. It has, however, been
+/// live-verified against Homebrew `jq` 1.8.2 (`skip(1.5;1,2,3,4)` -> `2,3,4`,
+/// `skip(0.4;...)` -> unchanged, `skip(nan;...)` -> error, `skip(-1;...)` ->
+/// error, `skip(9007199254740995;1,2,3,4)` -> `[]`, all matching this function
+/// exactly) -- not the pinned oracle, so still worth re-checking once the pin
+/// itself moves past 1.8, tracked in #1880.
 fn classify_skip_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
     match n_owned {
         OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if i >= 0 => {
