@@ -20784,14 +20784,15 @@ fn resolve_limit<'a, S: EvalSemantics>(
 /// lesson #106 already burned this file on once).
 ///
 /// - #1850: bare `.[]` is bounded directly via `.take(n)` on the same
-///   iterator `resolve_node`'s own `Expr::Iterate` arm builds, making
-///   `path(limit(n; .[]))`/`path(first(.[]))` O(n) instead of O(document
-///   size) -- see [`resolve_iterate_bounded`]'s own doc comment for why this
-///   is scoped to exactly this shape rather than `resolve_node`'s generator
-///   path in general: every other arm there returns a fully materialized
-///   `Vec<PathBranch>` with no sink/early-stop protocol to plug into, so a
-///   fully general fix is a separate, much wider design question that
-///   issue itself left open.
+///   iterator `resolve_node`'s own `Expr::Iterate` arm builds (see
+///   [`resolve_iterate_bounded`]'s own doc comment for the implementation),
+///   making `path(limit(n; .[]))`/`path(first(.[]))` O(n) instead of
+///   O(document size). Scoped to exactly this shape rather than
+///   `resolve_node`'s generator path in general because every other arm
+///   there returns a fully materialized `Vec<PathBranch>` with no
+///   sink/early-stop protocol to plug into -- a fully general fix needs
+///   that protocol threaded through `resolve_node` itself, tracked as its
+///   own open design question in #1952 rather than attempted here.
 /// - #1906: `repeat(f)` needs the same interception, for a correctness
 ///   reason rather than a performance one -- see [`resolve_repeat_bounded`]'s
 ///   own doc comment. This has to intercept *before* the generic

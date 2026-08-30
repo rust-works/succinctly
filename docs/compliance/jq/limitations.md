@@ -1875,9 +1875,11 @@ passing through one of these has no way to know, at that point, how many outputs
 actually be needed -- closing this generally would need a bound threaded *through*
 arbitrary combinator nesting before ever calling `resolve_node` on the `repeat` itself,
 which its current single `(expr, value, trackable, snapshot) -> Vec<PathBranch>` signature
-has no parameter for. Tracked as an open scoping question in #1935 rather than attempted
-here; the narrow `first`/`limit` fixes already close the two shapes named in #1906/#1935's
-own repros.
+has no parameter for. Tracked as its own standalone design question in
+[#1952](https://github.com/rust-works/succinctly/issues/1952) (a general sink/early-stop
+protocol for `resolve_node`, the same shape `eval_each_owned` already gives value-mode
+evaluation) rather than attempted here; the narrow `first`/`limit` fixes already close
+the two shapes named in #1906/#1935's own repros.
 
 ## Provenance
 
