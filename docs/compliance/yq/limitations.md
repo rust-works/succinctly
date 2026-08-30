@@ -867,8 +867,28 @@ A `null` target is deliberately excluded from this fix — real yq autovivifies 
 as part of the write itself (already correct on both sides before and after this fix), so it
 is not a *total* no-op the way an empty/all-scalar container is, and this predicate's
 all-or-nothing `Skip`/`Continue` caller has no way to express "skip the RHS, but still
-perform the write." That narrower, still-open gap is tracked separately by
-[#1857](https://github.com/rust-works/succinctly/issues/1857).
+perform the write." That narrower gap was tracked separately as #1857 -- see the entry below.
+
+**Fixed by [#1857](https://github.com/rust-works/succinctly/issues/1857):** a *mid-chain*
+`Iterate` autovivifying `null` into `[]` still evaluated the RHS eagerly, where real yq's
+equivalent write never needs it (zero elements to write into). New `assign_path_rhs_unused`
+answers a broader question than `assign_path_all_noop`'s total-no-op check -- "is the RHS
+ever actually read" -- recognizing `null` under a mid-chain `Iterate` as one more case where
+it isn't, and `yq_assign_noop_check` performs the (already fully determined) write with a
+placeholder value instead of evaluating the RHS at all:
+
+```bash
+$ printf 'a: null\n' | yq            -o=json '.a[].b = error("boom")'   # {"a":[]}, RHS never runs
+$ printf 'a: null\n' | succinctly yq -o=json '.a[].b = error("boom")'   # {"a":[]} (fixed)
+```
+
+Reaches every yq-mode assignment operator routed through this mechanism (`=`, `+=`, `-=`,
+`*=`, `/=`, `%=`, `//=`). A **terminal** `Iterate` (`.a[] = v`, the assignment target itself)
+is a different, still-open case neither this fix nor #1432's own covers — see
+[#1921](https://github.com/rust-works/succinctly/issues/1921). Plain `|=` doesn't share this
+mechanism at all and turned out to have a separate, more severe divergence (a hard error
+instead of missing autovivification) — see
+[#1919](https://github.com/rust-works/succinctly/issues/1919).
 
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 

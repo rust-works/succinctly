@@ -15663,12 +15663,20 @@ fn yq_assign_is_total_noop(path: &Expr, root: &OwnedValue) -> bool {
 /// [`yq_assign_is_total_noop`]'s twin for the narrower #1857 gap: a path is
 /// not a *total* no-op (the document does change) but still never actually
 /// reads the RHS value, because every write it reaches is either already a
-/// no-op (`assign_path_all_noop`'s own shape) or a mid-chain `Iterate` that
-/// autovivifies `Null` into an empty array -- zero elements, so whatever
-/// `set_path` gets handed as the value is never written anywhere. Shares
-/// every gate `yq_assign_is_total_noop` has (empty-flattened-list bail,
-/// slice-anywhere exclusion, terminal-shape check) since none of that
+/// no-op (`assign_path_all_noop`'s own shape) or a *mid-chain* `Iterate`
+/// that autovivifies `Null` into an empty array -- zero elements, so
+/// whatever `set_path` gets handed as the value is never written anywhere.
+/// Shares every gate `yq_assign_is_total_noop` has (empty-flattened-list
+/// bail, slice-anywhere exclusion, terminal-shape check) since none of that
 /// reasoning changes here -- only the final predicate call differs.
+///
+/// Deliberately does **not** cover a *terminal* `Iterate` (`.a[] = v`, the
+/// `Iterate` itself is `last`, stripped into the caller's own `prefix`
+/// before this is ever reached) reaching an already-empty container or
+/// `Null` -- that shape needs the terminal step's own type available at the
+/// point its target is examined, which this prefix-only design structurally
+/// can't see (same reason `assign_path_all_noop` never covered it either).
+/// Filed separately as #1921 rather than folded in here.
 fn yq_assign_rhs_unused(path: &Expr, root: &OwnedValue) -> bool {
     let mut flat = Vec::new();
     push_path_components(&mut flat, path);
@@ -15776,9 +15784,14 @@ fn assign_path_rhs_unused(current: &OwnedValue, steps: &[Expr]) -> bool {
 /// legitimate `null` -> `[]` write that already happens correctly on the
 /// normal `Continue` path -- there is no way to express "skip the RHS,
 /// but still perform the write" through this predicate's boolean answer
-/// alone. That narrower gap (the RHS still evaluates eagerly for `Null`,
-/// where real yq's own equivalent write never needs it) is real but out
-/// of this predicate's reach -- filed separately as #1857.
+/// alone. That narrower gap (the RHS still evaluates eagerly for `Null`
+/// reached via a *mid-chain* `Iterate`, where real yq's own equivalent
+/// write never needs it) was filed as #1857 and is now handled by this
+/// function's own twin, [`assign_path_rhs_unused`], through the separate
+/// `yq_assign_noop_check` branch that calls it -- see that function's doc
+/// comment. A *terminal* `Iterate` reaching `Null` (`.a[] = v` with no
+/// further path after it) is a different, still-open case neither twin
+/// covers -- filed as #1921 for that shape.
 fn assign_path_all_noop(current: &OwnedValue, steps: &[Expr]) -> bool {
     let (step, rest) = match steps.split_first() {
         None => return is_yq_field_index_noop_scalar(current),

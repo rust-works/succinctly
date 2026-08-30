@@ -22247,6 +22247,11 @@ fn test_yq_nonterminal_iterate_scalar_noop_discards_rhs_1298() -> Result<()> {
 /// case below is the same gap reached through #1432's own recursion (a
 /// `Null` nested inside a fanned-into array), not just a bare top-level
 /// target.
+///
+/// Scoped to a *mid-chain* `Iterate` only (`.a[].b = v`, something after
+/// the `[]`) -- a *terminal* one (`.a[] = v`, the assignment target
+/// itself) is a different, still-open case this fix doesn't reach, filed
+/// separately as #1921.
 #[test]
 fn test_yq_nonterminal_iterate_null_target_skips_rhs_1298() -> Result<()> {
     let (out, err, code) =
@@ -22282,6 +22287,30 @@ fn test_yq_nonterminal_iterate_null_mixed_with_real_write_still_evaluates_rhs_18
         "a:\n  - null\n  - [{}]\n",
         &["-o", "json"],
     )?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+    Ok(())
+}
+
+/// #1921 (known gap, not fixed by #1857): a *terminal* `Iterate` -- the
+/// assignment target itself, no further path after it -- always evaluates
+/// the RHS, even over an already-empty container or `Null`. Real yq skips
+/// it (`.a[] = error("boom")` on `a: []`/`a: null` both stay/become `[]`,
+/// live-verified v4.53.3); succinctly still errors. Pinned here as a known
+/// divergence rather than silently left uncovered -- see #1921 for why
+/// this needs its own fix, not a #1857 extension (a terminal `Iterate`'s
+/// own semantics -- overwrite every real element regardless of type --
+/// genuinely differ from a mid-chain one's).
+#[test]
+fn test_yq_terminal_iterate_empty_or_null_target_still_evaluates_rhs_known_gap_1921() -> Result<()>
+{
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a[] = error(\"boom\")", "a: []\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("boom"), "err={err}");
+
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr(".a[] = error(\"boom\")", "a: null\n", &["-o", "json"])?;
     assert_ne!(code, 0);
     assert!(err.contains("boom"), "err={err}");
     Ok(())
