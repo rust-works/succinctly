@@ -26416,6 +26416,80 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Turn a per-element path-context loop's stop signal -- the `Some(stop)`
+/// [`accumulate_path_context_step`] returns once `iterate_element_step`
+/// forces `optional = false` into each element's own evaluation -- into
+/// this arm's final `QueryResult`, catching a genuine `Error` under this
+/// arm's own *ambient* `optional` and either discarding or keeping the
+/// already-produced prefix depending on whether the construct is atomic
+/// (#1888): one definition for the "catch `Error` under ambient `optional`,
+/// keep-or-discard prefix" dispatch `Builtin::Map` (#1826) and
+/// `Expr::Iterate` (#1869) each independently hand-rolled after their own
+/// fix for this exact `iterate_element_step` isolation.
+///
+/// `atomic`:
+/// - `true` (`Builtin::Map`, array construction): any escaping control
+///   signal -- `Error`, `Break`, or `Halt` -- discards the whole prefix,
+///   matching `eval_array_construction`'s atomicity. Only `Error` is gated
+///   on `optional` (caught, it becomes `QueryResult::None`); `Break`/`Halt`
+///   always propagate as bare signals, matching `eval_try`'s "never catches
+///   Break/Halt" rule -- even when `optional` is `true`.
+/// - `false` (`Expr::Iterate`, a genuine multi-output generator, not a
+///   constructor): only `Error` is ever caught, but catching it *keeps* the
+///   already-produced prefix (`owned_vec_to_result`) instead of discarding
+///   it. `Break`/`Halt` are left completely untouched, falling through to
+///   `other => other` with their own `Partial` wrapper -- and therefore
+///   their own prefix -- intact.
+///
+/// Both `QueryResult::Error(e)` and `QueryResult::Partial(_, Control::Error(e))`
+/// must be matched, not just `Partial`: [`partial`] (#400/#494) collapses an
+/// *empty* accumulated prefix to the bare `Error` variant, which happens
+/// exactly when the erroring element is the *first* one. Code review on
+/// #1826 caught that missing this exact case silently reproduces the
+/// original per-element-error-swallowing bug -- unifying both call sites
+/// through one function, rather than each re-deriving the same match by
+/// hand, makes that gap structurally impossible to reintroduce at a future
+/// call site.
+///
+/// The prefix lives *inside* the matched `Partial` pattern, not in a
+/// separately-passed accumulator: `accumulate_path_context_step` already
+/// moved the caller's own `results` `Vec` into that `Partial` via
+/// `core::mem::take` at the moment it produced this stop signal, so by the
+/// time a caller's loop breaks, its own `results` binding is already empty
+/// -- reusing it here instead of the pattern's own `prefix` would silently
+/// keep nothing.
+fn catch_error_under_optional<W: Clone + AsRef<[u64]>>(
+    stopped: QueryResult<'_, W>,
+    optional: bool,
+    atomic: bool,
+) -> QueryResult<'_, W> {
+    match stopped {
+        QueryResult::Error(e) => {
+            if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            }
+        }
+        QueryResult::Partial(prefix, Control::Error(e)) => {
+            if optional {
+                if atomic {
+                    QueryResult::None
+                } else {
+                    owned_vec_to_result(prefix)
+                }
+            } else if atomic {
+                QueryResult::Error(e)
+            } else {
+                QueryResult::Partial(prefix, Control::Error(e))
+            }
+        }
+        QueryResult::Partial(_, Control::Break(label)) if atomic => QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) if atomic => QueryResult::Halt(code),
+        other => other,
+    }
+}
+
 /// Continue evaluating `rest` for each output of an already-computed
 /// intermediate `QueryResult`, preserving `root`/`current_path` (the
 /// intermediate stage doesn't move navigational position -- e.g. a
@@ -27456,18 +27530,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             match stopped {
                 None => owned_vec_to_result(results),
-                // Guard-gated on `optional`, mirroring the path-context
-                // `Expr::Array` arm's own idiom: when it doesn't match (no
-                // ambient `optional`, or a non-`Error` control signal), the
-                // shared `Some(other) => other` arm below returns the
-                // original `stopped` value unchanged -- for the `Partial`
-                // shape that's already exactly `partial()`'s own
-                // non-empty-prefix output, so there's nothing to rebuild.
-                Some(QueryResult::Error(_)) if optional => QueryResult::None,
-                Some(QueryResult::Partial(prefix, Control::Error(_))) if optional => {
-                    owned_vec_to_result(prefix)
-                }
-                Some(other) => other,
+                // Unlike `Array`/`Map`, `Iterate` is not a constructor --
+                // there is no atomic "discard the whole in-progress
+                // collection" model to reach for, so `atomic: false` here
+                // means a caught `Error` keeps the already-produced prefix
+                // rather than discarding it, and `Break`/`Halt` are left
+                // completely untouched (`catch_error_under_optional`,
+                // #1888).
+                Some(stop) => catch_error_under_optional::<W>(stop, optional, false),
             }
         }
         Expr::Paren(inner) => {
@@ -27860,41 +27930,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
             let map_result = match stopped {
-                // Only `Error` is gated on this arm's own ambient
-                // `optional` -- matches the path-context `Expr::Array`
-                // arm's identical `QueryResult::Error(_) |
-                // QueryResult::Partial(_, Control::Error(_)) if optional`
-                // catch a few hundred lines below, and `eval_try`'s own
-                // "never catches Break/Halt" rule just below here.
-                //
-                // Both patterns are needed, not just `Partial`: `partial()`
-                // (#400/#494) collapses an *empty* prefix to the bare
-                // `Error`/`Break`/`Halt` variant, which happens exactly
-                // when the erroring element is the *first* one -- code
-                // review on #1826 caught that matching only `Partial` here
-                // left that case falling through to `Some(other) => other`
-                // unguarded by the gate below, reproducing the original bug
-                // whenever the failing element came first (`results` still
-                // empty at that point). `Expr::Array`'s own arm already ORs
-                // both shapes together in its one guard for the same reason.
-                Some(QueryResult::Error(e) | QueryResult::Partial(_, Control::Error(e))) => {
-                    if optional {
-                        QueryResult::None
-                    } else {
-                        QueryResult::Error(e)
-                    }
-                }
-                Some(QueryResult::Partial(_, Control::Break(label))) => QueryResult::Break(label),
                 // `map(f)` is array construction, atomic in jq (see
-                // `eval_array_construction`'s matching comment) — a `Halt`
-                // partway through must discard the elements mapped so far,
-                // same as `Error`/`Break` just above, not let them leak out
-                // as this arm's result (#791). The bare `QueryResult::Halt`
-                // case (no elements mapped yet) already falls through
-                // `Some(other) => other` correctly, since there is nothing
-                // to discard.
-                Some(QueryResult::Partial(_, Control::Halt(code))) => QueryResult::Halt(code),
-                Some(other) => other,
+                // `eval_array_construction`'s matching comment): any
+                // escaping control signal discards the elements mapped so
+                // far rather than letting them leak out as this arm's
+                // result (#791), which is what `atomic: true` means to
+                // `catch_error_under_optional` (#1888) -- only `Error` is
+                // gated on this arm's own ambient `optional`.
+                Some(stop) => catch_error_under_optional::<W>(stop, optional, true),
                 None => QueryResult::Owned(OwnedValue::Array(results)),
             };
             if rest.is_empty() {
@@ -38116,6 +38159,150 @@ mod tests {
             Some(Control::Halt(c)) => format!("halt:{c}"),
         };
         (out, tag)
+    }
+
+    /// #1888: `catch_error_under_optional`'s full truth table, exercised
+    /// directly rather than only through the CLI-level tests that already
+    /// pin `Builtin::Map`/`Expr::Iterate`'s own behavior (#1826/#1869) --
+    /// this is the one function both now route through, so a gap here is a
+    /// gap in both at once. Every case names the exact
+    /// `(shape, optional, atomic)` combination it covers; `type W = Vec<u64>`
+    /// is an arbitrary concrete choice, the function is generic over it.
+    #[test]
+    fn test_catch_error_under_optional_full_truth_table_1888() {
+        type W = Vec<u64>;
+        let err = || EvalError::new("boom");
+        let prefix = || vec![OwnedValue::Int(1), OwnedValue::Int(2)];
+
+        // Bare `Error` (the empty-accumulated-prefix collapse, #400/#494) --
+        // atomic and non-atomic converge, since there's no prefix to keep
+        // either way.
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(err()),
+                true,
+                true
+            )),
+            (vec![], "ok".to_string())
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(err()),
+                true,
+                false
+            )),
+            (vec![], "ok".to_string())
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(err()),
+                false,
+                true
+            )),
+            (vec![], "error:boom".to_string())
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(err()),
+                false,
+                false
+            )),
+            (vec![], "error:boom".to_string())
+        );
+
+        // `Partial(prefix, Error)` -- this is where atomic and non-atomic
+        // actually diverge: atomic always discards `prefix`, non-atomic
+        // keeps it whenever the caught state doesn't need to raise.
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(err())),
+                true,
+                true
+            )),
+            (vec![], "ok".to_string()),
+            "atomic + optional: discards prefix, caught to None"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(err())),
+                true,
+                false
+            )),
+            (prefix(), "ok".to_string()),
+            "non-atomic + optional: keeps prefix, caught (no error tag)"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(err())),
+                false,
+                true
+            )),
+            (vec![], "error:boom".to_string()),
+            "atomic + not optional: discards prefix even when raising"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(err())),
+                false,
+                false
+            )),
+            (prefix(), "error:boom".to_string()),
+            "non-atomic + not optional: keeps prefix AND still raises \
+             (the original Partial, unchanged)"
+        );
+
+        // `Partial(prefix, Break)`/`Partial(prefix, Halt)`: never gated on
+        // `optional` at all (a break/halt escapes regardless) -- only
+        // `atomic` decides whether the prefix survives.
+        for (control, tag) in [
+            (Control::Break("out".to_string()), "break:out"),
+            (Control::Halt(3), "halt:3"),
+        ] {
+            for optional in [true, false] {
+                assert_eq!(
+                    normalize(catch_error_under_optional::<W>(
+                        QueryResult::Partial(prefix(), control.clone()),
+                        optional,
+                        true
+                    )),
+                    (vec![], tag.to_string()),
+                    "atomic discards the prefix for {tag} regardless of optional={optional}"
+                );
+                assert_eq!(
+                    normalize(catch_error_under_optional::<W>(
+                        QueryResult::Partial(prefix(), control.clone()),
+                        optional,
+                        false
+                    )),
+                    (prefix(), tag.to_string()),
+                    "non-atomic keeps the prefix for {tag} regardless of optional={optional}"
+                );
+            }
+        }
+
+        // Anything else (`Owned`, `ManyOwned`, `None`, a bare `Break`/`Halt`)
+        // passes straight through unchanged, in both atomic and non-atomic
+        // modes -- this function is only ever called with `stopped`, a
+        // genuine control-signal-derived value, but the fallthrough must
+        // still be a true no-op for whatever it receives.
+        for atomic in [true, false] {
+            assert_eq!(
+                normalize(catch_error_under_optional::<W>(
+                    QueryResult::Owned(OwnedValue::Int(9)),
+                    true,
+                    atomic
+                )),
+                (vec![OwnedValue::Int(9)], "ok".to_string())
+            );
+            assert_eq!(
+                normalize(catch_error_under_optional::<W>(
+                    QueryResult::Break("out".to_string()),
+                    true,
+                    atomic
+                )),
+                (vec![], "break:out".to_string())
+            );
+        }
     }
 
     /// **The invariant the whole #820 design rests on**: with a sink that
