@@ -21888,6 +21888,15 @@ fn resolve_leaf<'a, S: EvalSemantics>(
             // Only meaningful when the incoming position *was* the register
             // (`trackable`); otherwise the register is somewhere further
             // back and `resolve_seq` carries its own copy forward instead.
+            //
+            // This records where the register stood *entering* the stage,
+            // which is a fact about the incoming branch. Whether it
+            // survives *out* of the stage is a different question — reaching
+            // this arm means only that this resolver could not decompose
+            // the stage into path components, not that jq did not navigate
+            // inside it — and it is answered where the stage's own
+            // expression is in view, by `resolve_seq`'s
+            // `stage_preserves_register` ([`cannot_move_register`]).
             trackable.then(|| Cow::Borrowed(value)),
         )]),
         // No output prunes the branch — unless there never would have been
@@ -22034,6 +22043,159 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
     }
 }
 
+/// Whether evaluating `expr` as one pipe stage provably leaves jq's path
+/// register (`value_at_path`) exactly where it was (#1573).
+///
+/// An allowlist, and deliberately a *syntactic* one: the answer has to be
+/// "no" for every shape this resolver cannot see inside. jq's register
+/// moves on any `INDEX` its bytecode executes in the stage's own extent —
+/// not only on the navigation this resolver can decompose into path
+/// components. A user-defined function body, or a jq-*defined* builtin like
+/// `first`/`last`/`add`/`any` (each of which is `.[0]`/`.[-1]`/`reduce .[]
+/// ...` underneath), indexes from inside a stage that arrives at
+/// [`resolve_leaf`] as one opaque computed value, and jq's register moves
+/// with it:
+///
+/// ```text
+/// $ jq -c 'path(. as $x | ([.a]|first) | $x)'    # refuses: `first` is `.[0]`,
+///                                                # which moved the register onto
+///                                                # the constructed array's element
+/// $ jq -c 'path(. as $x | (def f: .a; f) | $x)'  # refuses: same, via the body
+/// $ jq -c 'path(. as $x | ([1]|first) | $x)'     # refuses with no navigation
+///                                                # anywhere in the stage's *text*
+/// ```
+///
+/// Recording the ambient value as the register for those stages made
+/// [`reestablishes_register`] answer a path jq refuses — and, through
+/// `=`/`|=`/`del()`, *write* a document jq leaves untouched, which is the
+/// accept-where-jq-refuses class #1466 closed. So only the forms below
+/// qualify, each confirmed live against jq 1.7.1 to leave the register in
+/// place; everything else is `false`, which can only ever cost a refusal.
+///
+/// `[...]`, `{...}` and string interpolation recurse into their contents
+/// even though jq wraps each of them in `SUBEXP_BEGIN`/`SUBEXP_END`, which
+/// does save and restore the register: the register is not the only thing
+/// at stake. jq *also* raises "Invalid path expression near attempt to
+/// access element" for a `.a` applied to a computed value anywhere inside
+/// `path()`, subexpression or not, and this resolver never sees the `.a`
+/// inside a construction at all — it evaluates the whole construction as
+/// one value. Letting the register through such a stage therefore lets a
+/// later `$var` re-establish on a pipeline jq had already refused:
+///
+/// ```text
+/// $ jq -c 'path(. as $x | {k:.a} | [.a] | $x)'   # refuses — the second
+///                                                # `.a` is applied to the
+///                                                # constructed {"k":null}
+/// ```
+///
+/// So a construction qualifies only when nothing inside it navigates,
+/// which costs the single-construction shapes jq does accept
+/// (`path(. as $x | [.a] | $x)` is `[]` in jq and refuses here) — a
+/// refusal, the safe direction. An `as` binding's *source* is
+/// subexp-restored the same way (`path(.a as $y | .b)` is `["b"]`) and is
+/// recursed into for the same reason. Every other composite recurses into
+/// all of its operands, which is stricter than jq needs for the ones it
+/// also subexp-wraps (an arithmetic operand, an `if` condition) — stricter
+/// is the safe direction, and a false `false` is invisible except as a
+/// refusal.
+///
+/// The builtin arm is an explicit list rather than a property of the
+/// [`Builtin`] enum, because the distinction it draws — C-implemented
+/// versus defined in jq's own `builtin.jq` — is not visible from this AST:
+/// `length` and `first` are one variant each here, and only one of them
+/// indexes. Add a variant only with an oracle row to go with it.
+///
+/// A `def` and a call are always `false`, even when the body is a constant
+/// — deciding otherwise would mean resolving the call to its body here, and
+/// a name is not a body. The whole cost of that is
+/// `path(. as $x | (def f: 5; f) | $x)`, which jq answers `[]` and this
+/// refuses: one more refusal on a shape nothing writes, versus a rule that
+/// has to be right about every `def` anyone does write.
+fn cannot_move_register(expr: &Expr) -> bool {
+    match expr {
+        // Nothing here reads the document's structure at all.
+        Expr::Identity
+        | Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Env
+        | Expr::Loc { .. }
+        | Expr::Not
+        | Expr::Format(_) => true,
+
+        // Subexp-restored, so the register survives — but only safe to
+        // carry when nothing inside navigates; see the doc comment.
+        Expr::Array(inner) => cannot_move_register(inner),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            cannot_move_register(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => cannot_move_register(key),
+                }
+        }),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => cannot_move_register(inner),
+        }),
+
+        // Composites: safe exactly when every operand is.
+        Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => {
+            cannot_move_register(inner)
+        }
+        Expr::Pipe(stages) | Expr::Comma(stages) => stages.iter().all(cannot_move_register),
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => {
+            cannot_move_register(left) && cannot_move_register(right)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            cannot_move_register(cond)
+                && cannot_move_register(then_branch)
+                && cannot_move_register(else_branch)
+        }
+        Expr::Try { expr, catch } => {
+            cannot_move_register(expr)
+                && match catch {
+                    Some(handler) => cannot_move_register(handler),
+                    None => true,
+                }
+        }
+        Expr::As { expr, body, .. } => cannot_move_register(expr) && cannot_move_register(body),
+
+        // `error` raises; it navigates nothing. Its message expression is
+        // still evaluated, so that recurses. Needed by the escaping-prefix
+        // shape `($x, error("boom"))`, whose already-emitted `$x` jq keeps
+        // (and re-establishes) before raising.
+        Expr::Error(message) => match message {
+            Some(inner) => cannot_move_register(inner),
+            None => true,
+        },
+
+        Expr::Builtin(builtin) => matches!(
+            builtin,
+            Builtin::Type
+                | Builtin::Length
+                | Builtin::Utf8ByteLength
+                | Builtin::Keys
+                | Builtin::KeysUnsorted
+                | Builtin::ToString
+                | Builtin::ToNumber
+                | Builtin::ToJson
+        ),
+
+        // Everything else — navigation, `reduce`/`foreach`, `label`, a
+        // function definition or call, `..`, and every builtin not listed
+        // above — is assumed to have moved the register.
+        _ => false,
+    }
+}
+
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
@@ -22049,9 +22211,18 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// `{"a":1,"c":1}`). Only `null`/`true`/`false` fall to its `default: r = 1`
 /// arm, where having the same kind *is* being identical — for those, and
 /// only those, structural equality is exact rather than an approximation
-/// (confirmed live: `path(.a | null)` on `{"a":null}` and `path(.a | false)`
-/// on `{"a":false}` both answer `["a"]`, while `path(.a | false)` on
-/// `{"a":true}` raises).
+/// (confirmed live: `path(reduce (1) as $i (.a; null))` on `{"a":null}` and
+/// the same filter with `false` on `{"a":false}` both answer `["a"]`, while
+/// `false` against `{"a":true}` raises).
+///
+/// jq applies that same `null`/`bool` arm one step earlier than succinctly
+/// does: `path(.a | null)` on `{"a":null}` is `["a"]` in jq, because the
+/// literal never moved the register and `null` is identical to it — while
+/// succinctly refuses, since `reestablishes_register` only re-establishes a
+/// branch that is *already* untracked and a stage sitting directly on a
+/// trackable one never gets there. Refuse-only, pre-existing, and recorded
+/// in `docs/compliance/jq/limitations.md`; do not read the arm below as
+/// claiming that shape works.
 ///
 /// So a value is identical to the register when it equals it *and* is
 /// either
@@ -24056,6 +24227,24 @@ fn apply_static_tail<'a, S: EvalSemantics>(
     Ok(out)
 }
 
+/// The register-relevant facts about one resolved step (#1573), bundled so
+/// the two rules below cannot be handed different subsets of them — and
+/// because four independent `bool`s at a call site is exactly what clippy's
+/// `fn_params_excessive_bools` is for (same reasoning as `SliceEditFlags`).
+#[derive(Clone, Copy)]
+struct StepRegisterFacts {
+    /// Was the branch entering this stage still sitting on the register?
+    branch_trackable: bool,
+    /// Did this step contribute path components of its own?
+    navigated: bool,
+    /// Can the stage's *expression* be proven not to have moved jq's own
+    /// register ([`cannot_move_register`])? Per stage, not per branch.
+    stage_preserves_register: bool,
+    /// Is the step's output a frozen `as`-binding snapshot
+    /// ([`PathBranch::snapshot`])?
+    step_snapshot: bool,
+}
+
 /// Whether one pipe stage's output re-establishes the path register, and so
 /// is trackable again despite arriving on an already-untracked branch
 /// (#1573).
@@ -24077,7 +24266,8 @@ fn apply_static_tail<'a, S: EvalSemantics>(
 /// All four confirmed live against jq 1.7.1, along with the rest of the
 /// matrix on #1573.
 ///
-/// The four preconditions are each load-bearing:
+/// The five preconditions are each load-bearing (the first four ride
+/// [`StepRegisterFacts`]):
 ///
 /// - `!branch_trackable` — a trackable branch needs no re-establishing, and
 ///   its `Expr::TrackedVar` arm already certifies against the ambient value
@@ -24085,6 +24275,10 @@ fn apply_static_tail<'a, S: EvalSemantics>(
 /// - `!navigated` — the step contributed no path components. A step that
 ///   navigated reached a genuinely new position, and `trackable` already
 ///   answers for it; re-pointing it at `prefix` would report the wrong path.
+/// - `stage_preserves_register` — the step's *own expression* provably left
+///   jq's register where it was ([`cannot_move_register`]). "Contributed no
+///   path components" is this resolver's answer, not jq's: a stage it
+///   cannot decompose may still have indexed inside jq's own bytecode.
 /// - a live `register` — `None` means "not known here", the safe answer.
 /// - [`register_identical`] — the whole rule, shared with the fold register
 ///   so the two cannot drift.
@@ -24093,20 +24287,19 @@ fn apply_static_tail<'a, S: EvalSemantics>(
 /// costs an accepted path jq refuses — the dangerous direction, and why
 /// every clause above is a conjunct rather than a heuristic.
 fn reestablishes_register(
-    branch_trackable: bool,
-    navigated: bool,
+    facts: StepRegisterFacts,
     register: Option<&OwnedValue>,
     resulting: &OwnedValue,
-    step_snapshot: bool,
 ) -> bool {
-    !branch_trackable
-        && !navigated
-        && register.is_some_and(|reg| register_identical(reg, resulting, step_snapshot))
+    !facts.branch_trackable
+        && !facts.navigated
+        && facts.stage_preserves_register
+        && register.is_some_and(|reg| register_identical(reg, resulting, facts.step_snapshot))
 }
 
 /// The path register to hand to the next pipe stage (#1573).
 ///
-/// Three cases, in the order they are tested:
+/// Four cases, in the order they are tested:
 ///
 /// - The branch is trackable again (either it never stopped being, or
 ///   `reestablishes_register` just put it back): the register is the
@@ -24115,6 +24308,11 @@ fn reestablishes_register(
 /// - The step navigated: it moved the register onto what it reached, which
 ///   is exactly the trackable case above; if the branch is nonetheless
 ///   untracked here, the navigation was refused and no register survives.
+/// - The step is one this resolver cannot see inside
+///   (`!stage_preserves_register`): jq may well have indexed within it —
+///   `first`, `add`, and every user-defined function body do — so any
+///   register that was live entering the stage is now of unknown position
+///   and is dropped. Costs a refusal; keeping it fabricates a path.
 /// - Otherwise the step computed something without navigating, so whatever
 ///   register was live entering the stage is still live at the same path.
 ///   It comes either from the step itself — `resolve_leaf` records the
@@ -24122,15 +24320,14 @@ fn reestablishes_register(
 ///   place that value is still in hand — or, once already untracked, from
 ///   the branch's own carried copy.
 fn carry_register<'a>(
-    branch_trackable: bool,
-    navigated: bool,
+    facts: StepRegisterFacts,
     reestablished: bool,
     carried: &Option<Cow<'a, OwnedValue>>,
     step_register: Option<Cow<'a, OwnedValue>>,
 ) -> Option<Cow<'a, OwnedValue>> {
-    if reestablished || navigated {
+    if reestablished || facts.navigated || !facts.stage_preserves_register {
         None
-    } else if branch_trackable {
+    } else if facts.branch_trackable {
         step_register
     } else {
         carried.clone()
@@ -24264,6 +24461,15 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // | .foo)` on `{"a":[{"c":[{"foo":1}]}]}` raises `t2`, not `t1`.
     let mut deferred_escape: Option<EvalEscape> = None;
     for element in &flat[..=last_dynamic] {
+        // Whether this stage can carry a live path register across itself
+        // at all (#1573). `false` is the answer for every stage this
+        // resolver cannot see inside, because jq's register moves on any
+        // `INDEX` the stage executes — including the ones hidden in a
+        // jq-defined builtin (`first` is `.[0]`) or a user function body,
+        // which arrive here as one opaque computed value. See
+        // [`cannot_move_register`]: dropping the register merely costs a
+        // refusal, keeping a stale one fabricates a path.
+        let stage_preserves_register = cannot_move_register(element);
         let mut next = Vec::new();
         // Consumes `branches` (not `&branches`) so each `current` arrives by
         // value: only then can `resolve_against_cow` recover the branch's
@@ -24295,107 +24501,80 @@ fn resolve_seq<'a, S: EvalSemantics>(
             // knowing its target is untracked, which is how jq's "near
             // attempt to access element K of 1" wording gets produced
             // without any new context parameter (see #989).
+            // Where one step's output lands, for both the `Ok` fan-out and
+            // the partial prefix an escaping stage leaves behind. Written
+            // once rather than twice: the two arms differ only in which
+            // list they walk, and #1573's register re-establishment had
+            // already been fixed in the `Ok` arm alone once before the
+            // `Err` arm's identical omission was noticed.
+            let place_step = |step: PathBranch<'a>| -> PathBranch<'a> {
+                let PathBranch {
+                    path: components,
+                    value: resulting,
+                    trackable: step_trackable,
+                    snapshot: step_snapshot,
+                    register: step_register,
+                } = step;
+                let facts = StepRegisterFacts {
+                    branch_trackable,
+                    navigated: components.depth() > 0,
+                    stage_preserves_register,
+                    step_snapshot,
+                };
+                let reestablished =
+                    reestablishes_register(facts, carried_register.as_deref(), &resulting);
+                let path = if reestablished {
+                    Rc::clone(&prefix)
+                } else {
+                    PathPrefix::extend_many(&prefix, components.to_vec())
+                };
+                PathBranch {
+                    register: carry_register(
+                        facts,
+                        reestablished,
+                        &carried_register,
+                        step_register,
+                    ),
+                    path,
+                    value: resulting,
+                    // Untracked is absorbing: nothing downstream can
+                    // re-certify a value that was computed rather than
+                    // navigated to. Erring toward `false` is also the safe
+                    // direction — it can only turn a silent acceptance into
+                    // a loud error, never the reverse (#985's revert is what
+                    // the reverse looks like).
+                    //
+                    // #1573 adds the one exception jq itself has: untracked
+                    // is absorbing for *navigation*, but a `$var` whose
+                    // frozen value is still identical to the live register
+                    // is not navigation — jq's own `path_intact` compares
+                    // against `value_at_path`, which a literal never moved,
+                    // so the variable re-establishes the register's position
+                    // rather than reaching a new one. See
+                    // `reestablishes_register`.
+                    trackable: reestablished || (branch_trackable && step_trackable),
+                    // Unlike `trackable`, this comes from the *step* alone:
+                    // the value leaving this stage is the step's own output,
+                    // so `.a | $x` still hands back the frozen snapshot
+                    // whatever `.a` was, and `$x | .a` no longer is one
+                    // (#1466).
+                    //
+                    // A re-established branch is `trackable` again, and this
+                    // type's invariant is that `snapshot` implies
+                    // `!trackable`: a certified snapshot has resolved to a
+                    // real path and needs no second marker (#1573).
+                    snapshot: step_snapshot && !reestablished,
+                }
+            };
             match resolve_against_cow::<S>(element, current, branch_trackable, branch_snapshot) {
                 Ok(resolved) => {
-                    for PathBranch {
-                        path: components,
-                        value: resulting,
-                        trackable: step_trackable,
-                        snapshot: step_snapshot,
-                        register: step_register,
-                    } in resolved
-                    {
-                        let navigated = components.depth() > 0;
-                        let reestablished = reestablishes_register(
-                            branch_trackable,
-                            navigated,
-                            carried_register.as_deref(),
-                            &resulting,
-                            step_snapshot,
-                        );
-                        let path = if reestablished {
-                            Rc::clone(&prefix)
-                        } else {
-                            PathPrefix::extend_many(&prefix, components.to_vec())
-                        };
-                        next.push(PathBranch {
-                            register: carry_register(
-                                branch_trackable,
-                                navigated,
-                                reestablished,
-                                &carried_register,
-                                step_register,
-                            ),
-                            path,
-                            value: resulting,
-                            // Untracked is absorbing: nothing downstream can
-                            // re-certify a value that was computed rather
-                            // than navigated to. Erring toward `false` is
-                            // also the safe direction — it can only turn a
-                            // silent acceptance into a loud error, never the
-                            // reverse (#985's revert is what the reverse
-                            // looks like).
-                            //
-                            // #1573 adds the one exception jq itself has:
-                            // untracked is absorbing for *navigation*, but a
-                            // `$var` whose frozen value is still identical to
-                            // the live register is not navigation — jq's own
-                            // `path_intact` compares against `value_at_path`,
-                            // which a literal never moved, so the variable
-                            // re-establishes the register's position rather
-                            // than reaching a new one. See
-                            // `reestablishes_register`.
-                            trackable: reestablished || (branch_trackable && step_trackable),
-                            // Unlike `trackable`, this comes from the *step*
-                            // alone: the value leaving this stage is the
-                            // step's own output, so `.a | $x` still hands
-                            // back the frozen snapshot whatever `.a` was,
-                            // and `$x | .a` no longer is one (#1466).
-                            //
-                            // A re-established branch is `trackable` again,
-                            // and this type's invariant is that `snapshot`
-                            // implies `!trackable`: a certified snapshot has
-                            // resolved to a real path and needs no second
-                            // marker (#1573).
-                            snapshot: step_snapshot && !reestablished,
-                        });
+                    for step in resolved {
+                        next.push(place_step(step));
                     }
                 }
                 Err((partial, e)) => {
-                    for PathBranch {
-                        path: components,
-                        value: resulting,
-                        trackable: step_trackable,
-                        snapshot: step_snapshot,
-                        register: step_register,
-                    } in partial
-                    {
-                        let navigated = components.depth() > 0;
-                        let reestablished = reestablishes_register(
-                            branch_trackable,
-                            navigated,
-                            carried_register.as_deref(),
-                            &resulting,
-                            step_snapshot,
-                        );
-                        let path = if reestablished {
-                            Rc::clone(&prefix)
-                        } else {
-                            PathPrefix::extend_many(&prefix, components.to_vec())
-                        };
-                        next.push(PathBranch {
-                            register: carry_register(
-                                branch_trackable,
-                                navigated,
-                                reestablished,
-                                &carried_register,
-                                step_register,
-                            ),
-                            path,
-                            value: resulting,
-                            trackable: reestablished || (branch_trackable && step_trackable),
-                            snapshot: step_snapshot && !reestablished,
-                        });
+                    for step in partial {
+                        next.push(place_step(step));
                     }
                     // Keep whatever this branch produced before its escape,
                     // record the escape, and stop attempting any
@@ -67753,6 +67932,117 @@ mod tests {
                 assert_eq!(e.message, "boom");
             }
         );
+    }
+
+    /// The register must **not** survive a stage this resolver cannot see
+    /// inside. jq's `value_at_path` moves on any `INDEX` its bytecode
+    /// executes, and a jq-*defined* builtin (`first` is `.[0]`, `add` is
+    /// `reduce .[] as $x ...`) or a user function body indexes from inside
+    /// a stage that arrives here as one opaque computed value — so jq's
+    /// register has moved even though this resolver produced no path
+    /// component. All four refuse in jq 1.7.1; before
+    /// [`cannot_move_register`] gated the carry, all four answered `[]`.
+    ///
+    /// `([1]|first)` is the one that rules out any syntactic "does the
+    /// stage mention `.a`" shortcut: no navigation appears in its text at
+    /// all, and jq still refuses, because `first`'s own body is the `.[0]`
+    /// that moves the register.
+    #[test]
+    fn test_path_register_dropped_across_opaque_navigating_stage_1573() {
+        for filter in [
+            r"path(. as $x | (def f: .a; f) | $x)",
+            r"path(. as $x | ([.a]|first) | $x)",
+            r"path(. as $x | ([1]|first) | $x)",
+            r"path(. as $x | ([.a]|add) | $x)",
+            r"path(. as $x | ([.a]|first) | 5 | $x)",
+        ] {
+            query!(br#"{"a":{"b":1},"c":{"b":1}}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                }
+            );
+        }
+    }
+
+    /// The same gap seen from the side that does damage: a fabricated path
+    /// is not refuse-only once it reaches `=`/`|=`/`del()`, which then
+    /// *write* a document jq leaves untouched — the accept-where-jq-refuses
+    /// class #1466 closed. jq 1.7.1 raises (exit 5) for all three.
+    #[test]
+    fn test_write_through_opaque_navigating_stage_refuses_1573() {
+        for filter in [
+            r"(. as $x | ([.a]|first) | $x.c) = 9",
+            r"(. as $x | ([.a]|first) | $x.c) |= 42",
+            r"del(. as $x | (def f: .a; f) | 5 | $x.c)",
+        ] {
+            query!(br#"{"a":{"b":1},"c":{"b":1}}"#, filter,
+                QueryResult::Error(e) => {
+                    // Both spellings count: a write reaches its refusal
+                    // through `$x.c`'s own untracked navigation, which is
+                    // jq's "near attempt to access element" wording rather
+                    // than the bare "with result" one.
+                    assert!(
+                        e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
+                        "{filter}: {}",
+                        e.message
+                    );
+                }
+            );
+        }
+    }
+
+    /// The boundary on the other side: a construction or interpolation that
+    /// navigates nothing keeps carrying the register, so these still
+    /// answer. Pins the allowlist's positive half — narrowing it further
+    /// has to break a test rather than quietly cost these.
+    #[test]
+    fn test_path_register_survives_navigation_free_stages_1573() {
+        for filter in [
+            r"path(. as $x | [1] | $x)",
+            "path(. as $x | { k: 1 } | $x)",
+            r#"path(. as $x | "s" | $x)"#,
+            r"path(. as $x | (1+2) | $x)",
+            r"path(. as $x | keys | $x)",
+            r"path(. as $x | type | $x)",
+            r"path(. as $x | tostring | $x)",
+            r"path(. as $x | @json | $x)",
+            r"path(. as $x | (if 1 then 5 else 6 end) | $x)",
+            r"path(. as $x | (try 5) | $x)",
+            r"path(. as $x | (5 // 6) | $x)",
+        ] {
+            assert_eq!(outputs(br#"{"a":{"b":1}}"#, filter), ["[]"], "{filter}");
+        }
+    }
+
+    /// What the conservative allowlist costs, pinned so a later widening is
+    /// deliberate. jq answers `[]` for every one of these; succinctly
+    /// refuses.
+    ///
+    /// A construction that *does* navigate (`[.a]`, `{k:.a}`, `"\(.a)"`)
+    /// is excluded because jq raises for a `.a` applied to a computed value
+    /// anywhere inside `path()` — subexpression or not — and this resolver
+    /// never sees that `.a`, evaluating the construction as one value
+    /// instead. `path(. as $x | {k:.a} | [.a] | $x)` is the shape that
+    /// proves it: jq raises on the *second* `.a`, applied to the
+    /// constructed `{"k":null}`, so carrying the register through the first
+    /// construction answered a pipeline jq had already refused. A `def` and
+    /// a call are excluded because resolving a call to its body is not
+    /// something this predicate can do from a name.
+    #[test]
+    fn test_navigating_construction_and_def_cost_a_refusal_1573() {
+        for filter in [
+            r"path(. as $x | [.a] | $x)",
+            "path(. as $x | { k: .a } | $x)",
+            r#"path(. as $x | ("\(.a)") | $x)"#,
+            r"path(. as $x | (.a as $q | 1) | $x)",
+            r"path(. as $x | (def f: 5; f) | $x)",
+        ] {
+            query!(br#"{"a":{"b":1}}"#, filter,
+                QueryResult::Error(e) => {
+                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                }
+            );
+        }
     }
 
     /// A variable bound from a *navigated* position still has no marker at
