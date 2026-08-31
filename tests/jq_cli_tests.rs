@@ -25574,6 +25574,44 @@ fn test_decode_failure_surfaces_as_error_1247() {
     }
 }
 
+/// #2008: an unpaired *low* surrogate (`\uDC00`-`\uDFFF`) is a different
+/// case from the unpaired *high* surrogate `test_decode_failure_surfaces_as_error_1247`
+/// pins above -- real jq 1.7.1 doesn't reject it at all, it substitutes
+/// U+FFFD and accepts the document (confirmed live against the pinned
+/// oracle: `{"a":"\udc00"}` decodes to `{"a":"\u{FFFD}"}`, exit 0). Holds
+/// mid-string and across the whole low-surrogate range; a valid surrogate
+/// pair and the high-surrogate case are both unaffected controls.
+#[test]
+fn test_low_surrogate_substitutes_replacement_character_2008() {
+    for (doc, want) in [
+        (r#"{"a":"\udc00"}"#, "{\"a\":\"\u{FFFD}\"}"),
+        (r#"{"a":"\udfff"}"#, "{\"a\":\"\u{FFFD}\"}"),
+        (r#"{"a":"x\udc00y"}"#, "{\"a\":\"x\u{FFFD}y\"}"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "."], Some(doc))
+            .unwrap_or_else(|e| panic!("doc={doc:?} failed to run: {e}"));
+        assert_eq!(code, 0, "doc={doc:?}\nstderr: {stderr}");
+        assert_eq!(stdout.trim(), want, "doc={doc:?}");
+    }
+
+    // Controls: unaffected by this fix.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a":"𐀀"}"#)).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "{\"a\":\"\u{10000}\"}");
+
+    // A materializing filter (bare `.` is a streaming passthrough that
+    // never decodes the string at all, unlike `to_entries`/`.a | length`
+    // above) still raises for a lone *high* surrogate, unaffected by this
+    // fix -- matching `test_decode_failure_surfaces_as_error_1247`.
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | length"], Some(r#"{"a":"\ud800"}"#)).unwrap();
+    assert_ne!(
+        code, 0,
+        "lone high surrogate should still be rejected (#1247)"
+    );
+    assert!(stderr.contains("invalid unicode escape sequence"));
+}
+
 /// #1642 (was #1247): an undecodable *key* does not silently shrink the
 /// object -- `to_entries` used to return one entry fewer than the document
 /// had, because `effective_fields`' dedup walk dropped any field whose key
