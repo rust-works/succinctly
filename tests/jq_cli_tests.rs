@@ -7004,6 +7004,94 @@ fn test_reduce_foreach_input_init_path_context_resolves_1765() -> Result<()> {
     Ok(())
 }
 
+/// #1978 code review: every case in the test above puts `key` in `INIT`,
+/// never `input` alone -- leaving the `needs_path_context(input) ||
+/// needs_path_context(init)` guard's "only `input` needs it" branch
+/// unexercised by any value-sensitive assertion. Here `input` is
+/// `key,.[]` (so `key` fires the guard) and `INIT` is the path-context-inert
+/// literal `[]` -- the mirror image of the existing test's coverage.
+#[test]
+fn test_reduce_foreach_input_alone_needs_path_context_1765() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | reduce (key,.[]) as $x ([]; . + [$x])"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",1,2]"#);
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [foreach (key,.[]) as $x ([]; . + [$x])]"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"[["a"],["a",1],["a",1,2]]"#);
+
+    Ok(())
+}
+
+/// #1978 code review: pins the error/`Partial`-mid-stream interaction with
+/// path-context routing for both `reduce` and `foreach` -- the new dispatch
+/// arms have substantial control-flow logic specifically for this shape
+/// (`Error`/`Break`/`Halt`/`Partial` coming back from the recursive
+/// path-context call), previously untested. `reduce`'s own single-shot
+/// semantics discard the `1,2` prefix entirely once `input` errors (matches
+/// jq 1.7.1 exactly, confirmed live with a literal substituted for `key`);
+/// `foreach` streams `1,2` before erroring, but only visibly so outside an
+/// atomic array constructor -- `[foreach ...]` swallows the whole partial
+/// array on an interior error the same way `[1,2,error("x")]` would,
+/// unrelated to this fix.
+#[test]
+fn test_reduce_foreach_input_error_mid_stream_path_context_1765() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a | reduce (1,2,error("boom")) as $x (key; .)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?}, stderr: {stderr:?}");
+    assert!(stdout.trim().is_empty(), "reduce must discard the prefix");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    // `?` suppresses the error entirely -- no partial output to salvage,
+    // matching `reduce`'s own single-shot semantics.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"(.a | reduce (1,2,error("boom")) as $x (key; .))?"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(stdout.trim().is_empty());
+
+    // `foreach` streams outputs one at a time (no atomic array wrapper
+    // here, unlike `[foreach ...]`), so `key`'s two resolved outputs print
+    // before the error -- confirms `input_control` still carries the
+    // trailing error forward correctly even when `input` needed
+    // path-context routing.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a | foreach (1,2,error("boom")) as $x (key; .)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?}, stderr: {stderr:?}");
+    assert_eq!(stdout, "\"a\"\n\"a\"\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #1978 code review: `foreach`'s optional third clause, `EXTRACT`, was
+/// never exercised by this issue's own new test -- only `UPDATE`'s "stays
+/// null" case was. `EXTRACT` shares `UPDATE`'s exact rationale (both
+/// evaluate against the accumulator, a synthetic value with no document
+/// position), so this pins that it's unchanged too.
+#[test]
+fn test_foreach_extract_path_context_unchanged_1765() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [foreach .[] as $x (0; .+$x; key)]"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[null,null]");
+
+    Ok(())
+}
+
 /// #1765 item 2: `Expr::Limit`'s body expression now resolves
 /// `key`/`parent`/`file_index` against the caller's own ambient position,
 /// via a hybrid dispatch (mirrors `eval_binary_fanout_with_path_context`'s
