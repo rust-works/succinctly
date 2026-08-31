@@ -2588,17 +2588,21 @@ fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> 
 /// own suggestion: collapses the `match to_owned_checked(&value) { Ok(v) =>
 /// v, Err(e) => return suppress_or_raise(e, optional) }` four-liner this
 /// issue's whole lineage (#1194→#1953→#1972→#1999→#2001) keeps
-/// rediscovering missing at one more call site, into a two-line `match ...
-/// { Ok(v) => v, Err(early_return) => return early_return }` -- `QueryResult`
-/// has no stable `Try`/`?` impl, so a literal `?` isn't achievable here, but
-/// this still turns "did this site remember `optional`" from a fact a human
-/// has to separately audit for into a call-site choice of which helper to
-/// call.
-fn to_owned_checked_or_suppress<'a, W: Clone + AsRef<[u64]>>(
-    value: &StandardJson<'_, W>,
-    optional: bool,
-) -> Result<OwnedValue, QueryResult<'a, W>> {
-    to_owned_checked(value).map_err(|e| suppress_or_raise(e, optional))
+/// rediscovering missing at one more call site, into a single call. A macro
+/// rather than a function because it has to `return` from the *caller* --
+/// `QueryResult` has no stable `Try`/`?` impl, so a function returning
+/// `Result<_, QueryResult<'_, W>>` still can't be unwrapped with `?` -- the
+/// same reasoning `eval_generic.rs`'s `owned_or_err!`/`push_or_control!`
+/// already establish for the identical "no-`Try`-impl, need-early-return"
+/// shape against `GenericResult`; this is that same idiom's `eval.rs`
+/// twin, not a new one.
+macro_rules! to_owned_checked_or_suppress {
+    ($value:expr, $optional:expr) => {
+        match to_owned_checked($value) {
+            Ok(v) => v,
+            Err(e) => return suppress_or_raise(e, $optional),
+        }
+    };
 }
 
 /// #1934 item 7: whether `optional == true` is ever actually reachable here
@@ -6790,10 +6794,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // raise, not silently compare as "". #2001: a non-decode-failure error
     // (a #1194 malformed-member shape) respects `optional` the same way
     // this function's own `check_escape`/fanout handling below does.
-    let key_owned = match to_owned_checked_or_suppress(&value, optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    let key_owned = to_owned_checked_or_suppress!(&value, optional);
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
     // once rather than once per candidate (#909 review). Semantics-aware --
@@ -7534,10 +7535,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `suppress_or_raise`'s own doc comment), so treating this entry
     // point's own conversion as unconditional was the actual gap, not a
     // deliberate split.
-    let owned = match to_owned_checked_or_suppress(&value, optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    let owned = to_owned_checked_or_suppress!(&value, optional);
 
     let mut matched = false;
     // `cond`'s own escape is not `gen`'s, so it travels out-of-band rather
@@ -8547,10 +8545,7 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does.
-    let input = match to_owned_checked_or_suppress(&value, optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    let input = to_owned_checked_or_suppress!(&value, optional);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -8659,10 +8654,7 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does -- mirrors `builtin_contains`'s matching fix.
-    let input = match to_owned_checked_or_suppress(&value, optional) {
-        Ok(v) => v,
-        Err(early_return) => return early_return,
-    };
+    let input = to_owned_checked_or_suppress!(&value, optional);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -37172,18 +37164,12 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // sibling `QueryResult::None if optional`/keys-must-be-an-array arms
     // in this same match do.
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => match to_owned_checked_or_suppress(&v, optional) {
-            Ok(v) => v,
-            Err(early_return) => return early_return,
-        },
+        QueryResult::One(v) => to_owned_checked_or_suppress!(&v, optional),
         // Defensive only: `eval_single` (unlike top-level `eval`'s own
         // `Expr::Identity` special case) never actually produces
         // `OneCursor`, so this arm is unreachable in practice today --
         // kept fallible anyway rather than assuming that stays true.
-        QueryResult::OneCursor(c) => match to_owned_checked_or_suppress(&c.value(), optional) {
-            Ok(v) => v,
-            Err(early_return) => return early_return,
-        },
+        QueryResult::OneCursor(c) => to_owned_checked_or_suppress!(&c.value(), optional),
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -37197,10 +37183,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
         QueryResult::Many(v) if !v.is_empty() => {
-            match to_owned_checked_or_suppress(&v.into_iter().next().unwrap(), optional) {
-                Ok(v) => v,
-                Err(early_return) => return early_return,
-            }
+            to_owned_checked_or_suppress!(&v.into_iter().next().unwrap(), optional)
         }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
@@ -40898,6 +40881,40 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Identity;
+        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001 (code review): `builtin_pick`'s keys-expression conversion has
+    /// *three* `to_owned_checked_or_suppress` sites -- `One`, `OneCursor`
+    /// (parser-unreachable, not covered here), and `Many` (reached by a
+    /// multi-output keys expression, which `pick`/`omit` take only the
+    /// first output of). The `One`-arm test above never exercises this one.
+    ///
+    /// `.k1, .k2` (two field accesses, matching
+    /// `test_pick_omit_keys_expression_raises_on_decode_failure_1755`'s own
+    /// established way of reaching this arm) is required rather than `(.,
+    /// [])`: both operands there stay cursor-backed, so `eval_comma`
+    /// aggregates them into `QueryResult::Many` without materializing
+    /// either upfront, letting `builtin_pick`'s own `Many` arm be the first
+    /// place `to_owned_checked` runs on the malformed `.k1`. A literal
+    /// operand like `[]` forces an earlier, unconditional owned-conversion
+    /// inside `eval_comma` itself before `builtin_pick` ever sees a
+    /// `Many`/`ManyOwned` result -- confirmed empirically: that shape
+    /// raises regardless of `optional`, an unrelated site this PR doesn't
+    /// touch, not the bug this test is pinning.
+    #[test]
+    fn test_builtin_pick_many_arm_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"k1":{"x":1,"y"},"k2":["b"]}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = parse("(.k1,.k2)").unwrap();
         match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), true) {
             QueryResult::None => {}
             other => panic!("expected None, got {other:?}"),
