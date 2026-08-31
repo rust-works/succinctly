@@ -1191,9 +1191,9 @@ pub fn key_delimiter_ok<F: DocumentFields>(
 /// Reuses `value`'s own decode (`text_start`) when the caller already has
 /// one -- a full [`DocumentFields::uncons`] walk resolves it regardless, so
 /// this is free for every caller of this function. A key-only walk that has
-/// not resolved a value at all should use
-/// [`key_only_value_delimiter_ok`] instead, which never touches the value
-/// cursor.
+/// not resolved a value at all should use `key_only_value_delimiter_ok`
+/// instead (private to this crate, unlike this function, since every
+/// caller of it lives here), which never touches the value cursor.
 pub fn value_delimiter_ok<F: DocumentFields>(
     value: Option<&F::Value>,
     value_cursor: &F::Cursor,
