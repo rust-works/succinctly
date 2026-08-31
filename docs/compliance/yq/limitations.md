@@ -139,11 +139,25 @@ different story — it collides with a real yq flag of the same name but an unre
 own justification doesn't change either way: it's applied to both spellings purely for
 internal consistency between them, not for fidelity to anything real yq does with `-j`.
 
-Scope note: this entry covers only the `---`-boundary corruption. The reparsed value shown
-above still differs from the original once the embedded `\0` itself is considered — succinctly
-performs no embedded-NUL content validation on `-0` output, unlike real yq's own refusal to
-read it back at all. That is a separate, already-filed gap
-([#1709](https://github.com/rust-works/succinctly/issues/1709)), not fixed by this entry.
+Scope note: this entry covers only the `---`-boundary corruption. `-0` output whose *value
+content* itself contains a raw NUL byte is a separate matter, fixed by
+[#1709](https://github.com/rust-works/succinctly/issues/1709): succinctly now rejects such
+a result the same way real yq does (`can't serialise value because it contains NUL char and
+you are using NUL separated output`), matching real yq's own flush-then-error atomicity
+(earlier results in a stream are still flushed; the offending result and everything after it
+are not) rather than either the whole-document-buffering approach an earlier attempt at that
+fix tried and abandoned (PR #1767, +65% peak RSS on a 100MB document) or silently emitting
+the raw byte.
+
+One interaction remains open: this check only fires on bytes that are genuinely unescaped in
+the rendered output. `-o=json -0 '.a'` *without* an explicit `-r` should print a properly
+JSON-escaped `"b c"` and succeed (JSON's default unwrap-scalar setting is `false`,
+unlike YAML's `true` — real yq needs `-r` explicit to unwrap a JSON scalar), but succinctly's
+own `raw_output` resolution unconditionally ORs in `-0`/`-j` regardless of output format, so
+this one combination instead unwraps (bypassing JSON's own escaping) and correctly triggers
+this same NUL check on the resulting raw byte. That's a distinct, pre-existing root cause —
+[#1996](https://github.com/rust-works/succinctly/issues/1996) — not something #1709 itself
+introduced or is scoped to fix.
 
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
