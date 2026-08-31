@@ -2806,35 +2806,27 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(anyhow::anyhow!("Invalid JSON: {s}: {e}")),
         Err(e) => {
-            // Real jq's own number parser tolerates a leading zero
-            // (`007`, `00`, `007.5`) that strict JSON doesn't (#1094) --
-            // retry once with every number token's leading zero stripped
-            // (string contents/keys left untouched) before surfacing the
-            // original error. Only paid on this (rare) failure path, so
-            // the common case's validation cost is unaffected. Can't use
-            // `validate_and_materialize_json` here: it must validate the
-            // *normalized* copy but still materialize the *original*
-            // text below -- this crate's own semi-indexer already
-            // tolerates a leading zero on its own (confirmed live), so
-            // there's nothing left to repair for it, and normalizing the
-            // materialized text too would silently rewrite the value's
-            // source spelling.
-            let normalized = normalize_leading_zero_numbers(s);
+            // Real jq is lenient in two ways `serde_json`'s validation gate
+            // isn't: a leading zero in a number (`007`, `00`, `007.5`,
+            // #1094) and a lone *low* surrogate escape (`\uDC00`-`\uDFFF`,
+            // #2012, the same leniency #2008 already gave this crate's own
+            // decoder). Apply *both* normalizations to one working copy,
+            // not two independent single-fix copies (code review on #2012:
+            // two independent retries each validated against the
+            // untouched original, so a value needing both fixes at once --
+            // e.g. `[007,"\udc00"]` -- failed both and was wrongly
+            // rejected, since neither copy ever had both defects
+            // corrected). Each normalizer is a no-op on text it finds
+            // nothing to fix, so a value needing only one fix still gets
+            // exactly that one. Can't use `validate_and_materialize_json`
+            // here: it must validate the *normalized* copy but still
+            // materialize the *original* text below -- this crate's own
+            // semi-indexer/decoder already tolerates both leniencies on
+            // its own (confirmed live), so there's nothing left to repair
+            // for either, and normalizing the materialized text too would
+            // silently rewrite the value's source spelling.
+            let normalized = normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s));
             if normalized != s && validate_json_str(&normalized).is_ok() {
-                return crate::output::json_bytes_to_owned_value(s.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
-            }
-
-            // A lone *low* surrogate escape (`\uDC00`-`\uDFFF`) (#2012):
-            // `serde_json` rejects it outright, but real jq accepts it and
-            // substitutes U+FFFD -- the same leniency #2008 already gave
-            // this crate's own decoder (`json::light::decode_escapes_into`),
-            // which `json_bytes_to_owned_value` below reaches. Same retry
-            // shape as the leading-zero case above: validate a normalized
-            // copy, materialize from the original `s` either way, since the
-            // decoder already does the right thing on its own.
-            let surrogate_fixed = normalize_lone_low_surrogates(s);
-            if surrogate_fixed != s && validate_json_str(&surrogate_fixed).is_ok() {
                 return crate::output::json_bytes_to_owned_value(s.as_bytes())
                     .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
             }
@@ -2903,30 +2895,32 @@ fn normalize_lone_low_surrogates(s: &str) -> String {
 /// lone low surrogates as `normalize_lone_low_surrogates` describes.
 fn normalize_string_span_low_surrogates(span: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
-    // Set right after copying a high surrogate escape that is immediately
-    // followed by a valid low surrogate escape -- the pair `serde_json`
-    // already accepts, so the low half must be copied verbatim too rather
-    // than substituted.
-    let mut next_low_is_paired = false;
     while i < span.len() {
         if let Some((value, next)) = parse_u_escape(span, i) {
             if (0xD800..=0xDBFF).contains(&value) {
-                out.extend_from_slice(&span[i..next]);
-                next_low_is_paired = parse_u_escape(span, next)
-                    .is_some_and(|(low, _)| (0xDC00..=0xDFFF).contains(&low));
-                i = next;
+                // A high surrogate immediately followed by a valid low
+                // surrogate is a real pair `serde_json` already accepts --
+                // consume and copy both escapes verbatim in this one step
+                // (rather than copying the high half now and deciding the
+                // low half's fate next iteration) so the low half's hex
+                // digits are parsed exactly once, not once here and once
+                // more when the loop reaches them.
+                let pair_end = match parse_u_escape(span, next) {
+                    Some((low, low_end)) if (0xDC00..=0xDFFF).contains(&low) => low_end,
+                    _ => next,
+                };
+                out.extend_from_slice(&span[i..pair_end]);
+                i = pair_end;
                 continue;
             }
-            if (0xDC00..=0xDFFF).contains(&value) && !next_low_is_paired {
+            if (0xDC00..=0xDFFF).contains(&value) {
                 out.extend_from_slice(b"\\ufffd");
             } else {
                 out.extend_from_slice(&span[i..next]);
             }
-            next_low_is_paired = false;
             i = next;
             continue;
         }
-        next_low_is_paired = false;
         if span[i] == b'\\' && i + 1 < span.len() {
             // Any other escape (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
             // `\t`, or a malformed `\u` this retry doesn't need to
@@ -6244,6 +6238,28 @@ mod tests {
     #[test]
     fn test_parse_json_value_still_rejects_lone_high_surrogate_2012() {
         assert!(parse_json_value(r#""\ud800""#).is_err());
+    }
+
+    /// #2012 code review: a value needing *both* the #1094 leading-zero
+    /// leniency and the #2012 lone-low-surrogate leniency at once must
+    /// still be accepted -- an earlier version of this fix tried each
+    /// normalization independently against the untouched original, so a
+    /// value needing both failed both retries and was wrongly rejected.
+    /// Verified live: `jq -n --argjson x '[007,"\udc00"]' '$x'` =>
+    /// `[7,"�"]`, exit 0.
+    #[test]
+    fn test_parse_json_value_composes_leading_zero_and_low_surrogate_fixes_2012() {
+        assert_eq!(
+            parse_json_value(r#"[007,"\udc00"]"#).unwrap().to_json(),
+            "[7,\"\u{FFFD}\"]"
+        );
+        // Nested inside an object too, not just a top-level array.
+        assert_eq!(
+            parse_json_value(r#"{"a":007,"b":{"c":"\udc00"}}"#)
+                .unwrap()
+                .to_json(),
+            "{\"a\":7,\"b\":{\"c\":\"\u{FFFD}\"}}"
+        );
     }
 
     #[test]

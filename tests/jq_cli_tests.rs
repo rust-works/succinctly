@@ -25774,6 +25774,45 @@ fn test_fromjson_lone_high_surrogate_key_no_longer_silently_collapses_2013() {
     assert_ne!(code, 0, "stderr: {stderr}");
 }
 
+/// #2012: `--argjson`/`--jsonargs`' own value parser (`parse_json_value`,
+/// `src/bin/succinctly/jq_runner.rs`) is a *third*, independent surrogate
+/// decoder from the two #2008 already fixed above -- it validates via
+/// `serde_json` first, which rejects a lone low surrogate outright, before
+/// this crate's own leniency (`json_bytes_to_owned_value`) ever gets a
+/// chance to run. Confirmed live against the pinned oracle before the fix
+/// (succinctly errored, real jq substituted U+FFFD, exit 0 either way).
+#[test]
+fn test_argjson_low_surrogate_substitutes_replacement_character_2012() {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "--argjson", "x", r#""\udc00""#, "$x"], None).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"\u{FFFD}\"");
+
+    // `--jsonargs` reaches the same `parse_json_value`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-n", "$ARGS.positional[0]", "--jsonargs", r#""\udc00""#],
+        None,
+    )
+    .unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"\u{FFFD}\"");
+
+    // Control: a lone *high* surrogate stays rejected (#2013's own,
+    // unrelated scope).
+    let (_stdout, stderr, code) =
+        run_jq_full(&["-n", "--argjson", "x", r#""\ud800""#, "$x"], None).unwrap();
+    assert_ne!(code, 0, "lone high surrogate should still be rejected");
+    assert!(!stderr.is_empty());
+
+    // Control: a value needing *both* the #1094 leading-zero leniency and
+    // this leniency at once (code review on #2012: an earlier version
+    // tried each fix independently and rejected exactly this shape).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "--argjson", "x", r#"[007,"\udc00"]"#, "$x"], None).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "[7,\"\u{FFFD}\"]");
+}
+
 /// #1642 (was #1247): an undecodable *key* does not silently shrink the
 /// object -- `to_entries` used to return one entry fewer than the document
 /// had, because `effective_fields`' dedup walk dropped any field whose key
