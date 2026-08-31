@@ -28,8 +28,8 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    effective_len, key_delimiter_ok, key_display_string, resolve_display_key, value_delimiter_ok,
-    DisplayKeyGuard, DistinctKeyCursors, DocumentFields,
+    effective_len, effective_len_checked, key_delimiter_ok, key_display_string,
+    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -395,6 +395,28 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// [`length`](Self::length), refusing a `LazyKeysArray` whose walk hits
+    /// a #1194/#1677 malformed member instead of silently returning a count
+    /// that omits it (#1974).
+    ///
+    /// `length()` itself stays infallible -- it has no internal caller in
+    /// this crate (every jq-side `length` evaluation goes through the
+    /// generic evaluator's own `effective_len_checked`-backed path
+    /// already), it's public API surface for external `succinctly::jq`
+    /// consumers constructing a `JqValue` directly, and changing its
+    /// existing signature would be a breaking change for no internal
+    /// benefit. This is an additive sibling instead, mirroring the
+    /// `effective_len`/`effective_len_checked` naming convention
+    /// `LazyKeysArray`'s own arm already delegates to.
+    pub fn length_checked(&self) -> Result<Option<usize>, EvalError> {
+        match self {
+            JqValue::LazyKeysArray { fields, collapse } => {
+                Ok(Some(effective_len_checked(fields, *collapse)?))
+            }
+            _ => Ok(self.length()),
         }
     }
 
@@ -1748,6 +1770,41 @@ mod tests {
         val.materialize()
             .expect_err("a missing delimiter is not well-formed JSON");
         val.into_owned()
+            .expect_err("a missing delimiter is not well-formed JSON");
+    }
+
+    /// #1974: `length()`'s `LazyKeysArray` arm calls `effective_len`, the
+    /// infallible sibling of `effective_len_checked` -- it computes the
+    /// same census internally but discards the malformed flag, so it
+    /// silently answers a count instead of surfacing the #1194/#1677 fault
+    /// `write_json`/`materialize`/`into_owned` on the identical value
+    /// already catch (per #1956, pinned by
+    /// [`test_lazy_keys_array_raises_on_missing_delimiter_1956`] above).
+    /// `length()` itself stays infallible (see its new sibling's doc
+    /// comment); `length_checked()` is the fix -- same fault, reported.
+    #[test]
+    fn test_lazy_keys_array_length_checked_raises_on_missing_delimiter_1974() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"{\"a\" 1, \"b\": 2}";
+
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = match cursor.value() {
+            StandardJson::Object(fields) => fields,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let val: JqValue<'_, Vec<u64>> = JqValue::LazyKeysArray {
+            fields,
+            collapse: true,
+        };
+
+        assert_eq!(
+            val.length(),
+            Some(2),
+            "documents the known gap: length() can't see the malformed member"
+        );
+        val.length_checked()
             .expect_err("a missing delimiter is not well-formed JSON");
     }
 
