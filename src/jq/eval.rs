@@ -3382,6 +3382,20 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             each_range::<W, S>(from, to.as_deref(), step.as_deref(), value, optional, sink)
         }
 
+        // #2014: `repeat(f)` is infinite by design and meant to be bounded
+        // by a wrapping `limit`/`first` -- but the `_` fallback below
+        // evaluates it *eagerly* first (via `eval_single` -> `eval_repeat`),
+        // whose own `MAX_ITERATIONS` round cap exists only as a hang
+        // backstop for when nothing demand-drives it. Reached through
+        // `limit`, that cap silently truncated `limit(80000; repeat(f))` to
+        // 1000 values before this wrapping `limit` ever got a chance to
+        // stop the source itself. `each_repeat` below pulls one round at a
+        // time and stops as soon as `sink` does, so a wrapping `limit`
+        // reaches its own requested count with no artificial ceiling,
+        // matching jq exactly; a `repeat(f)` with no such wrapper is just
+        // as genuinely unbounded here as it is in real jq.
+        Expr::Repeat(expr) => each_repeat::<W, S>(expr, value, optional, sink),
+
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
@@ -26018,12 +26032,12 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// pair per recursion-tree node there), so the shared numeric value
 /// today is coincidence, not a relationship a shared symbol should
 /// encode.
-const REDUCE_FOREACH_MAX_STEPS: usize = 10000;
+pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 10000;
 
 /// Check-and-charge one unit against a shared step budget (#695), the
 /// same check `until_step`/`while_step` each inline for their own cap.
 /// `what` names the construct in the resulting error message.
-fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
+pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     if *budget == 0 {
         return Some(Control::Error(EvalError::new(format!(
             "{what}: maximum iterations exceeded"
@@ -27507,6 +27521,92 @@ fn while_step<S: EvalSemantics>(
     }
 }
 
+/// Demand-driven twin of [`eval_repeat`] (#2014): pulls one round of
+/// `expr`'s outputs at a time via [`eval_owned_expr_fork`] (matching
+/// `eval_repeat`'s own per-round semantics exactly, including its
+/// multi-output-per-round forking -- see that function's doc comment for
+/// the live-verified `[limit(6; repeat((.+1, .+100)))]` example) and stops
+/// pulling further rounds as soon as `sink` does. A wrapping `limit`/
+/// `first` (routed here through [`eval_each`]'s own dispatch) supplies its
+/// own stop via `Demand::Stop` once satisfied, so `limit(80000; repeat(1))`
+/// genuinely runs all 80000 rounds, matching jq (confirmed live against jq
+/// 1.7.1, as does the equally narrow `limit(80000; repeat(.))`) -- but this
+/// still needs two safety nets, neither of which may cap the *round count*
+/// itself or that guarantee breaks:
+///
+/// - **Per-round `budget`** (`REDUCE_FOREACH_MAX_STEPS`, reset at the start
+///   of *every* round and charged one output at a time before a value
+///   reaches `sink`): bounds how many values a single round may fork into
+///   at once, independent of how many rounds run in total. Without it,
+///   `limit(50000; repeat(.[]))` over a 20001-element array would happily
+///   produce far more than the 10000 values value-mode and path-mode are
+///   supposed to agree on capping at
+///   (`test_path_repeat_width_budget_matches_value_mode_1933`) -- a
+///   demand-driven `Demand::Stop` from `limit` only ever fires *after*
+///   `sink` sees a value, so it cannot bound a single wide round on its own.
+///   This is a succinctly-only memory-safety net, not jq fidelity: real jq
+///   has no such cap either (confirmed live: `limit(50000; repeat(.[]))` on
+///   the same 20001-element array succeeds with all 50000 in jq 1.7.1) --
+///   `eval_owned_expr_fork` materializes a whole round into a `Vec` at once,
+///   so an unbounded single round could blow up memory on a wide-enough
+///   `expr`. **Charging cumulatively across rounds instead of resetting per
+///   round was tried and is wrong**: it silently reintroduces the exact
+///   `limit(80000; repeat(1))`-style truncation #2014 exists to fix, just
+///   as an error instead of a silent short-count -- caught by live-testing
+///   the `[limit(80000; repeat(1))]`/`repeat(.)` cases specifically, which
+///   no pinned test in this file happens to cover.
+/// - **Round-emptiness cap** (`MAX_EMPTY_REPEAT_ROUNDS`): `repeat`'s `expr`
+///   reruns against the *same* unchanging input every round (that is
+///   `repeat`'s whole definition), so a round producing zero outputs will
+///   produce zero outputs forever -- `sink` never receives anything to
+///   signal `Demand::Stop` from, no matter how small a wrapping `limit`'s
+///   own `n` is, so the per-round budget above (never charged, since
+///   nothing is ever pushed) cannot bound it either. Unlike the per-round
+///   budget, exhausting this one does not raise: it silently ends the
+///   stream (`Flow::Exhausted`), matching
+///   `test_repeat_empty_expr_yields_nothing_instead_of_looping_forever_on_nulls`'s
+///   own pinned, deliberately-jq-oracle-free convention for this shape
+///   (real jq has no answer to compare against -- a bare `repeat(empty)`
+///   spins forever there too).
+pub(crate) const MAX_EMPTY_REPEAT_ROUNDS: usize = 1000;
+
+fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let owned = match to_owned_checked(&value) {
+        Ok(v) => v,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let mut empty_rounds = 0usize;
+    loop {
+        let (vals, control) = eval_owned_expr_fork::<S>(expr, &owned, optional);
+        if vals.is_empty() && control.is_none() {
+            empty_rounds += 1;
+            if empty_rounds >= MAX_EMPTY_REPEAT_ROUNDS {
+                return Flow::Exhausted;
+            }
+            continue;
+        }
+        empty_rounds = 0;
+        let mut budget = REDUCE_FOREACH_MAX_STEPS;
+        for val in vals {
+            if let Some(control) = charge_budget(&mut budget, "repeat") {
+                return Flow::Escaped(control);
+            }
+            if sink(Item::Owned(val)) == Demand::Stop {
+                return Flow::Stopped { pending: None };
+            }
+        }
+        if let Some(control) = control {
+            return Flow::Escaped(control);
+        }
+    }
+}
+
 /// Evaluate `repeat(expr)` - repeatedly evaluate expr with the original input.
 /// In jq, `repeat(expr)` evaluates `expr` with the original input each time,
 /// producing an infinite stream of outputs. This is different from feeding
@@ -27529,6 +27629,18 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // reach: an `expr` that produces zero outputs every round (e.g.
     // `repeat(empty)`) never charges `budget` below, so it would loop
     // forever without this backstop.
+    //
+    // #2014: this loop is only reached when `repeat` sits *outside* any
+    // demand-driven consumer (`eval_each`'s own `Expr::Repeat` arm,
+    // `each_repeat`, handles `limit`/`first`/etc. -- see that function's
+    // own doc comment). A bare `repeat(f)` with no such wrapper is exactly
+    // as unbounded in real jq as it is here (it hangs forever there too),
+    // so this cap existing at all is this eager fallback's own necessary
+    // concession, not a divergence to remove -- but exhausting it used to
+    // fall through to `owned_vec_to_result(outputs)` silently, returning a
+    // truncated-but-successful result with no signal. Now raises the same
+    // way the per-value `budget` two lines below already does, matching
+    // `resolve_repeat_bounded`'s identical guard.
     const MAX_ITERATIONS: usize = 1000;
     // Bounds total output size independent of `expr`'s own fan-out (#855
     // follow-up): the per-round loop below used to push at most one
@@ -27568,7 +27680,8 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    owned_vec_to_result(outputs)
+    let control = Control::Error(EvalError::new("repeat: maximum iterations exceeded"));
+    finish_fork(outputs, Some(control), optional)
 }
 
 /// A numeric argument to `range()`: kept as `i64` when exact so all-integer
