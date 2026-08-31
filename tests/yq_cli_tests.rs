@@ -27140,3 +27140,57 @@ fn test_yq_namespaced_call_arguments_are_still_resolved_1473() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1909: `getpath`'s new native cursor-walking arm must materialize the
+/// node it lands on through `to_owned_cursor`, not hand its cursor back
+/// bare.
+///
+/// Caught by differential fuzzing against the pre-change binary, not by
+/// reasoning: an earlier version of the fast path returned the final
+/// `GenericResult::OneCursor` directly — which looks like a free #607-style
+/// laziness/duplicate-key win, but silently skipped `to_owned_cursor`'s
+/// YAML tag resolution (#747) that the round-trip path it replaced applies
+/// at the document root before serializing. `!!str 1` came back as the
+/// number `1` instead of the string `"1"`.
+///
+/// `getpath` is a jq-only builtin real yq's lexer rejects, so it needs
+/// `--jq-extensions` here (#1512).
+#[test]
+fn test_getpath_native_arm_resolves_yaml_tags_1909() -> Result<()> {
+    let doc = "a: !!str 1\nb: !!int 2\nc:\n  d: !!str 3\n";
+    for (filter, expected) in [
+        (r#"getpath(["a"])"#, r#""1""#),
+        (r#"getpath(["b"])"#, "2"),
+        (r#"getpath(["c","d"])"#, r#""3""#),
+        // The same node reached by plain navigation, for comparison: the
+        // fast path must not disagree with it.
+        (".a", r#""1""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &["--jq-extensions", "-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "out: {out:?} for `{filter}`");
+        assert_eq!(out.trim(), expected, "for `{filter}`");
+    }
+    Ok(())
+}
+
+/// #1909: the `Builtin::Path` and `Expr::Pipe` path-context arms now call
+/// `eval.rs`'s `builtin_path_on_owned`/`eval_pipe_with_path_context`
+/// directly instead of routing through `eval_on_owned`'s serialize +
+/// re-index bridge. That bridge is also where `to_json_for_reindex`'s
+/// `S`-gated float formatter runs — the only thing applying yq's "a
+/// document-sourced float that overflowed `i64` keeps its decimal point"
+/// rule (#953/#1168) — so `eval_path_context_on_owned` re-applies
+/// `yq_float_fidelity_fixup` afterwards. Pinned here on a `parent` output,
+/// which (unlike a path array) really can carry a document float back out.
+#[test]
+fn test_path_context_bypass_keeps_yq_float_fidelity_1909() -> Result<()> {
+    let doc = "outer:\n  big: 10000000000000000000.0\n  small: 3.5\n";
+    let (out, code) = run_yq_stdin(
+        ".outer.big | parent",
+        doc,
+        &["--jq-extensions", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"big":10000000000000000000.0,"small":3.5}"#);
+    Ok(())
+}

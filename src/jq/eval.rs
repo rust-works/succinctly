@@ -27614,7 +27614,7 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate a pipe while tracking the traversal path.
 /// This enables PathNoArg and Parent to access the path context.
-fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+pub(crate) fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     value: &OwnedValue,
     current_path: &[OwnedValue],
@@ -30323,7 +30323,24 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
+    builtin_path_on_owned::<W, S>(expr, &owned, optional)
+}
 
+/// [`builtin_path`]'s body once its input is already an [`OwnedValue`] --
+/// everything this builtin does after the `to_owned_checked` above.
+///
+/// Split out for #1909 so the CLI's generic evaluator can reach it with the
+/// `OwnedValue` it has *already* materialized, instead of going through
+/// `eval_generic::eval_on_owned`'s reindex bridge (serialize to JSON,
+/// `JsonIndex::build`, re-enter `eval`) only for that bridge to land back
+/// here and materialize the very same document a **second** time. Measured
+/// on a 300,000-element flat array, release build: `path(.)` cost 0.098s /
+/// 104.5 MiB peak RSS to produce the single output `[]`.
+pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Computed keys must become static components before the tracker runs — it
     // ignores anything it does not recognise, so an unresolved one would
     // silently yield no paths at all.
@@ -30334,7 +30351,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // a later one errors (confirmed live) — so that prefix is walked below
     // exactly like a successful resolution, and only the *error* is deferred
     // to the end.
-    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, &owned, true, false) {
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, owned, true, false) {
         Ok(exprs) => (exprs, None),
         Err((exprs, e)) => (exprs, Some(e)),
     };
@@ -30346,7 +30363,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // the expression is concretely walked) needs the same treatment:
         // whatever earlier resolved expressions already streamed into
         // `reached` survives, and only this one stops the walk.
-        if let Err(e) = walk_path::<S>(expr, &owned, &[], &mut reached, optional) {
+        if let Err(e) = walk_path::<S>(expr, owned, &[], &mut reached, optional) {
             walk_error = Some(e);
             break;
         }

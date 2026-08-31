@@ -1173,3 +1173,103 @@ fn test_parity_has_native_arm_1739() {
     // falling back to the existing round-trip path.
     assert_parity(br#"{"a":1,"b":2}"#, r#"[has(("a","z"))]"#);
 }
+
+/// #1909: `Builtin::GetPath`'s new native cursor-walking arm in
+/// `eval_generic.rs` must agree with `eval.rs`'s `builtin_getpath`/
+/// `getpath_one_path` — both for every shape it claims to handle itself and
+/// for every shape it deliberately defers back to that reference
+/// implementation. The whole point of the fast path is that a bounded read
+/// stops paying a whole-document materialize + re-serialize + re-index round
+/// trip, so a silent behavioural drift here would be buying speed with
+/// correctness.
+#[test]
+fn test_parity_getpath_native_arm_1909() {
+    // Shapes the native walk handles itself: string keys into objects,
+    // numeric keys into arrays, and a `null` reached mid-walk.
+    for (json, filter) in [
+        (br#"{"a":{"b":1}}"#.as_slice(), "getpath([])"),
+        (br#"{"a":{"b":1}}"#, r#"getpath(["a"])"#),
+        (br#"{"a":{"b":1}}"#, r#"getpath(["a","b"])"#),
+        // Past the end of the document: `null` short-circuits the rest.
+        (br#"{"a":{"b":1}}"#, r#"getpath(["a","b","c","d"])"#),
+        (br#"{"a":{"b":1}}"#, r#"getpath(["z"])"#),
+        (br#"{"a":{"b":1}}"#, r#"getpath(["z","y"])"#),
+        (br"[10,20,30]", "getpath([0])"),
+        (br"[10,20,30]", "getpath([2])"),
+        (br"[10,20,30]", "getpath([-1])"),
+        (br"[10,20,30]", "getpath([99])"),
+        (br"[10,20,30]", "getpath([1.7])"),
+        (br#"[{"a":[1,2]}]"#, r#"getpath([0,"a",1])"#),
+        (br"null", r#"getpath(["a","b"])"#),
+        (br#"{"a":null}"#, r#"getpath(["a","b"])"#),
+        // A path computed from the document, not a literal.
+        (br#"{"a":{"b":7},"p":["a","b"]}"#, "getpath(.p)"),
+        // The `paths`/`getpath` round trip this fast path exists to make
+        // ordinary rather than exotic.
+        (br#"{"a":{"b":1},"c":[1,2]}"#, "[paths as $p | getpath($p)]"),
+    ] {
+        assert_parity(json, filter);
+    }
+
+    // Shapes the native walk refuses, so the reference implementation still
+    // produces the exact error text, `optional` suppression, slice
+    // semantics, and generator fan-out it always did.
+    for (json, filter) in [
+        // Not an array at all: jq's `Path must be specified as an array`.
+        (br#"{"a":1}"#.as_slice(), r#"getpath("a")"#),
+        // A segment kind the walk doesn't accept.
+        (br#"{"a":1}"#, "getpath([null])"),
+        (br#"{"a":1}"#, "getpath([true])"),
+        (br"null", "getpath([null])"),
+        // Slice-descriptor segments.
+        (br"[10,20,30]", r#"getpath([{"start":0,"end":2}])"#),
+        (br#""hello""#, r#"getpath([{"start":1,"end":3}])"#),
+        // Type errors mid-walk, raised and suppressed.
+        (br#"{"a":1}"#, r#"getpath(["a","b"])"#),
+        (br#"{"a":1}"#, r#"try getpath(["a","b"]) catch "E""#),
+        (br#"{"a":1}"#, r#"getpath(["a","b"])?"#),
+        (br"[1,2]", r#"getpath(["a"])"#),
+        (br#"{"a":1}"#, "getpath([0])"),
+        // A generator path fans out one output per path (jq's rule).
+        (br#"{"a":1,"b":2}"#, r#"[getpath((["a"],["b"]))]"#),
+        (br#"{"a":1,"b":2}"#, r#"[getpath([("a","b")])]"#),
+        // An empty path generator produces no output at all.
+        (br#"{"a":1}"#, "[getpath(empty)]"),
+    ] {
+        assert_parity(json, filter);
+    }
+}
+
+/// #1909: `Builtin::Path`'s new arm in `eval_generic.rs` calls
+/// `eval::builtin_path_on_owned` directly instead of routing through
+/// `eval_on_owned`'s serialize + `JsonIndex::build` + re-enter bridge (which
+/// landed back in `eval::builtin_path` only for *it* to materialize the same
+/// document a second time). Same evaluator, same input tree — so every
+/// output, including the error and partial-output shapes, must be unchanged.
+#[test]
+fn test_parity_path_builtin_bypasses_reindex_bridge_1909() {
+    for (json, filter) in [
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#.as_slice(), "path(.)"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.a.b)"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(..)]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(.[])]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(.a,.c)]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, r#"path(.["a"])"#),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.c[0])"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.c[0:2])"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(first(.[]))]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(limit(2;.[]))]"),
+        // A dynamic index resolved against the document itself.
+        (br#"{"k":"a","a":1}"#, "path(.[.k])"),
+        // Error and partial-output shapes.
+        (br#"{"a":1}"#, "path(.a[0])"),
+        (br#"{"a":1}"#, r#"try path(.a[0]) catch "E""#),
+        (br#"{"a":{"b":1},"c":1}"#, "[path(.a.b, .c.d)]"),
+        (br"null", "path(.a.b)"),
+        // `path` nested in a pipe takes the `Expr::Pipe` bridge instead.
+        (br#"{"a":{"b":1}}"#, ".a | path(.b)"),
+        (br#"{"a":{"b":1}}"#, "[.a | path(.)]"),
+    ] {
+        assert_parity(json, filter);
+    }
+}
