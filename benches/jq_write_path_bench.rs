@@ -594,6 +594,45 @@ fn bench_del_filtered_descent_depth(c: &mut Criterion) {
     group.finish();
 }
 
+/// The same computed-key delete as `bench_del_shared_prefix_width` below, but
+/// with the branch count tied to the depth instead of pinned — a `D`-deep
+/// chain ending in a `D`-element array, `del(.c...c[range(D)])`.
+///
+/// This is the shape #1690's acceptance criteria describe (both the shared
+/// prefix depth *and* the leaf fan-out scale with `D`) reached the way that
+/// actually exposes the term #1690 fixes: through a computed key rather than
+/// a filter, so no `select` runs per branch to re-serialize that branch's
+/// value. `bench_del_filtered_descent_depth` above is the same scaling shape
+/// written the way the issue spells it, and is dominated by that
+/// serialization instead — the two together are what show which term is
+/// which.
+fn bench_del_shared_prefix_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_del_shared_prefix_depth");
+    for &d in DEPTHS {
+        let json = deep_chain_doc(d);
+        let expr = parse(&format!("del({}[range({d})])", ".c".repeat(d))).expect("must parse");
+
+        let out = eval_one(&expr, &json);
+        let OwnedValue::Array(items) = leaf_array(&out, d) else {
+            panic!("d={d}: the leaf must stay an array");
+        };
+        assert!(
+            items.is_empty(),
+            "d={d}: every leaf element must be deleted"
+        );
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(d as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 /// The same shared-deep-prefix delete with the depth pinned at
 /// [`FIXED_DEPTH`], reached by a computed key rather than a filter, so only
 /// the branch count varies.
@@ -645,6 +684,7 @@ criterion_group!(
     bench_del_computed_key_with_trailing_iterate_object,
     bench_del_comma_through_iterate,
     bench_del_filtered_descent_depth,
+    bench_del_shared_prefix_depth,
     bench_del_shared_prefix_width,
 );
 criterion_main!(benches);

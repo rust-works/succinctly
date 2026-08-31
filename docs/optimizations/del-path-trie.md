@@ -61,7 +61,7 @@ Two details are load-bearing and easy to get wrong:
 ## Measurement
 
 Depth is capped by `MAX_NESTING_DEPTH = 256`. Two shapes, A/B interleaved within each
-repetition, process-spawn floor subtracted, output identity gated first (Apple M5 Pro Max, on
+repetition, process-spawn floor subtracted, output identity gated first (Apple M5 Max, on
 AC power).
 
 **Depth-scaled** — a `D`-deep chain ending in a `D`-element array, `del(.c…c[(0,…,D-1)])`, so
@@ -88,9 +88,12 @@ varies, so anything growing with `K` is charged *per branch*:
 Per-branch marginal cost falls from ~37.5µs to ~5.9µs — a 6.4x reduction — and the ratio is
 still climbing at K=4000.
 
-Both are checked in as `jq_write_path_del_filtered_descent_depth` and
+Both tables are checked in as `jq_write_path_del_shared_prefix_depth` and
 `jq_write_path_del_shared_prefix_width` in
-[`benches/jq_write_path_bench.rs`](../../benches/jq_write_path_bench.rs).
+[`benches/jq_write_path_bench.rs`](../../benches/jq_write_path_bench.rs), alongside
+`jq_write_path_del_filtered_descent_depth` — the same depth-scaled shape written the way
+#1690 spells it, with `del(.. | select(...))`, which measures no improvement for the reason
+below. The pair is what shows which term is which.
 
 ## The term this does *not* fix
 
@@ -106,9 +109,11 @@ profile of `del(.. | select(type == "number"))` at depth 240 put `builtin_del` a
 process time with `to_json_for_reindex_at_depth` the dominant leaf; `builtin_del`'s own trie
 work (`insert_branch` + `delete_trie_apply`) was ~16% of that.
 
-This is why the width-scaled table above is the one that demonstrates #1690: it reaches the
-same shared-deep-prefix delete through a computed key instead of a filter, so no `select` runs
-per branch and the path-flatten term is left on its own.
+This is why both tables above reach the delete through a *computed key* rather than a filter:
+with no `select` running per branch, the path-flatten term is left on its own. The
+`jq_write_path_del_filtered_descent_depth` group is the same scaling shape written with the
+filter, kept precisely so the gap between the two stays visible — if a future change fixes
+#2048, that group is where it will show up.
 
 ## Lessons
 
