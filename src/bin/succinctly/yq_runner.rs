@@ -9,8 +9,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, resolve_display_key, DisplayKeyGuard, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, key_delimiter_ok, resolve_display_key, value_delimiter_ok, DisplayKeyGuard,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
@@ -722,6 +722,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
+        let mut is_first = true;
         while let Some((field, rest)) = f.uncons() {
             // `resolve_display_key`, not `field.key_str()`: a key that will
             // not *decode* (#1247/#1385) is preserved via its raw source
@@ -734,20 +735,55 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             // keys now raise instead of silently overwriting one another
             // (#1642/#1738), matching every other materializer.
             if let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? {
+                // #1975: this walk was missing the #1677 malformed-`,`/`:`
+                // delimiter check entirely -- unlike its
+                // `eval_generic::to_owned_at_depth` sibling it otherwise
+                // mirrors, which has always had it. This is why
+                // `--input-format json --slurp`/`--eval-all`/`--inplace`
+                // (the only callers of `parse_input`, hence of this
+                // function) silently accepted `{"a" 1, "b": 2}` when every
+                // other route into the evaluator correctly raised.
+                if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
+                    || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
+                {
+                    return Err(f.malformed_member_error());
+                }
                 map.insert(
                     key,
                     to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
                 );
             }
             f = rest;
+            is_first = false;
+        }
+        // #1975: the other half of the same gap -- an unpaired trailing
+        // child (#1194) that `resolve_display_key`'s per-field loop above
+        // never sees at all, matching `eval_generic::to_owned_at_depth`'s
+        // identical post-loop check.
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
         }
         OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
-        while let Some((elem, rest)) = elems.uncons() {
-            items.push(to_owned_canonicalizing_numbers_at_depth(&elem, depth + 1)?);
+        let mut is_first = true;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // #1975: matches `eval_generic::to_owned_at_depth`'s array arm --
+            // a missing/doubled `,` between elements was silently accepted
+            // here too.
+            if let Some(pos) = elem_cursor.text_position() {
+                let expected = if is_first { None } else { Some(b',') };
+                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+            }
+            items.push(to_owned_canonicalizing_numbers_at_depth(
+                &elem_cursor.value(),
+                depth + 1,
+            )?);
             elems = rest;
+            is_first = false;
         }
         OwnedValue::Array(items)
     } else if value.is_null() {
@@ -6073,6 +6109,50 @@ mod tests {
                 map.get("n")
             );
         }
+    }
+
+    /// #1975: `to_owned_canonicalizing_numbers` (the `parse_input` bridge
+    /// behind `--input-format json` under `--slurp`/`--eval-all`) had
+    /// neither the #1677 malformed-`,`/`:` delimiter check nor the #1194
+    /// unpaired-tail check at all -- unlike its `eval_generic::to_owned_at_depth`
+    /// sibling this function's own doc comment claims to mirror. Confirmed
+    /// live before this fix: `yq --input-format json --slurp -o=json '.[0] |
+    /// keys_unsorted'` on `{"a" 1, "b": 2}` silently returned `["a","b"]`
+    /// with exit 0, where every other route into the evaluator (`jq`,
+    /// `jq --slurp`, `yq --input-format json` without `--slurp`) correctly
+    /// raised.
+    #[test]
+    fn to_owned_canonicalizing_numbers_raises_on_malformed_delimiter_1975() {
+        for json in [
+            &br#"{"a" 1, "b": 2}"#[..], // missing ':'
+            &br#"{"a": 1 "b": 2}"#[..], // missing ','
+            &br#"{"a"}"#[..],           // unpaired tail
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            to_owned_canonicalizing_numbers(&cursor.value())
+                .expect_err(&format!("{json:?} is not well-formed JSON"));
+        }
+
+        // Well-formed data is unaffected.
+        let json = br#"{"a": 1, "b": 2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ]))
+        );
+
+        // The array arm has the identical gap for a missing ','.
+        let json = br"[1 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        to_owned_canonicalizing_numbers(&cursor.value())
+            .expect_err("a missing ',' between array elements is not well-formed JSON");
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring

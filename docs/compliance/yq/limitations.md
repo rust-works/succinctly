@@ -308,6 +308,27 @@ Four narrower gaps this fix deliberately left alone remain open, each already fi
   needs to reorder/slice entries, not just stream them) — a real representation limit, not a
   missed wiring like the three above.
 
+**[#1975](https://github.com/rust-works/succinctly/issues/1975) found this same `parse_input`/
+`to_owned_canonicalizing_numbers` bridge — #1343's still-open DOM fallback for `--slurp`/
+`--eval-all`, and `--inplace`'s DOM-forcing flags — had neither the #1194 unpaired-tail check
+nor the #1677 malformed-`,`/`:` delimiter check at all, unlike every other route into the
+evaluator.** Its own doc comment already claimed to mirror `eval_generic::to_owned_at_depth`
+"exactly"; this was the one place that claim wasn't true:
+
+```console
+$ printf '{"a" 1, "b": 2}' | succinctly jq -c 'keys_unsorted'
+jq: error (at <stdin>:0): Invalid JSON text: expected ':', found '1'         # correct
+$ printf '{"a" 1, "b": 2}' | succinctly yq --input-format json --slurp '.[0] | keys_unsorted'
+- a
+- b                                                                          # WRONG (before this fix)
+```
+
+Fixed by adding the same `key_delimiter_ok`/`value_delimiter_ok` checks (object arm) and
+`preceding_delimiter_ok` check (array arm) `to_owned_at_depth` already had, plus the missing
+`ends_unpaired()` check after the object loop. `key_delimiter_ok`/`value_delimiter_ok`
+(`src/jq/document.rs`) went from `pub(crate)` to `pub` for this — `src/bin/succinctly` is a
+separate crate from the library and had no way to call them otherwise.
+
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478),
 [#868](https://github.com/rust-works/succinctly/issues/868) and

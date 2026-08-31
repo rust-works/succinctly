@@ -1166,7 +1166,14 @@ pub fn resolve_display_key<V: DocumentValue, T>(
 /// `checked_len`, [`DistinctKeyCursors`], `effective_fields_checked`) has no
 /// way to name that equality -- naming `F` instead sidesteps needing it,
 /// since `key`/`key_cursor` are each used only through their own trait.
-pub(crate) fn key_delimiter_ok<F: DocumentFields>(
+///
+/// `pub`, not `pub(crate)` (#1975): `src/bin/succinctly` is a separate crate
+/// from this library, and its own `to_owned_canonicalizing_numbers_at_depth`
+/// (the `--input-format json --slurp`/`--eval-all`/`--inplace` DOM bridge)
+/// needed this exact check -- it had neither this nor
+/// [`value_delimiter_ok`] at all, unlike its `eval_generic::to_owned_at_depth`
+/// sibling it otherwise mirrors.
+pub fn key_delimiter_ok<F: DocumentFields>(
     key: &F::Value,
     key_cursor: &F::Cursor,
     is_first: bool,
@@ -1187,7 +1194,7 @@ pub(crate) fn key_delimiter_ok<F: DocumentFields>(
 /// not resolved a value at all should use
 /// [`key_only_value_delimiter_ok`] instead, which never touches the value
 /// cursor.
-pub(crate) fn value_delimiter_ok<F: DocumentFields>(
+pub fn value_delimiter_ok<F: DocumentFields>(
     value: Option<&F::Value>,
     value_cursor: &F::Cursor,
 ) -> bool {
