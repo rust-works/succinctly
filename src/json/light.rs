@@ -1503,6 +1503,18 @@ fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
     // encoding, so the concatenation is valid UTF-8 by construction (a `\`
     // is ASCII and so can never split a multi-byte sequence). Mapped rather
     // than `expect`ed to keep this path panic-free regardless.
+    //
+    // It is therefore a second validation pass over bytes already known to
+    // be valid, and `from_utf8_unchecked` would skip it -- measured (A/B,
+    // interleaved, 400k escaped strings in a 28 MB document) at -1.3% to
+    // -3.7% on the two workloads that decode every string, `-r '.[].s'` and
+    // `-S -c '.'`. Not taken: that is too small a win to introduce `unsafe`
+    // into this module for, and the obvious safe alternative -- dropping the
+    // per-chunk check and relying on this one -- is not equivalent, because
+    // it would report `InvalidEscape` where a string carrying both a bad
+    // literal byte and a later bad escape reports `InvalidUtf8` today. A
+    // sink trait letting `VALIDATE_UTF8 = true` build a `String` directly
+    // would get it safely, if the cost ever justifies the machinery.
     String::from_utf8(out).map_err(|_| JsonError::InvalidUtf8)
 }
 
