@@ -1604,8 +1604,17 @@ pub(crate) fn decode_escapes_into<const VALIDATE_UTF8: bool>(
                             return Err(JsonError::InvalidUnicodeEscape);
                         }
                     } else if (0xDC00..=0xDFFF).contains(&codepoint) {
-                        // Lone low surrogate
-                        return Err(JsonError::InvalidUnicodeEscape);
+                        // #2008: an unpaired *low* surrogate (`\uDC00`-`\uDFFF`)
+                        // is a different case from the unpaired *high*
+                        // surrogate arm above -- real jq 1.7.1 doesn't reject
+                        // this one at all: it accepts the document and
+                        // substitutes U+FFFD (confirmed live: `{"a":"\udc00"}`
+                        // decodes to `{"a":"�"}`, exit 0). Substituting
+                        // here rather than erroring matches that, where the
+                        // high-surrogate arm's `Err` (falling back to the raw
+                        // span) remains the already-documented leniency for
+                        // the case jq genuinely does reject.
+                        result.push('\u{FFFD}');
                     } else {
                         // Regular BMP character
                         if let Some(c) = char::from_u32(codepoint as u32) {
@@ -3671,6 +3680,13 @@ mod tests {
         }
     }
 
+    /// #2008: a lone low surrogate is a different case from the lone high
+    /// surrogate above -- real jq 1.7.1 doesn't reject it at all, it
+    /// substitutes U+FFFD and accepts the document (confirmed live:
+    /// `{"a":"\udc00"}` decodes to `{"a":"\u{FFFD}"}`, exit 0). Matches that
+    /// instead of erroring, unlike the high-surrogate case, which stays the
+    /// already-documented "echo the raw span" leniency since jq genuinely
+    /// rejects it.
     #[test]
     fn test_string_lone_low_surrogate() {
         // Lone low surrogate
@@ -3680,9 +3696,31 @@ mod tests {
 
         match root.value() {
             StandardJson::String(s) => {
-                assert_eq!(s.as_str(), Err(JsonError::InvalidUnicodeEscape));
+                let result = s.as_str().unwrap();
+                assert_eq!(&*result, "\u{FFFD}");
             }
             _ => panic!("expected string"),
+        }
+    }
+
+    /// #2008: pins the exact range boundary and mid-string/multiple-escape
+    /// cases the issue's own repro covers.
+    #[test]
+    fn test_string_lone_low_surrogate_range_and_mid_string_2008() {
+        for (json, want) in [
+            (&br#""\uDC00""#[..], "\u{FFFD}"),
+            (&br#""\uDFFF""#[..], "\u{FFFD}"),
+            (&br#""x\uDC00y""#[..], "x\u{FFFD}y"),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            match root.value() {
+                StandardJson::String(s) => {
+                    let result = s.as_str().unwrap();
+                    assert_eq!(&*result, want, "json={json:?}");
+                }
+                _ => panic!("expected string for json={json:?}"),
+            }
         }
     }
 
