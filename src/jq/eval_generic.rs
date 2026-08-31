@@ -1087,16 +1087,31 @@ enum LazySource<V: DocumentValue> {
     /// Array `keys_unsorted | map(f)` (#724) — synthetic `[0, 1, ..., len-1]`,
     /// no cursor to point at.
     IndexRange { next: usize, len: usize },
-    /// `Values`'s duplicate-key fallback (#1398): `obj | map(f)` is `[.[] |
-    /// f]`, and `.[]` collapses a repeated key to its first position but
-    /// last-seen value in both modes (see `Expr::Iterate`'s identical
-    /// rule). That requires seeing every occurrence before any value can
-    /// be emitted, so it can't stay a `Fields` cons-list walk -- this
-    /// variant holds the already-collapsed value cursors instead.
-    /// Constructed only when `document::collapsed_fields` actually finds a
-    /// repeat, so the ordinary duplicate-free `Values` path above is
-    /// unaffected.
-    CollapsedValues {
+    /// An explicit, already-ordered list of element cursors -- the general
+    /// "this array's elements are these document nodes, in this order"
+    /// source. Unlike every variant above it does not walk a live cons-list,
+    /// so the order and membership are whatever the producer chose.
+    ///
+    /// Two producers today:
+    ///
+    /// - `Values`'s duplicate-key fallback (#1398): `obj | map(f)` is `[.[] |
+    ///   f]`, and `.[]` collapses a repeated key to its first position but
+    ///   last-seen value in both modes (see `Expr::Iterate`'s identical
+    ///   rule). That requires seeing every occurrence before any value can
+    ///   be emitted, so it can't stay a `Fields` cons-list walk. Constructed
+    ///   only when `document::collapsed_fields` actually finds a repeat, so
+    ///   the ordinary duplicate-free `Values` path above is unaffected.
+    /// - The reordering/selecting builtins (#1687): `sort`, `sort_by`,
+    ///   `unique`, `unique_by` and `reverse` all answer a *permutation or
+    ///   subset of their input's own elements*, so their result is exactly
+    ///   this -- a `Vec<V::Cursor>` in the new order. Returning it as a
+    ///   `LazySeq` rather than an `OwnedValue::Array` is what keeps a
+    ///   duplicate mapping key *inside* a moved element alive, since
+    ///   `OwnedValue::Object` is `IndexMap`-backed and cannot represent one.
+    ///   `Builtin::Map`'s own long-standing `LazySeq` return (#724/#725) is
+    ///   the working precedent: `map(.)` is the one filter in this family
+    ///   that already preserved duplicates, for exactly this reason.
+    Cursors {
         cursors: Vec<V::Cursor>,
         next: usize,
     },
@@ -1114,8 +1129,8 @@ impl<V: DocumentValue> core::fmt::Debug for LazySource<V> {
                 .field("next", next)
                 .field("len", len)
                 .finish(),
-            Self::CollapsedValues { next, cursors } => f
-                .debug_struct("LazySource::CollapsedValues")
+            Self::Cursors { next, cursors } => f
+                .debug_struct("LazySource::Cursors")
                 .field("next", next)
                 .field("len", &cursors.len())
                 .finish(),
@@ -1128,6 +1143,14 @@ impl<V: DocumentValue> LazySource<V> {
     /// rule as it pulls (#1514).
     fn keys(fields: V::Fields, collapse: bool) -> Self {
         Self::Keys(DistinctKeyCursors::new(&fields, collapse))
+    }
+
+    /// A [`Self::Cursors`] source positioned at its first element.
+    ///
+    /// The `next: 0` is the only thing every producer would otherwise have
+    /// to remember to write, so it lives here rather than at each call site.
+    fn cursors(cursors: Vec<V::Cursor>) -> Self {
+        Self::Cursors { cursors, next: 0 }
     }
     /// Pull one element forward, storing "the rest" back into `self`. Once a
     /// variant's underlying cons-list is empty (or `next == len`), every
@@ -1172,7 +1195,7 @@ impl<V: DocumentValue> LazySource<V> {
                 *next += 1;
                 Some(LazyElem::Owned(OwnedValue::Int(i as i64)))
             }
-            Self::CollapsedValues { cursors, next } => {
+            Self::Cursors { cursors, next } => {
                 let Some(cursor) = cursors.get(*next).copied() else {
                     return Ok(None);
                 };
@@ -1256,6 +1279,20 @@ impl<V: DocumentValue> LazySeq<V> {
     fn push_map(mut self, f: &Expr, tag: EvalTag) -> Self {
         self.push_map_in_place(f, tag);
         self
+    }
+
+    /// An array whose elements are exactly `cursors`, with no `map` stage on
+    /// top -- the lossless answer for a builtin that reorders or selects its
+    /// input's own elements without computing new ones (#1687).
+    ///
+    /// The instruction chain is deliberately empty: `fold_one` then folds
+    /// each element through zero stages and hands the cursor straight back,
+    /// so `stream_json`/`stream_yaml` render every element from its own live
+    /// document position. That is the whole point -- it is what preserves a
+    /// duplicate mapping key inside a moved element, which an
+    /// `OwnedValue::Array` of `IndexMap`-backed objects cannot.
+    fn from_cursors(cursors: Vec<V::Cursor>) -> Self {
+        Self::new(LazySource::cursors(cursors))
     }
 
     /// Run one `Instruction` against one pending item, re-dispatching to
@@ -8006,13 +8043,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // so the duplicate-free case (by far the common one) keeps
                 // #724/#725's lazy pull unchanged.
                 let source = match collapsed_fields(&fields) {
-                    Some(collapsed) => LazySource::CollapsedValues {
-                        cursors: collapsed
+                    Some(collapsed) => LazySource::cursors(
+                        collapsed
                             .into_iter()
                             .map(|field| field.value_cursor)
                             .collect(),
-                        next: 0,
-                    },
+                    ),
                     None => LazySource::Values(fields),
                 };
                 GenericResult::LazySeq(Box::new(LazySeq::new(source).push_map(f, S::TAG)))
