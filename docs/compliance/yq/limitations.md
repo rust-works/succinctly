@@ -153,7 +153,8 @@ Two interactions remain open, neither closed by #1709 itself:
 
 1. This check only fires on bytes that are genuinely unescaped in the rendered output.
    `-o=json -0 '.a'` *without* an explicit `-r` should print a properly JSON-escaped
-   `"b\u0000c"` and succeed (JSON's default unwrap-scalar setting is `false`, unlike YAML's
+   `"b\u0000c"` and succeed (live-verified against the pinned oracle, Homebrew yq
+   v4.53.3: JSON's default unwrap-scalar setting is `false`, unlike YAML's
    `true` — real yq needs `-r` explicit to unwrap a JSON scalar), but succinctly's own
    `raw_output` resolution unconditionally ORs in `-0`/`-j` regardless of output format, so
    this one combination instead unwraps (bypassing JSON's own escaping) and correctly
