@@ -67656,7 +67656,10 @@ mod tests {
     /// and could only refuse.
     #[test]
     fn test_path_register_survives_intervening_literal_1573() {
-        assert_eq!(outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | $x)"), ["[]"]);
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | $x)"),
+            ["[]"]
+        );
     }
 
     /// The register is a *position*, not just a permission: navigation may
