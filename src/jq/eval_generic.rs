@@ -7315,9 +7315,19 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     if let Some(elements) = target.as_array() {
         let items = elements.collect_values();
         let range = SliceBounds::from_literals(start, end).resolve(items.len());
-        return GenericResult::Owned(OwnedValue::Array(owned_or_err!(to_owned_all(
-            items[range].iter()
-        ))));
+        // #2001 (code review): a #1194 malformed-member error nested
+        // inside a sliced element respects `optional` here too -- this is
+        // the `eval_generic` twin of `eval.rs`'s own `eval_single`
+        // literal-bounds `Expr::Slice` array arm, which had the identical
+        // gap this same PR fixed (see that arm's own #2001 comment). Can't
+        // reuse `eval.rs`'s `suppress_or_raise`/`to_owned_checked_or_suppress!`
+        // directly: different result type (`GenericResult` vs
+        // `QueryResult`), so the equivalent check is inlined instead.
+        return match to_owned_all(items[range].iter()) {
+            Ok(v) => GenericResult::Owned(OwnedValue::Array(v)),
+            Err(e) if optional && !e.is_decode_failure() => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        };
     }
     // yq's object AST-child-layout slicing rule (#1102) — mirrors
     // `eval.rs`'s cursor-backed `Expr::Slice` arm for the same target type;
@@ -7327,7 +7337,15 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
     // `IndexMap` `slice_object_as_yq_children` needs — same technique as
     // `eval.rs`'s own arm, for the same reason.
     if S::TAG == EvalTag::Yq && target.as_object().is_some() {
-        let OwnedValue::Object(map) = owned_or_err!(to_owned(&target)) else {
+        // #2001 (code review): same fix as the Array arm above -- a #1194
+        // malformed-member error nested inside the object respects
+        // `optional`.
+        let owned = match to_owned(&target) {
+            Ok(v) => v,
+            Err(e) if optional && !e.is_decode_failure() => return GenericResult::None,
+            Err(e) => return GenericResult::Error(e),
+        };
+        let OwnedValue::Object(map) = owned else {
             unreachable!("target.as_object() just confirmed this materializes to an Object")
         };
         return GenericResult::Owned(slice_object_as_yq_children(&map, start, end));
