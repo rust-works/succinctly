@@ -341,31 +341,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `first(limit((1,2); (1, ("B"|stderr))))` stop exploring the second `n`
   binding, matching jq, which it previously did not.
 
-  **This trades throughput for fidelity on large YAML sorts, deliberately.**
-  Cursor-backed results stream elements in *sorted* order rather than document
-  order, which defeats YAML's sequential cursor caches (`AdvancePositions`/
-  `CompactEndPositions` fall back to full recomputation on random access).
-  Interleaved A/B on a shuffled 200,000-element YAML sequence, byte-identical
-  output, Apple M-series:
+  Interleaved A/B against `main`'s tip, 7 reps, median, byte-identical output,
+  on a shuffled 200,000-element YAML sequence (Apple M-series, AC power). Both
+  absolute times are shown because a bare ratio is easy to read upside down:
 
-  | filter                        | speedup vs. before |
-  |-------------------------------|--------------------|
-  | `sort`, `unique`              | 0.25x              |
-  | `sort_by`                     | 0.30x              |
-  | `reverse`                     | 0.99x              |
-  | `min`/`max`                   | 1.6-1.9x           |
-  | `limit`/`nth`, single-value n | 1.01x              |
-  | `limit`/`nth`, generator n    | 2.0x               |
+  | filter                        | before  | after   | faster by |
+  |-------------------------------|--------:|--------:|-----------|
+  | `reverse`                     | 404 ms  |  43 ms  | **9.4x**  |
+  | `sort`                        | 670 ms  | 294 ms  | **2.3x**  |
+  | `sort_by`                     | 846 ms  | 390 ms  | **2.2x**  |
+  | `unique_by`                   | 849 ms  | 396 ms  | **2.1x**  |
+  | `min_by`/`max_by`             | 455 ms  | 318 ms  | **1.4x**  |
+  | `limit`/`nth`, single-value n | 128 ms  | 128 ms  | 1.01x     |
 
-  The loss is superlinear in element count (0.72x at 20k, 0.53x at 60k, 0.25x at
-  200k) and YAML-only -- JSON `sort` is 1.06-1.10x. Its cause is the permutation
-  alone, not the extra work: the same document *already sorted*, so the
-  permutation is the identity, measures 1.07x. `reverse` escapes it and
-  `min`/`max` touch a single cursor, which is why only the sorting spellings pay.
-  The previous path was losing data, so the trade is the right way round, but
-  making the sorted case fast again needs cheap random cursor access on the YAML
-  side, tracked in
-  [#2068](https://github.com/rust-works/succinctly/issues/2068).
+  The mechanism is that the elements are no longer decoded into an
+  `OwnedValue` at all, only reordered — so the saving grows with element count:
+  `reverse` measures 6.3x at 25,000 elements and 9.4x at 200,000, while
+  `sort_by` stays flat, its own sort still being O(n log n) on the keys.
+
+  A holdout rules out the emitted order mattering: the *same document already
+  sorted*, so the permutation is the identity, measures 2.3x — the same as the
+  shuffled one. `min_by`/`max_by`'s 1.4x is lower than the 2.9x measured before
+  the #1755 element decode-check below was restored; that check is the
+  difference, and correctness wins.
 
   Three cases are deliberately not fixed and are documented in
   `docs/compliance/yq/limitations.md`: `group_by` (an array of arrays has no

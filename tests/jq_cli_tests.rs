@@ -28765,3 +28765,44 @@ fn test_1687_limit_and_nth_still_bridge_a_live_input_queue() -> Result<()> {
 
     Ok(())
 }
+
+/// #1687 regression guard for #1755's rule. The `_by` spellings compute a key
+/// per element and never need the element's own value, so #1687's first cut
+/// skipped decoding it — which silently dropped `eval.rs`'s check that an
+/// undecodable element must *raise* rather than sort in as `""`.
+///
+/// The gap only shows when the bad element never reaches the output, so
+/// nothing else surfaces it. succinctly's semi-index accepts these documents
+/// where real jq rejects them at parse time, so there is no jq oracle here;
+/// the contract being pinned is #1755's own, and `main`'s behaviour.
+#[test]
+fn test_by_spellings_still_raise_on_an_undecodable_element_1687() -> Result<()> {
+    // A lone surrogate, a bad \u escape, and an unknown escape: all three are
+    // spans the semi-index accepts and the decoder rejects.
+    for bad in [r"\ud800", r"\uZZZZ", r"\x"] {
+        let input = format!(r#"[{{"a":2,"s":"{bad}"}},{{"a":1,"s":"ok"}}]"#);
+
+        // `length` never emits the offending element, so only the element
+        // decode-check can catch it.
+        for filter in [
+            "sort_by(.a) | length",
+            "unique_by(.a) | length",
+            "min_by(.a).a",
+            "max_by(.a).a",
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
+            assert_eq!(
+                code, 5,
+                "{filter} on {bad}: stdout {stdout:?} stderr {stderr}"
+            );
+            assert_eq!(stdout, "", "{filter} on {bad}");
+        }
+
+        // The bare spellings decode the element as their comparison key, so
+        // they were never affected — pinned as the control.
+        let (stdout, _, code) = run_jq_full(&["-c", "sort | length"], Some(&input))?;
+        assert_eq!(code, 5, "sort on {bad}");
+        assert_eq!(stdout, "", "sort on {bad}");
+    }
+    Ok(())
+}
