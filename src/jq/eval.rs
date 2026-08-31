@@ -4480,6 +4480,22 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// `each_operand` is `Fn`, not `FnMut`, because it is called **re-entrantly**:
 /// the per-right-value call on `left` happens while the call on `right` is
 /// still on the stack.
+/// Materialize one `binary_fanout_each` operand, aborting the fanout via
+/// `abort` on a decode failure (#1972) -- shared so the right- and
+/// left-operand call sites, otherwise identical, don't hand-copy the same
+/// abort-and-signal-`Stop` block. Unlike `combine`'s own error (handled
+/// separately, gated on `optional`), a decode failure is never suppressed
+/// (#1247/#1620), so this always escapes via `Flow::Escaped` regardless.
+fn checked_fanout_operand<W: Clone + AsRef<[u64]>>(
+    item: Item<'_, W>,
+    abort: &mut Option<Flow>,
+) -> Result<OwnedValue, Demand> {
+    item.into_owned_checked().map_err(|e| {
+        *abort = Some(Flow::Escaped(Control::Error(e)));
+        Demand::Stop
+    })
+}
+
 fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
     left: &Expr,
@@ -4494,26 +4510,15 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     let mut abort: Option<Flow> = None;
 
     let outer = each_operand(right, &mut |right_item: Item<'a, W>| {
-        // #1972: `into_owned_checked`, not `into_owned` -- an undecodable
-        // borrowed operand used to silently become `""` instead of raising.
-        // Unlike `combine`'s own error a few lines below, a decode failure
-        // is never suppressed by `optional` (#1247/#1620), so this always
-        // escapes via `Flow::Escaped` regardless.
-        let right_val = match right_item.into_owned_checked() {
+        let right_val = match checked_fanout_operand(right_item, &mut abort) {
             Ok(v) => v,
-            Err(e) => {
-                abort = Some(Flow::Escaped(Control::Error(e)));
-                return Demand::Stop;
-            }
+            Err(demand) => return demand,
         };
 
         let inner = each_operand(left, &mut |left_item: Item<'a, W>| {
-            let left_val = match left_item.into_owned_checked() {
+            let left_val = match checked_fanout_operand(left_item, &mut abort) {
                 Ok(v) => v,
-                Err(e) => {
-                    abort = Some(Flow::Escaped(Control::Error(e)));
-                    return Demand::Stop;
-                }
+                Err(demand) => return demand,
             };
             match combine(left_val, right_val.clone()) {
                 Ok(v) => sink(Item::Owned(v)),
