@@ -28806,3 +28806,61 @@ fn test_by_spellings_still_raise_on_an_undecodable_element_1687() -> Result<()> 
     }
     Ok(())
 }
+
+/// #1687: the `limit` sink arm's input-queue bridge — the one deferral
+/// `fanout_arg_each_generic` does *not* replace, because probing a live
+/// `input`/`inputs` queue would drain it as a side effect before the fallback
+/// ran.
+///
+/// Reaching it needs a shape that skips the *top-level* input-queue bridge in
+/// `eval_with_cursor_using`, which `takes_input_queue_bridge` declines for a
+/// query that also uses a cursor-metadata builtin (#1504). `limit(inputs; line)`
+/// is such a shape; `first(limit(inputs; ...))` is not, because
+/// `eval_first_or_last_generic`'s own guard fires first. That distinction is
+/// why this test exists separately from
+/// `test_1687_limit_and_nth_still_bridge_a_live_input_queue`.
+///
+/// `line` answers 0 rather than a real line number here: the bridge
+/// materializes the input and re-indexes it, so position metadata is gone.
+/// That is a pre-existing consequence of the guard — #1687 did not change its
+/// condition, only removed a separate bare-`Comma` disjunct beside it — and it
+/// sits awkwardly with #1504's own purpose, which was to keep `line` working
+/// alongside `inputs`. Pinned as the current behaviour, not endorsed.
+#[test]
+fn test_limit_sink_arm_bridges_a_live_input_queue_1687() -> Result<()> {
+    let inputs = "1\n2\n3\n4\n";
+
+    let (stdout, code) = run_jq_stdin("limit(inputs; line)", inputs, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout, "0\n0\n0\n",
+        "known gap: the bridge loses position metadata"
+    );
+
+    // Same arm, reached through a `Comma` sibling rather than as the whole
+    // program, so the bridge's `drain_result_generic` half runs too.
+    let (stdout, code) = run_jq_stdin("(limit(inputs; line), 1)", inputs, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n0\n0\n1\n");
+
+    Ok(())
+}
+
+/// #1687: `sort_family_control`'s non-`Error` half. A `halt_error` inside a
+/// sort key aborts the whole builtin with jq's own exit code and stderr —
+/// byte-identical to jq 1.7.1, which writes `10\n` and exits 5 (compared with
+/// `od -c`, since `halt_error`'s whole point is raw stderr).
+///
+/// The `Break` arm beside it is not reachable from any query this CLI can
+/// parse: `break $out` needs an enclosing `label`, `Expr::Label` has no native
+/// `eval_single` arm, so a label above `sort_by` routes the whole expression
+/// through the wildcard bridge before this arm runs. Same "unreachable but
+/// exhaustive" shape `Expr::Array`'s own `Break` arm documents (#1064).
+#[test]
+fn test_sort_family_propagates_halt_like_jq_1687() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "sort_by(halt_error)"], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stderr {stderr}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "10\n");
+    Ok(())
+}
