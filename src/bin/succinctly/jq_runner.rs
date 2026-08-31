@@ -1895,7 +1895,24 @@ fn get_inputs(
                         .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
                         .collect::<Vec<_>>()
                         .join("\n")
+                } else if args.input_dsv.is_none() && !args.raw_input {
+                    // #1743: JSON-shaped input (plain documents, `--slurp`
+                    // and `--seq` alike) gets jq's own per-JSON-string
+                    // substitution scope. Deliberately *not* gated on
+                    // `json_input_mode`, which excludes `--seq` -- `--seq`
+                    // input is still JSON text, just RS-separated, and real
+                    // jq scopes the substitution to each string there too
+                    // (oracle-verified). The two cases this branch must not
+                    // capture are the ones left in the `else` below.
+                    succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(e.as_bytes())
                 } else {
+                    // `--raw-input --slurp` (the non-slurp `-R` took the
+                    // per-line branch above) is genuinely whole-buffer in
+                    // real jq -- the entire input is one string, so the
+                    // buffer's own end *is* that string's end
+                    // (oracle-verified). DSV input is not JSON at all: its
+                    // strings are `""`-escaped, not backslash-escaped, so a
+                    // JSON string scanner would mis-segment it.
                     succinctly::text::utf8::substitute_invalid_utf8_jq_style(e.as_bytes())
                 }
             }
@@ -2369,8 +2386,12 @@ impl ErrorAt<'_> {
 /// Valid input is returned untouched and unallocated -- the check is a
 /// whole-input SIMD pass (~1.1 ms on 8.4 MB) and only a document that
 /// actually fails it pays for a copy, via
-/// [`substitute_invalid_utf8_jq_style`](succinctly::text::utf8::substitute_invalid_utf8_jq_style),
-/// whose own docs cover the substitution rule itself (#1617).
+/// [`substitute_invalid_utf8_jq_document`](succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document),
+/// which scopes
+/// [`substitute_invalid_utf8_jq_style`](succinctly::text::utf8::substitute_invalid_utf8_jq_style)'s
+/// rule (#1617/#1717) to each JSON string the way real jq's own lexer does
+/// (#1743) rather than to the whole file. Both of those carry the
+/// substitution rule and the scoping rationale respectively.
 ///
 /// Document input only, and only when `--validate` is off: the strict
 /// validator has to see the original bytes, or the substitution repairs the
@@ -2381,7 +2402,9 @@ impl ErrorAt<'_> {
 fn utf8_lossy_document(raw: Vec<u8>) -> Vec<u8> {
     match succinctly::text::utf8::validate_utf8(&raw) {
         Ok(()) => raw,
-        Err(_) => succinctly::text::utf8::substitute_invalid_utf8_jq_style(&raw).into_bytes(),
+        Err(_) => {
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(&raw).into_bytes()
+        }
     }
 }
 

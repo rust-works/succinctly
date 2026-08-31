@@ -80,6 +80,7 @@ mod lazy;
 mod parser;
 mod slice;
 pub mod stream;
+pub mod utf8_document;
 mod value;
 pub mod walk;
 
