@@ -8297,16 +8297,15 @@ fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
 /// still collapsed -- exactly as it is in `eval.rs` today. Only the emitted
 /// element is lossless.
 ///
-/// **The `Some(f)` arm deliberately does not decode-check the element, and so
-/// does not carry `eval.rs`'s #1755 rule for it.** `eval::builtin_sort_by`/
-/// `unique_by`/`min_by`/`max_by` each call `to_owned_checked(&item)` on the
-/// *element* as well as computing its key, so an undecodable element raises
-/// rather than sorting in as `""`. Here it is only decoded when `key` is
-/// `None`, since the `_by` forms never need the element's value -- and adding
-/// the check back would cost a full decode per element on exactly the path
-/// #1687 already made slower for large sorted YAML (see the CHANGELOG entry).
-/// No live repro is known for the gap today; filed as #2069 rather than closed
-/// blind, because the fix and the cost point in opposite directions.
+/// **Both arms carry `eval.rs`'s #1755 rule**, by different means: the `None`
+/// arm's own conversion is already the checked one, and the `Some(f)` arm
+/// runs `push_generic_truthiness_cursor_error` -- the same validation with the
+/// `OwnedValue` construction removed. #2069 filed this as an accepted gap on
+/// the grounds that no live repro was known and the check would cost a full
+/// decode per element; both premises were wrong. The repro is
+/// `[{"a":2,"s":"\ud800"},{"a":1,"s":"ok"}] | sort_by(.a) | length`, which
+/// answered 2 where `main` raised, and the validation-only walk costs no
+/// materialization.
 fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     cursors: Vec<V::Cursor>,
     key: Option<&Expr>,
@@ -8315,10 +8314,33 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     let mut keyed = vec_with_capacity(cursors.len());
     for cursor in cursors {
         let k = match key {
-            Some(f) => sort_key_generic::<S, V>(f, &cursor, optional)?,
-            // #1755's rule, in this file's spelling: `to_owned_cursor` is
-            // already the checked conversion, so an undecodable element
-            // raises rather than silently sorting in as `""`.
+            Some(f) => {
+                // #1755's rule for the `_by` forms. `eval::builtin_sort_by`/
+                // `unique_by`/`min_by`/`max_by` each `to_owned_checked` the
+                // *element* as well as computing its key, so an undecodable
+                // element raises rather than silently sorting in as `""`.
+                // Omitting that here was a live regression, not a theoretical
+                // one: on `[{"a":2,"s":"\ud800"},{"a":1,"s":"ok"}]`,
+                // `sort_by(.a) | length` answered 2 where `main` raised --
+                // the bad element never reaches the output, so nothing else
+                // would ever have surfaced it.
+                //
+                // `push_generic_truthiness_cursor_error`, not
+                // `to_owned_cursor`: it is that function's own traversal and
+                // validation with the `OwnedValue` construction removed, so
+                // the `_by` forms keep the point of this arm -- never
+                // materializing an element they only ever reorder -- while
+                // still raising on one that cannot be decoded. (Not free: it
+                // still allocates one `String` per object key, per
+                // `resolve_display_key`'s #1642 guard.)
+                if let Some(control) = push_generic_truthiness_cursor_error(&cursor, 0) {
+                    return Err(control);
+                }
+                sort_key_generic::<S, V>(f, &cursor, optional)?
+            }
+            // The bare forms compare elements by their own decoded value, so
+            // the conversion below *is* the check -- `to_owned_cursor` is
+            // already the checked one.
             None => to_owned_cursor(&cursor).map_err(Control::Error)?,
         };
         keyed.push((k, cursor));
