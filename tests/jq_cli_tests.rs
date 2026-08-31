@@ -23862,39 +23862,43 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
 }
 
 /// Code review (#1596): `each_limit_generic` (the native `Expr::Limit` arm
-/// `first`/`last` route through) must evaluate a generator `n` argument at
-/// most once, same as its non-`first`-wrapped siblings -- not this test's own
-/// "matches jq" claim, since real jq never evaluates the second `n` binding
-/// here at all (`first`'s own single-output need is already satisfied by the
-/// first), a *separate*, pre-existing gap in `eval.rs`'s own generator-`n`
-/// handling shared by every consumer (confirmed live:
-/// `isempty(limit((1,("N"|debug)); 42))` leaks the identical single
-/// `["DEBUG:","N"]` on `main`, unrelated to and unmoved by this issue).
+/// `first`/`last` route through) must not evaluate a generator `n` argument
+/// more times than jq does.
 ///
-/// What IS this issue's own regression risk: before the guards
-/// `each_limit_generic` gained in review, it evaluated `n_expr` via
-/// `eval_single` to classify it, then -- for exactly this generator shape --
-/// discarded that evaluation and re-ran the whole `Expr::Limit` node from
-/// scratch via the full-evaluator bridge, so `debug` fired *twice* under
-/// `first(...)` where every other route (bare `limit(...)`, `isempty(...)`)
-/// fires it once. This test pins the fixed count (one), not jq parity.
+/// The count this pins has now been tightened twice, and the history is the
+/// point of the test:
 ///
-/// A broader, separate residual (`expr`'s own side effects, not just
-/// `n_expr`'s, still leak past the bridge for a generator `n` under
-/// `first`/`nth`) is documented in
-/// [`docs/compliance/jq/limitations.md`](../docs/compliance/jq/limitations.md)
-/// rather than pinned here, since `expr = 42` above carries no side effect
-/// of its own -- this test's scope is `n_expr`'s count, not that residual.
+/// - Before #1596's own review guards, `each_limit_generic` evaluated
+///   `n_expr` via `eval_single` to classify it, then -- for exactly this
+///   generator shape -- discarded that evaluation and re-ran the whole
+///   `Expr::Limit` node from scratch through the full-evaluator bridge. So
+///   `debug` fired **twice**.
+/// - #1596 added a static bare-`Comma` guard that deferred before probing,
+///   bringing it to **once**, and this test pinned that. Its own comment
+///   recorded that jq fires it **zero** times -- `first`'s single-output need
+///   is already met by the `$n=1` binding, so jq never explores the second at
+///   all -- and called closing that a separate, pre-existing gap in the
+///   generator-`n` handling shared by every consumer.
+/// - #1687 closed it. `fanout_arg_each_generic` drives `n_expr` through the
+///   demand-driven sink, so a wrapping `first` stops the argument generator
+///   itself. This now pins jq parity (zero), re-verified live against the
+///   pinned jq 1.7.1.
+///
+/// `isempty(limit((1,("N"|debug)); 42))` still leaks the single
+/// `["DEBUG:","N"]` -- `isempty` does not route through this fan-out -- so
+/// that sibling remains the residual this test's earlier comment described,
+/// unmoved by #1687.
 #[test]
-fn test_first_over_limit_generator_n_evaluates_once_not_twice_1596() -> Result<()> {
+fn test_first_over_limit_generator_n_is_never_evaluated_1596() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-cn", r#"first(limit((1,("N"|debug)); 42))"#], None)?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "42\n");
     assert_eq!(
         stderr.trim_end_matches('\n'),
-        r#"["DEBUG:","N"]"#,
-        "n_expr's own side effect must fire exactly once, not twice"
+        "",
+        "jq never explores the second `n` binding once `first` is satisfied \
+         by the first, so `n_expr`'s side effect must not fire at all"
     );
     Ok(())
 }

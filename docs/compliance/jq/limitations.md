@@ -1633,17 +1633,21 @@ YAML, though — every YAML cursor's `preceding_delimiter_ok` uses the trait def
 to this evaluator-level check the way JSON's semi-index does — so there is no YAML input
 this gap check can actually catch or skip either way, today.
 
-## `limit`'s own `n` argument is not demand-aware when it is itself a generator
+## A generator `n` under a truncating consumer: fixed for `limit`, residual for `nth`/`isempty`
 
 Real jq passes `limit($n; f)`'s `$n` through the same backtracking arg-passing convention
 as any other filter argument, so a *generator* `n` (`limit((1,2); f)`, #1279's own canonical
 example) re-runs the whole `limit` body once per bound value of `$n` — but only as many
-times as the wrapping consumer actually needs:
+times as the wrapping consumer actually needs.
+
+**`limit` now matches jq here (#1687).** `eval_generic.rs`'s `fanout_arg_generic`/
+`fanout_arg_each_generic` drive `n` through the demand-driven sink, so a wrapping
+`first`/`nth`/`isempty`/`any` stops the `n` generator itself:
 
 ```
-$ succinctly jq -cn 'first(limit((1,2); (1, ("B"|stderr))))'      # jq: 1, no stderr
+$ succinctly jq -cn 'first(limit((1,2); (1, ("B"|stderr))))'      # jq: 1, no stderr — agrees
 1
-$ succinctly jq -cn '[limit((1,2); (1, ("B"|stderr)))]'           # jq: [1,1,"B"], stderr B (both agree)
+$ succinctly jq -cn '[limit((1,2); (1, ("B"|stderr)))]'           # jq: [1,1,"B"], stderr B — agrees
 [1,1,"B"]
 B
 ```
@@ -1651,30 +1655,25 @@ B
 The second row is not a typo: an *unbounded* consumer genuinely needs both of `$n`'s
 bindings (`$n=1` keeps `expr`'s first output alone; `$n=2` keeps its first two, so
 `("B"|stderr)`'s own value ends up in the array too), so exploring `expr`'s second output
-there is correct in both tools. The first row is where they diverge — jq's own `first`
-stops after `$n=1`'s single output and never even considers the `$n=2` binding, so
-`stderr` stays empty; `succinctly jq` still writes `B`.
+there is correct in both tools.
 
-**Root cause: no demand-aware entry point exists yet for a generator `n`.** `limit`'s fast,
-demand-forwarding paths (`eval::each_limit`, `eval_generic.rs`'s `eval_limit_generic`/
-`each_limit_generic`, #1607/#1596) all defer to `eval.rs`'s plain, fully-materializing
-`eval()`/`full_eval` the moment `n` is anything beyond a single plain value — the same
-"give up on the fast path, hand the whole node to the collecting evaluator" policy `map(f)`
-above used to have before #724/#725 gave it a genuinely lazy sequence type. `limit`'s own
-generator-`n` case has no equivalent lazy machinery to defer to: `eval()` collects every
-output across every `$n` binding into one `QueryResult` before any wrapping consumer's
-`Demand` is ever consulted, so a `first`/`nth` sitting outside a generator-`n` `limit` gets
-the answer only after paying (and leaking any side effect from) work it never asked for.
+**Two shapes still diverge**, both because they never reach that fan-out — verified live
+against jq 1.7.1, and unchanged by #1687:
 
-Deliberately not fixed here: it needs `eval.rs` itself to gain a demand-aware path for a
-generator `n`, not another consumer-side guard — the same order of work #724/#725 needed
-for `map(f)`, not a small patch. `n_expr` as a generator is jq's own rarer laziness
-contract to begin with (most real `limit`/`nth` calls pass a scalar), so the common case is
-unaffected; only a bare, side-effecting, multi-output `n` under a truncating consumer sees
-this. Tracked in
+| filter                                       | jq 1.7.1 | `succinctly jq` |
+|----------------------------------------------|----------|-----------------|
+| `isempty(limit((1,("N"\|debug)); 42))`        | no stderr | writes `["DEBUG:","N"]` |
+| `first(nth((0,1); (1, ("B"\|stderr))))`       | no stderr | writes `B`      |
+
+`isempty` has no native arm in `eval_generic.rs` at all, so the whole expression is
+evaluated by `eval.rs`, whose own `each_limit` still classifies `n` with a single eager
+`eval_single` rather than a fan-out. `nth` has an eager native arm but no sink-side
+(`each_`) twin, so a wrapping `first` has nothing to push its demand into. Both are the
+same shape of gap `limit` had before #1687 and both are fixable the same way — port
+`fanout_arg` to `eval::each_limit`, and give `nth` an `each_nth_generic` — neither of which
+is `limit`'s own scope. Tracked in
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md)
-(item 9) as a residual, not silently reintroduced — `each_limit_generic`'s own doc comment
-carries the same note at the call site.
+(item 9).
 
 ## A `?//`-alternatives bind under a short-circuiting consumer runs once, not once per alternative
 
