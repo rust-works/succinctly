@@ -992,10 +992,17 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // shape -- accumulating a partial prefix for a fan-out
                 // stream to report on error -- that this single-aggregate-
                 // value arm has no use for and was discarding unconditionally).
+                // #2001: `suppress_or_raise`, not an unconditional `Error`
+                // -- a #1194 malformed-member error nested inside a sliced
+                // element respects `optional` the same way the sibling
+                // `Object` arm below already does (#1953); can't use the
+                // `to_owned_checked_or_suppress!` macro directly inside
+                // `.map()` here since its `return` would return from the
+                // closure, not this function.
                 let sliced = slice_elements::<W>(elements, *start, *end);
                 match sliced.iter().map(to_owned_checked).collect() {
                     Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => suppress_or_raise(e, optional),
                 }
             }
             // yq treats a null/number/boolean target as an empty container
@@ -37382,10 +37389,11 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         // #1755: to_owned_checked, not to_owned
                         // -- an undecodable picked value must
                         // raise, not silently become "".
-                        let owned = match to_owned_checked(&field.value) {
-                            Ok(v) => v,
-                            Err(e) => return QueryResult::Error(e),
-                        };
+                        // #2001: ...or_suppress -- a #1194 malformed-member
+                        // error nested inside the picked value must respect
+                        // `optional`, matching this function's own
+                        // `keys_owned` conversion above (#2010).
+                        let owned = to_owned_checked_or_suppress!(&field.value, optional);
                         result.insert(k.clone(), owned);
                     }
                     // If key not found, yq silently skips it
@@ -37415,10 +37423,8 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // #1755: to_owned_checked, not to_owned -- an
                     // undecodable picked element must raise, not silently
                     // become "".
-                    let owned = match to_owned_checked(&arr[actual_idx as usize]) {
-                        Ok(v) => v,
-                        Err(e) => return QueryResult::Error(e),
-                    };
+                    // #2001: ...or_suppress -- see the Object arm above.
+                    let owned = to_owned_checked_or_suppress!(&arr[actual_idx as usize], optional);
                     result.push(owned);
                 }
                 // If index out of bounds, yq silently skips it
@@ -37447,19 +37453,16 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // must raise, not silently become "" (and then fail the "must be an
     // array" check with the wrong message, or worse, silently omit
     // nothing correctly-named).
+    // #2001: each `to_owned_checked` below now routes through
+    // `to_owned_checked_or_suppress` -- mirrors `pick`'s own identical fix
+    // (#2010) for this same match shape.
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => match to_owned_checked(&v) {
-            Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
-        },
+        QueryResult::One(v) => to_owned_checked_or_suppress!(&v, optional),
         // Defensive only: `eval_single` (unlike top-level `eval`'s own
         // `Expr::Identity` special case) never actually produces
         // `OneCursor`, so this arm is unreachable in practice today --
         // kept fallible anyway rather than assuming that stays true.
-        QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
-            Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
-        },
+        QueryResult::OneCursor(c) => to_owned_checked_or_suppress!(&c.value(), optional),
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -37473,10 +37476,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
         }
         QueryResult::Many(v) if !v.is_empty() => {
-            match to_owned_checked(&v.into_iter().next().unwrap()) {
-                Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
-            }
+            to_owned_checked_or_suppress!(&v.into_iter().next().unwrap(), optional)
         }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
@@ -37542,10 +37542,8 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // #1755: to_owned_checked, not to_owned -- an
                     // undecodable kept value must raise, not
                     // silently become "".
-                    let owned = match to_owned_checked(&field.value) {
-                        Ok(v) => v,
-                        Err(e) => return QueryResult::Error(e),
-                    };
+                    // #2001: ...or_suppress -- see `pick`'s identical fix.
+                    let owned = to_owned_checked_or_suppress!(&field.value, optional);
                     result.insert(key.into_owned(), owned);
                 }
             }
@@ -37570,6 +37568,14 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // #1755: to_owned_checked, not to_owned -- an undecodable kept
             // element must raise, not silently become "".
+            // #2001: routed through `suppress_or_raise` -- can't use the
+            // `to_owned_checked_or_suppress!` macro directly inside the
+            // `.map()` closure below, since its `return` would return from
+            // the closure (changing the collected type), not this
+            // function, so the same check is applied once here instead,
+            // after `collect()` surfaces the first error in iteration
+            // order -- equivalent to checking it at the point of failure,
+            // since either way only the first element error is ever seen.
             let result: Result<Vec<OwnedValue>, EvalError> = arr
                 .iter()
                 .enumerate()
@@ -37578,7 +37584,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .collect();
             let result = match result {
                 Ok(result) => result,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
 
             QueryResult::Owned(OwnedValue::Array(result))
@@ -40517,6 +40523,33 @@ mod tests {
         }
     }
 
+    /// #2001: `eval_single`'s `Expr::Slice`/`Expr::SliceNumber` `Array` arm
+    /// (available in both jq and yq mode, unlike the `Object` arm above,
+    /// which is yq-only) has the identical gap the `Object` arm's own
+    /// #1953 fix already closed -- found by code review as a sibling site
+    /// missed at the time. `end: Some(1)` (rather than the `Object` arm
+    /// test's `None, None`) so the array fast-path (`start: None|Some(0)
+    /// && end: None` -- an identity slice, returned without ever calling
+    /// `to_owned_checked`) isn't taken.
+    #[test]
+    fn test_eval_single_array_slice_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let slice_expr = Expr::Slice {
+            start: None,
+            end: Some(1),
+        };
+        match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
     /// doc comment above for the full rationale shared by all seven of
     /// these per-site tests. `eval_assign`'s `YqAssignNoopCheck::NotChecked`
@@ -40659,6 +40692,116 @@ mod tests {
             other => panic!("expected None, got {other:?}"),
         }
         match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001: `pick`/`omit` (yq-only) had the same gap as the seven sites
+    /// above, in the value/element conversion each performs once a
+    /// requested key/index actually matches -- PR #2010 migrated `pick`'s
+    /// own *keys-expression* conversion (the `keys_owned` match) to
+    /// `to_owned_checked_or_suppress!` but left its two per-match value
+    /// conversions (Object arm's `field.value`, Array arm's indexed
+    /// element) on the raw unconditional pattern, and didn't touch `omit`
+    /// at all -- `omit` mirrors `pick` exactly (same `keys_owned` match
+    /// shape, same per-kept-value conversion in both its Object and Array
+    /// arms) and needs the identical five-site fix.
+    ///
+    /// The malformed member must be nested inside the *picked*/*kept*
+    /// value, not the top-level document `pick`/`omit` themselves iterate
+    /// over -- that outer structure is already validated by
+    /// `effective_fields_checked` before either function reaches a single
+    /// field's own value.
+    #[test]
+    fn test_builtin_pick_object_value_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":{"x":1,"y"},"b":2}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::String("a".into()))));
+        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// See `test_builtin_pick_object_value_respects_optional_for_malformed_member_error_2001`'s
+    /// doc comment above -- `pick`'s Array arm sibling.
+    #[test]
+    fn test_builtin_pick_array_element_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::Int(0))));
+        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// See `test_builtin_pick_object_value_respects_optional_for_malformed_member_error_2001`'s
+    /// doc comment above -- `omit`'s own `keys_owned` conversion (its
+    /// `QueryResult::One` arm, reached here via `Expr::Identity` since the
+    /// keys expression and the value being omitted-from are the same input
+    /// under test).
+    #[test]
+    fn test_builtin_omit_keys_expr_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"x":1,"y"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Identity;
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// See `test_builtin_pick_object_value_respects_optional_for_malformed_member_error_2001`'s
+    /// doc comment above -- `omit`'s Object arm. Omits a non-matching key
+    /// (`"z"`) so `"a"`'s malformed value is *kept* (and so converted)
+    /// rather than skipped.
+    #[test]
+    fn test_builtin_omit_object_value_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":{"x":1,"y"},"b":2}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::String("z".into()))));
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// See `test_builtin_pick_object_value_respects_optional_for_malformed_member_error_2001`'s
+    /// doc comment above -- `omit`'s Array arm. Omits a non-matching index
+    /// (`5`) so the malformed element at index 0 is *kept*.
+    #[test]
+    fn test_builtin_omit_array_element_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::Int(5))));
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
