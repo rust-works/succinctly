@@ -35509,14 +35509,17 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: first(expr) - output only the first value from expr (stream version)
+///
+/// Unlike `eval_first_expr`, this function is never actually reached from
+/// parsed `succinctly jq`/`succinctly yq` filter text (#1986) -- `first(expr)`
+/// always parses to `Expr::FirstExpr`, not `Builtin::FirstStream` (see
+/// `builtin_first_stream_propagates_bare_halt`) -- so this update exists
+/// purely to keep the two implementations in sync.
 fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // `Builtin::FirstStream` is the internal spelling of the same `first(f)`;
-    // it differs from `eval_first_expr` only in always materializing its
-    // answer, which is preserved here.
     match each_take_first::<W, S>(expr, value, optional) {
         Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
         Ok(None) => QueryResult::None,
