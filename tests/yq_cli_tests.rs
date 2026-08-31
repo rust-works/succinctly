@@ -4044,6 +4044,90 @@ fn test_nul_output_unaffected_when_no_nul_present_1709() -> Result<()> {
     Ok(())
 }
 
+/// #1709 code review: the standard (non-M2, non-`--eval-all`) multi-file
+/// DOM loop wrote its `---` document separator eagerly, before the
+/// document's own first result ever reached `output_value`'s NUL check --
+/// same bug class the M2 streaming path's `PendingSeparator` was built to
+/// close, just unfixed on this loop. `.a + ""` forces the DOM path (same
+/// technique `test_nul_output_multidoc_dom_path_does_not_corrupt_1701`
+/// above uses, adapted to string concatenation since one document's value
+/// here is itself a string); doc2's own (only) result fails the check, so
+/// its `---` must not appear either.
+#[test]
+fn test_nul_output_dom_path_no_separator_leak_on_later_doc_failure_1709() -> Result<()> {
+    let input = "a: \"first\"\n---\na: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".a + \"\"", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "first\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// Same fix, `--eval-all` -- deferred separately from the standard loop
+/// above (own call site, own `results.len() > 1 && i > 0` condition).
+/// `--eval-all` combines every document into one array context, so `.[]`
+/// yields each *whole document* as its own result (`a: 1`, not `1`).
+#[test]
+fn test_nul_output_eval_all_no_separator_leak_on_later_doc_failure_1709() -> Result<()> {
+    let input = "a: 1\n---\nb: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".[]", input, &["--eval-all", "-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "a: 1\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709 code review: `stream_maybe_colored`'s `use_color` (`--colors`)
+/// branch read `separator.is_some()` to gate its own NUL scan but never
+/// consulted `DocSeparatorArgs` to actually *write* the `---` marker,
+/// silently dropping every document separator whenever `--colors` and
+/// `-0` were combined -- regardless of whether the NUL check passed.
+#[test]
+fn test_nul_output_colors_multidoc_separator_survives_1709() -> Result<()> {
+    let input = "a: 1\n---\nb: 2\n";
+    let (output, code) = run_yq_stdin(".", input, &["-0", "--colors"])?;
+    assert_eq!(code, 0);
+    assert!(
+        output.contains("---"),
+        "expected the document separator to survive --colors + -0, got: {output:?}"
+    );
+    // Byte-exact: ANSI-colorized "a: 1" (with its own trailing reset),
+    // NUL terminator, newline-guarded `---`, colorized "b: 2" (own
+    // trailing reset), NUL terminator (#1701's own established divergence
+    // for the newline-before-`---` fix, unaffected by this PR).
+    assert_eq!(
+        output,
+        "\u{1b}[36ma\u{1b}[0m: 1\u{1b}[0m\0\n---\n\u{1b}[36mb\u{1b}[0m: 2\u{1b}[0m\0"
+    );
+    Ok(())
+}
+
+/// #1709 code review: the identity (P9) path's leftover-buffer flush was
+/// gated on the render having fully succeeded, so a mid-document decode
+/// failure discarded whatever valid content had already rendered into the
+/// buffer before it -- violating this file's own established keep-the-
+/// prefix-and-diagnose trade (#1641/#1679), which the exact same query
+/// without `-0` still honors. One YAML document with two fields, the
+/// second undecodable -- no `-0` terminator appears anywhere here, `-0`
+/// or not: the whole document is a single identity-mode stream cut short
+/// mid-way, never reaching its own (would-be single, trailing) terminator
+/// write either way.
+#[test]
+fn test_nul_output_identity_keeps_prefix_on_decode_failure_1709() -> Result<()> {
+    let input = "a: 1\nb: \"\\x\"\n";
+
+    let (output, _, code) = run_yq_stdin_with_stderr(".", input, &[])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "a: 1\nb: ");
+
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "a: 1\nb: ");
+    assert!(stderr.contains("invalid escape"), "got: {stderr}");
+
+    Ok(())
+}
+
 /// Same fix, `--inplace` (#1701).
 #[test]
 fn test_nul_output_inplace_1701() -> Result<()> {
