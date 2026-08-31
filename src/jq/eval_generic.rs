@@ -8824,18 +8824,20 @@ mod tests {
     /// carried two full field-cursor copies (`rest`/`all`) plus the rare-path
     /// `seen`/`collapsed` fields for #1514's duplicate-key collapse, unboxed,
     /// on every `LazySeq` regardless of whether that document ever hits the
-    /// collapse path. Boxing `seen`/`collapsed` (#1973) shrank this to 152
-    /// bytes -- `rest`/`all`'s own two full cursor copies remain unboxed and
-    /// out of scope here (a materially larger change; see #1973's own "why
-    /// deferred" section), so this isn't the struct's floor, just its next
-    /// pinned value. Pinned on the YAML instantiation since it's the larger
-    /// (worse-case) of the two document kinds.
+    /// collapse path. Boxing `collapsed` (#1973) shrank this to 184 bytes --
+    /// `seen` deliberately stays unboxed (see its own doc comment: boxing it
+    /// would force an allocation on every jq-mode walk, not just the ones
+    /// that collapse), and `rest`/`all`'s own two full cursor copies remain
+    /// unboxed and out of scope here too (a materially larger change; see
+    /// #1973's own "why deferred" section) -- so this isn't the struct's
+    /// floor, just its next pinned value. Pinned on the YAML instantiation
+    /// since it's the larger (worse-case) of the two document kinds.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_lazyseq_size_is_pinned_1973() {
         assert_eq!(
             core::mem::size_of::<LazySeq<crate::yaml::YamlValue<'_, Vec<u64>>>>(),
-            152,
+            184,
             "LazySeq<YamlValue>'s size changed -- if it grew, a new unboxed-wide field \
              snuck onto LazySeq/LazySource/DistinctKeyCursors (investigate before \
              accepting); if it shrank, DistinctKeyCursors shrank further -- update this \
@@ -8846,14 +8848,17 @@ mod tests {
     /// The YAML twin of [`test_lazyseq_size_is_pinned_1973`] for
     /// `DistinctKeyCursors<YamlFields>` directly -- the actual struct #1973
     /// identifies as the real driver of `LazySeq<V>`'s size, not just the
-    /// enum variant wrapping it. `seen: Option<Box<KeyHashes>>` and
-    /// `collapsed: Option<Box<Vec<_>>>` (#1973) replace their previously
-    /// unboxed forms, shrinking this from 168 to 120 bytes -- both were
-    /// already niche-optimized `Option<_>`s, so boxing removes only the
-    /// pointee's own size from every walk that never hits the rare
-    /// duplicate-key path, at the cost of one allocation on the ones that
-    /// do. `rest`/`all`'s own two full field-cursor copies remain unboxed
-    /// and out of scope here (#1973's own "why deferred" section).
+    /// enum variant wrapping it. `collapsed: Option<Box<Vec<_>>>` (#1973)
+    /// replaces its previously unboxed form, shrinking this from 168 to 152
+    /// bytes -- already niche-optimized as `Option<Vec<_>>`, so boxing
+    /// removes only the `Vec`'s own size from every walk that never
+    /// collapses, at the cost of one extra allocation on the already-rare
+    /// confirmed-collapse path. `seen` deliberately stays unboxed (its own
+    /// doc comment has the full reasoning: boxing it would allocate on
+    /// every jq-mode walk, not just the rare ones that collapse -- caught
+    /// in code review before this landed). `rest`/`all`'s own two full
+    /// field-cursor copies remain unboxed and out of scope here too
+    /// (#1973's own "why deferred" section).
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_distinct_key_cursors_size_is_pinned_1973() {
@@ -8861,7 +8866,7 @@ mod tests {
             core::mem::size_of::<
                 crate::jq::document::DistinctKeyCursors<crate::yaml::YamlFields<'_, Vec<u64>>>,
             >(),
-            120,
+            152,
             "DistinctKeyCursors<YamlFields>'s size changed -- if it grew, a new field \
              landed unboxed on the rare-path (seen/collapsed) or copied cursor (rest/all) \
              members (investigate before accepting); if it shrank, update this pinned \
