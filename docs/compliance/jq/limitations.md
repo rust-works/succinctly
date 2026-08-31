@@ -519,16 +519,34 @@ is the revert that established what the other one costs.
 
 1. **Variable-rooted navigation off a mismatched accumulator** —
    `path(. as $x \| foreach (1,2) as $i (0; $x.a; .b))` on `{"a":{"b":1},"c":2}` is
-   `["a","b"]` ×2 in jq; succinctly refuses. Same root cause as the pre-existing, unrelated
-   `path(. as $x \| 5 \| $x.a)` on `{"a":1}` (jq `["a"]`, succinctly already refuses today) —
-   `resolve_node` conflates "current input" with a variable's own bound position outside any
-   fold too, so this isn't specific to #1440's own fix. `Expr::TrackedVar` witnesses only
-   `path=[]`, which is why `substitute_var_tracked` is gated on `is_identity_passthrough`:
-   a variable bound from a *navigated* position (`.a as $y`) carries no marker at all, so
-   `path(.a as $y \| reduce (1) as $i (.a; $y))` — jq `["a"]` — refuses too. Tracked as
-   [#1573](https://github.com/rust-works/succinctly/issues/1573), which proposes carrying the
-   binding's own path on the marker; goldens `fold_register_var_from_navigated_binding` and
-   `fold_register_snapshot_via_nested_init`.
+   `["a","b"]` ×2 in jq; succinctly refuses.
+
+   The *plain-pipe* half of this shape is closed.
+   [#1573](https://github.com/rust-works/succinctly/issues/1573) established that jq carries
+   a `(path, value_at_path)` **register** which only navigation advances — a literal never
+   moves it, so a `$var` frozen from where it still points steps back onto it — and
+   `resolve_seq` now threads that register (`PathBranch::register`,
+   `reestablishes_register`, `src/jq/eval.rs`). `path(. as $x \| 5 \| $x.a)` on `{"a":1}`,
+   which this list previously recorded as refusing, answers `["a"]` like jq.
+
+   What remains here is that [`FoldRegister`](../../../src/jq/eval.rs) does not seed *its*
+   register into the resolution of its own `UPDATE`/`EXTRACT`: the accumulator (`0`) is
+   resolved with tracking already off and no register to compare against, so `$x.a` cannot
+   re-establish the way it does in a plain pipe. Closing it means threading the register
+   into `resolve_node`/`resolve_leaf` as a parameter rather than carrying it on the branch,
+   which is a materially larger change across that function's ~20-call-site dispatch graph.
+
+   Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
+   marker at all, because `substitute_var_tracked` remains gated on
+   `is_identity_passthrough` — so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`,
+   refuses too. That gate **cannot simply be widened**: measured against jq 1.7.1, doing so
+   makes `path(.a as $y \| .c \| $y)` on `{"a":{"b":1},"c":{"b":1}}` answer `["c"]` where jq
+   refuses — reopening the accept-where-jq-refuses class #1466 closed, since
+   `register_identical`'s provenance bit records "never rebuilt", not "from *this*
+   position", and `OwnedValue` has no node identity. The marker needs a bind-time path
+   first; tracked as [#2042](https://github.com/rust-works/succinctly/issues/2042). Golden
+   `fold_register_var_from_navigated_binding`.
+
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
    refuses. [#1365](https://github.com/rust-works/succinctly/issues/1365) (`?//`-alternatives
