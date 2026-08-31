@@ -1314,12 +1314,22 @@ the reasoning behind each placement:
    evaluated `n_expr` unconditionally before ever consulting them. Fixed by porting the
    identical two pre-checks into `each_limit_generic`, deferring to the bridge *before* touching
    `n_expr` at all rather than after — pinned in
-   `test_first_over_limit_generator_n_evaluates_once_not_twice_1596`, which asserts the fixed
+   `test_first_over_limit_generator_n_evaluates_once_not_twice_1596`, which asserted the fixed
    count (one) rather than jq parity: real jq never evaluates the second `n` binding for this
    shape at all, since `first`'s own single-output need is already satisfied by the first, a
    *separate*, pre-existing gap in `eval.rs`'s own generator-`n` handling shared by every
    consumer (confirmed live: `isempty(limit((1,("N"|debug)); 42))` leaks the identical single
    `["DEBUG:","N"]` on unmodified `main`, unrelated to and unmoved by this issue).
+
+   **Superseded by #1687.** `fanout_arg_each_generic` drives `n_expr` through the demand-driven
+   sink instead of bridging, so `each_limit_generic` no longer evaluates it at all under
+   `first` — jq's own count. The pre-checks and the bridge for this shape are gone with it, and
+   the test is now
+   `test_first_over_limit_generator_n_is_never_evaluated_1596`, pinning zero. The `isempty`
+   sibling above is untouched and remains the residual: `isempty` has no native arm in
+   `eval_generic.rs`, so it is evaluated wholly by `eval.rs`, whose `each_limit` still
+   classifies `n` with one eager `eval_single`. `first(nth((0,1); ...))` is the same gap for
+   `nth`, which has no sink-side twin.
 
    Verified with `scripts/jq-fanout-oracle-sweep.sh`, which went from 20 known-gap cases
    attributed to this issue to 0 divergences (490/490 matching pinned jq 1.7.1); its now-dead
