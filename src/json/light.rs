@@ -1614,14 +1614,17 @@ pub(crate) fn decode_escapes_into<const VALIDATE_UTF8: bool>(
                         // high-surrogate arm's `Err` (falling back to the raw
                         // span) remains the already-documented leniency for
                         // the case jq genuinely does reject.
-                        result.push('\u{FFFD}');
+                        push_char(result, '\u{FFFD}');
                     } else {
-                        // Regular BMP character
-                        if let Some(c) = char::from_u32(codepoint as u32) {
-                            push_char(result, c);
-                        } else {
-                            return Err(JsonError::InvalidUnicodeEscape);
-                        }
+                        // Regular BMP character: codepoint is a u16 (from
+                        // parse_hex4) outside 0xD800-0xDFFF (both arms above
+                        // already cover that whole range), so it's always a
+                        // valid char and this can't fail.
+                        push_char(
+                            result,
+                            char::from_u32(codepoint as u32)
+                                .expect("non-surrogate u16 is always a valid char"),
+                        );
                     }
                 }
                 _ => return Err(JsonError::InvalidEscape),

@@ -1294,6 +1294,37 @@ Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1
   malformed-input wording fix. Filed as
   [#2006](https://github.com/rust-works/succinctly/issues/2006).
 
+### `fromjson`/`tonumber`'s shared decoder is jq-modeled, only narrowly gated for yq mode
+
+`Builtin::FromJson`/`Builtin::ToNumber` dispatch to `builtin_fromjson`/`tonumber_from_str`
+in `src/jq/eval.rs` with no mode split at all -- the same hand-rolled JSON-string decoder
+(`parse_json_string_value`) backs `fromjson`/`tonumber` in both `succinctly jq` and
+`succinctly yq`. [#2008](https://github.com/rust-works/succinctly/issues/2008) (a lone
+*low* surrogate escape, `\uDC00`-`\uDFFF`, should substitute U+FFFD rather than error,
+matching real jq) initially applied that fix unconditionally, which broke yq-mode fidelity
+here: real yq's `fromjson` doesn't use jq's JSON string grammar at all -- it decodes
+through go-yaml's own quoted-scalar scanner, which rejects *any* `\u` escape encoding a
+surrogate codepoint outright (confirmed live against yq v4.53.3, including a **valid**,
+correctly-paired surrogate escape, not just a lone one). Fixed during that PR's own review
+by gating the new low-surrogate arm behind `S::TAG == EvalTag::Yq` (threaded as a plain
+`yq_mode: bool` through `parse_complete_json`/`parse_json_value`/`parse_json_array`/
+`parse_json_object`/`parse_json_string_value`, since none of those carried an
+`EvalSemantics` type parameter before): yq mode keeps erroring on a lone low surrogate,
+unchanged from before #2008; only jq mode gained the new leniency.
+
+That gate is deliberately narrow -- it does not make yq-mode `fromjson` match real yq's
+actual model, which rejects the entire surrogate-pairing mechanism, not just the lone-low
+case. A **valid** surrogate pair still silently decodes successfully in yq mode today
+(`succinctly yq -n '"\"\\ud83d\\ude00\"" | fromjson'` → the emoji, real yq → a parse
+error), and a lone **high** surrogate is wrongly *accepted* (substitutes U+FFFD) in both
+jq and yq mode alike -- a separate, pre-existing bug unrelated to #2008's own scope, filed
+as [#2013](https://github.com/rust-works/succinctly/issues/2013) (also documents a real
+data-loss case: two `fromjson`-parsed object keys differing only by an unpaired high
+surrogate silently collapse, last-value-wins). Fully aligning yq-mode `fromjson` with real
+yq's stricter, non-pairing model is filed separately as
+[#2018](https://github.com/rust-works/succinctly/issues/2018), since it needs its own
+yq-mode branch checked ahead of all of jq's pairing logic, not an arm-by-arm patch.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
