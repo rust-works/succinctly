@@ -2767,10 +2767,10 @@ fn validate_json_str(s: &str) -> serde_json::Result<()> {
 /// the full "validate, then reparse the same span" pattern #1163 asked to
 /// share, for the call sites where the validated string and the
 /// materialized string are the same one. `parse_json_value`'s own
-/// leading-zero retry can't use this for its retry branch (it validates a
-/// *normalized* copy but must still materialize the *original* text, see
-/// its own comment), so that one branch calls `validate_json_str`
-/// directly instead.
+/// leading-zero/low-surrogate retry (#1094/#2012) can't use this for its
+/// retry branch (it validates a *normalized* copy but must still
+/// materialize the *original* text, see its own comment), so that branch
+/// calls `validate_json_str` directly instead.
 fn validate_and_materialize_json(
     s: &str,
 ) -> serde_json::Result<core::result::Result<OwnedValue, EvalError>> {
@@ -3729,17 +3729,25 @@ fn seq_pending_token_is_terminated(
 }
 
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
-/// same leading-zero form (`007e5`) `--seq` has accepted since #1243.
+/// same leading-zero form (`007e5`) `--seq` has accepted since #1243, and
+/// the same lone-low-surrogate escape (`\uDC00`-`\uDFFF`) `--argjson`
+/// accepts since #2012 (code review: `validate::validate` -- strict RFC
+/// 8259 -- and `validate_json_str` -- `serde_json` -- both reject a lone
+/// low surrogate, so without this, a `--seq` record real jq accepts
+/// [confirmed live: `printf '\x1e"\udc00"\n' | jq --seq -c '.'` =>
+/// `"�"`, exit 0] silently vanished instead, the exact leniency gap
+/// #2012 fixed for `--argjson` reappearing one function over).
 ///
-/// Normalization is needed *here* and only here: `validate::validate` is
-/// strict RFC 8259 and rejects a leading zero, while the semi-indexer behind
-/// `json_bytes_to_owned_value` already reads `0007` as `7` on its own -- so
-/// the value-building side needs no fallback.
+/// Normalization is needed *here* and only here: the value-building side
+/// (`json_bytes_to_owned_value`, reached once a record is judged valid)
+/// already reads `0007` as `7` and substitutes U+FFFD for a lone low
+/// surrogate on its own -- so it needs no fallback of its own for either
+/// leniency.
 fn seq_value_is_valid(value_text: &str) -> bool {
     if validate::validate(value_text.as_bytes()).is_ok() {
         return true;
     }
-    let normalized = normalize_leading_zero_numbers(value_text);
+    let normalized = normalize_lone_low_surrogates(&normalize_leading_zero_numbers(value_text));
     normalized != value_text && validate_json_str(&normalized).is_ok()
 }
 
@@ -6044,6 +6052,52 @@ mod tests {
         // at all, are unaffected.
         assert_eq!(normalize_lone_low_surrogates("[1,2]"), "[1,2]");
         assert_eq!(normalize_lone_low_surrogates(r#""hello""#), r#""hello""#);
+    }
+
+    /// #2012 code review: the low-surrogate range's inclusive bounds
+    /// (`0xDC00..=0xDFFF`) and the high-surrogate range just below it
+    /// (`0xD800..=0xDBFF`) were unverified at their exact edges -- an
+    /// off-by-one here would either miss a real lone low surrogate or
+    /// wrongly touch an ordinary character just outside either range.
+    /// Every value below is verified live against `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn test_normalize_lone_low_surrogates_range_boundaries_2012() {
+        // 0xDFFF: top of the low-surrogate range -- still substituted.
+        assert_eq!(normalize_lone_low_surrogates(r#""\udfff""#), r#""\ufffd""#);
+        // 0xDBFF: top of the high-surrogate range -- a lone high surrogate,
+        // left untouched (out of this issue's scope, same as 0xD800 above).
+        assert_eq!(normalize_lone_low_surrogates(r#""\udbff""#), r#""\udbff""#);
+        // 0xD7FF and 0xE000: the codepoints immediately outside either
+        // surrogate range -- ordinary characters, not surrogates at all,
+        // so `parse_u_escape` finds no surrogate here and copies verbatim.
+        assert_eq!(normalize_lone_low_surrogates(r#""\ud7ff""#), r#""\ud7ff""#);
+        assert_eq!(normalize_lone_low_surrogates(r#""\ue000""#), r#""\ue000""#);
+    }
+
+    /// #2012 code review: a lone low surrogate immediately followed by
+    /// another lone low surrogate, or a valid pair immediately followed
+    /// by another valid pair, with no plain character between them -- the
+    /// case most likely to expose an off-by-one in the pair-consuming
+    /// loop's own index arithmetic. Both verified live against jq 1.7.1.
+    #[test]
+    fn test_normalize_lone_low_surrogates_adjacent_escapes_2012() {
+        assert_eq!(
+            normalize_lone_low_surrogates(r#""\udc00\udc01""#),
+            r#""\ufffd\ufffd""#
+        );
+        // Two consecutive valid pairs: both left untouched.
+        assert_eq!(
+            normalize_lone_low_surrogates(r#""\ud800\udc00\ud801\udc01""#),
+            r#""\ud800\udc00\ud801\udc01""#
+        );
+        // A high surrogate immediately followed by a malformed (non-hex)
+        // `\u` escape is not a valid pair -- left untouched, same as any
+        // other lone high surrogate; `parse_u_escape` returns `None` for
+        // the malformed escape rather than panicking.
+        assert_eq!(
+            normalize_lone_low_surrogates(r#""\ud800\uZZZZ""#),
+            r#""\ud800\uZZZZ""#
+        );
     }
 
     #[test]

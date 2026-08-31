@@ -1237,6 +1237,43 @@ fn test_seq_still_drops_genuinely_malformed_record_1267() -> Result<()> {
     Ok(())
 }
 
+/// #2012 (code review): `--seq` had the identical lone-low-surrogate gap
+/// #2012 fixed for `--argjson`/`--jsonargs`, reached through a different
+/// function (`seq_value_is_valid`) that also gates on `serde_json`
+/// validation and had no low-surrogate fallback -- a `--seq` record real
+/// jq accepts (substituting U+FFFD, the same #2008 leniency) silently
+/// vanished instead of being emitted. Confirmed live against the pinned
+/// oracle: `printf '\x1e"\udc00"\n\x1e"ok"\n' | jq --seq -c '.'` prints
+/// both records, exit 0.
+#[test]
+fn test_seq_accepts_lone_low_surrogate_2012() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["--seq", "-c", "."], Some("\x1e\"\\udc00\"\n\x1e\"ok\"\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim_end(),
+        "\x1e\"\u{FFFD}\"\n\x1e\"ok\"",
+        "stdout: {stdout:?}"
+    );
+    Ok(())
+}
+
+/// #2012 (code review): the composed leading-zero + low-surrogate case
+/// must be accepted through `--seq` too, matching `--argjson`'s own
+/// composed-fix regression guard.
+#[test]
+fn test_seq_composes_leading_zero_and_low_surrogate_fixes_2012() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["--seq", "-c", "."], Some("\x1e[007,\"\\udc00\"]\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim_end(),
+        "\x1e[7,\"\u{FFFD}\"]",
+        "stdout: {stdout:?}"
+    );
+    Ok(())
+}
+
 /// A hyphen-prefixed `--slurpfile`/`--rawfile` FILE value must reach this
 /// crate's own file-open logic, not get rejected by clap as an unknown
 /// flag first (#1150, same `allow_hyphen_values` fix as `--arg`/
@@ -25798,11 +25835,16 @@ fn test_argjson_low_surrogate_substitutes_replacement_character_2012() {
     assert_eq!(stdout.trim(), "\"\u{FFFD}\"");
 
     // Control: a lone *high* surrogate stays rejected (#2013's own,
-    // unrelated scope).
+    // unrelated scope) -- asserting on the message content, not just
+    // non-empty stderr, so a regression that broke `--argjson` parsing
+    // for an unrelated reason wouldn't pass this check too.
     let (_stdout, stderr, code) =
         run_jq_full(&["-n", "--argjson", "x", r#""\ud800""#, "$x"], None).unwrap();
     assert_ne!(code, 0, "lone high surrogate should still be rejected");
-    assert!(!stderr.is_empty());
+    assert!(
+        stderr.contains("Invalid JSON for --argjson"),
+        "stderr: {stderr}"
+    );
 
     // Control: a value needing *both* the #1094 leading-zero leniency and
     // this leniency at once (code review on #2012: an earlier version
