@@ -8296,6 +8296,17 @@ fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
 /// document position at all. So a duplicate key *inside a comparison key* is
 /// still collapsed -- exactly as it is in `eval.rs` today. Only the emitted
 /// element is lossless.
+///
+/// **The `Some(f)` arm deliberately does not decode-check the element, and so
+/// does not carry `eval.rs`'s #1755 rule for it.** `eval::builtin_sort_by`/
+/// `unique_by`/`min_by`/`max_by` each call `to_owned_checked(&item)` on the
+/// *element* as well as computing its key, so an undecodable element raises
+/// rather than sorting in as `""`. Here it is only decoded when `key` is
+/// `None`, since the `_by` forms never need the element's value -- and adding
+/// the check back would cost a full decode per element on exactly the path
+/// #1687 already made slower for large sorted YAML (see the CHANGELOG entry).
+/// No live repro is known for the gap today; filed as #2069 rather than closed
+/// blind, because the fix and the cost point in opposite directions.
 fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
     cursors: Vec<V::Cursor>,
     key: Option<&Expr>,

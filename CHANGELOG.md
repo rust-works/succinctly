@@ -341,9 +341,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `first(limit((1,2); (1, ("B"|stderr))))` stop exploring the second `n`
   binding, matching jq, which it previously did not.
 
-  Measured on a 200,000-element sequence: `sort_by` 3.7x faster, `reverse` 9.6x,
-  `min_by`/`max_by` 2.9x, with byte-identical output (interleaved A/B, Apple
-  M-series). `limit`/`nth` are unchanged at 1.01x.
+  **This trades throughput for fidelity on large YAML sorts, deliberately.**
+  Cursor-backed results stream elements in *sorted* order rather than document
+  order, which defeats YAML's sequential cursor caches (`AdvancePositions`/
+  `CompactEndPositions` fall back to full recomputation on random access).
+  Interleaved A/B on a shuffled 200,000-element YAML sequence, byte-identical
+  output, Apple M-series:
+
+  | filter                        | speedup vs. before |
+  |-------------------------------|--------------------|
+  | `sort`, `unique`              | 0.25x              |
+  | `sort_by`                     | 0.30x              |
+  | `reverse`                     | 0.99x              |
+  | `min`/`max`                   | 1.6-1.9x           |
+  | `limit`/`nth`, single-value n | 1.01x              |
+  | `limit`/`nth`, generator n    | 2.0x               |
+
+  The loss is superlinear in element count (0.72x at 20k, 0.53x at 60k, 0.25x at
+  200k) and YAML-only -- JSON `sort` is 1.06-1.10x. Its cause is the permutation
+  alone, not the extra work: the same document *already sorted*, so the
+  permutation is the identity, measures 1.07x. `reverse` escapes it and
+  `min`/`max` touch a single cursor, which is why only the sorting spellings pay.
+  The previous path was losing data, so the trade is the right way round, but
+  making the sorted case fast again needs cheap random cursor access on the YAML
+  side, tracked in
+  [#2068](https://github.com/rust-works/succinctly/issues/2068).
 
   Three cases are deliberately not fixed and are documented in
   `docs/compliance/yq/limitations.md`: `group_by` (an array of arrays has no
