@@ -2570,6 +2570,26 @@ fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> 
     }
 }
 
+/// #1934 item 7: whether `optional == true` is ever actually reachable here
+/// (or at `eval_reduce`/`eval_foreach`/`eval_as`, which route into this same
+/// guard) was left as an open question after #1902/#1927's review -- multiple
+/// independent audits found it unreachable via any live jq/yq syntax, but
+/// flagged "worth a deliberate decision" rather than continuing to patch
+/// branches nothing can reach. Re-verified fresh here (not just re-read):
+/// `debug_assert!(!optional, ..)` at the top of all four functions, full
+/// `cargo test --workspace` run (only the deliberate white-box unit tests
+/// that call these functions directly with a hard-coded `true` tripped it --
+/// e.g. `test_finish_fork_ordinary_error_suppressed_decode_failure_is_not_1902`
+/// -- zero hits from any parsed-syntax-driven test), plus a battery of
+/// `?`-suffixed `reduce`/`foreach`/optional-chain CLI queries. Also confirmed
+/// `eval_generic.rs` has no native `Expr::Reduce`/`Expr::Foreach` arm at all --
+/// every `reduce`/`foreach` query, path-context or not, bridges to this
+/// module's own `eval_reduce`/`eval_foreach`, so this isn't a case of testing
+/// a rarely-reached evaluator; it is the *only* one, for every CLI query.
+/// Conclusion: kept as intentional defensive code (option (b) from the
+/// original finding), not simplified away -- removing it would mean deleting
+/// the existing white-box tests that exercise it, for a branch that costs
+/// nothing to keep and matches `finish_fork_generic`'s own identical guard.
 fn finish_fork<'a, W>(
     outputs: Vec<OwnedValue>,
     control: Option<Control>,
@@ -25410,7 +25430,14 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1642 collision error) is an ordinary error like any other, and
     // `optional` should suppress it the same way the bare `QueryResult::Error`
     // arm below already does (#1934 item 3: this used to be unconditionally
-    // fatal regardless of `optional`, unlike that sibling arm).
+    // fatal regardless of `optional`, unlike that sibling arm). #1934 item 6:
+    // this widening -- a malformed key/collision now raises here where the
+    // pre-#1902 unchecked `to_owned` silently dropped the offending member --
+    // is `to_owned_checked`'s own already-established contract from #1755
+    // onward, not new scope creep specific to `reduce`; #1907 tracks the
+    // general "`to_owned_checked`'s `Err` can carry a non-decode-failure
+    // error" question this arm (and its `eval_foreach`/`eval_as` siblings)
+    // are instances of.
     let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
         QueryResult::One(v) => match to_owned_checked(&v) {
             Ok(v) => vec![v],
