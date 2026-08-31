@@ -27568,6 +27568,16 @@ fn while_step<S: EvalSemantics>(
 ///   own pinned, deliberately-jq-oracle-free convention for this shape
 ///   (real jq has no answer to compare against -- a bare `repeat(empty)`
 ///   spins forever there too).
+///
+///   **Inherently approximate for an *impure* `expr`** (one reading
+///   `input`/`inputs`, so a later round can genuinely differ even though
+///   the repeated value itself never changes): a body needing 1000+
+///   consecutive empty rounds before its first real output is silently cut
+///   off here with no diagnostic, diverging from jq's own (correct, if
+///   unbounded) answer. Any finite bound has this same edge at whatever
+///   number it picks -- documented as an accepted, structural limitation in
+///   `docs/compliance/jq/limitations.md` rather than something a larger
+///   constant would actually fix.
 pub(crate) const MAX_EMPTY_REPEAT_ROUNDS: usize = 1000;
 
 fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(

@@ -13361,6 +13361,52 @@ fn test_path_repeat_width_budget_matches_value_mode_1933() -> Result<()> {
     Ok(())
 }
 
+/// #2014: `limit(n; repeat(f))` used to cap at a flat 1000 rounds
+/// regardless of `n`, silently truncating any larger request -- verified
+/// against jq 1.7.1 at the issue's own scaling table (n=1500, well past the
+/// old cap, with a narrow one-value-per-round `f` so the unrelated
+/// per-round *width* budget in `test_path_repeat_width_budget_matches_value_mode_1933`
+/// above never triggers). `each_repeat`'s per-round `Demand::Stop` handoff
+/// to the wrapping `limit` should let this run 1500 full rounds with no
+/// error.
+#[test]
+fn test_repeat_limit_n_above_1000_no_longer_truncates_2014() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[limit(1500; repeat(1))] | length"], Some("null"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1500\n");
+    Ok(())
+}
+
+/// #2014: the *eager* fallback -- `repeat(f)` reached through a consumer
+/// that never dispatches through `eval_each`'s lazy path (array
+/// construction, `reduce`, `foreach`, `last`) -- has no `Demand::Stop` to
+/// bound it, so it still runs `eval_repeat`'s original capped loop. #2014
+/// changed only how that cap fails on exhaustion: silent truncation to a
+/// short, successful result became a hard error, matching
+/// `resolve_repeat_bounded`'s (path-mode) existing convention instead of
+/// returning wrong-but-plausible output with no diagnostic. Real jq hangs
+/// on all of these instead (no oracle answer to compare against, same as
+/// `repeat(empty)` above) -- see limitations.md's own writeup of this
+/// three-way split (fixed / eager-fallback-raises / path-mode-still-caps).
+#[test]
+fn test_repeat_eager_fallback_raises_instead_of_silently_truncating_2014() -> Result<()> {
+    for query in [
+        "[repeat(1)] | length",
+        "reduce repeat(1) as $x (0; .+1)",
+        "foreach repeat(1) as $x (0; .+1)",
+        "last(repeat(1))",
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-c", query], Some("null"))?;
+        assert_eq!(code, 5, "query {query:?}, stderr: {stderr}");
+        assert!(
+            stderr.contains("repeat: maximum iterations exceeded"),
+            "query {query:?}, stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #1935: `first(f)` needs the same `resolve_node_bounded` dispatch #1906/
 /// #1850 gave `limit` -- `first(f)` is exactly `limit(1; f)` for
 /// path-tracking purposes, but was routing through the generic
