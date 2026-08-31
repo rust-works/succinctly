@@ -18042,6 +18042,51 @@ fn test_yq_iterate_assign_chained_scalar_and_null_is_noop_1181() -> Result<()> {
     Ok(())
 }
 
+/// #1919: unlike `=` and the compound-assign family (`+=`/`-=`/`*=`/`/=`/
+/// `%=`/`//=`), plain `|=` never autovivified a `null` reached through a
+/// *mid-chain* `Iterate` at all -- not "no-op", a hard `Cannot iterate over
+/// null` error, since the mid-chain `Expr::Iterate` arm inside
+/// `update_path`'s `Pipe`-chain dispatch was missing the yq-only
+/// `autovivify_array` call its terminal-`Iterate` sibling arm already had
+/// (added for #1181). `.a[].b |= 5` on `a: null` real yq gives `{"a": []}`
+/// (the write itself is discarded -- there is nothing to iterate over --
+/// but the container still gets built), matching `.a[] |= 5` on the same
+/// input (the terminal-`Iterate` case, which already worked before this
+/// fix).
+#[test]
+fn test_yq_iterate_pipe_chain_null_autovivifies_under_update_assign_1919() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a[].b |= 5", r#"{"a":null}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
+
+    // A deeper chain past the Iterate behaves the same way.
+    let (out, code) = run_yq_stdin(".a[][0] |= 5", r#"{"a":null}"#, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
+
+    // jq mode is unaffected: no null-autovivify rule for Iterate at all,
+    // matching real jq.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+    cmd.arg("jq").arg(".a[].b |= 5");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().unwrap().write_all(br#"{"a":null}"#)?;
+    let output = child.wait_with_output()?;
+    assert!(
+        !output.status.success(),
+        "jq mode should still raise: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Cannot iterate over null"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 /// Regression guard: a real array/object target still iterates and writes
 /// normally -- the no-op is specific to a genuinely scalar/null target.
 #[test]

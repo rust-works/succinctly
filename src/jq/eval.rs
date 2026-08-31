@@ -19077,22 +19077,45 @@ fn update_path<S: EvalSemantics>(
                             )
                         }
                     }
-                    Expr::Iterate => match root {
-                        OwnedValue::Array(arr) => {
-                            for elem in arr.iter_mut() {
-                                update_path::<S>(elem, &rest, filter_expr, optional, scalar_noop)?;
-                            }
-                            Ok(true)
+                    Expr::Iterate => {
+                        // #1919: same yq-only null-to-`[]` autovivify as the
+                        // terminal `Expr::Iterate` arm above (#1181) -- that
+                        // arm runs for `.[] |= f`, this one for a mid-chain
+                        // `.a[].b |= f`, and only the terminal one had the
+                        // call. Gated on `S::TAG`, not `here`/`scalar_noop`,
+                        // matching every other #1181 check in this function.
+                        if S::TAG == EvalTag::Yq {
+                            autovivify_array(root);
                         }
-                        OwnedValue::Object(map) => {
-                            for value in map.values_mut() {
-                                update_path::<S>(value, &rest, filter_expr, optional, scalar_noop)?;
+                        match root {
+                            OwnedValue::Array(arr) => {
+                                for elem in arr.iter_mut() {
+                                    update_path::<S>(
+                                        elem,
+                                        &rest,
+                                        filter_expr,
+                                        optional,
+                                        scalar_noop,
+                                    )?;
+                                }
+                                Ok(true)
                             }
-                            Ok(true)
+                            OwnedValue::Object(map) => {
+                                for value in map.values_mut() {
+                                    update_path::<S>(
+                                        value,
+                                        &rest,
+                                        filter_expr,
+                                        optional,
+                                        scalar_noop,
+                                    )?;
+                                }
+                                Ok(true)
+                            }
+                            _ if here || noop_scalar => Ok(false),
+                            _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
                         }
-                        _ if here || noop_scalar => Ok(false),
-                        _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
-                    },
+                    }
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
                     // when a branch resolved to more than one component, so
                     // unwrapping can expose a nested pipe. Splice it in rather
