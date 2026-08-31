@@ -23980,14 +23980,36 @@ fn test_yq_iterate_adjacent_builtins_reject_object_unlike_jq_1901() -> Result<()
         );
     }
 
-    // jq mode is unaffected: any/all/flatten succeed on an object, matching
-    // jq's own "iterate the values" semantics.
+    // jq mode is unaffected -- #1901 review found only `any`/`flatten` were
+    // pinned here, leaving `all`/`group_by`/`unique`/`unique_by`/
+    // `from_entries`'s own jq-mode object behavior unverified by this test.
+    // any/all/flatten succeed on an object, matching jq's own "iterate the
+    // values" semantics; group_by/unique/unique_by hit jq's own
+    // object-vs-array pairing bug (#995); from_entries hits its own,
+    // unrelated indexing error.
     let (out, _stderr, code) = run_jq_stdin_with_stderr("any", doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "true");
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("all", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "true");
     let (out, _stderr, code) = run_jq_stdin_with_stderr("flatten", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[3,1]");
+    for filter in ["group_by(.)", "unique", "unique_by(.)"] {
+        let (_out, stderr, code) = run_jq_stdin_with_stderr(filter, doc, &["-c"])?;
+        assert_ne!(code, 0, "`{filter}` unexpectedly succeeded");
+        assert!(
+            stderr.contains("cannot be sorted, as they are not both arrays"),
+            "`{filter}` -- stderr={stderr:?}"
+        );
+    }
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("from_entries", doc, &["-c"])?;
+    assert_ne!(code, 0, "from_entries unexpectedly succeeded");
+    assert!(
+        stderr.contains("Cannot index number with string"),
+        "stderr={stderr:?}"
+    );
 
     Ok(())
 }
@@ -24003,6 +24025,32 @@ fn test_yq_iterate_adjacent_builtins_well_formed_array_unaffected_1901() -> Resu
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "true");
 
+    Ok(())
+}
+
+/// #1901 review: `?` (optional) suppression on a non-array input for all
+/// seven builtins -- exit 0, no output, matching the pre-existing
+/// `scalar_fallback`/`object_pair_type_error` contract this fix routes
+/// through rather than a new one of its own. `succinctly`-only syntax
+/// (`--jq-extensions`), since real yq's own lexer rejects `?` as postfix
+/// syntax outright -- there is no live oracle for this specific spelling,
+/// only for the underlying `optional` semantics `scalar_fallback` already
+/// implements.
+#[test]
+fn test_yq_iterate_adjacent_builtins_optional_suppresses_1901() -> Result<()> {
+    for filter in [
+        "5 | any?",
+        "5 | all?",
+        "5 | flatten?",
+        "5 | group_by(.)?",
+        "5 | unique?",
+        "5 | unique_by(.)?",
+        "5 | from_entries?",
+    ] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(filter, "null", &["--jq-extensions"])?;
+        assert_eq!(code, 0, "`{filter}` should suppress\nstderr: {stderr}");
+        assert!(out.trim().is_empty(), "`{filter}` -- stdout: {out:?}");
+    }
     Ok(())
 }
 

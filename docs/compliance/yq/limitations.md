@@ -1248,6 +1248,21 @@ shapes:**
 
 Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1998).
 
+**Two more items found reviewing the fix itself, also not fixed here:**
+
+- **`any(cond)`/`all(cond)`/`any(gen; cond)`/`all(gen; cond)`** (the predicate-argument forms,
+  dispatched from `Builtin::AnyF`/`AllF`/`AnyCond`/`AllCond`) still leak jq's own wording and
+  still allow full object iteration, unlike the now-fixed bare forms — and real yq's own lexer
+  rejects this syntax entirely regardless of arity (`bad expression, please check expression
+  syntax`), which `succinctly yq`'s parser doesn't gate behind `--jq-extensions` the way
+  neighboring jq-only builtins like `min_by` do. Filed as
+  [#2005](https://github.com/rust-works/succinctly/issues/2005).
+- **`with_entries(f)` rejects numeric keys** that real yq coerces to strings on reassembly
+  (`[1,2] | with_entries(.)` succeeds on real yq, errors `Cannot use number (0) as object key`
+  on succinctly) — a functional bug on well-formed input, unrelated to this section's
+  malformed-input wording fix. Filed as
+  [#2006](https://github.com/rust-works/succinctly/issues/2006).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
