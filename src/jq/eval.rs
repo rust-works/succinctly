@@ -20124,6 +20124,29 @@ struct PathBranch<'a> {
     /// `FoldRegister` could only compare values, which promoted every
     /// reconstruction that happened to land on the same value (#1466).
     snapshot: bool,
+    /// The value jq's own path *register* (`value_at_path`) holds, when it
+    /// is still live at `self.path` but this branch's `value` has moved off
+    /// it (#1573).
+    ///
+    /// `path()` in real jq carries a `(path, value_at_path)` register that
+    /// only *navigation* advances: a literal, an arithmetic result, an
+    /// arbitrary builtin call all leave it exactly where it was. That is
+    /// what makes `path(. as $x | 5 | $x)` answer `[]` — the `5` never
+    /// moved the register off the root, so `$x` (frozen from that same
+    /// root) is still `jv_identical` to it when `path()` checks its own
+    /// output. `trackable` alone cannot express that: it says "this
+    /// branch's value *is* the register", which the `5` genuinely
+    /// falsified. Keeping the register's value here is what lets a later
+    /// `Expr::TrackedVar` re-establish trackability against it, by exactly
+    /// the rule [`register_identical`] already applies inside a fold.
+    ///
+    /// `None` means "no live register known here", and is always the safe
+    /// answer — it can only cost a refusal, never invent a path. Only ever
+    /// set while `!trackable`: when `trackable` holds, the branch's own
+    /// value *is* the register at its own path, which is exactly what
+    /// `trackable` means, so there is nothing separate to store —
+    /// [`PathBranch::with_register`] asserts that.
+    register: Option<Cow<'a, OwnedValue>>,
 }
 
 impl<'a> PathBranch<'a> {
@@ -20150,6 +20173,10 @@ impl<'a> PathBranch<'a> {
             value,
             trackable,
             snapshot: false,
+            // A navigation step's own value is the register (or it is
+            // untracked with no register knowledge to pass on) — either
+            // way nothing extra to record here (#1573).
+            register: None,
         }
     }
 
@@ -20184,6 +20211,14 @@ impl<'a> PathBranch<'a> {
             value,
             trackable,
             snapshot: snapshot && !trackable,
+            // #1573: `passthrough` hands a value straight through without
+            // navigating, so a live register would survive it — but every
+            // one of its call sites sits *inside* a single resolve step,
+            // with no access to the register `resolve_seq` threads between
+            // steps. `resolve_seq`'s own loop re-attaches it around the
+            // call instead (see `carried_register` there), which keeps this
+            // constructor's contract to its callers unchanged.
+            register: None,
         }
     }
 
@@ -20198,6 +20233,7 @@ impl<'a> PathBranch<'a> {
             value,
             trackable: false,
             snapshot: false,
+            register: None,
         }
     }
 
@@ -20209,6 +20245,7 @@ impl<'a> PathBranch<'a> {
             value,
             trackable: false,
             snapshot: true,
+            register: None,
         }
     }
 
@@ -20242,6 +20279,24 @@ impl<'a> PathBranch<'a> {
         }
     }
 
+    /// Attach the live path register to a freshly-built branch (#1573).
+    ///
+    /// A builder rather than a parameter on `untracked`/`new`: exactly one
+    /// construction site has a register to record (`resolve_leaf`'s
+    /// computed-value leaf, the single point where a branch steps off the
+    /// register while the register's value is still in scope), and every
+    /// other site would have to pass `None`. `debug_assert`s the field's own
+    /// invariant instead of silently tolerating a caller that ignores it.
+    fn with_register(mut self, register: Option<Cow<'a, OwnedValue>>) -> Self {
+        debug_assert!(
+            !(self.trackable && register.is_some()),
+            "a trackable branch's register is its own value; storing a second one \
+             would let `register_value` answer from a stale copy",
+        );
+        self.register = register;
+        self
+    }
+
     /// Force this branch's value to `Cow::Owned`, so it can outlive whatever
     /// it was borrowing from — see `resolve_against_cow` (#668).
     fn into_owned_value(self) -> PathBranch<'static> {
@@ -20250,6 +20305,9 @@ impl<'a> PathBranch<'a> {
             value: Cow::Owned(self.value.into_owned()),
             trackable: self.trackable,
             snapshot: self.snapshot,
+            // Same reason as `value`: a borrowed register would cap this
+            // branch at the borrow it is escaping (#1573/#668).
+            register: self.register.map(|r| Cow::Owned(r.into_owned())),
         }
     }
 }
@@ -20542,6 +20600,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                              value: v,
                              trackable,
                              snapshot,
+                             register,
                          }| {
                             let components = components.to_vec();
                             let inner_path = if components.len() == 1 {
@@ -20569,6 +20628,11 @@ fn resolve_node<'a, S: EvalSemantics>(
                                     inner_path,
                                 ))]),
                                 value: v,
+                                // Same reason as `trackable`/`snapshot`
+                                // above: `?` navigates nothing, so a live
+                                // path register survives it untouched
+                                // (#1573).
+                                register,
                                 trackable,
                                 snapshot,
                             }
@@ -21812,7 +21876,20 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // output — whether a bare `Escaped` the sink never had a chance to
         // avoid, or `pending` on a `Stopped` from an eager fallback — is
         // dropped: real jq never reaches whatever would have caused it.
-        Some(v) => Ok(vec![PathBranch::untracked(Cow::Owned(v))]),
+        Some(v) => Ok(vec![PathBranch::untracked(Cow::Owned(v)).with_register(
+            // #1573: this is the exact moment a branch steps *off* the path
+            // register — the value was computed, not navigated to — and the
+            // only place the register's own value is still in hand. Real jq
+            // does not lose it here: `value_at_path` is untouched by a
+            // literal, so a later `$var` frozen from this same position is
+            // still `jv_identical` to it (`path(. as $x | 5 | $x)` is `[]`).
+            // Recording it lets `resolve_seq` re-establish that.
+            //
+            // Only meaningful when the incoming position *was* the register
+            // (`trackable`); otherwise the register is somewhere further
+            // back and `resolve_seq` carries its own copy forward instead.
+            trackable.then(|| Cow::Borrowed(value)),
+        )]),
         // No output prunes the branch — unless there never would have been
         // one because evaluating `expr` itself broke/errored (Halt excluded,
         // handled above) before producing anything. `Flow::Stopped` with no
@@ -21992,6 +22069,45 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
 /// boundary — confirmed live, `path(foreach (1) as $i (.a; .b; .))` on
 /// `{"a":{"b":5},"c":5}` is `["a","b"]`, inheriting UPDATE's own
 /// trackable result through EXTRACT directly, no reset.
+/// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
+/// that has no pointer to compare — the single definition shared by every
+/// site that has to answer "is this branch still sitting *on* the path
+/// register?" (#1466 for the fold register, #1573 for `resolve_seq`'s own
+/// pipe register).
+///
+/// `jv_identical` is **not** structural equality. It compares the two `jv`s'
+/// kind/offset/size and then, for the three heap kinds — string, array,
+/// object — their *pointers*; for a number it compares the raw
+/// representation, which a reconstruction never reproduces (confirmed live
+/// against jq 1.7.1: `path(reduce (1) as $i (.a; 1))` on `{"a":1}` raises,
+/// even though `1 == 1`, and so does `path(.a as $y | .c | $y)` on
+/// `{"a":1,"c":1}`). Only `null`/`true`/`false` fall to its `default: r = 1`
+/// arm, where having the same kind *is* being identical — for those, and
+/// only those, structural equality is exact rather than an approximation
+/// (confirmed live: `path(.a | null)` on `{"a":null}` and `path(.a | false)`
+/// on `{"a":false}` both answer `["a"]`, while `path(.a | false)` on
+/// `{"a":true}` raises).
+///
+/// So a value is identical to the register when it equals it *and* is
+/// either
+///
+/// - a frozen `as`-binding snapshot (`PathBranch::snapshot`) — a value jq is
+///   still holding by the very same pointer, never rebuilt — or
+/// - a `null`/`true`/`false`.
+///
+/// A *trackable* branch never needs this: it navigated to a real path, and
+/// its caller places it directly. Both callers keep their own separate
+/// `trackable` precondition (a dead register can never match anything)
+/// rather than folding it in here, so this stays a pure statement about the
+/// two values.
+///
+/// Kept as one function precisely because it is now consulted from two
+/// unrelated places: a second, hand-inlined copy of this rule would be free
+/// to drift from jq's without either copy's tests noticing.
+fn register_identical(register: &OwnedValue, value: &OwnedValue, snapshot: bool) -> bool {
+    value == register && (snapshot || matches!(*value, OwnedValue::Null | OwnedValue::Bool(_)))
+}
+
 struct FoldRegister {
     path: Rc<PathPrefix>,
     value: OwnedValue,
@@ -22092,37 +22208,24 @@ impl FoldRegister {
         }
     }
 
-    /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value
-    /// type that has no pointer to compare (#1466).
+    /// Whether `branch` is still sitting on this register — jq's own
+    /// `jv_identical(v, jq->value_at_path)`, modeled for a value type that
+    /// has no pointer to compare (#1466).
     ///
-    /// `jv_identical` is **not** structural equality. It compares the two
-    /// `jv`s' kind/offset/size and then, for the three heap kinds — string,
-    /// array, object — their *pointers*; for a number it compares the raw
-    /// representation, which a reconstruction never reproduces (confirmed
-    /// live against jq 1.7.1: `path(reduce (1) as $i (.a; 1))` on `{"a":1}`
-    /// raises, even though `1 == 1`). Only `null`/`true`/`false` fall to its
-    /// `default: r = 1` arm, where having the same kind *is* being identical
-    /// — for those, and only those, structural equality is exact rather than
-    /// an approximation (confirmed live: the same filter with `null` on
-    /// `{"a":null}`, and with `false` on `{"a":false}`, both answer `["a"]`,
-    /// while `true` against `{"a":false}` raises).
+    /// The rule itself lives in [`register_identical`], which
+    /// `resolve_seq`'s own pipe register shares (#1573); this adds only the
+    /// `trackable` precondition, since a register that never resolved to a
+    /// real path cannot recognise anything. A *trackable* branch never
+    /// needs this either way: it navigated to a real path and `relocate`'s
+    /// first arm already places it.
     ///
-    /// So a branch is identical to this register when it is either
-    ///
-    /// - a [`PathBranch::snapshot`] — a frozen `. as $x` binding jq is still
-    ///   holding by the very same pointer — carrying this register's value, or
-    /// - a `null`/`true`/`false` equal to it.
-    ///
-    /// A *trackable* branch never needs this: it navigated to a real path and
-    /// `relocate`'s first arm already places it. Before #1466 this compared
-    /// values alone, which promoted any reconstruction that happened to land
-    /// on the register's value — so `path(reduce (1) as $i (.; {a:.a}))`
-    /// answered `[]` where jq raises, and `=`/`|=`/`del()` through it wrote
-    /// to a document jq leaves untouched.
+    /// Before #1466 this compared values alone, which promoted any
+    /// reconstruction that happened to land on the register's value — so
+    /// `path(reduce (1) as $i (.; {a:.a}))` answered `[]` where jq raises,
+    /// and `=`/`|=`/`del()` through it wrote to a document jq leaves
+    /// untouched.
     fn identical(&self, branch: &PathBranch<'_>) -> bool {
-        self.trackable
-            && *branch.value == self.value
-            && (branch.snapshot || matches!(*branch.value, OwnedValue::Null | OwnedValue::Bool(_)))
+        self.trackable && register_identical(&self.value, &branch.value, branch.snapshot)
     }
 
     fn relocate<'a>(&self, branches: Vec<PathBranch<'a>>) -> Vec<PathBranch<'a>> {
@@ -23015,6 +23118,11 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             value: current,
             trackable: node_trackable,
             snapshot: node_snapshot,
+            // #1573: the recurse family walks *into* the document, so every
+            // node it visits is reached by navigation and carries no
+            // separate register of its own. `resolve_seq` re-attaches the
+            // pipe register around this whole call if one is live.
+            register: _,
         } = stack.pop().unwrap();
         // `current.clone()` is cheap (`Cow`, #668). `prefix` is a
         // `PathPrefix` (#701): `Rc::clone` is O(1), not the O(path length)
@@ -23022,6 +23130,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         outputs.push(PathBranch {
             path: Rc::clone(&prefix),
             value: current.clone(),
+            register: None,
             // Propagated rather than assumed `true`. The shared
             // recurse-family guard means only a trackable value can enter
             // this loop today, so this is `true` in practice — but carrying
@@ -23077,6 +23186,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             value: child_value,
             trackable: child_trackable,
             snapshot: child_snapshot,
+            register: _,
         } in children
         {
             let path = PathPrefix::extend_many(&prefix, child_components.to_vec());
@@ -23098,6 +23208,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                         next.push(PathBranch {
                             path,
                             value: child_value,
+                            register: None,
                             trackable: node_trackable && child_trackable,
                             // `f`'s own mark, propagated (#1591). Unlike
                             // `trackable` this is not `&&`-ed with the
@@ -23134,6 +23245,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                             next.push(PathBranch {
                                 path: Rc::clone(&path),
                                 value: child_value.clone(),
+                                register: None,
                                 trackable: node_trackable && child_trackable,
                                 // Same propagation as the `None` arm above
                                 // (#1591); `cond` gates whether the child is
@@ -23886,6 +23998,7 @@ fn apply_static_tail<'a, S: EvalSemantics>(
         value: current,
         trackable,
         snapshot,
+        register,
     } in branches
     {
         // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
@@ -23931,9 +24044,97 @@ fn apply_static_tail<'a, S: EvalSemantics>(
             // navigated *into* the value and so produced a different one,
             // which is no longer the snapshot (#1466).
             snapshot: snapshot && tail.is_empty(),
+            // The register survives for exactly the same reason, and fails
+            // to for a different one: an empty tail navigates nothing, so a
+            // register live at `prefix` is still live here; a non-empty one
+            // *did* navigate, which by definition moves the register onto
+            // what it reached — at which point `trackable` already carries
+            // it and this field is not consulted (#1573).
+            register: register.filter(|_| tail.is_empty()),
         });
     }
     Ok(out)
+}
+
+/// Whether one pipe stage's output re-establishes the path register, and so
+/// is trackable again despite arriving on an already-untracked branch
+/// (#1573).
+///
+/// Real `path()` carries a `(path, value_at_path)` register that only
+/// *navigation* advances; `jq_next`'s `INDEX` and `PATH_END` both check the
+/// current value against it with `jv_identical`. A literal in the middle of
+/// a pipe therefore doesn't end path tracking, it merely steps off the
+/// register — and a `$var` frozen from where the register still points
+/// steps straight back onto it:
+///
+/// ```text
+/// $ jq -c 'path(. as $x | 5 | $x)'         # []      register never left the root
+/// $ jq -c 'path(.a as $y | .a | 5 | $y)'   # ["a"]   register is still .a
+/// $ jq -c 'path(.a as $y | .c | $y)'       # refuses .c MOVED the register
+/// $ jq -c 'path(.a | 5)'                   # refuses 5 is not the register
+/// ```
+///
+/// All four confirmed live against jq 1.7.1, along with the rest of the
+/// matrix on #1573.
+///
+/// The four preconditions are each load-bearing:
+///
+/// - `!branch_trackable` — a trackable branch needs no re-establishing, and
+///   its `Expr::TrackedVar` arm already certifies against the ambient value
+///   directly (which *is* the register while trackable).
+/// - `!navigated` — the step contributed no path components. A step that
+///   navigated reached a genuinely new position, and `trackable` already
+///   answers for it; re-pointing it at `prefix` would report the wrong path.
+/// - a live `register` — `None` means "not known here", the safe answer.
+/// - [`register_identical`] — the whole rule, shared with the fold register
+///   so the two cannot drift.
+///
+/// This only ever turns a refusal into an answer, so getting it *wrong*
+/// costs an accepted path jq refuses — the dangerous direction, and why
+/// every clause above is a conjunct rather than a heuristic.
+fn reestablishes_register(
+    branch_trackable: bool,
+    navigated: bool,
+    register: Option<&OwnedValue>,
+    resulting: &OwnedValue,
+    step_snapshot: bool,
+) -> bool {
+    !branch_trackable
+        && !navigated
+        && register.is_some_and(|reg| register_identical(reg, resulting, step_snapshot))
+}
+
+/// The path register to hand to the next pipe stage (#1573).
+///
+/// Three cases, in the order they are tested:
+///
+/// - The branch is trackable again (either it never stopped being, or
+///   `reestablishes_register` just put it back): the register is the
+///   branch's own value at its own path, so nothing is stored — see
+///   [`PathBranch::register_value`].
+/// - The step navigated: it moved the register onto what it reached, which
+///   is exactly the trackable case above; if the branch is nonetheless
+///   untracked here, the navigation was refused and no register survives.
+/// - Otherwise the step computed something without navigating, so whatever
+///   register was live entering the stage is still live at the same path.
+///   It comes either from the step itself — `resolve_leaf` records the
+///   ambient value on the very transition that drops trackability, the only
+///   place that value is still in hand — or, once already untracked, from
+///   the branch's own carried copy.
+fn carry_register<'a>(
+    branch_trackable: bool,
+    navigated: bool,
+    reestablished: bool,
+    carried: &Option<Cow<'a, OwnedValue>>,
+    step_register: Option<Cow<'a, OwnedValue>>,
+) -> Option<Cow<'a, OwnedValue>> {
+    if reestablished || navigated {
+        None
+    } else if branch_trackable {
+        step_register
+    } else {
+        carried.clone()
+    }
 }
 
 /// Resolve a pipe of path nodes, threading the value left to right.
@@ -24073,8 +24274,21 @@ fn resolve_seq<'a, S: EvalSemantics>(
             value: current,
             trackable: branch_trackable,
             snapshot: branch_snapshot,
+            register: branch_register,
         } in branches
         {
+            // The path register as it stands *entering* this stage (#1573).
+            //
+            // While `branch_trackable` holds, the register is `current`
+            // itself — but `current` is about to be moved into
+            // `resolve_against_cow`, and the step is the one that knows
+            // whether it navigated off it, so that case is left to the step
+            // (`resolve_leaf` records `current` as the register on the very
+            // transition that drops trackability). What has to be carried
+            // by hand is the *already*-untracked case, where the register
+            // is live somewhere behind us and no step below can see it any
+            // more.
+            let carried_register = branch_register;
             // #986: each branch carries its own trackability now, so this
             // passes *that* rather than the single outer parameter. It is
             // what makes `1 | .[K]` reach `resolve_index_expr` already
@@ -24088,10 +24302,30 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         value: resulting,
                         trackable: step_trackable,
                         snapshot: step_snapshot,
+                        register: step_register,
                     } in resolved
                     {
-                        let path = PathPrefix::extend_many(&prefix, components.to_vec());
+                        let navigated = components.depth() > 0;
+                        let reestablished = reestablishes_register(
+                            branch_trackable,
+                            navigated,
+                            carried_register.as_deref(),
+                            &resulting,
+                            step_snapshot,
+                        );
+                        let path = if reestablished {
+                            Rc::clone(&prefix)
+                        } else {
+                            PathPrefix::extend_many(&prefix, components.to_vec())
+                        };
                         next.push(PathBranch {
+                            register: carry_register(
+                                branch_trackable,
+                                navigated,
+                                reestablished,
+                                &carried_register,
+                                step_register,
+                            ),
                             path,
                             value: resulting,
                             // Untracked is absorbing: nothing downstream can
@@ -24101,13 +24335,29 @@ fn resolve_seq<'a, S: EvalSemantics>(
                             // silent acceptance into a loud error, never the
                             // reverse (#985's revert is what the reverse
                             // looks like).
-                            trackable: branch_trackable && step_trackable,
+                            //
+                            // #1573 adds the one exception jq itself has:
+                            // untracked is absorbing for *navigation*, but a
+                            // `$var` whose frozen value is still identical to
+                            // the live register is not navigation — jq's own
+                            // `path_intact` compares against `value_at_path`,
+                            // which a literal never moved, so the variable
+                            // re-establishes the register's position rather
+                            // than reaching a new one. See
+                            // `reestablishes_register`.
+                            trackable: reestablished || (branch_trackable && step_trackable),
                             // Unlike `trackable`, this comes from the *step*
                             // alone: the value leaving this stage is the
                             // step's own output, so `.a | $x` still hands
                             // back the frozen snapshot whatever `.a` was,
                             // and `$x | .a` no longer is one (#1466).
-                            snapshot: step_snapshot,
+                            //
+                            // A re-established branch is `trackable` again,
+                            // and this type's invariant is that `snapshot`
+                            // implies `!trackable`: a certified snapshot has
+                            // resolved to a real path and needs no second
+                            // marker (#1573).
+                            snapshot: step_snapshot && !reestablished,
                         });
                     }
                 }
@@ -24117,14 +24367,34 @@ fn resolve_seq<'a, S: EvalSemantics>(
                         value: resulting,
                         trackable: step_trackable,
                         snapshot: step_snapshot,
+                        register: step_register,
                     } in partial
                     {
-                        let path = PathPrefix::extend_many(&prefix, components.to_vec());
+                        let navigated = components.depth() > 0;
+                        let reestablished = reestablishes_register(
+                            branch_trackable,
+                            navigated,
+                            carried_register.as_deref(),
+                            &resulting,
+                            step_snapshot,
+                        );
+                        let path = if reestablished {
+                            Rc::clone(&prefix)
+                        } else {
+                            PathPrefix::extend_many(&prefix, components.to_vec())
+                        };
                         next.push(PathBranch {
+                            register: carry_register(
+                                branch_trackable,
+                                navigated,
+                                reestablished,
+                                &carried_register,
+                                step_register,
+                            ),
                             path,
                             value: resulting,
-                            trackable: branch_trackable && step_trackable,
-                            snapshot: step_snapshot,
+                            trackable: reestablished || (branch_trackable && step_trackable),
+                            snapshot: step_snapshot && !reestablished,
                         });
                     }
                     // Keep whatever this branch produced before its escape,
@@ -67365,6 +67635,120 @@ mod tests {
         );
         assert_eq!(paths.len(), 300);
         assert!(paths.iter().all(|p| p == r#"["root_marker",0]"#));
+    }
+
+    // =========================================================================
+    // #1573: `path()` carries a *register* — `jq_state`'s own
+    // `(path, value_at_path)` — that only navigation advances. A literal in
+    // the middle of a pipe steps off it without ending path tracking, so a
+    // `$var` frozen from where the register still points steps back onto it.
+    // Every expectation below is confirmed live against jq 1.7.1.
+    // =========================================================================
+
+    /// The register survives a literal stage: `5` never moved
+    /// `value_at_path` off the root, so `$x` — frozen from that same root —
+    /// is still `jv_identical` to it when `path()` checks its own output.
+    ///
+    /// This shape has a `TrackedVar` marker already (`.` is an
+    /// identity passthrough, so #844's gate admits it); what it lacked was
+    /// anywhere for the register to *survive* the literal, so the marker
+    /// reached its use site with the ambient value `5` to compare against
+    /// and could only refuse.
+    #[test]
+    fn test_path_register_survives_intervening_literal_1573() {
+        assert_eq!(outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | $x)"), ["[]"]);
+    }
+
+    /// The register is a *position*, not just a permission: navigation may
+    /// continue off the re-established variable, and the emitted path is the
+    /// register's own, not the empty one the ambient literal would give.
+    #[test]
+    fn test_path_register_navigates_off_reestablished_var_1573() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | $x.a)"),
+            [r#"["a"]"#]
+        );
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | $x | .a)"),
+            [r#"["a"]"#]
+        );
+    }
+
+    /// Consecutive non-navigating stages each carry the register forward —
+    /// the second one is already untracked when it runs, so it cannot
+    /// re-derive the register from its own ambient input the way the first
+    /// one does, and has to inherit the branch's carried copy.
+    #[test]
+    fn test_path_register_survives_consecutive_literals_1573() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | 5 | 6 | $x)"),
+            ["[]"]
+        );
+    }
+
+    /// Not only literals: any stage that computes rather than navigates
+    /// leaves the register where it was. `length` and a `Comma` fan-out are
+    /// both confirmed live (`(1,2)` yields the path twice, once per branch,
+    /// exactly as jq does).
+    #[test]
+    fn test_path_register_survives_non_literal_computed_stages_1573() {
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | length | $x)"),
+            ["[]"]
+        );
+        assert_eq!(
+            outputs(br#"{"a":{"b":1}}"#, r"path(. as $x | (1,2) | $x)"),
+            ["[]", "[]"]
+        );
+    }
+
+    /// Negative control, and the reason `reestablishes_register` insists on
+    /// `!navigated`: a stage that *did* navigate moved the register onto
+    /// what it reached, so a variable frozen from the old position no longer
+    /// matches. jq raises here, and must keep raising — accepting would
+    /// report `[]` for a position the register has left.
+    #[test]
+    fn test_path_register_moves_on_navigation_1573() {
+        query!(br#"{"a":{"b":1}}"#, r"path(. as $x | .a | $x)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression());
+            }
+        );
+    }
+
+    /// Negative control for the value half of the comparison: a computed
+    /// value that is *not* the register stays untracked however
+    /// non-navigating its stage was. `path(.a | 5)` raises in jq for exactly
+    /// this reason — `5` is not what `value_at_path` points at — and the
+    /// register threading must not turn that into an answer.
+    #[test]
+    fn test_path_register_rejects_value_that_is_not_the_register_1573() {
+        query!(br#"{"a":{"b":1}}"#, r"path(.a | 5)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression());
+            }
+        );
+        query!(br#"{"a":{"b":1},"c":9}"#, r"path(. as $x | 5 | $x | .c | 5)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression());
+            }
+        );
+    }
+
+    /// A variable bound from a *navigated* position still has no marker at
+    /// all (`substitute_bound_var`'s `is_identity_passthrough` gate), so it
+    /// keeps refusing regardless of the register. This is the half of #1573
+    /// the register does not close, pinned here so widening the gate later
+    /// has to come back and update this test deliberately rather than
+    /// silently flipping it — see the issue for why the marker needs a
+    /// bind-time path before that widening is sound.
+    #[test]
+    fn test_path_navigated_binding_still_refused_pending_gate_1573() {
+        query!(br#"{"a":{"b":1}}"#, r"path(.a as $y | .a | $y)",
+            QueryResult::Error(e) => {
+                assert!(e.is_invalid_path_expression());
+            }
+        );
     }
 
     // =========================================================================
