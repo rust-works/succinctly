@@ -386,9 +386,15 @@ macro_rules! json_ascii {
 /// pre-existing cost unrelated to `-0`); a `-0`+`--color` combination is
 /// checked for an embedded NUL over that same already-buffered content
 /// before writing, coarser-grained (whole document, not per-result) than
-/// the no-color path below, but bounded by the same memory this
-/// combination already pays for coloring — see
-/// `docs/compliance/yq/limitations.md` for this scope note.
+/// the no-color path below -- bounded by the same memory this combination
+/// already pays for coloring, but NOT flush-then-error atomic the way the
+/// no-color path is: real yq's own `--colors -0` still flushes earlier
+/// valid results before erroring on a later NUL-containing one
+/// (live-verified), while this whole-buffer check discards every result in
+/// the render, including already-clean earlier ones, on any NUL anywhere
+/// in the stream. A real, currently-open divergence, not a documented
+/// design choice — see `docs/compliance/yq/limitations.md`'s `-0`
+/// multi-document separator entry and #2004.
 fn stream_maybe_colored<W: Write, T>(
     writer: &mut W,
     use_color: bool,
@@ -2464,31 +2470,57 @@ fn write_doc_separator_marker<W: std::io::Write>(
 /// State for tracking split_doc output separators.
 struct SplitDocState {
     has_split_doc: bool,
-    is_first_output: bool,
+    /// Same polarity as `DocSeparatorArgs`/`PendingSeparator`'s own
+    /// `doc_streamed` (`true` once *any* output has happened), not the
+    /// original `is_first_output`'s inverted one -- needed so a `-0` call
+    /// site can hand this field straight to `output_value` as its own
+    /// deferred separator state (#1709 code review) without an extra
+    /// polarity-flipping adapter.
+    any_output: bool,
 }
 
 impl SplitDocState {
     fn new(has_split_doc: bool) -> Self {
         Self {
             has_split_doc,
-            is_first_output: true,
+            any_output: false,
         }
     }
 
-    /// Write a separator if needed for split_doc mode. Returns Ok(()) always.
+    /// Write a separator if needed for split_doc mode -- unless `config`'s
+    /// output is NUL-separated, in which case the separator is deferred
+    /// into the returned `DocSeparatorArgs` for `output_value`'s own
+    /// per-result NUL check to decide instead (#1709 code review): this
+    /// method used to always write eagerly, the same bug class every other
+    /// document-separator call site in this file was fixed for -- verified
+    /// live that a `split_doc`-tagged result whose value contains an
+    /// embedded NUL left a dangling `---` for content that was never
+    /// actually emitted.
     ///
     /// Same `---`-must-start-on-its-own-line fix as `emit_yaml_doc_separator`
-    /// (#1701 code review): the previous document's own terminator might
-    /// have been `\0`/nothing rather than `\n`, and gluing `---` directly
-    /// onto that document's last byte corrupts it on reparse the same way.
-    fn write_separator<W: Write>(&mut self, writer: &mut W, config: &OutputConfig) -> Result<()> {
-        if self.has_split_doc && config.output_format == OutputFormat::Yaml && !config.no_doc {
-            if !self.is_first_output {
-                write_doc_separator_marker(writer, terminator_from_config(config))?;
-            }
-            self.is_first_output = false;
+    /// (#1701 code review) for the eager case: the previous document's own
+    /// terminator might have been `\0`/nothing rather than `\n`, and gluing
+    /// `---` directly onto that document's last byte corrupts it on
+    /// reparse.
+    fn write_separator<W: Write>(
+        &mut self,
+        writer: &mut W,
+        config: &OutputConfig,
+    ) -> Result<Option<DocSeparatorArgs<'_>>> {
+        if !self.has_split_doc || config.output_format != OutputFormat::Yaml || config.no_doc {
+            return Ok(None);
         }
-        Ok(())
+        if config.nul_output {
+            return Ok(Some(DocSeparatorArgs {
+                doc_streamed: &mut self.any_output,
+                no_doc: config.no_doc,
+            }));
+        }
+        if self.any_output {
+            write_doc_separator_marker(writer, terminator_from_config(config))?;
+        }
+        self.any_output = true;
+        Ok(None)
     }
 }
 
@@ -2552,10 +2584,12 @@ fn write_pending_separator<W: Write>(
     terminator: Terminator,
 ) -> Result<()> {
     if let Some(sep) = separator {
-        if *sep.doc_streamed && !sep.no_doc {
-            write_doc_separator_marker(writer, terminator)?;
-        }
-        *sep.doc_streamed = true;
+        // Reuses the same guard/write/set-flag logic every other terminator
+        // mode's separator goes through, rather than hand-duplicating it
+        // here (#1709 code review) -- `true` for `will_output` since
+        // reaching this point already means this result survived
+        // `output_value`'s own NUL check.
+        emit_yaml_doc_separator(writer, sep.doc_streamed, true, sep.no_doc, terminator)?;
     }
     Ok(())
 }
@@ -4831,12 +4865,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 && output_config.output_format == OutputFormat::Yaml
                 && !output_config.no_doc
                 && results.len() > 1;
-            if has_split_doc {
+            let mut doc_streamed = i > 0;
+            let separator = if has_split_doc {
                 // The filter explicitly marks its outputs as separate
                 // documents (`split_doc`); route through the same state
                 // machine every other output path uses for that, or no
-                // separator is ever written here at all.
-                split_doc_state.write_separator(&mut writer, &output_config)?;
+                // separator is ever written here at all. Deferred into
+                // `output_value` under `-0`, same as every other arm here.
+                split_doc_state.write_separator(&mut writer, &output_config)?
             } else if wants_doc_separator && i > 0 && !output_config.nul_output {
                 // `---` BETWEEN results (not before the first) -- deliberately
                 // different from --slurp's no-separator convention, since
@@ -4855,14 +4891,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // to close. `output_value` writes it lazily instead, below,
                 // once its own check has passed.
                 write_doc_separator_marker(&mut writer, terminator_from_config(&output_config))?;
-            }
-            any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
-            let mut doc_streamed = i > 0;
-            let separator =
+                None
+            } else {
                 (wants_doc_separator && output_config.nul_output).then_some(DocSeparatorArgs {
                     doc_streamed: &mut doc_streamed,
                     no_doc: output_config.no_doc,
-                });
+                })
+            };
+            any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(
                 &mut writer,
                 result,
@@ -5008,14 +5044,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         let results = evaluate_input(&OwnedValue::Null, &program.expr, &mut sink)?;
         for result in results {
-            split_doc_state.write_separator(&mut writer, &output_config)?;
+            let split_separator = split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
             output_value(
                 &mut writer,
                 &result,
                 &CommentTree::empty(),
                 &output_config,
-                None,
+                split_separator,
             )?;
         }
     } else if args.raw_input {
@@ -5044,14 +5080,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let slurped = OwnedValue::String(input_content);
             let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
             for result in results {
-                split_doc_state.write_separator(&mut writer, &output_config)?;
+                let split_separator =
+                    split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                 output_value(
                     &mut writer,
                     &result,
                     &CommentTree::empty(),
                     &output_config,
-                    None,
+                    split_separator,
                 )?;
             }
         } else {
@@ -5060,14 +5097,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 let input = OwnedValue::String(line.to_string());
                 let results = evaluate_input(&input, &program.expr, &mut sink)?;
                 for result in results {
-                    split_doc_state.write_separator(&mut writer, &output_config)?;
+                    let split_separator =
+                        split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                     output_value(
                         &mut writer,
                         &result,
                         &CommentTree::empty(),
                         &output_config,
-                        None,
+                        split_separator,
                     )?;
                 }
                 // halt/halt_error (#791) outranks evaluating any further lines.
@@ -5260,14 +5298,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             let results = evaluate_input(&slurped, &program.expr, &mut sink)?;
             let mut split_doc_state = SplitDocState::new(has_split_doc);
             for result in results {
-                split_doc_state.write_separator(&mut writer, &output_config)?;
+                let split_separator =
+                    split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
                 output_value(
                     &mut writer,
                     &result,
                     &CommentTree::empty(),
                     &output_config,
-                    None,
+                    split_separator,
                 )?;
             }
         }
@@ -5562,12 +5601,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                             doc_had_output = true;
                             any_doc_output_this_file = true;
                         }
-                        split_doc_state.write_separator(&mut buf_writer, &output_config)?;
+                        // `split_doc` (#1709 code review) takes priority
+                        // over the inter-document separator above when both
+                        // apply -- matches every other call site's own
+                        // has_split_doc-first precedence (e.g. the
+                        // --eval-all arm above).
+                        let split_separator =
+                            split_doc_state.write_separator(&mut buf_writer, &output_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                        let separator = defer_to_nul_check.then_some(DocSeparatorArgs {
-                            doc_streamed: &mut any_doc_output_this_file,
-                            no_doc: output_config.no_doc,
+                        let separator = split_separator.or_else(|| {
+                            defer_to_nul_check.then_some(DocSeparatorArgs {
+                                doc_streamed: &mut any_doc_output_this_file,
+                                no_doc: output_config.no_doc,
+                            })
                         });
                         output_value(
                             &mut buf_writer,
@@ -5822,13 +5869,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // 2's own (unwanted) separator check to fire on it too.
                 let mut first_result_in_doc = true;
                 for (result, comments) in results {
-                    split_doc_state.write_separator(&mut writer, &file_output_config)?;
+                    // `split_doc` (#1709 code review) takes priority over
+                    // the inter-document separator above when both apply --
+                    // matches every other call site's own has_split_doc-
+                    // first precedence.
+                    let split_separator =
+                        split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    let separator =
+                    let separator = split_separator.or_else(|| {
                         (defer_to_nul_check && first_result_in_doc).then_some(DocSeparatorArgs {
                             doc_streamed: &mut any_yaml_doc_output,
                             no_doc: output_config.no_doc,
-                        });
+                        })
+                    });
                     output_value(
                         &mut writer,
                         &result,

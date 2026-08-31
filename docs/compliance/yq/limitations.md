@@ -149,15 +149,31 @@ are not) rather than either the whole-document-buffering approach an earlier att
 fix tried and abandoned (PR #1767, +65% peak RSS on a 100MB document) or silently emitting
 the raw byte.
 
-One interaction remains open: this check only fires on bytes that are genuinely unescaped in
-the rendered output. `-o=json -0 '.a'` *without* an explicit `-r` should print a properly
-JSON-escaped `"b\u0000c"` and succeed (JSON's default unwrap-scalar setting is `false`,
-unlike YAML's `true` — real yq needs `-r` explicit to unwrap a JSON scalar), but succinctly's
-own `raw_output` resolution unconditionally ORs in `-0`/`-j` regardless of output format, so
-this one combination instead unwraps (bypassing JSON's own escaping) and correctly triggers
-this same NUL check on the resulting raw byte. That's a distinct, pre-existing root cause —
-[#1996](https://github.com/rust-works/succinctly/issues/1996) — not something #1709 itself
-introduced or is scoped to fix.
+Two interactions remain open, neither closed by #1709 itself:
+
+1. This check only fires on bytes that are genuinely unescaped in the rendered output.
+   `-o=json -0 '.a'` *without* an explicit `-r` should print a properly JSON-escaped
+   `"b\u0000c"` and succeed (JSON's default unwrap-scalar setting is `false`, unlike YAML's
+   `true` — real yq needs `-r` explicit to unwrap a JSON scalar), but succinctly's own
+   `raw_output` resolution unconditionally ORs in `-0`/`-j` regardless of output format, so
+   this one combination instead unwraps (bypassing JSON's own escaping) and correctly
+   triggers this same NUL check on the resulting raw byte. That's a distinct, pre-existing
+   root cause — [#1996](https://github.com/rust-works/succinctly/issues/1996) — not
+   something #1709 itself introduced or is scoped to fix.
+
+2. **`--color`/`--colors` combined with `-0` loses the flush-then-error atomicity described
+   above.** Real yq's own `--colors -0` still flushes earlier valid results before erroring
+   on a later NUL-containing one — live-verified: `yq --colors -0 '.[]'` on `["hello",
+   "wor\0ld", "x"]` prints `hello\0` to stdout, then errors on the second element, exit 1.
+   succinctly's own `--colors -0` combination instead buffers the *entire* multi-result
+   render into one string (the pre-existing, `--color`-only mechanism `colorize_yaml`/
+   `colorize_json` need to re-lex ANSI spans across result boundaries) and scans that whole
+   buffer once before writing anything — so a NUL anywhere in the stream discards every
+   earlier, already-valid result too, printing nothing at all where real yq printed
+   `hello\0`. Fixing this properly needs the buffered/color rendering path restructured to
+   flush (and re-colorize) per result rather than once for the whole document — a
+   materially larger change than #1709's own scope, filed separately as
+   [#2004](https://github.com/rust-works/succinctly/issues/2004).
 
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
