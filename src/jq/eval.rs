@@ -13578,6 +13578,43 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     Ok(values)
 }
 
+/// One match's replacement text: the single-output case inline, generator
+/// replacements behind a `Vec`.
+///
+/// `sub`/`gsub` accept a generator replacement, so a match can produce more
+/// than one row -- but a literal or any other non-generator replacement
+/// produces exactly one, which is the case essentially every real call
+/// takes. Giving that case its own `Vec` cost one heap allocation per match
+/// on top of the string it holds: at half a million matches in a single
+/// `gsub`, 108.7 -> 75.6 MiB of peak RSS (#1834, measured against a probe
+/// that removed the per-match `Vec` outright).
+#[cfg(feature = "regex")]
+enum ReplacementCell {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[cfg(feature = "regex")]
+impl ReplacementCell {
+    /// How many rows this match contributes.
+    fn len(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Many(rows) => rows.len(),
+        }
+    }
+
+    /// This match's text for `row`, or `None` when it has no such row --
+    /// a shorter generator among longer siblings contributes nothing to the
+    /// later rows, exactly as the previous `Vec::get` did.
+    fn row(&self, row: usize) -> Option<&str> {
+        match self {
+            Self::One(one) => (row == 0).then_some(one.as_str()),
+            Self::Many(rows) => rows.get(row).map(String::as_str),
+        }
+    }
+}
+
 /// Apply `replacement_expr` at every match and produce **one output string per
 /// transposed row** (#1279).
 ///
@@ -13612,23 +13649,35 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     matches: &[regex::Captures],
     optional: bool,
 ) -> Result<Vec<String>, QueryResult<'a, W>> {
-    let mut cells: Vec<Vec<String>> = vec_with_capacity(matches.len());
+    let mut cells: Vec<ReplacementCell> = vec_with_capacity(matches.len());
     let mut last_end = 0;
     for caps in matches {
         let m = caps
             .get(0)
             .expect("capture group 0 is always present on a match");
-        let outputs = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
+        let mut outputs = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
         let gap = &input[last_end..m.start()];
-        let mut cell = vec_with_capacity(outputs.len());
-        for replacement in outputs {
-            cell.push(combine_sub_gap::<W, S>(gap, replacement)?);
-        }
+        // One output is the overwhelmingly common case -- a literal or any
+        // other non-generator replacement -- and it is stored inline rather
+        // than behind its own `Vec` (#1834). Half a million matches in one
+        // `gsub` call held half a million one-element `Vec`s alongside their
+        // strings, which measured 108.7 -> 75.6 MiB peak RSS against a probe
+        // that removed them.
+        let cell = if outputs.len() == 1 {
+            let replacement = outputs.pop().expect("len checked");
+            ReplacementCell::One(combine_sub_gap::<W, S>(gap, replacement)?)
+        } else {
+            let mut many = vec_with_capacity(outputs.len());
+            for replacement in outputs {
+                many.push(combine_sub_gap::<W, S>(gap, replacement)?);
+            }
+            ReplacementCell::Many(many)
+        };
         cells.push(cell);
         last_end = m.end();
     }
 
-    let rows = cells.iter().map(Vec::len).max().unwrap_or(0);
+    let rows = cells.iter().map(ReplacementCell::len).max().unwrap_or(0);
     if rows == 0 {
         return Ok(vec![input.to_string()]);
     }
@@ -13637,7 +13686,7 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .map(|row| {
             let mut out = string_with_capacity(input.len());
             for cell in &cells {
-                if let Some(piece) = cell.get(row) {
+                if let Some(piece) = cell.row(row) {
                     out.push_str(piece);
                 }
             }
