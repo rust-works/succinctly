@@ -13,6 +13,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
+use proptest::prelude::*;
 use tempfile::{NamedTempFile, TempDir};
 
 #[path = "common/cargo_run_exit.rs"]
@@ -1953,6 +1954,107 @@ keep: 5
         );
     }
     Ok(())
+}
+
+/// One level of container nesting for
+/// [`fuzz_select_and_write_agree_on_corruption_1965`]'s generated documents
+/// -- mirrors `jq_cli_tests.rs`'s own `FuzzContainer`, kept as a separate
+/// type since the two files don't share a common module.
+#[derive(Debug, Clone, Copy)]
+enum FuzzYamlContainer {
+    Array,
+    Object,
+}
+
+/// The two malformation kinds meaningful in YAML (no analog to JSON's
+/// "structural error" -- an unquoted bareword like `xyz123` is a perfectly
+/// valid plain scalar in YAML, per
+/// `test_select_and_write_agree_on_corruption_1803`'s own doc comment).
+#[derive(Debug, Clone, Copy)]
+enum FuzzYamlMalformation {
+    DecodeFailure,
+    Collision,
+}
+
+impl FuzzYamlMalformation {
+    /// The YAML flow-style text substituted at the leaf position.
+    fn leaf_yaml(self) -> &'static str {
+        match self {
+            Self::DecodeFailure => r#""a\qb""#,
+            Self::Collision => r#"{"a\qb": 1, "a\zc": 2}"#,
+        }
+    }
+
+    /// Matches `test_select_and_write_agree_on_corruption_1803`'s own two
+    /// constants.
+    fn expect_stderr(self) -> &'static str {
+        match self {
+            Self::DecodeFailure => "invalid escape sequence",
+            Self::Collision => "ambiguous",
+        }
+    }
+}
+
+/// Wrap `leaf` in `path`'s containers using YAML flow style (`[...]`/
+/// `{x: ...}`), outermost first -- flow style nests recursively as easily as
+/// JSON's brace/bracket syntax does, unlike YAML's indentation-sensitive
+/// block style, and is valid mixed into an otherwise block-style document
+/// (`test_select_and_write_agree_on_corruption_1803`'s own "nested in
+/// array" case already does exactly this: `bad: ["a\qb"]`).
+fn fuzz_wrap_yaml(path: &[FuzzYamlContainer], leaf: &str) -> String {
+    match path.split_first() {
+        None => leaf.to_string(),
+        Some((FuzzYamlContainer::Array, rest)) => format!("[{}]", fuzz_wrap_yaml(rest, leaf)),
+        Some((FuzzYamlContainer::Object, rest)) => format!("{{x: {}}}", fuzz_wrap_yaml(rest, leaf)),
+    }
+}
+
+fn fuzz_build_yaml_doc(path: &[FuzzYamlContainer], malformation: FuzzYamlMalformation) -> String {
+    format!(
+        "bad: {}\nkeep: 5\n",
+        fuzz_wrap_yaml(path, malformation.leaf_yaml())
+    )
+}
+
+// The YAML twin of `jq_cli_tests.rs`'s `fuzz_select_and_materialize_agree_on_corruption_1965`
+// -- see that test's own doc comment for the full #1965 rationale (why this
+// generalizes the fixed-case test above rather than replacing it, and why
+// `ProptestConfig::with_cases` is turned down from proptest's default).
+// Cases are lower here (32 vs. 48) since each one drives *three* real
+// subprocess spawns exactly like the JSON side, and the YAML CLI path is
+// measurably slower per invocation than JSON's (per this repo's own
+// benchmarks) -- keeping this property's wall-clock roughly comparable
+// rather than strictly matching the JSON side's case count.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn fuzz_select_and_write_agree_on_corruption_1965(
+        path in prop::collection::vec(
+            prop_oneof![Just(FuzzYamlContainer::Array), Just(FuzzYamlContainer::Object)],
+            0..=4,
+        ),
+        malformation_index in 0..2u8,
+    ) {
+        let malformation = match malformation_index {
+            0 => FuzzYamlMalformation::DecodeFailure,
+            _ => FuzzYamlMalformation::Collision,
+        };
+        let yaml = fuzz_build_yaml_doc(&path, malformation);
+        let expect_stderr = malformation.expect_stderr();
+        let label = format!("{path:?}/{malformation:?}");
+
+        assert_yq_raises(&label, "select(.bad)", "select(.bad) | .keep", &yaml, &[], expect_stderr);
+        assert_yq_raises(&label, ".keep = 9", ".keep = 9", &yaml, &[], expect_stderr);
+        assert_yq_raises(
+            &label,
+            ".keep = 9 -o=json",
+            ".keep = 9",
+            &yaml,
+            &["-o=json"],
+            expect_stderr,
+        );
+    }
 }
 
 /// #478: `--slurp '.'` shares the same `IndexMap`-backed conversion
