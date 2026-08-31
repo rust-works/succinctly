@@ -67738,6 +67738,23 @@ mod tests {
         );
     }
 
+    /// The register also has to survive into an *escaping* stage's partial
+    /// prefix. `($x, error(...))` emits `$x` and then raises, and jq keeps
+    /// the already-produced output rather than un-emitting it — so the
+    /// re-establishment has to happen on the `Err` side of the fan-out
+    /// loop too, not only the `Ok` side.
+    ///
+    /// Confirmed live against jq 1.7.1: prints `[]`, then raises `boom`.
+    #[test]
+    fn test_path_register_reestablished_in_escaping_partial_prefix_1573() {
+        query!(br#"{"a":1}"#, r#"path(. as $x | 5 | ($x, error("boom")))"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[]"]);
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
     /// A variable bound from a *navigated* position still has no marker at
     /// all (`substitute_bound_var`'s `is_identity_passthrough` gate), so it
     /// keeps refusing regardless of the register. This is the half of #1573
