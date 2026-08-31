@@ -1061,10 +1061,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
                 // #1755: to_owned_checked, not to_owned -- an undecodable
                 // field value must raise, not silently become "" and get
-                // sliced as if it were the real value.
+                // sliced as if it were the real value. #1953: a non-decode-
+                // failure to_owned_checked error (a #1194 malformed-member
+                // or #1642 collision error) respects `optional` the same
+                // way the sibling `_ if optional` arm below does -- only a
+                // genuine decode failure is unconditional.
                 let owned = match to_owned_checked(&value) {
                     Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
                 let OwnedValue::Object(map) = owned else {
                     unreachable!("StandardJson::Object always materializes to OwnedValue::Object")
@@ -16919,9 +16923,14 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
+            // #1953: a non-decode-failure to_owned_checked error (#1194
+            // malformed-member/#1642 collision) respects `optional` like
+            // every other fallible step at this boundary (per this
+            // function's own doc comment above) -- only a genuine decode
+            // failure is unconditional.
             let pristine = match to_owned_checked(&input) {
                 Ok(pristine) => pristine,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
                 Ok(paths) => paths,
@@ -16995,10 +17004,14 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
-    // Convert input to owned for modification
+    // Convert input to owned for modification. #1953: a non-decode-failure
+    // to_owned_checked error respects `optional` like every other fallible
+    // step at this boundary (see this function's own `resolve_dynamic_indexes`
+    // arm and `eval_assign`'s matching comment below) -- only a genuine
+    // decode failure is unconditional.
     let mut result = match to_owned_checked(&input) {
         Ok(result) => result,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
 
     // Computed keys resolve against the original document, before any update.
@@ -17215,9 +17228,13 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(early_return) => return early_return,
         };
 
+    // #1953: a non-decode-failure to_owned_checked error respects `optional`
+    // like the sibling `resolve_dynamic_indexes` arm just below (and
+    // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
+    // decode failure is unconditional.
     let pristine = match to_owned_checked(&input) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
     let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
         Ok(paths) => paths,
@@ -31026,9 +31043,11 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(EvalError::path_must_be_array())
                 };
             };
+            // #1953: a non-decode-failure to_owned_checked error respects
+            // `optional`, the same as every other builtin refusal here.
             let owned = match to_owned_checked(&value) {
                 Ok(owned) => owned,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             match set_value_at_path(owned, &path, new_val) {
                 Ok(result) => QueryResult::Owned(result),
@@ -34826,10 +34845,13 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
                         // #1755: to_owned_checked, not to_owned -- an
                         // undecodable element must raise, not silently
                         // become "" and take part in the product.
+                        // #1953: a non-decode-failure error respects
+                        // `optional`, the same as the sibling `_ if
+                        // optional` arms in this same match.
                         let inner_values: Vec<OwnedValue> =
                             match inner.map(|v| to_owned_checked(&v)).collect() {
                                 Ok(v) => v,
-                                Err(e) => return QueryResult::Error(e),
+                                Err(e) => return suppress_or_raise(e, optional),
                             };
                         arrays.push(inner_values);
                     }
@@ -34940,9 +34962,11 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // raise, not silently become "" and take part in the product.
     let base_array: Vec<OwnedValue> = match &value {
         StandardJson::Array(elements) => {
+            // #1953: a non-decode-failure error respects `optional`, the
+            // same as the sibling `_ if optional` arm below.
             match (*elements).map(|v| to_owned_checked(&v)).collect() {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             }
         }
         _ if optional => return QueryResult::None,
@@ -40104,6 +40128,44 @@ mod tests {
                 );
             }
         );
+    }
+
+    /// #1953: `to_owned_checked`'s `Err` can carry a #1194 malformed-member
+    /// error (a trailing unpaired object member, e.g. `{"a":1,"b"}`), which
+    /// is not `is_decode_failure()`-tagged -- unlike a genuine decode
+    /// failure, `optional` should suppress it the same way it suppresses
+    /// any other ordinary error, at the six sites this fix scoped to (each
+    /// already had an adjacent, established "ordinary error respects
+    /// `optional`" sibling to mirror). Before this fix, all six propagated
+    /// unconditionally regardless of `optional`.
+    #[test]
+    fn test_six_sites_respect_optional_for_malformed_member_error_1953() {
+        // eval_assign: unsuppressed still raises...
+        query!(
+            br#"{"a":1,"b"}"#,
+            ".c = 5",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure())
+        );
+        // ...and `optional` now suppresses it.
+        query!(br#"{"a":1,"b"}"#, "(.c = 5)?", QueryResult::None => {});
+
+        // eval_update
+        query!(br#"{"a":1,"b"}"#, "(.c |= . + 1)?", QueryResult::None => {});
+
+        // eval_update_multi (via compound assign)
+        query!(br#"{"a":1,"b"}"#, "(.c += 1)?", QueryResult::None => {});
+
+        // builtin_setpath
+        query!(br#"{"a":1,"b"}"#, r#"setpath(["c"]; 5)?"#, QueryResult::None => {});
+
+        // builtin_combinations
+        query!(br#"{"a":1,"b"}"#, "[combinations]?", QueryResult::None => {});
+
+        // builtin_combinations_n
+        query!(br#"{"a":1,"b"}"#, "[combinations(1)]?", QueryResult::None => {});
+
+        // eval_single's yq Object-slice arm
+        yq_query!(br#"{"a":1,"b"}"#, ".[0:1]?", QueryResult::None => {});
     }
 
     /// #1972: `eval_single`'s fully-open `Expr::Slice` fast path (the same
