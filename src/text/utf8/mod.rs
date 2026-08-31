@@ -742,23 +742,28 @@ pub fn format_byte(byte: u8) -> String {
 ///
 /// This function's own fix is granularity-independent -- it only cares
 /// about how many bytes remain in `input` from the lead's own position --
-/// so it correctly reaches every caller where `input` is already scoped
-/// to one decoded JSON string (`@base64d`/`@urid`, #1719). It does *not*
-/// reach `jq_runner.rs`'s document/raw-input callers (`utf8_lossy_document`,
-/// `get_inputs`), which substitute a whole file/document buffer in one
-/// pass before JSON structure is parsed: real jq's own condition is
-/// scoped to *each JSON string's own closing quote* (document mode) or
-/// *each line* (raw-input mode, confirmed live: `printf 'a\xe1\x41\n' |
-/// jq -R '.'` drops the byte even though it's followed by the file's own
-/// trailing newline) -- neither of which is "the whole buffer's own end"
-/// in a realistic multi-field document or multi-line file, so this fix
-/// essentially never activates there, even though jq's own trigger
-/// condition is not rare at all (it fires on *any* string/line ending in
-/// the right byte shape, however much more content follows in the rest
-/// of the file). See `docs/compliance/jq/limitations.md`'s "fixed at
-/// function granularity, open at document granularity" section for the
-/// live-verified detail, #1743 for the document-mode gap, and #1742 for
-/// the separate, more tractable raw-input caller-ordering gap.
+/// so *what a caller passes as `input` is what decides where the quirk
+/// fires*. Real jq's own condition is scoped to each JSON string's own
+/// decoded bytes (document mode, inside `jv_string_sized`) or to each line
+/// (raw-input mode, confirmed live: `printf 'a\xe1\x41\n' | jq -R '.'`
+/// drops the byte even though it's followed by the file's own trailing
+/// newline). Neither is "the whole buffer's own end" in a realistic
+/// multi-field document or multi-line file, and jq's trigger is not rare
+/// at all -- it fires on *any* string/line ending in the right byte shape,
+/// however much more content follows in the rest of the file -- so a
+/// whole-file caller would essentially never reproduce it.
+///
+/// Every caller is therefore scoped the way jq scopes it:
+/// `@base64d`/`@urid` are already handed one decoded string (#1719),
+/// `jq_runner.rs`'s `--raw-input` decode splits on `\n` first (#1742),
+/// and JSON document input goes through
+/// [`substitute_invalid_utf8_jq_document`](crate::jq::utf8_document::substitute_invalid_utf8_jq_document),
+/// which segments the document and calls this function once per JSON
+/// string (#1743). `--raw-input --slurp` is the one caller that stays
+/// whole-buffer, because real jq is whole-buffer there too: the entire
+/// input is a single string, so the buffer's own end genuinely *is* that
+/// string's end. See `docs/compliance/jq/limitations.md` for the
+/// live-verified detail.
 ///
 /// A single left-to-right scan, not a loop over [`validate_utf8`]: that
 /// function's AVX2 path has no early exit (it scans every 32-byte block of

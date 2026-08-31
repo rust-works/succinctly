@@ -315,6 +315,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jq`: U+FFFD substitution in a non-UTF-8 JSON document is now scoped per
+  JSON string, matching jq 1.7.1** (#1743). jq substitutes inside
+  `jv_string_sized`, which its lexer calls once per string with that
+  string's own decoded bytes; succinctly substituted over the whole file
+  instead, so #1717's end-of-buffer drop quirk almost never fired where jq
+  fires it. `printf '{"a":"\xe1\x41"}' | sjq -c .a` printed `"\u{fffd}A"`
+  and now prints `"\u{fffd}"`, as jq does.
+
+  The scope is the *escape-decoded* string, not the raw source span —
+  escapes only shrink a string, so they can push a lead byte over the
+  `len - pos < seq_len` line its raw span would clear (`"\xe1A"` is
+  seven raw bytes but two decoded, and real jq collapses it). A string
+  carrying escapes is therefore decoded, substituted and re-escaped; one
+  without them takes a direct path, and a valid string is copied verbatim.
+
+  Four routes were affected — the lazy and non-lazy document paths,
+  `--slurp` and `--seq`. `--raw-input --slurp` keeps whole-buffer scope
+  because real jq is whole-buffer there too (the entire input is one
+  string), and `--input-dsv` keeps it because DSV is not JSON; both are now
+  pinned by tests. Valid documents are untouched and pay nothing: both
+  callers still gate on the existing whole-input SIMD `validate_utf8`.
+
 - **`jq`: four architectural gaps in `input`/`inputs`/`input_line_number`**
   (#1309), all four verified against pinned jq 1.7.1 before and after.
 
