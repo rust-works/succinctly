@@ -20497,12 +20497,15 @@ fn resolve_node<'a, S: EvalSemantics>(
             }
         }
 
-        // `first(f)` keeps only the first branch `f` resolves to. Both
-        // internal spellings reach here: `Expr::FirstExpr` is what the
-        // dedicated `first(...)` parse path builds; `Builtin::FirstStream`
-        // is a second, older representation reachable from a different
-        // parser path. Keeping both arms means it does not matter which one
-        // a given call site produces.
+        // `first(f)` keeps only the first branch `f` resolves to.
+        // `Expr::FirstExpr` is what the dedicated `first(...)` parse path
+        // builds; `Builtin::FirstStream` is never constructed by the parser
+        // (#1986) -- `parse_first_expr` intercepts `first(...)` before
+        // `try_parse_builtin` ever runs, so this second arm is dead from any
+        // parseable query. Kept anyway as defensive symmetry, the same way
+        // `builtin_first_stream_propagates_bare_halt`'s own doc comment
+        // documents and tests `Builtin::FirstStream` directly rather than
+        // relying on a (nonexistent) parser path to reach it.
         //
         // #1935: `first(f)` is exactly `limit(1; f)` for path-tracking
         // purposes, so it shares `resolve_limit_one_n`'s own bounded
