@@ -6929,52 +6929,74 @@ fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
     Ok(())
 }
 
-/// Documents two deliberate, narrow gaps #1663 leaves open rather than
-/// silently missing: `needs_path_context` still has no dedicated evaluation
-/// arm for `Expr::Reduce` or `Expr::Foreach`, so a path-context builtin
-/// inside either still falls through to the generic fallback and stubs to
-/// its zero default, exactly as before this fix. `Expr::Object` has the
-/// identical gap but is tracked separately as #1332 (already true before
-/// #1663, per the `Array` arm's own doc comment).
+/// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
+/// open rather than silently missing: a `?//`-chained `AsPattern` (2+
+/// alternatives) still has no dedicated evaluation arm, so a path-context
+/// builtin inside it falls through to the generic fallback and stubs to
+/// its zero default. Its retry-on-failure semantics are real complexity
+/// #1765 didn't attempt to replicate, per that issue's own scoping.
+/// `Expr::Object` has the identical gap but is tracked separately as #1332.
 ///
-/// `Expr::As` (#1663), the single-pattern case of `Expr::AsPattern` (#1765),
-/// and `Expr::Limit` (#1765) -- the most consequential shapes, since the
-/// first two are the ordinary `EXPR as $v | body` / `EXPR as PATTERN | body`
-/// idioms -- are all fixed; see `test_as_pattern_single_pattern_path_context_resolves_1765`
-/// and `test_limit_path_context_resolves_1765` for that coverage. A
-/// `?//`-chained `AsPattern` (2+ alternatives) is intentionally still a known
-/// gap alongside the two below -- its retry-on-failure semantics are real
-/// complexity #1765 didn't attempt to replicate, per that issue's own
-/// scoping.
-///
-/// None of the remaining three shapes (reduce/foreach, plus `?//`) have a
-/// real-yq oracle to verify a fix against (yq's lexer rejects destructuring
-/// `as`, `reduce`, and `foreach` outright), and `Reduce`/`Foreach` in
-/// particular raise a real semantic question (what should `key` mean while
-/// evaluating the fold's own accumulator, which has no document position?)
-/// that #1663's own investigation didn't settle. Filed as a follow-up rather
-/// than guessed at here. Pinned so a future regression or accidental fix is
-/// visible either way, matching #1306's identical "known gap" precedent
+/// `Expr::As` (#1663); the single-pattern case of `Expr::AsPattern`,
+/// `Expr::Limit`, and (`input`/`INIT` only) `Expr::Reduce`/`Expr::Foreach`
+/// (all #1765) are all fixed -- see
+/// `test_as_pattern_single_pattern_path_context_resolves_1765`,
+/// `test_limit_path_context_resolves_1765`, and
+/// `test_reduce_foreach_input_init_path_context_resolves_1765` for that
+/// coverage. No real-yq oracle exists to verify any of this against (yq's
+/// lexer rejects destructuring `as`, `reduce`, and `foreach` outright).
+/// Pinned so a future regression or accidental fix is visible either way,
+/// matching #1306's identical "known gap" precedent
 /// (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
 #[test]
-fn test_reduce_foreach_path_context_still_known_gaps_1663() -> Result<()> {
+fn test_as_pattern_alternatives_path_context_still_a_known_gap_1663() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | . as [$x] ?// {b:$x} | key"],
+        Some(r#"{"a":[1]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "null");
+
+    Ok(())
+}
+
+/// #1765 item 3: `Expr::Reduce`/`Expr::Foreach`'s `input`/`INIT` now resolve
+/// `key`/`parent`/`file_index` against the caller's own ambient position,
+/// mirroring `Expr::Limit`'s own hybrid dispatch above -- `input`/`INIT`
+/// route through the path-context evaluator only when either needs it,
+/// then feed `eval_reduce_with_values`/`eval_foreach_with_values` (the
+/// OwnedValue-domain core shared with each function's ordinary,
+/// cursor-sourced entry point) exactly as before. `UPDATE`/`EXTRACT` are
+/// deliberately unchanged: both evaluate against the accumulator, a
+/// synthetic value with no document position, where `key` already
+/// (correctly) answers `null` -- confirmed by the third case below, which
+/// keeps that behavior unchanged even though `input`/`INIT` in the same
+/// expression are now fixed.
+#[test]
+fn test_reduce_foreach_input_init_path_context_resolves_1765() -> Result<()> {
+    // `INIT` is `key` for both -- the exact shape #1663's own investigation
+    // left open. `input`'s own iteration doesn't move position, so `key`
+    // still resolves to the same top-level field name every fold restarts.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | reduce .[] as $x (key; .)"],
         Some(r#"{"a":[1,2]}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "null");
+    assert_eq!(stdout.trim(), r#""a""#);
 
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | [foreach .[] as $x (key; .)]"],
         Some(r#"{"a":[1,2]}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[null,null]");
+    assert_eq!(stdout.trim(), r#"["a","a"]"#);
 
+    // `UPDATE` unchanged: `key` there means "the accumulator's own
+    // position" (none), so it's still `null` -- not fixed, not attempted,
+    // matching this issue's own scoping.
     let (stdout, _, code) = run_jq_full(
-        &["-c", ".a | . as [$x] ?// {b:$x} | key"],
-        Some(r#"{"a":[1]}"#),
+        &["-c", ".a | reduce .[] as $x (0; key)"],
+        Some(r#"{"a":[1,2]}"#),
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "null");
