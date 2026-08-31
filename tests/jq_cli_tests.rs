@@ -8157,7 +8157,11 @@ fn test_func_def_path_context_builtins_1306() -> Result<()> {
     // `continue_rest_with_context` branch.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | (def f: 5; f) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#""a""#);
+    // #1409: `null`, not `"a"` -- `f`'s output is the literal `5`, a fresh
+    // root with no path, exactly as the un-wrapped `.a | 5 | key` already
+    // reports. (Real yq emits *no* output at all there, a separate,
+    // pre-existing divergence this assertion isn't about.)
+    assert_eq!(stdout.trim(), "null");
 
     Ok(())
 }
@@ -28898,5 +28902,139 @@ fn test_compile_error_with_unread_stdin_is_not_a_broken_pipe_2057() -> Result<()
             "{filter}: stderr {stderr:?}"
         );
     }
+    Ok(())
+}
+
+/// #1409: an isolated sub-expression's outputs must continue the rest of
+/// the pipe from *their own* path, not the ambient pre-isolation one.
+///
+/// Several arms of `eval_pipe_with_path_context_internal` evaluate a
+/// sub-expression with an empty `rest` -- because the construct scopes
+/// something `rest` must stay outside of -- and only afterwards continue the
+/// real `rest`. `Field`/`Index`/`Iterate` build an updated path only when
+/// they have a non-empty `rest` to recurse into, so isolation used to hand
+/// the continuation bare values and a stale path: every wrapper below
+/// reported `"a"` for all three elements instead of `0`, `1`, `2`.
+///
+/// The oracle is the un-wrapped pipeline, and `path()` agrees with real jq
+/// 1.7.1 on each of these shapes (`jq 'path(.a | (try .[] catch empty))'`
+/// => `["a",0]`, `["a",1]`, `["a",2]`), so wrapper and un-wrapped form
+/// disagreeing was unambiguously the bug rather than an open question.
+#[test]
+fn test_isolated_subexpr_threads_per_output_path_1409() -> Result<()> {
+    let input = r#"{"a":[1,2,3]}"#;
+
+    // The un-wrapped pipeline every wrapper below has to agree with.
+    let (baseline, _, code) = run_jq_full(&["-c", ".a | .[] | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(baseline, "0\n1\n2\n");
+
+    for filter in [
+        ".a | (try .[] catch empty) | key",
+        ".a | (try .[]) | key",
+        ".a | (label $out | .[]) | key",
+        ".a | (if true then .[] else empty end) | key",
+        ".a | (def f: .[]; f) | key",
+        ".a | limit(3; .[]) | key",
+        // `As` reaches its own path-context arm only when `expr` or `body`
+        // needs path context on its own; `select(key >= 0)` is what routes
+        // this shape there. The bare `. as $x | .[]` form is a separate,
+        // still-open routing gap, not this fix's subject.
+        ".a | (. as $x | (.[] | select(key >= 0))) | key",
+        ".a | (. as [$x] | (.[] | select(key >= 0))) | key",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: {stderr}");
+        assert_eq!(stdout, baseline, "{filter} disagrees with `.a | .[] | key`");
+    }
+
+    // The same threading, observed through `path` rather than `key`, so a
+    // regression that produced the right *last* component but the wrong
+    // prefix would still be caught.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (try .[] catch empty) | path"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\",0]\n[\"a\",1]\n[\"a\",2]\n");
+
+    // A non-fan-out navigational body threads its single component too.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (try .b catch empty) | path"],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\",\"b\"]\n");
+
+    Ok(())
+}
+
+/// #1409: the probe that carries each output's path sits *inside* the
+/// isolated pipe, so it must not widen what the construct scopes.
+///
+/// This is the property that ruled out `Comma`'s own fix (#1509) for these
+/// arms: rewriting `try f catch c | rest` as `try (f | rest) catch (c |
+/// rest)` would let an error raised by `rest` be caught by the `try`'s own
+/// handler, which real jq never does (`jq '.a | (try .[] catch "CAUGHT") |
+/// (., error("boom"))'` prints the first element, then fails with `boom`).
+#[test]
+fn test_isolated_subexpr_probe_does_not_widen_catch_scope_1409() -> Result<()> {
+    let input = r#"{"a":[1,2,3]}"#;
+
+    // `error("boom")` is raised by `rest`, outside the `try` -- the handler
+    // must not see it, so this fails rather than printing `"CAUGHT"`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#".a | (try .[] catch "CAUGHT") | (key, error("boom"))"#,
+        ],
+        Some(input),
+    )?;
+    assert_eq!(code, 5, "rest's own error must escape the try: {stderr}");
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert!(!stdout.contains("CAUGHT"), "stdout: {stdout}");
+
+    // A `label`'s break scope is likewise unwidened: the `break` below
+    // belongs to the *inner* label, and the outer one still sees nothing.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (label $in | .[]) | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n1\n2\n");
+
+    Ok(())
+}
+
+/// #1409: a `catch` handler's outputs stay on the ambient path rather than
+/// being probed.
+///
+/// The handler runs against the error *payload*, which is not a node of the
+/// document, so probing it would name a path that does not exist: `try
+/// error({"b":9}) catch .b` would claim `["a","b"]` even though nothing
+/// lives there. Real jq refuses the question outright (`path(.a | (try
+/// error({"b":9}) catch .b))` => `Invalid path expression`), so there is no
+/// oracle demanding a deeper answer -- and inventing one is strictly worse
+/// than the ambient path this evaluator already reported.
+#[test]
+fn test_catch_handler_outputs_keep_ambient_path_1409() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#".a | (try error({"b":9}) catch .b) | path"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n");
+
+    // A prefix produced before the error keeps its own probed path, while
+    // the handler's output falls back to the ambient one -- both encodings
+    // coexisting in a single result.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            r#".a | (try (.[], error("x")) catch "C") | [path, .]"#,
+        ],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        "[[\"a\",0],1]\n[[\"a\",1],2]\n[[\"a\",2],3]\n[[\"a\"],\"C\"]\n"
+    );
+
     Ok(())
 }
