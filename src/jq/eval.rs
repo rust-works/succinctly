@@ -2584,6 +2584,23 @@ fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> 
     }
 }
 
+/// [`to_owned_checked`] plus [`suppress_or_raise`] in one call, per #2001's
+/// own suggestion: collapses the `match to_owned_checked(&value) { Ok(v) =>
+/// v, Err(e) => return suppress_or_raise(e, optional) }` four-liner this
+/// issue's whole lineage (#1194→#1953→#1972→#1999→#2001) keeps
+/// rediscovering missing at one more call site, into a two-line `match ...
+/// { Ok(v) => v, Err(early_return) => return early_return }` -- `QueryResult`
+/// has no stable `Try`/`?` impl, so a literal `?` isn't achievable here, but
+/// this still turns "did this site remember `optional`" from a fact a human
+/// has to separately audit for into a call-site choice of which helper to
+/// call.
+fn to_owned_checked_or_suppress<'a, W: Clone + AsRef<[u64]>>(
+    value: &StandardJson<'_, W>,
+    optional: bool,
+) -> Result<OwnedValue, QueryResult<'a, W>> {
+    to_owned_checked(value).map_err(|e| suppress_or_raise(e, optional))
+}
+
 /// #1934 item 7: whether `optional == true` is ever actually reachable here
 /// (or at `eval_reduce`/`eval_foreach`/`eval_as`, which route into this same
 /// guard) was left as an open question after #1902/#1927's review -- multiple
@@ -6770,10 +6787,12 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // doesn't change `.`).
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable key must
-    // raise, not silently compare as "".
-    let key_owned = match to_owned_checked(&value) {
+    // raise, not silently compare as "". #2001: a non-decode-failure error
+    // (a #1194 malformed-member shape) respects `optional` the same way
+    // this function's own `check_escape`/fanout handling below does.
+    let key_owned = match to_owned_checked_or_suppress(&value, optional) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(early_return) => return early_return,
     };
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
@@ -7506,12 +7525,18 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable root value
     // must raise, not silently become "" and get fed to `gen` as if it
-    // were the real value. Unconditional regardless of `optional`: that
-    // flag governs `gen`'s own generator errors below, never a decode
-    // failure at this entry point.
-    let owned = match to_owned_checked(&value) {
+    // were the real value. #2001: a genuine decode failure still raises
+    // unconditionally either way, but a non-decode-failure error (a #1194
+    // malformed-member shape) now respects `optional` the same way `gen`'s
+    // own generator errors do a few lines below -- `optional` is a live,
+    // used parameter throughout the rest of this function (unlike
+    // `builtin_recurse_f`'s principled exemption, see
+    // `suppress_or_raise`'s own doc comment), so treating this entry
+    // point's own conversion as unconditional was the actual gap, not a
+    // deliberate split.
+    let owned = match to_owned_checked_or_suppress(&value, optional) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(early_return) => return early_return,
     };
 
     let mut matched = false;
@@ -8518,10 +8543,13 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // argument would pay for it N times.
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable input must
-    // raise, not silently be checked for containment as "".
-    let input = match to_owned_checked(&value) {
+    // raise, not silently be checked for containment as "". #2001: a
+    // non-decode-failure error (a #1194 malformed-member shape) respects
+    // `optional` the same way the closure's own kind-mismatch check below
+    // does.
+    let input = match to_owned_checked_or_suppress(&value, optional) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(early_return) => return early_return,
     };
     fanout_arg::<W, S, _>(
         b_expr,
@@ -8627,10 +8655,13 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_contains`, of which this is the inverse.
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable input must
-    // raise, not silently be checked for containment as "".
-    let input = match to_owned_checked(&value) {
+    // raise, not silently be checked for containment as "". #2001: a
+    // non-decode-failure error (a #1194 malformed-member shape) respects
+    // `optional` the same way the closure's own kind-mismatch check below
+    // does -- mirrors `builtin_contains`'s matching fix.
+    let input = match to_owned_checked_or_suppress(&value, optional) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(early_return) => return early_return,
     };
     fanout_arg::<W, S, _>(
         b_expr,
@@ -37135,18 +37166,23 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // must raise, not silently become "" (and then fail the "must be an
     // array" check with the wrong message, or worse, silently pick/omit
     // nothing correctly-named).
+    // #2001: each `to_owned_checked` below now routes through
+    // `to_owned_checked_or_suppress` -- a non-decode-failure error (a
+    // #1194 malformed-member shape) respects `optional` the same way the
+    // sibling `QueryResult::None if optional`/keys-must-be-an-array arms
+    // in this same match do.
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned_checked_or_suppress(&v, optional) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(early_return) => return early_return,
         },
         // Defensive only: `eval_single` (unlike top-level `eval`'s own
         // `Expr::Identity` special case) never actually produces
         // `OneCursor`, so this arm is unreachable in practice today --
         // kept fallible anyway rather than assuming that stays true.
-        QueryResult::OneCursor(c) => match to_owned_checked(&c.value()) {
+        QueryResult::OneCursor(c) => match to_owned_checked_or_suppress(&c.value(), optional) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(early_return) => return early_return,
         },
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
@@ -37161,9 +37197,9 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
         QueryResult::Many(v) if !v.is_empty() => {
-            match to_owned_checked(&v.into_iter().next().unwrap()) {
+            match to_owned_checked_or_suppress(&v.into_iter().next().unwrap(), optional) {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(early_return) => return early_return,
             }
         }
         QueryResult::Many(_) => {
@@ -40750,6 +40786,125 @@ mod tests {
         match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), df_cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2001: `builtin_in`'s own root-value conversion had the same
+    /// unconditional-regardless-of-`optional` gap the #1953/#1972/#1999
+    /// sweeps already closed elsewhere. See
+    /// `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment for why this is exercised via a direct call rather than
+    /// through the CLI.
+    #[test]
+    fn test_builtin_in_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let obj_expr = parse("[]").unwrap();
+        match builtin_in::<Vec<u64>, JqSemantics>(&obj_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_in::<Vec<u64>, JqSemantics>(&obj_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001: `any_all_gen_cond`'s own root-value conversion was previously
+    /// unconditional by design (its own doc comment claimed `optional`
+    /// only ever governs `gen`'s later generator errors) -- but `optional`
+    /// is a live, used parameter throughout the rest of this function
+    /// (unlike `builtin_recurse_f`'s principled exemption), so that split
+    /// was the actual gap. See
+    /// `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment for why this is exercised via a direct call.
+    #[test]
+    fn test_any_all_gen_cond_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let gen_expr = Expr::Identity;
+        let cond_expr = Expr::Literal(Literal::Bool(true));
+        match any_all_gen_cond::<Vec<u64>, JqSemantics>(
+            &gen_expr,
+            &cond_expr,
+            cursor.value(),
+            true,
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match any_all_gen_cond::<Vec<u64>, JqSemantics>(
+            &gen_expr,
+            &cond_expr,
+            cursor.value(),
+            false,
+            true,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001: `builtin_contains`'s own root-value conversion had the same
+    /// gap. See
+    /// `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment for why this is exercised via a direct call.
+    #[test]
+    fn test_builtin_contains_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let b_expr = Expr::Literal(Literal::String(String::new()));
+        match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001: `builtin_inside`'s own root-value conversion had the same
+    /// gap, mirroring `builtin_contains`'s matching fix. See
+    /// `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment for why this is exercised via a direct call.
+    #[test]
+    fn test_builtin_inside_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let b_expr = Expr::Literal(Literal::String(String::new()));
+        match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001: `builtin_pick`'s own keys-expression-result conversion (the
+    /// `QueryResult::One(v)` arm) had the same gap. Uses `Expr::Identity`
+    /// as the keys expression so its own output is the same malformed
+    /// document under test.
+    #[test]
+    fn test_builtin_pick_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let keys_expr = Expr::Identity;
+        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
