@@ -144,6 +144,23 @@ fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(St
     Ok((stdout, exit_code))
 }
 
+/// #2009: the pinned yq oracle (v4.53.3) tolerates any flag given twice
+/// (live-verified: `yq -n -n '.'` succeeds) -- succinctly's clap-derived
+/// parser used to hard-error on any repeated bool flag with "cannot be used
+/// multiple times", the same underlying clap-derive default `JqCommand` had
+/// (see `jq_cli_tests.rs`'s own `test_repeated_*_flag_is_tolerated_2009`
+/// tests). Only the repeat-tolerance half of that fix applies to yq --
+/// yq's own `--tab`/`--indent`/output-format flags have a different shape
+/// than jq's and would need separate oracle verification before adding a
+/// last-wins override group, not attempted here.
+#[test]
+fn test_repeated_null_input_flag_is_tolerated_2009() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "", &["-n", "-n", "-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+    Ok(())
+}
+
 // ============================================================================
 // Type Preservation Tests - Core yq Compatibility
 // ============================================================================

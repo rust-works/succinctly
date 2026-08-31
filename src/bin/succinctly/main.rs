@@ -801,21 +801,22 @@ struct GenerateYamlSuite {
     max_size: usize,
 }
 
+/// The three jq flags that together form one output-format knob (#2009) --
+/// shared so `overrides_with_all` on each of `JqCommand`'s three fields
+/// below names one definition instead of three hand-copied literals that
+/// could silently drift out of sync if a fourth output-format flag is ever
+/// added (CLAUDE.md: "duplicated predicates diverge silently"). A simpler
+/// single-pair version of this same clap idiom already exists at
+/// `header`'s own `overrides_with = "no_header"` (DSV generation, below) --
+/// that one is one-directional and needs no command-level
+/// `args_override_self` since it's a two-flag pair with no repeat-tolerance
+/// requirement, unlike this three-way mutual group.
+const JQ_OUTPUT_FORMAT_FLAGS: &[&str] = &["compact_output", "tab", "indent"];
+
 /// Command-line JSON processor (jq-compatible CLI)
-///
-/// `args_override_self = true` (#2009): clap's derive default hard-errors on
-/// a repeated flag ("cannot be used multiple times") for every plain bool
-/// field here, unlike real jq, which tolerates any flag given twice (a
-/// wrapper script or alias that already passes e.g. `-c` should not make a
-/// caller's own `-c` a hard failure). Verified live against jq 1.7.1 that
-/// this tolerance isn't specific to `-c` -- `-n -n`, `-r -j`/`-j -r`, etc.
-/// all succeed there too -- so this is set at the command level rather than
-/// per-field. Doesn't affect `Vec`-typed `ArgAction::Append` fields like
-/// `--arg`, which already accumulate correctly regardless of this setting.
 #[derive(Debug, Parser)]
 #[command(name = "jq")]
 #[command(about = "Command-line JSON processor", long_about = None)]
-#[command(args_override_self = true)]
 struct JqCommand {
     /// jq filter expression (e.g., ".", ".foo", ".[]")
     /// If not provided, uses "." (identity)
@@ -828,11 +829,26 @@ struct JqCommand {
 
     // === Input Options ===
     /// Don't read any input; use null as the single input value
-    #[arg(short = 'n', long)]
+    ///
+    /// `overrides_with = "null_input"` (#2009): clap's derive default
+    /// hard-errors on a repeated flag ("cannot be used multiple times") for
+    /// every plain bool field, unlike real jq, which tolerates any flag
+    /// given twice (a wrapper script or alias that already passes a flag
+    /// should not make a caller's own repeat of it a hard failure) --
+    /// live-verified against jq 1.7.1 for `-n -n` specifically, and for
+    /// `-r -j`/`-j -r` (see those fields' own attributes below). Applied
+    /// per-bool-field rather than as one command-level
+    /// `args_override_self` (code review, #2009): that setting also covers
+    /// `ArgAction::Set` value options like `--from-file`/`--input-dsv`,
+    /// and real jq's own `-f a.jq -f b.jq` does *not* behave as simple
+    /// last-wins (live-verified: it errors trying to concatenate both
+    /// files into one program) -- so the blanket command-level version
+    /// would have silently introduced a new, unverified divergence there.
+    #[arg(short = 'n', long, overrides_with = "null_input")]
     null_input: bool,
 
     /// Read each line as a string instead of JSON
-    #[arg(short = 'R', long)]
+    #[arg(short = 'R', long, overrides_with = "raw_input")]
     raw_input: bool,
 
     /// [Extension] Read input as DSV (delimiter-separated values).
@@ -844,12 +860,12 @@ struct JqCommand {
     input_dsv: Option<char>,
 
     /// Read all inputs into an array and use it as the single input value
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, overrides_with = "slurp")]
     slurp: bool,
 
     /// Validate JSON strictly according to RFC 8259 before processing.
     /// Reports detailed validation errors with line:column positions.
-    #[arg(long)]
+    #[arg(long, overrides_with = "validate")]
     validate: bool,
 
     // === Output Options ===
@@ -860,55 +876,60 @@ struct JqCommand {
     /// `jq -c --tab '.'` pretty-prints with tabs, `jq --tab -c '.'` stays
     /// compact). `overrides_with_all` on each of the three, naming all
     /// three (itself included, so a later repeat of the same flag still
-    /// wins over an earlier different one), reproduces that ordering.
-    #[arg(short = 'c', long, overrides_with_all = ["compact_output", "tab", "indent"])]
+    /// wins over an earlier different one, with no need for a separate
+    /// self-only `overrides_with` alongside it), reproduces that ordering.
+    #[arg(short = 'c', long, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
     compact_output: bool,
 
     /// Output raw strings without quotes
-    #[arg(short = 'r', long)]
+    ///
+    /// See `null_input`'s own doc comment for the shared repeat-tolerance
+    /// rationale (#2009) -- `-r -j`/`-j -r` specifically live-verified
+    /// against jq 1.7.1.
+    #[arg(short = 'r', long, overrides_with = "raw_output")]
     raw_output: bool,
 
     /// Like -r but don't print newline after each output
-    #[arg(short = 'j', long)]
+    #[arg(short = 'j', long, overrides_with = "join_output")]
     join_output: bool,
 
     /// Like -r but print NUL instead of newline after each output
-    #[arg(long)]
+    #[arg(long, overrides_with = "raw_output0")]
     raw_output0: bool,
 
     /// Output ASCII only, escaping non-ASCII as \uXXXX
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, overrides_with = "ascii_output")]
     ascii_output: bool,
 
     /// Colorize output (default if stdout is a terminal)
-    #[arg(short = 'C', long)]
+    #[arg(short = 'C', long, overrides_with = "color_output")]
     color_output: bool,
 
     /// Disable colorized output
-    #[arg(short = 'M', long)]
+    #[arg(short = 'M', long, overrides_with = "monochrome_output")]
     monochrome_output: bool,
 
     /// Sort keys of each object on output
-    #[arg(short = 'S', long)]
+    #[arg(short = 'S', long, overrides_with = "sort_keys")]
     sort_keys: bool,
 
     /// Preserve original input formatting (numbers like 4e4, escape sequences)
     /// Can also be enabled via SUCCINCTLY_PRESERVE_INPUT=1 environment variable
-    #[arg(long)]
+    #[arg(long, overrides_with = "preserve_input")]
     preserve_input: bool,
 
     /// Use tabs for indentation
     ///
     /// See `compact_output`'s own doc comment for the shared
     /// last-flag-wins rationale (#2009).
-    #[arg(long, overrides_with_all = ["compact_output", "tab", "indent"])]
+    #[arg(long, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
     tab: bool,
 
     /// Use n spaces for indentation (max 7)
     ///
     /// See `compact_output`'s own doc comment for the shared
     /// last-flag-wins rationale (#2009).
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7), overrides_with_all = ["compact_output", "tab", "indent"])]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7), overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
     indent: Option<u8>,
 
     // === Program Input ===
@@ -959,25 +980,25 @@ struct JqCommand {
 
     // === Formats ===
     /// Parse input/output as application/json-seq (RFC 7464)
-    #[arg(long)]
+    #[arg(long, overrides_with = "seq")]
     seq: bool,
 
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long, overrides_with = "exit_status")]
     exit_status: bool,
 
     /// Flush output after each JSON value
-    #[arg(long)]
+    #[arg(long, overrides_with = "unbuffered")]
     unbuffered: bool,
 
     // === Info ===
     /// Show version information
-    #[arg(short = 'V', long)]
+    #[arg(short = 'V', long, overrides_with = "version")]
     version: bool,
 
     /// Show build configuration
-    #[arg(long)]
+    #[arg(long, overrides_with = "build_configuration")]
     build_configuration: bool,
 }
 
@@ -1026,6 +1047,19 @@ pub enum FrontMatterMode {
 }
 
 /// Command-line YAML processor (yq-compatible)
+///
+/// Bool flags below carry `overrides_with = "self"` (#2009): same
+/// clap-derive default gap `JqCommand` had (see `null_input`'s own doc
+/// comment there) -- `syq -n -n`/`--tab --tab` etc. used to hard-error,
+/// where the pinned yq oracle (v4.53.3) tolerates any repeated flag
+/// (live-verified: `yq -n -n '.'` succeeds there). Applied per-field, not
+/// as one command-level `args_override_self`, for the same reason
+/// `JqCommand` uses per-field attributes -- that setting would also cover
+/// `--from-file`/`--split-exp`/etc., unverified against the oracle here.
+/// yq's own `--tab`/`--indent`/output-format flags have a different shape
+/// than jq's (`-I` takes a default value, not `Option`; no `-c` at all)
+/// and would need their own oracle verification before adding an
+/// `overrides_with_all` last-wins group, not attempted here.
 #[derive(Debug, Parser)]
 #[command(name = "yq")]
 #[command(about = "Command-line YAML processor (yq-compatible)", long_about = None)]
@@ -1040,15 +1074,15 @@ pub struct YqCommand {
 
     // === Input Options ===
     /// Don't read any input; use null as the single input value
-    #[arg(short = 'n', long)]
+    #[arg(short = 'n', long, overrides_with = "null_input")]
     pub null_input: bool,
 
     /// Read each line as a string instead of parsing as YAML/JSON
-    #[arg(short = 'R', long)]
+    #[arg(short = 'R', long, overrides_with = "raw_input")]
     pub raw_input: bool,
 
     /// Read all inputs into an array and use it as the single input value
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, overrides_with = "slurp")]
     pub slurp: bool,
 
     /// Combine all documents from all files into one evaluation context
@@ -1057,19 +1091,19 @@ pub struct YqCommand {
     /// must use explicit `.[]` iteration (e.g. `.[] | select(file_index ==
     /// 0)`) rather than a bare top-level `select(...)` -- see
     /// docs/reference/yq-language.md for the full deviation (#715).
-    #[arg(long = "eval-all", alias = "ea")]
+    #[arg(long = "eval-all", alias = "ea", overrides_with = "eval_all")]
     pub eval_all: bool,
 
     /// Validate YAML strictly (opt-in) before processing. Reports line:column
     /// errors and exits without producing output on the first violation.
-    #[arg(long)]
+    #[arg(long, overrides_with = "validate")]
     pub validate: bool,
 
     /// Accept jq-only builtins real yq's lexer rejects (`paths`, `getpath`,
     /// `limit`, `gsub`/`scan`/`splits`, `leaf_paths`, etc.) as a succinctly
     /// extension. Off by default so `succinctly yq` matches real yq's
     /// syntax surface (#1512).
-    #[arg(long)]
+    #[arg(long, overrides_with = "jq_extensions")]
     pub jq_extensions: bool,
 
     /// Input format type [auto, yaml, json] (default: auto)
@@ -1094,35 +1128,35 @@ pub struct YqCommand {
     pub output_format: OutputFormat,
 
     /// Unwrap scalar values, print without quotes (default for YAML)
-    #[arg(short = 'r', long = "unwrapScalar")]
+    #[arg(short = 'r', long = "unwrapScalar", overrides_with = "raw_output")]
     pub raw_output: bool,
 
     /// Like -r but don't print newline after each output
-    #[arg(short = 'j', long)]
+    #[arg(short = 'j', long, overrides_with = "join_output")]
     pub join_output: bool,
 
     /// Use NUL char to separate values instead of newline
-    #[arg(short = '0', long = "nul-output")]
+    #[arg(short = '0', long = "nul-output", overrides_with = "nul_output")]
     pub nul_output: bool,
 
     /// Output ASCII only, escaping non-ASCII as \uXXXX
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, overrides_with = "ascii_output")]
     pub ascii_output: bool,
 
     /// Force colorized output
-    #[arg(short = 'C', long = "colors")]
+    #[arg(short = 'C', long = "colors", overrides_with = "color_output")]
     pub color_output: bool,
 
     /// Disable colorized output
-    #[arg(short = 'M', long = "no-colors")]
+    #[arg(short = 'M', long = "no-colors", overrides_with = "monochrome_output")]
     pub monochrome_output: bool,
 
     /// Sort keys of each object on output
-    #[arg(short = 'S', long)]
+    #[arg(short = 'S', long, overrides_with = "sort_keys")]
     pub sort_keys: bool,
 
     /// Don't print document separators (---)
-    #[arg(short = 'N', long = "no-doc")]
+    #[arg(short = 'N', long = "no-doc", overrides_with = "no_doc")]
     pub no_doc: bool,
 
     /// Select specific document by 0-based index from multi-document stream
@@ -1131,14 +1165,14 @@ pub struct YqCommand {
 
     /// Pretty print, expand flow styles to block style (currently a no-op:
     /// output is already always block-style pending style preservation, #707)
-    #[arg(short = 'P', long = "prettyPrint")]
+    #[arg(short = 'P', long = "prettyPrint", overrides_with = "pretty_print")]
     pub pretty_print: bool,
 
     /// Use tabs for indentation. Write-only: succinctly's own YAML reader (like
     /// the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so
     /// this flag's YAML output cannot be read back by `succinctly yq` itself,
     /// or by other spec-strict YAML parsers (#1684).
-    #[arg(long)]
+    #[arg(long, overrides_with = "tab")]
     pub tab: bool,
 
     /// Sets indent level for output (default 2). 0 means compact/flow for
@@ -1148,7 +1182,7 @@ pub struct YqCommand {
     pub indent: u8,
 
     /// Update the file in place
-    #[arg(short = 'i', long)]
+    #[arg(short = 'i', long, overrides_with = "inplace")]
     pub inplace: bool,
 
     /// Split output into multiple files, one per result, named by evaluating
@@ -1178,16 +1212,16 @@ pub struct YqCommand {
 
     // === Exit Status ===
     /// Set exit status based on output (0 if last output != false/null)
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long, overrides_with = "exit_status")]
     pub exit_status: bool,
 
     // === Info ===
     /// Show version information
-    #[arg(short = 'V', long)]
+    #[arg(short = 'V', long, overrides_with = "version")]
     pub version: bool,
 
     /// Show build configuration
-    #[arg(long)]
+    #[arg(long, overrides_with = "build_configuration")]
     pub build_configuration: bool,
 }
 
