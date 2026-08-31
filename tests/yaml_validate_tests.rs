@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::exit_code_or_signal_death;
+use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -21,19 +21,20 @@ fn succinctly_bin() -> &'static str {
     env!("CARGO_BIN_EXE_succinctly")
 }
 
+/// #2016: routed through `spawn_with_signal_retry` (previously hand-rolled
+/// `spawn()` + `write_all(...)?` + `wait_with_output()`) -- a `write_all`
+/// failure used to return via `?` before the child was ever waited on,
+/// leaking a zombie for the rest of this test binary's run (#1891's own
+/// fix, for a different call site with the identical shape).
 fn run_validate_stdin(input: &str, extra_args: &[&str]) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(succinctly_bin())
-        .args(["yaml", "validate"])
-        .args(extra_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-    let output = cmd.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["yaml", "validate"]).args(extra_args);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     Ok((stdout, stderr, code))
@@ -228,18 +229,16 @@ fn rejects_out_dented_sequence_continuation() -> Result<()> {
 // `syq --validate` (the yq runner's opt-in validation flag).
 // ============================================================================
 
+/// See `run_validate_stdin`'s own #2016 doc comment above.
 fn run_yq_validate_stdin(input: &str, filter: &str) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(succinctly_bin())
-        .args(["yq", "--validate", filter])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-    let output = cmd.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["yq", "--validate", filter]);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     Ok((stdout, stderr, code))
@@ -269,22 +268,17 @@ fn yq_validate_rejects_invalid_yaml_before_output() -> Result<()> {
 fn yq_without_validate_accepts_the_same_invalid_yaml() -> Result<()> {
     // The default loader is non-validating: the same input succeeds without
     // `--validate`, proving the flag is opt-in.
-    let (_, _, code) = {
-        let mut cmd = Command::new(succinctly_bin())
-            .args(["yq", "."])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = cmd.stdin.take() {
-            stdin.write_all(b"a: b: c: d\n")?;
-        }
-        let output = cmd.wait_with_output()?;
-        let code = exit_code_or_signal_death(output.status, &output.stderr)?;
-        let stdout = String::from_utf8(output.stdout)?;
-        let stderr = String::from_utf8(output.stderr)?;
-        (stdout, stderr, code)
-    };
+    //
+    // #2016: routed through `spawn_with_signal_retry` -- see
+    // `run_validate_stdin`'s own doc comment above for why.
+    let (_output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["yq", "."]);
+            command
+        },
+        Some(b"a: b: c: d\n"),
+    )?;
     assert_eq!(code, 0);
     Ok(())
 }

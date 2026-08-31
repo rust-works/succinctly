@@ -17,7 +17,7 @@ use tempfile::{NamedTempFile, TempDir};
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::exit_code_or_signal_death;
+use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
 /// Path to the pre-built `succinctly` CLI binary. Cargo builds the `succinctly`
 /// bin target (gated `required-features = ["cli"]`) before this test binary
@@ -28,21 +28,21 @@ fn succinctly_bin() -> &'static str {
 }
 
 /// Run `text validate utf8` with raw bytes piped on stdin.
+///
+/// #2016: routed through `spawn_with_signal_retry` (previously hand-rolled
+/// `spawn()` + `write_all(...)?` + `wait_with_output()`) -- a `write_all`
+/// failure used to return via `?` before the child was ever waited on,
+/// leaking a zombie for the rest of this test binary's run (#1891's own
+/// fix, for a different call site with the identical shape).
 fn run_validate_stdin(input: &[u8], extra_args: &[&str]) -> Result<(Vec<u8>, String, i32)> {
-    let mut cmd = Command::new(succinctly_bin())
-        .args(["text", "validate", "utf8"])
-        .args(extra_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input)?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["text", "validate", "utf8"]).args(extra_args);
+            command
+        },
+        Some(input),
+    )?;
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     Ok((output.stdout, stderr, exit_code))
 }

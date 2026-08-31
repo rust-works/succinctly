@@ -18,114 +18,93 @@ use tempfile::{NamedTempFile, TempDir};
 
 #[path = "common/cargo_run_exit.rs"]
 mod cargo_run_exit;
-use cargo_run_exit::exit_code_or_signal_death;
+use cargo_run_exit::{exit_code_or_signal_death, spawn_with_signal_retry};
 
 /// Helper to run yq command with input from stdin
+///
+/// #2016: routed through `spawn_with_signal_retry` (previously hand-rolled
+/// `spawn()` + `write_all(...)?` + `wait_with_output()`) -- a `write_all`
+/// failure used to return via `?` before the child was ever waited on,
+/// leaking a zombie for the rest of this test binary's run (#1891's own
+/// fix, for a different call site with the identical shape). Also picks up
+/// the ENOENT/signal-death retry `spawn_with_signal_retry` provides, which
+/// this hand-rolled version never had.
 fn run_yq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").args(extra_args).arg(filter);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
-
     Ok((stdout, exit_code))
 }
 
-/// Helper to run yq command with input from stdin, capturing stderr too
+/// Helper to run yq command with input from stdin, capturing stderr too.
+/// See `run_yq_stdin`'s own #2016 doc comment above.
 fn run_yq_stdin_with_stderr(
     filter: &str,
     input: &str,
     extra_args: &[&str],
 ) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").args(extra_args).arg(filter);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-
     Ok((stdout, stderr, exit_code))
 }
 
 /// `run_yq_stdin_with_stderr`'s raw-bytes counterpart, for input that isn't
 /// valid UTF-8 -- deliberately not `unsafe { str::from_utf8_unchecked(...) }`
 /// over an invalid byte sequence, which is real UB even when the only thing
-/// done with the resulting `&str` is write its bytes back out (#1187).
+/// done with the resulting `&str` is write its bytes back out (#1187). See
+/// `run_yq_stdin`'s own #2016 doc comment above.
 fn run_yq_stdin_bytes_with_stderr(
     filter: &str,
     input: &[u8],
     extra_args: &[&str],
 ) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input)?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").args(extra_args).arg(filter);
+            command
+        },
+        Some(input),
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
     Ok((stdout, stderr, exit_code))
 }
 
 /// jq-mode counterpart of `run_yq_stdin_with_stderr` -- this file otherwise
 /// hand-rolls `Command::new(...).arg("jq")` boilerplate per jq-mode test
 /// (#1146: introduced to avoid compounding that duplication for its own
-/// new jq-mode tests, not a full sweep of the pre-existing copies).
+/// new jq-mode tests, not a full sweep of the pre-existing copies). See
+/// `run_yq_stdin`'s own #2016 doc comment above.
 fn run_jq_stdin_with_stderr(
     filter: &str,
     input: &str,
     extra_args: &[&str],
 ) -> Result<(String, String, i32)> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(extra_args)
-        .arg(filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").args(extra_args).arg(filter);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
-
     Ok((stdout, stderr, exit_code))
 }
 

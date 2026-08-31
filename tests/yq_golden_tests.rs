@@ -156,13 +156,32 @@ fn run_case_with_input(case: &Case, input: &str) -> Result<(), String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn succinctly: {e}"))?;
-    child
+    // #2016: write, but don't propagate a failure yet -- matching
+    // `spawn_with_signal_retry`'s own #1891 fix. A `?` here, before
+    // `wait_with_output()` below, would drop `child` without reaping it on
+    // a write failure (e.g. the child exits before ever reading stdin),
+    // leaking a zombie for the rest of this test binary's run -- driven by
+    // potentially thousands of fixture cases here, so a regression that
+    // hits this path could leak many at once.
+    let write_result = child
         .stdin
         .take()
         .expect("stdin piped")
         .write_all(input.as_bytes())
-        .map_err(|e| format!("write stdin: {e}"))?;
-    let output = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
+        .map_err(|e| format!("write stdin: {e}"));
+    // Prefer the write error's own diagnostic over `wait_with_output`'s, on
+    // the rare double failure where the child is also reaped or killed by
+    // something else between the write failing and this wait running
+    // (matching `spawn_with_signal_retry`'s own #1891-review priority).
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(wait_err) => {
+            return Err(write_result
+                .err()
+                .unwrap_or_else(|| format!("wait: {wait_err}")))
+        }
+    };
+    write_result?;
 
     match case.expected_status {
         None => {

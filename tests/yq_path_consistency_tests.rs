@@ -76,13 +76,18 @@ fn run_path(args: &[&str], yaml: &str) -> PathResult {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn succinctly");
-    child
+    // #2016: write, but don't panic yet -- an `.expect(...)` here, before
+    // `wait_with_output()` below, unwinds past the wait the same way a `?`
+    // early-return would, dropping `child` without reaping it on a write
+    // failure and leaking a zombie for the rest of this test binary's run
+    // (matching `spawn_with_signal_retry`'s own #1891 fix).
+    let write_result = child
         .stdin
         .take()
         .expect("stdin piped")
-        .write_all(yaml.as_bytes())
-        .expect("write stdin");
+        .write_all(yaml.as_bytes());
     let output = child.wait_with_output().expect("wait");
+    write_result.expect("write stdin");
 
     if !output.status.success() {
         return PathResult::Errored;
