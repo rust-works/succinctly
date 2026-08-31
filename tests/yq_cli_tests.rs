@@ -27358,7 +27358,11 @@ fn test_reduce_and_foreach_see_every_duplicate_key_1687() -> Result<()> {
 
     let (out, code) = run_yq_stdin("[keys | .[]]", dup, &args)?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"["b","a","b"]"#, "the invariant to agree with");
+    assert_eq!(
+        out.trim(),
+        r#"["b","a","b"]"#,
+        "the invariant to agree with"
+    );
 
     let (out, code) = run_yq_stdin("reduce (keys|.[]) as $k (0; .+1)", dup, &args)?;
     assert_eq!(code, 0);
