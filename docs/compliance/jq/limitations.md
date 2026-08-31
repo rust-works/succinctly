@@ -1935,7 +1935,7 @@ precedent for a gap that doesn't fit the letter of rule 4 but is kept rather
 than silently left unrecorded. See
 [#1561](https://github.com/rust-works/succinctly/issues/1561).
 
-### `repeat(f)` silently caps at 1000 rounds, in both value and path mode
+### `repeat(f)` under `limit`/`first` (value mode): fixed (#2014); the eager fallback and path mode still cap, in two different ways
 
 `repeat(f)` (`def repeat(f): f, repeat(f);`) has no base case at all: an `f`
 that never errors and never produces a value on some round recurses forever.
@@ -1947,38 +1947,100 @@ $ timeout 3 jq -cn 'limit(3; repeat(empty))'; echo "exit: $?"
 exit: 124                                 # real jq hangs -- 124 is `timeout`'s own code
 ```
 
-`eval_repeat` (value mode, `src/jq/eval.rs`) already backstops this with a
-`MAX_ITERATIONS = 1000` round cap, so `limit(3; repeat(empty))` returns no
-output and exits 0 in succinctly instead of hanging the process --
-unquestionably permitted under ADR-0018 rule 4c (matching a reference's hang
-is not something this project attempts). [#1906](https://github.com/rust-works/succinctly/issues/1906)
-added the identical cap to `resolve_repeat_bounded` (path mode, the
-`path(repeat(f))`/`path(limit(n; repeat(f)))` route) for the same reason and
-to keep the two modes consistent with each other.
-
-The cap has a real side effect neither call site's own doc comment
-mentioned before now: it also silently truncates a *legitimate*, `n` greater
-than 1000 request, with no error and no warning, where jq itself handles a
-large `n` trivially:
+Before [#2014](https://github.com/rust-works/succinctly/issues/2014), value
+mode's `eval_repeat` ran `repeat`'s body *eagerly*, capped at a flat
+`MAX_ITERATIONS = 1000` rounds regardless of a wrapping `limit`/`first`'s own
+requested count, and silently returned whatever it had accumulated once that
+cap was hit -- so `limit(1500; repeat(1))` returned only 1000 values, exit 0,
+no error, where real jq returns all 1500. #2014 gave `eval_each`'s lazy
+dispatch (in both evaluators -- see the module-level note on the two
+evaluators elsewhere in this repo) a native `Expr::Repeat` arm
+(`each_repeat`/`each_repeat_generic`) that pulls one round at a time and
+stops exactly when the wrapping consumer's own `Demand::Stop` does, so a
+`limit`/`first`-bounded `repeat` is now uncapped in round count and matches
+jq exactly, confirmed at every scale the original issue's own table named:
 
 ```console
-$ jq -cn '[limit(1500; repeat(1))] | length'
-1500
 $ succinctly jq -cn '[limit(1500; repeat(1))] | length'
+1500
+$ succinctly jq -cn '[limit(80000; repeat(1))] | length'
+80000
+```
+
+Two narrower caps remain by necessity, both accepted under ADR-0018 rule 4c
+(preventing a hang, not matching one) rather than removed:
+
+- **A per-*round* width budget** (`REDUCE_FOREACH_MAX_STEPS = 10000`, reset
+  at the start of every round): bounds how many values a *single* round may
+  fork into at once -- a memory-safety net for a wide `f` like `.[]`, since
+  a round is materialized into a `Vec` before being handed to the sink. Real
+  jq has no such cap (`limit(50000; repeat(.[]))` over a 20001-element array
+  succeeds with all 50000 in jq 1.7.1); succinctly raises
+  `"repeat: maximum iterations exceeded"` once a single round's own output
+  passes 10000. This is scoped to one round, not the whole stream, so it
+  does not reintroduce the round-count cap #2014 removed -- a `repeat`
+  producing a handful of values per round runs indefinitely regardless of
+  total round count.
+- **A round-*emptiness* cap** (`MAX_EMPTY_REPEAT_ROUNDS = 1000` *consecutive*
+  empty rounds, reset by any productive round): `repeat`'s `expr` reruns
+  every round, so a round producing zero outputs will, if `expr` is pure
+  over the repeated value, produce zero outputs forever -- no wrapping
+  `Demand::Stop` can ever fire to stop it, since `sink` is never called on
+  an empty round. Exhausting this silently ends the stream (matching
+  `repeat(empty)`'s hang-instead-of-diverging precedent above) rather than
+  raising. **This cap is inherently approximate for an *impure* `f`** (one
+  that reads `input`/`inputs`, so a later round can differ even though the
+  repeated value itself does not): a body that happens to need 1000 or more
+  consecutive empty rounds before its first real output is silently cut
+  short with no error, exactly like the width budget above but with no
+  diagnostic at all. Any finite bound has this same edge at whatever number
+  it picks -- raising the constant only moves the cliff, per this section's
+  own prior finding about the old round-count cap -- so it is recorded here
+  as an accepted, structural limitation rather than something a bigger
+  number would fix.
+
+The **eager fallback** -- `repeat(f)` reached through any consumer that
+doesn't dispatch through `eval_each`'s lazy path (bare `[repeat(f)]`,
+`reduce repeat(f) as $x (...)`, `foreach repeat(f) as $x (...)`,
+`last(repeat(f))`) -- still runs `eval_repeat`'s original eager, capped loop,
+since none of those consumers can express a demand to stop early. #2014 also
+changed *its* cap-exhaustion behavior, from the same silent truncation
+described above to raising `"repeat: maximum iterations exceeded"`:
+
+```console
+$ succinctly jq -cn '[repeat(1)] | length'
+jq: error (at <unknown>): repeat: maximum iterations exceeded
+$ succinctly jq -cn 'last(repeat(1))'
+jq: error (at <unknown>): repeat: maximum iterations exceeded
+```
+
+Real jq hangs on all four of these shapes instead (there is no wrapping
+consumer to stop it early, and no #2014 fix changes that). Raising is a
+*third* outcome -- neither the old silent truncation nor jq's hang -- chosen
+deliberately: ADR-0018 rule 4c permits not matching a hang, and a loud,
+immediate error is strictly preferable to either alternative for these four
+shapes, which have no legitimate large-`n` use case in the first place
+(nothing here can ever stop the eager loop early, unlike the `limit`/`first`
+case above).
+
+**Path mode is unchanged and still has the original bug.**
+[#2014](https://github.com/rust-works/succinctly/issues/2014) only touched
+value mode's two evaluators; `resolve_repeat_bounded` (path mode, the
+`path(repeat(f))`/`path(limit(n; repeat(f)))` route added by
+[#1906](https://github.com/rust-works/succinctly/issues/1906)) still runs
+its own flat `MAX_ITERATIONS = 1000` round cap regardless of the wrapping
+consumer's requested count, and still silently truncates on exhaustion:
+
+```console
+$ succinctly jq -cn 'path(limit(1500; repeat(.))) | length' # counts output lines
 1000
 ```
 
-This half of the behavior doesn't fit any of ADR-0018's four conditions on
-its own (the output is readable, nothing is corrupted, and unlike the
-`repeat(empty)` case this input does not threaten to hang the process) --
-but it is the unavoidable other side of the same guard that rule 4c does
-cover, not a second, separable design choice: a per-round cap cannot
-distinguish "this round produced nothing because `f` is degenerate" from
-"this round produced nothing yet because we haven't gotten to round 1001",
-so raising the cap only moves where a sufficiently large `n` starts silently
-truncating rather than removing the tradeoff. Recorded here rather than left
-implicit in a doc comment that named only the case it was actually written
-to prevent.
+This is the same bug value mode had before #2014, now isolated to path mode
+alone -- left open rather than fixed here since #2014's own scope and
+verification are both about value mode; a follow-up applying the identical
+demand-driven treatment to `resolve_repeat_bounded` would close this the
+same way.
 
 ### `path(repeat(f))` tracking (#1906/#1935) only reaches `limit`/`first`'s *direct* child, not `nth` or a combinator-nested `repeat`
 
