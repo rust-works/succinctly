@@ -420,7 +420,7 @@ succinctly yq '.users[]' input.yaml
 - `-N, --no-doc`: Don't print document separators (`---`)
 - `-P, --prettyPrint`: Pretty print, expand flow styles to block style
 - `--tab`: Use tabs for indentation (write-only — see [yq Language Reference § Known Limitations](../reference/yq-language.md#known-limitations))
-- `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`
+- `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`. **Not a real yq flag** — v4.53.3 rejects it as an unknown flag; this is a succinctly extension borrowed from jq's own `-a` (ADR-0018 rule 5), so it carries no fidelity obligation to yq. JSON output only: `-o yaml --ascii-output` emits raw UTF-8, since YAML has no `\uXXXX` escape convention to borrow. Escaping happens at the output sink (`AsciiEscapeWriter`), so the flag keeps the streaming path and its duplicate mapping keys; the routes that materialize a DOM anyway (`-P` without `-I0`, `--arg`/`--argjson`, `-r`/`-j`/`-0`, `--eval-all`, `--split-exp`) still collapse duplicates and carry the DOM emitter's own divergences (#1700, #1982)
 - `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter). Suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
 
 ### Input Options
