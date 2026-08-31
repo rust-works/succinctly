@@ -559,7 +559,8 @@ is the revert that established what the other one costs.
    `reestablishes_register` only re-establishes a branch that is *already* untracked and a
    stage sitting directly on a trackable one never gets there. Pre-existing (it predates the
    register threading), refuse-only, and closing it is a widening that needs its own live
-   matrix.
+   matrix; tracked as [#2044](https://github.com/rust-works/succinctly/issues/2044), which
+   carries the same root cause under its own repro (`path(null \| .a)` on `null`).
 
    Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
    marker at all, because `substitute_var_tracked` remains gated on
