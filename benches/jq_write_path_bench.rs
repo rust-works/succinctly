@@ -85,9 +85,10 @@ fn computed_key_doc(n: usize) -> Vec<u8> {
 
 /// [`computed_key_doc`]'s object-valued twin: `{"items": [{"foo": {"k0": 0,
 /// ...}}, {...}]}`. `del(.items[(0,1)].foo[])` over this routes the same
-/// per-element siblings into `delete_expr_object_paths`' grouping rather
-/// than `delete_expr_array_paths`', which is a separate copy of the same
-/// logic and was quadratic in the same way (#1301). `bench_del_object` does
+/// per-element siblings into the delete walk's object arm rather than its
+/// array arm -- which until #1690 merged them into one `DeleteTrie` were
+/// two separate copies of the same logic, quadratic in the same way
+/// (#1301). `bench_del_object` does
 /// not cover it -- without a computed key, `del(.foo[])` takes
 /// `builtin_del`'s single-path route and never reaches the grouping at all.
 fn computed_key_object_doc(n: usize) -> Vec<u8> {
@@ -484,6 +485,154 @@ fn bench_del_comma_through_iterate(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// #1690: del() over a match set that grows with depth
+// =============================================================================
+
+/// Depths for the two #1690 groups. `MAX_NESTING_DEPTH` is 256, so the curve
+/// is fitted over 30..240 rather than further out.
+const DEPTHS: &[usize] = &[30, 60, 120, 240];
+
+/// A `d`-deep `{"c": ...}` chain terminating in a `d`-element array:
+/// `{"c":{"c":...{"c":[0,1,...,d-1]}}}`.
+///
+/// Both the shared prefix depth *and* the leaf fan-out scale with `d`, which
+/// is what makes this shape discriminate a truly-shared trie (O(d)) from a
+/// naively-flattened-per-branch one (O(d^2)). A "broom" — a fixed-size match
+/// set under a deep prefix — measures **linear** however the flatten is done,
+/// because the branch *count* is what multiplies the per-branch cost.
+fn deep_chain_doc(d: usize) -> Vec<u8> {
+    let mut out = String::new();
+    for _ in 0..d {
+        out.push_str(r#"{"c":"#);
+    }
+    out.push('[');
+    for i in 0..d {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&i.to_string());
+    }
+    out.push(']');
+    for _ in 0..d {
+        out.push('}');
+    }
+    out.into_bytes()
+}
+
+/// [`deep_chain_doc`] at a *fixed* depth of 240 with a `k`-element leaf array,
+/// so only the branch count varies.
+fn wide_leaf_doc(k: usize) -> Vec<u8> {
+    let mut out = String::new();
+    for _ in 0..FIXED_DEPTH {
+        out.push_str(r#"{"c":"#);
+    }
+    out.push('[');
+    for i in 0..k {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&i.to_string());
+    }
+    out.push(']');
+    for _ in 0..FIXED_DEPTH {
+        out.push('}');
+    }
+    out.into_bytes()
+}
+
+const FIXED_DEPTH: usize = 240;
+const WIDTHS: &[usize] = &[250, 500, 1_000, 2_000, 4_000];
+
+/// Walk `d` `.c` steps into a [`deep_chain_doc`] result and return the array
+/// found there, so each group can check its own premise.
+fn leaf_array(mut value: &OwnedValue, d: usize) -> &OwnedValue {
+    for _ in 0..d {
+        let OwnedValue::Object(entries) = value else {
+            panic!("expected an object at every chain level");
+        };
+        value = entries.get("c").expect("chain key `c` must survive");
+    }
+    value
+}
+
+/// `del(.. | select(type == "number"))` over [`deep_chain_doc`] — the shape
+/// #1690 is about: a *filtered* recursive descent whose match set excludes
+/// the document root, so #1651's root short-circuit never fires and every
+/// resolved branch used to pay its own O(depth) flatten.
+///
+/// Note what this group does **not** isolate. Evaluating `select(...)` per
+/// resolved branch inside `resolve_node` re-serializes that branch's value
+/// through `to_json_for_reindex_at_depth`, which is O(subtree) per branch and
+/// so O(d^2) in its own right — a separate term that dominates this shape and
+/// is tracked separately from #1690. Use
+/// `jq_write_path_del_shared_prefix_width` below to see the path-flatten term
+/// on its own.
+fn bench_del_filtered_descent_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_del_filtered_descent_depth");
+    let expr = parse(r#"del(.. | select(type == "number"))"#).expect("must parse");
+    for &d in DEPTHS {
+        let json = deep_chain_doc(d);
+
+        // Guard the premise: every number must actually be gone, and the
+        // chain itself must survive (a silent no-op would read as a speedup).
+        let out = eval_one(&expr, &json);
+        let OwnedValue::Array(items) = leaf_array(&out, d) else {
+            panic!("d={d}: the leaf must stay an array");
+        };
+        assert!(items.is_empty(), "d={d}: every leaf number must be deleted");
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(d as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The same shared-deep-prefix delete with the depth pinned at
+/// [`FIXED_DEPTH`], reached by a computed key rather than a filter, so only
+/// the branch count varies.
+///
+/// This is the group that isolates #1690's own term. Every branch shares the
+/// full 240-step prefix and differs only in its final index, the computed key
+/// is evaluated once against the (small) leaf array, and no `select` runs per
+/// branch — so anything growing with `k` here is charged *per branch*, which
+/// is exactly what the pre-#1690 per-branch flatten was and what the trie
+/// removes. Reported per element, an O(depth)-per-branch cost shows up as a
+/// flat-but-large ns/element and a shared-prefix one as a falling curve.
+fn bench_del_shared_prefix_width(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_del_shared_prefix_width");
+    let prefix = ".c".repeat(FIXED_DEPTH);
+    for &k in WIDTHS {
+        let json = wide_leaf_doc(k);
+        let expr = parse(&format!("del({prefix}[range({k})])")).expect("must parse");
+
+        let out = eval_one(&expr, &json);
+        let OwnedValue::Array(items) = leaf_array(&out, FIXED_DEPTH) else {
+            panic!("k={k}: the leaf must stay an array");
+        };
+        assert!(
+            items.is_empty(),
+            "k={k}: every leaf element must be deleted"
+        );
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(k as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_del_array,
@@ -495,5 +644,7 @@ criterion_group!(
     bench_del_computed_key_with_trailing_iterate,
     bench_del_computed_key_with_trailing_iterate_object,
     bench_del_comma_through_iterate,
+    bench_del_filtered_descent_depth,
+    bench_del_shared_prefix_width,
 );
 criterion_main!(benches);
