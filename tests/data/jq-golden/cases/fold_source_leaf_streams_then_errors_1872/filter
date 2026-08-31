@@ -1,0 +1,1 @@
+def f: 1,2,error("x"); path(foreach (f, keys[]) as $k (.; .))
