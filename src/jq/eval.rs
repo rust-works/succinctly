@@ -66240,6 +66240,128 @@ mod tests {
     }
 
     #[test]
+    fn builtin_del_optional_swallows_apply_errors_called_directly() {
+        // The three `optional` arms `builtin_del` reaches *after* path
+        // resolution succeeds, as opposed to the resolution-time one the test
+        // above covers. All are called directly for the same reason it is: a
+        // source-level `del(...)?` never reaches `builtin_del` with
+        // `optional = true` (the parser routes it through its own
+        // try/catch-shaped desugaring instead), so the flag's arms have no
+        // parseable spelling -- only `eval_assign`'s sibling call shape does.
+        //
+        // What they guard is #537: `optional` must turn the *whole call's*
+        // output into empty, never be threaded into the walkers as a
+        // per-step tolerance, which would emit the unchanged input instead.
+        fn del_optional(json: &'static [u8], path: &str) -> QueryResult<'static, Vec<u64>> {
+            // Leaked so the returned `QueryResult` can borrow it -- a test-only
+            // allocation, and the only way to hand `builtin_del` a cursor whose
+            // index outlives the call.
+            let index: &'static JsonIndex<Vec<u64>> = Box::leak(Box::new(JsonIndex::build(json)));
+            let cursor = index.root(json);
+            let path_expr = parse(path).unwrap();
+            builtin_del::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), true)
+        }
+
+        // Multi-path where path *resolution* is what raises (`.b` is a
+        // number, so `.b.x` cannot be navigated).
+        match del_optional(br#"{"a":1,"b":5}"#, ".a, .b.x") {
+            QueryResult::None => {}
+            other => panic!("expected None from path resolution, got {other:?}"),
+        }
+        // Multi-path where the *apply* is what raises, not path resolution:
+        // slicing a string is a legal read, so `resolve_del_path_branches`
+        // lets both branches through and `delete_trie_array`'s non-array gate
+        // is what fails (#504's shape).
+        match del_optional(br#""hi""#, ".[0:1], .[1:2]") {
+            QueryResult::None => {}
+            other => panic!("expected None from the trie apply, got {other:?}"),
+        }
+        // Single-path: `delete_at_path` raises instead.
+        match del_optional(br#"{"a":"s"}"#, ".a[0]") {
+            QueryResult::None => {}
+            other => panic!("expected None from delete_at_path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_del_yq_multi_path_bare_root_slice_noop_1690() {
+        // #1101/#1162's bare-root slice no-op in its *multi-path* form: real
+        // yq no-ops a comma of bare slices exactly as it does the single-path
+        // case. #1690 kept the check but moved the multi-path copy to the
+        // trie's own entry, so it needs coverage of its own.
+        //
+        // The filter has to carry a **computed** slice bound to get here.
+        // `rewrite_yq_del_comma_branches` (#1223) rewrites every *static*
+        // comma branch up front, and a bare slice classifies as
+        // `YqDelSliceOutcome::Noop` there and is dropped outright -- so
+        // `del(.[0:1], .[1:2])` never reaches path resolution as two branches
+        // at all (`tests/yq_cli_tests.rs` covers that route end-to-end). A
+        // computed bound is exactly the case that pre-pass skips ("a branch
+        // that itself needs a prepass is left untouched"), which is what
+        // leaves this gate reachable -- verified with a temporary probe over
+        // a sweep of slice shapes, not assumed.
+        //
+        // `{"a":1}` with `.a`-derived bounds, because that is the target real
+        // yq agrees on: `yq 'del(.[.a:1], .[.a:2])'` returns it unchanged
+        // (v4.53.3). Other target types diverge here for reasons that predate
+        // #1690.
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("del(.[.a:1], .[.a:2])").unwrap();
+        let rendered: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(rendered, vec![r#"{"a":1}"#.to_string()]);
+    }
+
+    #[test]
+    fn delete_trie_builder_rejects_unsupported_components_called_directly() {
+        // `DeleteTrieBuilder::child_of` rejects every component shape the
+        // pre-#1690 `delete_expr_paths_at` rejected, with the identical
+        // message -- and no parseable query reaches it: a `del()` path is
+        // fully static `Field`/`Index`/`Slice` components by the time it is
+        // interned, and anything else fails earlier, during path navigation.
+        // Exercised directly, the same way the parser-unreachable
+        // `builtin_*` functions above are.
+        //
+        // Both insertion routes are covered: `insert_expr` (yq's slice
+        // rewrites, which hand over an already-flat `Expr`) and
+        // `insert_branch` (everything else, which walks an `Rc<PathPrefix>`
+        // chain through `push_component`).
+        //
+        // The `Expr::Iterate` arm is deliberately *not* exercised here: its
+        // own `debug_assert!(false, ...)` fires before the `Err` it then
+        // returns, so a test build cannot reach the return at all. That is
+        // the arm working as designed (#1382 says a bare `.[]` can never get
+        // this far, and the assert is what would say so loudly if that ever
+        // stopped being true) -- the graceful `Err` behind it exists only so
+        // a *release* build degrades to an ordinary error instead of the
+        // process crash an `unreachable!()` would give (#1098).
+        let unsupported = Expr::Literal(Literal::Null);
+
+        let mut builder = DeleteTrieBuilder::new();
+        let err = builder
+            .insert_expr(&unsupported)
+            .expect_err("not a delete target");
+        assert_eq!(err.message, "cannot use expression as delete target");
+
+        let mut builder = DeleteTrieBuilder::new();
+        let chain =
+            PathPrefix::from_components([Expr::Field("a".to_string()), unsupported.clone()]);
+        let err = builder
+            .insert_branch(&chain)
+            .expect_err("not a delete target");
+        assert_eq!(err.message, "cannot use expression as delete target");
+        // The prefix that *was* supported is still interned, so the failure
+        // is a clean abort partway through one branch rather than a poisoned
+        // builder.
+        assert_eq!(builder.trie.node(DELETE_TRIE_ROOT).fields.len(), 1);
+    }
+
+    #[test]
     fn delete_trie_exhausted_root_path_guard_called_directly() {
         // `DelPaths::Root` intercepts every branch that resolves to the
         // document root before a trie is ever built, so `root_is_terminal`

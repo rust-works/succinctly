@@ -2154,6 +2154,34 @@ fn test_del_trie_shares_prefixes_and_batches_removals_1690() {
     );
 }
 
+/// #1690: the trie apply's own `null`-tolerance and optional-swallow arms,
+/// which the shapes above never reach.
+///
+/// `Outcome::values(&[])` is `del(...)?` swallowing the error into an empty
+/// stream — distinct from `Outcome::values(&["null"])`, and the reason
+/// `Outcome` distinguishes an error from an empty stream at all.
+#[test]
+fn test_del_trie_null_tolerance_and_optional_swallow_1690() {
+    // `null` at an *array*-kind step, with tails still to walk: the object
+    // arm's `null` exemption has its own coverage above, this is the index
+    // arm's. Both are per-step (#476/#527), so the tails are walked against a
+    // synthetic `null` and the container is left alone.
+    check("null", "del(.[0].x, .[1].y)", Outcome::values(&["null"]));
+    // The same through a container that is present but whose element is not.
+    check(
+        r#"{"a":null}"#,
+        "del(.a[0].x, .a[1].y)",
+        Outcome::values(&[r#"{"a":null}"#]),
+    );
+
+    // `del(...)?` over a *multi-path* match set swallows the walk's error
+    // into an empty stream — not into the unchanged input, which is what
+    // threading `optional` into the walkers themselves would produce (#537).
+    check(r#"{"a":1,"b":5}"#, "del(.a, .b.x)?", Outcome::values(&[]));
+    // Its single-path counterpart, for the same distinction.
+    check(r#"{"a":"s"}"#, "del(.a[0])?", Outcome::values(&[]));
+}
+
 /// #1690's own headline shape: a filtered recursive descent whose match set
 /// excludes the document root, so #1651's root short-circuit never fires and
 /// every match is its own resolved branch under a shared prefix.

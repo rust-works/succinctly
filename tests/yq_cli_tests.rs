@@ -20088,12 +20088,54 @@ fn test_1153_optional_outside_paren_still_applies_parent_key_rule() -> Result<()
     Ok(())
 }
 
+/// #1690: yq's two `del()` slice rules across the trie route.
+///
+/// The merge only assembles the branches whose path actually contains a
+/// slice, because both rules decline immediately without one — so these are
+/// the shapes that prove the two rules still reach a multi-path `del()` at
+/// all after the merge, and that the branches they *don't* apply to still go
+/// through unrewritten.
+///
+/// All three expectations captured live from yq v4.53.3.
+#[test]
+fn test_1690_yq_del_slice_rules_over_a_merged_match_set() -> Result<()> {
+    // The bare-root no-op, in its multi-path form: every resolved path is
+    // literally a bare top-level slice, so the whole call does nothing —
+    // regardless of the target's type (#1101/#1162).
+    for input in [r#"{"a":1}"#, "[1,2,3]", "5", r#""hi""#, "null"] {
+        let (out, code) = run_yq_stdin("del(.[0:1], .[1:2])", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "bare-root slice comma on {input}");
+        assert_eq!(out.trim(), input, "bare-root slice comma on {input}");
+    }
+
+    // The chained rule declining: neither prefix navigates to anything, so
+    // `yq_del_slice_outcome` returns `NotApplicable` for both branches and
+    // each path is merged unrewritten, leaving the document alone.
+    let (out, code) = run_yq_stdin("del(.a[0:2], .c[0:2])", r#"{"b":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":1}"#);
+
+    // And a match set that mixes a slice-carrying branch with a slice-free
+    // one: only the first is assembled and rewritten (dropping `.a`
+    // outright, #1116), while the second merges straight from its resolved
+    // chain.
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:1], .b)",
+        r#"{"a":5,"b":6,"c":7}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"c":7}"#);
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
-/// multiple values) — `delete_expr_paths_at`'s sibling-grouping walker
-/// never sees the original chained-scalar-slice path at all, since each
-/// resolved path is rewritten *before* flattening, the same way #1101's
-/// own no-op rule already had to be special-cased for this branch.
+/// multiple values) — the multi-path delete walk never sees the original
+/// chained-scalar-slice path at all, since each resolved path is rewritten
+/// *before* it is merged into the trie (#1690), the same way #1101's own
+/// no-op rule already had to be special-cased for this branch.
 #[test]
 fn test_1116_chained_scalar_slice_del_multi_path() -> Result<()> {
     let (out, code) = run_yq_stdin(
