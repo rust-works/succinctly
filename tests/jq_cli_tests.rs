@@ -2054,8 +2054,11 @@ impl FuzzMalformation {
 /// Wrap `leaf` in `path`'s containers, outermost first -- `path = []` leaves
 /// `leaf` unwrapped (depth-0, matching the existing "top level" case);
 /// `path = [Array]`/`[Object]` reproduce the existing "nested in
-/// array"/"nested in object" cases exactly; longer paths generate depths the
-/// hand-picked list never covered.
+/// array"/"nested in object" cases exactly for `DecodeFailure`/
+/// `StructuralError` (the only two the hand-picked list ever nested); the
+/// hand-picked list's `Collision` case was top-level only, so any nested
+/// `Collision` path here is new coverage, not a reproduction. Longer paths
+/// generate depths the hand-picked list never covered for any kind.
 fn fuzz_wrap_json(path: &[FuzzContainer], leaf: &str) -> String {
     match path.split_first() {
         None => leaf.to_string(),
@@ -2101,13 +2104,12 @@ proptest! {
             prop_oneof![Just(FuzzContainer::Array), Just(FuzzContainer::Object)],
             0..=4,
         ),
-        malformation_index in 0..3u8,
+        malformation in prop_oneof![
+            Just(FuzzMalformation::DecodeFailure),
+            Just(FuzzMalformation::StructuralError),
+            Just(FuzzMalformation::Collision),
+        ],
     ) {
-        let malformation = match malformation_index {
-            0 => FuzzMalformation::DecodeFailure,
-            1 => FuzzMalformation::StructuralError,
-            _ => FuzzMalformation::Collision,
-        };
         let doc = fuzz_build_json_doc(&path, malformation);
         let expect_stderr = malformation.expect_stderr();
         let label = format!("{path:?}/{malformation:?}");

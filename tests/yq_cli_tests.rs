@@ -1995,25 +1995,80 @@ impl FuzzYamlMalformation {
     }
 }
 
-/// Wrap `leaf` in `path`'s containers using YAML flow style (`[...]`/
-/// `{x: ...}`), outermost first -- flow style nests recursively as easily as
-/// JSON's brace/bracket syntax does, unlike YAML's indentation-sensitive
-/// block style, and is valid mixed into an otherwise block-style document
-/// (`test_select_and_write_agree_on_corruption_1803`'s own "nested in
-/// array" case already does exactly this: `bad: ["a\qb"]`).
-fn fuzz_wrap_yaml(path: &[FuzzYamlContainer], leaf: &str) -> String {
+/// Whether a generated case nests its containers with YAML flow syntax
+/// (`[...]`/`{x: ...}`) or block syntax (indentation-based `- `/`x:` on
+/// their own lines). Added after code review on #1965 found the first
+/// version of this fuzzer only ever generated flow style, silently never
+/// exercising the indentation-sensitive block-mapping/block-sequence
+/// parsing path at all -- despite
+/// `test_select_and_write_agree_on_corruption_1803`'s own "nested in
+/// object" and "colliding decode-failure keys" cases specifically using
+/// block style. A regression reachable only through block-style nesting
+/// (e.g. a divergence between block- and flow-mapping key/value boundary
+/// tracking) would have passed every generated case forever.
+#[derive(Debug, Clone, Copy)]
+enum FuzzYamlStyle {
+    Flow,
+    Block,
+}
+
+/// Wrap `leaf` in `path`'s containers, outermost first, in the chosen
+/// `style` throughout (never mixed: a block collection can hold a flow
+/// child, but not the reverse, so picking one style per generated case
+/// avoids ever generating invalid YAML). `indent` is the block-nesting
+/// depth already consumed by the caller -- 0 at the top (`bad:`'s own
+/// level) -- used only when `style` is `Block`, to indent each level two
+/// spaces deeper than its parent.
+fn fuzz_wrap_yaml(
+    path: &[FuzzYamlContainer],
+    leaf: &str,
+    style: FuzzYamlStyle,
+    indent: usize,
+) -> String {
     match path.split_first() {
         None => leaf.to_string(),
-        Some((FuzzYamlContainer::Array, rest)) => format!("[{}]", fuzz_wrap_yaml(rest, leaf)),
-        Some((FuzzYamlContainer::Object, rest)) => format!("{{x: {}}}", fuzz_wrap_yaml(rest, leaf)),
+        Some((container, rest)) => {
+            let inner = fuzz_wrap_yaml(rest, leaf, style, indent + 1);
+            match (style, container) {
+                (FuzzYamlStyle::Flow, FuzzYamlContainer::Array) => format!("[{inner}]"),
+                (FuzzYamlStyle::Flow, FuzzYamlContainer::Object) => format!("{{x: {inner}}}"),
+                (FuzzYamlStyle::Block, FuzzYamlContainer::Array) => {
+                    format!("\n{}- {inner}", "  ".repeat(indent + 1))
+                }
+                (FuzzYamlStyle::Block, FuzzYamlContainer::Object) => {
+                    format!("\n{}x: {inner}", "  ".repeat(indent + 1))
+                }
+            }
+        }
     }
 }
 
-fn fuzz_build_yaml_doc(path: &[FuzzYamlContainer], malformation: FuzzYamlMalformation) -> String {
-    format!(
-        "bad: {}\nkeep: 5\n",
-        fuzz_wrap_yaml(path, malformation.leaf_yaml())
-    )
+fn fuzz_build_yaml_doc(
+    path: &[FuzzYamlContainer],
+    malformation: FuzzYamlMalformation,
+    style: FuzzYamlStyle,
+) -> String {
+    // The leaf sits one level deeper than the deepest container -- same
+    // depth `fuzz_wrap_yaml`'s own recursion would reach it at -- so a
+    // block-style `Collision` leaf (itself a two-key mapping, needing its
+    // own indentation) lines up with its container siblings.
+    let leaf = match (malformation, style) {
+        (FuzzYamlMalformation::DecodeFailure, _) => malformation.leaf_yaml(),
+        (FuzzYamlMalformation::Collision, FuzzYamlStyle::Flow) => malformation.leaf_yaml(),
+        (FuzzYamlMalformation::Collision, FuzzYamlStyle::Block) => {
+            let pad = "  ".repeat(path.len() + 1);
+            return format!(
+                "bad: {}\nkeep: 5\n",
+                fuzz_wrap_yaml(
+                    path,
+                    &format!("\n{pad}\"a\\qb\": 1\n{pad}\"a\\zc\": 2"),
+                    style,
+                    0
+                )
+            );
+        }
+    };
+    format!("bad: {}\nkeep: 5\n", fuzz_wrap_yaml(path, leaf, style, 0))
 }
 
 // The YAML twin of `jq_cli_tests.rs`'s `fuzz_select_and_materialize_agree_on_corruption_1965`
@@ -2034,15 +2089,15 @@ proptest! {
             prop_oneof![Just(FuzzYamlContainer::Array), Just(FuzzYamlContainer::Object)],
             0..=4,
         ),
-        malformation_index in 0..2u8,
+        malformation in prop_oneof![
+            Just(FuzzYamlMalformation::DecodeFailure),
+            Just(FuzzYamlMalformation::Collision),
+        ],
+        style in prop_oneof![Just(FuzzYamlStyle::Flow), Just(FuzzYamlStyle::Block)],
     ) {
-        let malformation = match malformation_index {
-            0 => FuzzYamlMalformation::DecodeFailure,
-            _ => FuzzYamlMalformation::Collision,
-        };
-        let yaml = fuzz_build_yaml_doc(&path, malformation);
+        let yaml = fuzz_build_yaml_doc(&path, malformation, style);
         let expect_stderr = malformation.expect_stderr();
-        let label = format!("{path:?}/{malformation:?}");
+        let label = format!("{path:?}/{malformation:?}/{style:?}");
 
         assert_yq_raises(&label, "select(.bad)", "select(.bad) | .keep", &yaml, &[], expect_stderr);
         assert_yq_raises(&label, ".keep = 9", ".keep = 9", &yaml, &[], expect_stderr);
