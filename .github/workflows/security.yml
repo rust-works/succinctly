@@ -23,7 +23,7 @@ jobs:
 
       # Prebuilt binary via taiki-e/install-action (cacheable), rather than
       # `cargo install cargo-audit`, which recompiles from source every run.
-      - uses: taiki-e/install-action@v2.86.5
+      - uses: taiki-e/install-action@v2.87.0
         with:
           tool: cargo-audit
 
@@ -54,7 +54,7 @@ jobs:
       # input for a custom config path, so invoke cargo-deny directly with
       # each workspace's own deny.toml (root deny.toml is intentionally
       # tuned to the shipped crate's dependency tree only).
-      - uses: taiki-e/install-action@v2.86.5
+      - uses: taiki-e/install-action@v2.87.0
         with:
           tool: cargo-deny
 
