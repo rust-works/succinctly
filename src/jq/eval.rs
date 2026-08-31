@@ -20290,8 +20290,8 @@ impl<'a> PathBranch<'a> {
     fn with_register(mut self, register: Option<Cow<'a, OwnedValue>>) -> Self {
         debug_assert!(
             !(self.trackable && register.is_some()),
-            "a trackable branch's register is its own value; storing a second one \
-             would let `register_value` answer from a stale copy",
+            "a trackable branch's register is its own value at its own path; \
+             storing a second one would let a reader answer from a stale copy",
         );
         self.register = register;
         self
@@ -22034,41 +22034,6 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
     }
 }
 
-/// The register `path()`-tracking compares each `reduce`/`foreach` fold
-/// iteration's own navigation against — jq's `(path, value_at_path)` pair,
-/// derived empirically against jq 1.7.1 (#1440; no fold-specific machinery
-/// exists in real jq, since `reduce`/`foreach` are sugar over the same
-/// variable-binding primitive every other construct uses — confirmed by
-/// `substitute_var_impl`'s existing `Reduce`/`Foreach` arms, which already
-/// correctly thread an outer `Expr::TrackedVar` marker into UPDATE/EXTRACT;
-/// the only missing piece was `resolve_node` never walking into the
-/// construct at all).
-///
-/// **Fixed once per INIT fork ([`FoldRegister::enter`]) — never advances
-/// across source-element iterations of the same fold.** Confirmed live:
-/// `path(reduce (1,2) as $i (.a; .b))` on `{"a":{"b":{"b":9}}}` raises
-/// "near attempt to access element \"b\" of {\"b\":9}" on the *second*
-/// iteration — if the register had advanced to iteration 1's own result
-/// (path `["a","b"]`, value `{"b":9}`), iteration 2's `.b` would have
-/// navigated it successfully instead of raising. `foreach` has the
-/// identical reset between source elements (confirmed live the same way),
-/// even though *within* one source element it does chain UPDATE into
-/// EXTRACT (see [`FoldRegister::advance`]) — the register resets at every
-/// "re-entry" into UPDATE for a new element, but not at the direct,
-/// same-step continuation from UPDATE into EXTRACT.
-///
-/// `reduce`'s own *final* accumulator gets the identical reset treatment,
-/// even though it isn't itself a new UPDATE call: confirmed live,
-/// `path(reduce (1) as $i (.a; .b))` on `{"a":{"b":9}}` raises "Invalid
-/// path expression with result 9" — `.b`'s own navigation inside that one
-/// UPDATE call *was* genuinely trackable (path `["a","b"]`), but reduce's
-/// exit back into its own caller is itself another such boundary, so the
-/// emitted value is re-checked against the same fixed register one more
-/// time rather than keeping UPDATE's own transient path. `foreach`'s own
-/// per-element emission (UPDATE directly, or via EXTRACT) is *not* such a
-/// boundary — confirmed live, `path(foreach (1) as $i (.a; .b; .))` on
-/// `{"a":{"b":5},"c":5}` is `["a","b"]`, inheriting UPDATE's own
-/// trackable result through EXTRACT directly, no reset.
 /// jq's own `jv_identical(v, jq->value_at_path)`, modeled for a value type
 /// that has no pointer to compare — the single definition shared by every
 /// site that has to answer "is this branch still sitting *on* the path
@@ -22108,6 +22073,41 @@ fn register_identical(register: &OwnedValue, value: &OwnedValue, snapshot: bool)
     value == register && (snapshot || matches!(*value, OwnedValue::Null | OwnedValue::Bool(_)))
 }
 
+/// The register `path()`-tracking compares each `reduce`/`foreach` fold
+/// iteration's own navigation against — jq's `(path, value_at_path)` pair,
+/// derived empirically against jq 1.7.1 (#1440; no fold-specific machinery
+/// exists in real jq, since `reduce`/`foreach` are sugar over the same
+/// variable-binding primitive every other construct uses — confirmed by
+/// `substitute_var_impl`'s existing `Reduce`/`Foreach` arms, which already
+/// correctly thread an outer `Expr::TrackedVar` marker into UPDATE/EXTRACT;
+/// the only missing piece was `resolve_node` never walking into the
+/// construct at all).
+///
+/// **Fixed once per INIT fork ([`FoldRegister::enter`]) — never advances
+/// across source-element iterations of the same fold.** Confirmed live:
+/// `path(reduce (1,2) as $i (.a; .b))` on `{"a":{"b":{"b":9}}}` raises
+/// "near attempt to access element \"b\" of {\"b\":9}" on the *second*
+/// iteration — if the register had advanced to iteration 1's own result
+/// (path `["a","b"]`, value `{"b":9}`), iteration 2's `.b` would have
+/// navigated it successfully instead of raising. `foreach` has the
+/// identical reset between source elements (confirmed live the same way),
+/// even though *within* one source element it does chain UPDATE into
+/// EXTRACT (see [`FoldRegister::advance`]) — the register resets at every
+/// "re-entry" into UPDATE for a new element, but not at the direct,
+/// same-step continuation from UPDATE into EXTRACT.
+///
+/// `reduce`'s own *final* accumulator gets the identical reset treatment,
+/// even though it isn't itself a new UPDATE call: confirmed live,
+/// `path(reduce (1) as $i (.a; .b))` on `{"a":{"b":9}}` raises "Invalid
+/// path expression with result 9" — `.b`'s own navigation inside that one
+/// UPDATE call *was* genuinely trackable (path `["a","b"]`), but reduce's
+/// exit back into its own caller is itself another such boundary, so the
+/// emitted value is re-checked against the same fixed register one more
+/// time rather than keeping UPDATE's own transient path. `foreach`'s own
+/// per-element emission (UPDATE directly, or via EXTRACT) is *not* such a
+/// boundary — confirmed live, `path(foreach (1) as $i (.a; .b; .))` on
+/// `{"a":{"b":5},"c":5}` is `["a","b"]`, inheriting UPDATE's own
+/// trackable result through EXTRACT directly, no reset.
 struct FoldRegister {
     path: Rc<PathPrefix>,
     value: OwnedValue,
@@ -24110,8 +24110,8 @@ fn reestablishes_register(
 ///
 /// - The branch is trackable again (either it never stopped being, or
 ///   `reestablishes_register` just put it back): the register is the
-///   branch's own value at its own path, so nothing is stored — see
-///   [`PathBranch::register_value`].
+///   branch's own value at its own path, so nothing is stored — that is
+///   exactly what `trackable` means.
 /// - The step navigated: it moved the register onto what it reached, which
 ///   is exactly the trackable case above; if the branch is nonetheless
 ///   untracked here, the navigation was refused and no register survives.
