@@ -3785,6 +3785,32 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // gap (#796).
         Expr::Builtin(Builtin::Select(_)) => true,
 
+        // #1687: `sort`/`sort_by`/`unique`/`unique_by`/`reverse` now answer a
+        // `GenericResult::LazySeq` over their input's own element cursors,
+        // and `min`/`min_by`/`max`/`max_by` a bare `OneCursor` -- the same
+        // shapes `map`/`first` above already stream. Without an arm here the
+        // fix is discarded one layer up, exactly as #1607's was before its
+        // review caught it: `evaluate_yaml_cursor`'s unconditional
+        // `to_owned()` DOM path flattens the cursor-preserving result back
+        // into an `IndexMap`-backed `OwnedValue` at output time, silently
+        // re-collapsing the duplicate mapping key inside a moved element.
+        //
+        // The key filter is never recursed into: it only ever produces a
+        // comparison key, which is an `OwnedValue` regardless and never
+        // reaches the output. What *is* streamed is the element the key
+        // selected, and that is always a document node.
+        Expr::Builtin(
+            Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Min
+            | Builtin::MinBy(_)
+            | Builtin::Max
+            | Builtin::MaxBy(_)
+            | Builtin::Reverse,
+        ) => true,
+
         // `keys_unsorted` on a mapping produces `GenericResult::LazyKeys { sorted: false, .. }`,
         // which `GenericResult::stream_json`/`stream_yaml` now stream directly
         // from the field cursor (#685) instead of materializing a `Vec<String>`
