@@ -8,6 +8,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
+use proptest::prelude::*;
 use tempfile::NamedTempFile;
 
 #[path = "common/cargo_run_exit.rs"]
@@ -2001,6 +2002,128 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// One level of container nesting between `.bad` and the malformed leaf, for
+/// [`fuzz_select_and_materialize_agree_on_corruption_1965`]'s generated
+/// documents -- `Array`/`Object` mirror the two shapes
+/// [`test_select_and_materialize_agree_on_corruption_1645`]'s hand-picked
+/// cases already cover at depth 1, generalized here to an arbitrary,
+/// generated depth and mix.
+#[derive(Debug, Clone, Copy)]
+enum FuzzContainer {
+    Array,
+    Object,
+}
+
+/// The three malformation kinds [`test_select_and_materialize_agree_on_corruption_1645`]'s
+/// fixed case list covers, as a generatable enum.
+#[derive(Debug, Clone, Copy)]
+enum FuzzMalformation {
+    DecodeFailure,
+    StructuralError,
+    Collision,
+}
+
+impl FuzzMalformation {
+    /// The JSON text substituted at the leaf position -- a raw malformed
+    /// *value* for the first two kinds, a whole malformed *object* (two
+    /// colliding decode-failure keys, #1642) for the third, since a
+    /// collision isn't expressible as a single scalar value.
+    fn leaf_json(self) -> &'static str {
+        match self {
+            Self::DecodeFailure => r#""\x""#,
+            Self::StructuralError => "xyz123",
+            Self::Collision => r#"{"\ud800":1,"\ud800":2}"#,
+        }
+    }
+
+    /// The stderr substring every one of the three CLI paths must raise,
+    /// matching [`test_select_and_materialize_agree_on_corruption_1645`]'s
+    /// own three constants -- stable across nesting depth/shape, since the
+    /// underlying `EvalError`'s message never mentions its own position.
+    fn expect_stderr(self) -> &'static str {
+        match self {
+            Self::DecodeFailure => "invalid escape sequence",
+            Self::StructuralError => "unexpected character",
+            Self::Collision => "ambiguous",
+        }
+    }
+}
+
+/// Wrap `leaf` in `path`'s containers, outermost first -- `path = []` leaves
+/// `leaf` unwrapped (depth-0, matching the existing "top level" case);
+/// `path = [Array]`/`[Object]` reproduce the existing "nested in
+/// array"/"nested in object" cases exactly; longer paths generate depths the
+/// hand-picked list never covered.
+fn fuzz_wrap_json(path: &[FuzzContainer], leaf: &str) -> String {
+    match path.split_first() {
+        None => leaf.to_string(),
+        Some((FuzzContainer::Array, rest)) => format!("[{}]", fuzz_wrap_json(rest, leaf)),
+        Some((FuzzContainer::Object, rest)) => {
+            format!(r#"{{"x": {}}}"#, fuzz_wrap_json(rest, leaf))
+        }
+    }
+}
+
+fn fuzz_build_json_doc(path: &[FuzzContainer], malformation: FuzzMalformation) -> String {
+    format!(
+        r#"{{"bad": {}, "keep": 5}}"#,
+        fuzz_wrap_json(path, malformation.leaf_json())
+    )
+}
+
+// Differential fuzzer for #1965: generalizes
+// `test_select_and_materialize_agree_on_corruption_1645`'s hand-picked
+// 7-case list (3 malformation kinds x up to 2 nesting depths) to
+// proptest-generated nesting paths of 0-4 arbitrary `Array`/`Object`
+// containers, crossed with all 3 malformation kinds -- the same "generate
+// nesting depth/shape, run the same CLI battery, assert consistency" design
+// the issue asked for, so a divergence at a depth/shape combination the
+// fixed list never happened to hit still gets caught. Kept alongside
+// (rather than replacing) the fixed-case test: the fixed list's exact case
+// labels are easier to read in a failure message, and losing that
+// human-readable coverage while adding generated coverage would be a
+// regression in debuggability, not just redundant.
+//
+// `ProptestConfig::with_cases` is turned down from proptest's own default
+// (256) because this drives three real subprocess spawns per case (a
+// `Command::new(env!("CARGO_BIN_EXE_succinctly"))` per
+// `run_jq_full`/`assert_jq_raises` call, unlike proptest's usual in-process
+// property) -- 48 cases x 3 spawns is already ~3x this file's entire
+// pre-existing corruption-consistency coverage in one property.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    #[test]
+    fn fuzz_select_and_materialize_agree_on_corruption_1965(
+        path in prop::collection::vec(
+            prop_oneof![Just(FuzzContainer::Array), Just(FuzzContainer::Object)],
+            0..=4,
+        ),
+        malformation_index in 0..3u8,
+    ) {
+        let malformation = match malformation_index {
+            0 => FuzzMalformation::DecodeFailure,
+            1 => FuzzMalformation::StructuralError,
+            _ => FuzzMalformation::Collision,
+        };
+        let doc = fuzz_build_json_doc(&path, malformation);
+        let expect_stderr = malformation.expect_stderr();
+        let label = format!("{path:?}/{malformation:?}");
+
+        assert_jq_raises(&label, "select(.bad)", &[], "select(.bad) | .keep", &doc, 5, expect_stderr);
+        assert_jq_raises(&label, "-Sc .bad", &["-Sc"], ".bad", &doc, 5, expect_stderr);
+        assert_jq_raises(
+            &label,
+            "-e .bad (cursor_to_owned_at_depth, lazy.rs)",
+            &["-e"],
+            ".bad",
+            &doc,
+            5,
+            expect_stderr,
+        );
+    }
 }
 
 #[test]
