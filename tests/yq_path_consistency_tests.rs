@@ -80,15 +80,29 @@ fn canonicalize(value: Value) -> Value {
 /// priority on a double failure, neither of which this hand-rolled version
 /// had.
 fn run_path(args: &[&str], yaml: &str) -> PathResult {
-    let (output, _code) = spawn_with_signal_retry(
+    // #2016 (code review): the pre-conversion `wait_with_output().expect(
+    // "wait")` never actually panicked on a signal-killed child --
+    // `wait_with_output` succeeds regardless of *how* the child exited, so
+    // a signal death fell through to the `!status.success()` check below
+    // and was gracefully classified as `PathResult::Errored`, the same as
+    // any other non-zero exit. `spawn_with_signal_retry` retries a signal
+    // death transparently, but if it's still dead after `MAX_CARGO_RETRIES`
+    // attempts it returns a hard `Err` -- an `.expect(...)` on that would
+    // panic and abort this whole ~800-call corpus loop over one flaky case
+    // instead of recording it as one more disagreement and moving on, the
+    // exact resilience `yq_paths_agree_on_corpus`'s own per-case `BTreeMap`
+    // collection is built for. Route it into the same `Errored` outcome
+    // instead, matching the original behavior.
+    let Ok((output, _code)) = spawn_with_signal_retry(
         || {
             let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
             command.arg("yq").args(args).arg(".");
             command
         },
         Some(yaml.as_bytes()),
-    )
-    .expect("spawn succinctly");
+    ) else {
+        return PathResult::Errored;
+    };
 
     if !output.status.success() {
         return PathResult::Errored;

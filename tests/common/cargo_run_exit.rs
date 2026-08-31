@@ -29,7 +29,7 @@
 
 #![allow(dead_code)] // Each consumer uses a different subset.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 #[path = "../../src/bin/succinctly/exit_status.rs"]
 mod exit_status;
@@ -145,66 +145,6 @@ pub fn succinctly_bin() -> &'static str {
     env!("CARGO_BIN_EXE_succinctly")
 }
 
-/// Spawns `build()` (already configured with args), optionally writing
-/// `stdin_input` to it, retrying the whole spawn+wait up to
-/// [`MAX_CARGO_RETRIES`] times on either of two transient failures: `spawn()`
-/// itself returning `ENOENT` (a concurrent, differently-featured `cargo
-/// test` invocation sharing this `target/` directory can be transiently
-/// mid-relink of the shared `succinctly_bin()` path, #550), or the spawned
-/// child being killed by a signal rather than exiting with a real code -- an
-/// OOM kill, another session's `pkill`, or a stall-guard's process-group
-/// kill (`cargo-guard.sh`, by design, on a detected stall, #935) catching
-/// this specific child, all just as plausible under this repo's routine
-/// heavy concurrent multi-session load as the cargo-lock-contention case
-/// `classify_cargo_run_exit` retries for. Unlike that function, there is
-/// no exit-101 case to also retry on here: a direct `succinctly_bin()`
-/// spawn has no cargo invocation of its own to contend on a lock.
-///
-/// Shared by every direct-spawn CLI test helper (#1847 review) --
-/// `cli_golden_tests.rs`, `cli_characterization_tests.rs`,
-/// `deep_nesting_valid_tests.rs`, `json_validate_tests.rs`, and (via #1884's
-/// follow-up fix, after that file's own bespoke copy was found to have
-/// silently dropped signal-death retry) `jq_cli_tests.rs` each independently
-/// dropped some or all of this retry surface (along with the lock-contention
-/// case that genuinely no longer applies) when first converting away from
-/// `cargo run`; sharing one copy here instead of five independently
-/// drifting ones is the same fix `classify_cargo_run_exit`'s own doc comment
-/// already describes for the exit-code-classification half of this same
-/// problem. (#1884 code review, round 3: this function's own `spawn()` call
-/// used a bare `?` with no `ENOENT` handling until this paragraph's fix --
-/// the one piece of `spawn_jq_full`'s old protection that got lost when
-/// `jq_cli_tests.rs` first adopted this shared helper, since this function
-/// didn't have it either at the time.)
-///
-/// `build` is called fresh on each retry attempt, since a spawned
-/// `std::process::Command` cannot be reused. `stdout`/`stderr` are always
-/// piped. `stdin` is piped and `stdin_input` written to it when `Some`;
-/// when `None`, `stdin` is explicitly set to `Stdio::null()` -- **not**
-/// left unconfigured, which would default to inheriting this test
-/// process's own stdin under `.spawn()` (unlike `.output()`, whose
-/// documented default *is* `Stdio::null()`; an earlier version of this
-/// function relied on that same default by simply never calling
-/// `.stdin(...)` in the `None` case, silently inheriting instead once
-/// converted to `.spawn()`/`.wait_with_output()` -- confirmed live: a
-/// spawned child with only stdout/stderr piped echoes back whatever this
-/// process's own stdin contains, where the old `.output()` calls it
-/// replaced saw immediate EOF). Getting this wrong reintroduces exactly
-/// the class of hang this whole conversion exists to eliminate, just
-/// relocated to stdin instead of an orphaned grandchild.
-///
-/// Retries sleep `100 * (attempt + 1)` ms between attempts, matching
-/// every pre-conversion call site's own backoff -- an immediate retry
-/// under the same sustained load that caused the first signal death (an
-/// OOM condition that hasn't cleared, a stall-guard still killing the
-/// process group) is more likely to be killed again in the same narrow
-/// window, burning through the retry budget faster than a short backoff
-/// would.
-///
-/// Returns the real exit code alongside the `Output` so callers never
-/// need their own `output.status.code().expect(...)` -- that invariant
-/// (a real code is always present in an `Ok` result) is asserted here
-/// exactly once, via [`exit_code_or_signal_death`], rather than
-/// re-asserted independently at every call site.
 /// Writes `stdin_input` to `child`'s stdin (if it was piped and this is
 /// `Some`), then waits for `child` to exit, reaping it regardless of
 /// whether the write succeeded.
@@ -255,12 +195,86 @@ pub fn write_stdin_then_wait(
     // write itself failed with a more generic wait/I-O error.
     let output = match child.wait_with_output() {
         Ok(output) => output,
-        Err(wait_err) => return Err(write_result.err().unwrap_or(wait_err).into()),
+        Err(wait_err) => {
+            return Err(match write_result {
+                Ok(()) => anyhow::Error::new(wait_err).context("wait"),
+                Err(write_err) => anyhow::Error::new(write_err).context("write stdin"),
+            })
+        }
     };
-    write_result?;
+    // #2016 (code review): `.context(...)`, not a bare `?` -- consolidating
+    // three call sites' own hand-written "write stdin: {e}" diagnostics
+    // into this shared function had silently dropped that stage-tagging
+    // (a bare `io::Error`'s own `Display` doesn't say *which* fallible step
+    // produced it), making a real failure harder to triage than before.
+    write_result.context("write stdin")?;
     Ok(output)
 }
 
+/// Spawns `build()` (already configured with args), optionally writing
+/// `stdin_input` to it, retrying the whole spawn+wait up to
+/// [`MAX_CARGO_RETRIES`] times on either of two transient failures: `spawn()`
+/// itself returning `ENOENT` (a concurrent, differently-featured `cargo
+/// test` invocation sharing this `target/` directory can be transiently
+/// mid-relink of the shared `succinctly_bin()` path, #550), or the spawned
+/// child being killed by a signal rather than exiting with a real code -- an
+/// OOM kill, another session's `pkill`, or a stall-guard's process-group
+/// kill (`cargo-guard.sh`, by design, on a detected stall, #935) catching
+/// this specific child, all just as plausible under this repo's routine
+/// heavy concurrent multi-session load as the cargo-lock-contention case
+/// `classify_cargo_run_exit` retries for. Unlike that function, there is
+/// no exit-101 case to also retry on here: a direct `succinctly_bin()`
+/// spawn has no cargo invocation of its own to contend on a lock.
+///
+/// Shared by every direct-spawn CLI test helper (#1847 review) --
+/// `cli_golden_tests.rs`, `cli_characterization_tests.rs`,
+/// `deep_nesting_valid_tests.rs`, `json_validate_tests.rs`, and (via #1884's
+/// follow-up fix, after that file's own bespoke copy was found to have
+/// silently dropped signal-death retry) `jq_cli_tests.rs` each independently
+/// dropped some or all of this retry surface (along with the lock-contention
+/// case that genuinely no longer applies) when first converting away from
+/// `cargo run`; sharing one copy here instead of five independently
+/// drifting ones is the same fix `classify_cargo_run_exit`'s own doc comment
+/// already describes for the exit-code-classification half of this same
+/// problem. (#1884 code review, round 3: this function's own `spawn()` call
+/// used a bare `?` with no `ENOENT` handling until this paragraph's fix --
+/// the one piece of `spawn_jq_full`'s old protection that got lost when
+/// `jq_cli_tests.rs` first adopted this shared helper, since this function
+/// didn't have it either at the time.)
+///
+/// `build` is called fresh on each retry attempt, since a spawned
+/// `std::process::Command` cannot be reused. `stdout`/`stderr` are always
+/// piped. `stdin` is piped and `stdin_input` written to it when `Some`;
+/// when `None`, `stdin` is explicitly set to `Stdio::null()` -- **not**
+/// left unconfigured, which would default to inheriting this test
+/// process's own stdin under `.spawn()` (unlike `.output()`, whose
+/// documented default *is* `Stdio::null()`; an earlier version of this
+/// function relied on that same default by simply never calling
+/// `.stdin(...)` in the `None` case, silently inheriting instead once
+/// converted to `.spawn()`/`.wait_with_output()` -- confirmed live: a
+/// spawned child with only stdout/stderr piped echoes back whatever this
+/// process's own stdin contains, where the old `.output()` calls it
+/// replaced saw immediate EOF). Getting this wrong reintroduces exactly
+/// the class of hang this whole conversion exists to eliminate, just
+/// relocated to stdin instead of an orphaned grandchild.
+///
+/// Uses [`write_stdin_then_wait`] for the write/wait/reap sequencing
+/// itself (#2016 code review); this function's own contribution on top is
+/// the spawn-ENOENT retry, the signal-death retry, and the backoff below.
+///
+/// Retries sleep `100 * (attempt + 1)` ms between attempts, matching
+/// every pre-conversion call site's own backoff -- an immediate retry
+/// under the same sustained load that caused the first signal death (an
+/// OOM condition that hasn't cleared, a stall-guard still killing the
+/// process group) is more likely to be killed again in the same narrow
+/// window, burning through the retry budget faster than a short backoff
+/// would.
+///
+/// Returns the real exit code alongside the `Output` so callers never
+/// need their own `output.status.code().expect(...)` -- that invariant
+/// (a real code is always present in an `Ok` result) is asserted here
+/// exactly once, via [`exit_code_or_signal_death`], rather than
+/// re-asserted independently at every call site.
 pub fn spawn_with_signal_retry(
     mut build: impl FnMut() -> std::process::Command,
     stdin_input: Option<&[u8]>,
@@ -283,7 +297,10 @@ pub fn spawn_with_signal_retry(
                 std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            // #2016 (code review): `.context(...)`, matching
+            // `write_stdin_then_wait`'s own stage-tagging -- see its doc
+            // comment for why.
+            Err(e) => return Err(anyhow::Error::new(e).context("spawn succinctly")),
         };
         // A write failure surfaces here unconditionally, same as it always
         // has (#1891 code review): only exit-status classification below
