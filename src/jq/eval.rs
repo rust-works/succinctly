@@ -33265,65 +33265,61 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path, "all paths qualify" and "the one path qualifies" are the same
     // condition, so a second per-path check here would be unreachable dead
     // code, not a real fallback.)
-    {
-        let mut result = result;
-        for path in &paths {
-            // yq's chained-scalar-slice del() rule (#1116, generalized by
-            // #1219 to a whole trailing slice-run) — a *different* rule from
-            // #1101's no-op above: rewrite the path to delete the parent key
-            // outright (or no-op the whole call) rather than walking the
-            // original path at all, when it applies. See
-            // `yq_del_slice_outcome`'s doc comment. `false`: this walks the
-            // whole resolved path, not a per-element `rest` after `.[]`, so
-            // an empty residual prefix means "no-op," not "delete the root."
-            let outcome = if S::TAG == EvalTag::Yq {
-                yq_del_slice_outcome(path, &result, false)
-            } else {
-                YqDelSliceOutcome::NotApplicable
-            };
-            let effective_path: &Expr = match &outcome {
-                YqDelSliceOutcome::DropParent(rewritten) => rewritten,
-                // #1219: a chained slice with more path after it that
-                // *isn't* itself another trailing slice (`.a[1:3][0]`,
-                // `.a[1:3][0].x`, `.a[1:3][]`) real-yq no-ops entirely,
-                // live-verified — it does *not* fall through to walking the
-                // slice and then the rest of the path, which is what
-                // `delete_at_path`'s own per-step walk would otherwise do
-                // here and get wrong.
-                YqDelSliceOutcome::Noop => continue,
-                YqDelSliceOutcome::NotApplicable => path,
-            };
-            // yq's root-delete rule (#1702): real yq deletes the whole
-            // document and emits nothing for a bare `del(.)` (no `?`
-            // anywhere), and treats `del(.?)` as a full no-op — the
-            // optional root delete never fires. `succinctly` previously
-            // followed jq's model for both (`del(.)` => `null`,
-            // `del(.?)` => `null`), which is correct for `succinctly jq`
-            // but not `succinctly yq`. Checked here, ahead of
-            // `delete_at_path`, rather than inside its `Expr::Identity`
-            // arm, since that arm has no way to signal "no output at
-            // all" through its `Result<(), EvalError>` return type.
-            if S::TAG == EvalTag::Yq {
-                match effective_path {
-                    Expr::Identity => return QueryResult::None,
-                    Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Identity) => {
-                        continue;
-                    }
-                    _ => {}
+    let mut result = result;
+    for path in &paths {
+        // yq's chained-scalar-slice del() rule (#1116, generalized by
+        // #1219 to a whole trailing slice-run) — a *different* rule from
+        // #1101's no-op above: rewrite the path to delete the parent key
+        // outright (or no-op the whole call) rather than walking the
+        // original path at all, when it applies. See
+        // `yq_del_slice_outcome`'s doc comment. `false`: this walks the
+        // whole resolved path, not a per-element `rest` after `.[]`, so
+        // an empty residual prefix means "no-op," not "delete the root."
+        let outcome = if S::TAG == EvalTag::Yq {
+            yq_del_slice_outcome(path, &result, false)
+        } else {
+            YqDelSliceOutcome::NotApplicable
+        };
+        let effective_path: &Expr = match &outcome {
+            YqDelSliceOutcome::DropParent(rewritten) => rewritten,
+            // #1219: a chained slice with more path after it that
+            // *isn't* itself another trailing slice (`.a[1:3][0]`,
+            // `.a[1:3][0].x`, `.a[1:3][]`) real-yq no-ops entirely,
+            // live-verified — it does *not* fall through to walking the
+            // slice and then the rest of the path, which is what
+            // `delete_at_path`'s own per-step walk would otherwise do
+            // here and get wrong.
+            YqDelSliceOutcome::Noop => continue,
+            YqDelSliceOutcome::NotApplicable => path,
+        };
+        // yq's root-delete rule (#1702): real yq deletes the whole
+        // document and emits nothing for a bare `del(.)` (no `?`
+        // anywhere), and treats `del(.?)` as a full no-op — the
+        // optional root delete never fires. `succinctly` previously
+        // followed jq's model for both (`del(.)` => `null`,
+        // `del(.?)` => `null`), which is correct for `succinctly jq`
+        // but not `succinctly yq`. Checked here, ahead of
+        // `delete_at_path`, rather than inside its `Expr::Identity`
+        // arm, since that arm has no way to signal "no output at
+        // all" through its `Result<(), EvalError>` return type.
+        if S::TAG == EvalTag::Yq {
+            match effective_path {
+                Expr::Identity => return QueryResult::None,
+                Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Identity) => {
+                    continue;
                 }
-            }
-            if let Err(e) =
-                delete_at_path(&mut result, effective_path, false, S::TAG == EvalTag::Yq)
-            {
-                return if optional {
-                    QueryResult::None
-                } else {
-                    QueryResult::Error(e)
-                };
+                _ => {}
             }
         }
-        return QueryResult::Owned(result);
+        if let Err(e) = delete_at_path(&mut result, effective_path, false, S::TAG == EvalTag::Yq) {
+            return if optional {
+                QueryResult::None
+            } else {
+                QueryResult::Error(e)
+            };
+        }
     }
+    QueryResult::Owned(result)
 }
 
 /// Delete a value at a path expression.
