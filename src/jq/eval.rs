@@ -2605,6 +2605,27 @@ macro_rules! to_owned_checked_or_suppress {
     };
 }
 
+/// The collection-level twin of [`to_owned_checked_or_suppress`]: converts
+/// every item of `$iter` with `to_owned_checked`, short-circuiting on the
+/// first error (code review, #1989/#2028) -- was hand-rolled as `match
+/// $iter.map(|v| to_owned_checked(&v)).collect() { Ok(v) => v, Err(e) =>
+/// return suppress_or_raise(e, $optional) }` at three separate call sites
+/// (`builtin_combinations`, `builtin_combinations_n`, `builtin_skip`)
+/// before this consolidation -- the exact "keeps rediscovering missing at
+/// one more call site" pattern [`to_owned_checked_or_suppress`]'s own doc
+/// comment already names for the single-value case.
+macro_rules! to_owned_checked_vec_or_suppress {
+    ($iter:expr, $optional:expr) => {
+        match $iter
+            .map(|v| to_owned_checked(&v))
+            .collect::<Result<Vec<OwnedValue>, EvalError>>()
+        {
+            Ok(v) => v,
+            Err(e) => return suppress_or_raise(e, $optional),
+        }
+    };
+}
+
 /// #1934 item 7: whether `optional == true` is ever actually reachable here
 /// (or at `eval_reduce`/`eval_foreach`/`eval_as`, which route into this same
 /// guard) was left as an open question after #1902/#1927's review -- multiple
@@ -11278,15 +11299,8 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         QueryResult::Many(results) => {
-            let skipped: Result<Vec<OwnedValue>, EvalError> = results
-                .into_iter()
-                .skip(n)
-                .map(|v| to_owned_checked(&v))
-                .collect();
-            match skipped {
-                Ok(skipped) => owned_vec_to_result(skipped),
-                Err(e) => suppress_or_raise(e, optional),
-            }
+            let skipped = to_owned_checked_vec_or_suppress!(results.into_iter().skip(n), optional);
+            owned_vec_to_result(skipped)
         }
         QueryResult::ManyOwned(results) => {
             let skipped: Vec<OwnedValue> = results.into_iter().skip(n).collect();
@@ -35149,10 +35163,7 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
                         // `optional`, the same as the sibling `_ if
                         // optional` arms in this same match.
                         let inner_values: Vec<OwnedValue> =
-                            match inner.map(|v| to_owned_checked(&v)).collect() {
-                                Ok(v) => v,
-                                Err(e) => return suppress_or_raise(e, optional),
-                            };
+                            to_owned_checked_vec_or_suppress!(inner, optional);
                         arrays.push(inner_values);
                     }
                     _ if optional => return QueryResult::None,
@@ -35264,10 +35275,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => {
             // #1953: a non-decode-failure error respects `optional`, the
             // same as the sibling `_ if optional` arm below.
-            match (*elements).map(|v| to_owned_checked(&v)).collect() {
-                Ok(v) => v,
-                Err(e) => return suppress_or_raise(e, optional),
-            }
+            to_owned_checked_vec_or_suppress!(*elements, optional)
         }
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
