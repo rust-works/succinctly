@@ -1628,6 +1628,49 @@ fn test_input_format_json_bridge_raises_on_colliding_decode_failure_key_1738() -
     Ok(())
 }
 
+/// #1975: the `--input-format json` bridge's `to_owned_canonicalizing_numbers`
+/// had neither the #1677 malformed-`,`/`:` delimiter check nor the #1194
+/// unpaired-tail check at all, unlike every other route into the evaluator.
+/// Confirmed live before this fix: `.[0] | keys_unsorted` here silently
+/// returned `["a","b"]` with exit 0.
+#[test]
+fn test_input_format_json_bridge_raises_on_malformed_delimiter_1975() -> Result<()> {
+    let json = r#"{"a" 1, "b": 2}"#;
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".[0] | keys_unsorted",
+        json,
+        &["--input-format", "json", "--slurp"],
+    )?;
+    assert_eq!(code, 1, "--slurp should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".[0] | keys_unsorted",
+        json,
+        &["--input-format", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 1, "--eval-all should raise, stderr: {stderr}");
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+
+    // Well-formed data is unaffected.
+    let (output, code) = run_yq_stdin(
+        ".[0] | keys_unsorted",
+        r#"{"a":1,"b":2}"#,
+        &["--input-format", "json", "--slurp", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a","b"]"#);
+
+    Ok(())
+}
+
 /// #1749 sibling: `DisplayKeyGuard::check`'s own contract is "a fallback
 /// spelling on *either side* of the collision is refused" (`document.rs`'s
 /// own doc comment) -- not just fallback-vs-fallback. Pins both orders: a
