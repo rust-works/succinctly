@@ -1,0 +1,1 @@
+path(foreach (range(3) | (., if . == 2 then .a else empty end)) as $k (.; .))

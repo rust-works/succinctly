@@ -1,0 +1,1 @@
+path(foreach (first(range(2000000000)), keys[]) as $k (.; .))

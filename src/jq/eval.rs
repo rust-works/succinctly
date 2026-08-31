@@ -20498,16 +20498,16 @@ impl Keep {
     /// This bound, narrowed to at most `n` outputs.
     fn at_most(self, n: usize) -> Self {
         match self {
-            Keep::First => Keep::First,
-            Keep::AtMost(k) => Keep::AtMost(k.min(n)),
+            Self::First => Self::First,
+            Self::AtMost(k) => Self::AtMost(k.min(n)),
         }
     }
 
     /// The output count at which the leaf's sink answers [`Demand::Stop`].
     fn limit(self) -> usize {
         match self {
-            Keep::First => 1,
-            Keep::AtMost(n) => n,
+            Self::First => 1,
+            Self::AtMost(n) => n,
         }
     }
 }
@@ -22732,91 +22732,103 @@ impl FoldRegister {
     }
 }
 
-/// Path-checks a `reduce`/`foreach` source expression under ambient
-/// tracking before its values are taken from the untracked
-/// `eval_owned_expr_fork` evaluator, shared by [`resolve_reduce`] and
-/// [`resolve_foreach`] (#1467). Real jq evaluates a fold's source "with
-/// tracking on" and raises when it navigates *through* a computed value
-/// (`. as $x | reduce (keys[]) as $k (.; .)` raises "near attempt to
-/// iterate through" -- `keys[]`'s `Iterate` reaches into `keys`'s own
-/// untracked output -- live-verified against jq 1.7.1), even though most
-/// sources (`.a`, `.[]`, `keys`, `range(n)`, a literal) are accepted:
-/// `resolve_node`'s existing recursive dispatch already gets every one of
-/// those cases right for any other tracked position in this file, so
-/// routing the source through it here reuses that logic rather than
-/// re-deriving it.
+/// Resolve a `reduce`/`foreach` source expression to the values the fold
+/// iterates, plus whatever control terminated it -- shared by
+/// [`resolve_reduce`] and [`resolve_foreach`] (#1467, #1872).
+///
+/// Real jq evaluates a fold's source "with tracking on" and raises when it
+/// navigates *through* a computed value (`. as $x | reduce (keys[]) as $k
+/// (.; .)` raises "near attempt to iterate through" -- `keys[]`'s `Iterate`
+/// reaches into `keys`'s own untracked output -- live-verified against jq
+/// 1.7.1), even though most sources (`.a`, `.[]`, `keys`, `range(n)`, a
+/// literal) are accepted. `resolve_node`'s existing recursive dispatch
+/// already gets every one of those cases right for any other tracked
+/// position in this file, so routing the source through it reuses that
+/// logic rather than re-deriving it.
 ///
 /// **Gated on `any_subexpr` finding an actual navigation step
 /// (`Field`/`Index`/`IndexNumber`/`Slice`/`SliceNumber`/`Iterate`)
 /// anywhere in `source`** -- only such a step can ever reach one of
 /// `resolve_node`'s own raising arms in the first place, so a source with
 /// none (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
-/// skips this function's own re-evaluation of `source` entirely. This
-/// isn't just an optimization: an earlier, ungated version of this check
-/// evaluated `input`/`inputs`-sourced folds *twice* -- once here (via
-/// `resolve_leaf`'s stop-after-first sink, which still fully evaluates
-/// the source's first output to answer the check), once more in
-/// `eval_owned_expr_fork` below for the real value -- silently
-/// desynchronizing the two evaluations' shared input-reader position, so
-/// the fold ran against the *second* input document while reporting an
-/// error that named the first (`reduce input as $x (0; $x)` over
-/// `10\n20\n30\n`: real jq names `10`, the ungated version named `20`).
-/// A source containing real navigation has no such stateful-generator
-/// risk baked into this fix specifically -- it can still double-fire an
-/// ordinary side effect (see below) -- but a *reader position* is exactly
-/// the kind of state where "fire twice" isn't cosmetic, it's silent data
-/// corruption, so gating out every source that doesn't need the check at
-/// all removes the entire class for the common case.
+/// goes straight to `eval_owned_expr_fork` and is never resolved here at
+/// all. This isn't just an optimization: an earlier, ungated version of
+/// #1467's check evaluated `input`/`inputs`-sourced folds *twice* -- once
+/// for the check, once more for the real value -- silently desynchronizing
+/// the two evaluations' shared input-reader position, so the fold ran
+/// against the *second* input document while reporting an error that named
+/// the first (`reduce input as $x (0; $x)` over `10\n20\n30\n`: real jq
+/// names `10`, the ungated version named `20`).
 ///
-/// `resolve_node`'s own branches are discarded -- only the escape
-/// matters, and only `Halt` and `EvalError::is_untracked_navigation_error`
-/// (the "near attempt to access/iterate" family this check exists to
-/// surface) are treated as fatal here. Any *other* escape -- an ordinary
-/// runtime `Error` or a `Break` -- returns `None`, deliberately ignored,
-/// even though `resolve_node` did in fact hit it: caught the hard way via
-/// a genuine regression this fix introduced and a test caught,
+/// For a navigating source in jq mode whose resolved branches are all
+/// **untracked**, there is exactly **one** evaluation: [`Keep::AtMost`]
+/// makes `resolve_leaf`'s general case keep every output instead of #987's
+/// first one, so those branches' values *are* the fold's real values. That
+/// is what closes both of #1467's documented costs at once:
+///
+/// - a navigating source's first output no longer fires its side effect
+///   twice (`. as $x | path(reduce (.[] | stderr) as $i (0; $x))` on `[1]`
+///   writes `1` once, matching jq);
+/// - `foreach` keeps the outputs a source legitimately streamed before the
+///   element that raises -- `path(foreach (1,2,keys[]) as $k (.; .))` on
+///   `{"a":1}` now streams `[]` twice before raising, as jq does (#1872).
+///   The escape is returned *with* those values rather than short-circuiting,
+///   and [`resolve_foreach`]'s own per-element loop applies it after
+///   streaming them, exactly as it already did for an ordinary `Partial`
+///   source.
+///
+/// The all-untracked condition is load-bearing, not a conservative hedge. A
+/// *trackable* branch means the source is itself a path expression in jq's
+/// eyes, and jq's fold then behaves in a way this file does not model:
+/// the source's own navigation clobbers the path register, so jq raises
+/// "Invalid path expression with result <input>" on the fold's very first
+/// emit instead of emitting (`path(foreach (.a) as $k (.; .))` on
+/// `{"a":1}` exits 5 in jq and prints `[]` here — a separate, pre-existing
+/// divergence, #2031). Streaming a resolved prefix there would
+/// surface that divergence in new places, so such a source falls back to
+/// #1467's two-pass shape, unchanged. Randomised differential fuzzing
+/// against jq 1.7.1 is what established the boundary: an unrestricted
+/// version regressed eleven of four thousand generated folds, every one of
+/// them a source with a trackable branch, and zero without.
+///
+/// `Keep::First` would silently break both: it narrows a multi-output leaf
+/// like `range(3)` to its first value, which is not merely a shorter error
+/// prefix but a *wrong fold* -- `reduce (limit(2; range(5)), .a) as $i` would
+/// run two iterations instead of three. It also makes the check itself
+/// blind: `path(foreach (range(3) | (., if . == 2 then .a else empty end))
+/// as $k (.; .))` raises jq's tracked "near attempt to access element" only
+/// once the leaf is allowed to reach its third output.
+///
+/// **The invariant this now depends on is stronger than the one this file
+/// generally maintains.** `take_path_branches`' own doc comment promises
+/// only that a prefix is never *longer* than jq's; a *shorter* one has
+/// always been acceptable, because branches were previously discarded here.
+/// They are values now, so a short prefix is a wrong answer rather than a
+/// wrong error message. The `Err(_)` arm below deliberately falls back to
+/// `eval_owned_expr_fork` for any escape that is neither `Halt` nor
+/// `EvalError::is_untracked_navigation_error`, which covers the escapes
+/// this check exists to surface and leaves every other one to the untracked
+/// evaluator that has always answered them (and keeps
 /// `test_reduce_foreach_escapes_and_partial_prefix_1440`'s `foreach
-/// (1,2,error("s"))` case, whose `[[], []]` partial prefix an earlier
-/// version of this function silently discarded by treating *any*
-/// `resolve_node` escape as fatal -- that escape carries no information
-/// the caller doesn't already get, correctly along with any partial
-/// prefix, from its own `eval_owned_expr_fork` call immediately below.
-/// `resolve_node`'s own branches are discarded unconditionally regardless
-/// of which escape (if any) fired: `resolve_leaf`'s general, non-primitive
-/// case (`#986`'s deliberate defer-not-raise leaf) narrows a multi-output
-/// source like `range(3)` to its first value alone, which would silently
-/// truncate the fold to one iteration if taken as the real source.
+/// (1,2,error("s"))` prefix intact). It does **not** cover the six places
+/// that launder an `Err` into a short `Ok` below this call -- `Expr::Optional`'s
+/// blanket arm, `resolve_catch`'s no-`catch` case, `Expr::Label` on a
+/// matching break, `take_path_branches`, `resolve_recurse`'s
+/// `RECURSE_MAX_ITEMS` cap, and `resolve_repeat_bounded`. Anyone changing
+/// one of those is changing a fold's values here too.
 ///
-/// **Documented cost, not fixed here**: for a *navigating* source, the
-/// stop-after-first sink above still fully evaluates the first output
-/// twice -- so a navigating source whose first output has a side effect
-/// (`stderr`) fires it twice where jq's own single tracked evaluation
-/// fires it once. Measured live against jq 1.7.1
-/// (`path(. as $x | reduce (.[range(1)] | stderr) as $i (0; $x))` writes
-/// one `stderr` line in jq, two here) -- accepted as this approach's own
-/// stated trade-off rather than the alternative (threading a new "keep
-/// every output while tracking" mode through `resolve_node`'s entire
-/// ~20-call-site dispatch graph so the fold's real values could be taken
-/// from this same evaluation), which is a materially larger, more
-/// invasive change to a widely-shared traversal.
-///
-/// **Also not fixed here** (filed as a follow-up rather than expanded
-/// into this already-corrected fix): `foreach`'s own per-element
-/// streaming means a *navigating* source that legitimately emits some
-/// elements before the one that raises loses that earlier output --
-/// `path(foreach (1,2,keys[]) as $k (.; .))` on `{"a":1}` streams `[]`
-/// twice before raising in jq, prints nothing here -- because this
-/// function checks the *whole* source expression before
-/// `eval_owned_expr_fork` gets to stream anything. Fixing this needs the
-/// same "single interleaved evaluation" architecture the side-effect
-/// trade-off above already declined for a materially larger change. See
-/// docs/compliance/jq/limitations.md for both remaining gaps.
-fn path_check_fold_source<S: EvalSemantics>(
+/// **`EvalTag::Jq` only.** Real yq's lexer rejects `reduce`, `foreach` *and*
+/// `path` outright (confirmed live against yq v4.53.3), so yq mode has no
+/// oracle to check a value against, and `resolve_index_expr`'s yq-only
+/// `scalar_noop` arm would feed the *unchanged target* into the fold where
+/// the evaluator raises. Yq keeps #1467's original two-pass shape: check
+/// with `Keep::First`, take the values from `eval_owned_expr_fork`.
+fn resolve_fold_source<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
     snapshot: bool,
-) -> Option<EvalEscape> {
+) -> (Vec<OwnedValue>, Option<Control>) {
     let has_navigation = any_subexpr(source, &mut |e| {
         matches!(
             e,
@@ -22829,16 +22841,62 @@ fn path_check_fold_source<S: EvalSemantics>(
         )
     });
     if !has_navigation {
-        return None;
+        return eval_owned_expr_fork::<S>(source, value, false);
     }
-    match resolve_node::<S>(source, value, trackable, snapshot, Keep::First) {
-        Ok(_) => None,
-        Err((_, EvalEscape::Halt(code))) => Some(EvalEscape::Halt(code)),
-        Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
-            Some(EvalEscape::Error(e))
+    let keep = if S::TAG == EvalTag::Jq {
+        Keep::AtMost(usize::MAX)
+    } else {
+        Keep::First
+    };
+    let resolved = resolve_node::<S>(source, value, trackable, snapshot, keep);
+    if S::TAG != EvalTag::Jq {
+        // Yq: branches discarded, only the fatal escape kept (#1467's
+        // original shape) -- see this function's doc comment.
+        return match resolved {
+            Err((_, e @ EvalEscape::Halt(_))) => (Vec::new(), Some(e.into())),
+            Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
+                (Vec::new(), Some(Control::Error(e)))
+            }
+            _ => eval_owned_expr_fork::<S>(source, value, false),
+        };
+    }
+    let (branches, escape) = match resolved {
+        Ok(branches) => (branches, None),
+        Err((prefix, e @ EvalEscape::Halt(_))) => (prefix, Some(e)),
+        Err((prefix, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
+            (prefix, Some(EvalEscape::Error(e)))
         }
-        Err(_) => None,
+        // Any other escape is the untracked evaluator's to report -- see
+        // this function's doc comment.
+        Err(_) => return eval_owned_expr_fork::<S>(source, value, false),
+    };
+    if branches.iter().all(|b| !b.trackable) {
+        return (branch_values(branches), escape.map(Control::from));
     }
+    // At least one branch carries a live path, i.e. the source is itself a
+    // path expression in jq's eyes -- and jq's fold then behaves in a way
+    // this file does not model at all: the source's own navigation clobbers
+    // the path register, so jq raises "Invalid path expression with result
+    // <input>" on the fold's very first emit rather than emitting
+    // (`path(foreach (.a) as $k (.; .))` on `{"a":1}` exits 5 in jq, prints
+    // `[]` here -- a separate, pre-existing divergence, #2031).
+    // Reusing the resolved values here would stream a prefix jq never
+    // streams, so this falls back to #1467's original two-pass shape,
+    // leaving that divergence exactly where it was. Randomised differential
+    // fuzzing against jq 1.7.1 is what found this: an unrestricted version
+    // regressed eleven of four thousand generated folds, every one of them
+    // a source with a trackable branch.
+    match escape {
+        Some(e) => (Vec::new(), Some(e.into())),
+        None => eval_owned_expr_fork::<S>(source, value, false),
+    }
+}
+
+/// The values a resolved branch list carries, in order — the fold's own
+/// source stream once [`resolve_fold_source`] has run the source with
+/// [`Keep::AtMost`].
+fn branch_values(branches: Vec<PathBranch<'_>>) -> Vec<OwnedValue> {
+    branches.into_iter().map(|b| b.value.into_owned()).collect()
 }
 
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
@@ -22861,6 +22919,13 @@ fn path_check_fold_source<S: EvalSemantics>(
 /// this function receives it already embedded; `FoldRegister`'s only job is
 /// keeping that marker's own check comparing against the position it was
 /// actually bound from, not the accumulator's.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `keep` (#1872) joins `trackable`/`snapshot`
+                                     // as the ambient trio threaded verbatim through every one of
+                                     // `resolve_node`'s ~20 recursive call sites in this file; a
+                                     // context struct just for this one call site would diverge
+                                     // from that established, unbundled threading convention, and
+                                     // would hide the handful of sites that deliberately override
+                                     // one ambient and not the others.
 fn resolve_reduce<'a, S: EvalSemantics>(
     input: &Expr,
     pattern: &Pattern,
@@ -22871,17 +22936,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     snapshot: bool,
     keep: Keep,
 ) -> PathResolveResult<'a> {
-    // #1467: path-check the source under ambient tracking before taking
-    // its values from the untracked evaluator below.
-    if let Some(e) = path_check_fold_source::<S>(input, value, trackable, snapshot) {
-        return Err((Vec::new(), e));
-    }
     // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
     // output is always single-shot, so a `Partial` input just extracts the
     // control and drops the prefix (there's no path-tracking analogue of
     // "a prefix" for the source stream itself, same as the value
-    // evaluator).
-    let (input_values, input_escape) = eval_owned_expr_fork::<S>(input, value, false);
+    // evaluator). `reduce` therefore returns on *any* source escape here,
+    // including #1467's path-check escape, exactly as it did when that
+    // check was a separate short-circuit ahead of this call — only
+    // `foreach` has a prefix to stream first (#1872).
+    let (input_values, input_escape) = resolve_fold_source::<S>(input, value, trackable, snapshot);
     if let Some(control) = input_escape {
         return Err((Vec::new(), control.into()));
     }
@@ -23042,15 +23105,12 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     snapshot: bool,
     keep: Keep,
 ) -> PathResolveResult<'a> {
-    // #1467: path-check the source under ambient tracking before taking
-    // its values from the untracked evaluator below — see
-    // `resolve_reduce`'s identical check for the full rationale.
-    if let Some(e) = path_check_fold_source::<S>(input, value, trackable, snapshot) {
-        return Err((Vec::new(), e));
-    }
     // Unlike `reduce`, a `Partial` source stream's own prefix is iterated
-    // below — mirrors `eval_foreach`'s identical rule.
-    let (input_values, input_control) = eval_owned_expr_fork::<S>(input, value, false);
+    // below — mirrors `eval_foreach`'s identical rule, and #1467's
+    // path-check escape is now just another such trailing control rather
+    // than a short-circuit ahead of this call, which is what lets the
+    // elements produced before it still stream (#1872).
+    let (input_values, input_control) = resolve_fold_source::<S>(input, value, trackable, snapshot);
 
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
     // into its own INIT resolution — see that function's doc comment
@@ -69891,6 +69951,13 @@ mod tests {
         // Source-stream partial: `foreach` streams the produced prefix
         // (two outputs) before raising; `reduce` is single-shot and drops
         // it, raising with nothing.
+        //
+        // This source contains no navigation step, so
+        // `resolve_fold_source`'s `any_subexpr` gate routes it straight to
+        // `eval_owned_expr_fork` and it never reaches the tracked resolver
+        // at all. That makes it the canary for anyone loosening that gate:
+        // an ungated version of #1467's own check discarded this `[[], []]`
+        // prefix, which is how the gate got written in the first place.
         query!(
             br#"{"a":1}"#,
             r#"path(foreach (1,2,error("s")) as $i (.; .))"#,
@@ -69927,6 +69994,111 @@ mod tests {
                 r"[label $out | path(reduce (1,2) as $i (.; if $i==2 then ., break $out else . end))]"
             ),
             [r"[]"]
+        );
+    }
+
+    /// #1872: a fold source that navigates through an untracked value
+    /// raises, but `foreach` still streams whatever the source
+    /// legitimately produced *before* that point — real jq evaluates the
+    /// source once, with tracking on, interleaved with consuming each
+    /// output, so the elements before the failing one have already been
+    /// folded and emitted by the time it raises.
+    ///
+    /// Every case here is captured from jq 1.7.1 and also pinned as a
+    /// `fold_source_*_1872` golden; they are repeated in-process because a
+    /// golden compares whole streams while these assert the *prefix
+    /// length*, which is what a `Keep::First` regression in
+    /// `resolve_fold_source` would silently shorten.
+    #[test]
+    fn test_fold_source_streams_prefix_before_fatal_escape_1872() {
+        // The issue's own repro: elements `1` and `2` fold and emit, then
+        // `keys[]`'s `Iterate` reaches into `keys`'s untracked output.
+        query!(
+            br#"{"a":1}"#,
+            r"path(foreach (1,2,keys[]) as $k (.; .))",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r"[]", r"[]"]);
+                assert!(
+                    e.message.contains("near attempt to iterate through"),
+                    "{}", e.message
+                );
+            }
+        );
+
+        // `reduce`'s output is single-shot, so it still raises with
+        // nothing — unchanged by #1872.
+        query!(
+            br#"{"a":1}"#,
+            r"path(reduce (1,2,keys[]) as $k (.; .))",
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("near attempt to iterate through"),
+                    "{}", e.message
+                );
+            }
+        );
+
+        // A multi-output *leaf* in the prefix is the case `Keep::First`
+        // cannot express: `range(3)` must contribute all three values, not
+        // just its first. jq streams three `[]` here.
+        query!(
+            br#"{"a":1}"#,
+            r"path(foreach (range(3), keys[]) as $k (.; .))",
+            QueryResult::Partial(vs, Control::Error(_)) => {
+                assert_eq!(prefix_json(&vs), [r"[]", r"[]", r"[]"]);
+            }
+        );
+
+        // ...and a *bounded* one must contribute exactly its bound, which
+        // is why `resolve_node_bounded` narrows `keep` rather than
+        // dropping it: two here, not one (`Keep::First`) and not five
+        // (an unnarrowed `Keep::AtMost`).
+        query!(
+            br#"{"a":1}"#,
+            r"path(foreach (limit(2; range(5)), keys[]) as $k (.; .))",
+            QueryResult::Partial(vs, Control::Error(_)) => {
+                assert_eq!(prefix_json(&vs), [r"[]", r"[]"]);
+            }
+        );
+
+        // Keeping every output is also what makes the *check* see the
+        // failure at all: the navigation only happens on the leaf's third
+        // value, so a stop-after-first resolver reported jq's untracked
+        // "Cannot index number with string" instead of this tracked one.
+        query!(
+            br#"{"a":1}"#,
+            r"path(foreach (range(3) | (., if . == 2 then .a else empty end)) as $k (.; .))",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r"[]", r"[]", r"[]"]);
+                assert_eq!(
+                    e.message,
+                    "Invalid path expression near attempt to access element \"a\" of 2"
+                );
+            }
+        );
+    }
+
+    /// #1872: `Keep::AtMost` is introduced by `resolve_fold_source` and
+    /// nowhere else, so an ordinary `path()` still sees #987's
+    /// stop-after-first leaf. These are the shapes that would change if it
+    /// ever leaked out of a fold source into `resolve_dynamic_indexes`'s
+    /// own entry.
+    #[test]
+    fn test_fold_source_keep_all_does_not_leak_to_path_consumers_1872() {
+        query!(
+            br"[1,2,3]",
+            r"path(range(3))",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 0");
+            }
+        );
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, r"[path(limit(2; .a, .b))]"),
+            [r#"[["a"],["b"]]"#]
+        );
+        assert_eq!(
+            outputs(br#"{"a":1,"b":2}"#, r"[path(first(.a, .b))]"),
+            [r#"[["a"]]"#]
         );
     }
 
