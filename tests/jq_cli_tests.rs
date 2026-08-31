@@ -29038,3 +29038,179 @@ fn test_catch_handler_outputs_keep_ambient_path_1409() -> Result<()> {
 
     Ok(())
 }
+
+/// #2061: every arm of the cursor-native `path()` walk, exercised through the
+/// CLI so it reaches `eval_generic.rs`'s `Builtin::Path` rather than
+/// `eval.rs`'s library-only entry point.
+///
+/// Every expectation is jq 1.7.1's own output, re-verified live: this arm
+/// exists to be faster, not to behave differently, so parity is the whole
+/// specification.
+#[test]
+fn test_path_cursor_native_navigational_shapes_2061() -> Result<()> {
+    for (filter, input, want) in [
+        // Identity, field, nested field.
+        ("path(.)", "{\"a\":1}", "[]\n"),
+        ("path(.a)", "{\"a\":1}", "[\"a\"]\n"),
+        ("path(.a.b)", "{\"a\":{\"b\":1}}", "[\"a\",\"b\"]\n"),
+        // A path need not exist: jq yields it and keeps navigating through
+        // the absent node as if it were null.
+        ("path(.a)", "{}", "[\"a\"]\n"),
+        ("path(.a.b)", "{}", "[\"a\",\"b\"]\n"),
+        ("path(.a.b)", "null", "[\"a\",\"b\"]\n"),
+        // Index, including the float spelling (#1088) and a negative index,
+        // neither of which needs the array's length.
+        ("path(.[0])", "[7,8]", "[0]\n"),
+        ("path(.[0])", "[]", "[0]\n"),
+        ("path(.[2.0])", "[1,2,3]", "[2.0]\n"),
+        ("path(.[-1])", "[1,2,3]", "[-1]\n"),
+        // Iterate over both container kinds.
+        ("[path(.[])]", "{\"a\":1,\"b\":2}", "[[\"a\"],[\"b\"]]\n"),
+        ("[path(.[])]", "[7,8]", "[[0],[1]]\n"),
+        ("[path(.[])]", "{}", "[]\n"),
+        // Comma, pipe through a fan-out, and `?`.
+        ("[path(.a,.b)]", "{\"a\":1,\"b\":2}", "[[\"a\"],[\"b\"]]\n"),
+        (
+            "[path(.[]|.x)]",
+            "[{\"x\":1},{\"x\":2}]",
+            "[[0,\"x\"],[1,\"x\"]]\n",
+        ),
+        ("[path(.a?)]", "[1,2]", "[]\n"),
+        ("[path((.a)?)]", "[1,2]", "[]\n"),
+        // A non-navigable body still works -- it defers to the materializing
+        // resolver rather than being rejected.
+        ("[path(.[]|select(.>1))]", "[1,2,3]", "[[1],[2]]\n"),
+        ("path(.[\"a\"])", "{\"a\":1}", "[\"a\"]\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on `{input}`");
+        assert_eq!(stdout, want, "`{filter}` on `{input}`");
+    }
+    Ok(())
+}
+
+/// #2061: the error arms of the same walk. Each message is jq 1.7.1's own,
+/// and comes from the same `EvalError` constructor the materializing resolver
+/// uses, so the two cannot drift.
+#[test]
+fn test_path_cursor_native_type_errors_2061() -> Result<()> {
+    for (filter, input, want) in [
+        ("path(.a)", "[1,2]", "Cannot index array with string \"a\""),
+        ("path(.a)", "5", "Cannot index number with string \"a\""),
+        ("path(.a)", "\"s\"", "Cannot index string with string \"a\""),
+        ("path(.a)", "true", "Cannot index boolean with string \"a\""),
+        (
+            "path(.a.b)",
+            "{\"a\":1}",
+            "Cannot index number with string \"b\"",
+        ),
+        ("path(.[0])", "{}", "Cannot index object with number"),
+        ("path(.[0])", "5", "Cannot index number with number"),
+        ("path(.[])", "null", "Cannot iterate over null (null)"),
+        ("path(.[])", "5", "Cannot iterate over number (5)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}` on `{input}`: stdout {stdout:?}");
+        assert!(
+            stderr.contains(want),
+            "`{filter}` on `{input}`: wanted {want:?}, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2061: a partial result produced before a later sibling errors must still
+/// be emitted -- jq's generator never un-emits an output it already produced.
+///
+/// Discarding it is the bug the evaluator-parity and golden suites caught in
+/// this change's first cut, so it is pinned directly rather than left to them.
+#[test]
+fn test_path_cursor_native_keeps_output_before_a_later_error_2061() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("path(.a.b, .c.d)", "{\"a\":{\"b\":1},\"c\":1}", &["-c"])?;
+    assert_eq!(code, 5, "stderr {stderr}");
+    assert_eq!(stdout, "[\"a\",\"b\"]\n");
+    assert!(
+        stderr.contains("Cannot index number with string \"d\""),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// #2061: the validity walk's lazy #1642 collision map, whose fallback branch
+/// only runs once an undecodable key actually appears.
+///
+/// All three layouts matter and are checked separately, because the branch
+/// re-walks the object's *preceding* keys to seed the map: a fallback key
+/// first exercises the empty-prefix case, a fallback key after a clean one
+/// exercises the re-walk itself, and two fallback keys exercise the guard
+/// finding a genuine collision. Byte-identical to the eager map on all three,
+/// verified against `main` before this change landed.
+///
+/// Raw invalid UTF-8 rather than a `\uXXXX` escape: succinctly's semi-index
+/// accepts these bytes (real jq does too, substituting U+FFFD), where every
+/// bad-escape form is rejected at parse time and never reaches this walk.
+#[test]
+fn test_path_validity_walk_lazy_collision_map_2061() -> Result<()> {
+    let replacement = "\u{fffd}\u{fffd}";
+
+    // Fallback key first: the re-walk runs with an empty prefix.
+    let (out, code) = run_jq_binary_stdin("[path(.[])]", b"{\"\xff\xfe\": 1, \"a\": 2}", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim(),
+        format!("[[\"{replacement}\"],[\"a\"]]")
+    );
+
+    // Fallback key after a clean one: the re-walk has a prefix to seed from.
+    let (out, code) = run_jq_binary_stdin(
+        "[path(.[])]",
+        b"{\"a\": 1, \"\xff\xfe\": 2, \"b\": 3}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim(),
+        format!("[[\"a\"],[\"{replacement}\"],[\"b\"]]")
+    );
+
+    // Two fallback keys whose display forms collide: `keys` collapses them,
+    // and the walk must not raise for an ordinary repeat.
+    let (out, code) = run_jq_binary_stdin(
+        "[path(.[])]",
+        b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out).trim(),
+        format!("[[\"{replacement}\"]]")
+    );
+
+    // A navigation that never visits the undecodable key still sees it,
+    // because the walk validates the whole document -- this is the behaviour
+    // #2061 deliberately preserved rather than trading away for speed.
+    let (out, code) = run_jq_binary_stdin("path(.a)", b"{\"\xff\xfe\": 1, \"a\": 2}", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "[\"a\"]");
+
+    Ok(())
+}
+
+/// #2061: a `\uXXXX`-family decode failure anywhere in the document still
+/// makes `path()` raise, unchanged from before this change.
+///
+/// This is the validity gate the cursor walk deliberately keeps: dropping it
+/// would have made `path()` roughly 8x faster still, but #1755/#1953 chose to
+/// raise on undecodable content rather than silently substitute, and a
+/// performance change is not the place to reverse that.
+#[test]
+fn test_path_still_raises_on_an_undecodable_sibling_2061() -> Result<()> {
+    for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
+        let input = format!("{{\"a\":\"{bad}\",\"d\":5}}");
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.d)", &input, &["-c"])?;
+        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{bad}");
+    }
+    Ok(())
+}
