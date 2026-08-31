@@ -699,6 +699,12 @@ fn gather_input_sources(
 /// `key_display_string` call it used to make (#1738: that gap meant this,
 /// the `--input-format json` bridge, was the one materializer PR #1672 never
 /// reached).
+///
+/// Also raises on a #1194/#1677 structurally malformed document (a bare
+/// non-string key, an unpaired trailing member, a missing/doubled `,`/`:`,
+/// or a value token the semi-index couldn't classify) -- #1975 found this
+/// function missing every one of `to_owned_at_depth`'s checks for these,
+/// despite this doc comment's own "mirrors ... exactly" claim above.
 fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_canonicalizing_numbers_at_depth(value, 0)
 }
@@ -730,29 +736,34 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             // silently drop such a field under `--slurp`/`--eval-all`/
             // `--inplace` (the only callers of `parse_input`, hence of this
             // function), one short of `length`'s real field count. A key
-            // the format's grammar never allowed at all (#1194) is still
-            // dropped, same as before this fix. Two colliding decode-failure
-            // keys now raise instead of silently overwriting one another
-            // (#1642/#1738), matching every other materializer.
-            if let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? {
-                // #1975: this walk was missing the #1677 malformed-`,`/`:`
-                // delimiter check entirely -- unlike its
-                // `eval_generic::to_owned_at_depth` sibling it otherwise
-                // mirrors, which has always had it. This is why
-                // `--input-format json --slurp`/`--eval-all`/`--inplace`
-                // (the only callers of `parse_input`, hence of this
-                // function) silently accepted `{"a" 1, "b": 2}` when every
-                // other route into the evaluator correctly raised.
-                if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
-                    || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
-                {
-                    return Err(f.malformed_member_error());
-                }
-                map.insert(
-                    key,
-                    to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
-                );
+            // that will not *stringify* at all -- a key JSON's grammar never
+            // allowed (`{123: 1}`) -- is a different, structural fault
+            // (#1194) and now raises instead of silently dropping the whole
+            // field (#1975: this used to be an `if let Some(key) = ... {}`
+            // with no `else`, the exact pattern #1679 already fixed at five
+            // other call sites, but missed here). Two colliding
+            // decode-failure keys now raise instead of silently overwriting
+            // one another (#1642/#1738), matching every other materializer.
+            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
+                return Err(f.malformed_member_error());
+            };
+            // #1975: this walk was missing the #1677 malformed-`,`/`:`
+            // delimiter check entirely -- unlike its
+            // `eval_generic::to_owned_at_depth` sibling it otherwise
+            // mirrors, which has always had it. This is why
+            // `--input-format json --slurp`/`--eval-all`/`--inplace`
+            // (the only callers of `parse_input`, hence of this
+            // function) silently accepted `{"a" 1, "b": 2}` when every
+            // other route into the evaluator correctly raised.
+            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
+                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
+            {
+                return Err(f.malformed_member_error());
             }
+            map.insert(
+                key,
+                to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
+            );
             f = rest;
             is_first = false;
         }
@@ -771,12 +782,12 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1975: matches `eval_generic::to_owned_at_depth`'s array arm --
             // a missing/doubled `,` between elements was silently accepted
-            // here too.
-            if let Some(pos) = elem_cursor.text_position() {
-                let expected = if is_first { None } else { Some(b',') };
-                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
-                    return Err(elem_cursor.malformed_delimiter_error());
-                }
+            // here too. `element_gap_ok` (`DocumentCursor`, #1597) rather
+            // than re-deriving `text_position()`/`expected` inline, unlike
+            // that sibling's own still-inline copy (pre-dates the
+            // extraction).
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Err(elem_cursor.malformed_delimiter_error());
             }
             items.push(to_owned_canonicalizing_numbers_at_depth(
                 &elem_cursor.value(),
@@ -811,9 +822,29 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         OwnedValue::Float(f)
     } else if let Some(s) = value.as_str() {
         OwnedValue::String(s.into_owned())
+    } else if let Some(reason) = value.string_decode_error() {
+        // #1975: matches `eval_generic::to_owned_at_depth`'s identical arm
+        // (#1247) -- `as_str` above answered `None`, but the value *is* a
+        // string token whose bytes just don't decode. This function used to
+        // fall all the way to the final `else` for this case, materializing
+        // an undecodable string as `null` instead of raising.
+        return Err(EvalError::decode_failure(reason));
+    } else if value.is_error() {
+        // #1975: matches `eval_generic::to_owned_at_depth`'s identical arm
+        // (#1194) -- a structurally malformed value (`[xyz123]`, `[tru]`)
+        // the semi-index accepted as a span but could not classify as any
+        // JSON token. This function used to materialize it as `null`
+        // instead of raising the semi-index's own, more specific message.
+        return Err(EvalError::new(
+            value
+                .error_message()
+                .unwrap_or("malformed value in document")
+                .to_string(),
+        ));
     } else {
-        // Matches `to_owned_at_depth`'s own `else` arm (#1098) --
-        // unaffected by number canonicalization.
+        // Matches `to_owned_at_depth`'s own final `else` arm (#1098) --
+        // a genuinely unknown type no format implements today, unaffected
+        // by number canonicalization.
         OwnedValue::Null
     })
 }
@@ -6153,6 +6184,34 @@ mod tests {
         let cursor = index.root(json);
         to_owned_canonicalizing_numbers(&cursor.value())
             .expect_err("a missing ',' between array elements is not well-formed JSON");
+    }
+
+    /// #1975 review round 1: two more gaps in the same function, found by
+    /// comparing against `eval_generic::to_owned_at_depth` field-by-field
+    /// rather than trusting this function's own "mirrors exactly" doc
+    /// comment. Both used to silently drop or null out a structurally
+    /// invalid document instead of raising, the same #1194 class the
+    /// delimiter-fault fix above addresses.
+    #[test]
+    fn to_owned_canonicalizing_numbers_raises_on_structural_faults_1975() {
+        // A key JSON's grammar never allowed at all (not a decode failure --
+        // a bare, non-string key) used to be silently dropped along with its
+        // value, the exact `if let Some(key) = ... {}`-no-`else` pattern
+        // #1679 already fixed at five other call sites.
+        let json = br#"{"a": 1, 123: 2, "b": 3}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        to_owned_canonicalizing_numbers(&cursor.value())
+            .expect_err("a non-string key is not well-formed JSON");
+
+        // A structurally malformed value token (not a decode failure -- a
+        // span the semi-index could not classify as any JSON token) used to
+        // materialize as `null` instead of raising.
+        let json = br"[xyz123]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        to_owned_canonicalizing_numbers(&cursor.value())
+            .expect_err("an unclassifiable value token is not well-formed JSON");
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring

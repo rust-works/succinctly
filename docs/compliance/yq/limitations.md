@@ -324,10 +324,25 @@ $ printf '{"a" 1, "b": 2}' | succinctly yq --input-format json --slurp '.[0] | k
 ```
 
 Fixed by adding the same `key_delimiter_ok`/`value_delimiter_ok` checks (object arm) and
-`preceding_delimiter_ok` check (array arm) `to_owned_at_depth` already had, plus the missing
-`ends_unpaired()` check after the object loop. `key_delimiter_ok`/`value_delimiter_ok`
-(`src/jq/document.rs`) went from `pub(crate)` to `pub` for this — `src/bin/succinctly` is a
-separate crate from the library and had no way to call them otherwise.
+`element_gap_ok` check (array arm, #1597's already-extracted helper) `to_owned_at_depth`
+already had, plus the missing `ends_unpaired()` check after the object loop.
+`key_delimiter_ok`/`value_delimiter_ok` (`src/jq/document.rs`) went from `pub(crate)` to
+`pub` for this — `src/bin/succinctly` is a separate crate from the library and had no way
+to call them otherwise.
+
+Review of that first pass found the "mirrors `to_owned_at_depth` exactly" claim had two more
+exceptions, both the same #1194 class as the delimiter/unpaired-tail gap above and both fixed
+the same way:
+
+- A key JSON's grammar never allowed at all (a bare, non-string key like `{123: 1}` — not a
+  *decode* failure, which is preserved via its raw span rather than raised on, same as
+  `to_owned_at_depth`) used to be silently dropped along with its whole field — the
+  `if let Some(key) = ... {}`-with-no-`else` pattern [#1679](https://github.com/rust-works/succinctly/issues/1679)
+  already fixed at five other call sites, missed here.
+- A structurally malformed value token the semi-index accepted as a span but couldn't
+  classify as any JSON token (`[xyz123]`) used to materialize as `null` instead of raising —
+  `to_owned_at_depth`'s own `string_decode_error()`/`is_error()` arms (#1247) were missing
+  from this function entirely.
 
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478),
