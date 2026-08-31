@@ -8618,6 +8618,15 @@ mod tests {
     /// `REINDEX_LITERAL_LEN_CAP`, which is duplicated from a private `const`
     /// inside `to_json_for_reindex`'s body and cannot be shared.
     ///
+    /// One case is *not* checked against the bridge here, and saying so
+    /// matters more than the check it replaces: `round_trips_unchanged`
+    /// normalizes a bare `Int` before comparing, so `Int` passes this test by
+    /// construction rather than by observation. The equality that
+    /// normalization assumes is asserted on its own in
+    /// [`test_reindex_bridge_int_normalization_1909`] — otherwise the most
+    /// load-bearing claim the guard makes would be the one nothing can
+    /// falsify (code review).
+    ///
     /// What is asserted is **soundness** — predicate ⟹ the bridge really was
     /// an identity — not equivalence. Conservatism is free here (a `false`
     /// for something the bridge happens to leave alone costs a missed
@@ -8743,6 +8752,41 @@ mod tests {
         );
     }
 
+    /// The one thing [`reindex_bridge_is_identity`]'s `Int` arm rests on, and
+    /// the one thing `round_trips_unchanged` cannot check because it
+    /// normalizes `Int` before comparing: `to_json_for_reindex` spells a bare
+    /// `Int` as exactly `format!("{n}")`, in **both** modes.
+    ///
+    /// That is what makes the resulting `NumberLiteral(Int(n), "n")` carry no
+    /// text the bare value didn't already render as — the difference from a
+    /// bare `Float`, whose spelling is mode-forked (#953) and genuinely
+    /// differs, which is why the guard refuses that one. If the `Int` arm in
+    /// `to_json_for_reindex` (`src/jq/value.rs`, currently reached through
+    /// `to_json_at_depth`'s own `Self::Int(n) => format!("{n}")` fallback)
+    /// ever grows a mode fork or a separator, this fails here rather than
+    /// silently changing what `succinctly yq` prints for a `parent`/`key`
+    /// query on any document with an integer in it.
+    #[test]
+    fn test_reindex_bridge_int_normalization_1909() {
+        for n in [0i64, 1, -1, 7, -7, 1000, i64::MIN, i64::MAX] {
+            let value = OwnedValue::Int(n);
+            let expected = alloc::format!("{n}");
+            assert_eq!(
+                value.to_json_for_reindex::<JqSemantics>(),
+                expected,
+                "jq-mode reindex spelling for Int({n})"
+            );
+            assert_eq!(
+                value.to_json_for_reindex::<YqSemantics>(),
+                expected,
+                "yq-mode reindex spelling for Int({n})"
+            );
+            // ...and the predicate really does admit it, so this is the arm
+            // the bypass takes rather than a case it quietly falls back on.
+            assert!(super::reindex_bridge_is_identity(&value));
+        }
+    }
+
     /// The real thing `reindex_bridge_is_identity` predicts: run `value`
     /// through `eval_on_owned`'s exact bridge (`to_json_for_reindex`,
     /// `JsonIndex::build`, `to_owned_checked` via `owned_from_standard_json`)
@@ -8755,38 +8799,31 @@ mod tests {
         let cursor = index.root(bytes);
         let round_tripped = owned_from_standard_json(&cursor.value())
             .expect("the bridge's own serialization must reparse");
-        {
-            // Structural equality, not `==`: `OwnedValue`'s `PartialEq`
-            // compares a `NumberLiteral` by its parsed `NumberRepr` and
-            // ignores the source text, but that text is exactly what #1008's
-            // literal preservation echoes back on output -- so a value whose
-            // spelling the bridge rewrote (`0.000...1` -> `1e-257`) compares
-            // *equal* while behaving differently. The derived `Debug` shows
-            // the text; that is the identity this predicate has to be about.
-            // Structural equality, not `==`: `OwnedValue`'s `PartialEq`
-            // compares a `NumberLiteral` by its parsed `NumberRepr` and
-            // ignores the source text, but that text is exactly what #1008's
-            // literal preservation echoes back on output -- so a value whose
-            // spelling the bridge rewrote (`0.000...1` -> `1e-257`) compares
-            // *equal* while behaving differently. The derived `Debug` shows
-            // the text; that is the identity this predicate has to be about.
-            //
-            // The single sanctioned exception is `Int(n)` -> `NumberLiteral(
-            // Int(n), format!("{n}"))`: a normalization that bakes in the
-            // only spelling an `i64` has, so it introduces no text the bare
-            // value didn't already render as. Spelled out here rather than
-            // folded into a looser "renders the same" comparison, because
-            // rendering equality alone would also wave through a bare
-            // `Float`, whose re-spelling is precisely what this guard
-            // exists to catch.
-            {
-                let normalized = match value {
-                    OwnedValue::Int(n) => OwnedValue::from_number_literal(&alloc::format!("{n}")),
-                    other => other.clone(),
-                };
-                format!("{round_tripped:?}") == format!("{normalized:?}")
-            }
-        }
+
+        // Structural equality, not `==`: `OwnedValue`'s `PartialEq` compares
+        // a `NumberLiteral` by its parsed `NumberRepr` and ignores the source
+        // text, but that text is exactly what #1008's literal preservation
+        // echoes back on output -- so a value whose spelling the bridge
+        // rewrote (`0.000...1` -> `1e-257`) compares *equal* while behaving
+        // differently. The derived `Debug` shows the text; that is the
+        // identity this predicate has to be about.
+        //
+        // The single sanctioned exception is `Int(n)` -> `NumberLiteral(
+        // Int(n), format!("{n}"))`: a normalization that bakes in the only
+        // spelling an `i64` has, so it introduces no text the bare value
+        // didn't already render as. Spelled out here rather than folded into
+        // a looser "renders the same" comparison, because rendering equality
+        // alone would also wave through a bare `Float`, whose re-spelling is
+        // precisely what this guard exists to catch. Normalizing here does
+        // mean `Int` cannot *fail* this helper, so the equality it assumes
+        // (`to_json_for_reindex` spells an `Int` as `format!("{n}")`) is
+        // asserted on its own in `test_reindex_bridge_int_normalization_1909`
+        // rather than left to this comment.
+        let normalized = match value {
+            OwnedValue::Int(n) => OwnedValue::from_number_literal(&alloc::format!("{n}")),
+            other => other.clone(),
+        };
+        format!("{round_tripped:?}") == format!("{normalized:?}")
     }
 
     /// #1098/#1247: `JsonIndex::build`'s semi-index scan finds string
