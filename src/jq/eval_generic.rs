@@ -5348,7 +5348,110 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             None => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
         },
 
+        // #2014: `repeat(f)` has no native arm in this evaluator at all --
+        // the `_` fallback below evaluates it *eagerly*, which bridges all
+        // the way to `eval.rs`'s own `eval_repeat`, whose `MAX_ITERATIONS`
+        // round cap exists only as a hang backstop for when nothing
+        // demand-drives it (see that function's own doc comment). Reached
+        // through this fallback, `limit`/`first`/etc. above already stopped
+        // pulling by the time they'd see any of it -- `eval_repeat` ran to
+        // its own 1000-round cap (now raising, not silently truncating)
+        // before this arm's own caller ever got a chance to ask for fewer.
+        // Fixing this needs a *native* arm here, mirroring `eval.rs`'s own
+        // `each_repeat` fix for the identical bug on that evaluator's side
+        // (`Expr::Repeat`'s own arm in `eval_each`) -- one bridging to the
+        // owned-domain `eval_each_owned` per round rather than reproducing
+        // the whole pull loop against `V: DocumentValue` directly.
+        Expr::Repeat(f) => each_repeat_generic::<S, V>(f, value, optional, cursor, sink),
+
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
+    }
+}
+
+/// Demand-driven `Expr::Repeat` arm for the generic evaluator (#2014) --
+/// the generic-evaluator twin of `eval.rs`'s own `each_repeat`. Decodes
+/// `value` once (checked, matching `eval.rs`'s `eval_repeat`'s identical
+/// up-front decode), then pulls one round of `f`'s outputs at a time via
+/// the already-lazy `eval_each_owned` (the owned-domain twin of `eval_each`
+/// this file already imports for exactly this "loop back into eval.rs's
+/// lazy machinery on an owned snapshot" shape), stopping as soon as the
+/// wrapping `sink` does.
+///
+/// Two independent caps, mirroring `eval.rs`'s own `each_repeat` exactly:
+/// a per-*round* `REDUCE_FOREACH_MAX_STEPS` budget, reset at the start of
+/// every round and charged one output at a time via `charge_budget` --
+/// bounding how many values a single round may fork into at once (a
+/// succinctly-only memory-safety net for a wide `f` like `.[]`, not jq
+/// fidelity -- see `eval.rs`'s `each_repeat` doc comment for the live
+/// oracle checks: real jq has no such cap, and charging this cumulatively
+/// across rounds instead of resetting per round was tried and silently
+/// reintroduces the exact `limit(80000; repeat(1))`-style truncation #2014
+/// exists to fix). This *raises* on exhaustion, matching
+/// `resolve_repeat_bounded`'s path-context sibling so `path(repeat(f))`
+/// and `repeat(f)` agree on the same wide-round wall at the same count
+/// (`test_path_repeat_width_budget_matches_value_mode_1933`). A separate
+/// per-round-count `MAX_EMPTY_REPEAT_ROUNDS` cap counts consecutive rounds
+/// that produce nothing at all (reset by any productive round), which
+/// *silently* returns `Flow::Exhausted` instead -- `repeat`'s `f` reruns
+/// against the same unchanging input every round, so once a round produces
+/// nothing it never will, and no wrapping consumer's `Demand::Stop` can
+/// ever fire to save it (`sink` is never called on a zero-output round).
+/// Raising there instead would contradict
+/// `test_repeat_empty_expr_yields_nothing_instead_of_looping_forever_on_nulls`'s
+/// own pinned convention: a bare `repeat(empty)` has no jq oracle answer
+/// (it hangs forever there too), so succinctly silently yields nothing
+/// rather than erroring.
+fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let owned = match to_owned_with_cursor(&value, cursor) {
+        Ok(v) => v,
+        Err(e) if optional && !e.is_decode_failure() => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let mut empty_rounds = 0usize;
+    loop {
+        let mut stopped = false;
+        let mut produced_any = false;
+        let mut budget_control = None;
+        let mut budget = super::eval::REDUCE_FOREACH_MAX_STEPS;
+        let flow = eval_each_owned::<S>(f, &owned, optional, &mut |v| {
+            produced_any = true;
+            if let Some(control) = super::eval::charge_budget(&mut budget, "repeat") {
+                budget_control = Some(control);
+                stopped = true;
+                return Demand::Stop;
+            }
+            match sink(GenericItem::Owned(v)) {
+                Demand::Continue => Demand::Continue,
+                Demand::Stop => {
+                    stopped = true;
+                    Demand::Stop
+                }
+            }
+        });
+        if let Some(control) = budget_control {
+            return Flow::Escaped(control);
+        }
+        if stopped {
+            return Flow::Stopped { pending: None };
+        }
+        if !produced_any && matches!(flow, Flow::Exhausted) {
+            empty_rounds += 1;
+            if empty_rounds >= super::eval::MAX_EMPTY_REPEAT_ROUNDS {
+                return Flow::Exhausted;
+            }
+            continue;
+        }
+        empty_rounds = 0;
+        match flow {
+            Flow::Exhausted => continue,
+            other => return other,
+        }
     }
 }
 
