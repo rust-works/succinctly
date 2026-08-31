@@ -28597,3 +28597,78 @@ fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result
     assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
 }
+
+/// #1687 on the jq side. Plain `succinctly jq` collapses duplicate keys on
+/// purpose (#1385, matching real jq), so the observable surface here is
+/// `--preserve-input`, the extension whose stated job is keeping the input's
+/// own formatting.
+///
+/// The result is deliberately asymmetric, and this pins both halves:
+///
+/// - `min`/`max`/`min_by`/`max_by` answer a bare `GenericResult::OneCursor`,
+///   which `generic_result_to_jq_values` forwards as `JqValue::Cursor`
+///   without decoding -- so they now preserve, joining `first(.[])`, which
+///   always has.
+/// - `sort`/`unique`/`reverse` and the `_by` forms answer a `LazySeq`, and
+///   `jq_runner.rs` has no lazy-array `JqValue`: its `LazySeq` arm calls
+///   `materialize_atomic()`, producing an `IndexMap`-backed `OwnedValue`.
+///   They therefore still collapse -- a pre-existing property of the jq
+///   output path, not something #1687 changed: `map(.)` has answered a
+///   `LazySeq` since #724/#725 and collapses here identically.
+///
+/// Closing that second half means giving the jq CLI a streaming array value
+/// the way `yq_runner.rs` already has one; filed separately rather than
+/// widened into this change.
+#[test]
+fn test_preserve_input_sort_family_cursor_results_keep_duplicate_keys_1687() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3}]"#;
+
+    // Control: the whole document, and the long-standing `first` path.
+    let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[{\"a\":1,\"a\":2},{\"b\":3}]\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", "first(.[])"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "{\"a\":1,\"a\":2}\n");
+
+    // Single-element results now match it.
+    for filter in ["min", "max_by(.a)"] {
+        let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, "{\"a\":1,\"a\":2}\n", "{filter}");
+    }
+
+    // Array-valued results do not, for the reason above. `map(.)` is here as
+    // the control proving the cause is the output path rather than #1687.
+    for filter in ["map(.)", "sort", "unique"] {
+        let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(
+            stdout, "[{\"a\":2},{\"b\":3}]\n",
+            "{filter}: jq_runner has no lazy-array JqValue, so a LazySeq materializes"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1687 must not disturb plain jq mode, where collapsing duplicate keys is
+/// the *correct* behaviour (#1385) -- every row below re-verified live
+/// against the pinned jq 1.7.1.
+#[test]
+fn test_sort_family_still_collapses_in_plain_jq_mode_1687() -> Result<()> {
+    let input = r#"[{"a":1,"a":2},{"b":3}]"#;
+    for (filter, want) in [
+        ("sort", "[{\"a\":2},{\"b\":3}]\n"),
+        ("reverse", "[{\"b\":3},{\"a\":2}]\n"),
+        ("unique", "[{\"a\":2},{\"b\":3}]\n"),
+        ("min", "{\"a\":2}\n"),
+        ("max", "{\"b\":3}\n"),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, want, "{filter}");
+    }
+    Ok(())
+}

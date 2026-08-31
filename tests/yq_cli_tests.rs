@@ -27233,3 +27233,257 @@ fn test_path_context_bypass_keeps_yq_float_fidelity_1909() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1687: `sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/`max`/`max_by`
+/// and `reverse` all answer a permutation or subset of their input's *own*
+/// elements, yet every one of them routed through `eval_generic.rs`'s `_`
+/// bridge, which materializes the document into an `IndexMap`-backed
+/// `OwnedValue` first -- so a duplicate mapping key inside a moved element
+/// was gone before the builtin ran. `reverse` is the sharpest case: it
+/// already held the element cursors and decoded them anyway.
+///
+/// Every expectation here is real yq v4.53.3's own byte-for-byte output,
+/// captured live, for the seven spellings yq implements. `min_by`/`max_by`
+/// are lexer-rejected there, so they are pinned against their siblings
+/// instead -- the winning element is one of the input's own either way.
+/// Mirrors #1607's `test_limit_and_nth_preserve_duplicate_keys_inside_captured_item_1607`.
+#[test]
+fn test_sort_family_preserves_duplicate_keys_in_moved_elements_1687() -> Result<()> {
+    let dup = "- b: 1\n  a: 2\n  b: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+    let whole = r#"[{"b":1,"a":2,"b":3}]"#;
+    let element = r#"{"b":1,"a":2,"b":3}"#;
+
+    // The reference: identity already preserves every duplicate.
+    let (out, code) = run_yq_stdin(".", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), whole);
+
+    // Array-valued results: a `LazySeq` over the reordered cursors.
+    for filter in ["sort", "unique", "reverse", "sort_by(.a)", "unique_by(.a)"] {
+        let (out, code) = run_yq_stdin(filter, dup, &args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), whole, "{filter}");
+    }
+
+    // Single-element results: a bare `OneCursor`.
+    for filter in ["min", "max", "min_by(.a)", "max_by(.a)"] {
+        let (out, code) = run_yq_stdin(filter, dup, &args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(out.trim(), element, "{filter}");
+    }
+
+    Ok(())
+}
+
+/// #1687: the same builtins on the DOM route also dropped comments and flow
+/// style wholesale -- #757's own lesson that a construct on that route loses
+/// everything the DOM cannot carry, all at once. Keeping the elements
+/// cursor-backed restores them, and these expectations are real yq v4.53.3's.
+///
+/// The document-level head comment (`# top`) is deliberately absent from the
+/// input: succinctly drops it on every one of these filters both before and
+/// after #1687, a separate pre-existing gap this test is not the place to
+/// pin.
+#[test]
+fn test_sort_family_preserves_comments_and_flow_style_1687() -> Result<()> {
+    let args = ["--jq-extensions"];
+
+    let commented = "- b: 1   # keep\n  a: 2\n- c: 3\n";
+    let (out, code) = run_yq_stdin("sort_by(.c)", commented, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- b: 1 # keep\n  a: 2\n- c: 3\n");
+
+    let styled = "- [1, 2]\n- {a: 1, b: 2}\n";
+    let (out, code) = run_yq_stdin("reverse", styled, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- {a: 1, b: 2}\n- [1, 2]\n");
+
+    Ok(())
+}
+
+/// #1687: **succinctly never emits YAML it cannot read back**, so the
+/// cursor-backed reordering above is switched off entirely for a document
+/// carrying any `*alias`.
+///
+/// Reordering can lift an alias above the anchor it resolves to, and
+/// `reverse` on this input demonstrably does: real yq answers `- *x` then
+/// `- &x {p: 1}`, a forward reference it then rejects with `unknown anchor
+/// 'x' referenced` when asked to read its own output back (both verified
+/// live against v4.53.3). `enforce_anchor_soundness` is what normally
+/// prevents that, but it is a DOM-path pass over a `CommentTree` and the
+/// cursor-streaming path has none (#1350) -- so `DocumentCursor::
+/// document_has_aliases` sends an alias-bearing document down the DOM path
+/// unchanged, losing the marks rather than emitting an unreadable file.
+///
+/// This is a deliberate divergence from real yq, not a gap: the same one
+/// ADR-0018 admits for `del()` and the rest of the #763 family.
+#[test]
+fn test_sort_family_refuses_to_reorder_aliases_above_anchors_1687() -> Result<()> {
+    let aliased = "- &x {p: 1}\n- *x\n";
+    let args = ["--jq-extensions"];
+
+    // Aliases expanded, anchors dropped -- sound, and byte-identical to what
+    // this input produced before #1687.
+    let (out, code) = run_yq_stdin("reverse", aliased, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- p: 1\n- p: 1\n");
+
+    // The gate is on aliases, not anchors: an unreferenced `&x` is valid
+    // YAML wherever it lands, so this document still takes the fast path.
+    let anchor_only = "- &x {p: 1}\n- {q: 2}\n";
+    let (out, code) = run_yq_stdin("reverse", anchor_only, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- {q: 2}\n- &x {p: 1}\n");
+
+    Ok(())
+}
+
+/// #1687: `reduce`/`foreach` had no arm in `eval_generic.rs` at all, so every
+/// one of them bridged the whole document through an `IndexMap` before
+/// `input` was evaluated -- and the input generator then walked a document
+/// that had already lost a duplicate key. The result was an internal
+/// contradiction rather than merely a divergence: `[keys|.[]] | length`
+/// answered 3 on this document while `reduce (keys|.[]) as $k (0; .+1)`
+/// answered 2.
+///
+/// Real yq has neither builtin (its lexer rejects both, confirmed live
+/// against v4.53.3), so there is no oracle here; the expectation is
+/// agreement with `keys` on the same document, which is the invariant that
+/// was broken.
+#[test]
+fn test_reduce_and_foreach_see_every_duplicate_key_1687() -> Result<()> {
+    let dup = "b: 1\na: 2\nb: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+
+    let (out, code) = run_yq_stdin("[keys | .[]]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","a","b"]"#, "the invariant to agree with");
+
+    let (out, code) = run_yq_stdin("reduce (keys|.[]) as $k (0; .+1)", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3");
+
+    let (out, code) = run_yq_stdin("[foreach (keys|.[]) as $k (0; .+1; .)]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,3]");
+
+    Ok(())
+}
+
+/// #1687 item 1's documented residual: `reduce`/`foreach` recover the
+/// *number* of elements, not each element's own shape.
+///
+/// The accumulator and every `$x` a pattern binds are `OwnedValue` in both
+/// evaluators -- `substitute_bound_var` takes `&OwnedValue`, and no
+/// duplicate-key-capable owned representation exists in this crate -- so an
+/// element that gets bound is collapsed at the bind. A known gap pinned
+/// deliberately, following `test_object_slice_duplicate_key_known_gap_1102`.
+#[test]
+fn test_reduce_binding_still_collapses_duplicate_keys_known_gap_1687() -> Result<()> {
+    let dup = "- b: 1\n  a: 2\n  b: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+
+    // The element itself survives every route that keeps it a cursor.
+    let (out, code) = run_yq_stdin("first(.[])", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":1,"a":2,"b":3}"#);
+
+    // Bound to `$x`, it does not.
+    let (out, code) = run_yq_stdin("reduce .[] as $x (null; $x)", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        r#"{"b":3,"a":2}"#,
+        "known gap: a bound element is an OwnedValue, which cannot hold a duplicate key"
+    );
+
+    Ok(())
+}
+
+/// #1687 items 2 and 3: a *generator* `n` for `limit`/`nth` used to be probed
+/// with `eval_single`, found multi-output, and handed to the lossy bridge --
+/// costing the duplicate keys the native path exists to preserve. Driving `n`
+/// through `fanout_arg_generic` keeps the whole walk cursor-native for every
+/// `n` shape.
+///
+/// `n` is the outer loop and the generator the inner one, re-run once per `n`
+/// (jq 1.7.1: `[limit((1,2); (10,20,30))]` is `[10,10,20]`), so the expected
+/// key sequences below are per-`n` prefixes concatenated.
+#[test]
+fn test_limit_and_nth_generator_n_preserve_duplicate_keys_1687() -> Result<()> {
+    let dup = "b: 1\na: 2\nb: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+
+    // n=1 keeps ["b"]; n=3 keeps ["b","a","b"].
+    let (out, code) = run_yq_stdin("[limit((1,3); keys|.[])]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","b","a","b"]"#);
+
+    // Index 2 is the *second* "b", which the collapsed document could not
+    // even reach before.
+    let (out, code) = run_yq_stdin("[nth((0,1,2); keys|.[])]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["b","a","b"]"#);
+
+    Ok(())
+}
+
+/// #1687's carve-outs, pinned so they are visible rather than merely
+/// asserted in prose.
+///
+/// `group_by` returns an array *of arrays*: `LazySeq` has no nested-lazy form
+/// and `OwnedValue::Array(Vec<OwnedValue>)` cannot hold a cursor, so there is
+/// no lossless representation for it today -- it keeps the bridge, and real
+/// yq (which does implement it) preserves where succinctly collapses.
+/// `while`/`until` compute their state from step 1 onward, so only the seed
+/// could ever stay a cursor.
+#[test]
+fn test_group_by_and_while_until_remain_lossy_known_gap_1687() -> Result<()> {
+    let dup = "- b: 1\n  a: 2\n  b: 3\n";
+    let args = ["--jq-extensions", "-o=json", "-I=0"];
+
+    let (out, code) = run_yq_stdin("group_by(.a) | .[0] | .[0]", dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        r#"{"b":3,"a":2}"#,
+        "known gap: an array of arrays has no cursor-backed representation"
+    );
+
+    let scalar_dup = "b: 1\na: 2\nb: 3\n";
+    let (out, code) = run_yq_stdin("[limit(1; while(true; .))]", scalar_dup, &args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        r#"[{"b":3,"a":2}]"#,
+        "known gap: while/until fold through an OwnedValue state"
+    );
+
+    Ok(())
+}
+
+/// #1687 regression guard: `reduce`/`foreach` consume `input` and `INIT`
+/// eagerly, but `each_repeat_generic` (#2014) is deliberately unbounded --
+/// it relies on a wrapping `limit`/`first` to stop it. Driving it from an
+/// eager consumer spun forever, where `eval.rs`'s own `reduce` raises.
+///
+/// Both operands are guarded, not just `input`: guarding `input` alone still
+/// hung on the `INIT` spelling below.
+#[test]
+fn test_reduce_and_foreach_over_repeat_still_raise_1687() -> Result<()> {
+    for filter in [
+        "reduce repeat(1) as $x (0; .+1)",
+        "foreach repeat(1) as $x (0; .+1)",
+        "reduce .[] as $x (repeat(1); .+$x)",
+        "[foreach .[] as $x (repeat(1); .+$x; .)]",
+    ] {
+        let (_, stderr, code) = run_jq_stdin_with_stderr(filter, "[1,2]", &[])?;
+        assert_eq!(code, 5, "{filter}: stderr {stderr}");
+        assert!(
+            stderr.contains("repeat: maximum iterations exceeded"),
+            "{filter}: stderr {stderr}"
+        );
+    }
+    Ok(())
+}
