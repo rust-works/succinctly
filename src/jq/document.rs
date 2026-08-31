@@ -1707,14 +1707,24 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// cursor position, so this is a copy of a couple of machine words.
     all: F,
     /// Hashes of the keys yielded so far, while the rule is in force and
-    /// the object is not yet proved clean.
-    seen: Option<KeyHashes>,
+    /// the object is not yet proved clean. Boxed (#1973): live only on the
+    /// probing phase of the rare duplicate-key path, so every walk over a
+    /// clean object (`collapse` false, or true but never repeated) pays a
+    /// single pointer instead of `KeyHashes`'s own ~40-byte hash-table
+    /// header -- `Option<Box<T>>` niches to the same width as `Option<T>`
+    /// would for a `T` that already carries a non-null pointer, so this
+    /// costs nothing beyond the fields it removes from the struct itself.
+    seen: Option<Box<KeyHashes>>,
     /// How many cursors have gone out, which is where `collapsed` resumes.
     yielded: usize,
     /// The exact collapsed key list, once a repeat is confirmed. Key and
     /// cursor only -- this iterator never reads a field's value, so
     /// `collapse_confirmed_repeat` never materializes one (#1514 review).
-    collapsed: Option<Vec<(F::Value, F::Cursor)>>,
+    /// Boxed (#1973) for the same reason as `seen` above -- this is already
+    /// niche-optimized as `Option<Vec<_>>`, so wrapping it in a `Box` before
+    /// niching only removes the `Vec`'s own three machine words from every
+    /// instance that never collapses.
+    collapsed: Option<Box<Vec<(F::Value, F::Cursor)>>>,
     /// Whether the walk ran out on an unpaired child (#1194). Recorded as
     /// the walk discovers it, because neither branch can answer afterwards:
     /// `rest` is exhausted on one and stale mid-object on the other.
@@ -1738,7 +1748,7 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
         Self {
             rest: fields.clone(),
             all: fields.clone(),
-            seen: collapse.then(KeyHashes::new),
+            seen: collapse.then(|| Box::new(KeyHashes::new())),
             yielded: 0,
             collapsed: None,
             ended_unpaired: false,
@@ -1837,7 +1847,7 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             self.delimiter_fault |= confirmed.delimiter_fault;
             let ConfirmedRepeat { keys, total, .. } = confirmed;
             if keys.len() < total {
-                self.collapsed = Some(keys);
+                self.collapsed = Some(Box::new(keys));
                 self.seen = None;
                 // Resumes at `yielded`, which the collapsed list's own
                 // prefix matches: every key emitted so far was a first
