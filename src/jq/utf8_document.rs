@@ -105,12 +105,12 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
             continue;
         }
 
-        out.push_str(&substitute_invalid_utf8_jq_style(&raw[segment_start..i]));
+        push_segment(&mut out, &raw[segment_start..i]);
         out.push('"');
 
         let body_start = i + 1;
         let (body_end, has_escape) = scan_string_body(raw, body_start);
-        out.push_str(&repair_string_body(&raw[body_start..body_end], has_escape));
+        repair_string_body(&mut out, &raw[body_start..body_end], has_escape);
 
         if body_end < raw.len() {
             // The closing quote, consumed here so the scan resumes outside
@@ -125,8 +125,26 @@ pub fn substitute_invalid_utf8_jq_document(raw: &[u8]) -> String {
         segment_start = i;
     }
 
-    out.push_str(&substitute_invalid_utf8_jq_style(&raw[segment_start..]));
+    push_segment(&mut out, &raw[segment_start..]);
     out
+}
+
+/// Append one run of bytes from *outside* any string, substituting only if
+/// it is not already valid UTF-8.
+///
+/// The check is not an optimisation on top of a different answer -- it *is*
+/// the same answer: [`substitute_invalid_utf8_jq_style`] returns valid input
+/// byte-for-byte unchanged, pinned by #1247's own guard test. Skipping it
+/// skips an allocation and a second scan, and that is worth having because
+/// segment count scales with the document, not with the corruption in it: a
+/// file with one bad byte still has one segment per JSON string, so building
+/// a `String` for each is millions of short-lived allocations on a large
+/// input where a borrow would do.
+fn push_segment(out: &mut String, bytes: &[u8]) {
+    match core::str::from_utf8(bytes) {
+        Ok(s) => out.push_str(s),
+        Err(_) => out.push_str(&substitute_invalid_utf8_jq_style(bytes)),
+    }
 }
 
 /// The offset of the string's closing quote (or `raw.len()` if it is
@@ -161,8 +179,9 @@ fn scan_string_body(raw: &[u8], body_start: usize) -> (usize, bool) {
 /// 2. **Invalid, no escapes** -- substituted directly. Raw body and decoded
 ///    string are the same bytes here, so this is exact, and it needs no
 ///    re-escaping: the body provably contains no `"` (the scan stopped at
-///    one) and no `\`, and substitution only ever replaces non-ASCII bytes
-///    with U+FFFD, so it cannot introduce either.
+///    one) and no `\` (that is what `has_escape` being false means), and
+///    substitution only ever replaces non-ASCII bytes with U+FFFD, so it
+///    cannot introduce either.
 /// 3. **Invalid, with escapes** -- decoded to bytes, substituted, re-escaped.
 ///    Required for exactness because jq's rule is scoped to the *decoded*
 ///    string, and escapes only ever shrink it: `"\xe1\u0041"` decodes to two
@@ -176,23 +195,31 @@ fn scan_string_body(raw: &[u8], body_start: usize) -> (usize, bool) {
 /// A body whose escapes cannot be decoded at all (a bad escape character, a
 /// lone surrogate) falls back to case 2's raw-span substitution rather than
 /// inventing a decoding: such a document is a parse error downstream, and
-/// this keeps the bytes that error is reported against unchanged.
-fn repair_string_body(body: &[u8], has_escape: bool) -> String {
+/// this keeps the bytes that error is reported against unchanged. That
+/// fallback is the one route into case 2 whose body *does* carry a `\`, so
+/// case 2's own proof does not cover it -- but the string still cannot be
+/// broken open: substitution never emits a `"`, and the byte after a
+/// surviving `\` is either a U+FFFD or a byte copied from a body the scan
+/// already proved holds no unescaped quote. The result is an invalid escape
+/// either way, which is exactly the error the caller wants reported.
+fn repair_string_body(out: &mut String, body: &[u8], has_escape: bool) {
     if let Ok(s) = core::str::from_utf8(body) {
-        return String::from(s);
+        out.push_str(s);
+        return;
     }
 
     if has_escape {
         let mut decoded = Vec::with_capacity(body.len());
         if decode_escapes_into::<false>(body, &mut decoded).is_ok() {
-            return escape_json_body(
+            out.push_str(&escape_json_body(
                 write_json_body_jq,
                 &substitute_invalid_utf8_jq_style(&decoded),
-            );
+            ));
+            return;
         }
     }
 
-    substitute_invalid_utf8_jq_style(body)
+    out.push_str(&substitute_invalid_utf8_jq_style(body));
 }
 
 #[cfg(test)]
