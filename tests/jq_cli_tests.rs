@@ -189,33 +189,13 @@ fn spawn_jq(args: &[&str], stdin_input: Option<&[u8]>) -> Result<(std::process::
 /// their retry -- ENOENT while a sibling test rebuilds the binary, and a
 /// signal-killed child (#1516/#1691) -- rather than reimplementing the retry
 /// policy with different numbers.
-/// Deletes the wrapped directory on drop, covering every exit path (a
-/// `return`, an early `?`, or a panic) rather than requiring each one to
-/// remember its own `std::fs::remove_dir_all` call -- code review (#2016):
-/// the two explicit cleanup calls this guard replaces only ran on the
-/// success and retries-exhausted paths, silently leaking the scratch
-/// directory on every other error return (both pre-existing, like the
-/// initial spawn failing, and the two new ones this same fix introduced by
-/// deferring the write error past the wait).
-struct RemoveDirOnDrop<'a>(&'a std::path::Path);
-
-impl Drop for RemoveDirOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(self.0);
-    }
-}
-
 fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32)> {
-    let dir = std::env::temp_dir().join(format!(
-        "sjq-interleave-{}-{}",
-        std::process::id(),
-        // Distinct per call within one process: two tests running
-        // concurrently in the same binary would otherwise share a path.
-        INTERLEAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir)?;
-    let _cleanup = RemoveDirOnDrop(&dir);
-    let path = dir.join("combined.txt");
+    // #2016 (code review): `TempDir`, not a hand-rolled unique path plus a
+    // bespoke `Drop`-guard -- `tempfile` is already a dependency, already
+    // used this same way by sibling test files, and already provides
+    // exactly this "unique scratch dir, deleted on drop" guarantee.
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("combined.txt");
 
     for attempt in 0..MAX_CARGO_RETRIES {
         // Truncate per attempt: a retry must not read a previous attempt's
@@ -257,8 +237,6 @@ fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32
     }
     unreachable!()
 }
-
-static INTERLEAVE_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `spawn_jq`'s counterpart for the environment-variable test cluster
 /// (#1889 code review): the 8 tests covering `NO_COLOR`/`JQ_COLORS`/
@@ -2520,22 +2498,25 @@ fn test_reduce() -> Result<()> {
 fn test_default_identity_filter() -> Result<()> {
     // When no filter is provided, should default to "."
     //
-    // #1889: intentionally left off `spawn_with_signal_retry` -- this test
-    // never calls `wait_with_output()` (it drops the spawned `Child`
-    // immediately), so there is no signal-death race to retry against, and
-    // routing it through the shared helper would add a wait this test was
-    // never designed to perform. `spawn()` itself can still transiently
-    // ENOENT (#550), but that's the same low-value tradeoff as leaving this
-    // near-vestigial test's semantics unchanged rather than restructuring
-    // it for a race this specific test doesn't meaningfully protect
-    // against anyway (it asserts nothing about the process's outcome).
+    // #2016 (code review): the previous version of this test spawned a
+    // child and immediately `drop`ped it without ever calling `wait()` --
+    // unlike every other #1891/#2016 site, which only leaked a zombie
+    // conditionally (on a write failure racing the wait), this leaked one
+    // unconditionally, on every single run. `Stdio::null()` for stdin
+    // (rather than piped-then-never-written) means the child sees EOF
+    // immediately with nothing for this test to write or close, and
+    // `wait_with_output()` (not a bare `wait()`) drains stdout/stderr
+    // concurrently so the child can't block on a full output pipe either.
+    // Still asserts nothing about the process's outcome, matching this
+    // near-vestigial test's original intent -- only the leak is fixed.
     let output = Command::new(succinctly_bin())
         .arg("jq")
         .arg("-c")
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()?
+        .wait_with_output()?;
 
     // This test would need special handling for empty filter
     // For now, just verify the command runs
