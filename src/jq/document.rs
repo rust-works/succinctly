@@ -7,7 +7,7 @@
 #[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, string::String, vec::Vec};
 
 use indexmap::IndexMap;
 #[cfg(test)]
@@ -1699,6 +1699,12 @@ pub fn collapsed_fields_if<F: DocumentFields>(
 ///
 /// `collapse` false (yq) carries no probe state at all and is the plain
 /// cons-list walk it always was.
+///
+/// Key and cursor pairs for the confirmed-collapse case below -- factored
+/// out into its own alias since `Option<Box<Vec<(F::Value, F::Cursor)>>>`
+/// trips `clippy::type_complexity` as an inline field type.
+type CollapsedKeys<F> = Vec<(<F as DocumentFields>::Value, <F as DocumentFields>::Cursor)>;
+
 #[derive(Clone)]
 pub struct DistinctKeyCursors<F: DocumentFields> {
     /// The fields still to walk.
@@ -1734,7 +1740,7 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// collapses -- already niche-optimized as `Option<Vec<_>>`, wrapping
     /// it in a `Box` before niching only removes the `Vec`'s own three
     /// machine words from every instance that stays `None`.
-    collapsed: Option<Box<Vec<(F::Value, F::Cursor)>>>,
+    collapsed: Option<Box<CollapsedKeys<F>>>,
     /// Whether the walk ran out on an unpaired child (#1194). Recorded as
     /// the walk discovers it, because neither branch can answer afterwards:
     /// `rest` is exhausted on one and stale mid-object on the other.
