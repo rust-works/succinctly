@@ -220,13 +220,32 @@ pub fn spawn_with_signal_retry(
             }
             Err(e) => return Err(e.into()),
         };
-        if let Some(input) = stdin_input {
+        // Write, but don't propagate a failure yet (#1891): if the child
+        // exits or closes stdin early (e.g. an argv-parse error before it
+        // ever reads stdin), `write_all` can fail before the child has been
+        // waited on. Returning via `?` at that point would drop `child`
+        // without reaping it -- `Child`'s `Drop` does not wait() the OS
+        // process, so the early return would leak a zombie for the rest of
+        // this test binary's run. `wait_with_output()` below doesn't care
+        // whether the write succeeded; call it unconditionally first so the
+        // child is always reaped, then surface the write error if there was
+        // one.
+        //
+        // Ordering invariant: this write runs to completion (blocking on a
+        // full pipe buffer) *before* `wait_with_output()`'s own concurrent
+        // stdout/stderr draining starts, which is the classic double-pipe
+        // deadlock shape if the child fills its stdout/stderr buffer while
+        // waiting on stdin. Currently safe only because every binary this
+        // helper spawns reads stdin to completion before writing any
+        // output, and the small inputs/outputs these tests use never fill
+        // an OS pipe buffer either way -- not an invariant this function
+        // enforces itself.
+        let write_result = stdin_input.and_then(|input| {
             use std::io::Write;
-            if let Some(mut sin) = child.stdin.take() {
-                sin.write_all(input)?;
-            }
-        }
+            child.stdin.take().map(|mut sin| sin.write_all(input))
+        });
         let output = child.wait_with_output()?;
+        write_result.transpose()?;
         if let Some(code) = output.status.code() {
             return Ok((output, code));
         }
@@ -241,4 +260,82 @@ pub fn spawn_with_signal_retry(
         std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
     }
     unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_with_signal_retry;
+
+    /// #1891: a `write_all` failure used to `?` out of
+    /// `spawn_with_signal_retry` before the child was ever waited on,
+    /// leaking a zombie process for the rest of this test binary's run.
+    /// Reproduces the failure condition -- a large stdin payload to a
+    /// child that closes its own stdin (and so its own read end of the
+    /// pipe) almost immediately, reliably forcing `write_all` to observe
+    /// a broken pipe (a small write can silently land in the kernel pipe
+    /// buffer even after the reader has gone away, so this needs to be
+    /// large enough to exceed that buffer) -- and verifies via a
+    /// process-table check that the *specific* child process is not left
+    /// as a zombie either way.
+    ///
+    /// Checks one targeted PID, not a system-wide zombie count: this
+    /// crate's own test suite runs many test binaries and threads
+    /// concurrently, each spawning its own short-lived subprocesses, so a
+    /// broad "any zombie owned by this process" scan sees transient noise
+    /// from unrelated sibling tests under load and is not reliable here
+    /// (this shape of flake was caught live during this issue's own
+    /// verification). The child writes its own PID to a temp file as its
+    /// first action -- independent of whatever happens to its stdin --
+    /// so the PID is known even on the failure path, where
+    /// `spawn_with_signal_retry`'s own `Output` (whose stdout would
+    /// otherwise carry it) is never returned.
+    ///
+    /// Skips the assertion (not the exercise of the code path itself) if
+    /// `ps` isn't available in this environment, rather than failing on
+    /// an environment limitation.
+    #[test]
+    #[cfg(unix)]
+    fn reaps_child_on_stdin_write_failure_1891() {
+        let pid_file = tempfile::NamedTempFile::new().expect("create temp file");
+        let pid_path = pid_file.path().to_path_buf();
+
+        let big_input = vec![0u8; 8 * 1024 * 1024];
+        // The write failing (or not -- the OS's exact timing isn't
+        // guaranteed) is the path under test here, not a test failure in
+        // itself; what matters is that this doesn't panic and doesn't
+        // leave a zombie either way.
+        let _ = spawn_with_signal_retry(
+            || {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args(["-c", &format!("echo $$ > {}", pid_path.display())]);
+                cmd
+            },
+            Some(&big_input),
+        );
+
+        // The child writing its PID file and exiting isn't necessarily
+        // synchronous with this function returning; give it a moment.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let Ok(pid_text) = std::fs::read_to_string(&pid_path) else {
+            eprintln!("skipping zombie assertion: child never wrote its PID file");
+            return;
+        };
+        let Ok(pid) = pid_text.trim().parse::<u32>() else {
+            eprintln!("skipping zombie assertion: unparseable PID {pid_text:?}");
+            return;
+        };
+
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        else {
+            eprintln!("skipping zombie assertion: `ps` unavailable in this environment");
+            return;
+        };
+        let stat = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stat.contains('Z'),
+            "child pid {pid} is a zombie (stat: {stat:?}) -- not reaped"
+        );
+    }
 }
