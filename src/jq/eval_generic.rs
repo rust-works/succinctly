@@ -1645,6 +1645,63 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     query_result_to_generic::<V>(full_eval::<Vec<u64>, S>(expr, cursor))
 }
 
+/// Materialize `value` (with its `cursor`, if any) and hand `expr` to the
+/// full `OwnedValue` evaluator -- the "give up on the cursor-native path"
+/// bridge every deferring native arm ends in.
+///
+/// Six call sites grew an identical hand-written copy of this three-step
+/// shape (`to_owned_with_cursor` + reconstruct the AST node + `eval_on_owned`)
+/// before it was extracted (#1687 item 4): `Expr::Limit`, `Expr::NthExpr`,
+/// `Builtin::NthStream` and `Builtin::Has` in the two dispatch matches,
+/// `eval_first_or_last_generic`'s input-queue guard, and
+/// `each_limit_generic`'s `Flow`-returning local closure (now
+/// [`bridge_to_full_evaluator_flow`]). CLAUDE.md's own #106 lesson --
+/// duplicated predicates diverge silently -- applies directly: these copies
+/// differ only in which `Expr` they rebuild, and nothing but review was
+/// stopping one of them from acquiring a subtly different `optional` or
+/// error-conversion rule.
+///
+/// **This bridge is lossy by construction and always has been.**
+/// `to_owned_with_cursor` funnels through `to_owned_at_depth`, whose object
+/// arm is an `IndexMap`, so a duplicate mapping key is gone before `expr`
+/// runs -- regardless of `S::COLLAPSE_DUPLICATE_KEYS`. Reaching this
+/// function at all is what every native arm in this file exists to avoid;
+/// centralizing it does not make it cheaper or more faithful, it only makes
+/// the remaining call sites countable.
+fn bridge_to_full_evaluator<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+) -> GenericResult<V> {
+    // Spelled as a `match` rather than `owned_or_err!`: this function sits
+    // above that macro's own definition point in the file, and `macro_rules!`
+    // is only in scope textually after it.
+    match to_owned_with_cursor(&value, cursor) {
+        Ok(owned) => eval_on_owned::<S, V>(expr, owned, optional),
+        Err(e) => GenericResult::Error(e),
+    }
+}
+
+/// [`bridge_to_full_evaluator`] for a sink-driven caller: same materialize +
+/// delegate, then drain whatever the full evaluator produced into `sink`.
+///
+/// A decode failure surfaces as `Flow::Escaped(Control::Error(..))` rather
+/// than `GenericResult::Error`, matching what `each_limit_generic`'s
+/// hand-written closure did before this replaced it.
+fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match to_owned_with_cursor(&value, cursor) {
+        Ok(owned) => drain_result_generic(eval_on_owned::<S, V>(expr, owned, optional), sink),
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
 /// Convert a `QueryResult` produced by `eval.rs` into the generic
 /// evaluator's own `GenericResult`.
 ///
@@ -4877,17 +4934,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Limit { n, expr } => {
             match eval_limit_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
                 Some(result) => result,
-                None => {
-                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                    eval_on_owned::<S, _>(
-                        &Expr::Limit {
-                            n: n.clone(),
-                            expr: expr.clone(),
-                        },
-                        owned,
-                        optional,
-                    )
-                }
+                None => bridge_to_full_evaluator::<S, _>(
+                    &Expr::Limit {
+                        n: n.clone(),
+                        expr: expr.clone(),
+                    },
+                    value,
+                    cursor,
+                    optional,
+                ),
             }
         }
 
@@ -4904,17 +4959,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::NthExpr { n, expr } => {
             match eval_nth_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
                 Some(result) => result,
-                None => {
-                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                    eval_on_owned::<S, _>(
-                        &Expr::NthExpr {
-                            n: n.clone(),
-                            expr: expr.clone(),
-                        },
-                        owned,
-                        optional,
-                    )
-                }
+                None => bridge_to_full_evaluator::<S, _>(
+                    &Expr::NthExpr {
+                        n: n.clone(),
+                        expr: expr.clone(),
+                    },
+                    value,
+                    cursor,
+                    optional,
+                ),
             }
         }
 
@@ -6158,27 +6211,17 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let mut bridge_to_full_evaluator = |value: V, cursor: Option<V::Cursor>| -> Flow {
-        let owned = match to_owned_with_cursor(&value, cursor) {
-            Ok(o) => o,
-            Err(e) => return Flow::Escaped(Control::Error(e)),
-        };
-        let result = eval_on_owned::<S, V>(
-            &Expr::Limit {
-                n: Box::new(n_expr.clone()),
-                expr: Box::new(expr.clone()),
-            },
-            owned,
-            optional,
-        );
-        drain_result_generic(result, sink)
+    // Rebuilt once, up front: all three deferral points below hand the same
+    // node to the same bridge (#1687 item 4).
+    let bridged = Expr::Limit {
+        n: Box::new(n_expr.clone()),
+        expr: Box::new(expr.clone()),
     };
 
-    if limit_or_nth_uses_live_input_queue(n_expr, expr) {
-        return bridge_to_full_evaluator(value, cursor);
-    }
-    if matches!(unwrap_paren(n_expr), Expr::Comma(_)) {
-        return bridge_to_full_evaluator(value, cursor);
+    if limit_or_nth_uses_live_input_queue(n_expr, expr)
+        || matches!(unwrap_paren(n_expr), Expr::Comma(_))
+    {
+        return bridge_to_full_evaluator_flow::<S, V>(&bridged, value, cursor, optional, sink);
     }
 
     let n_result = eval_single::<S, V>(n_expr, value.clone(), optional, cursor);
@@ -6201,7 +6244,9 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
         // `n_expr` evaluation here, same documented residual gap as
         // `eval_limit_generic`'s own identical fallback -- narrowing it
         // further isn't needed to fix #1596's own leak.
-        _ => return bridge_to_full_evaluator(value, cursor),
+        _ => {
+            return bridge_to_full_evaluator_flow::<S, V>(&bridged, value, cursor, optional, sink)
+        }
     };
 
     let n = match classify_limit_n(n_value) {
@@ -6616,8 +6661,12 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         && crate::jq::input_queue_is_active()
         && crate::jq::walk::uses_input_builtins(inner)
     {
-        let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-        return eval_on_owned::<S, _>(&Expr::FirstExpr(Box::new(inner.clone())), owned, optional);
+        return bridge_to_full_evaluator::<S, _>(
+            &Expr::FirstExpr(Box::new(inner.clone())),
+            value,
+            cursor,
+            optional,
+        );
     }
 
     // `first` stops pulling from `inner` as soon as it has one output, so
@@ -8467,14 +8516,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::NthStream(n, expr) => {
             match eval_nth_generic::<S, _>(n, expr, value.clone(), optional, cursor) {
                 Some(result) => result,
-                None => {
-                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                    eval_on_owned::<S, _>(
-                        &Expr::Builtin(Builtin::NthStream(n.clone(), expr.clone())),
-                        owned,
-                        optional,
-                    )
-                }
+                None => bridge_to_full_evaluator::<S, _>(
+                    &Expr::Builtin(Builtin::NthStream(n.clone(), expr.clone())),
+                    value,
+                    cursor,
+                    optional,
+                ),
             }
         }
 
@@ -8509,10 +8556,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Has(key_expr) => {
             match eval_has_generic::<S, _>(key_expr, value.clone(), optional, cursor) {
                 Some(result) => result,
-                None => {
-                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                    eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
-                }
+                None => bridge_to_full_evaluator::<S, _>(
+                    &Expr::Builtin(builtin.clone()),
+                    value,
+                    cursor,
+                    optional,
+                ),
             }
         }
 
