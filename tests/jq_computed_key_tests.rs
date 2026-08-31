@@ -2016,6 +2016,166 @@ fn test_del_static_comma_type_error_reports_the_first_sibling() {
     );
 }
 
+/// #1690: `del()`'s multi-path route merges every resolved path into a
+/// `DeleteTrie` instead of flattening each branch independently. These pin
+/// the behaviour the merge has to preserve; every expectation was captured
+/// from jq 1.7.1 first.
+///
+/// The interesting ones are the two the trie's structure could plausibly get
+/// wrong, since both are places where "one node per distinct prefix" is a
+/// genuinely different shape from "one flat path per resolved branch":
+///
+/// 1. **Group order is not key order.** The old walker kept its recursion
+///    groups (`groups`) separately from its terminal keys (`terminal`), so a
+///    key that first appears as a *terminal* path and only later as a prefix
+///    is ordered by that later appearance. A trie node has one child map, so
+///    reproducing that needs an explicit `field_groups`/`index_groups` list;
+///    ordering the recursion by the child map instead silently rewrites which
+///    error jq reports.
+/// 2. **A terminal node is not consulted on the way in.** `del(.a, .a[0])`
+///    reaches `.a` as both a doomed key and a prefix, and jq still walks
+///    *into* it — the walk raises even though the key is about to be deleted
+///    wholesale. Short-circuiting a terminal node on entry would swallow
+///    that.
+#[test]
+fn test_del_trie_preserves_group_order_and_terminal_recursion_1690() {
+    // (1) `.a` first appears terminal, `.b` first appears as a prefix, so the
+    // recursion order is `b` then `a` — the string at `.b` is reached first
+    // and its error is the one reported. Ordering by first appearance of
+    // *any* kind would put `a` first and report `Cannot index number with
+    // string "y"` instead.
+    check(
+        r#"{"a":5,"b":"s"}"#,
+        "del(.a, .b.x, .a.y)",
+        Outcome::error(r#"Cannot index string with string "x""#),
+    );
+    // Same document, roles swapped in the filter: now `a` is the prefix seen
+    // first, and the *other* error surfaces. The pair is what makes this a
+    // real order check rather than an accident of which key errors.
+    check(
+        r#"{"a":5,"b":"s"}"#,
+        "del(.b, .a.y, .b.x)",
+        Outcome::error(r#"Cannot index number with string "y""#),
+    );
+    // The array-index side keeps its own, separate group list.
+    check(
+        r#"[5,"s"]"#,
+        "del(.[0], .[1].x, .[0].y)",
+        Outcome::error(r#"Cannot index string with string "x""#),
+    );
+    check(
+        r#"[5,"s"]"#,
+        "del(.[1], .[0].y, .[1].x)",
+        Outcome::error(r#"Cannot index number with string "y""#),
+    );
+
+    // (2) `.a` is deleted outright *and* recursed into, and the recursion is
+    // what raises — in either argument order.
+    check(
+        r#"{"a":"s"}"#,
+        "del(.a, .a[0])",
+        Outcome::error("Cannot index string with number"),
+    );
+    check(
+        r#"{"a":"s"}"#,
+        "del(.a[0], .a)",
+        Outcome::error("Cannot index string with number"),
+    );
+    // When the recursion succeeds, the terminal delete still wins: the whole
+    // subtree goes, not just the nested key.
+    check(
+        r#"{"a":{"b":1,"c":2}}"#,
+        "del(.a, .a.b)",
+        Outcome::values(&["{}"]),
+    );
+    check(
+        r#"{"a":{"b":1,"c":2}}"#,
+        "del(.a.b, .a)",
+        Outcome::values(&["{}"]),
+    );
+}
+
+/// #1690: the properties the merge shares with the walker it replaced —
+/// prefix sharing, one batched removal per container, and the per-step `null`
+/// tolerance — checked through the multi-path route specifically.
+#[test]
+fn test_del_trie_shares_prefixes_and_batches_removals_1690() {
+    // Three paths through one shared `.a.b` prefix: the trie visits `a` and
+    // `b` once each, and both leaves still go.
+    check(
+        r#"{"a":{"b":{"c":1,"d":2},"e":3},"f":4}"#,
+        "del(.a.b.c, .a.b.d, .a.e)",
+        Outcome::values(&[r#"{"a":{"b":{}},"f":4}"#]),
+    );
+
+    // #424: every terminal key of one container is removed in a single
+    // `delete_keys` batch, so a negative index resolves against the length
+    // the array had on entry rather than one an earlier sibling shortened.
+    check(
+        "[10,20,30,40]",
+        "del(.[(-1,-2)])",
+        Outcome::values(&["[10,20]"]),
+    );
+    // ...and overlapping slices union rather than compound, for the same
+    // reason: `[0:2]` and `[1:3]` reach `delete_keys` together.
+    check(
+        "[1,2,3,4]",
+        "del(.[0:2], .[1:3])",
+        Outcome::values(&["[4]"]),
+    );
+    // A repeated path is one trie node, deleted once.
+    check("[10,20,30]", "del(.[(0,0)])", Outcome::values(&["[20,30]"]));
+
+    // #476/#527: `null` tolerates any key at the step that names it, and the
+    // exemption is per step — the tails are still walked.
+    check("null", "del(.a, .b)", Outcome::values(&["null"]));
+    check(
+        r#"{"a":null}"#,
+        "del(.a.b, .a.c)",
+        Outcome::values(&[r#"{"a":null}"#]),
+    );
+    check(
+        r#"{"a":{}}"#,
+        "del(.a.b.c, .a.b.d)",
+        Outcome::values(&[r#"{"a":{}}"#]),
+    );
+    // #477/#529: an out-of-range index names nothing, and its tail decides.
+    check(
+        r#"{"a":[1,2,3]}"#,
+        "del(.a[5].x, .a[0])",
+        Outcome::values(&[r#"{"a":[2,3]}"#]),
+    );
+    // Deleting *through* a slice edits the sub-array and splices it back,
+    // alongside a sibling bare index in the same batch.
+    check(
+        "[1,[2],[3]]",
+        "del(.[1:3][0], .[0])",
+        Outcome::values(&["[[3]]"]),
+    );
+}
+
+/// #1690's own headline shape: a filtered recursive descent whose match set
+/// excludes the document root, so #1651's root short-circuit never fires and
+/// every match is its own resolved branch under a shared prefix.
+#[test]
+fn test_del_filtered_recursive_descent_1690() {
+    check(
+        r#"{"a":{"b":{"c":[1,2,3]}},"d":4}"#,
+        r#"del(.. | select(type == "number"))"#,
+        Outcome::values(&[r#"{"a":{"b":{"c":[]}}}"#]),
+    );
+    check(
+        r#"{"a":1,"b":{"c":2}}"#,
+        r#"del(.. | select(type == "number"))"#,
+        Outcome::values(&[r#"{"b":{}}"#]),
+    );
+    check(
+        r#"{"a":[1,[2,3]],"b":2}"#,
+        r#"del(.. | select(type == "number"))"#,
+        Outcome::values(&[r#"{"a":[[]]}"#]),
+    );
+}
+
 /// #1322: `delete_expr_array_paths`'s multi-path type-mismatch check used to
 /// be gated behind `paths.iter().all(|p| p[start].optional)`, but every
 /// sibling here reaching this function already had its own `Expr::Optional`

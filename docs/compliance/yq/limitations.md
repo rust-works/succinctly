@@ -881,8 +881,8 @@ three operations' "skip and continue in given order" fix to `del()` would make i
 *more* than real yq does for some orderings (`del(.a, 1)` would delete `.a`, which real yq
 leaves untouched) — a data-loss-shaped divergence in the wrong direction, not a cosmetic
 one. `del()` therefore keeps raising `reject_untracked_at_terminal`'s pre-existing error
-(via the same `short_circuit_del_root` flag `resolve_dynamic_indexes` already uses to
-distinguish `del()`'s call shape from its three siblings) until the real reverse-order/
+(via `resolve_del_path_branches`, `del()`'s own path-resolution entry point, which is
+what distinguishes its call shape from its three siblings') until the real reverse-order/
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 

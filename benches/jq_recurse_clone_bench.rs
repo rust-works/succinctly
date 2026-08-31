@@ -23,9 +23,9 @@
 //! `path(..)` benchmark would be dominated by `walk_path`, not by the
 //! function #668 targets, near-invisible to that fix, and would repeat
 //! exactly the mistake #675 was filed to correct in the first place.
-//! `del(..)` instead reaches `resolve_dynamic_indexes` and then applies
-//! `delete_at_path`/`delete_expr_paths_at` directly to the already-assembled
-//! static paths — no second walk of the original tree — so its cost tracks
+//! `del(..)` instead reaches `resolve_del_path_branches` and then applies
+//! `delete_at_path`/`DeleteTrie` directly to the already-resolved static
+//! paths — no second walk of the original tree — so its cost tracks
 //! `push_recursive_branches`'s own share closely.
 //!
 //! #701 found the depth-400 point in the list below panicking
@@ -60,19 +60,26 @@
 //! `Vec<DeleteStep>` (`builtin_del`'s `flatten_delete_path`) — once per
 //! resolved branch, unconditionally, even though this fixture's own guard
 //! above proves the result is always `null` and neither flattened form is
-//! ever inspected. `resolve_dynamic_indexes` now takes a
-//! `short_circuit_del_root` flag, set only by `del()`'s own call: when any
-//! resolved branch is the document root (true for `..`/bare
+//! ever inspected. `del()` now resolves through `resolve_del_path_branches`,
+//! which reports the document root as `DelPaths::Root` (true for `..`/bare
 //! `recurse`/`recurse(f)`/`recurse(f;cond)` unconditionally, since each
-//! emits self before recursing into children), it returns
-//! `[Expr::Identity]` immediately, skipping both flattens. This benchmark
-//! now exercises only `push_recursive_branches`'s own O(d) branch
+//! emits self before recursing into children) and skips both flattens. This
+//! benchmark now exercises only `push_recursive_branches`'s own O(d) branch
 //! construction (still real work — every node's path is still resolved) —
-//! its growth exponent should read ~k≈1 post-fix. A **filtered** recurse
-//! whose match set excludes the root (`del(.. | select(cond))` where `cond`
-//! rejects `.`) is *not* covered by this flag and still pays both O(d²)
-//! flattens in full — deliberately out of scope here; see the #1651
-//! follow-up issue for that shape.
+//! its growth exponent should read ~k≈1 post-fix.
+//!
+//! **#1690 update.** A **filtered** recurse whose match set excludes the
+//! root (`del(.. | select(cond))` where `cond` rejects `.`) never reaches
+//! `DelPaths::Root`, so #1651 left it paying both flattens in full. #1690
+//! removed them for every multi-path `del()` by merging the resolved paths
+//! into a `DeleteTrie` rather than flattening each branch independently. It
+//! is deliberately still not covered *here* — that shape's own cost is
+//! dominated by a different term (`select` re-serializing each branch's
+//! value through `to_json_for_reindex_at_depth`), which is exactly the
+//! "poor isolator" problem this file's header is about; see
+//! `benches/jq_write_path_bench.rs`'s
+//! `jq_write_path_del_shared_prefix_width` group for the isolating
+//! fixture.
 //!
 //! This file makes **no timing assertion** — it is a Criterion benchmark for
 //! manual before/after comparison, not a CI gate. Run it interleaved

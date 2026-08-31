@@ -16574,10 +16574,10 @@ enum YqDelSliceOutcome {
 /// since `Expr::pipe` doesn't flatten nested pipes when combining stages
 /// during parsing) -- both live-verified to silently fall through to the
 /// old buggy per-step walk instead of this rule. `flatten_delete_path` is
-/// the same recursive flattener `delete_expr_paths_at`'s sibling-grouping
-/// machinery already relies on to see through exactly this nesting, so
-/// reusing it here closes the gap instead of re-deriving a second,
-/// shallower flattening pass.
+/// the same recursive flattener [`DeleteTrieBuilder`] relies on to see
+/// through exactly this nesting when it interns a path, so reusing it here
+/// closes the gap instead of re-deriving a second, shallower flattening
+/// pass.
 ///
 /// `empty_prefix_is_identity: true` is for `delete_at_path`'s
 /// `Expr::Iterate` arm's per-element `rest`: there, an empty residual
@@ -19613,9 +19613,10 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 /// dead code.
 ///
 /// The `Expr::Iterate => true` arm below is also load-bearing for
-/// `delete_expr_paths_at` (a comma-grouped `del()`'s multi-path walker):
+/// [`DeleteTrieBuilder::child_of`], which interns a comma-grouped `del()`'s
+/// resolved paths:
 /// it's what guarantees a bare `.[]` never survives into that function's
-/// resolved paths, which is why `delete_expr_paths_at` has no `Iterate`
+/// resolved paths, which is why the delete trie has no `Iterate`
 /// case of its own (#1382 -- removed as confirmed-dead code once this arm
 /// was found to always fire first). Narrowing this arm would silently
 /// reopen that dead branch as a real one.
@@ -24836,10 +24837,10 @@ enum DelPaths<'a> {
     /// unconditionally (`push_recursive_branches` pushes the current node
     /// before recursing into children, and `recurse`'s own definition emits
     /// `.` regardless of what `f` does). Deleting the root subsumes every
-    /// other resolved path — `delete_expr_paths_at`'s `paths.iter().any(|p|
-    /// p.len() == start)` check and `delete_at_path`'s `Expr::Identity` arm
-    /// both already collapse the whole value to `null` on exactly this
-    /// condition — so the remaining branches are never flattened at all.
+    /// other resolved path — [`DeleteTrie::root_is_terminal`] and
+    /// `delete_at_path`'s `Expr::Identity` arm both already collapse the
+    /// whole value to `null` on exactly this condition — so the remaining
+    /// branches are never flattened at all.
     /// This is what makes `del(..)` O(d) rather than O(d²) on a depth-`d`
     /// document; the *filtered* descent that misses the root is what
     /// [`DeleteTrie`] is for.
@@ -24950,10 +24951,12 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// 80,000 while widening the computed key from 2 branches to 512 — so this
 /// function emits exactly as many paths every time — took `del` from 890ms
 /// to 95ms, and a profile put 99.9% of the samples in
-/// `delete_expr_array_paths`. The quadratic was that function's own sibling
+/// `delete_expr_array_paths` (the pre-#1690 array walker, now
+/// `delete_trie_array`). The quadratic was that function's own sibling
 /// grouping, which scanned an insertion-ordered `Vec` linearly per sibling;
-/// it and its three siblings are `IndexMap`/`IndexSet` now, and `del` on the
-/// repro is 22.0s -> 0.38s at 400,000. The four items above remain the
+/// it and its three siblings became `IndexMap`/`IndexSet`, and `del` on the
+/// repro went 22.0s -> 0.38s at 400,000; #1690 has since merged all four
+/// into [`DeleteTrie`], which keeps that same insertion-ordered keying. The four items above remain the
 /// reason this flag is `false`; they are not a prerequisite for `del`'s
 /// scaling.
 ///
@@ -32260,13 +32263,13 @@ struct DeleteStep {
 /// Flatten a resolved (fully static) `del` path into atomic steps.
 ///
 /// Mirrors `push_path_components`, but fully resolves `Optional` instead of
-/// leaving it as an opaque wrapper. Two callers, with different needs: the
-/// comma-grouped multi-path walker ([`delete_expr_paths_at`]) compares steps
-/// across sibling paths position by position, so it needs one flat sequence
-/// rather than a tree that hides some components behind `Optional`/`Pipe`
-/// nodes; a `del()` path resolved this way never actually carries a literal
-/// `Iterate` component by the time it reaches that walker (#1382), only
-/// `Field`/`Index`/`Slice`. [`yq_del_slice_outcome`] is the other caller,
+/// leaving it as an opaque wrapper. Two callers, with different needs:
+/// [`DeleteTrieBuilder`] turns each path into one trie edge per atomic step,
+/// so it needs one flat sequence rather than a tree that hides some
+/// components behind `Optional`/`Pipe` nodes; a `del()` path resolved this
+/// way never actually carries a literal `Iterate` component by the time it
+/// is interned (#1382), only `Field`/`Index`/`Slice`.
+/// [`yq_del_slice_outcome`] is the other caller,
 /// and does need `Iterate` to survive flattening -- its trailing-slice-run
 /// scan walks a path that can genuinely still contain one.
 fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
@@ -32286,7 +32289,7 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
     }
 }
 
-/// [`delete_expr_paths_through_absent`]'s single-path counterpart, for
+/// [`delete_trie_through_absent`]'s single-path counterpart, for
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
 fn delete_at_path_through_absent(
@@ -32300,13 +32303,13 @@ fn delete_at_path_through_absent(
 
 /// One array-level step of a `del` path: a bare index, or a slice.
 ///
-/// The two share a bucket in [`delete_expr_paths_at`] because they name
+/// The two share one [`DeleteTrieNode`] `indices` map because they name
 /// elements of the same array and have to reach [`delete_keys`] in one batch —
-/// see the comment there on why splitting them would compound overlapping
-/// ranges instead of unioning them.
+/// see [`DeleteTrieBuilder::child_of`] on why splitting them would compound
+/// overlapping ranges instead of unioning them.
 ///
-/// `Hash` is for use as an [`IndexMap`] key in [`delete_expr_array_paths`]'s
-/// grouping (#1301) — a lookup accelerator only. It implies no meaningful
+/// `Hash` is for use as an [`IndexMap`] key there (#1301) — a lookup
+/// accelerator only. It implies no meaningful
 /// ordering or identity beyond the `PartialEq` above.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ArrayStep {
@@ -32324,7 +32327,7 @@ struct DeleteTrieNode {
     ///
     /// Read only by this node's *parent*, when it batches its terminal
     /// children into one [`delete_keys`] call — never by the node itself on
-    /// the way in. That mirrors [`delete_expr_paths_at`], whose own
+    /// the way in. That mirrors the pre-#1690 `delete_expr_paths_at`, whose own
     /// exhausted-path check (`paths.iter().any(|path| path.len() == start)`)
     /// is unreachable for `start > 0`: everything a `groups` bucket collects
     /// there has `len() >= start + 2`, so only the top-level call can ever
@@ -32336,7 +32339,7 @@ struct DeleteTrieNode {
     /// swallow that.
     terminal: bool,
     /// Child edges keyed by object field name, in first-occurrence order
-    /// across the resolved paths — [`delete_expr_object_paths`]'s `terminal`
+    /// across the resolved paths — the pre-#1690 `delete_expr_object_paths`'s `terminal`
     /// `IndexSet` and `groups` `IndexMap` merged into one map, with
     /// `terminal` above and `field_groups` below recovering each half.
     fields: IndexMap<String, u32>,
@@ -32345,7 +32348,7 @@ struct DeleteTrieNode {
     /// Positions within `fields` of the children that have children of their
     /// own, in the order they first acquired one.
     ///
-    /// This is exactly [`delete_expr_object_paths`]'s `groups` iteration
+    /// This is exactly the pre-#1690 `delete_expr_object_paths`'s `groups` iteration
     /// order — "the order of the first resolved path that continues past
     /// this key" — which is load-bearing for jq's error priority (#1301) and
     /// is *not* the same as `fields`' own order (`del(.a, .b.x, .a.y)` has
@@ -32361,7 +32364,7 @@ struct DeleteTrieNode {
     slot: usize,
     keyed_by_field: bool,
     /// Whether any resolved path reaching this node carried a `?` at this
-    /// step — [`delete_expr_array_paths`]'s `paths.iter().any(|p|
+    /// step — the pre-#1690 `delete_expr_array_paths`'s `paths.iter().any(|p|
     /// p[start].optional)`, precomputed. Only read by a `debug_assert!`;
     /// see there for why the claim it guards is narrower than it looks
     /// (#1331).
@@ -32395,8 +32398,8 @@ impl DeleteTrieNode {
 /// `del()`'s multi-path route used to flatten each resolved branch into its
 /// own independent `Vec<Expr>` ([`assemble_path_branches`]) and then into its
 /// own independent `Vec<DeleteStep>` ([`flatten_delete_path`]), and
-/// [`delete_expr_paths_at`] then re-grouped those flat paths against each
-/// other one position at a time. All three are O(depth) *per branch*, so a
+/// the pre-#1690 `delete_expr_paths_at` then re-grouped those flat paths
+/// against each other one position at a time. All three are O(depth) *per branch*, so a
 /// match set that grows with depth — the shape a filtered recursive descent
 /// (`del(.. | select(cond))` where `cond` rejects `.`) produces — cost O(d²)
 /// (#1690; measured exponent 2.02-2.04 over depths 30..240, with the
@@ -32415,9 +32418,11 @@ impl DeleteTrieNode {
 /// # Fidelity
 ///
 /// The three apply functions ([`delete_trie_apply`], [`delete_trie_object`],
-/// [`delete_trie_array`]) are deliberately structural mirrors of
-/// [`delete_expr_paths_at`], [`delete_expr_object_paths`] and
-/// [`delete_expr_array_paths`] — same per-step `null` tolerance (#476/#527),
+/// [`delete_trie_array`]) are deliberately structural mirrors of the
+/// `delete_expr_paths_at`/`delete_expr_object_paths`/`delete_expr_array_paths`
+/// trio they replace (removed by #1690, rather than left standing as a second
+/// implementation of the same rules) — same per-step `null` tolerance
+/// (#476/#527),
 /// same non-array type-error wording and ordering (#1322/#1331), same
 /// single-batch [`delete_keys`] call for terminal keys (#424), same
 /// insertion-ordered grouping (#1301). The one thing they do *not* mirror is
@@ -32437,7 +32442,7 @@ impl DeleteTrie {
     /// trie is ever built, so this can only fire for a branch whose
     /// components all flatten away to nothing (an `Expr::Identity`
     /// component, or one wrapped in enough `?`/`()` to leave no step
-    /// behind) — [`delete_expr_paths_at`]'s own `path.len() == start` case
+    /// behind) — the pre-#1690 `delete_expr_paths_at`'s own `path.len() == start` case
     /// at `start == 0`, which collapses the whole document to `null`.
     fn root_is_terminal(&self) -> bool {
         self.node(DELETE_TRIE_ROOT).terminal
@@ -32481,7 +32486,7 @@ impl DeleteTrieBuilder {
 
     /// Get or create the child of `parent` reached by one atomic path step.
     ///
-    /// Rejects any component shape [`delete_expr_paths_at`]'s own dispatch
+    /// Rejects any component shape the pre-#1690 `delete_expr_paths_at`'s dispatch
     /// rejects, with the identical message. Doing it here rather than during
     /// the walk is not an ordering change: every one of those shapes produces
     /// the *same* `cannot use expression as delete target` error, and
@@ -32513,7 +32518,8 @@ impl DeleteTrieBuilder {
                 }
             }
             // A `Slice` shares the `Index` bucket rather than getting one of
-            // its own, for the reason `delete_expr_paths_at` spells out:
+            // its own, for the reason the pre-#1690 `delete_expr_paths_at`
+            // spelled out:
             // `delete_trie_array` funnels every terminal key into a single
             // `delete_keys` call, and that one batch is what makes
             // overlapping ranges union instead of compound.
@@ -32563,8 +32569,9 @@ impl DeleteTrieBuilder {
             // `parent` just gained its first child, so it moves from "a
             // terminal key its own parent batches into `delete_keys`" to
             // "a group its own parent recurses into" — appended in exactly
-            // the order `delete_expr_object_paths`/`delete_expr_array_paths`
-            // would have first inserted it into their `groups` map.
+            // the order the pre-#1690 `delete_expr_object_paths`/
+            // `delete_expr_array_paths` would have first inserted it into
+            // their `groups` map.
             let node = self.trie.node(parent);
             let (grandparent, slot, by_field) = (node.parent, node.slot, node.keyed_by_field);
             let gp = &mut self.trie.nodes[grandparent as usize];
@@ -32766,15 +32773,15 @@ fn del_branch_slice_paths<S: EvalSemantics>(branches: &[PathBranch<'_>]) -> Vec<
         .collect()
 }
 
-/// [`delete_expr_paths_at`] against a [`DeleteTrie`] node instead of a
-/// position across a slice of flat paths.
+/// The pre-#1690 `delete_expr_paths_at`, rewritten against a [`DeleteTrie`]
+/// node instead of a position across a slice of flat paths.
 fn delete_trie_apply(
     mut value: OwnedValue,
     trie: &DeleteTrie,
     id: u32,
 ) -> Result<OwnedValue, EvalError> {
     let node = trie.node(id);
-    // `delete_expr_paths_at`'s `paths.is_empty()` guard. Only the root can
+    // The pre-#1690 `delete_expr_paths_at`'s `paths.is_empty()` guard. Only the root can
     // actually reach it (every recursive call below is made against a node
     // already known to have children), but it costs nothing and keeps the
     // two functions readable side by side.
@@ -32799,7 +32806,7 @@ fn delete_trie_apply(
 }
 
 /// Walk a doomed subtree against the `null` that a step naming nothing reads
-/// as — [`delete_expr_paths_through_absent`]'s trie counterpart.
+/// as — the pre-#1690 `delete_expr_paths_through_absent`'s counterpart.
 ///
 /// Every arm this can reach is `null`-tolerant and every unsupported
 /// component shape was already rejected when the trie was built, so this
@@ -32816,7 +32823,7 @@ fn delete_trie_through_absent(trie: &DeleteTrie, id: u32) -> Result<(), EvalErro
     Ok(())
 }
 
-/// [`delete_expr_object_paths`]'s trie counterpart.
+/// The pre-#1690 `delete_expr_object_paths`'s counterpart.
 fn delete_trie_object(
     mut value: OwnedValue,
     trie: &DeleteTrie,
@@ -32876,7 +32883,7 @@ fn delete_trie_object(
     Ok(value)
 }
 
-/// [`delete_expr_array_paths`]'s trie counterpart.
+/// The pre-#1690 `delete_expr_array_paths`'s counterpart.
 fn delete_trie_array(
     mut value: OwnedValue,
     trie: &DeleteTrie,
@@ -32914,7 +32921,8 @@ fn delete_trie_array(
         );
         // *Which* sentence comes from the first-inserted step specifically,
         // because jq walks the paths in source order and dies on the first —
-        // the same `paths[0]` rule `delete_expr_array_paths` follows, and
+        // the same `paths[0]` rule the pre-#1690 `delete_expr_array_paths`
+        // followed, and
         // insertion order here is that same source order. The non-string
         // slice arm and the index arm are not known to be live-reachable (a
         // bare or nested number root fails earlier, during path navigation);
@@ -33121,7 +33129,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `resolve_dynamic_indexes`). A path with no computed key at all is
     // returned verbatim instead and may still contain a literal `Iterate`,
     // but is always the sole entry, so it takes the `paths.len() <= 1`
-    // branch below rather than `delete_expr_paths_at`'s comma-grouped one
+    // branch below rather than the trie's comma-grouped one
     // (#1382).
     //
     // `resolve_del_path_branches`, not `resolve_dynamic_indexes`: `del()` is
@@ -33441,7 +33449,7 @@ fn delete_at_path(
                         OwnedValue::Object(map) => match map.get_mut(name) {
                             Some(current) => delete_at_path(current, &rest, optional, yq_mode),
                             // Same "reads as `null`, keep walking" rule as
-                            // `delete_expr_object_paths`' missing-field arm
+                            // `delete_trie_object`'s missing-field arm
                             // (#527): `del(.a.b.c)` is a no-op, `del(.a.b[])`
                             // still raises. `here` no longer gates this — a
                             // `?` on the missing step does not suppress what
@@ -61243,7 +61251,7 @@ mod tests {
         // `[]` tail still raises `Cannot iterate over null (null)` even
         // though every other tail stays a no-op. Both `[1,2]`'s single-path
         // walker (`delete_at_path`) and its grouped/comma walker
-        // (`delete_expr_array_paths`) must agree.
+        // (`delete_trie_array`) must agree.
         for (json, filter) in [
             (&br"[1,2]"[..], r"del(.[5][])"),
             (&br#"{"a":[1,2]}"#[..], r"del(.a[5][])"),
