@@ -32333,7 +32333,7 @@ struct DeleteTrieNode {
     /// there has `len() >= start + 2`, so only the top-level call can ever
     /// see a path exhausted at its own position. Checking it here instead
     /// would be a real behaviour change, not a shortcut — `{"a":"s"} |
-    /// del(.a, .a[0])` raises `Cannot delete fields from string` today
+    /// del(.a, .a[0])` raises `Cannot index string with number` today
     /// because the recursion into `.a` still runs even though `.a` is
     /// already doomed, and short-circuiting on `terminal` would silently
     /// swallow that.
@@ -32844,12 +32844,24 @@ fn delete_trie_object(
         return Ok(value);
     }
 
-    // Every edge here is Field-kind, so `resolve_node` (invoked by
-    // `resolve_del_path_branches` before any of this runs) already validated
-    // `value` as field-indexable for each path — raising the same `Cannot
-    // index … with …` error itself — before the trie was ever built. `null`
-    // is excluded above, so this can only fire if that earlier validation
-    // regresses.
+    // Every edge here is Field-kind, and for most call shapes `resolve_node`
+    // (invoked by `resolve_del_path_branches` before any of this runs)
+    // already validated `value` as field-indexable for each path — raising
+    // the same `Cannot index … with …` error itself — before the trie was
+    // ever built.
+    //
+    // **Not for all of them, though: this `unreachable!()` is live-reachable
+    // and aborts the process.** `[] | del(.[0], .[1:2].b?[2:3])` reaches it
+    // in jq mode (where jq 1.7.1 prints `[]`), and `2.5 | del(.[("k0","k1")])`
+    // reaches it in yq mode (where real yq prints `2.5`) -- both confirmed
+    // live, both identically reachable before #1690 through this function's
+    // predecessor, whose own comment made the same false claim. Tracked as
+    // [#2049](https://github.com/rust-works/succinctly/issues/2049) rather
+    // than fixed here: turning it into an `EvalError` (which is what the
+    // array arm below already does for its own equivalent gate, and what
+    // #1098 established as this crate's rule) is a behaviour change needing
+    // its own oracle capture of *which* error -- or, per both references
+    // above, of no error at all -- and #1690 is gated on changing nothing.
     let OwnedValue::Object(entries) = &mut value else {
         unreachable!("delete_trie_object reached a non-object, non-null root")
     };
