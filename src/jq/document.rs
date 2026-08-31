@@ -1707,23 +1707,33 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// cursor position, so this is a copy of a couple of machine words.
     all: F,
     /// Hashes of the keys yielded so far, while the rule is in force and
-    /// the object is not yet proved clean. Boxed (#1973): live only on the
-    /// probing phase of the rare duplicate-key path, so every walk over a
-    /// clean object (`collapse` false, or true but never repeated) pays a
-    /// single pointer instead of `KeyHashes`'s own ~40-byte hash-table
-    /// header -- `Option<Box<T>>` niches to the same width as `Option<T>`
-    /// would for a `T` that already carries a non-null pointer, so this
-    /// costs nothing beyond the fields it removes from the struct itself.
-    seen: Option<Box<KeyHashes>>,
+    /// the object is not yet proved clean. Deliberately **not** boxed
+    /// (#1973 code review): unlike `collapsed` below, this is constructed
+    /// eagerly in [`new`](Self::new) for every jq-mode walk (`collapse`
+    /// true is the default), not lazily once a duplicate is actually
+    /// found -- `KeyHashes::new()` itself is genuinely free (an empty
+    /// `Vec` allocates nothing until its first insertion), but wrapping it
+    /// in a `Box` would force a heap allocation for the `KeyHashes`
+    /// struct itself on every single call, regardless of whether the
+    /// object ever has a duplicate key. That would add a real,
+    /// unconditional per-object allocation to `keys_unsorted`/`.[]`-style
+    /// hot paths this codebase has otherwise gone out of its way to keep
+    /// allocation-free (see `KeyHashes::slots`'s own doc comment, and the
+    /// O5 optimization, #1599/#1606/#1609) in exchange for shrinking a
+    /// struct that is not on those same hot paths' critical dimension.
+    seen: Option<KeyHashes>,
     /// How many cursors have gone out, which is where `collapsed` resumes.
     yielded: usize,
     /// The exact collapsed key list, once a repeat is confirmed. Key and
     /// cursor only -- this iterator never reads a field's value, so
     /// `collapse_confirmed_repeat` never materializes one (#1514 review).
-    /// Boxed (#1973) for the same reason as `seen` above -- this is already
-    /// niche-optimized as `Option<Vec<_>>`, so wrapping it in a `Box` before
-    /// niching only removes the `Vec`'s own three machine words from every
-    /// instance that never collapses.
+    /// Boxed (#1973): unlike `seen` above, this is only ever set to `Some`
+    /// once a repeat is already confirmed (`collapse_confirmed_repeat` has
+    /// already run its own `IndexMap`/`Vec` allocations by that point), so
+    /// the one extra box here is genuinely free on every walk that never
+    /// collapses -- already niche-optimized as `Option<Vec<_>>`, wrapping
+    /// it in a `Box` before niching only removes the `Vec`'s own three
+    /// machine words from every instance that stays `None`.
     collapsed: Option<Box<Vec<(F::Value, F::Cursor)>>>,
     /// Whether the walk ran out on an unpaired child (#1194). Recorded as
     /// the walk discovers it, because neither branch can answer afterwards:
@@ -1748,7 +1758,7 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
         Self {
             rest: fields.clone(),
             all: fields.clone(),
-            seen: collapse.then(|| Box::new(KeyHashes::new())),
+            seen: collapse.then(KeyHashes::new),
             yielded: 0,
             collapsed: None,
             ended_unpaired: false,
