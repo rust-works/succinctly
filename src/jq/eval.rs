@@ -11517,14 +11517,23 @@ fn parse_json_string_value(
                                     }
                                     *pos += 5; // Move past the low surrogate (will be incremented again below)
                                 } else {
-                                    // Lone high surrogate - use replacement character
-                                    result.push('\u{FFFD}');
-                                    *pos -= 1; // Back up so we don't skip the next escape
+                                    // #2013: a lone high surrogate (this
+                                    // \u wasn't followed by a valid low
+                                    // surrogate) is an error, matching real
+                                    // jq (confirmed live) and this crate's
+                                    // own primary document decoder
+                                    // (`json::light::decode_escapes`'s
+                                    // sibling high-surrogate arm). No
+                                    // yq-mode split needed: real yq also
+                                    // rejects every surrogate escape
+                                    // unconditionally (#2018).
+                                    return Err("invalid unicode codepoint".to_string());
                                 }
                             } else {
-                                // Lone high surrogate
-                                result.push('\u{FFFD}');
-                                *pos -= 1;
+                                // #2013: lone high surrogate, not followed
+                                // by any `\u` escape at all -- same fix as
+                                // above.
+                                return Err("invalid unicode codepoint".to_string());
                             }
                         } else if (0xDC00..=0xDFFF).contains(&codepoint) {
                             // #2008: a lone low surrogate isn't a valid Rust

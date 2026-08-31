@@ -25734,6 +25734,46 @@ fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
     assert_eq!(stdout.trim(), "😀");
 }
 
+/// #2013: the opposite-direction bug from #2008/the test above -- a lone
+/// *high* surrogate (`\uD800`-`\uDBFF`) in `fromjson`'s own decoder wrongly
+/// substituted U+FFFD instead of raising, where real jq 1.7.1 rejects it
+/// (confirmed live). Covers every shape the issue's own investigation
+/// found: end-of-string, followed by a non-`\u` escape, followed by a
+/// `\u` escape that isn't a valid low surrogate, and two consecutive
+/// unpaired high surrogates -- each previously took a different silent
+/// path to the same wrong "succeeds with U+FFFD" outcome.
+#[test]
+fn test_fromjson_lone_high_surrogate_raises_2013() {
+    for filter in [
+        r#""\"\\ud800\"" | fromjson"#,
+        r#""\"\\ud800\\n\"" | fromjson"#,
+        r#""\"\\ud800\\u0041\"" | fromjson"#,
+        r#""\"\\ud800\\ud800\"" | fromjson"#,
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-n", "-r", filter], None).unwrap();
+        assert_ne!(code, 0, "filter={filter:?} should raise, stderr: {stderr}");
+    }
+}
+
+/// #2013: object keys go through the same decoder, so two `fromjson`-parsed
+/// keys differing only by an unpaired high surrogate used to silently
+/// collapse (last value wins) instead of the whole document raising --
+/// real data loss, not just a leniency mismatch. Confirmed live: real jq
+/// rejects the document outright.
+#[test]
+fn test_fromjson_lone_high_surrogate_key_no_longer_silently_collapses_2013() {
+    let (_stdout, stderr, code) = run_jq_full(
+        &[
+            "-n",
+            "-c",
+            r#""{\"a\\ud800\":1,\"a\\ud800\":2}" | fromjson"#,
+        ],
+        None,
+    )
+    .unwrap();
+    assert_ne!(code, 0, "stderr: {stderr}");
+}
+
 /// #1642 (was #1247): an undecodable *key* does not silently shrink the
 /// object -- `to_entries` used to return one entry fewer than the document
 /// had, because `effective_fields`' dedup walk dropped any field whose key
