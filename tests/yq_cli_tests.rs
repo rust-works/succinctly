@@ -4285,6 +4285,38 @@ fn test_nul_output_identity_keeps_prefix_on_decode_failure_1709() -> Result<()> 
     Ok(())
 }
 
+/// #1709 code review (independently caught by two separate finders): the
+/// `split_doc` builtin's own separator writer, `SplitDocState::
+/// write_separator`, was never updated to defer past `output_value`'s NUL
+/// check the way every *other* document-separator writer in this file was
+/// -- reachable via a plain `split_doc` in the filter itself, not just
+/// `--split-exp`, so this isn't a rare edge branch.
+#[test]
+fn test_nul_output_split_doc_no_separator_leak_on_later_result_failure_1709() -> Result<()> {
+    let input = "- ok1\n- \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".[] | split_doc", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "ok1\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709 counterpart: the separator DOES still appear once an earlier
+/// `split_doc` result already flushed clean.
+#[test]
+fn test_nul_output_split_doc_separator_kept_when_earlier_result_succeeds_1709() -> Result<()> {
+    let input = "- ok1\n- ok2\n- \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".[] | split_doc", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert!(
+        output.contains("---"),
+        "expected the split_doc separator between the two surviving results, got: {output:?}"
+    );
+    assert_eq!(output, "ok1\0\n---\nok2\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
 /// Same fix, `--inplace` (#1701).
 #[test]
 fn test_nul_output_inplace_1701() -> Result<()> {
