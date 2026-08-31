@@ -20463,6 +20463,55 @@ impl<'a> PathBranch<'a> {
 /// semantics (confirmed live: `(.a, 1) = 5` produces no output at all).
 type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, EvalEscape)>;
 
+/// How many outputs a *generator* leaf may contribute to one path
+/// resolution — the resolver's fourth ambient, threaded verbatim alongside
+/// `trackable`/`snapshot` and read in exactly one place,
+/// [`resolve_leaf`]'s general non-primitive case.
+///
+/// [`Keep::First`] is every ordinary `path()`/`=`/`|=`/`del()` entry
+/// point's value and reproduces #987's stop-after-first sink exactly: real
+/// jq's `path(...)` raises on a generator's *first* output and never asks
+/// it for another, so a later output's side effect must not fire either.
+///
+/// [`Keep::AtMost`] exists for the one context where that rule is wrong: a
+/// `reduce`/`foreach` *source*, which jq evaluates with tracking on while
+/// consuming **every** value it produces (see [`resolve_fold_source`]).
+/// There the leaf's outputs are the fold's real values, so truncating to
+/// the first silently runs the fold too few times. `AtMost(1)` is
+/// byte-identical to `First` — the two are kept distinct only so the
+/// intent at each call site stays readable.
+///
+/// Count-bounded resolutions narrow it rather than forwarding it
+/// ([`resolve_node_bounded`], [`resolve_repeat_bounded`]): a caller that
+/// wants at most `n` branches can never need more than `n` outputs from
+/// any single leaf, and that cap is what keeps `first(range(2000000000))`
+/// inside a fold source from materializing two billion values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// Stop the leaf's generator after its first output (#987).
+    First,
+    /// Keep up to `n` outputs, then stop.
+    AtMost(usize),
+}
+
+impl Keep {
+    /// This bound, narrowed to at most `n` outputs.
+    fn at_most(self, n: usize) -> Self {
+        match self {
+            Keep::First => Keep::First,
+            Keep::AtMost(k) => Keep::AtMost(k.min(n)),
+        }
+    }
+
+    /// The output count at which the leaf's sink answers [`Demand::Stop`].
+    fn limit(self) -> usize {
+        match self {
+            Keep::First => 1,
+            Keep::AtMost(n) => n,
+        }
+    }
+}
+
 /// Combine an already-resolved branch prefix with an optional trailing
 /// escape into this resolver's `PathResolveResult` shape.
 ///
@@ -20577,10 +20626,11 @@ fn resolve_node<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     match expr {
-        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable, snapshot),
-        Expr::Paren(inner) => resolve_node::<S>(inner, value, trackable, snapshot),
+        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable, snapshot, keep),
+        Expr::Paren(inner) => resolve_node::<S>(inner, value, trackable, snapshot, keep),
 
         // #1371: `path(f)` has to see *through* a call to whatever its body
         // navigates, exactly as it did when the body was substituted in
@@ -20599,13 +20649,13 @@ fn resolve_node<'a, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => resolve_node::<S>(bound, value, trackable, snapshot),
+            Ok(bound) => resolve_node::<S>(bound, value, trackable, snapshot, keep),
             Err(e) => Err((Vec::new(), e.into())),
         },
         // Transparent, like `Paren`: the wrapped argument is ordinary code
         // whose own navigation is exactly as trackable here as it would be
         // written out in place.
-        Expr::Shared(inner) => resolve_node::<S>(inner, value, trackable, snapshot),
+        Expr::Shared(inner) => resolve_node::<S>(inner, value, trackable, snapshot, keep),
 
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
@@ -20627,7 +20677,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // siblings are still appended to `out` in source order, and
                 // an untracked one still stops everything after it, just at
                 // the point that knows enough to say so.
-                match resolve_node::<S>(e, value, trackable, snapshot) {
+                match resolve_node::<S>(e, value, trackable, snapshot, keep) {
                     Ok(branches) => out.extend(branches),
                     Err((prefix, e)) => {
                         out.extend(prefix);
@@ -20654,14 +20704,14 @@ fn resolve_node<'a, S: EvalSemantics>(
             // a path expression and nothing else until #367 — but when it can,
             // this arm still wants to see only the bare shape.
             Expr::IndexExpr { target, key } => {
-                resolve_index_expr::<S>(target, key, value, true, trackable)
+                resolve_index_expr::<S>(target, key, value, true, trackable, keep)
             }
 
             // `E[S:T]?` is the same bare shape for slice bounds: only a
             // failure to *slice* is covered, never `E`, `S`, or `T`'s own
             // evaluation — see `resolve_slice_expr`'s doc comment.
             Expr::SliceExpr { target, start, end } => {
-                resolve_slice_expr::<S>(target, start, end, value, true, trackable)
+                resolve_slice_expr::<S>(target, start, end, value, true, trackable, keep)
             }
 
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
@@ -20729,7 +20779,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                         | Expr::Slice { .. }
                         | Expr::SliceNumber { .. }
                 );
-                let branches = match resolve_node::<S>(inner, value, trackable, snapshot) {
+                let branches = match resolve_node::<S>(inner, value, trackable, snapshot, keep) {
                     Ok(branches) => branches,
                     // Only a genuine collection failure prunes to the
                     // already-resolved prefix: `halt`/`halt_error(n)` is
@@ -20827,11 +20877,11 @@ fn resolve_node<'a, S: EvalSemantics>(
         }
 
         Expr::IndexExpr { target, key } => {
-            resolve_index_expr::<S>(target, key, value, false, trackable)
+            resolve_index_expr::<S>(target, key, value, false, trackable, keep)
         }
 
         Expr::SliceExpr { target, start, end } => {
-            resolve_slice_expr::<S>(target, start, end, value, false, trackable)
+            resolve_slice_expr::<S>(target, start, end, value, false, trackable, keep)
         }
 
         // Every spelling here (`..`, bare `recurse`/`recurse(f)`/
@@ -20892,10 +20942,10 @@ fn resolve_node<'a, S: EvalSemantics>(
         // same reason as just above. `resolve_recurse` itself asserts this
         // rather than re-deriving it (#843 review).
         Expr::Builtin(Builtin::RecurseF(f)) => {
-            resolve_recurse::<S>(f, None, value, trackable, snapshot)
+            resolve_recurse::<S>(f, None, value, trackable, snapshot, keep)
         }
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
-            resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot)
+            resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, keep)
         }
 
         // `select(f)` and the typeof filters (`objects`, `arrays`, ...) add no
@@ -20992,7 +21042,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         // generic truncate-after-the-fact shape alone. Live-verified against
         // jq 1.7.1: `{"a":1} | path(first(repeat(.)))` is `[]`.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            resolve_node_bounded::<S>(inner, value, trackable, snapshot, 1)
+            resolve_node_bounded::<S>(inner, value, trackable, snapshot, keep, 1)
         }
 
         // `if cond then a else b end`: only the branch the runtime actually
@@ -21020,7 +21070,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
             resolve_cond_fork(cond_outputs, escape, |truthy, out| {
                 let branch = if truthy { then_branch } else { else_branch };
-                match resolve_node::<S>(branch, value, trackable, snapshot) {
+                match resolve_node::<S>(branch, value, trackable, snapshot, keep) {
                     Ok(branches) => {
                         out.extend(branches);
                         None
@@ -21074,16 +21124,16 @@ fn resolve_node<'a, S: EvalSemantics>(
         Expr::Alternative(left, right) => {
             if let Expr::Literal(lit) = unwrap_paren(left) {
                 if !literal_to_owned(lit).is_truthy() {
-                    return resolve_node::<S>(right, value, trackable, snapshot);
+                    return resolve_node::<S>(right, value, trackable, snapshot, keep);
                 }
             }
             let branches: Vec<PathBranch<'a>> =
-                resolve_node::<S>(left, value, trackable, snapshot)?
+                resolve_node::<S>(left, value, trackable, snapshot, keep)?
                     .into_iter()
                     .filter(|b| b.value.is_truthy())
                     .collect();
             if branches.is_empty() {
-                resolve_node::<S>(right, value, trackable, snapshot)
+                resolve_node::<S>(right, value, trackable, snapshot, keep)
             } else {
                 Ok(branches)
             }
@@ -21095,7 +21145,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         // from jq (e.g. a negative `n`), which is that function's bug to
         // fix, not this resolver's. Both internal spellings reach here for
         // the same reason as `first` above.
-        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value, trackable, snapshot),
+        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value, trackable, snapshot, keep),
         // `Builtin::Limit` is never constructed by the parser (a CLI
         // `limit(n; expr)` always parses through `parse_limit_expr` into
         // `Expr::Limit` above, matched first) -- unreachable from any
@@ -21104,7 +21154,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         // builtin. Kept for exhaustiveness/parity with that arm, not
         // coverage-testable through this dispatch.
         Expr::Builtin(Builtin::Limit(n, expr)) => {
-            resolve_limit::<S>(n, expr, value, trackable, snapshot)
+            resolve_limit::<S>(n, expr, value, trackable, snapshot, keep)
         }
 
         // `try expr catch handler` (and `expr?`, sugar for `try expr`):
@@ -21123,34 +21173,36 @@ fn resolve_node<'a, S: EvalSemantics>(
         // message shape this resolver did not reproduce at all; `resolve_catch`
         // below now raises it correctly by marking the handler's payload
         // untracked, #843.)
-        Expr::Try { expr, catch } => match resolve_node::<S>(expr, value, trackable, snapshot) {
-            Ok(branches) => Ok(branches),
-            // `halt`/`halt_error(n)` is never caught by `try`/`catch`, in
-            // path expressions any more than in value position (#791) —
-            // only a genuine error or a break (below) reaches `catch`;
-            // everything else propagates unchanged, as does an
-            // invalid-path-expression complaint (#530) and, per the same
-            // reasoning, a decode failure (#1247, #1620) — both always
-            // uncatchable, with no positional nuance either shares with
-            // `is_untracked_navigation_error` above.
-            Err((prefix, EvalEscape::Error(e))) if !e.is_uncatchable() => {
-                resolve_catch::<S>(catch.as_deref(), prefix, e.payload())
+        Expr::Try { expr, catch } => {
+            match resolve_node::<S>(expr, value, trackable, snapshot, keep) {
+                Ok(branches) => Ok(branches),
+                // `halt`/`halt_error(n)` is never caught by `try`/`catch`, in
+                // path expressions any more than in value position (#791) —
+                // only a genuine error or a break (below) reaches `catch`;
+                // everything else propagates unchanged, as does an
+                // invalid-path-expression complaint (#530) and, per the same
+                // reasoning, a decode failure (#1247, #1620) — both always
+                // uncatchable, with no positional nuance either shares with
+                // `is_untracked_navigation_error` above.
+                Err((prefix, EvalEscape::Error(e))) if !e.is_uncatchable() => {
+                    resolve_catch::<S>(catch.as_deref(), prefix, e.payload(), keep)
+                }
+                // `catch` catches a `break` the same way it catches a raised
+                // error, regardless of which label it targets — jq's own rule
+                // (#562, already applied by the value-position `eval_try`),
+                // mirrored here for path context (#824): confirmed live,
+                // `label $out | path(try (.a, break $out) catch "x")` prints the
+                // prefix `["a"]` and then raises the catch handler's own
+                // `"x"` as an invalid-path-expression (#530) — the break never
+                // reaches `$out` at all. Real jq binds the handler's input to
+                // its internal break marker, which `null` stands in for here,
+                // same as `eval_try` already does.
+                Err((prefix, EvalEscape::Break(_))) => {
+                    resolve_catch::<S>(catch.as_deref(), prefix, OwnedValue::Null, keep)
+                }
+                Err(escape) => Err(escape),
             }
-            // `catch` catches a `break` the same way it catches a raised
-            // error, regardless of which label it targets — jq's own rule
-            // (#562, already applied by the value-position `eval_try`),
-            // mirrored here for path context (#824): confirmed live,
-            // `label $out | path(try (.a, break $out) catch "x")` prints the
-            // prefix `["a"]` and then raises the catch handler's own
-            // `"x"` as an invalid-path-expression (#530) — the break never
-            // reaches `$out` at all. Real jq binds the handler's input to
-            // its internal break marker, which `null` stands in for here,
-            // same as `eval_try` already does.
-            Err((prefix, EvalEscape::Break(_))) => {
-                resolve_catch::<S>(catch.as_deref(), prefix, OwnedValue::Null)
-            }
-            Err(escape) => Err(escape),
-        },
+        }
 
         // `label $x | body`: catches a `break` targeting this exact label
         // while resolving `body`, mirroring the value-position `eval_label`'s
@@ -21166,11 +21218,13 @@ fn resolve_node<'a, S: EvalSemantics>(
         // A non-matching break (a different label, still meant for something
         // further out) is not this arm's to catch, so it propagates
         // unchanged along with every other escape.
-        Expr::Label { name, body } => match resolve_node::<S>(body, value, trackable, snapshot) {
-            Ok(branches) => Ok(branches),
-            Err((prefix, EvalEscape::Break(label))) if label == *name => Ok(prefix),
-            Err(escape) => Err(escape),
-        },
+        Expr::Label { name, body } => {
+            match resolve_node::<S>(body, value, trackable, snapshot, keep) {
+                Ok(branches) => Ok(branches),
+                Err((prefix, EvalEscape::Break(label))) if label == *name => Ok(prefix),
+                Err(escape) => Err(escape),
+            }
+        }
 
         // `E as $x | body`: bind each output of `E` into `body` by
         // substitution — reusing `substitute_var`, already relied on for
@@ -21191,7 +21245,7 @@ fn resolve_node<'a, S: EvalSemantics>(
             let mut out = Vec::new();
             for bound in bound_values {
                 let substituted = substitute_bound_var(expr, body, var, &bound);
-                match resolve_node::<S>(&substituted, value, trackable, snapshot) {
+                match resolve_node::<S>(&substituted, value, trackable, snapshot, keep) {
                     Ok(branches) => out.extend(branches),
                     Err((body_prefix, escape)) => {
                         out.extend(body_prefix);
@@ -21273,8 +21327,9 @@ fn resolve_node<'a, S: EvalSemantics>(
                 value,
                 trackable,
                 snapshot,
+                keep,
             ),
-            _ => resolve_leaf::<S>(expr, value, trackable, snapshot),
+            _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
         },
         Expr::Foreach {
             input,
@@ -21292,8 +21347,9 @@ fn resolve_node<'a, S: EvalSemantics>(
                 value,
                 trackable,
                 snapshot,
+                keep,
             ),
-            _ => resolve_leaf::<S>(expr, value, trackable, snapshot),
+            _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
         },
 
         // #844: a frozen variable snapshot from a statically-verified
@@ -21336,7 +21392,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // creates its own fresh snapshot fact from `marker_value`,
                 // independent of whatever `value` it's being compared
                 // against (#1591).
-                resolve_leaf::<S>(expr, value, trackable, snapshot).map(|branches| {
+                resolve_leaf::<S>(expr, value, trackable, snapshot, keep).map(|branches| {
                     branches
                         .into_iter()
                         .map(PathBranch::into_snapshot)
@@ -21516,10 +21572,10 @@ fn resolve_node<'a, S: EvalSemantics>(
             if let Some(e) = escape {
                 return Err((Vec::new(), e));
             }
-            resolve_leaf::<S>(expr, value, trackable, snapshot)
+            resolve_leaf::<S>(expr, value, trackable, snapshot, keep)
         }
 
-        other => resolve_leaf::<S>(other, value, trackable, snapshot),
+        other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
     }
 }
 
@@ -21541,6 +21597,7 @@ fn resolve_limit<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // #1313: `eval_owned_expr_ctrl` (used elsewhere in this file) collapses
     // a genuinely zero-output bound to `Null` by design -- which would fall
@@ -21565,7 +21622,7 @@ fn resolve_limit<'a, S: EvalSemantics>(
     let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
     let mut branches = Vec::new();
     for n_value in n_values {
-        match resolve_limit_one_n::<S>(n_value, expr, value, trackable, snapshot) {
+        match resolve_limit_one_n::<S>(n_value, expr, value, trackable, snapshot, keep) {
             Ok(mut b) => branches.append(&mut b),
             Err((mut b, e)) => {
                 branches.append(&mut b);
@@ -21621,12 +21678,16 @@ fn resolve_node_bounded<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
     n: usize,
 ) -> PathResolveResult<'a> {
     match unwrap_paren(expr) {
-        Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, n),
+        Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, keep, n),
         Expr::Iterate if trackable => resolve_iterate_bounded::<S>(value, n),
-        _ => take_path_branches(resolve_node::<S>(expr, value, trackable, snapshot), n),
+        _ => take_path_branches(
+            resolve_node::<S>(expr, value, trackable, snapshot, keep.at_most(n)),
+            n,
+        ),
     }
 }
 
@@ -21638,6 +21699,7 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // Uses main's `classify_limit_n` (landed independently while this
     // branch was in flight) rather than the inline match this commit
@@ -21646,14 +21708,14 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
     // drifting -- `path(limit(-1.5; ...))` diverging from value-mode
     // `limit(-1.5; ...)` is exactly the bug #1313 already had to fix once.
     let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => return resolve_node::<S>(expr, value, trackable, snapshot),
+        Ok(LimitN::Unlimited) => return resolve_node::<S>(expr, value, trackable, snapshot, keep),
         Ok(LimitN::Take(n)) => n,
         Err(e) => return Err((Vec::new(), e.into())),
     };
     if n == 0 {
         return Ok(Vec::new());
     }
-    resolve_node_bounded::<S>(expr, value, trackable, snapshot, n)
+    resolve_node_bounded::<S>(expr, value, trackable, snapshot, keep, n)
 }
 
 /// `repeat(f)`'s own path-branch construction (#1906), bounded to at most
@@ -21706,6 +21768,7 @@ fn resolve_repeat_bounded<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
     n: usize,
 ) -> PathResolveResult<'a> {
     const MAX_ITERATIONS: usize = 1000;
@@ -21715,7 +21778,7 @@ fn resolve_repeat_bounded<'a, S: EvalSemantics>(
         if branches.len() >= n {
             break;
         }
-        match resolve_node::<S>(f, value, trackable, snapshot) {
+        match resolve_node::<S>(f, value, trackable, snapshot, keep.at_most(n)) {
             Ok(round) => {
                 for branch in round {
                     if budget == 0 {
@@ -21856,6 +21919,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     if !trackable {
         if let Some(element) = navigation_element(expr) {
@@ -21999,10 +22063,21 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // for both) — `resolve_leaf` has no way to tell that context apart from
     // `path(...)`'s own leaf today; filed as #989 rather than attempted
     // here.
-    let mut first: Option<OwnedValue> = None;
+    //
+    // `keep` (#1872) is the one dial on that rule. It is [`Keep::First`] for
+    // every ordinary `path()`/`=`/`|=`/`del()` entry, which is exactly the
+    // stop-after-first sink described above. A `reduce`/`foreach` *source*
+    // passes [`Keep::AtMost`] instead, because jq's fold does ask the
+    // generator for every value — see [`resolve_fold_source`].
+    let limit = keep.limit();
+    let mut values: Vec<OwnedValue> = Vec::new();
     let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
-        first = Some(v);
-        Demand::Stop
+        values.push(v);
+        if values.len() >= limit {
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
     });
 
     // Halt-first, exactly as the eager version checked `trailing` first —
@@ -22019,10 +22094,39 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         _ => None,
     };
     if let Some(code) = halt {
-        return Err((Vec::new(), EvalEscape::Halt(code)));
+        // Under `Keep::First` the prefix stays empty, exactly as before
+        // #1872: this arm is reached with at most one already-produced
+        // value, and `path(...)`'s own consumers never saw it. Under
+        // `Keep::AtMost(n > 1)` the fold *has* already consumed the values
+        // produced before the halt, and jq streams them (verified live:
+        // `path(foreach (1,2,(.a|tostring|halt_error(3))) as $k (.; .))` on
+        // `{"a":1}` prints two `[]` before exiting 3), so they are carried
+        // out as the prefix.
+        return if matches!(keep, Keep::First) {
+            Err((Vec::new(), EvalEscape::Halt(code)))
+        } else {
+            Err((
+                untracked_branches(values, trackable, value),
+                EvalEscape::Halt(code),
+            ))
+        };
     }
 
-    match first {
+    if values.is_empty() {
+        // No output prunes the branch — unless there never would have been
+        // one because evaluating `expr` itself broke/errored (Halt excluded,
+        // handled above) before producing anything. `Flow::Stopped` with no
+        // value cannot actually occur (this sink always pushes before it can
+        // answer `Stop`); folded to `Ok(Vec::new())` rather than
+        // `unreachable!()` for the same reason as the primitive branch above.
+        return match flow {
+            Flow::Exhausted | Flow::Stopped { .. } => Ok(Vec::new()),
+            Flow::Escaped(control) => Err((Vec::new(), EvalEscape::from(control))),
+        };
+    }
+
+    let branches = untracked_branches(values, trackable, value);
+    match (keep, flow) {
         // #986: *defer*, don't raise. Whether a non-path-shaped value is an
         // error depends on whether anything after it still has to navigate
         // into it, and only this branch's consumer knows that: `path(1)` is
@@ -22035,40 +22139,55 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // output — whether a bare `Escaped` the sink never had a chance to
         // avoid, or `pending` on a `Stopped` from an eager fallback — is
         // dropped: real jq never reaches whatever would have caused it.
-        Some(v) => Ok(vec![PathBranch::untracked(Cow::Owned(v)).with_register(
-            // #1573: this is the exact moment a branch steps *off* the path
-            // register — the value was computed, not navigated to — and the
-            // only place the register's own value is still in hand. Real jq
-            // does not lose it here: `value_at_path` is untouched by a
-            // literal, so a later `$var` frozen from this same position is
-            // still `jv_identical` to it (`path(. as $x | 5 | $x)` is `[]`).
-            // Recording it lets `resolve_seq` re-establish that.
-            //
-            // Only meaningful when the incoming position *was* the register
-            // (`trackable`); otherwise the register is somewhere further
-            // back and `resolve_seq` carries its own copy forward instead.
-            //
-            // This records where the register stood *entering* the stage,
-            // which is a fact about the incoming branch. Whether it
-            // survives *out* of the stage is a different question — reaching
-            // this arm means only that this resolver could not decompose
-            // the stage into path components, not that jq did not navigate
-            // inside it — and it is answered where the stage's own
-            // expression is in view, by `resolve_seq`'s
-            // `stage_preserves_register` ([`cannot_move_register`]).
-            trackable.then(|| Cow::Borrowed(value)),
-        )]),
-        // No output prunes the branch — unless there never would have been
-        // one because evaluating `expr` itself broke/errored (Halt excluded,
-        // handled above) before producing anything. `Flow::Stopped` with no
-        // `first` cannot actually occur (this sink always sets `first`
-        // before answering `Stop`); folded to `Ok(Vec::new())` rather than
-        // `unreachable!()` for the same reason as the primitive branch above.
-        None => match flow {
-            Flow::Exhausted | Flow::Stopped { .. } => Ok(Vec::new()),
-            Flow::Escaped(control) => Err((Vec::new(), EvalEscape::from(control))),
-        },
+        (Keep::First, _) => Ok(branches),
+        // `Keep::AtMost` inverts exactly that reasoning (#1872): a fold
+        // source *is* pulled to exhaustion, so jq does reach the trailing
+        // escape, and dropping it here would silently turn an erroring
+        // source into a clean one. A `Stopped` still drops its `pending` —
+        // the sink genuinely stopped at `limit`, so the fold would not have
+        // asked for whatever produced it either.
+        (_, Flow::Escaped(control)) => Err((branches, EvalEscape::from(control))),
+        (_, Flow::Exhausted | Flow::Stopped { .. }) => Ok(branches),
     }
+}
+
+/// One deferred, untracked branch per value — #986's "defer, don't raise"
+/// shape ([`resolve_leaf`]'s general case), lifted out because that case now
+/// builds it from one value or from `keep`-many.
+///
+/// Each branch also records the live path register (#1573): this is the
+/// exact moment a branch steps *off* the path register — the value was
+/// computed, not navigated to — and the only place the register's own value
+/// is still in hand. Real jq does not lose it here: `value_at_path` is
+/// untouched by a literal, so a later `$var` frozen from this same position
+/// is still `jv_identical` to it (`path(. as $x | 5 | $x)` is `[]`).
+/// Recording it lets `resolve_seq` re-establish that.
+///
+/// Only meaningful when the incoming position *was* the register
+/// (`trackable`); otherwise the register is somewhere further back and
+/// `resolve_seq` carries its own copy forward instead.
+///
+/// This records where the register stood *entering* the stage, which is a
+/// fact about the incoming branch — the same for every value this call
+/// produces, since they all come from resolving the same `expr` against the
+/// same `value`. Whether it survives *out* of the stage is a different
+/// question — reaching this arm means only that this resolver could not
+/// decompose the stage into path components, not that jq did not navigate
+/// inside it — and it is answered where the stage's own expression is in
+/// view, by `resolve_seq`'s `stage_preserves_register`
+/// ([`cannot_move_register`]).
+fn untracked_branches(
+    values: Vec<OwnedValue>,
+    trackable: bool,
+    value: &OwnedValue,
+) -> Vec<PathBranch<'_>> {
+    values
+        .into_iter()
+        .map(|v| {
+            PathBranch::untracked(Cow::Owned(v))
+                .with_register(trackable.then(|| Cow::Borrowed(value)))
+        })
+        .collect()
 }
 
 /// Fan `..` out into one branch per node in `value`'s tree, self before
@@ -22183,10 +22302,11 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
     current: Cow<'a, OwnedValue>,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     match current {
-        Cow::Borrowed(r) => resolve_node::<S>(expr, r, trackable, snapshot),
-        Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable, snapshot) {
+        Cow::Borrowed(r) => resolve_node::<S>(expr, r, trackable, snapshot, keep),
+        Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable, snapshot, keep) {
             Ok(branches) => Ok(branches
                 .into_iter()
                 .map(PathBranch::into_owned_value)
@@ -22530,9 +22650,10 @@ impl FoldRegister {
         input: OwnedValue,
         at_register: bool,
         snapshot: bool,
+        keep: Keep,
     ) -> PathResolveResult<'a> {
         let tr = self.trackable && at_register;
-        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr, snapshot) {
+        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr, snapshot, keep) {
             Ok(branches) => Ok(self.relocate(branches)),
             Err((prefix, e)) => Err((self.relocate(prefix), e)),
         }
@@ -22710,7 +22831,7 @@ fn path_check_fold_source<S: EvalSemantics>(
     if !has_navigation {
         return None;
     }
-    match resolve_node::<S>(source, value, trackable, snapshot) {
+    match resolve_node::<S>(source, value, trackable, snapshot, Keep::First) {
         Ok(_) => None,
         Err((_, EvalEscape::Halt(code))) => Some(EvalEscape::Halt(code)),
         Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
@@ -22748,6 +22869,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // #1467: path-check the source under ambient tracking before taking
     // its values from the untracked evaluator below.
@@ -22771,10 +22893,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // e.g. `$x | reduce (1) as $i (.; ...)` seeds INIT's own branch from
     // `$x`'s mark, for the rare case nothing ever runs an UPDATE step to
     // overwrite it (an empty `input` stream — see `acc_snapshot` below).
-    let (init_branches, init_escape) = match resolve_node::<S>(init, value, trackable, snapshot) {
-        Ok(branches) => (branches, None),
-        Err((prefix, e)) => (prefix, Some(e)),
-    };
+    let (init_branches, init_escape) =
+        match resolve_node::<S>(init, value, trackable, snapshot, keep) {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
     if init_branches.is_empty() {
         return path_result(Vec::new(), init_escape);
     }
@@ -22828,7 +22951,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 }
             };
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            match reg.resolve::<S>(substituted, acc_input, acc_at_register, acc_snapshot) {
+            match reg.resolve::<S>(substituted, acc_input, acc_at_register, acc_snapshot, keep) {
                 Ok(branches) => {
                     // Only the last output of a multi-output UPDATE
                     // becomes the new accumulator (same rule as
@@ -22917,6 +23040,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // #1467: path-check the source under ambient tracking before taking
     // its values from the untracked evaluator below — see
@@ -22931,10 +23055,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
     // into its own INIT resolution — see that function's doc comment
     // (#1591).
-    let (init_branches, init_escape) = match resolve_node::<S>(init, value, trackable, snapshot) {
-        Ok(branches) => (branches, None),
-        Err((prefix, e)) => (prefix, Some(e)),
-    };
+    let (init_branches, init_escape) =
+        match resolve_node::<S>(init, value, trackable, snapshot, keep) {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
     if init_branches.is_empty() {
         return path_result(Vec::new(), init_escape);
     }
@@ -22991,6 +23116,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 state,
                 state_at_register,
                 state_snapshot,
+                keep,
             ) {
                 Ok(branches) => branches,
                 Err((_prefix, e)) => {
@@ -23019,6 +23145,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         update_branch.value.clone().into_owned(),
                         extract_at_register,
                         extract_snapshot,
+                        keep,
                     ) {
                         Ok(branches) => out.extend(branches),
                         Err((prefix, e)) => {
@@ -23131,6 +23258,7 @@ fn resolve_catch<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     prefix: Vec<PathBranch<'a>>,
     payload: OwnedValue,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     let Some(catch_expr) = catch else {
         return Ok(prefix);
@@ -23138,7 +23266,7 @@ fn resolve_catch<'a, S: EvalSemantics>(
     let mut out = prefix;
     // A caught error/break payload is never a snapshot (#1591): jq's own
     // handler binding is unrelated to any `$x` frozen elsewhere in scope.
-    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false, false) {
+    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false, false, keep) {
         Ok(branches) => out.extend(branches),
         Err((branches, e)) => {
             out.extend(branches);
@@ -23396,6 +23524,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // Every caller in `resolve_node` already short-circuits on the shared
     // recurse-family untracked guard before ever reaching here (#843's
@@ -23501,7 +23630,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // one was just popped, and that node's own mark is what a
         // pass-through arm inside `f` (e.g. a bare `.`) must inherit.
         let (children, mut deferred_error) =
-            match resolve_against_cow::<S>(f, current, node_trackable, node_snapshot) {
+            match resolve_against_cow::<S>(f, current, node_trackable, node_snapshot, keep) {
                 Ok(children) => (children, None),
                 Err((partial_children, e)) => (partial_children, Some(e)),
             };
@@ -23679,6 +23808,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     // Keeps `key`'s partial prefix (not `eval_owned_multi`'s all-or-nothing)
     // for the same reason as `Select`/`If`/`GetPath`'s argument — #842/#854's
@@ -23724,11 +23854,11 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // `PathBranch::new`'s hardcoded `false`, since indexing always breaks
     // the frozen-pointer identity regardless of ambient) — so `false` here
     // is provably unobservable, not a real decision (#1591).
-    let (target_branches, target_escape) = match resolve_node::<S>(target, value, trackable, false)
-    {
-        Ok(branches) => (branches, None),
-        Err((prefix, e)) => (prefix, Some(e)),
-    };
+    let (target_branches, target_escape) =
+        match resolve_node::<S>(target, value, trackable, false, keep) {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
     // #843: `target` can also resolve successfully with `trackable: false`
     // through `Builtin::GetPath`'s own deliberate exemption (real jq lets
     // `getpath(P)` navigate an untracked value, matching how a literal
@@ -23929,6 +24059,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     let (starts, starts_escape) =
         resolve_slice_bound::<S>(start, value, f64::floor).map_err(|e| (Vec::new(), e))?;
@@ -23991,11 +24122,11 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // downstream read of `target_branches` below inspects only
     // `.value`/`.trackable`, and this function's own output is always
     // `snapshot: false` regardless (slicing is genuine navigation).
-    let (target_branches, target_escape) = match resolve_node::<S>(target, value, trackable, false)
-    {
-        Ok(branches) => (branches, None),
-        Err((prefix, e)) => (prefix, Some(e)),
-    };
+    let (target_branches, target_escape) =
+        match resolve_node::<S>(target, value, trackable, false, keep) {
+            Ok(branches) => (branches, None),
+            Err((prefix, e)) => (prefix, Some(e)),
+        };
     // #843: `resolve_index_expr`'s sibling `getpath`-laundering check —
     // `target` can also resolve successfully with `trackable: false`
     // through `Builtin::GetPath`'s deliberate exemption, which doesn't
@@ -24511,6 +24642,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
+    keep: Keep,
 ) -> PathResolveResult<'a> {
     let mut flat = Vec::new();
     for e in exprs {
@@ -24731,7 +24863,13 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     snapshot: step_snapshot && !reestablished,
                 }
             };
-            match resolve_against_cow::<S>(element, current, branch_trackable, branch_snapshot) {
+            match resolve_against_cow::<S>(
+                element,
+                current,
+                branch_trackable,
+                branch_snapshot,
+                keep,
+            ) {
                 Ok(resolved) => {
                     for step in resolved {
                         next.push(place_step(step));
@@ -25026,7 +25164,11 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     // `input` is this call's own fresh document root — never itself a frozen
     // `$x` snapshot, so ambient `snapshot` starts `false` (#1591), same as
     // `resolve_dynamic_indexes`'s own top-level entry.
-    match reject_untracked_prefix_too(resolve_node::<S>(expr, input, true, false), false, false) {
+    match reject_untracked_prefix_too(
+        resolve_node::<S>(expr, input, true, false, Keep::First),
+        false,
+        false,
+    ) {
         Ok(branches) => {
             if branches.iter().any(|b| b.path.depth() == 0) {
                 Ok(DelPaths::Root)
@@ -25197,7 +25339,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // same as it does at this function's other top-level entry point
         // below (#1591).
         return match reject_untracked_prefix_too(
-            resolve_node::<S>(expr, input, true, false),
+            resolve_node::<S>(expr, input, true, false, Keep::First),
             false,
             skip_untracked,
         ) {
@@ -25212,7 +25354,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         _ => Expr::Pipe(flat),
     };
     match reject_untracked_prefix_too(
-        resolve_node::<S>(&reduced_expr, input, true, false),
+        resolve_node::<S>(&reduced_expr, input, true, false, Keep::First),
         true,
         skip_untracked,
     ) {
