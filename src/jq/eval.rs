@@ -7301,31 +7301,36 @@ fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
 /// any is [.[] | .] with an early-exit truthiness check, and .[] over an
 /// object iterates its values, so jq accepts an object here as readily as
 /// an array (#422).
-fn builtin_any<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'_, W>,
+fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'a, W>,
     optional: bool,
-) -> QueryResult<'_, W> {
+) -> QueryResult<'a, W> {
     let owned_bool = |r: Result<bool, EvalError>| {
         r.map_or_else(QueryResult::Error, |b| {
             QueryResult::Owned(OwnedValue::Bool(b))
         })
     };
+    // #1901: unlike jq (which iterates an object's *values*), real yq
+    // rejects an object the same as a scalar -- confirmed live: `{"a":1} |
+    // any` is `"any only supports arrays, was !!map"` in yq v4.53.3, not a
+    // successful iteration. One closure, called from both the object arm
+    // and the scalar arm below, rather than two copies of the same
+    // `scalar_fallback` call (#1901 review) -- also why this arm now comes
+    // *before* the pre-existing `_ if optional` wildcard: that ordering
+    // used to make this whole branch (and the decode-failure check inside
+    // `scalar_fallback`) unreachable whenever `optional` was `true` (#1901
+    // review, confirmed live via a direct library call).
+    let yq_reject_non_array = |value: &StandardJson<'a, W>| {
+        scalar_fallback(value, optional, || {
+            EvalError::yq_only_supports_arrays("any", yaml_type_tag(value))
+        })
+    };
     match value {
         StandardJson::Array(elements) => owned_bool(any_all_over(elements, true)),
-        // #1901: unlike jq (which iterates an object's *values*), real yq
-        // rejects an object the same as a scalar -- confirmed live:
-        // `{"a":1} | any` is `"any only supports arrays, was !!map"` in
-        // yq v4.53.3, not a successful iteration.
-        StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            scalar_fallback(&value, optional, || {
-                EvalError::yq_only_supports_arrays("any", yaml_type_tag(&value))
-            })
-        }
+        StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), true)),
+        _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         _ if optional => QueryResult::None,
-        _ if S::TAG == EvalTag::Yq => scalar_fallback(&value, optional, || {
-            EvalError::yq_only_supports_arrays("any", yaml_type_tag(&value))
-        }),
         _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     }
 }
@@ -7333,28 +7338,29 @@ fn builtin_any<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: all
 ///
 /// Same shape as `any` — see #422.
-fn builtin_all<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'_, W>,
+fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'a, W>,
     optional: bool,
-) -> QueryResult<'_, W> {
+) -> QueryResult<'a, W> {
     let owned_bool = |r: Result<bool, EvalError>| {
         r.map_or_else(QueryResult::Error, |b| {
             QueryResult::Owned(OwnedValue::Bool(b))
         })
     };
+    // #1901: same yq-only rejection as `any` above, including the same
+    // arm-ordering fix (this arm must precede `_ if optional`, not follow
+    // it -- see `builtin_any`'s identical comment).
+    let yq_reject_non_array = |value: &StandardJson<'a, W>| {
+        scalar_fallback(value, optional, || {
+            EvalError::yq_only_supports_arrays("all", yaml_type_tag(value))
+        })
+    };
     match value {
         StandardJson::Array(elements) => owned_bool(any_all_over(elements, false)),
-        // #1901: same yq-only rejection as `any` above.
-        StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            scalar_fallback(&value, optional, || {
-                EvalError::yq_only_supports_arrays("all", yaml_type_tag(&value))
-            })
-        }
+        StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), false)),
+        _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         _ if optional => QueryResult::None,
-        _ if S::TAG == EvalTag::Yq => scalar_fallback(&value, optional, || {
-            EvalError::yq_only_supports_arrays("all", yaml_type_tag(&value))
-        }),
         _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
     }
 }
@@ -8775,23 +8781,23 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     // #1755: to_owned_checked, not to_owned -- an undecodable element must
     // raise, not silently flatten in as "".
+    //
+    // #1901: unlike jq (`flatten` is defined over `[.[]]`, and `.[]` on an
+    // object iterates its values, per this function's own doc comment
+    // above), real yq rejects an object the same as a scalar -- confirmed
+    // live: `{"a":1} | flatten` is `"only arrays are supported for
+    // flatten"` in yq v4.53.3. One zero-capture closure (`Copy`, so it can
+    // be passed to `scalar_fallback` at both call sites below) rather than
+    // two copies of the same error literal (#1901 review).
+    let yq_reject_non_array = || EvalError::yq_only_arrays_supported_for("flatten");
     let items: Result<Vec<OwnedValue>, EvalError> = match &value {
         StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
-        // #1901: unlike jq (`flatten` is defined over `[.[]]`, and `.[]` on
-        // an object iterates its values, per this function's own doc
-        // comment above), real yq rejects an object the same as a scalar --
-        // confirmed live: `{"a":1} | flatten` is `"only arrays are
-        // supported for flatten"` in yq v4.53.3.
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            return scalar_fallback(&value, optional, || {
-                EvalError::yq_only_arrays_supported_for("flatten")
-            });
+            return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
-            return scalar_fallback(&value, optional, || {
-                EvalError::yq_only_arrays_supported_for("flatten")
-            });
+            return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
@@ -8883,6 +8889,16 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1901: real yq rejects an object outright for `group_by`, unlike jq's
+    // own `object_pair_type_error` handling below -- confirmed live:
+    // `{"a":3,"b":1} | group_by(.)` is `"only arrays are supported for
+    // group by"` in yq v4.53.3. One closure for both call sites (#1901
+    // review), same pattern as `builtin_any`.
+    let yq_reject_non_array = |value: &StandardJson<'a, W>| {
+        scalar_fallback(value, optional, || {
+            EvalError::yq_only_arrays_supported_for("group by")
+        })
+    };
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<StandardJson<'a, W>> = elements.collect();
@@ -8946,15 +8962,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             QueryResult::Owned(OwnedValue::Array(groups))
         }
-        // #1901: real yq rejects an object outright for `group_by`, unlike
-        // jq's own `object_pair_type_error` handling below -- confirmed
-        // live: `{"a":3,"b":1} | group_by(.)` is `"only arrays are
-        // supported for group by"` in yq v4.53.3.
-        StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            scalar_fallback(&value, optional, || {
-                EvalError::yq_only_arrays_supported_for("group by")
-            })
-        }
+        StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #995: group_by shares min_by/max_by/unique_by's `map([f])`-pairing
         // computation (see `map_bracketed_over_object_fields`) and
         // unique_by's own suffix -- confirmed live: `{"a":3,"b":1} |
@@ -8964,10 +8972,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
-        // #1901: real yq's own scalar wording, same as the object arm above.
-        _ if S::TAG == EvalTag::Yq => scalar_fallback(&value, optional, || {
-            EvalError::yq_only_arrays_supported_for("group by")
-        }),
+        _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #995: same "Cannot iterate over" wording min_by/max_by/unique_by's
         // own scalar arm uses -- confirmed live: `5 | group_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
@@ -8982,10 +8987,20 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: unique - remove duplicates
-fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'_, W>,
+fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'a, W>,
     optional: bool,
-) -> QueryResult<'_, W> {
+) -> QueryResult<'a, W> {
+    // #1901: real yq rejects an object outright for `unique`, unlike jq's
+    // own `object_pair_type_error` handling below -- confirmed live:
+    // `{"a":3,"b":1} | unique` is `"only arrays are supported for unique"`
+    // in yq v4.53.3. One closure for both call sites (#1901 review), same
+    // pattern as `builtin_any`.
+    let yq_reject_non_array = |value: &StandardJson<'a, W>| {
+        scalar_fallback(value, optional, || {
+            EvalError::yq_only_arrays_supported_for("unique")
+        })
+    };
     match value {
         StandardJson::Array(elements) => {
             // #1755: to_owned_checked, not to_owned -- an undecodable
@@ -9009,15 +9024,7 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             QueryResult::Owned(OwnedValue::Array(items))
         }
-        // #1901: real yq rejects an object outright for `unique`, unlike
-        // jq's own `object_pair_type_error` handling below -- confirmed
-        // live: `{"a":3,"b":1} | unique` is `"only arrays are supported for
-        // unique"` in yq v4.53.3.
-        StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            scalar_fallback(&value, optional, || {
-                EvalError::yq_only_arrays_supported_for("unique")
-            })
-        }
+        StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #995: real jq defines `unique` as `unique_by(.)`, so it shares the
         // identical object-input pairing bug -- confirmed live:
         // `{"a":3,"b":1} | unique` raises `object ({"a":3,"b":1}) and array
@@ -9029,10 +9036,7 @@ fn builtin_unique<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             optional,
             EvalError::pair_cannot_be_sorted,
         ),
-        // #1901: real yq's own scalar wording, same as the object arm above.
-        _ if S::TAG == EvalTag::Yq => scalar_fallback(&value, optional, || {
-            EvalError::yq_only_arrays_supported_for("unique")
-        }),
+        _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
@@ -9048,6 +9052,17 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1901: real yq rejects an object outright for `unique_by`, unlike
+    // jq's own `object_pair_type_error` handling below -- confirmed live:
+    // `{"a":3,"b":1} | unique_by(.)` is `"only arrays are supported for
+    // unique"` in yq v4.53.3 (not "unique by" -- same wording as bare
+    // `unique`, confirmed, not a typo). One closure for both call sites
+    // (#1901 review), same pattern as `builtin_any`.
+    let yq_reject_non_array = |value: &StandardJson<'a, W>| {
+        scalar_fallback(value, optional, || {
+            EvalError::yq_only_arrays_supported_for("unique")
+        })
+    };
     match value {
         StandardJson::Array(elements) => {
             let items: Vec<StandardJson<'a, W>> = elements.collect();
@@ -9087,16 +9102,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let result: Vec<OwnedValue> = keyed.into_iter().map(|(_, v)| v).collect();
             QueryResult::Owned(OwnedValue::Array(result))
         }
-        // #1901: real yq rejects an object outright for `unique_by`, unlike
-        // jq's own `object_pair_type_error` handling below -- confirmed
-        // live: `{"a":3,"b":1} | unique_by(.)` is `"only arrays are
-        // supported for unique"` in yq v4.53.3 (not "unique by" -- same
-        // wording as bare `unique`, confirmed, not a typo).
-        StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            scalar_fallback(&value, optional, || {
-                EvalError::yq_only_arrays_supported_for("unique")
-            })
-        }
+        StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #929: unique_by shares min_by/max_by's `map([f])`-pairing
         // computation (see `map_bracketed_over_object_fields`) but a third,
         // distinct suffix -- confirmed live: `{"a":3,"b":1} | unique_by(.)`
@@ -9105,10 +9111,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             object_pair_type_error::<W, S>(f, fields, optional, EvalError::pair_cannot_be_sorted)
         }
-        // #1901: real yq's own scalar wording, same as the object arm above.
-        _ if S::TAG == EvalTag::Yq => scalar_fallback(&value, optional, || {
-            EvalError::yq_only_arrays_supported_for("unique")
-        }),
+        _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         // #929: same "Cannot iterate over" wording min_by/max_by's own
         // scalar arm uses -- confirmed live: `5 | unique_by(.)` raises
         // "Cannot iterate over number (5)" in jq 1.7.1.
@@ -9414,23 +9417,22 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable entry must
     // raise, not silently become "".
+    //
+    // #1901: unlike jq (which accepts an object of entries as readily as
+    // an array, per this function's own doc comment above), real yq
+    // rejects a plain object here -- confirmed live: `{"a":1} |
+    // from_entries` is `"from entries only runs against arrays"` in
+    // yq v4.53.3. One zero-capture closure for both call sites (#1901
+    // review), same pattern as `builtin_flatten`.
+    let yq_reject_non_array = || EvalError::yq_from_entries_requires_array();
     let entries: Result<Vec<OwnedValue>, EvalError> = match &value {
         StandardJson::Array(elements) => elements.map(|elem| to_owned_checked(&elem)).collect(),
-        // #1901: unlike jq (which accepts an object of entries as readily
-        // as an array, per this function's own doc comment above), real
-        // yq rejects a plain object here -- confirmed live: `{"a":1} |
-        // from_entries` is `"from entries only runs against arrays"` in
-        // yq v4.53.3.
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-            return scalar_fallback(&value, optional, || {
-                EvalError::yq_from_entries_requires_array()
-            });
+            return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
-            return scalar_fallback(&value, optional, || {
-                EvalError::yq_from_entries_requires_array()
-            });
+            return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
@@ -47520,14 +47522,23 @@ mod tests {
     /// these four leak jq's template into yq mode any more.
     #[test]
     fn test_cannot_iterate_call_sites_use_the_real_mode_tag_1494() {
-        for expr in ["any", "all", "flatten", "from_entries"] {
+        for (expr, want_yq) in [
+            ("any", "any only supports arrays, was !!float"),
+            ("all", "all only supports arrays, was !!float"),
+            ("flatten", "only arrays are supported for flatten"),
+            ("from_entries", "from entries only runs against arrays"),
+        ] {
             let filter = format!("(1.0 + 2.0) | {expr}");
+            // #1901 revision: an exact match on real yq's own wording
+            // (confirmed live against v4.53.3), not merely the absence of
+            // jq's old template -- the weaker `!contains("Cannot iterate")`
+            // form this replaced would pass just as well for any other
+            // wrong string (#1901 review).
             yq_query!(br"null", &filter,
                 QueryResult::Error(e) => {
-                    assert!(
-                        !e.message.contains("Cannot iterate"),
-                        "{filter}: yq mode must use real yq's own wording (#1901), not jq's template: {:?}",
-                        e.message
+                    assert_eq!(
+                        e.message, want_yq,
+                        "{filter}: yq mode must use real yq's own wording (#1901)"
                     );
                 }
             );
@@ -47536,6 +47547,34 @@ mod tests {
                     assert_eq!(
                         e.message, "Cannot iterate over number (3)",
                         "{filter}: jq mode must be unchanged from before this fix"
+                    );
+                }
+            );
+        }
+    }
+
+    /// #1901 review: `builtin_any`/`builtin_all`'s new yq-mode rejection arm
+    /// used to sit *after* the pre-existing `_ if optional => QueryResult::None`
+    /// wildcard, so it (and the decode-failure check inside `scalar_fallback`)
+    /// was unreachable whenever `optional` was `true` -- an undecodable
+    /// scalar under `any?`/`all?` in yq mode would silently return `None`
+    /// instead of raising, unlike the other five #1901-fixed builtins
+    /// (flatten/group_by/unique/unique_by/from_entries), none of which have
+    /// this preceding wildcard arm. Confirmed live via mutation testing
+    /// during review; fixed by reordering the arms so the yq-mode check runs
+    /// first, matching the other five.
+    #[test]
+    fn test_any_all_respect_decode_failure_before_optional_in_yq_mode_1901() {
+        // A lone-byte string token the JSON semi-index accepts as a span but
+        // whose bytes are not valid UTF-8.
+        let json: &[u8] = b"\"\xff\xfe\"";
+        for expr in ["any?", "all?"] {
+            yq_query!(json, expr,
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "{expr}: message: {}",
+                        e.message
                     );
                 }
             );
