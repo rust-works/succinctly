@@ -27656,13 +27656,31 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
             results.extend(vs);
             None
         }
-        // `eval_fanout` (used by `Select`) returns these borrowed-cursor
-        // variants even from an all-owned-value call site -- e.g. `select`
-        // on a truthy condition hands back the input as `One(value)`, a
-        // genuine borrowed cursor, not `Owned` -- so this must convert, not
-        // treat them as unreachable. (A `select` that matched nothing now
-        // collapses to a bare `None` instead, since #1043 gave
-        // `eval_fanout`'s tail match its missing `0 => None` arm.)
+        // #2026: this comment used to claim `eval_fanout` (used by `Select`)
+        // hands back these borrowed-cursor variants "even from an
+        // all-owned-value call site" -- stale relative to the current code.
+        // This arm's own `Select` closure (`eval_pipe_with_path_context_
+        // internal`'s `Expr::Builtin(Builtin::Select(cond))` arm) always
+        // constructs `QueryResult::Owned(value.clone())` for a truthy bit,
+        // never a cursor, so `eval_fanout`'s per-bit loop never has a
+        // `borrowed` entry to push here and its own `owned_vec_to_result`
+        // tail always answers instead of `borrowed_vec_to_result`. The
+        // sibling `Expr::Builtin(_)` generic fallback (`eval_owned_input`)
+        // collapses `One`/`Many` to `Owned`/`ManyOwned` internally too,
+        // before ever returning here. An exhaustive sweep of every
+        // path-context-triggering construct this file implements (`select`,
+        // `reduce`, `foreach`, `map`, array construction, `first`/`last`/
+        // `limit`, nested/comma-combined selects, `as`-binding) found no
+        // live query that reaches this arm with a genuine cursor. Kept
+        // rather than collapsed into `unreachable!()`: 20 of this
+        // function's 22 call sites weren't individually traced, and
+        // `eval_fanout` is a shared, generic helper whose *other* callers
+        // (`builtin_select`, `resolve_node`'s own `Select` arm) do pass
+        // cursor-producing closures, just not through this path-context
+        // machinery specifically. `to_owned`, not `to_owned_checked`, is
+        // therefore not proven safe by usage; if this ever needs the
+        // checked twin, verify a live repro first (this file's own
+        // #1953/#1972 lesson).
         QueryResult::One(v) => {
             results.push(to_owned(&v));
             None
@@ -27777,13 +27795,13 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // `eval_fanout` (reached via `Select`) can hand back its borrowed-cursor
-    // variants (`One`/`Many`) even here, not just Owned/ManyOwned -- e.g. a
-    // `select` on a truthy condition hands back the input as a genuine
-    // borrowed `One` -- so those convert via `to_owned` instead of being
-    // treated as unreachable. (A `select` that matched nothing now
-    // collapses to a bare `None` instead, since #1043 gave `eval_fanout`'s
-    // tail match its missing `0 => None` arm.)
+    // #2026: see `accumulate_path_context_step`'s matching comment -- this
+    // one used to make the identical "`eval_fanout`/`select` can hand back
+    // a genuine borrowed `One`" claim, now stale relative to the current
+    // `Select` arm (its truthy closure always constructs `Owned`, never a
+    // cursor). Kept for the same reason: not every one of this function's
+    // 22 call sites was individually traced, and `eval_fanout` is a shared
+    // helper whose other callers genuinely do produce cursors.
     match intermediate.materialize_cursor() {
         // #1445 (code review): `rest.is_empty()` short-circuits straight to
         // the terminal value instead of recursing into
