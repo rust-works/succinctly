@@ -315,6 +315,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`yq`: the sort family, `reduce`/`foreach` and `limit`/`nth`'s generator `n`
+  no longer collapse duplicate mapping keys** (#1687). `sort`, `sort_by`,
+  `unique`, `unique_by`, `min`, `min_by`, `max`, `max_by` and `reverse` all
+  answer a permutation or subset of their input's *own* elements, but every one
+  of them routed through `eval_generic.rs`'s wildcard bridge, which
+  materializes the whole document into an `IndexMap`-backed `OwnedValue` first
+  — so a duplicate key inside a moved element was gone before the builtin ran.
+  They now keep those elements as cursors (a `LazySeq` for the array-valued
+  ones, a bare `OneCursor` for `min`/`max`), matching real yq on all seven
+  spellings it implements, and recovering comments, anchors and flow style
+  through them as well.
+
+  `reduce`/`foreach` had no arm in that evaluator at all, producing an internal
+  contradiction rather than merely a divergence: `[keys|.[]] | length` answered
+  3 on `b: 1\na: 2\nb: 3\n` while `reduce (keys|.[]) as $k (0; .+1)` answered
+  2. Their `input` and INIT streams are now evaluated cursor-natively, with the
+  fold itself still eval.rs's.
+
+  `limit`/`nth` handled only a single-valued `n`; a generator (`limit((1,3);
+  f)`) was probed, found multi-output, and handed to the same bridge — losing
+  the duplicate keys *and* evaluating `n` a second time, so a `debug` inside it
+  fired twice where jq fires it once. A new `fanout_arg_generic` drives `n`
+  exactly once for every shape. Its sink-side twin also makes
+  `first(limit((1,2); (1, ("B"|stderr))))` stop exploring the second `n`
+  binding, matching jq, which it previously did not.
+
+  Measured on a 200,000-element sequence: `sort_by` 3.7x faster, `reverse` 9.6x,
+  `min_by`/`max_by` 2.9x, with byte-identical output (interleaved A/B, Apple
+  M-series). `limit`/`nth` are unchanged at 1.01x.
+
+  Three cases are deliberately not fixed and are documented in
+  `docs/compliance/yq/limitations.md`: `group_by` (an array of arrays has no
+  cursor-backed representation), `while`/`until` (their state is computed from
+  step 1), and `reduce`/`foreach`'s bindings (`$x` is an `OwnedValue` in both
+  evaluators, so a *bound* element still collapses). An alias-bearing document
+  is also kept off the new path entirely — reordering can lift a `*x` above its
+  `&x`, and real yq emits exactly that then refuses to read it back.
+
 - **`jq`/`yq`: function calls are resolved at compile time, before any input is
   read** (#1473). Real jq rejects a call to an undefined function — or to an
   undefined arity of an existing one — unconditionally, uncatchably, with exit
