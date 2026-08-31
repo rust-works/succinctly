@@ -1255,8 +1255,12 @@ fn test_parity_path_builtin_bypasses_reindex_bridge_1909() {
         (br#"{"a":{"b":1}}"#, "[path(..)]"),
         (br#"{"a":{"b":3.5},"c":1e18}"#, "[path(..)]"),
         (br#"{"a":10000000000000000000.0}"#, "[path(..)]"),
-        // A partial result: `.a.b` resolves, then `.c.d` errors.
-        (br#"{"a":{"b":1},"c":1}"#, "[path(.a.b, .c.d)]"),
+        // A genuine `QueryResult::Partial`: `.a.b` resolves and is emitted,
+        // then `.c.d` errors. Deliberately *unwrapped* -- `[path(...)]`
+        // raises with no output at all, so it would compare `[] == []` here
+        // and leave `query_result_to_generic`'s `Partial` arm uncovered on
+        // the bypass (code review).
+        (br#"{"a":{"b":1},"c":1}"#, "path(.a.b, .c.d)"),
         (br#"{"a":1}"#, r#"try path(.a[0]) catch "E""#),
     ] {
         assert_parity(json, filter);

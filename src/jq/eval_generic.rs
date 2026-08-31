@@ -1724,7 +1724,6 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 ///   carrying that new text. This is the case the bridge is genuinely
 ///   load-bearing for: without the guard, `.outer.big | parent` on
 ///   `10000000000000000000.0` prints `1e+19` in yq mode.
-/// - A bare **`Int`** likewise comes back as `NumberLiteral(Int(n), "n")`.
 /// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
 /// - A `NumberLiteral` whose source text exceeds
 ///   [`REINDEX_LITERAL_LEN_CAP`] is discarded (#1211).
@@ -1734,6 +1733,26 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// document-sourced `NumberLiteral` with short source text, which
 /// `to_json_for_reindex` echoes verbatim -- survives the trip unchanged, so
 /// the bypass applies to it.
+///
+/// A bare **`Int`** is the one node that is *normalized* rather than
+/// preserved and is still allowed through: it comes back as
+/// `NumberLiteral(Int(n), "n")`. That is sound where a bare `Float` isn't,
+/// because `to_json_for_reindex` writes an `Int` as exactly `format!("{n}")`
+/// in both modes -- the only spelling an `i64` has -- so the literal the
+/// bridge bakes in is the same text the bare `Int` renders as anyway, and
+/// #1008's literal preservation has nothing new to echo. A `Float`'s
+/// spelling, by contrast, is mode-forked and genuinely differs from what the
+/// bare value would produce, which is exactly the `1e+19` breakage the guard
+/// exists to prevent.
+///
+/// Excluding `Int` is not merely conservative here, it is the difference
+/// between this fix applying to `succinctly yq` and not (code review):
+/// **every** YAML integer materializes as a bare `Int` (YAML's
+/// `number_literal()` override returns `Some` only for a preservable
+/// *float*), so one `count: 3` line anywhere in a manifest would have
+/// disabled the bypass for the whole document. Same for any
+/// `--input-format json` document, whose `canonicalize_numbers` also
+/// produces plain `Int`/`Float`.
 ///
 /// Deliberately an **input-side** predicate rather than an output-side fixup.
 /// A first version of this fix re-applied `yq_float_fidelity_fixup` to the
@@ -1746,7 +1765,8 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// alone can safely skip the bridge.
 fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
     match value {
-        OwnedValue::Float(_) | OwnedValue::Int(_) => false,
+        OwnedValue::Float(_) => false,
+        OwnedValue::Int(_) => true,
         OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => false,
         OwnedValue::NumberLiteral(_, literal) => literal.len() <= REINDEX_LITERAL_LEN_CAP,
         OwnedValue::Array(items) => items.iter().all(reindex_bridge_is_identity),
@@ -8678,6 +8698,14 @@ mod tests {
                 "ok".to_string(),
                 OwnedValue::from_number_literal("1"),
             )])),
+            // The shape every real YAML document has: a bare `Int`. Rejecting
+            // it left `succinctly yq` with no bypass at all (code review),
+            // since YAML's `number_literal()` override only preserves floats.
+            &OwnedValue::Int(7),
+            &OwnedValue::Object(IndexMap::from([
+                ("count".to_string(), OwnedValue::Int(3)),
+                ("name".to_string(), OwnedValue::String("x".to_string())),
+            ])),
         ] {
             assert!(
                 super::reindex_bridge_is_identity(value),
@@ -8719,7 +8747,29 @@ mod tests {
             // spelling the bridge rewrote (`0.000...1` -> `1e-257`) compares
             // *equal* while behaving differently. The derived `Debug` shows
             // the text; that is the identity this predicate has to be about.
-            Ok(round_tripped) => format!("{round_tripped:?}") == format!("{value:?}"),
+            // Structural equality, not `==`: `OwnedValue`'s `PartialEq`
+            // compares a `NumberLiteral` by its parsed `NumberRepr` and
+            // ignores the source text, but that text is exactly what #1008's
+            // literal preservation echoes back on output -- so a value whose
+            // spelling the bridge rewrote (`0.000...1` -> `1e-257`) compares
+            // *equal* while behaving differently. The derived `Debug` shows
+            // the text; that is the identity this predicate has to be about.
+            //
+            // The single sanctioned exception is `Int(n)` -> `NumberLiteral(
+            // Int(n), format!("{n}"))`: a normalization that bakes in the
+            // only spelling an `i64` has, so it introduces no text the bare
+            // value didn't already render as. Spelled out here rather than
+            // folded into a looser "renders the same" comparison, because
+            // rendering equality alone would also wave through a bare
+            // `Float`, whose re-spelling is precisely what this guard
+            // exists to catch.
+            Ok(round_tripped) => {
+                let normalized = match value {
+                    OwnedValue::Int(n) => OwnedValue::from_number_literal(&alloc::format!("{n}")),
+                    other => other.clone(),
+                };
+                format!("{round_tripped:?}") == format!("{normalized:?}")
+            }
             // A value the bridge cannot even reparse is certainly not one the
             // bypass may claim is unchanged.
             Err(_) => false,
