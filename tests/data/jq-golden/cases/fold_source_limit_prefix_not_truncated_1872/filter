@@ -1,0 +1,1 @@
+path(foreach (limit(2; range(5)), keys[]) as $k (.; .))

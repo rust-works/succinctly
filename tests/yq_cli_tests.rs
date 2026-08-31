@@ -27578,3 +27578,47 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1872 gates `resolve_fold_source`'s single tracked evaluation on
+/// `EvalTag::Jq`. Real yq's lexer rejects `reduce`, `foreach` *and* `path`
+/// outright (confirmed live against yq v4.53.3), so yq mode has no oracle to
+/// check a fold's values against, and `resolve_index_expr`'s yq-only
+/// `scalar_noop` arm would hand the *unchanged target* to the fold where the
+/// evaluator raises. Yq therefore keeps #1467's original two-pass shape:
+/// path-check with `Keep::First`, take the values from the untracked
+/// evaluator. These pin that, so the gate cannot be dropped silently.
+#[test]
+fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
+    // The `scalar_noop` shape: still the evaluator's own type error, not
+    // the resolver's target-unchanged branch value.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "path(foreach (.a.b) as $k (.; .))",
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains(r#"Cannot index number with string "b""#),
+        "stderr: {stderr}"
+    );
+
+    // The path-check itself still runs in yq mode -- #1467's fix is not
+    // gated, only #1872's value reuse is.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "path(foreach (1,2,keys[]) as $k (.; .))",
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("near attempt to iterate through"),
+        "stderr: {stderr}"
+    );
+
+    // A navigating source that resolves cleanly is unaffected either way.
+    let (out, code) = run_yq_stdin("path(reduce (.[]) as $k (.; .))", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+
+    Ok(())
+}

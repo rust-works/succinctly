@@ -1,0 +1,1 @@
+[path(foreach (1,2,keys[]) as $k (empty; .))]

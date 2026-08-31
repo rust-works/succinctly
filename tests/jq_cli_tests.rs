@@ -29915,3 +29915,109 @@ fn test_path_cursor_native_absent_nodes_and_pipes_2061() -> Result<()> {
 
     Ok(())
 }
+
+/// #1872: `resolve_fold_source` runs a navigating fold source **once**, with
+/// tracking on, and the fold's real values come from that same evaluation --
+/// so a side effect embedded in the source fires exactly as often as it does
+/// in jq. Before #1872 the source was evaluated twice (once to path-check it,
+/// once for the values), which fired the first output's `stderr` twice.
+///
+/// Counted by occurrence, not by line: `stderr` writes no trailing newline.
+/// Captured from jq 1.7.1.
+#[test]
+fn fold_source_side_effect_fires_once_per_output_1872() -> Result<()> {
+    for (input, filter, want, why) in [
+        (
+            "[1]",
+            ". as $x | path(reduce (.[] | stderr) as $i (0; $x))",
+            "1",
+            "single-output navigating source: one write, not two",
+        ),
+        (
+            "[1,2,3]",
+            ". as $x | path(reduce (.[] | stderr) as $i (0; $x))",
+            "123",
+            "one write per output, in order",
+        ),
+        (
+            "[1,2,3]",
+            ". as $x | path(foreach (.[] | stderr) as $i (0; $x))",
+            "123",
+            "foreach pulls the same single evaluation",
+        ),
+    ] {
+        let (_stdout, stderr, _code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stderr, want, "{why}");
+    }
+    Ok(())
+}
+
+/// #1872: `Keep::AtMost` makes a fold source's leaves keep every output, so
+/// the count-bounded resolutions must narrow that bound rather than forward
+/// it -- otherwise `first(range(2000000000))` inside a navigating source
+/// materializes two billion values instead of stopping at one.
+///
+/// A subprocess rather than an in-process `query!`, so a regression here
+/// exhausts the child's memory rather than the test harness's. Both
+/// expectations are captured from jq 1.7.1: `first(...)` contributes exactly
+/// one source element, `limit(3; ...)` exactly three.
+#[test]
+fn fold_source_bounded_generator_stays_bounded_1872() -> Result<()> {
+    for (filter, want_stdout, why) in [
+        (
+            "path(foreach (first(range(2000000000)), keys[]) as $k (.; .))",
+            "[]\n",
+            "first(...) yields one source element",
+        ),
+        (
+            "path(foreach (limit(3; range(2000000000)), keys[]) as $k (.; .))",
+            "[]\n[]\n[]\n",
+            "limit(3; ...) yields exactly three, not one and not two billion",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(stdout, want_stdout, "{why}");
+        assert!(
+            stderr.contains("near attempt to iterate through"),
+            "{why} -- {stderr}"
+        );
+        assert_eq!(code, 5, "{why}");
+    }
+    Ok(())
+}
+
+/// #1872: `resolve_fold_source` now takes a navigating source's values from
+/// `resolve_node`'s own branches, which makes a *short* branch prefix a wrong
+/// answer rather than merely a wrong error message. Several arms below that
+/// call launder an `Err` into a truncated `Ok` -- `Expr::Optional`'s blanket
+/// arm, `Expr::Label` on a matching break, `take_path_branches` -- and none of
+/// them is covered by the `Err(_)` fallback. Each case's value count is
+/// captured from jq 1.7.1.
+#[test]
+fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
+    for (input, filter, want, why) in [
+        (
+            "[10,20,30]",
+            "[foreach ((.[(0,error(\"b\")):(2,3)])?) as $k (0; .+1)]",
+            "[1,2]\n",
+            "Expr::Optional swallows the escape and keeps its own prefix",
+        ),
+        (
+            r#"{"a":{"b":1},"c":[1,2]}"#,
+            "path(label $out | ((.c[0:1], break $out), .a))",
+            "[\"c\",{\"start\":0,\"end\":1}]\n",
+            "Expr::Label keeps the prefix produced before a matching break",
+        ),
+        (
+            r#"{"a":1}"#,
+            "[foreach (limit(2; 1,2,3), 9) as $k (0; .+$k)]",
+            "[1,3,12]\n",
+            "take_path_branches truncates to its bound, not to one",
+        ),
+    ] {
+        let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, want, "{why}");
+        assert_eq!(code, 0, "{why}");
+    }
+    Ok(())
+}
