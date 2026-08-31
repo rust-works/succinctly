@@ -8710,6 +8710,55 @@ mod tests {
         );
     }
 
+    /// #789's own fix boxed `GenericResult`/`GenericItem`'s `LazySeq`
+    /// variant, but left `LazySeq<V>` itself unboxed and just as wide as
+    /// before (184 bytes for `StandardJson`, 200 for `YamlValue`, since
+    /// YAML's field-cursor type is bigger than JSON's). #1973's review of
+    /// #1969 traced this to `LazySource::Keys(DistinctKeyCursors<V::Fields>)`
+    /// -- `DistinctKeyCursors` carries two full field-cursor copies
+    /// (`rest`/`all`) plus the rare-path `seen`/`collapsed` fields for
+    /// #1514's duplicate-key collapse, unboxed, on every `LazySeq`
+    /// regardless of whether that document ever hits the collapse path.
+    /// Shrinking `DistinctKeyCursors` at the source is out of scope here
+    /// (a materially larger change touching #1514's machinery -- see
+    /// #1973's own "why deferred" section); this test only pins today's
+    /// size so a *third* unboxed-wide-variant regression (a new field on
+    /// `LazySeq`/`LazySource`/`DistinctKeyCursors`) is caught the same way
+    /// the #789 guards above catch a regression on `GenericResult`/
+    /// `GenericItem`. Pinned on the YAML instantiation since it's the
+    /// larger (worse-case) of the two document kinds.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_lazyseq_size_is_pinned_pending_distinctkeycursors_shrink_1973() {
+        assert_eq!(
+            core::mem::size_of::<LazySeq<crate::yaml::YamlValue<'_, Vec<u64>>>>(),
+            200,
+            "LazySeq<YamlValue>'s size changed -- if it grew, a new unboxed-wide field \
+             snuck onto LazySeq/LazySource/DistinctKeyCursors (investigate before \
+             accepting); if it shrank, #1973's DistinctKeyCursors-shrink follow-up may \
+             have landed -- update this pinned value to match"
+        );
+    }
+
+    /// The YAML twin of [`test_lazyseq_size_is_pinned_pending_distinctkeycursors_shrink_1973`]
+    /// for `DistinctKeyCursors<YamlFields>` directly -- the actual struct
+    /// #1973 identifies as the real driver of `LazySeq<V>`'s size, not just
+    /// the enum variant wrapping it.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_distinct_key_cursors_size_is_pinned_pending_shrink_1973() {
+        assert_eq!(
+            core::mem::size_of::<
+                crate::jq::document::DistinctKeyCursors<crate::yaml::YamlFields<'_, Vec<u64>>>,
+            >(),
+            168,
+            "DistinctKeyCursors<YamlFields>'s size changed -- if it grew, a new field \
+             landed unboxed on the rare-path (seen/collapsed) or copied cursor (rest/all) \
+             members (investigate before accepting); if it shrank, #1973's shrink \
+             follow-up may have landed -- update this pinned value to match"
+        );
+    }
+
     /// `GenericResult::produces_output()`'s exhaustive match (added after
     /// #791's `Halt` variant was once missed by a hand-maintained exclusion
     /// list, see the method's own doc comment): four of its `true` arms —
