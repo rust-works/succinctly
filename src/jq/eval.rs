@@ -6222,7 +6222,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::ToString => builtin_tostring::<W, S>(value, optional),
         Builtin::ToNumber => builtin_tonumber::<W>(value, optional),
         Builtin::ToJson => builtin_tojson::<W, S>(value, optional),
-        Builtin::FromJson => builtin_fromjson::<W>(value, optional),
+        Builtin::FromJson => builtin_fromjson::<W, S>(value, optional),
 
         // Phase 6: Additional String Functions
         Builtin::Explode => builtin_explode::<W>(value, optional),
@@ -11137,7 +11137,11 @@ pub(super) fn tonumber_from_str(s: &str) -> Result<OwnedValue, EvalError> {
     if let Ok(f) = trimmed.parse::<f64>() {
         return Ok(OwnedValue::Float(f));
     }
-    if parse_complete_json(trimmed).is_ok() {
+    // Mode-blind on purpose: this call only distinguishes "valid JSON but
+    // not a number" from "not valid JSON at all" for a nicer error message,
+    // never returns the parsed value, so `fromjson`'s jq/yq surrogate-mode
+    // split (#2008) has nothing to plumb through here.
+    if parse_complete_json(trimmed, false).is_ok() {
         Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
             s.to_string(),
         )))
@@ -11285,7 +11289,7 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: fromjson - parse JSON string to value
-fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
+fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -11296,7 +11300,7 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
                 // The whole string must be one JSON value: jq rejects `"0x10"`
                 // and `"1 2"` rather than reading the first value and dropping
                 // the rest, which is what the old prefix parse did here.
-                match parse_complete_json(json_str) {
+                match parse_complete_json(json_str, S::TAG == EvalTag::Yq) {
                     Ok(owned) => QueryResult::Owned(owned),
                     Err(_) if optional => QueryResult::None,
                     Err(_) => QueryResult::Error(EvalError::invalid_numeric_literal(json_str)),
@@ -11317,10 +11321,10 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>>(
 /// `x10` silently dropped and `"1 2"` as `1`. `tonumber` needs it to tell
 /// "this is valid JSON but not a number" (`"null"`) from "this is not valid
 /// JSON at all" (`"0x10"`), which jq words differently.
-fn parse_complete_json(s: &str) -> Result<OwnedValue, String> {
+fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     let bytes = s.as_bytes();
     let mut pos = 0;
-    let value = parse_json_value(bytes, &mut pos)?;
+    let value = parse_json_value(bytes, &mut pos, yq_mode)?;
     while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
     }
@@ -11331,7 +11335,7 @@ fn parse_complete_json(s: &str) -> Result<OwnedValue, String> {
 }
 
 /// Parse a JSON value starting at the given position
-fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+fn parse_json_value(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
     // Skip whitespace
     while *pos < bytes.len() && matches!(bytes[*pos], b' ' | b'\t' | b'\n' | b'\r') {
         *pos += 1;
@@ -11371,15 +11375,15 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
         }
         b'"' => {
             // string
-            parse_json_string_value(bytes, pos)
+            parse_json_string_value(bytes, pos, yq_mode)
         }
         b'[' => {
             // array
-            parse_json_array(bytes, pos)
+            parse_json_array(bytes, pos, yq_mode)
         }
         b'{' => {
             // object
-            parse_json_object(bytes, pos)
+            parse_json_object(bytes, pos, yq_mode)
         }
         b'-' | b'0'..=b'9' => {
             // number
@@ -11394,7 +11398,11 @@ fn parse_json_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
 /// The bounds check is not redundant with [`parse_json_value`]'s: an object's
 /// key position is reached from [`parse_json_object`] directly, so `"{"` and
 /// `{"a":1,` arrive here at end of input.
-fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+fn parse_json_string_value(
+    bytes: &[u8],
+    pos: &mut usize,
+    yq_mode: bool,
+) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() {
         return Err("unexpected end of input".to_string());
     }
@@ -11467,17 +11475,33 @@ fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, 
                             }
                         } else if (0xDC00..=0xDFFF).contains(&codepoint) {
                             // #2008: a lone low surrogate isn't a valid Rust
-                            // `char` (falls through `char::from_u32` below),
-                            // but real jq accepts it and substitutes U+FFFD --
-                            // matches the high-surrogate arm above and
-                            // `json::light::decode_escapes`.
+                            // `char` (falls through `char::from_u32` below).
+                            // Real jq accepts it and substitutes U+FFFD, but
+                            // real yq's `fromjson` doesn't use jq's JSON
+                            // string grammar at all -- it decodes through
+                            // go-yaml's own quoted-scalar scanner, which
+                            // rejects *any* `\u` escape encoding a surrogate
+                            // codepoint outright, lone or (even) validly
+                            // paired (confirmed live against yq v4.53.3, incl.
+                            // a valid astral-plane pair). Matching that fully
+                            // is a larger, separate gap (#2013); this only
+                            // keeps yq's pre-#2008 behavior for the lone-low
+                            // case unchanged (error) rather than silently
+                            // picking up jq's leniency here too.
+                            if yq_mode {
+                                return Err("invalid unicode codepoint".to_string());
+                            }
                             result.push('\u{FFFD}');
                             *pos += 3;
-                        } else if let Some(c) = char::from_u32(codepoint) {
-                            result.push(c);
-                            *pos += 3; // Move past the hex digits (will be incremented again below)
                         } else {
-                            return Err("invalid unicode codepoint".to_string());
+                            // codepoint is <= 0xFFFF (4 hex digits) and
+                            // outside 0xD800-0xDFFF (both arms above already
+                            // cover that whole range), so it's always a
+                            // valid char and this can't fail.
+                            result.push(char::from_u32(codepoint).expect(
+                                "non-surrogate u16-range codepoint is always a valid char",
+                            ));
+                            *pos += 3; // Move past the hex digits (will be incremented again below)
                         }
                     }
                     c => return Err(format!("invalid escape sequence: \\{}", c as char)),
@@ -11506,7 +11530,7 @@ fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, 
 }
 
 /// Parse a JSON array
-fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+fn parse_json_array(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() || bytes[*pos] != b'[' {
         return Err("expected '['".to_string());
     }
@@ -11526,7 +11550,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
     }
 
     loop {
-        let value = parse_json_value(bytes, pos)?;
+        let value = parse_json_value(bytes, pos, yq_mode)?;
         elements.push(value);
 
         // Skip whitespace
@@ -11552,7 +11576,7 @@ fn parse_json_array(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String>
 }
 
 /// Parse a JSON object
-fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String> {
+fn parse_json_object(bytes: &[u8], pos: &mut usize, yq_mode: bool) -> Result<OwnedValue, String> {
     if *pos >= bytes.len() || bytes[*pos] != b'{' {
         return Err("expected '{{'".to_string());
     }
@@ -11578,7 +11602,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String
         }
 
         // Parse key (must be a string)
-        let key = match parse_json_string_value(bytes, pos)? {
+        let key = match parse_json_string_value(bytes, pos, yq_mode)? {
             OwnedValue::String(s) => s,
             _ => return Err("object key must be a string".to_string()),
         };
@@ -11595,7 +11619,7 @@ fn parse_json_object(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, String
         *pos += 1;
 
         // Parse value
-        let value = parse_json_value(bytes, pos)?;
+        let value = parse_json_value(bytes, pos, yq_mode)?;
         entries.insert(key, value);
 
         // Skip whitespace

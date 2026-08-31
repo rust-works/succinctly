@@ -26978,3 +26978,32 @@ fn test_jq_only_date_builtins_gated_behind_jq_extensions_1907() -> Result<()> {
 
     Ok(())
 }
+
+/// #2008 (code review): `fromjson`/`tonumber`'s shared decoder
+/// (`parse_json_string_value` in `eval.rs`, reachable from both jq and yq
+/// mode via the same unparameterized `Builtin::FromJson` dispatch) is not
+/// jq-only -- #2008's own low-surrogate fix initially applied jq's leniency
+/// (substitute U+FFFD) unconditionally, which broke `succinctly yq`'s own
+/// fidelity: real yq's `fromjson` doesn't use jq's JSON string grammar at
+/// all, it decodes through go-yaml's quoted-scalar scanner, which rejects
+/// *any* `\u` escape encoding a surrogate codepoint outright -- lone or even
+/// validly paired (confirmed live against yq v4.53.3). This pins that
+/// `succinctly yq`'s `fromjson` keeps rejecting a lone low surrogate
+/// (ADR-0018: mode decides, never format), unlike jq mode's
+/// `test_fromjson_low_surrogate_substitutes_replacement_character_2008`.
+#[test]
+fn test_yq_fromjson_low_surrogate_still_rejected_2008() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#""\"x\\udc00y\"" | fromjson"#, "", &["-n"])?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+
+    // A valid surrogate pair is an unaffected control -- still decodes to
+    // the emoji in yq mode too (real yq itself actually rejects even valid
+    // pairs, a separate, pre-existing, much larger divergence tracked
+    // separately; this control only pins that #2008 didn't newly break it).
+    let (out, code) = run_yq_stdin(r#""\"\\ud83d\\ude00\"" | fromjson"#, "", &["-n"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "😀");
+
+    Ok(())
+}
