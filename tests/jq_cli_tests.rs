@@ -223,12 +223,29 @@ fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32
             }
             Err(e) => return Err(e.into()),
         };
-        if let Some(mut stdin) = child.stdin.take() {
+        // #2016: write, but don't propagate a failure yet -- same shape as
+        // `spawn_with_signal_retry`'s own #1891 fix. A `?` here, before
+        // `child.wait()` below, would drop `child` without reaping it on a
+        // write failure (e.g. the child exits before ever reading stdin),
+        // leaking a zombie for the rest of this test binary's run.
+        let write_result: std::io::Result<()> = if let Some(mut stdin) = child.stdin.take() {
             if let Some(input) = input {
-                stdin.write_all(input.as_bytes())?;
+                stdin.write_all(input.as_bytes())
+            } else {
+                Ok(())
             }
-        }
-        let status = child.wait()?;
+        } else {
+            Ok(())
+        };
+        // Prefer the write error's own diagnostic over `wait`'s, on the
+        // rare double failure where the child is also reaped or killed by
+        // something else between the write failing and this wait running
+        // (matching `spawn_with_signal_retry`'s own #1891-review priority).
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(wait_err) => return Err(write_result.err().unwrap_or(wait_err).into()),
+        };
+        write_result?;
         let combined = std::fs::read_to_string(&path)?;
         if let Some(code) = status.code() {
             let _ = std::fs::remove_dir_all(&dir);
