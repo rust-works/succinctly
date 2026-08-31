@@ -35515,9 +35515,19 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Same sink as `eval_nth_expr`, differing only in always materializing
-            // its answer (#820).
+            // its answer (#820). #1972: `into_owned_checked`, not `into_owned` --
+            // an undecodable borrowed output must raise `decode_failure`, not
+            // silently materialize as "" the way a bare `nth(n; g)` used to
+            // (confirmed live: `eval_nth_expr`'s own `Expr::NthExpr` sibling
+            // already returns its borrowed `One`/`OneCursor` result lazily,
+            // deferring the decode entirely, so it was never at risk the same
+            // way -- this "always materializing" spelling is the one that
+            // forces the conversion and so is the one that must check it).
             match each_take_nth::<W, S>(expr, value.clone(), optional, n) {
-                Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
+                Ok(Some(item)) => match item.into_owned_checked() {
+                    Ok(v) => QueryResult::Owned(v),
+                    Err(e) => QueryResult::Error(e),
+                },
                 Ok(None) => QueryResult::None,
                 Err(control) => control_to_result(control),
             }
@@ -40152,6 +40162,43 @@ mod tests {
             r#""\(.[:])""#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, r#"[1,2,"ok",4]"#);
+            }
+        );
+    }
+
+    /// #1972 continued investigation: auditing every `fanout_arg` consumer
+    /// for the same unguarded-materialization shape found two *more*
+    /// already-fixed sites (#1976) turned up a third, still-live one --
+    /// `nth(n; g)`'s two-argument, generator form. Unlike `limit`/`first`/
+    /// `last`, whose bare top-level spelling parses to a lazy `Expr` variant
+    /// that returns its selected output as a still-borrowed `One`/`Many`
+    /// (deferring the decode, never at risk here), `nth(n; g)` has no such
+    /// lazy AST production -- it always parses straight to
+    /// `Builtin::NthStream`/`builtin_nth_stream`, whose "always materializing"
+    /// design (#820) used to call `Item::into_owned` unconditionally on the
+    /// selected output, silently turning an undecodable string into `""`
+    /// instead of raising. Confirmed dead ends investigated alongside this:
+    /// `has`/`contains`/`getpath`/`index`/`inside`/`setpath`/`delpaths`/`in`
+    /// each already raise (either their own independent root-level
+    /// `to_owned_checked` happens to cover the same corrupted document, or a
+    /// type mismatch masks it before content ever matters), and bare
+    /// `limit`/`first`/`last` return lazily. Fixed via
+    /// `Item::into_owned_checked`, the same helper #1976 introduced.
+    #[test]
+    fn test_nth_stream_raises_on_selected_output_decode_failure_1972() {
+        query!(
+            &b"[1,2,\"\xff\xfe\",4]"[..],
+            "nth(2; .[:][])",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data through the same arm is unaffected.
+        query!(
+            br#"[1,2,"ok",4]"#,
+            "nth(2; .[:][])",
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ok");
             }
         );
     }
