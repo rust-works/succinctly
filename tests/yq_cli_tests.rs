@@ -4259,6 +4259,28 @@ fn test_nul_output_colors_multidoc_separator_survives_1709() -> Result<()> {
     Ok(())
 }
 
+/// #1709 code review (4th round, live-verified): the `--colors` branch's
+/// separator write had no empty-buffer guard the way the non-color
+/// `NulChecked` path does, so a zero-result middle document (whose
+/// structural `produces_output()` is false, no NUL involved anywhere)
+/// still got an unwanted `---` written around it, producing a stray
+/// separator pair with nothing between them -- a structural corruption of
+/// the multi-document boundary the non-color `-0` path never had.
+#[test]
+fn test_nul_output_colors_no_stray_separator_around_empty_document_1709() -> Result<()> {
+    let input = "a: 1\n---\na: 2\n---\na: 3\n";
+    let (output, code) = run_yq_stdin("select(.a != 2)", input, &["-0", "--colors"])?;
+    assert_eq!(code, 0);
+    // Exactly one `---`, between the two surviving documents -- not two,
+    // and none around the empty middle one.
+    assert_eq!(output.matches("---").count(), 1, "got: {output:?}");
+    assert_eq!(
+        output,
+        "\u{1b}[36ma\u{1b}[0m: 1\0\u{1b}[0m\n---\n\u{1b}[36ma\u{1b}[0m: 3\0"
+    );
+    Ok(())
+}
+
 /// #1709 code review: the identity (P9) path's leftover-buffer flush was
 /// gated on the render having fully succeeded, so a mid-document decode
 /// failure discarded whatever valid content had already rendered into the

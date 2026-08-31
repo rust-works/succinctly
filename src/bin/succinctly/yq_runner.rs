@@ -4355,9 +4355,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // `result.produces_output()` predicts the STRUCTURE of
                     // the result, not whether its first NUL-checked result
                     // will actually survive, so a NUL-separated document's
-                    // separator has to be decided lazily too.
+                    // separator has to be decided lazily too. Still gated
+                    // on `result.produces_output()` itself (#1709 code
+                    // review): a document producing zero results must
+                    // never offer a separator opportunity at all, colored
+                    // or not -- the color/`Buffered` arm of
+                    // `stream_maybe_colored` has no empty-buffer guard of
+                    // its own the way the non-color `NulChecked` arm does,
+                    // so an ungated `Some(..)` here wrote a stray `---`
+                    // around an empty middle document even when nothing
+                    // failed the NUL check at all. Live-verified regression:
+                    // `-0 --colors 'select(.a != 2)'` over three documents
+                    // whose middle one matches nothing.
                     let nul_separator = if terminator == Terminator::Nul {
-                        Some(DocSeparatorArgs {
+                        result.produces_output().then_some(DocSeparatorArgs {
                             doc_streamed: $doc_streamed,
                             no_doc: $output_config.no_doc,
                         })
