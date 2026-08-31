@@ -1668,6 +1668,36 @@ fn test_input_format_json_bridge_raises_on_malformed_delimiter_1975() -> Result<
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["a","b"]"#);
 
+    // `--inplace` is `parse_input`'s third caller (per
+    // `to_owned_canonicalizing_numbers`'s own doc comment), on its DOM path
+    // only -- an assignment forces that path the same way `-P`/`--arg`
+    // would (#1738's own sibling test), where a plain M2-streamable filter
+    // takes a separate fast path that never calls `parse_input` at all.
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{json}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .args(["--input-format", "json"])
+        .arg(".a = 5")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace should raise, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+    let file_contents = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        file_contents, json,
+        "a raised --inplace write must leave the file untouched"
+    );
+
     Ok(())
 }
 
