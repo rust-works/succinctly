@@ -35,14 +35,13 @@ use super::document::{
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
     collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned,
-    eval_foreach_with_values, eval_reduce_with_values, expand_func_calls,
-    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
+    eval_foreach_with_values, eval_reduce_with_values, expand_func_calls, extract_pattern_bindings,
+    format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
     slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var, substitute_vars,
     suppresses, tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand,
-    EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -7122,9 +7121,10 @@ where
 
     // Whatever `body` already produced still stands in front of the control,
     // exactly as it does for the argument's own escape below.
-    let flush_pending = |pending: Option<GenericResult<V>>,
-                        out: &mut Vec<OwnedValue>|
-     -> Option<Control> { pending.and_then(|p| push_generic_owned_values(p, out)) };
+    let flush_pending =
+        |pending: Option<GenericResult<V>>, out: &mut Vec<OwnedValue>| -> Option<Control> {
+            pending.and_then(|p| push_generic_owned_values(p, out))
+        };
 
     if let Some(control) = decode_err {
         let control = flush_pending(pending_first, &mut out).unwrap_or(control);
@@ -9159,9 +9159,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // hand-rolling the comparison keeps that asymmetry from being
             // re-derived and getting it backwards.
             let winner = if matches!(builtin, Builtin::Min | Builtin::MinBy(_)) {
-                keyed.into_iter().min_by(|(a, _), (b, _)| compare_values(a, b))
+                keyed
+                    .into_iter()
+                    .min_by(|(a, _), (b, _)| compare_values(a, b))
             } else {
-                keyed.into_iter().max_by(|(a, _), (b, _)| compare_values(a, b))
+                keyed
+                    .into_iter()
+                    .max_by(|(a, _), (b, _)| compare_values(a, b))
             };
             match winner {
                 Some((_, cursor)) => GenericResult::OneCursor(cursor),
@@ -16926,5 +16930,4 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
-
 }

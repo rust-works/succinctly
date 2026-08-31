@@ -277,7 +277,7 @@ separator" above discusses this same flag from a different angle — why `-0`/`-
 getting a newline-guarded `---` is a *permitted* rule-4(a) divergence, independent of the
 name-collision question here.
 
-### Duplicate mapping keys — the format leak and `.[]` collapse are resolved; four narrower gaps remain
+### Duplicate mapping keys — the format leak, `.[]` collapse and the sort family are resolved; narrower gaps remain
 
 The subject of [ADR-0018](../../adrs/adr-0018.md)'s worked example.
 [#1398](https://github.com/rust-works/succinctly/issues/1398) resolved the two divergences it
@@ -321,8 +321,56 @@ rather than adding a second mechanism; the change lands on shared `eval_generic.
 also fixes jq mode's own `[.[]]` as a side effect — one of #1385's five listed jq-mode gaps
 (`.`, `length`, `keys`, `keys_unsorted` remain open there).
 
-Four narrower gaps this fix deliberately left alone remain open, each already filed before
-#1398 landed:
+[#1687](https://github.com/rust-works/succinctly/issues/1687) then closed the next batch of
+wildcard-bridge casualties. `sort`, `sort_by`, `unique`, `unique_by`, `min`, `min_by`, `max`,
+`max_by` and `reverse` all answer a permutation or subset of their input's *own* elements, so
+they now keep those elements as cursors (a `LazySeq` for the array-valued ones, a bare
+`OneCursor` for `min`/`max`) instead of decoding them. Real yq preserves duplicates through
+every one of the seven it implements; succinctly now matches, and — per #757's own lesson that
+a construct on the DOM route loses everything the DOM cannot carry at once — recovers comments,
+anchors and flow style through them too:
+
+```bash
+$ printf -- '- b: 1\n  a: 2\n  b: 3\n' > dup_arr.yaml
+
+$ yq            -o=json -I=0 'sort_by(.a)' dup_arr.yaml   # [{"b":1,"a":2,"b":3}]
+$ succinctly yq -o=json -I=0 'sort_by(.a)' dup_arr.yaml   # [{"b":1,"a":2,"b":3}]  (was [{"b":3,"a":2}])
+```
+
+The same change gave `reduce`/`foreach` their first arm in `eval_generic.rs`, and `limit`/`nth`
+a real fan-out for a generator `n` — closing an internal contradiction in the first case
+(`[keys|.[]] | length` answered 3 while `reduce (keys|.[]) as $k (0; .+1)` answered 2 on the
+same document) and the last of `limit`/`nth`'s duplicate-key loss in the second.
+
+**Three gaps #1687 deliberately did not close**, alongside the four below:
+
+- **`group_by`** returns an array *of arrays*. `LazySeq` has no nested-lazy form and
+  `OwnedValue::Array(Vec<OwnedValue>)` cannot hold a cursor, so there is no lossless
+  representation for it today — it keeps the bridge, and real yq preserves where succinctly
+  collapses. The same representation limit as #1102 below, one level up.
+- **`while`/`until`** compute their state from step 1 onward, so only the seed `.` could ever
+  stay a cursor; folding through an `OwnedValue` state is inherent, not a wiring gap.
+- **`reduce`/`foreach`'s bindings.** The fix recovers the *number and order* of the input
+  stream's elements, not each element's own shape: the accumulator and every `$x` a pattern
+  binds are `OwnedValue` in both evaluators (`substitute_bound_var` takes `&OwnedValue`, and no
+  duplicate-key-capable owned type exists in this crate), so an element that gets bound is
+  collapsed at the bind. `reduce .[] as $x (null; $x)` therefore still answers
+  `{"b":3,"a":2}` where `first(.[])` on the same document answers `{"b":1,"a":2,"b":3}`.
+
+**And one deliberate divergence from real yq, not a gap.** The cursor-backed reordering above
+is switched off entirely for a document carrying any `*alias`, via
+`DocumentCursor::document_has_aliases`. Reordering can lift an alias above the anchor it
+resolves to, and `reverse` on `- &x {p: 1}` / `- *x` does: real yq answers `- *x` then
+`- &x {p: 1}`, then rejects its own output with `unknown anchor 'x' referenced` when asked to
+read it back (both verified live against v4.53.3). `enforce_anchor_soundness` is what normally
+prevents that, but it is a DOM-path pass over a `CommentTree` and the cursor-streaming path has
+none to run it over ([#1350](https://github.com/rust-works/succinctly/issues/1350)) — so an
+alias-bearing document takes the DOM path unchanged, losing the marks rather than emitting a
+file succinctly could not read back. The gate is on *aliases*, not anchors: an unreferenced
+`&x` is valid YAML wherever it lands.
+
+Four narrower gaps #1398's fix deliberately left alone remain open, each already filed before
+it landed:
 
 - [#1342](https://github.com/rust-works/succinctly/issues/1342) — `paths(node_filter)` still
   collapses (a YAML-only DOM-representation gap, unrelated to the format leak).
@@ -332,7 +380,8 @@ Four narrower gaps this fix deliberately left alone remain open, each already fi
 - [#1344](https://github.com/rust-works/succinctly/issues/1344) — `del`/`with_entries`/
   `map_values`/`tostream`/`walk`/`recurse` fall through `eval_generic.rs`'s wildcard bridge
   (`eval_on_owned`), which still materializes via an `IndexMap` and collapses duplicates for
-  both formats today.
+  both formats today. #1687 closed the same class for the sort family and `reduce`/`foreach`
+  above; this list is the remaining membership.
 - [#1102](https://github.com/rust-works/succinctly/issues/1102) — object slicing (`.[S:E]` on
   an object) must materialize into an `OwnedValue::Object` to build yq's AST-child-list view
   before slicing it, with no cursor-preserving alternative available (the operation inherently
