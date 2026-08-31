@@ -5506,6 +5506,17 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
 /// this function propagates it verbatim without ever running `catch` --
 /// matching jq exactly: `first(try (1, error("x")) catch "c")` is `1`, and
 /// jq never even reaches `error`, let alone `catch`.
+///
+/// **#1948: a still-lazy `GenericItem` pushed to `sink` must be checked
+/// *here*, before this boundary can close.** `eval_each_generic`'s wildcard
+/// fallback (`drain_result_generic`) forwards `LazyKeys`/`LazySeq` items
+/// opaque and unmaterialized -- the same #1194-class escape #1936/#1812
+/// already closed for the pull-model `try_single_generic`, reached through a
+/// different dispatch path here. `sink`'s own `Demand` return has no error
+/// channel, so [`check_lazy_item_for_try`] reports a fault via the
+/// `lazy_fault` side channel below instead (the same "capture, then check
+/// once the driver returns" idiom `stream.rs`'s own writers use for a
+/// mid-push fault) rather than plumbing one through `Demand` itself.
 fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     catch: Option<&Expr>,
@@ -5514,7 +5525,21 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    match eval_each_generic::<S, V>(expr, value, optional, cursor, sink) {
+    let mut lazy_fault: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        match check_lazy_item_for_try(item) {
+            Ok(item) => sink(item),
+            Err(control) => {
+                lazy_fault = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+    let flow = match lazy_fault {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    };
+    match flow {
         Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
             Flow::Escaped(Control::Error(e))
         }
@@ -5537,6 +5562,50 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
         // Halt is never caught (`Control`'s own guarantee); other terminal
         // shapes (`Exhausted`, `Stopped`) pass straight through.
         other => other,
+    }
+}
+
+/// Forces a #1194-class check on a still-lazy [`GenericItem`] *before* it
+/// reaches a push-model sink guarded by `try`/`catch`/`?` (#1948) -- the
+/// push-model twin of [`try_single_generic`]'s identical per-variant switch
+/// for `GenericResult` (#1936/#1812).
+///
+/// `LazyKeys` keeps its laziness on success: [`keys_are_well_formed`] only
+/// walks and checks, never collects, so a well-formed object still reaches
+/// `sink` as a live `LazyKeys` item -- collapsing it to `Owned` here
+/// regardless of outcome would be the exact regression #1503's review found
+/// and reverted (see [`GenericItem`]'s own doc comment). `LazySeq` cannot be
+/// checked without running its buffered `map(f)` closures, so it fully
+/// materializes via `materialize_atomic` -- matching `try_single_generic`'s
+/// own `LazySeq` arm, and sound for the same reason that one is: a
+/// `try`/`catch`/`?` boundary must know *now* whether its body raised, so
+/// laziness cannot survive past it regardless of push or pull. `LazyIndexRange`
+/// can never fail (`0..len`, pure arithmetic) and passes through unchanged.
+///
+/// Nested `try`/`catch` boundaries each re-walk the same still-forwarded
+/// `LazyKeys` item once per boundary (`try (try (keys_unsorted) catch empty)
+/// catch "c"` walks it twice) -- inherited from, not introduced by, this
+/// function: `try_single_generic`'s own pull-model `LazyKeys` arm has the
+/// identical per-boundary cost already, tracked as a future optimization
+/// under #1951 (cache an "already validated" fact on `LazyKeys` itself)
+/// rather than fixed at either call site.
+fn check_lazy_item_for_try<V: DocumentValue>(
+    item: GenericItem<V>,
+) -> Result<GenericItem<V>, Control> {
+    match item {
+        GenericItem::LazyKeys {
+            fields,
+            sorted,
+            collapse,
+        } => keys_are_well_formed::<V>(&fields, collapse)
+            .map(|()| GenericItem::LazyKeys {
+                fields,
+                sorted,
+                collapse,
+            })
+            .map_err(Control::Error),
+        GenericItem::LazySeq(seq) => seq.materialize_atomic().map(GenericItem::Owned),
+        other => Ok(other),
     }
 }
 
@@ -5691,6 +5760,20 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
 /// next alternative -- once the consumer has what it wants, no further
 /// alternative is ever tried, matching [`each_try_generic`]'s identical
 /// reasoning.
+///
+/// **Wraps `sink` the same way `each_try_generic` does (#1948 review):**
+/// `eval_each_generic`'s wildcard fallback forwards a still-lazy
+/// `GenericItem::LazyKeys`/`LazySeq` to `sink` opaque, which returns
+/// `Flow::Exhausted` regardless of whether the item is actually
+/// well-formed -- so this loop would otherwise treat a malformed
+/// `keys_unsorted`/`map(f)` tail as "this alternative succeeded" and never
+/// try the next one, the identical boundary-closes-too-soon bug
+/// `each_try_generic` closed for `try`/`catch`/`?`, just for `?//`'s own
+/// fallthrough decision instead. [`check_lazy_item_for_try`] runs the same
+/// check; a fault it finds is folded into this loop's own
+/// `Flow::Escaped(Control::Error/Break/Halt)` handling below via the same
+/// side-channel idiom, so it participates in the *same* `is_last`
+/// fallthrough/decode-failure-exclusion rules as an ordinary error.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `eval::each_pattern_alternatives`'s
                                      // own 7-argument shape plus this module's `cursor` --
                                      // every param is threaded straight through to the
@@ -5736,7 +5819,26 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             ),
         );
 
-        match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
+        let mut lazy_fault: Option<Control> = None;
+        let flow = eval_each_generic::<S, V>(
+            &substituted_body,
+            value.clone(),
+            optional,
+            cursor,
+            &mut |item| match check_lazy_item_for_try(item) {
+                Ok(item) => sink(item),
+                Err(control) => {
+                    lazy_fault = Some(control);
+                    Demand::Stop
+                }
+            },
+        );
+        let flow = match lazy_fault {
+            Some(control) => Flow::Escaped(control),
+            None => flow,
+        };
+
+        match flow {
             Flow::Exhausted => return Flow::Exhausted,
             Flow::Stopped { pending } => return Flow::Stopped { pending },
             // #1620/#1660: same decode-failure exclusion as

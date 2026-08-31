@@ -25750,44 +25750,84 @@ fn test_optional_and_try_catch_unaffected_by_lazykeys_lazyindexrange_forcing_193
     Ok(())
 }
 
-/// #1936 review found a related, still-open gap: `try_single_generic`
-/// (fixed above) only covers the *pull*-model `?`/`try`/`catch` dispatch
-/// (reached via plain `eval_single`). `each_try_generic`, the *push*-model
-/// twin reached via `eval_each_generic` for `first`/`limit`, has the
-/// identical bug class -- a lazy `LazyKeys`/`LazySeq` still escapes past a
-/// `?`/`try`/`catch` boundary once it's wrapped in one more layer of
-/// demand-aware consumer, since `eval_each_generic`'s wildcard fallback
-/// forwards the lazy result straight to `sink` unmaterialized. Deliberately
-/// not folded into #1936 (tracked separately as #1948): closing it needs
-/// `eval_each_generic` itself to carry a "must materialize now" signal
-/// through arbitrarily nested push-model consumers, not just a new arm in
-/// `each_try_generic`'s own dispatch. Pinned as a known, documented
-/// divergence (`docs/compliance/jq/limitations.md`) -- if this starts
-/// suppressing/catching correctly, that is a deliberate future fix (closing
-/// #1948), not a regression, and this test should be updated alongside it.
+/// #1936 review found a related gap, tracked separately as #1948:
+/// `try_single_generic` (fixed above) only covers the *pull*-model
+/// `?`/`try`/`catch` dispatch (reached via plain `eval_single`).
+/// `each_try_generic`, the *push*-model twin reached via `eval_each_generic`
+/// for `first`/`limit`, had the identical bug class -- a lazy
+/// `LazyKeys`/`LazySeq` escaped past a `?`/`try`/`catch` boundary once it was
+/// wrapped in one more layer of demand-aware consumer, since
+/// `eval_each_generic`'s wildcard fallback forwarded the lazy result straight
+/// to `sink` unmaterialized. #1948 closed it by wrapping `sink` itself inside
+/// `each_try_generic` to force the identical `try_single_generic` check
+/// synchronously, before the boundary can close, via a side-channel `Control`
+/// captured across the push (`check_lazy_item_for_try`).
 #[test]
-fn test_first_limit_wrapped_optional_try_catch_still_known_gap_1948() -> Result<()> {
-    // LazyKeys (#1936's own target), one push-model layer further out.
-    for filter in ["first(keys_unsorted?)", r#"first(try (keys) catch "c")"#] {
+fn test_first_limit_wrapped_optional_try_catch_suppresses_and_catches_1948() -> Result<()> {
+    // LazyKeys (#1936's own target), one push-model layer further out --
+    // `?`-suppression: exit 0, empty stdout, no catch handler runs.
+    for filter in ["first(keys_unsorted?)", "limit(1; keys_unsorted?)"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
-        assert_ne!(code, 0, "`{filter}` should still fail\nstdout: {stdout}");
-        assert!(
-            !stdout.contains('c'),
-            "`{filter}` should not have run the catch handler\nstdout: {stdout}"
-        );
-        assert!(!stderr.is_empty(), "`{filter}` should carry a diagnostic");
+        assert_eq!(code, 0, "`{filter}` should suppress\nstderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout}");
     }
 
-    // LazySeq (#1812's own target), predating #1936 entirely.
+    // Same LazyKeys fault, `try`/`catch` this time: exit 0, catch handler's
+    // own output reaches stdout.
+    for filter in [
+        r#"first(try (keys) catch "c")"#,
+        r#"first(try (keys_unsorted) catch "c")"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))
+            .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
+        assert_eq!(code, 0, "`{filter}` should catch\nstderr: {stderr}");
+        assert_eq!(stdout.trim(), "\"c\"", "`{filter}` -- stdout: {stdout}");
+    }
+
+    // LazySeq (#1812's own target), predating #1936/#1948 entirely.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", r#"first(try (map(error("x"))) catch "c")"#],
         Some("[1,2,3]"),
     )
     .unwrap_or_else(|e| panic!("failed to run: {e}"));
-    assert_ne!(code, 0, "should still fail\nstdout: {stdout}");
-    assert!(!stdout.contains('c'), "stdout: {stdout}");
-    assert!(!stderr.is_empty());
+    assert_eq!(code, 0, "should catch\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "\"c\"");
+
+    // `LazyIndexRange` (`keys_unsorted` on a well-formed array): unaffected
+    // by this fix, same as `try_single_generic`'s own `other => other`
+    // wildcard for this variant -- it can never fail, so `check_lazy_item_for_try`
+    // passes it through unchecked.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "first(keys_unsorted?)"], Some("[1,2,3]"))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "well-formed array is unaffected\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "[0,1,2]");
+
+    Ok(())
+}
+
+/// #1948 review found a sibling gap in `each_pattern_alternatives_generic`
+/// (`?//`'s own push-model fallthrough decision, reached via `first`/`limit`
+/// wrapping an `?//`-chain): the identical unwrapped-`sink` bug, just
+/// deciding "try the next alternative" instead of "run the catch handler".
+/// A still-lazy `LazySeq` from the taken alternative's body used to make
+/// this loop believe that alternative succeeded, so it never fell through to
+/// the next one when the lazy item's later materialization would have
+/// raised. Fixed the same way, reusing `check_lazy_item_for_try` unchanged.
+#[test]
+fn test_pattern_alternatives_wrapped_in_first_falls_through_on_lazy_fault_1948() -> Result<()> {
+    let filter = r#"first(. as [$a] ?// $b |
+        (if $a == 1
+         then (. | map(if . == 2 then error("boom") else . + 10 end))
+         else (. | map(. + 100))
+         end))"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(
+        code, 0,
+        "should fall through to the second alternative\nstderr: {stderr}"
+    );
+    assert_eq!(stdout.trim(), "[101,102,103]");
 
     Ok(())
 }

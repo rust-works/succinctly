@@ -703,32 +703,53 @@ rather than folded into #1629's own scope.
 `keys_unsorted | length` is not in this set at all — it reaches `effective_len`, which walks, and
 so has carried the check for free since #1628.
 
-**A separate catchability dimension, fixed for the pull model, still open for the push
-model (#1936/#1948).** Whether a malformed key *raises* (documented above) is distinct from
+**A separate catchability dimension, now fixed for both the pull model and the push model
+(#1936, #1948).** Whether a malformed key *raises* (documented above) is distinct from
 whether `?`/`try`/`catch` can *suppress or catch* that raise — `keys`/`keys_unsorted` stay
-lazy (`GenericResult::LazyKeys`) until something actually materializes them, so wrapping a
-bare `keys_unsorted` in `?` used to let the error escape past a boundary that had already
-closed by the time materialization happened. #1936 fixed this for the pull-model dispatch
-(`try_single_generic`, reached via plain `eval_single`) by checking for a malformed key
-before the boundary's match runs, without forcing a full decode on success (preserving
+lazy (`GenericResult`/`GenericItem::LazyKeys`) until something actually materializes them,
+so wrapping a bare `keys_unsorted` in `?` used to let the error escape past a boundary that
+had already closed by the time materialization happened. #1936 fixed this for the pull-model
+dispatch (`try_single_generic`, reached via plain `eval_single`) by checking for a malformed
+key before the boundary's match runs, without forcing a full decode on success (preserving
 `fold_pipe_stages`'s lazy fast paths for `.[]`/`.[n]`/`first`/`last`/`length`):
 
 ```
-$ echo '{123: 1}' | sjq -c 'keys_unsorted?'                      # suppressed, exit 0 (fixed)
-$ echo '{123: 1}' | sjq -c 'try (keys_unsorted) catch "c"'       # "c", exit 0 (fixed)
+$ echo '{123: 1}' | sjq -c 'keys_unsorted?'                      # suppressed, exit 0
+$ echo '{123: 1}' | sjq -c 'try (keys_unsorted) catch "c"'       # "c", exit 0
 ```
 
 The push-model dispatch (`each_try_generic`, reached via `eval_each_generic` for
-`first`/`limit`) has the identical bug class and remains open — tracked as #1948 rather
-than folded into #1936, since closing it needs `eval_each_generic` itself to carry a "must
-materialize now" signal through arbitrarily nested push-model consumers, not just a new
-arm in `each_try_generic`'s own dispatch. It also affects `LazySeq` (`map(f)`), not just
-`LazyKeys` — a gap that predates #1936 entirely, since #1812 only fixed `LazySeq`'s
-pull-model catchability:
+`first`/`limit`) had the identical bug class, plus a wider one: it also affected `LazySeq`
+(`map(f)`), a gap that predated #1936 entirely, since #1812 only fixed `LazySeq`'s
+pull-model catchability. #1948 closed both by wrapping `sink` itself inside
+`each_try_generic` — `check_lazy_item_for_try` runs the identical `keys_are_well_formed`
+check (staying lazy on success, same as `try_single_generic`) or, for `LazySeq`, the
+identical `materialize_atomic` call `try_single_generic` already made, capturing any fault
+via a side channel checked once the push loop returns (`Demand` has no error channel of its
+own to carry it through directly):
 
 ```
-$ echo '{123: 1}' | sjq -c 'first(keys_unsorted?)'                       # exit 5 -- unfixed
-$ echo '[1,2,3]' | sjq -c 'first(try (map(error("x"))) catch "c")'       # exit 5 -- unfixed
+$ echo '{123: 1}' | sjq -c 'first(keys_unsorted?)'                       # suppressed, exit 0
+$ echo '[1,2,3]' | sjq -c 'first(try (map(error("x"))) catch "c")'       # "c", exit 0
+```
+
+**`?//`'s own push-model fallthrough decision had the identical gap** (found reviewing #1948):
+`each_pattern_alternatives_generic` — the sink-based dispatch for a `?//`-chain, reached via
+`first`/`limit` wrapping one — decided whether the *taken* alternative "succeeded" purely from
+the `Flow` `eval_each_generic` returned, and a still-lazy item forwarded to `sink` unmaterialized
+answers `Flow::Exhausted` regardless of whether it would later raise. So a malformed
+`keys_unsorted`/`map(f)` tail on the taken alternative's body made this loop believe that
+alternative succeeded and never try the next one — the exact boundary-closes-too-soon bug
+`each_try_generic` closed for `try`/`catch`/`?`, just for `?//`'s fallthrough rule instead. Fixed
+the same way, reusing `check_lazy_item_for_try` unchanged:
+
+```
+$ echo '[1,2,3]' | sjq -c 'first(. as [$a] ?// $b |
+    (if $a == 1
+     then (. | map(if . == 2 then error("boom") else . + 10 end))
+     else (. | map(. + 100))
+     end))'
+[101,102,103]                                                            # falls through, exit 0
 ```
 
 Bare `keys_unsorted` — no stage after it — does raise, but only part-way through: it streams,
