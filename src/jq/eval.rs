@@ -909,6 +909,21 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // navigation before `limit` already creates the enclosing `Pipe`
         // this arm needs.
         Expr::Limit { expr, .. } => needs_path_context(expr),
+        // `reduce EXPR as PATTERN (INIT; UPDATE)` / `foreach EXPR as
+        // PATTERN (INIT; UPDATE[; EXTRACT])` (#1765, item 3 of #1663's own
+        // remaining-gaps list): `input`/`INIT` both evaluate against the
+        // caller's own ambient position -- `eval_reduce`/`eval_foreach`
+        // evaluate each via `eval_single(_, value.clone(), optional)`, the
+        // same `value` this whole pipe is already at -- so a `key`/
+        // `parent`/`file_index` inside either one needs the same context a
+        // sibling `key` elsewhere in the pipe would get. `UPDATE`/`EXTRACT`
+        // are deliberately excluded: both evaluate against the
+        // accumulator, a synthetic value with no real document position,
+        // so `key` there already (and correctly) answers `null` without
+        // needing path-context routing -- the issue's own investigation
+        // flagged this as likely already correct, not a gap to close.
+        Expr::Reduce { input, init, .. } => needs_path_context(input) || needs_path_context(init),
+        Expr::Foreach { input, init, .. } => needs_path_context(input) || needs_path_context(init),
         _ => false,
     }
 }
@@ -25371,6 +25386,34 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // forks), only the trailing error is swallowed.
     let (init_values, init_control) = stream_outputs_checked(init_result.materialize_cursor());
 
+    eval_reduce_with_values::<W, S>(
+        patterns,
+        update,
+        input_values,
+        init_values,
+        init_control,
+        optional,
+    )
+}
+
+/// The OwnedValue-domain heart of `reduce EXPR as PATTERN (INIT; UPDATE)`,
+/// once `input`/`INIT` have already been reduced to `Vec<OwnedValue>` --
+/// shared by [`eval_reduce`] (cursor-sourced `input`/`INIT`, the ordinary
+/// case) and `eval_pipe_with_path_context_internal`'s own `Expr::Reduce` arm
+/// (#1765: `input`/`INIT` sourced from the path-context evaluator instead,
+/// when either needs `key`/`parent`/`file_index` to resolve correctly).
+/// `update` itself is deliberately never routed through path-context
+/// evaluation by either caller -- it runs against the accumulator, a
+/// synthetic value with no real document position, so `key` there already
+/// answers `null` correctly without needing to change (#1765's own scoping).
+fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    input_values: Vec<OwnedValue>,
+    init_values: Vec<OwnedValue>,
+    init_control: Option<Control>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
@@ -26063,6 +26106,40 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
 
+    eval_foreach_with_values::<W, S>(
+        patterns,
+        update,
+        extract,
+        input_values,
+        input_control,
+        init_values,
+        init_control,
+        optional,
+    )
+}
+
+/// The OwnedValue-domain heart of `foreach EXPR as PATTERN (INIT; UPDATE[; EXTRACT])`,
+/// once `input`/`INIT` have already been reduced to `Vec<OwnedValue>` (plus
+/// each one's own trailing control, if any) -- shared by [`eval_foreach`]
+/// (cursor-sourced `input`/`INIT`, the ordinary case) and
+/// `eval_pipe_with_path_context_internal`'s own `Expr::Foreach` arm (#1765:
+/// `input`/`INIT` sourced from the path-context evaluator instead, when
+/// either needs `key`/`parent`/`file_index` to resolve correctly). `update`/
+/// `extract` are deliberately never routed through path-context evaluation
+/// by either caller -- both run against the accumulator, a synthetic value
+/// with no real document position, so `key` there already answers `null`
+/// correctly without needing to change (#1765's own scoping).
+#[allow(clippy::too_many_arguments)]
+fn eval_foreach_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    extract: Option<&Expr>,
+    input_values: Vec<OwnedValue>,
+    input_control: Option<Control>,
+    init_values: Vec<OwnedValue>,
+    init_control: Option<Control>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Same hoist as `eval_reduce`: skipped entirely when there are no
     // INIT forks to consume it.
     //
@@ -29222,6 +29299,178 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             };
             continue_rest_with_context::<W, S>(
                 limited,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `reduce EXPR as PATTERN (INIT; UPDATE)` (#1765, item 3 of #1663's
+        // own remaining-gaps list): `input`/`INIT` are evaluated through
+        // this same path-context evaluator instead of the ordinary one,
+        // whenever either needs it (this arm's own guard), then handed to
+        // `eval_reduce_with_values` -- the OwnedValue-domain core shared
+        // with `eval_reduce`'s own cursor-sourced entry point. `UPDATE` is
+        // deliberately left on the plain evaluator inside that shared core
+        // (see its own doc comment): it runs against the accumulator, a
+        // synthetic value with no document position, so `key` there is
+        // already correctly `null` without needing this routing.
+        //
+        // The `input`/`Partial` arms below mirror `eval_reduce`'s own
+        // cursor-sourced handling exactly (an input-stream error, break, or
+        // halt -- even one arriving after a partial prefix -- returns
+        // immediately, before `INIT` is ever evaluated: `reduce`'s own
+        // output is always single-shot). No `to_owned_checked`/
+        // `promote_borrowed_checked` conversion is needed here the way
+        // `eval_reduce`'s cursor-based version needs it -- this evaluator
+        // already returns checked `OwnedValue`s, never a raw cursor.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } if needs_path_context(input) || needs_path_context(init) => {
+            let input_values: Vec<OwnedValue> = match eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(input),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            ) {
+                QueryResult::Owned(v) => vec![v],
+                QueryResult::ManyOwned(vs) => vs,
+                QueryResult::None => Vec::new(),
+                QueryResult::Error(e) => return suppress_or_raise(e, optional),
+                QueryResult::Break(label) => return QueryResult::Break(label),
+                QueryResult::Halt(code) => return QueryResult::Halt(code),
+                QueryResult::Partial(_prefix, Control::Error(e)) => {
+                    return suppress_or_raise(e, optional);
+                }
+                QueryResult::Partial(_prefix, Control::Break(label)) => {
+                    return QueryResult::Break(label);
+                }
+                QueryResult::Partial(_prefix, Control::Halt(code)) => {
+                    return QueryResult::Halt(code);
+                }
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
+                    )
+                }
+            };
+            let init_result = eval_pipe_with_path_context_internal::<W, S>(
+                core::slice::from_ref(init),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let (init_values, init_control) = stream_outputs_checked(init_result);
+            let result = eval_reduce_with_values::<W, S>(
+                patterns,
+                update,
+                input_values,
+                init_values,
+                init_control,
+                optional,
+            );
+            continue_rest_with_context::<W, S>(
+                result,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `foreach EXPR as PATTERN (INIT; UPDATE[; EXTRACT])` (#1765): same
+        // reasoning and scoping as `Expr::Reduce` above. Unlike `Reduce`,
+        // an input-stream `Partial` here keeps its already-produced prefix
+        // (`input_control` carried forward, not an immediate return) --
+        // mirroring `eval_foreach`'s own cursor-sourced handling exactly,
+        // since `foreach` (unlike `reduce`) streams one output per input
+        // element as it goes.
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } if needs_path_context(input) || needs_path_context(init) => {
+            let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
+                match eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(input),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ) {
+                    QueryResult::Owned(v) => (vec![v], None),
+                    QueryResult::ManyOwned(vs) => (vs, None),
+                    QueryResult::None => (Vec::new(), None),
+                    QueryResult::Error(e) => return suppress_or_raise(e, optional),
+                    QueryResult::Break(label) => return QueryResult::Break(label),
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    QueryResult::Partial(vs, control) => (vs, Some(control)),
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                };
+            let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
+                match eval_pipe_with_path_context_internal::<W, S>(
+                    core::slice::from_ref(init),
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ) {
+                    QueryResult::Owned(v) => (vec![v], None),
+                    QueryResult::ManyOwned(vs) => (vs, None),
+                    QueryResult::None => (Vec::new(), None),
+                    QueryResult::Error(e) => {
+                        return finish_fork(
+                            Vec::new(),
+                            input_control.or(Some(Control::Error(e))),
+                            optional,
+                        );
+                    }
+                    QueryResult::Break(label) => {
+                        return finish_fork(
+                            Vec::new(),
+                            input_control.or(Some(Control::Break(label))),
+                            optional,
+                        );
+                    }
+                    QueryResult::Halt(code) => return QueryResult::Halt(code),
+                    QueryResult::Partial(vs, control) => (vs, Some(control)),
+                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                        unreachable!(
+                            "eval_pipe_with_path_context_internal only ever produces \
+                             Owned/ManyOwned/None/Error/Break/Partial"
+                        )
+                    }
+                };
+            let result = eval_foreach_with_values::<W, S>(
+                patterns,
+                update,
+                extract.as_deref(),
+                input_values,
+                input_control,
+                init_values,
+                init_control,
+                optional,
+            );
+            continue_rest_with_context::<W, S>(
+                result,
                 rest,
                 root,
                 file_origin,
