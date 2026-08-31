@@ -1063,9 +1063,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // field value must raise, not silently become "" and get
                 // sliced as if it were the real value. #1953: a non-decode-
                 // failure to_owned_checked error (a #1194 malformed-member
-                // or #1642 collision error) respects `optional` the same
-                // way the sibling `_ if optional` arm below does -- only a
-                // genuine decode failure is unconditional.
+                // error -- a #1642 collision error is itself tagged as a
+                // decode failure and so is unaffected by this) respects
+                // `optional` the same way the sibling `_ if optional` arm
+                // below does -- only a genuine decode failure is
+                // unconditional.
                 let owned = match to_owned_checked(&value) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
@@ -16923,11 +16925,12 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
-            // #1953: a non-decode-failure to_owned_checked error (#1194
-            // malformed-member/#1642 collision) respects `optional` like
-            // every other fallible step at this boundary (per this
-            // function's own doc comment above) -- only a genuine decode
-            // failure is unconditional.
+            // #1953: a non-decode-failure to_owned_checked error (a #1194
+            // malformed-member error -- a #1642 collision error is itself
+            // tagged as a decode failure and so is unaffected by this)
+            // respects `optional` like every other fallible step at this
+            // boundary (per this function's own doc comment above) -- only
+            // a genuine decode failure is unconditional.
             let pristine = match to_owned_checked(&input) {
                 Ok(pristine) => pristine,
                 Err(e) => return suppress_or_raise(e, optional),
@@ -25423,8 +25426,9 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // raising. A decode failure is never suppressed by `optional` (#1620),
     // matching the "drop the prefix, propagate unconditionally" policy the
     // comment below already applies to an ordinary `Partial` error -- but a
-    // *non*-decode-failure conversion error (a #1194 malformed-member or
-    // #1642 collision error) is an ordinary error like any other, and
+    // *non*-decode-failure conversion error (a #1194 malformed-member error
+    // -- a #1642 collision error is itself tagged as a decode failure and
+    // so is unaffected by this) is an ordinary error like any other, and
     // `optional` should suppress it the same way the bare `QueryResult::Error`
     // arm below already does (#1934 item 3: this used to be unconditionally
     // fatal regardless of `optional`, unlike that sibling arm).
@@ -40165,40 +40169,212 @@ mod tests {
 
     /// #1953: `to_owned_checked`'s `Err` can carry a #1194 malformed-member
     /// error (a trailing unpaired object member, e.g. `{"a":1,"b"}`), which
-    /// is not `is_decode_failure()`-tagged -- unlike a genuine decode
-    /// failure, `optional` should suppress it the same way it suppresses
-    /// any other ordinary error, at the six sites this fix scoped to (each
-    /// already had an adjacent, established "ordinary error respects
-    /// `optional`" sibling to mirror). Before this fix, all six propagated
-    /// unconditionally regardless of `optional`.
+    /// is not `is_decode_failure()`-tagged. Confirmed here (via a plain,
+    /// un-suppressed `.c = 5` reachable straight through the CLI) that the
+    /// raised error is indeed not a decode failure -- the premise the rest
+    /// of this fix rests on.
     #[test]
-    fn test_six_sites_respect_optional_for_malformed_member_error_1953() {
-        // eval_assign: unsuppressed still raises...
+    fn test_malformed_member_error_is_not_a_decode_failure_1953() {
         query!(
             br#"{"a":1,"b"}"#,
             ".c = 5",
             QueryResult::Error(e) => assert!(!e.is_decode_failure())
         );
-        // ...and `optional` now suppresses it.
-        query!(br#"{"a":1,"b"}"#, "(.c = 5)?", QueryResult::None => {});
+    }
 
-        // eval_update
-        query!(br#"{"a":1,"b"}"#, "(.c |= . + 1)?", QueryResult::None => {});
+    /// #1953: the seven `to_owned_checked` call sites tested individually
+    /// below all propagated this non-decode-failure error unconditionally,
+    /// ignoring `optional`, before this fix -- diverging from an adjacent
+    /// sibling arm at the very same boundary in every case.
+    ///
+    /// None of the seven is reachable with `optional: true` through any
+    /// real `?`/`try` syntax today (code review, #1953): `Expr::Optional`'s
+    /// dispatch (see the doc comment on `eval_single`'s own `Expr::Optional
+    /// (inner) if matches!(**inner, Expr::IndexExpr{..}|Expr::SliceExpr{..})`
+    /// arm) only ever forwards `optional: true` *directly* into a callee for
+    /// that one dynamic-bounds index/slice shape. Every other spelling of
+    /// `?` -- including a literal-bounds slice like `.[0:1]?` (which folds
+    /// to `Expr::Slice`/`Expr::SliceNumber`, not `Expr::SliceExpr`, so it
+    /// doesn't take that bypass either) and Assign/Update/SetPath/
+    /// Combinations, none of which are Index/Slice at all -- instead
+    /// evaluates its inner expression with the *ambient* `optional` and
+    /// lets `eval_try`'s own catch-and-convert machinery decide the
+    /// aggregate outcome afterward, independent of what the callee did
+    /// internally. So each site is exercised directly here, the same way
+    /// this file's own pre-existing `eval_assign_optional_swallows_
+    /// ordinary_path_error_called_directly` and its siblings already test
+    /// `optional`-gated behavior with no reachable `?` spelling of its own.
+    /// Fixing it anyway keeps every one of these functions' own `optional`
+    /// parameter internally consistent with what its doc comment already
+    /// promises, in case a future caller (or a future widening of the
+    /// `Expr::Optional` bypass above) ever does reach it with `true`.
+    /// Split one function per site (rather than one function with seven
+    /// blocks) so a regression at any single site fails its own test
+    /// instead of hiding behind an earlier block's panic.
+    #[test]
+    fn test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let slice_expr = Expr::Slice {
+            start: None,
+            end: None,
+        };
+        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
-        // eval_update_multi (via compound assign)
-        query!(br#"{"a":1,"b"}"#, "(.c += 1)?", QueryResult::None => {});
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale shared by all seven of
+    /// these per-site tests. `eval_assign`'s `YqAssignNoopCheck::NotChecked`
+    /// branch is reached under `JqSemantics`, which never takes the
+    /// yq-only no-op fast path (see `eval_assign_optional_swallows_ordinary_
+    /// path_error_called_directly` above for the same convention).
+    #[test]
+    fn test_eval_assign_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = Expr::Identity;
+        let value_expr = Expr::Literal(Literal::Int(5));
+        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
-        // builtin_setpath
-        query!(br#"{"a":1,"b"}"#, r#"setpath(["c"]; 5)?"#, QueryResult::None => {});
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale. Exercises `eval_update`'s
+    /// own input-conversion step.
+    #[test]
+    fn test_eval_update_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match eval_update::<Vec<u64>, JqSemantics>(
+            &Expr::Identity,
+            &Expr::Identity,
+            cursor.value(),
+            true,
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_update::<Vec<u64>, JqSemantics>(
+            &Expr::Identity,
+            &Expr::Identity,
+            cursor.value(),
+            false,
+            true,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
-        // builtin_combinations
-        query!(br#"{"a":1,"b"}"#, "[combinations]?", QueryResult::None => {});
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale. Exercises
+    /// `eval_update_multi`'s own input-conversion step, reached via
+    /// `eval_compound_assign` (`+=`), which just forwards its own
+    /// `optional` straight through.
+    #[test]
+    fn test_eval_update_multi_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = Expr::Identity;
+        let value_expr = Expr::Literal(Literal::Int(1));
+        match eval_compound_assign::<Vec<u64>, JqSemantics>(
+            AssignOp::Add,
+            &path_expr,
+            &value_expr,
+            cursor.value(),
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_compound_assign::<Vec<u64>, JqSemantics>(
+            AssignOp::Add,
+            &path_expr,
+            &value_expr,
+            cursor.value(),
+            false,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
-        // builtin_combinations_n
-        query!(br#"{"a":1,"b"}"#, "[combinations(1)]?", QueryResult::None => {});
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale. Exercises
+    /// `builtin_setpath`'s `fanout_two_args` closure.
+    #[test]
+    fn test_builtin_setpath_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let path_expr = parse(r#"["c"]"#).unwrap();
+        let val_expr = Expr::Literal(Literal::Int(5));
+        match builtin_setpath::<Vec<u64>, JqSemantics>(&path_expr, &val_expr, cursor.value(), true)
+        {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_setpath::<Vec<u64>, JqSemantics>(&path_expr, &val_expr, cursor.value(), false)
+        {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
-        // eval_single's yq Object-slice arm
-        yq_query!(br#"{"a":1,"b"}"#, ".[0:1]?", QueryResult::None => {});
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale. Exercises
+    /// `builtin_combinations`'s per-element inner-array loop -- needs an
+    /// array of arrays, so the malformed object sits one level deeper.
+    #[test]
+    fn test_builtin_combinations_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"[[{"a":1,"b"}]]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_combinations::<Vec<u64>>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_combinations::<Vec<u64>>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
+    /// doc comment above for the full rationale. Exercises
+    /// `builtin_combinations_n`'s array-conversion step.
+    #[test]
+    fn test_builtin_combinations_n_respects_optional_for_malformed_member_error_1953() {
+        let json_bytes: &[u8] = br#"[{"a":1,"b"}]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = Expr::Literal(Literal::Int(1));
+        match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     /// #1972: `eval_single`'s fully-open `Expr::Slice` fast path (the same
