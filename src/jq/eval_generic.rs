@@ -36,7 +36,7 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
     collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned,
     eval_foreach_with_values, eval_reduce_with_values, expand_func_calls, extract_pattern_bindings,
-    format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
     slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var, substitute_vars,
@@ -8422,6 +8422,259 @@ fn sort_keyed_elements<V: DocumentValue>(keyed: &mut [(OwnedValue, V::Cursor)]) 
     keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
 }
 
+/// Whether `path(expr)` can be resolved by walking cursors instead of
+/// materializing the whole document (#2061).
+///
+/// Deliberately narrow: only the pure-navigation shapes, whose emitted paths
+/// depend on the document's *structure* along the path and never on a value
+/// it has to compute. Anything else -- a computed index (`.[$k]`), a slice, a
+/// builtin, `getpath`, `first`/`last`, a comparison -- defers to
+/// `builtin_path_on_owned` unchanged, so this adds a fast path rather than a
+/// second implementation of path resolution.
+///
+/// `Expr::Comma` is included: `path(.a, .b)` is just both walks, and the
+/// walk below already fans out for `Iterate`.
+fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate => true,
+        Expr::Field(_) => true,
+        // A negative index needs no array length: `path(.[-1])` is `[-1]`
+        // verbatim in both jq and succinctly today (verified live), so the
+        // sign costs nothing here.
+        Expr::Index(_) | Expr::IndexNumber { .. } => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => path_expr_is_cursor_navigable(inner),
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
+        _ => false,
+    }
+}
+
+/// One node reached during a [`path_walk_generic`] step.
+///
+/// `Absent` is not an error: jq yields a path for a component that does not
+/// exist (`{} | path(.a)` is `["a"]`) and keeps navigating as if the value
+/// were `null` (`{} | path(.a.b)` is `["a","b"]`), so the walk has to carry
+/// "no such node" as a first-class position rather than stopping.
+enum PathNode<V: DocumentValue> {
+    At(V::Cursor),
+    Absent,
+}
+
+impl<V: DocumentValue> Clone for PathNode<V> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::At(c) => Self::At(*c),
+            Self::Absent => Self::Absent,
+        }
+    }
+}
+
+/// The type name to report in an indexing error, for a node that may be
+/// absent. An absent node is `null`, which both jq and succinctly allow every
+/// navigation through.
+fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
+    match node {
+        PathNode::At(c) => {
+            let v = c.value();
+            tagged_type_name(&v, Some(*c))
+        }
+        PathNode::Absent => "null",
+    }
+}
+
+/// Walk `expr` from `node`, appending one `OwnedValue::Array` per emitted
+/// path to `out` (#2061).
+///
+/// The whole point is that no `OwnedValue` tree is ever built for the
+/// *document*: only the path components themselves are owned, and those are
+/// bounded by the query's own depth and fan-out rather than the input's size.
+///
+/// Error texts are taken from the same constructors the materializing path
+/// uses, so the two agree exactly -- verified live against every shape in
+/// `test_path_cursor_native_matches_the_materializing_path_2061`.
+fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    node: &PathNode<V>,
+    path: &mut Vec<OwnedValue>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), EvalError> {
+    match expr {
+        Expr::Identity => {
+            out.push(OwnedValue::Array(path.clone()));
+            Ok(())
+        }
+        Expr::Paren(inner) => path_walk_generic::<S, V>(inner, node, path, out),
+        Expr::Optional(inner) => {
+            // `?` discards this branch's outputs as well as its error,
+            // matching `path(.a?)` on an array emitting nothing at all
+            // rather than a partial prefix (verified live against jq 1.7.1).
+            let mut branch = Vec::new();
+            match path_walk_generic::<S, V>(inner, node, &mut path.clone(), &mut branch) {
+                Ok(()) => {
+                    out.append(&mut branch);
+                    Ok(())
+                }
+                Err(_) => Ok(()),
+            }
+        }
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                path_walk_generic::<S, V>(e, node, &mut path.clone(), out)?;
+            }
+            Ok(())
+        }
+        Expr::Pipe(exprs) => match exprs.split_first() {
+            None => {
+                out.push(OwnedValue::Array(path.clone()));
+                Ok(())
+            }
+            Some((first, [])) => path_walk_generic::<S, V>(first, node, path, out),
+            Some((first, rest)) => {
+                // Each output of `first` is a distinct position to continue
+                // the rest of the pipe from, so the step is re-walked rather
+                // than batched -- the same per-output shape `Expr::Iterate`
+                // needs below.
+                let mut heads = Vec::new();
+                path_step_generic::<S, V>(first, node, path, &mut heads)?;
+                let rest_expr = if rest.len() == 1 {
+                    rest[0].clone()
+                } else {
+                    Expr::Pipe(rest.to_vec())
+                };
+                for (mut next_path, next_node) in heads {
+                    path_walk_generic::<S, V>(&rest_expr, &next_node, &mut next_path, out)?;
+                }
+                Ok(())
+            }
+        },
+        // A terminal navigation step: take it, then emit each resulting path.
+        _ => {
+            let mut heads = Vec::new();
+            path_step_generic::<S, V>(expr, node, path, &mut heads)?;
+            for (p, _) in heads {
+                out.push(OwnedValue::Array(p));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// One navigation step: from `node` at `path`, produce every (path, node)
+/// position the step reaches.
+fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    node: &PathNode<V>,
+    path: &[OwnedValue],
+    out: &mut Vec<(Vec<OwnedValue>, PathNode<V>)>,
+) -> Result<(), EvalError> {
+    match expr {
+        Expr::Identity => {
+            out.push((path.to_vec(), node.clone()));
+            Ok(())
+        }
+        Expr::Paren(inner) => path_step_generic::<S, V>(inner, node, path, out),
+        Expr::Field(name) => {
+            let next = match node {
+                PathNode::Absent => PathNode::Absent,
+                PathNode::At(c) => {
+                    let v = c.value();
+                    if v.is_null() {
+                        PathNode::Absent
+                    } else if let Some(fields) = v.as_object() {
+                        match fields.find_cursor(name)? {
+                            Some(fc) => PathNode::At(fc),
+                            None => PathNode::Absent,
+                        }
+                    } else {
+                        return Err(EvalError::cannot_index_with_field(
+                            path_node_type_name::<V>(node),
+                            name,
+                        ));
+                    }
+                }
+            };
+            let mut p = path.to_vec();
+            p.push(OwnedValue::String(name.clone()));
+            out.push((p, next));
+            Ok(())
+        }
+        Expr::Index(_) | Expr::IndexNumber { .. } => {
+            // The component is reported with its own source spelling
+            // (`path(.[2.0])` is `[2.0]`, not `[2]` -- #1088), which only
+            // `IndexNumber` carries. `index_component_value` is `eval.rs`'s
+            // own renderer for exactly this, shared rather than re-derived.
+            let (idx, key) = match expr {
+                Expr::Index(i) => (*i, None),
+                Expr::IndexNumber { idx, key } => (*idx, Some(key)),
+                _ => unreachable!("guarded by the match arm above"),
+            };
+            let next = match node {
+                PathNode::Absent => PathNode::Absent,
+                PathNode::At(c) => {
+                    let v = c.value();
+                    if v.is_null() {
+                        PathNode::Absent
+                    } else if let Some(elements) = v.as_array() {
+                        usize::try_from(idx)
+                            .ok()
+                            .and_then(|i| elements.get_cursor(i))
+                            .map_or(PathNode::Absent, PathNode::At)
+                    } else {
+                        return Err(EvalError::cannot_index_with_type(
+                            path_node_type_name::<V>(node),
+                            "number",
+                        ));
+                    }
+                }
+            };
+            let mut p = path.to_vec();
+            p.push(index_component_value(idx, key));
+            out.push((p, next));
+            Ok(())
+        }
+        Expr::Iterate => match node {
+            // `null` and a missing node are not iterable, matching
+            // `path(.[])` on `null` raising rather than yielding nothing.
+            PathNode::Absent => Err(EvalError::cannot_iterate_with(
+                EvalTag::Jq,
+                &OwnedValue::Null,
+            )),
+            PathNode::At(c) => {
+                let v = c.value();
+                if let Some(fields) = v.as_object() {
+                    // `effective_fields_checked` with the mode's own
+                    // duplicate-key rule, plus `key_display_string` -- the
+                    // same two helpers `collect_paths_generic` uses, reused
+                    // rather than re-derived. Walking `all_fields()` instead
+                    // emitted `[["a"],["a"]]` for `[path(.[])]` on
+                    // `{"a":1,"a":2}`, where jq mode collapses to `[["a"]]`
+                    // (#1385); caught by the evaluator-parity suite.
+                    for field in effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)? {
+                        let Some(key) = key_display_string(&field.key) else {
+                            return Err(fields.malformed_member_error());
+                        };
+                        let mut p = path.to_vec();
+                        p.push(OwnedValue::String(key.into_owned()));
+                        out.push((p, PathNode::At(field.value_cursor)));
+                    }
+                    Ok(())
+                } else if let Some(elements) = v.as_array() {
+                    for (i, ec) in elements.collect_cursors().into_iter().enumerate() {
+                        let mut p = path.to_vec();
+                        p.push(OwnedValue::Int(i as i64));
+                        out.push((p, PathNode::At(ec)));
+                    }
+                    Ok(())
+                } else {
+                    Err(EvalError::cannot_iterate_with(EvalTag::Jq, &to_owned(&v)?))
+                }
+            }
+        },
+        // `path_expr_is_cursor_navigable` gates every caller, so nothing else
+        // can arrive here.
+        other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),
+    }
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -9240,6 +9493,48 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // verbatim otherwise. See `reindex_bridge_is_identity`, and the
         // `Expr::Pipe` arm above for why `optional` isn't threaded in.
         Builtin::Path(path_expr) => {
+            // #2061: `path(...)` output is small and bounded, but this arm
+            // materialized the whole document to produce it -- `path(.[0])`
+            // on a 20 MB array cost 0.78s and 519 MiB against `.[0]`'s 0.09s
+            // and 34 MiB, and `path(.)` cost 1003 MiB to answer `[]`.
+            //
+            // For a purely navigational path expression the answer depends
+            // on the document's *structure* along the path, never on a value
+            // that has to be computed, so it can be walked with cursors.
+            //
+            // The whole-document walk is not skipped, only the tree build:
+            // `to_owned_with_cursor` doubles as a validity gate (#1755/
+            // #1953), and dropping it would make `path(.d)` start accepting
+            // documents it rejects today. `push_generic_truthiness_cursor_error`
+            // is that same traversal and validation with the `OwnedValue`
+            // construction removed, so error behaviour is unchanged while the
+            // allocation is not paid.
+            if let Some(root) = cursor.filter(|_| path_expr_is_cursor_navigable(path_expr)) {
+                if let Some(control) = push_generic_truthiness_cursor_error(&root, 0) {
+                    return match control {
+                        Control::Error(e) => GenericResult::Error(e),
+                        Control::Break(label) => GenericResult::Break(label),
+                        Control::Halt(code) => GenericResult::Halt(code),
+                    };
+                }
+                let mut out = Vec::new();
+                return match path_walk_generic::<S, V>(
+                    path_expr,
+                    &PathNode::At(root),
+                    &mut Vec::new(),
+                    &mut out,
+                ) {
+                    Ok(()) => owned_vec_to_generic_result(out),
+                    // Whatever resolved before the failure still stands:
+                    // jq's generator never un-emits an output it already
+                    // produced, so `path(.a.b, .c.d)` on `{"a":{"b":1},"c":1}`
+                    // emits `["a","b"]` and *then* errors. Discarding the
+                    // prefix here is what `builtin_path_on_owned`'s own doc
+                    // comment warns against, and the evaluator-parity and
+                    // golden suites both caught it.
+                    Err(e) => partial_generic(out, Control::Error(e)),
+                };
+            }
             let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
             if reindex_bridge_is_identity(&owned) {
                 return query_result_to_generic::<V>(crate::jq::eval::builtin_path_on_owned::<

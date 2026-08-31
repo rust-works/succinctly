@@ -19948,7 +19948,7 @@ fn numeric_slice_bound_key(v: &OwnedValue) -> Option<NumberKey> {
 /// `key` is [`Expr::index_number_key`]'s answer for the component being
 /// rendered: `None` is a plain [`Expr::Index`], whose own `idx` is the
 /// component.
-fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
+pub(crate) fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedValue {
     match key {
         None => OwnedValue::Int(idx),
         Some(NumberKey::Float(f)) => OwnedValue::Float(*f),
