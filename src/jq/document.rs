@@ -272,6 +272,35 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Whether this cursor's *document* declares any `*name` alias at all.
+    ///
+    /// A whole-document property, not a property of this node, and O(1) --
+    /// `YamlIndex::has_aliases` is an emptiness check on an already-built
+    /// map. `false` for formats with no alias concept (JSON), where it
+    /// monomorphizes away entirely.
+    ///
+    /// Needed by any builtin that *reorders, selects or drops* a document's
+    /// own nodes while keeping them cursor-backed (#1687: `sort`, `sort_by`,
+    /// `unique`, `unique_by`, `reverse`, `min`, `max`, `min_by`, `max_by`).
+    /// Re-emitting `&anchor`/`*alias` marks is only sound while every alias
+    /// still follows a declaration of the same name holding an equal value;
+    /// moving nodes around can break that, and `reverse` on `- &x {p: 1}` /
+    /// `- *x` demonstrably does -- it yields `- *x` / `- &x {p: 1}`, a
+    /// forward reference real yq rejects with `unknown anchor 'x'
+    /// referenced`. `enforce_anchor_soundness` (`yq_runner.rs`) exists to
+    /// prevent exactly that, but it is a DOM-path pass over a
+    /// `CommentTree`, and the cursor-streaming path has none to run it over
+    /// (#1350). So those builtins consult this instead and hand an
+    /// alias-bearing document to the DOM path unchanged, rather than
+    /// emitting YAML succinctly could not read back.
+    ///
+    /// Gating on aliases rather than anchors is deliberate: an unreferenced
+    /// `&x` is valid YAML wherever it lands, so a document with anchors but
+    /// no aliases can be reordered freely.
+    fn document_has_aliases(&self) -> bool {
+        false
+    }
+
     /// Get the explicit YAML tag at this node, if any (e.g. `"!!str"`).
     ///
     /// Returns `None` when the node has no explicit tag, and for formats

@@ -6150,6 +6150,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn document_has_aliases(&self) -> bool {
+        self.index.has_aliases()
+    }
+
+    #[inline]
     fn explicit_tag(&self) -> Option<&str> {
         YamlCursor::explicit_tag(self)
     }

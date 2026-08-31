@@ -34,7 +34,7 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
-    collect_pattern_var_names, eval as full_eval, eval_each_owned, expand_func_calls,
+    collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned, expand_func_calls,
     extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
@@ -44,7 +44,7 @@ use super::eval::{
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
-use super::value::{NumberRepr, OwnedValue};
+use super::value::{owned_value_eq, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
 
 /// Recursion-depth ceiling for [`to_owned`]/[`to_owned_cursor`]/
@@ -7910,6 +7910,140 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// jq's sort key for one element: `[f]`, the array of *every* output of the
+/// key filter, not just its first (#155).
+///
+/// The generic twin of `eval::eval_array_construction`'s use inside
+/// `builtin_min_by`/`sort_by`/`group_by`/`unique_by`. It deliberately does
+/// *not* route through this file's own `Expr::Array` arm, which additionally
+/// applies `yq_float_fidelity_fixup` -- that fixup exists to make a computed
+/// float *print* the way real yq prints it, and running it here would let an
+/// output-formatting rule change which element sorts first.
+///
+/// Atomic, matching `eval_array_construction`: any control from `f` -- error,
+/// break, halt, or the trailing control of a `Partial` -- discards the prefix
+/// and aborts the whole builtin, rather than keying the element on a partial
+/// array.
+fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
+    f: &Expr,
+    elem: &V::Cursor,
+    optional: bool,
+) -> Result<OwnedValue, Control> {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let result = eval_single::<S, V>(f, elem.value(), optional, Some(*elem));
+    match push_generic_owned_values(result, &mut out) {
+        Some(control) => Err(control),
+        None => Ok(OwnedValue::Array(out)),
+    }
+}
+
+/// Pair every element of `cursors` with its comparison key, keeping the
+/// cursor itself untouched.
+///
+/// `key` is `None` for the bare `sort`/`unique`/`min`/`max` spellings, which
+/// compare elements by their own decoded value; `Some(f)` for the `_by`
+/// forms, which compare by [`sort_key_generic`]. Either way the *element*
+/// stays a `V::Cursor` -- that is the whole point of #1687's fix for this
+/// family, since only a cursor can still name a duplicate mapping key.
+///
+/// The key is an `OwnedValue` in both cases and unavoidably so: `compare_values`
+/// has no cursor-domain equivalent, and a `_by` key is a computed value with no
+/// document position at all. So a duplicate key *inside a comparison key* is
+/// still collapsed -- exactly as it is in `eval.rs` today. Only the emitted
+/// element is lossless.
+fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
+    cursors: Vec<V::Cursor>,
+    key: Option<&Expr>,
+    optional: bool,
+) -> Result<Vec<(OwnedValue, V::Cursor)>, Control> {
+    let mut keyed = vec_with_capacity(cursors.len());
+    for cursor in cursors {
+        let k = match key {
+            Some(f) => sort_key_generic::<S, V>(f, &cursor, optional)?,
+            // #1755's rule, in this file's spelling: `to_owned_cursor` is
+            // already the checked conversion, so an undecodable element
+            // raises rather than silently sorting in as `""`.
+            None => to_owned_cursor(&cursor).map_err(Control::Error)?,
+        };
+        keyed.push((k, cursor));
+    }
+    Ok(keyed)
+}
+
+/// Whether the reordering builtins may keep this input's elements as
+/// cursors, or must hand the whole thing to the DOM path instead.
+///
+/// See [`DocumentCursor::document_has_aliases`] for the full reasoning: an
+/// alias is only sound while it still follows a declaration of the same name,
+/// and reordering, selecting or dropping nodes can break that. The DOM path's
+/// `enforce_anchor_soundness` is what normally prevents it, and the
+/// cursor-streaming path cannot reach that pass (#1350). So an alias-bearing
+/// document keeps exactly the behaviour it had before #1687 -- sound output,
+/// at the cost of the duplicate keys this fix would otherwise have saved --
+/// rather than gaining faithful marks it could not read back.
+///
+/// `cursor` is `None` when the array being reordered is itself a computed
+/// value with no document position; there are no marks to get wrong then.
+fn reordering_may_keep_cursors<V: DocumentValue>(cursor: Option<&V::Cursor>) -> bool {
+    !cursor.is_some_and(DocumentCursor::document_has_aliases)
+}
+
+/// Turn a `Control` raised while keying elements back into a `GenericResult`.
+///
+/// Every builtin in this family is atomic -- `eval.rs`'s own arms return
+/// bare `Error`/`Break`/`Halt` with no partial prefix -- so this never
+/// produces a `Partial`.
+fn sort_family_control<V: DocumentValue>(control: Control) -> GenericResult<V> {
+    match control {
+        Control::Error(e) => GenericResult::Error(e),
+        Control::Break(label) => GenericResult::Break(label),
+        Control::Halt(code) => GenericResult::Halt(code),
+    }
+}
+
+/// The shared body of `sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/
+/// `max`/`max_by`/`reverse` for the array case (#1687).
+///
+/// Only the array case: every one of those builtins gives a non-array input
+/// its own mode-specific error wording (`object_pair_type_error`'s jq pairing
+/// bug for `min_by`, `yq_only_arrays_supported_for` for `unique`,
+/// `cannot_be_sorted` for `sort`, and `scalar_fallback`'s decode-failure
+/// precedence in front of `optional` for all of them). Reproducing that here
+/// would be a second copy of a decision tree #929/#995/#1755/#1901 have each
+/// corrected once already, so the caller bridges a non-array input to
+/// `eval.rs` verbatim instead. This function is reached only once the input
+/// is known to be an array.
+///
+/// `reorder` receives the keyed elements and returns the elements the result
+/// should contain, in order. Returning `GenericResult::LazySeq` over those
+/// cursors -- rather than an `OwnedValue::Array` -- is what keeps a duplicate
+/// mapping key inside a moved element alive.
+fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
+    cursors: Vec<V::Cursor>,
+    key: Option<&Expr>,
+    optional: bool,
+    reorder: impl FnOnce(Vec<(OwnedValue, V::Cursor)>) -> Vec<V::Cursor>,
+) -> GenericResult<V> {
+    let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
+        Ok(keyed) => keyed,
+        Err(control) => return sort_family_control(control),
+    };
+    GenericResult::LazySeq(Box::new(LazySeq::from_cursors(reorder(keyed))))
+}
+
+/// `sort`/`sort_by`'s ordering step, shared with `unique`/`unique_by`, which
+/// jq defines as a sort followed by a dedup.
+///
+/// `sort_by` (not `sort_unstable_by`) on purpose: jq's sort is stable, so two
+/// elements with equal keys keep their input order. That is observable here
+/// in a way it is not in `eval.rs` -- there the tied elements have already
+/// been flattened to equal `OwnedValue`s, whereas the cursors this returns
+/// still point at distinct document positions that can print differently
+/// (two mappings with the same collapsed form but different duplicate keys).
+fn sort_keyed_elements<V: DocumentValue>(keyed: &mut [(OwnedValue, V::Cursor)]) {
+    keyed.sort_by(|(a, _), (b, _)| compare_values(a, b));
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -8561,12 +8695,27 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // #1687: `reverse` already held the element cursors in hand
+        // (`collect_cursors()`) and then threw them away, decoding each into
+        // an `IndexMap`-backed `OwnedValue` purely to hand back an
+        // `OwnedValue::Array`. Every duplicate mapping key inside a reversed
+        // element died there, even though reversing moves elements without
+        // computing a single new value. Returning the cursors as a `LazySeq`
+        // instead keeps them alive -- real yq preserves them (v4.53.3,
+        // `reverse | .[0]` on a duplicate-keyed mapping element).
         Builtin::Reverse => {
+            if !reordering_may_keep_cursors::<V>(cursor.as_ref()) {
+                return bridge_to_full_evaluator::<S, _>(
+                    &Expr::Builtin(builtin.clone()),
+                    value,
+                    cursor,
+                    optional,
+                );
+            }
             if let Some(elements) = value.as_array() {
-                let values: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(
-                    elements.collect_cursors().iter().rev()
-                ));
-                GenericResult::Owned(OwnedValue::Array(values))
+                let mut cursors = elements.collect_cursors();
+                cursors.reverse();
+                GenericResult::LazySeq(Box::new(LazySeq::from_cursors(cursors)))
             } else if optional {
                 GenericResult::None
             } else {
@@ -8574,6 +8723,104 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     tagged_type_name(&value, cursor),
                     "number",
                 ))
+            }
+        }
+
+        // #1687: `sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/`max`/
+        // `max_by` all answer a permutation or subset of their *input's own*
+        // elements, computing nothing new except the comparison keys -- so
+        // there is no reason for any of them to route through the `_` bridge
+        // below, which materializes the whole document into an `IndexMap`-
+        // backed `OwnedValue` first and collapses every duplicate mapping key
+        // in the process. Real yq preserves them (verified live against
+        // v4.53.3 for `sort`, `sort_by`, `unique`, `unique_by`, `min`, `max`
+        // and `reverse`; `min_by`/`max_by` are lexer-rejected there, so they
+        // follow their siblings and `keys`, which yq does implement and which
+        // preserves).
+        //
+        // Array inputs only, on purpose -- see `sort_family_array_generic`'s
+        // doc comment for why a non-array input bridges instead of growing a
+        // second copy of `eval.rs`'s per-builtin error wording.
+        Builtin::Sort | Builtin::SortBy(_) | Builtin::Unique | Builtin::UniqueBy(_) => {
+            let Some(elements) = value
+                .as_array()
+                .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
+            else {
+                return bridge_to_full_evaluator::<S, _>(
+                    &Expr::Builtin(builtin.clone()),
+                    value,
+                    cursor,
+                    optional,
+                );
+            };
+            let key = match builtin {
+                Builtin::SortBy(f) | Builtin::UniqueBy(f) => Some(&**f),
+                _ => None,
+            };
+            let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
+            sort_family_array_generic::<S, _>(
+                elements.collect_cursors(),
+                key,
+                optional,
+                |mut keyed| {
+                    sort_keyed_elements::<V>(&mut keyed);
+                    if dedup {
+                        // `owned_value_eq::<S>`, not `compare_values(..) ==
+                        // Equal`: the sort above stays widening, but two
+                        // elements only count as duplicates under `==`'s own
+                        // yq-mode strict Int/Float distinction (#950). Same
+                        // choice `eval::builtin_unique` makes, reused rather
+                        // than re-derived.
+                        keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
+                    }
+                    keyed.into_iter().map(|(_, cursor)| cursor).collect()
+                },
+            )
+        }
+
+        // The single-element half of the same family. `min`/`max` answer one
+        // of the input's own elements, so the winner is returned as a bare
+        // `OneCursor` -- the same shape `eval_first_or_last_generic` already
+        // uses to keep `first(.[])` lossless (#607).
+        Builtin::Min | Builtin::MinBy(_) | Builtin::Max | Builtin::MaxBy(_) => {
+            let Some(elements) = value
+                .as_array()
+                .filter(|_| reordering_may_keep_cursors::<V>(cursor.as_ref()))
+            else {
+                return bridge_to_full_evaluator::<S, _>(
+                    &Expr::Builtin(builtin.clone()),
+                    value,
+                    cursor,
+                    optional,
+                );
+            };
+            let cursors = elements.collect_cursors();
+            // jq answers `null` for an empty array, for all four spellings.
+            if cursors.is_empty() {
+                return GenericResult::Owned(OwnedValue::Null);
+            }
+            let key = match builtin {
+                Builtin::MinBy(f) | Builtin::MaxBy(f) => Some(&**f),
+                _ => None,
+            };
+            let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
+                Ok(keyed) => keyed,
+                Err(control) => return sort_family_control(control),
+            };
+            // `min_by`/`max_by` on ties: jq's own definitions keep the
+            // *first* minimum and the *last* maximum (`min_by` uses `<`,
+            // `max_by` uses `<=` internally), which is exactly what
+            // `Iterator::min_by`/`max_by` do. Reusing them rather than
+            // hand-rolling the comparison keeps that asymmetry from being
+            // re-derived and getting it backwards.
+            let winner = if matches!(builtin, Builtin::Min | Builtin::MinBy(_)) {
+                keyed.into_iter().min_by(|(a, _), (b, _)| compare_values(a, b))
+            } else {
+                keyed.into_iter().max_by(|(a, _), (b, _)| compare_values(a, b))
+            };
+            match winner {
+                Some((_, cursor)) => GenericResult::OneCursor(cursor),
+                None => unreachable!("the empty case returned above"),
             }
         }
 
