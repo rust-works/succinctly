@@ -34,12 +34,14 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
-    collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned, expand_func_calls,
+    collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned,
+    eval_foreach_with_values, eval_reduce_with_values, expand_func_calls,
     extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_in_array_bounds,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
     slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var, substitute_vars,
-    tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand, EvalError,
+    suppresses, tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand,
+    EvalError,
     EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
@@ -5066,6 +5068,83 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // instead of losing it to the wildcard fallback's whole-document
         // `to_owned()`, which collapses duplicate mapping keys before the
         // wrapped expression ever runs (#1168).
+        // #1687: `reduce`/`foreach` had no arm here at all, so every one of
+        // them bridged the whole document through an `IndexMap`-backed
+        // `OwnedValue` before `input` was evaluated -- collapsing duplicate
+        // mapping keys the *input generator itself* would have walked.
+        // `reduce (keys|.[]) as $k (0; .+1)` on `b: 1\na: 2\nb: 3\n`
+        // answered 2 where `[keys|.[]] | length` on the same document
+        // answers 3, an internal contradiction rather than merely a
+        // divergence. Evaluating `input`/INIT through the generic sink here
+        // fixes the count; the fold itself is then `eval.rs`'s, unchanged.
+        //
+        // See `stream_owned_outputs_generic` for what this does *not* fix:
+        // the accumulator and every bound `$x` stay `OwnedValue`, so a
+        // duplicate key inside a bound element still collapses at the bind.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } if !streams_unbounded(input) && !streams_unbounded(init) => {
+            let (input_values, input_control) =
+                stream_owned_outputs_generic::<S, V>(input, value.clone(), optional, cursor);
+            // `reduce`'s output is single-shot -- it emits only the final
+            // accumulator, never an intermediate -- so a control anywhere in
+            // the input stream discards the prefix and propagates alone.
+            // Mirrors `eval::eval_reduce`'s identical arms, `optional`
+            // suppression included (a decode failure is never suppressed,
+            // #1620/#1902, which `suppresses` already encodes).
+            if let Some(control) = input_control {
+                return match control {
+                    Control::Error(e) if suppresses(&e, optional) => GenericResult::None,
+                    Control::Error(e) => GenericResult::Error(e),
+                    Control::Break(label) => GenericResult::Break(label),
+                    Control::Halt(code) => GenericResult::Halt(code),
+                };
+            }
+            let (init_values, init_control) =
+                stream_owned_outputs_generic::<S, V>(init, value, optional, cursor);
+            query_result_to_generic::<V>(eval_reduce_with_values::<Vec<u64>, S>(
+                patterns,
+                update,
+                input_values,
+                init_values,
+                init_control,
+                optional,
+            ))
+        }
+
+        // `foreach`'s twin of the arm above, with `eval::eval_foreach`'s own
+        // difference preserved: unlike `reduce` it emits per step, so a
+        // `Partial` input stream's already-produced prefix is still iterated
+        // and `input_control` is carried alongside it rather than replacing
+        // it. `eval_foreach_with_values` owns that precedence (it folds
+        // `input_control` in ahead of INIT's), so it is passed through
+        // untouched here rather than re-decided.
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } if !streams_unbounded(input) && !streams_unbounded(init) => {
+            let (input_values, input_control) =
+                stream_owned_outputs_generic::<S, V>(input, value.clone(), optional, cursor);
+            let (init_values, init_control) =
+                stream_owned_outputs_generic::<S, V>(init, value, optional, cursor);
+            query_result_to_generic::<V>(eval_foreach_with_values::<Vec<u64>, S>(
+                patterns,
+                update,
+                extract.as_deref(),
+                input_values,
+                input_control,
+                init_values,
+                init_control,
+                optional,
+            ))
+        }
+
         Expr::Array(inner) => {
             let items: Vec<OwnedValue> = match eval_single::<S, _>(inner, value, optional, cursor)
                 .materialize_lazy()
@@ -6863,6 +6942,83 @@ fn limit_or_nth_uses_live_input_queue(n_expr: &Expr, expr: &Expr) -> bool {
 /// binding to completion before any demand could apply, writing `B` to
 /// stderr where jq writes nothing -- a divergence `each_limit_generic`'s own
 /// doc comment recorded as a residual and this closes.
+/// Materialize every output of `expr` through the *generic* evaluator,
+/// alongside whatever control terminated the stream.
+///
+/// The generic twin of `eval::stream_outputs_checked`, and the whole of
+/// #1687's `reduce`/`foreach` fix: those two constructs had no arm in this
+/// file at all, so every `reduce`/`foreach` query bridged the entire document
+/// into an `OwnedValue` before `input` was so much as looked at -- and
+/// `reduce (keys|.[]) as $k (0; .+1)` over `b: 1\na: 2\nb: 3\n` therefore
+/// counted 2 keys where `[keys|.[]]` on the same document correctly counts 3.
+/// Evaluating `input`/`INIT` here instead keeps the *stream* faithful.
+///
+/// **The elements are still owned, and that is a real limit, not an
+/// oversight.** `reduce`'s accumulator, and every `$x` a pattern binds, are
+/// `OwnedValue` throughout both evaluators -- `substitute_bound_var` takes
+/// `&OwnedValue`, and no duplicate-key-capable owned representation exists in
+/// this crate. So a duplicate mapping key inside an element that gets *bound*
+/// is still collapsed at the bind, exactly as it is in `eval.rs`. Only the
+/// number and order of the elements is recovered here. Recorded in
+/// `docs/compliance/yq/limitations.md`.
+/// Whether `expr` can produce an unbounded stream when pulled to exhaustion,
+/// and so must not be driven through [`stream_owned_outputs_generic`].
+///
+/// Only `repeat` qualifies today, and the reason is asymmetric on purpose.
+/// `Expr::Repeat`'s *eager* evaluation (`eval::eval_repeat`) stops after
+/// `MAX_ITERATIONS` rounds and raises `repeat: maximum iterations exceeded`;
+/// its *demand-driven* sink arm (`each_repeat_generic`, #2014) deliberately
+/// does not, because its whole purpose is to let a wrapping `limit`/`first`
+/// stop it at the source. Every other consumer of that sink stops; an eager
+/// one does not, so `reduce repeat(1) as $x (0; .+1)` would spin forever
+/// rather than raising the way `eval.rs`'s own `reduce` does.
+///
+/// `range(infinite)` needs no entry here -- it self-caps -- and `while`/
+/// `until` have no sink arm at all, so both reach `eval.rs`'s bounded
+/// evaluation regardless.
+///
+/// Consulted for *both* operands this file drives eagerly -- `input` and
+/// `INIT`. Guarding only `input` still hung on
+/// `reduce .[] as $x (repeat(1); .+$x)`: the guard's scope has to match every
+/// call site it protects, not just the one in the repro. UPDATE needs no
+/// guard, since `eval.rs`'s fold evaluates it.
+///
+/// Conservative in the safe direction: a false positive costs only the
+/// duplicate-key fidelity this arm adds, falling back to exactly the
+/// behaviour `reduce`/`foreach` had before #1687.
+fn streams_unbounded(expr: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::Repeat(_)))
+}
+
+fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let mut decode_err: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        match generic_item_into_owned(item) {
+            Ok(owned) => {
+                out.push(owned);
+                Demand::Continue
+            }
+            // The prefix already converted is kept, matching
+            // `stream_outputs_checked`'s `promote_borrowed_checked` arm.
+            Err(control) => {
+                decode_err = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+    let control = decode_err.or(match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    });
+    (out, control)
+}
+
 fn fanout_arg_each_generic<S: EvalSemantics, V: DocumentValue, B>(
     arg_expr: &Expr,
     value: V,
@@ -16674,4 +16830,101 @@ mod tests {
         }
         assert_eq!(value_err.message, cursor_err.message);
     }
+
+    /// #1687: the sort family's array-valued results (`sort`, `sort_by`,
+    /// `unique`, `unique_by`, `reverse`) answer a `LazySeq` over the
+    /// reordered element cursors rather than a materialized
+    /// `OwnedValue::Array`. That shape is what carries a duplicate mapping
+    /// key through, so it is worth pinning directly.
+    ///
+    /// **The duplicate keys themselves are not observable on a JSON index**,
+    /// and deliberately so: only `YamlCursor` overrides
+    /// `DocumentCursor::supports_sequence_streaming`, so
+    /// `sequence_streamable_cursors` returns `None` for JSON and
+    /// `stream_json`'s `LazySeq` arm falls back to `lazy_elem_to_owned` --
+    /// an `IndexMap`. That is pre-existing and shared with `map(.)`, which
+    /// has answered a `LazySeq` since #724/#725; it is why plain jq mode
+    /// still collapses here (correct, per #1385) and why even
+    /// `--preserve-input` does. The preservation this arm buys is pinned on
+    /// the YAML path instead, by
+    /// `test_sort_family_preserves_duplicate_keys_in_moved_elements_1687`
+    /// in `tests/yq_cli_tests.rs`.
+    #[test]
+    fn test_sort_family_streams_reordered_cursors_1687() {
+        let json = br#"[{"b":2,"b":9},{"a":1,"a":8}]"#;
+        let index = JsonIndex::build(json);
+
+        for (filter, want) in [
+            // Ordering is the observable half here: jq's total order puts an
+            // object keyed `a` before one keyed `b`.
+            ("sort_by(.a)", r#"[{"b":9},{"a":8}]"#),
+            ("reverse", r#"[{"a":8},{"b":9}]"#),
+            ("unique_by(.a)", r#"[{"b":9},{"a":8}]"#),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_with_cursor(&expr, index.root(json));
+            assert!(
+                matches!(result, GenericResult::LazySeq(_)),
+                "{filter} should answer a LazySeq, not a materialized array"
+            );
+            let mut out = String::new();
+            result
+                .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+                .unwrap();
+            assert_eq!(out, want, "{filter}");
+        }
+    }
+
+    /// #1687: `min`/`max`/`min_by`/`max_by` select one of the input's own
+    /// elements, so the winner is returned as a bare `OneCursor` -- the same
+    /// shape `first(.[])` uses (#607).
+    #[test]
+    fn test_min_max_family_returns_the_winning_cursor_1687() {
+        let json = br#"[{"a":2,"a":9},{"a":1,"a":8}]"#;
+        let index = JsonIndex::build(json);
+
+        for (filter, want) in [
+            ("min_by(.a)", r#"{"a":1,"a":8}"#),
+            ("max_by(.a)", r#"{"a":2,"a":9}"#),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let result = eval_with_cursor(&expr, index.root(json));
+            assert!(result.is_single_cursor(), "{filter}");
+            let mut out = String::new();
+            result
+                .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+                .unwrap();
+            assert_eq!(out, want, "{filter}");
+        }
+    }
+
+    /// #1687: `limit`/`nth` had no unit-level coverage at all -- #1607/#1686
+    /// pinned them only through the CLI. A single-valued `n` must keep the
+    /// batch cursor-backed (`ManyCursor`), which is what preserves a
+    /// duplicate key *inside* a captured element, and the generator-`n` path
+    /// added here must not lose that.
+    #[test]
+    fn test_limit_keeps_captured_elements_cursor_backed_1687() {
+        let json = br#"[{"a":1,"a":2},{"b":3,"b":4},{"c":5}]"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse("limit(2; .[])").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert!(
+            matches!(result, GenericResult::ManyCursor(_)),
+            "a single-valued n must not flatten the batch"
+        );
+        let mut out = String::new();
+        result
+            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .unwrap();
+        assert_eq!(out, r#"{"a":1,"a":2}{"b":3,"b":4}"#);
+
+        // Generator `n`: outer loop over n, inner over `.[]`, so n=1 keeps
+        // one element and n=2 keeps two.
+        let expr = crate::jq::parse("[limit((1,2); .[])] | length").unwrap();
+        let result = eval_with_cursor(&expr, index.root(json));
+        assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
+    }
+
 }

@@ -2567,7 +2567,7 @@ fn eval_owned_expr_fork<S: EvalSemantics>(
 /// fixing five more `eval_reduce`/`eval_foreach` arms that had the same
 /// drift); one shared predicate is the actual fix for a bug class that
 /// otherwise recurs every time a new match arm needs the same check.
-fn suppresses(e: &EvalError, optional: bool) -> bool {
+pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
     optional && !e.is_decode_failure()
 }
 
@@ -2584,7 +2584,7 @@ fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// jq's own `recurse` having no internal optional-suppression concept).
 /// That's a principled exemption, not an oversight -- don't "complete the
 /// sweep" by wiring it in there without re-reading that reasoning first.
-fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> {
+pub(crate) fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> {
     if suppresses(&e, optional) {
         QueryResult::None
     } else {
@@ -26314,7 +26314,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluation by either caller -- it runs against the accumulator, a
 /// synthetic value with no real document position, so `key` there already
 /// answers `null` correctly without needing to change (#1765's own scoping).
-fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+pub(crate) fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     update: &Expr,
     input_values: Vec<OwnedValue>,
@@ -27044,7 +27044,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                      // separately, since it can outlive `input_values` being consumed (#534
                                      // follow-up); collapsing the two into one shared field would lose that
                                      // distinction, not just shorten the signature.
-fn eval_foreach_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+pub(crate) fn eval_foreach_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     update: &Expr,
     extract: Option<&Expr>,
