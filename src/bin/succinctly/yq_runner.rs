@@ -167,7 +167,6 @@ struct PendingSeparator<'a> {
 struct NulCheckedSink<'a, W: Write> {
     writer: &'a mut W,
     buf: String,
-    terminator: Terminator,
     nul_detected: &'a Cell<bool>,
     separator: Option<PendingSeparator<'a>>,
 }
@@ -190,11 +189,24 @@ impl<W: Write> NulCheckedSink<'_, W> {
         }
         if let Some(sep) = &mut self.separator {
             if !sep.settled {
-                if *sep.doc_streamed && !sep.no_doc {
-                    write_doc_separator_marker(self.writer, self.terminator)
-                        .map_err(|_| core::fmt::Error)?;
-                }
-                *sep.doc_streamed = true;
+                // Reuses the same guard/write/set-flag logic every other
+                // terminator mode's separator goes through, rather than
+                // hand-duplicating it here (#1709 code review) -- `true`
+                // for `will_output` since reaching this point already
+                // means this result survived the NUL check above.
+                // `Terminator::Nul` is a literal, not `self.terminator`:
+                // this sink is only ever constructed for that terminator
+                // (see its one call site in `stream_maybe_colored`), so a
+                // stored field would just be a second name for the same
+                // constant.
+                emit_yaml_doc_separator(
+                    self.writer,
+                    sep.doc_streamed,
+                    true,
+                    sep.no_doc,
+                    Terminator::Nul,
+                )
+                .map_err(|_| core::fmt::Error)?;
                 sep.settled = true;
             }
         }
@@ -408,6 +420,22 @@ fn stream_maybe_colored<W: Write, T>(
         if terminator == Terminator::Nul && separator.is_some() && buf.as_bytes().contains(&0) {
             return Err(anyhow::anyhow!(NUL_OUTPUT_ERROR_MESSAGE));
         }
+        // #1709: `separator` is only ever `Some` for a NUL-checked YAML
+        // call site (its caller skipped its own eager
+        // `emit_yaml_doc_separator` call for exactly this reason -- see
+        // the `NulChecked` branch below), and the NUL scan just above
+        // already gates reaching this point on "the document's own
+        // content survived." Write the separator now, directly to
+        // `writer` -- never colorized, matching every other call site's
+        // own separator write -- before the colorized body. A no-op for
+        // every other `use_color` call (terminator != Nul, or JSON, both
+        // of which pass `None`).
+        if let Some(sep) = separator {
+            if *sep.doc_streamed && !sep.no_doc {
+                write_doc_separator_marker(writer, terminator)?;
+            }
+            *sep.doc_streamed = true;
+        }
         write!(writer, "{}", colorize(&buf, &boundaries))?;
         match rendered {
             Ok(value) => Ok(Ok(value)),
@@ -419,7 +447,6 @@ fn stream_maybe_colored<W: Write, T>(
         let sink_state = NulCheckedSink {
             writer,
             buf: String::new(),
-            terminator,
             nul_detected: &nul_detected,
             separator: separator.map(|s| PendingSeparator {
                 doc_streamed: s.doc_streamed,
@@ -438,7 +465,18 @@ fn stream_maybe_colored<W: Write, T>(
         // terminator`, unlike the evaluated multi-result path, whose own
         // `on_value` calls already drained the buffer via `flush_result`
         // before `render` ever returns. A no-op there.
-        let rendered = if rendered.is_ok() && !sink_state.buf.is_empty() {
+        //
+        // Flushed even on a `StreamFailure::Decode` (#1709 code review):
+        // whatever rendered into the buffer before a mid-stream decode
+        // failure is still real, already-checked content, and this file's
+        // own established keep-the-prefix-and-diagnose trade (#1641/#1679,
+        // this function's own doc comment above) says to write it rather
+        // than silently drop it -- the `Buffered`/color arm above already
+        // does this unconditionally. Only a genuine write failure
+        // (`StreamFailure::Fmt`) means the underlying writer itself is
+        // already broken, with nothing left to safely flush.
+        let rendered = if !matches!(rendered, Err(StreamFailure::Fmt)) && !sink_state.buf.is_empty()
+        {
             match sink_state.flush_body() {
                 Ok(()) => rendered,
                 Err(e) => Err(StreamFailure::from(e)),
@@ -1824,7 +1862,7 @@ fn write_split_result(
     let mut buf = Vec::new();
     let mut no_color_config = output_config.clone();
     no_color_config.use_color = false;
-    output_value(&mut buf, result, comments, &no_color_config)?;
+    output_value(&mut buf, result, comments, &no_color_config, None)?;
 
     std::fs::write(&filename, &buf)
         .with_context(|| format!("failed to write --split-exp output file: {filename}"))
@@ -2498,16 +2536,42 @@ fn reject_nul_output(rendered: &str, config: &OutputConfig) -> Result<()> {
     Ok(())
 }
 
+/// Writes a pending `---` document separator, once its caller's own
+/// [`reject_nul_output`] check has already passed (#1709 code review):
+/// every `output_value` call site that precedes it with an eager
+/// `write_doc_separator_marker` call has the identical bug the M2 path's
+/// own `PendingSeparator` was built to close -- a document whose first
+/// result fails the NUL check still leaves its separator already on the
+/// writer. `None` for a call site with no separator concept of its own
+/// (most of `output_value`'s callers -- `-n`, `--raw-input`, `--slurp`,
+/// `--split-exp`, ...), matching `DocSeparatorArgs`'s own YAML-only use in
+/// `stream_maybe_colored`.
+fn write_pending_separator<W: Write>(
+    writer: &mut W,
+    separator: Option<DocSeparatorArgs<'_>>,
+    terminator: Terminator,
+) -> Result<()> {
+    if let Some(sep) = separator {
+        if *sep.doc_streamed && !sep.no_doc {
+            write_doc_separator_marker(writer, terminator)?;
+        }
+        *sep.doc_streamed = true;
+    }
+    Ok(())
+}
+
 fn output_value<W: Write>(
     writer: &mut W,
     value: &OwnedValue,
     comments: &CommentTree,
     config: &OutputConfig,
+    separator: Option<DocSeparatorArgs<'_>>,
 ) -> Result<()> {
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
             reject_nul_output(s, config)?;
+            write_pending_separator(writer, separator, terminator_from_config(config))?;
             write!(writer, "{s}")?;
             write_terminator(writer, config)?;
             return Ok(());
@@ -2592,6 +2656,7 @@ fn output_value<W: Write>(
             body
         };
         reject_nul_output(&output, config)?;
+        write_pending_separator(writer, separator, terminator_from_config(config))?;
         if config.use_color {
             // No boundary recorded here -- `write_terminator` below writes
             // directly to `writer`, outside this buffer (#1708).
@@ -2630,6 +2695,7 @@ fn output_value<W: Write>(
     );
 
     reject_nul_output(&json_str, config)?;
+    write_pending_separator(writer, separator, terminator_from_config(config))?;
     if config.use_color {
         write!(
             writer,
@@ -4761,17 +4827,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
 
         let mut split_doc_state = SplitDocState::new(has_split_doc);
         for (i, result) in results.iter().enumerate() {
+            let wants_doc_separator = !has_split_doc
+                && output_config.output_format == OutputFormat::Yaml
+                && !output_config.no_doc
+                && results.len() > 1;
             if has_split_doc {
                 // The filter explicitly marks its outputs as separate
                 // documents (`split_doc`); route through the same state
                 // machine every other output path uses for that, or no
                 // separator is ever written here at all.
                 split_doc_state.write_separator(&mut writer, &output_config)?;
-            } else if output_config.output_format == OutputFormat::Yaml
-                && !output_config.no_doc
-                && results.len() > 1
-                && i > 0
-            {
+            } else if wants_doc_separator && i > 0 && !output_config.nul_output {
                 // `---` BETWEEN results (not before the first) -- deliberately
                 // different from --slurp's no-separator convention, since
                 // eval-all is explicitly a multi-document-stream feature (#715).
@@ -4780,10 +4846,30 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // (#1701 code review): the previous result's own
                 // `write_terminator` call (inside `output_value` below)
                 // might have written `\0`/nothing rather than `\n`.
+                //
+                // Skipped under `-0` (#1709 code review): a NUL-checked
+                // result can still fail `output_value`'s own check, and
+                // writing this eagerly would leave a stray `---` for a
+                // document whose own content never made it out -- same bug
+                // class the M2 streaming path's `PendingSeparator` exists
+                // to close. `output_value` writes it lazily instead, below,
+                // once its own check has passed.
                 write_doc_separator_marker(&mut writer, terminator_from_config(&output_config))?;
             }
             any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
-            output_value(&mut writer, result, &CommentTree::empty(), &output_config)?;
+            let mut doc_streamed = i > 0;
+            let separator =
+                (wants_doc_separator && output_config.nul_output).then_some(DocSeparatorArgs {
+                    doc_streamed: &mut doc_streamed,
+                    no_doc: output_config.no_doc,
+                });
+            output_value(
+                &mut writer,
+                result,
+                &CommentTree::empty(),
+                &output_config,
+                separator,
+            )?;
         }
     } else if let Some(split_expr) = split_expr.as_ref() {
         // Handle --split-exp: write each result to its own file (named by
@@ -4924,7 +5010,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         for result in results {
             split_doc_state.write_separator(&mut writer, &output_config)?;
             any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-            output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+            output_value(
+                &mut writer,
+                &result,
+                &CommentTree::empty(),
+                &output_config,
+                None,
+            )?;
         }
     } else if args.raw_input {
         // Handle --raw-input: read each line as a string instead of
@@ -4954,7 +5046,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+                output_value(
+                    &mut writer,
+                    &result,
+                    &CommentTree::empty(),
+                    &output_config,
+                    None,
+                )?;
             }
         } else {
             // Without --slurp, process each line independently
@@ -4964,7 +5062,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 for result in results {
                     split_doc_state.write_separator(&mut writer, &output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+                    output_value(
+                        &mut writer,
+                        &result,
+                        &CommentTree::empty(),
+                        &output_config,
+                        None,
+                    )?;
                 }
                 // halt/halt_error (#791) outranks evaluating any further lines.
                 if sink.halted().is_some() {
@@ -5158,7 +5262,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             for result in results {
                 split_doc_state.write_separator(&mut writer, &output_config)?;
                 any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                output_value(&mut writer, &result, &CommentTree::empty(), &output_config)?;
+                output_value(
+                    &mut writer,
+                    &result,
+                    &CommentTree::empty(),
+                    &output_config,
+                    None,
+                )?;
             }
         }
     } else if args.inplace {
@@ -5425,14 +5535,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // eagerly left a dangling `---` whenever a doc
                         // produced zero output, whether from an ordinary
                         // empty filter or from a halt partway through (#791).
-                        if !doc_had_output
+                        let wants_doc_separator = !doc_had_output
                             && !has_split_doc
                             && output_config.output_format == OutputFormat::Yaml
                             && !output_config.no_doc
                             && is_multi_doc
                             && front_matter_body.is_none()
-                            && any_doc_output_this_file
-                        {
+                            && any_doc_output_this_file;
+                        // #1709 code review: deferred to `output_value`
+                        // itself under `-0`, same reason as the `--eval-all`
+                        // arm above -- an eager write here can't yet know
+                        // whether this document's own first result will
+                        // survive `output_value`'s NUL check.
+                        let defer_to_nul_check = wants_doc_separator && output_config.nul_output;
+                        if wants_doc_separator && !output_config.nul_output {
                             // #1701 code review: same fix as
                             // `emit_yaml_doc_separator` -- the previous
                             // document's own terminator might not have been
@@ -5442,17 +5558,27 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 terminator_from_config(&output_config),
                             )?;
                         }
-                        doc_had_output = true;
-                        any_doc_output_this_file = true;
+                        if !defer_to_nul_check {
+                            doc_had_output = true;
+                            any_doc_output_this_file = true;
+                        }
                         split_doc_state.write_separator(&mut buf_writer, &output_config)?;
                         any_truthy |=
                             !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
+                        let separator = defer_to_nul_check.then_some(DocSeparatorArgs {
+                            doc_streamed: &mut any_doc_output_this_file,
+                            no_doc: output_config.no_doc,
+                        });
                         output_value(
                             &mut buf_writer,
                             &result,
                             &CommentTree::empty(),
                             &output_config,
+                            separator,
                         )?;
+                        if defer_to_nul_check {
+                            doc_had_output = true;
+                        }
                         any_real_output = true;
                     }
                     // halt/halt_error (#791): still write this file's buffer
@@ -5664,13 +5790,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // YAML document immediately after a JSON one would
                 // wrongly get a leading separator, while the same YAML
                 // document appearing first would not.
-                if !has_split_doc
+                let wants_doc_separator = !has_split_doc
                     && file_output_config.output_format == OutputFormat::Yaml
                     && !output_config.no_doc
                     && is_multi_doc
                     && front_matter_body.is_none()
-                    && any_yaml_doc_output
-                {
+                    && any_yaml_doc_output;
+                // #1709 code review: deferred to `output_value` itself
+                // under `-0`, same reason as the `--eval-all`/`--inplace`
+                // arms above -- an eager write here can't yet know whether
+                // this document's own first result will survive
+                // `output_value`'s NUL check.
+                let defer_to_nul_check = wants_doc_separator && file_output_config.nul_output;
+                if wants_doc_separator && !file_output_config.nul_output {
                     // #1701 code review: same fix as
                     // `emit_yaml_doc_separator` -- the previous document's
                     // own terminator might not have been `\n`.
@@ -5679,13 +5811,32 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         terminator_from_config(&file_output_config),
                     )?;
                 }
-                if file_output_config.output_format == OutputFormat::Yaml {
+                if file_output_config.output_format == OutputFormat::Yaml && !defer_to_nul_check {
                     any_yaml_doc_output = true;
                 }
+                // Only the first result of this document gets a chance at
+                // the deferred separator -- `defer_to_nul_check` alone is
+                // constant across every result in `results`, so without
+                // this, `output_value`'s own successful flush of result 1
+                // would flip `any_yaml_doc_output` true in time for result
+                // 2's own (unwanted) separator check to fire on it too.
+                let mut first_result_in_doc = true;
                 for (result, comments) in results {
                     split_doc_state.write_separator(&mut writer, &file_output_config)?;
                     any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
-                    output_value(&mut writer, &result, &comments, &file_output_config)?;
+                    let separator =
+                        (defer_to_nul_check && first_result_in_doc).then_some(DocSeparatorArgs {
+                            doc_streamed: &mut any_yaml_doc_output,
+                            no_doc: output_config.no_doc,
+                        });
+                    output_value(
+                        &mut writer,
+                        &result,
+                        &comments,
+                        &file_output_config,
+                        separator,
+                    )?;
+                    first_result_in_doc = false;
                     any_output_this_file = true;
                 }
             }
