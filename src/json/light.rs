@@ -1496,7 +1496,52 @@ impl<'a> JsonString<'a> {
 ///
 /// Handles: \\, \", \/, \b, \f, \n, \r, \t, and \uXXXX (including surrogate pairs)
 fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
-    let mut result = String::with_capacity(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len());
+    decode_escapes_into::<true>(bytes, &mut out)?;
+    // Unreachable in practice: with `VALIDATE_UTF8 = true` every literal
+    // chunk was already checked and every escape contributes a `char`'s own
+    // encoding, so the concatenation is valid UTF-8 by construction (a `\`
+    // is ASCII and so can never split a multi-byte sequence). Mapped rather
+    // than `expect`ed to keep this path panic-free regardless.
+    String::from_utf8(out).map_err(|_| JsonError::InvalidUtf8)
+}
+
+/// The shared core of [`decode_escapes`], writing *bytes* rather than a
+/// `String` so a caller holding text that is not (yet) valid UTF-8 can still
+/// use it.
+///
+/// `VALIDATE_UTF8` selects between the two callers' differing needs, without
+/// a second copy of this escape table -- three independent copies of one
+/// predicate is the drift trap #106 records:
+///
+/// - `true` ([`decode_escapes`], the hot `as_str` path): a literal run that
+///   is not valid UTF-8 fails immediately with [`JsonError::InvalidUtf8`],
+///   exactly where it did when this loop pushed `&str` chunks into a
+///   `String`. Preserving the *position* of that check, rather than deferring
+///   it to one `String::from_utf8` at the end, keeps the reported error kind
+///   unchanged for a string carrying both a bad literal byte and a later bad
+///   escape.
+/// - `false` (`jq::utf8_document`'s per-string repair, #1743): invalid bytes
+///   pass through verbatim, because reproducing jq's own substitution timing
+///   requires running the substitution over the *decoded* bytes -- jq
+///   substitutes inside `jv_string_sized`, after its lexer has decoded the
+///   escapes, not over the raw source span.
+///
+/// The escape errors themselves are reported identically under both, so a
+/// string the `false` caller cannot decode is exactly one the parser will
+/// reject anyway.
+pub(crate) fn decode_escapes_into<const VALIDATE_UTF8: bool>(
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), JsonError> {
+    /// Append `c`'s UTF-8 encoding. `char::encode_utf8` needs a scratch
+    /// buffer; `String::push`'s own byte-level equivalent is not public.
+    fn push_char(out: &mut Vec<u8>, c: char) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
+
+    let result = &mut *out;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -1506,14 +1551,14 @@ fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
             }
             i += 1;
             match bytes[i] {
-                b'"' => result.push('"'),
-                b'\\' => result.push('\\'),
-                b'/' => result.push('/'),
-                b'b' => result.push('\u{0008}'), // backspace
-                b'f' => result.push('\u{000C}'), // form feed
-                b'n' => result.push('\n'),
-                b'r' => result.push('\r'),
-                b't' => result.push('\t'),
+                b'"' => result.push(b'"'),
+                b'\\' => result.push(b'\\'),
+                b'/' => result.push(b'/'),
+                b'b' => result.push(0x08), // backspace
+                b'f' => result.push(0x0C), // form feed
+                b'n' => result.push(b'\n'),
+                b'r' => result.push(b'\r'),
+                b't' => result.push(b'\t'),
                 b'u' => {
                     // Unicode escape: \uXXXX
                     if i + 4 >= bytes.len() {
@@ -1535,7 +1580,7 @@ fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
                                     + ((codepoint as u32 - 0xD800) << 10)
                                     + (low as u32 - 0xDC00);
                                 if let Some(c) = char::from_u32(cp) {
-                                    result.push(c);
+                                    push_char(result, c);
                                     i += 6; // Skip \uXXXX for low surrogate
                                 } else {
                                     return Err(JsonError::InvalidUnicodeEscape);
@@ -1552,7 +1597,7 @@ fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
                     } else {
                         // Regular BMP character
                         if let Some(c) = char::from_u32(codepoint as u32) {
-                            result.push(c);
+                            push_char(result, c);
                         } else {
                             return Err(JsonError::InvalidUnicodeEscape);
                         }
@@ -1567,13 +1612,15 @@ fn decode_escapes(bytes: &[u8]) -> Result<String, JsonError> {
             while i < bytes.len() && bytes[i] != b'\\' {
                 i += 1;
             }
-            let chunk =
-                core::str::from_utf8(&bytes[start..i]).map_err(|_| JsonError::InvalidUtf8)?;
-            result.push_str(chunk);
+            let chunk = &bytes[start..i];
+            if VALIDATE_UTF8 && core::str::from_utf8(chunk).is_err() {
+                return Err(JsonError::InvalidUtf8);
+            }
+            result.extend_from_slice(chunk);
         }
     }
 
-    Ok(result)
+    Ok(())
 }
 
 /// Parse 4 hex digits into a u16.

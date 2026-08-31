@@ -26108,32 +26108,120 @@ fn test_utf8_never_valid_lead_stays_one_fffd_per_byte_1617() -> Result<()> {
     Ok(())
 }
 
-/// #1717's fix reaches `@base64d`/`@urid` (#1719, see `yq_cli_tests.rs`'s
-/// own `test_jq_base64d_drops_*_1717` tests) but *not* this whole-document
-/// decode path (`utf8_lossy_document`) -- real jq's own trigger is scoped
-/// to each JSON string's own closing quote, but `utf8_lossy_document`
-/// substitutes the entire file's bytes in one pass before JSON structure
-/// is even parsed, so "last byte of the whole file" essentially never
-/// coincides with jq's actual trigger point. Pins the CURRENT (still
-/// divergent from jq) behavior as a deliberate regression guard, not a
-/// target to match -- see docs/compliance/jq/limitations.md's "fixed at
-/// function granularity, open at document granularity" section and #1743,
-/// which tracks closing this specific gap.
+/// #1743: #1717's end-of-buffer drop quirk now fires where real jq fires
+/// it -- at each JSON *string*'s own end, not the whole file's. This test
+/// previously pinned the divergence (`"\u{fffd}A"`) as a known gap; it now
+/// pins the match.
+///
+/// The 'A' is dropped even though the document plainly continues past it,
+/// because `substitute_invalid_utf8_jq_document` scopes the substitution
+/// per string the way jq's lexer does before calling `jv_string_sized`.
+/// Both the lazy and the non-lazy (`-S`) document routes are checked: they
+/// substitute at two separate call sites and would otherwise be free to
+/// drift apart.
 #[test]
-fn test_invalid_utf8_document_drop_quirk_still_diverges_from_jq_1717() -> Result<()> {
+fn test_invalid_utf8_document_drop_quirk_matches_jq_1743() -> Result<()> {
     let mut file = NamedTempFile::new()?;
-    file.write_all(b"{\"a\":\"\xe1\x41\"}")?;
+    // Content after the corrupt string, so a whole-file scope provably
+    // cannot be what produced the drop.
+    file.write_all(b"{\"a\":\"\xe1\x41\",\"b\":[1,2,3],\"c\":\"more\"}")?;
     file.flush()?;
     let path = file.path().to_str().unwrap();
 
     // Real jq 1.7.1 drops the 'A' entirely (confirmed live): `"\u{fffd}"`.
-    // succinctly keeps it -- `utf8_lossy_document` substitutes the whole
-    // file, and 'A' is not that whole file's own last byte (the closing
-    // `"}"` still follows it), so #1717's fix never activates here.
     let (stdout, stderr, code) =
         run_jq_full(&["-c", ".a", path], None).unwrap_or_else(|e| panic!("failed to run: {e}"));
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout.trim(), "\"\u{fffd}A\"");
+    assert_eq!(stdout.trim(), "\"\u{fffd}\"");
+
+    // `-S` forces the non-lazy path, whose substitution lives in
+    // `get_inputs` rather than `utf8_lossy_document`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-S", ".", path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "{\"a\":\"\u{fffd}\",\"b\":[1,2,3],\"c\":\"more\"}"
+    );
+    Ok(())
+}
+
+/// #1743: jq substitutes inside `jv_string_sized`, i.e. over the string's
+/// *escape-decoded* bytes, so an escape -- always shorter decoded than
+/// spelled -- can push a lead byte over the `len - pos < seq_len` line that
+/// its raw source span would clear.
+///
+/// `"\xe1A"` is seven raw bytes but two decoded, one short of the three
+/// the `0xE1` lead declares, so real jq collapses it to a bare U+FFFD and
+/// drops the `A` (confirmed live against jq 1.7.1). A repair scoped to the
+/// raw span would keep the `A`; this is the case that forces the decode.
+#[test]
+fn test_invalid_utf8_substitution_scoped_to_decoded_string_1743() -> Result<()> {
+    for (body, expected, label) in [
+        (&b"\xe1\\u0041"[..], "\u{fffd}", "3-byte lead, \\u escape"),
+        (
+            &b"\xf0\x90\\u0041"[..],
+            "\u{fffd}",
+            "4-byte lead, \\u escape",
+        ),
+        (&b"\xe1\\n"[..], "\u{fffd}", "3-byte lead, short escape"),
+        // Same document without the escape: two raw bytes still present
+        // after the lead, so nothing collapses and the 'A' survives.
+        (&b"\xe1\x41x"[..], "\u{fffd}Ax", "enough headroom, kept"),
+    ] {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(b"{\"a\":\"")?;
+        file.write_all(body)?;
+        file.write_all(b"\",\"z\":1}")?;
+        file.flush()?;
+        let path = file.path().to_str().unwrap();
+
+        let (stdout, stderr, code) = run_jq_full(&["-c", ".a", path], None)
+            .unwrap_or_else(|e| panic!("{label}: failed to run: {e}"));
+        assert_eq!(code, 0, "{label}: stderr: {stderr}");
+        assert_eq!(stdout.trim(), format!("\"{expected}\""), "{label}");
+    }
+    Ok(())
+}
+
+/// #1743: every JSON-shaped input route gets the per-string scope, not just
+/// the plain document one -- `--slurp` and `--seq` reach the substitution
+/// through `get_inputs`' own branch, and each was verified against jq 1.7.1
+/// separately. Object keys go through the same lexer path in jq, so they
+/// collapse too.
+#[test]
+fn test_invalid_utf8_per_string_scope_across_json_input_modes_1743() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"{\"a\":\"\xe1\x41\"} {\"b\":\"\xe1\x41\"}")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    // `jq -s -c .` => [{"a":"<fffd>"},{"b":"<fffd>"}]
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-s", ".", path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "[{\"a\":\"\u{fffd}\"},{\"b\":\"\u{fffd}\"}]");
+
+    // `--seq` input is still JSON text, just RS-separated -- the gate is
+    // deliberately wider than `json_input_mode`, which excludes it.
+    let mut seq_file = NamedTempFile::new()?;
+    seq_file.write_all(b"\x1e{\"a\":\"\xe1\x41\"}\n")?;
+    seq_file.flush()?;
+    let seq_path = seq_file.path().to_str().unwrap();
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--seq", ".", seq_path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("{\"a\":\"\u{fffd}\"}"), "--seq: {stdout:?}");
+
+    // Keys, not just values.
+    let mut key_file = NamedTempFile::new()?;
+    key_file.write_all(b"{\"\xe1\x41\":1,\"b\":2}")?;
+    key_file.flush()?;
+    let key_path = key_file.path().to_str().unwrap();
+    let (stdout, stderr, code) = run_jq_full(&["-c", "keys", key_path], None)
+        .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "[\"b\",\"\u{fffd}\"]");
     Ok(())
 }
 
@@ -26225,6 +26313,31 @@ fn test_raw_input_slurp_still_whole_buffer_substitution_1742() -> Result<()> {
         run_jq_full(&["-R", "-s", "-c", ".", path], None).unwrap_or_else(|e| panic!("failed: {e}"));
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout.trim(), "\"a\u{fffd}A\\nsecond\\nthird\\n\"");
+    Ok(())
+}
+
+/// #1743's per-JSON-string scope must not reach DSV input. DSV is not JSON:
+/// its fields are quoted with `""` doubling, not backslash escaping, so a
+/// JSON string scanner would mis-segment the document -- and there is no
+/// oracle to match anyway, since neither jq nor yq reads DSV. Whole-buffer
+/// substitution (the behaviour before #1743) is what this route keeps.
+///
+/// The `A` surviving is the tell: under the per-string scope it would be
+/// dropped, since it ends the field.
+#[test]
+fn test_input_dsv_keeps_whole_buffer_substitution_1743() -> Result<()> {
+    let mut file = NamedTempFile::new()?;
+    file.write_all(b"n,v\na\xe1\x41,1\n")?;
+    file.flush()?;
+    let path = file.path().to_str().unwrap();
+
+    let (stdout, stderr, code) = run_jq_full(&["--input-dsv", ",", "-c", ".", path], None)
+        .unwrap_or_else(|e| panic!("failed: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        ["[\"n\",\"v\"]", "[\"a\u{fffd}A\",\"1\"]"]
+    );
     Ok(())
 }
 
