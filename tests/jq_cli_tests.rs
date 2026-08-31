@@ -1260,7 +1260,9 @@ fn test_seq_accepts_lone_low_surrogate_2012() -> Result<()> {
 
 /// #2012 (code review): the composed leading-zero + low-surrogate case
 /// must be accepted through `--seq` too, matching `--argjson`'s own
-/// composed-fix regression guard.
+/// composed-fix regression guard. Confirmed live against the pinned
+/// oracle: `printf '\x1e[007,"\udc00"]\n' | jq --seq -c '.'` =>
+/// `[7,"�"]`, exit 0.
 #[test]
 fn test_seq_composes_leading_zero_and_low_surrogate_fixes_2012() -> Result<()> {
     let (stdout, stderr, code) =

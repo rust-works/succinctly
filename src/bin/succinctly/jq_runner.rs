@@ -2825,7 +2825,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             // its own (confirmed live), so there's nothing left to repair
             // for either, and normalizing the materialized text too would
             // silently rewrite the value's source spelling.
-            let normalized = normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s));
+            let normalized = normalize_json_leniently(s);
             if normalized != s && validate_json_str(&normalized).is_ok() {
                 return crate::output::json_bytes_to_owned_value(s.as_bytes())
                     .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
@@ -2834,6 +2834,28 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             Err(e).with_context(|| format!("Invalid JSON: {s}"))
         }
     }
+}
+
+/// Apply every leniency real jq allows that `serde_json`'s own validation
+/// doesn't (#1094's leading zero, #2012's lone low surrogate) in one
+/// composed pass, so a value needing more than one at once still gets all
+/// of them -- code review on #2012: `parse_json_value` and its `--seq`
+/// counterpart `seq_value_is_valid` each once applied the two
+/// normalizations independently against the untouched original, which
+/// missed exactly the value-needs-both case (`[007,"\udc00"]`). A no-op
+/// on text neither normalizer finds anything to fix in.
+///
+/// This grows one normalizer per leniency rather than trusting a grammar
+/// that already agrees with this crate's own decoder -- `parse_json_stream`
+/// above takes that alternative shape for `--slurpfile` (falls back to
+/// `find_json_values`'s boundary-only scan + this crate's own decoder,
+/// getting every leniency for free with no per-case enumeration), at the
+/// cost of losing `validate_json_str`'s magnitude-overflow rejection
+/// (`1e400`, #1095) that motivated using `serde_json::Value` here in the
+/// first place. Worth revisiting if a third leniency shows up (#2012 code
+/// review, altitude angle).
+fn normalize_json_leniently(s: &str) -> String {
+    normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s))
 }
 
 /// Whether `bytes[i..]` starts with a JSON `\uXXXX` escape -- if so, its
@@ -2890,6 +2912,16 @@ fn normalize_lone_low_surrogates(s: &str) -> String {
     )
 }
 
+/// Whether `v` is a UTF-16 high (leading) surrogate half.
+fn is_high_surrogate(v: u16) -> bool {
+    (0xD800..=0xDBFF).contains(&v)
+}
+
+/// Whether `v` is a UTF-16 low (trailing) surrogate half.
+fn is_low_surrogate(v: u16) -> bool {
+    (0xDC00..=0xDFFF).contains(&v)
+}
+
 /// Normalize one already-delimited string span (`span[0]` is the opening
 /// quote, `span`'s last byte the closing one) into `out`, substituting
 /// lone low surrogates as `normalize_lone_low_surrogates` describes.
@@ -2897,23 +2929,26 @@ fn normalize_string_span_low_surrogates(span: &[u8], out: &mut Vec<u8>) {
     let mut i = 0;
     while i < span.len() {
         if let Some((value, next)) = parse_u_escape(span, i) {
-            if (0xD800..=0xDBFF).contains(&value) {
+            if is_high_surrogate(value) {
                 // A high surrogate immediately followed by a valid low
                 // surrogate is a real pair `serde_json` already accepts --
                 // consume and copy both escapes verbatim in this one step
                 // (rather than copying the high half now and deciding the
-                // low half's fate next iteration) so the low half's hex
-                // digits are parsed exactly once, not once here and once
-                // more when the loop reaches them.
+                // low half's fate next iteration). This still reparses the
+                // low half's hex digits a second time when the lookahead
+                // itself fails (a lone high surrogate, or one followed by a
+                // malformed/non-surrogate `\u` escape) -- only the
+                // successful-pair branch below avoids the reparse, not
+                // every branch; harmless on this cold, tiny-input-only path.
                 let pair_end = match parse_u_escape(span, next) {
-                    Some((low, low_end)) if (0xDC00..=0xDFFF).contains(&low) => low_end,
+                    Some((low, low_end)) if is_low_surrogate(low) => low_end,
                     _ => next,
                 };
                 out.extend_from_slice(&span[i..pair_end]);
                 i = pair_end;
                 continue;
             }
-            if (0xDC00..=0xDFFF).contains(&value) {
+            if is_low_surrogate(value) {
                 out.extend_from_slice(b"\\ufffd");
             } else {
                 out.extend_from_slice(&span[i..next]);
@@ -3747,7 +3782,7 @@ fn seq_value_is_valid(value_text: &str) -> bool {
     if validate::validate(value_text.as_bytes()).is_ok() {
         return true;
     }
-    let normalized = normalize_lone_low_surrogates(&normalize_leading_zero_numbers(value_text));
+    let normalized = normalize_json_leniently(value_text);
     normalized != value_text && validate_json_str(&normalized).is_ok()
 }
 
