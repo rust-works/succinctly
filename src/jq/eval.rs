@@ -38031,6 +38031,29 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ),
         );
 
+        // #2027: the `One`/`Many` arms' bare `to_owned` below looked like a
+        // live silent-corruption gap (the same #1746/#1755 shape fixed
+        // elsewhere in this file) but is confirmed CLI-unreachable, not
+        // merely untested. `eval_generic.rs`'s eager `eval_single` has no
+        // native `Expr::As`/`Expr::AsPattern` arm, so every real CLI
+        // as-binding query reaches this function only via that module's
+        // wildcard `_` bridge, which calls `to_owned_with_cursor` -- a
+        // genuinely fallible, `EvalError`-raising conversion, not this
+        // file's own infallible `to_owned` -- on the *whole* ambient value
+        // before `full_eval` ever hands control to `eval_as_pattern`. That
+        // upstream conversion recursively decodes every string reachable
+        // from the ambient value (everything `body` could possibly
+        // navigate to, since `body` runs against that same value), so any
+        // genuine decode failure anywhere in it already raised before this
+        // loop starts -- confirmed live via reachability probes: on a
+        // document with a decode-failure-inducing string, `eval_as_pattern`
+        // and this function are never entered at all (even when the bad
+        // field is completely untouched by the query), while an
+        // all-valid document reaches both. Direct internal calls (e.g. this
+        // file's own `query!`-based tests) bypass that bridge and so remain
+        // a real way to exercise this arm's behavior -- matching the
+        // #1953/#1972 lesson this file's own comments already name
+        // elsewhere.
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => {
                 carried.push(to_owned(&v));
