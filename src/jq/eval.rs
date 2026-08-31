@@ -15936,10 +15936,14 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // own finding for `eval_single`'s array arm),
                             // so an undecodable string here used to
                             // silently become `""` instead of raising.
-                            QueryResult::One(v) => match to_owned_checked(&v) {
-                                Ok(v) => out.push(v),
-                                Err(e) => return QueryResult::Error(e),
-                            },
+                            // #2001 (code review): ...or_suppress -- this
+                            // is the computed-bounds sibling of
+                            // `eval_single`'s own literal-bounds `Expr::
+                            // Slice` array arm, which had the identical
+                            // unconditional-raise gap this same PR fixes.
+                            QueryResult::One(v) => {
+                                out.push(to_owned_checked_or_suppress!(&v, optional));
+                            }
                             QueryResult::Owned(v) => out.push(v),
                             QueryResult::None => {}
                             QueryResult::Error(e) => return QueryResult::Error(e),
@@ -37568,26 +37572,19 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // #1755: to_owned_checked, not to_owned -- an undecodable kept
             // element must raise, not silently become "".
-            // #2001: routed through `suppress_or_raise` -- can't use the
-            // `to_owned_checked_or_suppress!` macro directly inside the
-            // `.map()` closure below, since its `return` would return from
-            // the closure (changing the collected type), not this
-            // function, so the same check is applied once here instead,
-            // after `collect()` surfaces the first error in iteration
-            // order -- equivalent to checking it at the point of failure,
-            // since either way only the first element error is ever seen.
-            let result: Result<Vec<OwnedValue>, EvalError> = arr
+            // #2001: routed through `suppress_or_raise` -- see
+            // `eval_single`'s own `Expr::Slice` array arm above for why
+            // the macro can't be used directly inside `.map()` here.
+            match arr
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !omit_indices.contains(i))
                 .map(|(_, v)| to_owned_checked(v))
-                .collect();
-            let result = match result {
-                Ok(result) => result,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
-
-            QueryResult::Owned(OwnedValue::Array(result))
+                .collect::<Result<Vec<OwnedValue>, EvalError>>()
+            {
+                Ok(result) => QueryResult::Owned(OwnedValue::Array(result)),
+                Err(e) => suppress_or_raise(e, optional),
+            }
         }
         // #1755: a decode failure on the scalar itself must raise
         // unconditionally, checked ahead of `optional` -- see
@@ -40518,12 +40515,16 @@ mod tests {
 
     /// #2001: `eval_single`'s `Expr::Slice`/`Expr::SliceNumber` `Array` arm
     /// (available in both jq and yq mode, unlike the `Object` arm above,
-    /// which is yq-only) has the identical gap the `Object` arm's own
-    /// #1953 fix already closed -- found by code review as a sibling site
-    /// missed at the time. `end: Some(1)` (rather than the `Object` arm
-    /// test's `None, None`) so the array fast-path (`start: None|Some(0)
-    /// && end: None` -- an identity slice, returned without ever calling
-    /// `to_owned_checked`) isn't taken.
+    /// which is yq-only -- this arm has no `S::TAG` gate at all) has the
+    /// identical gap the `Object` arm's own #1953 fix already closed --
+    /// found by code review as a sibling site missed at the time. `end:
+    /// Some(1)` (rather than the `Object` arm test's `None, None`) so the
+    /// array fast-path (`start: None|Some(0) && end: None` -- an identity
+    /// slice, returned without ever calling `to_owned_checked`) isn't
+    /// taken. Checked under both semantics (code review, #2001): the arm's
+    /// own lack of an `S::TAG` gate means a future edit that *adds* one
+    /// could silently regress either mode while a single-mode test stayed
+    /// green.
     #[test]
     fn test_eval_single_array_slice_respects_optional_for_malformed_member_error_2001() {
         let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
@@ -40538,6 +40539,52 @@ mod tests {
             other => panic!("expected None, got {other:?}"),
         }
         match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2001 (code review): `eval_slice_expr`'s `Targets::Borrowed` arm
+    /// (the computed-bounds `.[$s:$e]` dispatch path -- the sibling of
+    /// `eval_single`'s literal-bounds `Expr::Slice` array arm above) had
+    /// the identical gap on the same fast-path-then-convert shape. `start:
+    /// Some(0), end: None` so the inner `eval_single` call takes the
+    /// fully-open-bound fast path (returning the target's original
+    /// borrowed value unconverted) and reaches this function's own
+    /// `to_owned_checked` call, not `eval_single`'s.
+    #[test]
+    fn test_eval_slice_expr_borrowed_respects_optional_for_malformed_member_error_2001() {
+        let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let target = Expr::Identity;
+        let start = Some(Box::new(Expr::Literal(Literal::Int(0))));
+        let end = None;
+        match eval_slice_expr::<Vec<u64>, JqSemantics>(&target, &start, &end, cursor.value(), true)
+        {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_slice_expr::<Vec<u64>, JqSemantics>(&target, &start, &end, cursor.value(), false)
+        {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match eval_slice_expr::<Vec<u64>, YqSemantics>(&target, &start, &end, cursor.value(), true)
+        {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_slice_expr::<Vec<u64>, YqSemantics>(&target, &start, &end, cursor.value(), false)
+        {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
@@ -40690,16 +40737,28 @@ mod tests {
         }
     }
 
-    /// #2001: `pick`/`omit` (yq-only) had the same gap as the seven sites
-    /// above, in the value/element conversion each performs once a
-    /// requested key/index actually matches -- PR #2010 migrated `pick`'s
-    /// own *keys-expression* conversion (the `keys_owned` match) to
+    /// #2001: `pick`/`omit` had the same gap as the seven sites above, in
+    /// the value/element conversion each performs once a requested
+    /// key/index actually matches -- PR #2010 migrated `pick`'s own
+    /// *keys-expression* conversion (the `keys_owned` match) to
     /// `to_owned_checked_or_suppress!` but left its two per-match value
     /// conversions (Object arm's `field.value`, Array arm's indexed
     /// element) on the raw unconditional pattern, and didn't touch `omit`
     /// at all -- `omit` mirrors `pick` exactly (same `keys_owned` match
     /// shape, same per-kept-value conversion in both its Object and Array
     /// arms) and needs the identical five-site fix.
+    ///
+    /// Neither builtin is yq-only despite the doc comment on this function
+    /// previously claiming so (code review, #2001): both are reachable and
+    /// functional under `JqSemantics` too (real jq itself has no `pick`/
+    /// `omit`, but `succinctly jq` accepts both as its own extension --
+    /// live-verified: `succinctly jq 'pick([0])'`/`'omit([1])'` on
+    /// `[{"x":1,"y"},2,3]` both exit 5, matching the raise this whole gap
+    /// is about). Checked under both semantics below for that reason, not
+    /// just yq's -- unlike `eval_single`'s array-slice arm above, `?` *is*
+    /// reachable here through real CLI syntax (`pick([0])?` exits 0
+    /// live-verified), so a regression in either mode is not merely an
+    /// internal-consistency concern.
     ///
     /// The malformed member must be nested inside the *picked*/*kept*
     /// value, not the top-level document `pick`/`omit` themselves iterate
@@ -40712,13 +40771,23 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::String("a".into()))));
-        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            for (got, mode) in [
+                (
+                    builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional),
+                    "jq",
+                ),
+                (
+                    builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), optional),
+                    "yq",
+                ),
+            ] {
+                match got {
+                    QueryResult::None if optional => {}
+                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
+                }
+            }
         }
     }
 
@@ -40730,13 +40799,23 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::Int(0))));
-        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            for (got, mode) in [
+                (
+                    builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional),
+                    "jq",
+                ),
+                (
+                    builtin_pick::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), optional),
+                    "yq",
+                ),
+            ] {
+                match got {
+                    QueryResult::None if optional => {}
+                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
+                }
+            }
         }
     }
 
@@ -40751,13 +40830,23 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Identity;
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            for (got, mode) in [
+                (
+                    builtin_omit::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional),
+                    "jq",
+                ),
+                (
+                    builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), optional),
+                    "yq",
+                ),
+            ] {
+                match got {
+                    QueryResult::None if optional => {}
+                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
+                }
+            }
         }
     }
 
@@ -40771,13 +40860,23 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::String("z".into()))));
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            for (got, mode) in [
+                (
+                    builtin_omit::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional),
+                    "jq",
+                ),
+                (
+                    builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), optional),
+                    "yq",
+                ),
+            ] {
+                match got {
+                    QueryResult::None if optional => {}
+                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
+                }
+            }
         }
     }
 
@@ -40790,13 +40889,23 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Array(Box::new(Expr::Literal(Literal::Int(5))));
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            for (got, mode) in [
+                (
+                    builtin_omit::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional),
+                    "jq",
+                ),
+                (
+                    builtin_omit::<Vec<u64>, YqSemantics>(&keys_expr, cursor.value(), optional),
+                    "yq",
+                ),
+            ] {
+                match got {
+                    QueryResult::None if optional => {}
+                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
+                }
+            }
         }
     }
 
