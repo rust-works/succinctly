@@ -839,10 +839,13 @@ which had at least one), confirmed live (`keys_unsorted | map(.)` silently succe
 so a malformed member raises under it exactly as it does without it.
 
 **A key that will not decode is never a duplicate.** succinctly semi-indexes rather than
-validates, so a key carrying an invalid escape or a lone surrogate — input real jq rejects
-outright with `Invalid escape` / `Invalid \uXXXX\uXXXX surrogate pair escape` — still
-reaches the evaluator. Such a key has no decoded name to compare, so it participates in no
-collapse and is echoed verbatim from its source span:
+validates, so a key carrying an invalid escape or a lone *high* surrogate — input real jq
+rejects outright with `Invalid escape` / `Invalid \uXXXX\uXXXX surrogate pair escape` —
+still reaches the evaluator. (A lone *low* surrogate is not this case since #2008: real jq
+accepts it and substitutes U+FFFD, and so does succinctly, so such a key decodes normally
+and participates in collapse like any other.) A key that genuinely won't decode has no
+name to compare, so it participates in no collapse and is echoed verbatim from its source
+span:
 
 ```
 $ echo '{"a\q":1,"b":2,"b":3}' | jq -c  .        # parse error: Invalid escape
