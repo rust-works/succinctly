@@ -543,16 +543,28 @@ otherwise already correct, and it can be reverted independently if the perf gate
   `String::from_utf8_lossy`'s own answer). Filed and later fixed *in the algorithm
   itself* as [#1717](https://github.com/rust-works/succinctly/issues/1717) -- likely an
   off-by-one in jq's own end-of-buffer lookahead rather than a designed rule, reproduced
-  bug-for-bug per ADR-0018 rule 4. The fix reaches `@base64d`/`@urid` (#1719, whose own
-  `input` is already scoped to one decoded string) but not this whole-document decode
-  path: `utf8_lossy_document` substitutes the entire file's bytes in one pass before
-  JSON structure is parsed, so jq's own per-string trigger point essentially never
-  coincides with "end of the whole buffer" the way it does for a base64/percent-decoded
-  buffer -- the example above is still accurate post-#1717, even though jq's own trigger
-  is not rare (it fires on any string ending in the right byte shape, however much more
-  content follows in the rest of the file). Closing this gap would need per-JSON-string
-  substitution timing, tracked separately as
-  [#1743](https://github.com/rust-works/succinctly/issues/1743).
+  bug-for-bug per ADR-0018 rule 4. The fix reached `@base64d`/`@urid` immediately (#1719,
+  whose own `input` is already scoped to one decoded string) but not this whole-document
+  decode path, which substituted the entire file's bytes in one pass, so jq's own
+  per-string trigger point essentially never coincided with "end of the whole buffer" --
+  the `"\u{fffd}A"` example above was accurate right up to
+  [#1743](https://github.com/rust-works/succinctly/issues/1743), which closed it.
+  **#1743 needed no change to substitution *timing*, and this document's invariants are
+  why.** The prediction recorded here -- that closing it would require deferring the
+  decode until after structural parsing -- was wrong: `utf8_lossy_document` and
+  `get_inputs` both gate on a whole-input SIMD `validate_utf8`, so a valid document never
+  enters the repair at all, and the repair still emits a valid-UTF-8 buffer, preserving
+  the invariant this whole document is built around (after the input boundary's pass,
+  `as_str()` can only fail on an *escape* problem -- what lets `StandardJson::as_str`
+  borrow out of the document, lets the printer echo a raw string span, and lets the
+  raw-identity fast path exist). Locating string boundaries in non-UTF-8 text needs only
+  a byte-level quote/backslash scan, sound because UTF-8 is self-synchronising: `"` and
+  `\` can never occur inside a multi-byte sequence, so the scan agrees with jq's own
+  byte-oriented lexer by construction. Only *how* the replacement buffer is built
+  changed; see `src/jq/utf8_document.rs`. One subtlety the issue also got wrong: the
+  scope is the escape-*decoded* string, not the raw source span, since escapes only
+  shrink a string and so can push a lead byte over the `len - pos < seq_len` line its raw
+  span would clear.
 - Scope was document input only until #1719 also routed `@base64d`/`@urid`'s jq-mode
   output through this same `substitute_invalid_utf8_jq_style` call (for the
   overlong/surrogate/out-of-range case). At the time, this inherited the #1717 quirk
@@ -560,13 +572,15 @@ otherwise already correct, and it can be reverted independently if the perf gate
   identical wrong answer for #1717's specific shape before #1719 (byte-identical output
   pre/post, confirmed live). #1717's later fix changed that: `@base64d`/`@urid` now match
   jq exactly for this quirk too, since the function's own `input` is naturally scoped to
-  one decoded string already. `--raw-input` shares the jq path too, but real jq's own
+  one decoded string already. `--raw-input` shares the jq path too, and real jq's own
   `-R` (non-slurp) trigger is scoped *per line*, not per whole file (live-verified:
   `printf 'a\xe1\x41\n' | jq -R '.'` drops the byte on a single-line file with an
-  ordinary trailing newline) -- `get_inputs` substitutes the whole raw buffer before
-  splitting into lines, so this is unfixed for a different, more tractable reason than
-  `utf8_lossy_document`'s genuine per-JSON-string granularity gap, tracked separately as
-  [#1742](https://github.com/rust-works/succinctly/issues/1742); DSV input,
+  ordinary trailing newline); `get_inputs` originally substituted the whole raw buffer
+  before splitting into lines, fixed by
+  [#1742](https://github.com/rust-works/succinctly/issues/1742) as a caller-side reorder
+  (split on `\n`, then substitute each line). `--raw-input --slurp` deliberately stays
+  whole-buffer, because real jq is whole-buffer there too -- the entire input is one
+  string, so the buffer's own end genuinely *is* that string's end. DSV input,
   `--arg`/`--argjson` and `--rawfile` remain untouched.
 - **`--validate` is excluded, and getting that wrong was a live regression** caught in
   review. The substitution originally ran at read time, before `validate_json_input`, so

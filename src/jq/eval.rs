@@ -224,19 +224,19 @@ pub trait EvalSemantics: Copy + Default {
     /// `substitute_invalid_utf8_jq_style` also matches jq's separate
     /// end-of-buffer drop quirk (#1717) at this function's own granularity
     /// -- one already-isolated string's bytes, which is exactly what
-    /// `@base64d`/`@urid` decode to. `jq_runner.rs`'s document/raw-input
-    /// callers do *not* gain that particular match: they substitute a
-    /// whole file/document buffer in one pass, before real jq's own
-    /// per-string (document mode) or per-line (`--raw-input`, live-
-    /// verified) scoping ever applies -- "last byte of the whole buffer"
-    /// essentially never coincides with jq's own trigger point in a
-    /// realistic multi-field document or multi-line file, even though
-    /// jq's own trigger itself is not rare at all (it fires on *any*
-    /// string/line ending in the right byte shape, however much more
-    /// content follows). See docs/compliance/jq/limitations.md's "jq's
-    /// own UTF-8 replacement-character substitution: fixed at function
-    /// granularity, open at document granularity" and #1742 for the
-    /// separate, more tractable raw-input caller-ordering gap.
+    /// `@base64d`/`@urid` decode to. That rule is granularity-independent
+    /// (it only asks how many bytes remain in the slice it was handed), so
+    /// *what a caller passes* decides where the quirk fires, and every
+    /// caller now passes what real jq passes: `jq_runner.rs`'s
+    /// `--raw-input` decode splits on `\n` first (#1742), and its JSON
+    /// document/`--slurp`/`--seq` decode goes through
+    /// `jq::utf8_document::substitute_invalid_utf8_jq_document`, which
+    /// segments the buffer and substitutes per JSON string (#1743).
+    /// `--raw-input --slurp` stays whole-buffer because real jq is
+    /// whole-buffer there too (the entire input is one string). See
+    /// docs/compliance/jq/limitations.md's "jq's own UTF-8
+    /// replacement-character substitution: matched, at each caller's own
+    /// granularity" section for the live-verified detail.
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool;
 }
 
@@ -10658,9 +10658,9 @@ fn format_base64d<S: EvalSemantics>(
     // In jq mode this now round-trips the oracle exactly, including the
     // #1717 end-of-buffer drop quirk (`"null"`'s decoded bytes happen to
     // hit that exact shape) -- see docs/compliance/jq/limitations.md's
-    // "fixed at function granularity, open at document granularity"
-    // section for the one place that quirk is still open (document/
-    // raw-input decode, a different granularity).
+    // "matched, at each caller's own granularity" section for how the
+    // other callers of that rule (document, `--slurp`/`--seq`,
+    // `--raw-input`) reach the same match at their own granularity.
     Ok(owned_string_from_decoded_bytes::<S>(result))
 }
 

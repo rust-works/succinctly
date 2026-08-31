@@ -22232,21 +22232,16 @@ fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
 /// ('A'), with no bytes at all remaining after it -- `len - pos == 2 <
 /// seq_len == 3`. Real jq 1.7.1 drops that trailing byte entirely
 /// (`echo '"4UE="' | jq -c '@base64d|explode'` -> `[65533]`), and
-/// `succinctly` now matches exactly, via `owned_string_from_decoded_bytes`
+/// `succinctly` matches exactly, via `owned_string_from_decoded_bytes`
 /// (`src/jq/eval.rs`) calling the fixed `substitute_invalid_utf8_jq_style`
-/// (`src/text/utf8/mod.rs`). Document/raw-input decode
-/// (`jq_runner.rs`'s `utf8_lossy_document`/`get_inputs`) does *not* gain
-/// this fix -- it substitutes a whole file/document buffer at once,
-/// before real jq's own per-string (document mode) or per-line
-/// (`--raw-input`) trigger point ever applies, so "last byte of input"
-/// almost never coincides with jq's own trigger the way it naturally
-/// does here, where `input` already *is* one decoded string's bytes
-/// (jq's own trigger is not rare -- it fires on any string/line ending
-/// in the right byte shape, however much more content follows; only
-/// succinctly's whole-buffer reproduction of it is). See #1742 for the
-/// separate, more tractable raw-input caller-ordering gap, and
-/// docs/compliance/jq/limitations.md's "fixed at function granularity,
-/// open at document granularity" section for the full detail.
+/// (`src/text/utf8/mod.rs`), whose `input` already *is* one decoded
+/// string's bytes. That rule is granularity-independent, so the other
+/// callers reach the same match by being handed what jq hands it:
+/// `--raw-input` splits on `\n` first (#1742) and JSON document /
+/// `--slurp` / `--seq` decode segments per JSON string via
+/// `jq::utf8_document::substitute_invalid_utf8_jq_document` (#1743).
+/// See docs/compliance/jq/limitations.md's "matched, at each caller's
+/// own granularity" section for the full detail.
 #[test]
 fn test_jq_base64d_drops_trailing_byte_quirk_fixed_1717() -> Result<()> {
     let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"4UE=\"", &["-c"])?;
