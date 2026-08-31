@@ -781,8 +781,51 @@ impl EvalError {
     /// The jq-pinned shim this once forwarded from (#1055) is gone: #1494
     /// finished migrating every production call site to pass its own real
     /// `S::TAG` instead of a hardcoded `EvalTag::Jq`.
+    ///
+    /// jq-mode only, despite taking a `tag` parameter for the value-preview
+    /// convention (#1494/#1900): #1901 found real yq doesn't use this
+    /// template at all for `any`/`all`/`flatten`/`group_by`/`unique`/
+    /// `unique_by`/`from_entries` -- see [`Self::yq_only_supports_arrays`],
+    /// [`Self::yq_only_arrays_supported_for`], and
+    /// [`Self::yq_from_entries_requires_array`] for real yq's own wording,
+    /// confirmed live against v4.53.3.
     pub fn cannot_iterate_with(tag: EvalTag, value: &OwnedValue) -> Self {
         Self::new(format!("Cannot iterate over {}", describe_with(tag, value)))
+    }
+
+    /// `<builtin> only supports arrays, was <tag>` (#1901).
+    ///
+    /// Real yq's own wording for `any`/`all` on a non-array (object or
+    /// scalar) -- confirmed live against yq v4.53.3: `5 | any` is `"any only
+    /// supports arrays, was !!int"`, `{"a":1} | any` is `"any only supports
+    /// arrays, was !!map"`. Unlike jq (whose `any`/`all` iterate an object's
+    /// *values*), real yq rejects an object the same as a scalar -- so this
+    /// covers both, not just the scalar case `cannot_iterate_with` was
+    /// reached for.
+    pub fn yq_only_supports_arrays(builtin: &str, tag: &str) -> Self {
+        Self::new(format!("{builtin} only supports arrays, was {tag}"))
+    }
+
+    /// `only arrays are supported for <op>` (#1901).
+    ///
+    /// Real yq's own wording for `flatten`/`group_by`/`unique`/`unique_by`
+    /// on a non-array -- confirmed live against yq v4.53.3: `5 | flatten` is
+    /// `"only arrays are supported for flatten"`, `5 | group_by(.)` is
+    /// `"...for group by"`, and both `5 | unique` and `5 | unique_by(.)` are
+    /// `"...for unique"` (`unique_by` does **not** get its own `"unique
+    /// by"` wording -- confirmed live, not a typo here). No YAML tag in this
+    /// one, unlike [`Self::yq_only_supports_arrays`] -- real yq's own
+    /// message doesn't name the offending type for these four.
+    pub fn yq_only_arrays_supported_for(op: &str) -> Self {
+        Self::new(format!("only arrays are supported for {op}"))
+    }
+
+    /// `from entries only runs against arrays` (#1901).
+    ///
+    /// Real yq's own wording for `from_entries` on a non-array -- confirmed
+    /// live against yq v4.53.3, for both an object and a scalar input.
+    pub fn yq_from_entries_requires_array() -> Self {
+        Self::new("from entries only runs against arrays")
     }
 
     /// `strptime/1 requires string inputs and arguments` (#929).
