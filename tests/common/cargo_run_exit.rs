@@ -1,10 +1,19 @@
 //! Shared exit-code classification for `cargo run`-spawned CLI test helpers.
 //!
-//! Included by `tests/jq_cli_tests.rs`, `tests/cli_golden_tests.rs`,
-//! `tests/cli_characterization_tests.rs`, `tests/deep_nesting_valid_tests.rs`
-//! and `tests/json_validate_tests.rs` via `#[path = ...] mod`, per the
-//! `tests/common/` convention `json_oracle.rs` established. #1516 fixed the
-//! signal-death misdiagnosis
+//! Included via `#[path = "common/cargo_run_exit.rs"] mod ...` by 11
+//! integration-test crates as of #1891's own code review (this list drifts
+//! independently of this comment -- `grep -rl '#\[path = "common/
+//! cargo_run_exit.rs"\]' tests/*.rs` is the source of truth, not this
+//! prose): `cli_characterization_tests.rs`, `cli_golden_tests.rs`,
+//! `deep_nesting_valid_tests.rs`, `dsv_cli_tests.rs`, `jq_cli_tests.rs`,
+//! `json_validate_tests.rs`, `locate_cli_tests.rs`,
+//! `orchestrate_cli_tests.rs`, `text_cli_tests.rs`,
+//! `yaml_validate_tests.rs`, `yq_cli_tests.rs` -- per the `tests/common/`
+//! convention `json_oracle.rs` established. Since `#[path]` textually
+//! inlines the whole file, anything added here (including this file's own
+//! `#[cfg(test)]` module) compiles and runs independently in *every* one of
+//! those crates, not just the ones that call this file's own functions.
+//! #1516 fixed the signal-death misdiagnosis
 //! (`.code().unwrap_or(-1)` silently coercing a killed child to a fake exit
 //! code) in `jq_cli_tests.rs` alone; its own `/code-review` found the
 //! identical pattern hand-rolled in three more files (#1546). Sharing one
@@ -240,12 +249,31 @@ pub fn spawn_with_signal_retry(
         // output, and the small inputs/outputs these tests use never fill
         // an OS pipe buffer either way -- not an invariant this function
         // enforces itself.
-        let write_result = stdin_input.and_then(|input| {
-            use std::io::Write;
-            child.stdin.take().map(|mut sin| sin.write_all(input))
-        });
-        let output = child.wait_with_output()?;
-        write_result.transpose()?;
+        let write_result: std::io::Result<()> =
+            if let (Some(input), Some(mut sin)) = (stdin_input, child.stdin.take()) {
+                use std::io::Write;
+                sin.write_all(input)
+            } else {
+                Ok(())
+            };
+        // Prefer the write error's own diagnostic over `wait_with_output`'s
+        // (#1891 code review): on the rare double failure -- the child is
+        // also reaped or killed by something else (an OOM kill, another
+        // session's `pkill`, `cargo-guard.sh`'s stall guard, all named
+        // above) between the write failing and this wait running --
+        // `wait_with_output` erroring first would otherwise mask *why* the
+        // write itself failed with a more generic wait/I-O error.
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(wait_err) => return Err(write_result.err().unwrap_or(wait_err).into()),
+        };
+        // A write failure returns here unconditionally, same as it always
+        // has (#1891 code review): only exit-status classification below
+        // gets this loop's own retry-on-signal-death treatment, not a
+        // failed write -- unchanged by this fix, which only moved *when*
+        // the child gets reaped relative to this return, not *whether* a
+        // write failure skips the retry path.
+        write_result?;
         if let Some(code) = output.status.code() {
             return Ok((output, code));
         }
@@ -290,16 +318,34 @@ mod tests {
     /// `spawn_with_signal_retry`'s own `Output` (whose stdout would
     /// otherwise carry it) is never returned.
     ///
-    /// Skips the assertion (not the exercise of the code path itself) if
-    /// `ps` isn't available in this environment, rather than failing on
-    /// an environment limitation.
+    /// No sleep between `spawn_with_signal_retry` returning and reading the
+    /// PID file: that call already blocks on `wait_with_output()` before
+    /// returning at all (on every path, success or the write-failure path
+    /// this test exercises -- that's the fix), so the child's PID-file
+    /// write and exit already happened, synchronously, before this
+    /// function got its `_` back.
+    ///
+    /// Skips the final assertion (not the exercise of the code path
+    /// itself) only for the one condition genuinely outside this test's
+    /// own control -- `ps` unavailable in this environment. The PID file
+    /// existing and parsing are asserted, not skipped, on failure: this
+    /// test wrote that `sh` command itself, so either failing indicates a
+    /// real regression in the spawn/write path, not an environment
+    /// limitation, and silently passing over it would let that regression
+    /// through as a quiet stderr line on an otherwise-green run.
     #[test]
     #[cfg(unix)]
     fn reaps_child_on_stdin_write_failure_1891() {
         let pid_file = tempfile::NamedTempFile::new().expect("create temp file");
         let pid_path = pid_file.path().to_path_buf();
 
-        let big_input = vec![0u8; 8 * 1024 * 1024];
+        // A few multiples of the largest common OS pipe buffer (64 KiB on
+        // Linux, historically 16 KiB on macOS) is enough to guarantee the
+        // write blocks against a child that never reads it; the child
+        // closing its own stdin (it never reads at all) is what turns
+        // that block into the broken-pipe failure this test exercises,
+        // not the buffer's own size past that point.
+        let big_input = vec![0u8; 1024 * 1024];
         // The write failing (or not -- the OS's exact timing isn't
         // guaranteed) is the path under test here, not a test failure in
         // itself; what matters is that this doesn't panic and doesn't
@@ -313,17 +359,13 @@ mod tests {
             Some(&big_input),
         );
 
-        // The child writing its PID file and exiting isn't necessarily
-        // synchronous with this function returning; give it a moment.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let Ok(pid_text) = std::fs::read_to_string(&pid_path) else {
-            eprintln!("skipping zombie assertion: child never wrote its PID file");
-            return;
-        };
-        let Ok(pid) = pid_text.trim().parse::<u32>() else {
-            eprintln!("skipping zombie assertion: unparseable PID {pid_text:?}");
-            return;
-        };
+        let pid_text = std::fs::read_to_string(&pid_path).expect(
+            "child should have written its PID file before spawn_with_signal_retry returned",
+        );
+        let pid: u32 = pid_text
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("unparseable PID {pid_text:?}: {e}"));
 
         let Ok(output) = std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
