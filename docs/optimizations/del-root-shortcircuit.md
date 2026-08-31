@@ -58,6 +58,13 @@ Ok(branches) => {
 }
 ```
 
+> **Since [#1690](https://github.com/rust-works/succinctly/issues/1690):** the flag is gone.
+> `del()` no longer calls `resolve_dynamic_indexes` at all — it resolves through
+> `resolve_del_path_branches`, which returns the branches themselves and reports this same
+> root case as `DelPaths::Root`. The check and its reasoning are unchanged; only the spelling
+> is. See [del-path-trie.md](del-path-trie.md) for what #1690 did to the *rest* of this
+> write-up's "two redundant flattening passes."
+
 Collapsing to `[Expr::Identity]` reuses a path `del(.)` already exercised before this change
 (plain `del(.)` hits `resolve_dynamic_indexes`'s `!needs_path_prepass` early return and produces
 exactly that), so no new code path was created.
@@ -120,8 +127,10 @@ O(d²) fix at a time (`push_recursive_branches`'s value clone → #668, its path
 
 - [select-scan.md](select-scan.md) — the precedent this write-up is modeled on: a proposed
   optimization that turned out to be measuring a different, quadratic defect entirely
-- [`src/jq/eval.rs`](../../src/jq/eval.rs) — `resolve_dynamic_indexes`, `builtin_del`,
-  `PathPrefix`, `delete_expr_paths_at`
+- [del-path-trie.md](del-path-trie.md) — #1690, the follow-up that removed the two flattening
+  passes this write-up only *skipped* for one shape
+- [`src/jq/eval.rs`](../../src/jq/eval.rs) — `resolve_del_path_branches`, `builtin_del`,
+  `PathPrefix`, `DeleteTrie`
 - [`benches/jq_recurse_clone_bench.rs`](../../benches/jq_recurse_clone_bench.rs) — the
   benchmark this fix targets, and its own doc comment for the full `path(..)`-is-a-poor-isolator
   reasoning
