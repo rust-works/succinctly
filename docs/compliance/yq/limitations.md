@@ -366,6 +366,23 @@ what a construct loses, the question to ask is which output route it takes, not 
 implements** — a construct on the DOM route loses everything the DOM cannot carry, all at
 once.
 
+[#1693](https://github.com/rust-works/succinctly/issues/1693) and
+[#1700](https://github.com/rust-works/succinctly/issues/1700) are that lesson arriving again,
+and the cleanest confirmation of it, because the routing change was made deliberately and for
+an unrelated reason. `--ascii-output` was routed to the DOM emitter because that was the only
+renderer implementing `\uXXXX` escaping — and it immediately lost three things that have
+nothing to do with ASCII: duplicate mapping keys (`a: 1 / a: 2` came back as `{"a":2}`), an
+explicit `!!str` tag's typing (`!!str 5` came back as the number `5`, where both real yq and
+succinctly's own streaming path give `"5"`), and `\L`/`\P`'s `\u2028`/`\u2029` escaping.
+#1700 moved the escaping to the output *sink* (`AsciiEscapeWriter`, `src/jq/escape.rs`)
+instead of into the streamers, which returns the flag to the streaming route and recovers all
+three at once. The DOM emitter's own `!!str` and `\L`/`\P` divergences are unaffected by that
+fix and remain live for the routes that genuinely materialize — `-P` without `-I0`, `--arg`/
+`--argjson`, `-r`/`-j`/`-0`, `--eval-all`, `--split-exp` (each verified live against this
+binary; `--slurpfile` is a jq flag `succinctly yq` does not accept, and `-P -I0` streams,
+because `-I0`'s own `compact` already satisfies the gate) —
+[#1982](https://github.com/rust-works/succinctly/issues/1982).
+
 The `-I0` nesting bug that surfaced along the way was *wider* than `map`: any filter
 `can_use_m2_streaming` rejects (`to_entries`, `with_entries`, `walk`, `--arg`-bearing
 queries, ...) reached the DOM emitter with an empty per-level indent string at `-I0`,

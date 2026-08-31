@@ -12,6 +12,7 @@ use succinctly::jq::document::{
     effective_keys, key_delimiter_ok, resolve_display_key, value_delimiter_ok, DisplayKeyGuard,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
 };
+use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
     to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta,
@@ -120,6 +121,68 @@ impl<W: Write> ColorSink<'_, W> {
             terminator.write_fmt(self)
         }
     }
+}
+
+/// Apply `--ascii-output` to a JSON render (#1700).
+///
+/// Wraps `$sink` in [`AsciiEscapeWriter`] when the flag is set and passes it
+/// through untouched when it is not, so the default path keeps exactly the
+/// code it had before — no per-write branch, and no extra layer between the
+/// M2 streamers and the writer (the `if` costs one predictable test per
+/// streaming call, not one per character). `$body` is duplicated across the
+/// two arms for that reason; it is a single streaming call at every use site.
+/// The duplication is not free, and the cost is code size rather than any
+/// branch: it monomorphizes each streamer twice, worth +108 KB (+1.3%) of
+/// release binary on arm64 and +123 KB (+1.1%) on x86_64 across the six use
+/// sites (measured against this commit's parent on the pinned benchmark
+/// hosts). That shows up in time on x86_64. An interleaved A/B of the
+/// *default*, non-`--ascii-output` path — `.` and `.[]` over 1 MB and 10 MB
+/// `users`/`navigation` documents, 7 reps, output identity gated — reads
+/// +0.49% median with **every one of 8 rows slower** on a 7950X, against a
+/// control floor there of −0.00% median / 4-of-8-slower; the same run on an
+/// M4 Pro is −1.21% median, 0 of 8 slower, against a −0.48% floor. Small, but
+/// the sign consistency on x86 makes it a real regression rather than noise,
+/// and it is the effect #965 was sensitive to arriving by a different route
+/// (code size, not a lost inline). It is accepted here because the flag it
+/// buys back was silently dropping duplicate mapping keys; if it ever needs
+/// recovering, the lever is to stop instantiating the streamers a second time
+/// — give the `--ascii-output` arm a `&mut dyn Write` and leave the default
+/// arm concrete, which pays a vtable call only on the branch that is already
+/// doing per-character escaping.
+///
+/// Escaping the *sink* rather than teaching the streamers an `ascii` flag is
+/// sound because of a property of JSON rather than of any particular writer —
+/// see [`AsciiEscapeWriter`]'s own comment for that argument. What it buys is
+/// that the flag cannot be missed at one of the streamers' three separate
+/// string-writing routes (`stream_json_string` and the two quoted-scalar
+/// transcoders); what it costs is that every JSON write route *in this file*
+/// has to go through this macro instead. Since `can_stream_json_output_style`
+/// no longer excludes `--ascii-output`, a route that skipped it would stream
+/// raw UTF-8 under the flag.
+///
+/// Three of the six use sites are reachable — both arms of `stream_cursor!`
+/// and `--slurp`'s `stream_json_sequence` — and
+/// `test_ascii_output_covers_every_live_json_route_1700` in
+/// `tests/yq_cli_tests.rs` pins those against exactly that failure. The other
+/// three (the two `stream_json_document` calls and `--inplace`'s direct
+/// `FmtWriter`) are in `_ =>` arms this file documents as defensive fallbacks
+/// no input reaches, so they carry the wrap without a test to hold it: a
+/// probe at each of the six sites showed every non-`--slurp` invocation —
+/// file, multi-document, `--inplace` and `-C` alike — landing on the identity
+/// arm. Wrap them anyway; #757's lesson in `docs/compliance/yq/limitations.md`
+/// is that routes move, and this is the loss such a move would cause.
+macro_rules! json_ascii {
+    ($ascii:expr, $sink:expr, |$out:ident| $body:expr) => {{
+        let sink = $sink;
+        if $ascii {
+            let mut escaped = AsciiEscapeWriter::new(sink);
+            let $out = &mut escaped;
+            $body
+        } else {
+            let $out = sink;
+            $body
+        }
+    }};
 }
 
 /// Streams through `render` directly when `use_color` is false. When true,
@@ -3687,28 +3750,25 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // falling back to the DOM/IndexMap path that would collapse duplicate
     // mapping keys (#442, #748, #809).
     let can_stream_pretty_or_colored = !args.pretty_print;
-    // `!args.ascii_output` gates the whole disjunction, not just the
-    // pretty-or-colored half (#1693): none of the M2 JSON streamers
-    // implement ASCII escaping, so `compact ||` previously let
-    // `--ascii-output` through unescaped whenever `-I=0`/compact mode was
-    // also requested -- the DOM path (`output_value`) is the only place
-    // that escapes correctly, and it's reached only when this is false.
+    // `--ascii-output` no longer appears here (#1700). It used to gate the
+    // whole disjunction (#1693) because no M2 JSON streamer could escape
+    // non-ASCII, leaving the DOM path (`output_value`) as the only correct
+    // renderer -- which cost the flag its duplicate mapping keys, since an
+    // `OwnedValue::Object`'s `IndexMap` cannot represent them (#442/#748/
+    // #809). That was a real, shipped data loss (`{"a":1,"a":2}` rendered
+    // as `{"a":2}`), not merely a slower path.
     //
-    // Falling back to DOM for `--ascii-output` reopens the duplicate-key
-    // collapse `can_stream_pretty_or_colored`'s own comment above warns
-    // about (#442/#748/#809) -- but only for this one flag, and only in a
-    // way that already shipped: pretty mode's `can_stream_pretty_or_colored
-    // && !ascii_output` had exactly this same DOM fallback (and therefore
-    // the same duplicate-key loss) for `--ascii-output` before #1693 ever
-    // touched this function. This shared local makes compact mode
-    // consistent with that pre-existing behavior instead of leaving the two
-    // output styles to diverge on the same input. #1700 tracks the real fix
-    // (ASCII-escaping support in the M2 streamers themselves, which would
-    // let `--ascii-output` keep both correct escaping and duplicate-key
-    // safety at once) -- not attempted here per #1693's own "Low, cosmetic"
-    // scoping and the same #965 inlining-cost reasoning this file's
-    // `stream_json_string` doc comment records for why that isn't a
-    // drop-in change.
+    // The escaping now happens at the sink instead, via `json_ascii!` at
+    // every JSON write route in this file, so the streamers stay untouched
+    // and `--ascii-output` keeps correct escaping and duplicate-key safety
+    // at once. #1700 itself proposed threading an `ascii` flag into the
+    // streamers; the sink adapter is sound for a stronger reason than any
+    // such flag would be -- outside a string literal JSON's grammar admits
+    // only ASCII, so every non-ASCII character in the stream is string
+    // content by construction. See `AsciiEscapeWriter` (`src/jq/escape.rs`)
+    // for that argument in full, and for why it also leaves
+    // `stream_json_string`'s #965-sensitive SIMD scan compiled exactly as
+    // before.
     //
     // Extracted into one local (rather than repeating the expression at
     // `can_json_fast_path`, `can_inplace_json_fast_path`, and
@@ -3731,9 +3791,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // risk a wrong fix to the streamers. Same reasoning YAML never needed:
     // YAML's own scalar rendering is already unquoted by default (`-r`-like
     // even without `-r`), so `can_yaml_fast_path` never had this gap.
-    let can_stream_json_output_style = !args.ascii_output
-        && !output_config.raw_output
-        && (output_config.compact || can_stream_pretty_or_colored);
+    let can_stream_json_output_style =
+        !output_config.raw_output && (output_config.compact || can_stream_pretty_or_colored);
     let can_json_fast_path = is_m2_streamable
         && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
@@ -3802,10 +3861,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // from before #1577.
     //
     // The JSON arm shares `can_json_fast_path`'s `can_stream_json_output_style`
-    // above (#1693 fixed all three JSON gates the same way: none of the M2
-    // JSON streamers implement ASCII escaping, so `!args.ascii_output` has to
-    // gate the whole disjunction, not just the pretty-or-colored half, or
-    // compact mode lets `--ascii-output` through unescaped).
+    // above, which is what keeps all three JSON gates in step -- #1693 had to
+    // fix each of them for `--ascii-output` separately before that local
+    // existed, and #1700 then removed the flag from the predicate entirely
+    // once the escaping moved to the sink. This route's own `json_ascii!`
+    // wrap is on its `stream_json_sequence` call below.
     let can_slurp_fast_path = is_identity
         && match output_config.output_format {
             OutputFormat::Json => can_stream_json_output_style,
@@ -3985,7 +4045,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $writer,
                         $use_color,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
-                        |out| $cursor.stream_json(out, json_indent, sort_keys),
+                        |sink| {
+                            json_ascii!($output_config.ascii_output, sink, |out| {
+                                $cursor.stream_json(out, json_indent, sort_keys)
+                            })
+                        },
                     )?;
                     if let Err(e) = rendered {
                         report_stream_decode_failure(&mut sink, &e);
@@ -4005,12 +4069,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         $writer,
                         $use_color,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
-                        |out| {
-                            result
-                                .stream_json(out, json_indent, sort_keys, |w| {
-                                    terminator.write_fmt(w)
-                                })
-                                .map_err(StreamFailure::from)
+                        |sink| {
+                            json_ascii!($output_config.ascii_output, sink, |out| {
+                                result
+                                    .stream_json(out, json_indent, sort_keys, |w| {
+                                        terminator.write_fmt(w)
+                                    })
+                                    .map_err(StreamFailure::from)
+                            })
                         },
                     )?;
                     // See the YAML branch above (#1615).
@@ -4120,7 +4186,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     |s, _boundaries| {
                                         output::colorize_json(s, &ColorScheme::default())
                                     },
-                                    |out| root.stream_json_document(out, json_indent, sort_keys),
+                                    |sink| {
+                                        json_ascii!(output_config.ascii_output, sink, |out| {
+                                            root.stream_json_document(out, json_indent, sort_keys)
+                                        })
+                                    },
                                 )?
                             };
                             if streamed_ok {
@@ -4257,8 +4327,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         |s, _boundaries| {
                                             output::colorize_json(s, &ColorScheme::default())
                                         },
-                                        |out| {
-                                            root.stream_json_document(out, json_indent, sort_keys)
+                                        |sink| {
+                                            json_ascii!(output_config.ascii_output, sink, |out| {
+                                                root.stream_json_document(
+                                                    out,
+                                                    json_indent,
+                                                    sort_keys,
+                                                )
+                                            })
                                         },
                                     )?
                                 };
@@ -4670,15 +4746,17 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     output_config.use_color,
                     &mut sink,
                     |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
-                    |out| {
-                        stream_json_sequence(
-                            cursors.iter().copied(),
-                            out,
-                            0,
-                            json_indent_spaces,
-                            indent_unit,
-                            sort_keys,
-                        )
+                    |sink| {
+                        json_ascii!(output_config.ascii_output, sink, |out| {
+                            stream_json_sequence(
+                                cursors.iter().copied(),
+                                out,
+                                0,
+                                json_indent_spaces,
+                                indent_unit,
+                                sort_keys,
+                            )
+                        })
                     },
                 )?
             } else {
@@ -4913,10 +4991,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                             sort_keys,
                                         )
                                     } else {
-                                        root.stream_json_document(
+                                        json_ascii!(
+                                            output_config.ascii_output,
                                             &mut FmtWriter(&mut buf_writer),
-                                            json_indent,
-                                            sort_keys,
+                                            |out| root.stream_json_document(
+                                                out,
+                                                json_indent,
+                                                sort_keys
+                                            )
                                         )
                                     };
                                     match streamed {

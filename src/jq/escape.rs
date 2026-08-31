@@ -198,6 +198,99 @@ pub fn escape_json_body(write: fn(&mut String, &str) -> core::fmt::Result, s: &s
     out
 }
 
+/// A [`Write`] adapter that rewrites non-ASCII characters as `\uXXXX` escapes.
+///
+/// Surrogate-paired above the BMP, the same convention
+/// [`write_json_body_yq_ascii`] applies inside a string body; every ASCII byte
+/// passes through untouched.
+///
+/// This is `--ascii-output` for a *streamed* JSON document (#1700), applied to
+/// the finished character stream rather than inside the string writers. That
+/// is sound because of a property of JSON itself, not of any particular
+/// writer: **outside a string literal, JSON's grammar admits only ASCII** —
+/// structural punctuation, digits, `true`/`false`/`null`, whitespace — and
+/// every escape sequence a writer emits is ASCII too. So every non-ASCII
+/// character in a well-formed JSON stream is content inside a string body,
+/// which is exactly the set `--ascii-output` has to escape, and escaping at
+/// the sink cannot reach anything else.
+///
+/// Two consequences worth naming:
+///
+/// - It is **idempotent**. Output that is already all-ASCII — the DOM path's
+///   `format_json` with `ascii: true`, say — passes through byte-for-byte, so
+///   wrapping a sink that some values reach by another route is harmless.
+/// - It composes with any downstream stage that is itself ASCII, ANSI color
+///   codes included.
+///
+/// Deliberately **not** an `ascii: bool` threaded through the M2 streamers,
+/// which is the fix direction #1700 itself first proposed. String bytes reach
+/// the sink from three independent writers — `stream_json_string` and the two
+/// `stream_transcode_*_quoted_to_json` scalar transcoders, the latter pair
+/// carrying ~15 inline write sites each — behind a deeper stack of call paths
+/// (`stream_json_value`, `stream_json_sequence`, `stream_resolved_scalar_as_json`,
+/// the mapping-key arm) that would each have to carry the flag. A flag missed
+/// at any one of them is a silently wrong document. The grammar argument above
+/// covers all of them at once, and leaves `stream_json_string`'s hot SIMD scan
+/// untouched — #965 measured that scan's inlining as worth up to 14%, and this
+/// adapter only exists on the `--ascii-output` branch, so the default path is
+/// compiled exactly as before.
+///
+/// ```
+/// use core::fmt::Write;
+/// use succinctly::jq::escape::AsciiEscapeWriter;
+///
+/// let mut out = String::new();
+/// AsciiEscapeWriter::new(&mut out).write_str("{\"k\":\"héllo 😀\"}").unwrap();
+/// // Structure and ASCII content pass through untouched; the two content
+/// // characters are escaped, the astral one as a surrogate pair.
+/// assert_eq!(out, r#"{"k":"h\u00e9llo \ud83d\ude00"}"#);
+/// ```
+pub struct AsciiEscapeWriter<'a, W> {
+    inner: &'a mut W,
+}
+
+impl<'a, W: Write> AsciiEscapeWriter<'a, W> {
+    /// Wrap `inner`, escaping every non-ASCII character written through it.
+    pub fn new(inner: &'a mut W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write> Write for AsciiEscapeWriter<'_, W> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let mut rest = s;
+        // ASCII runs are forwarded whole; only a non-ASCII character costs a
+        // decode. The scan can only stop on a *leading* byte: a continuation
+        // byte is never the first `>= 0x80` byte of valid UTF-8, so the
+        // `split_at` below always lands on a character boundary.
+        while let Some(pos) = rest.as_bytes().iter().position(|b| !b.is_ascii()) {
+            let (ascii, tail) = rest.split_at(pos);
+            if !ascii.is_empty() {
+                self.inner.write_str(ascii)?;
+            }
+            // `tail` is non-empty by construction, so this always matches;
+            // handled rather than unwrapped to keep the adapter panic-free.
+            let Some(c) = tail.chars().next() else { break };
+            write_u_escape(self.inner, c)?;
+            rest = &tail[c.len_utf8()..];
+        }
+        if !rest.is_empty() {
+            self.inner.write_str(rest)?;
+        }
+        Ok(())
+    }
+
+    /// The streamers write most structural characters one at a time, so the
+    /// default `write_str`-via-stack-buffer route is worth skipping.
+    fn write_char(&mut self, c: char) -> core::fmt::Result {
+        if c.is_ascii() {
+            self.inner.write_char(c)
+        } else {
+            write_u_escape(self.inner, c)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +466,78 @@ mod tests {
             assert_eq!(escape_json_body(write_json_body_jq, &s), jq(&s), "jq/{c:?}");
             assert_eq!(escape_json_body(write_json_body_yq, &s), yq(&s), "yq/{c:?}");
         }
+    }
+
+    /// Run a whole string through [`AsciiEscapeWriter`].
+    fn sink(s: &str) -> String {
+        let mut out = String::new();
+        AsciiEscapeWriter::new(&mut out).write_str(s).unwrap();
+        out
+    }
+
+    /// The design invariant behind escaping at the sink (#1700): a body
+    /// written with the *base* convention and then passed through the adapter
+    /// is byte-for-byte what the dedicated ASCII writer produces. This is what
+    /// lets `--ascii-output` reuse the M2 streamers untouched instead of
+    /// threading a flag into all three of their string-writing routes.
+    #[test]
+    fn adapter_over_base_convention_equals_the_ascii_convention() {
+        for c in corpus() {
+            let s = String::from(c);
+            assert_eq!(sink(&yq(&s)), yq_ascii(&s), "yq/{c:?}");
+            assert_eq!(sink(&jq(&s)), jq_ascii(&s), "jq/{c:?}");
+        }
+    }
+
+    /// Structure, punctuation and existing escapes pass through untouched:
+    /// JSON's grammar admits no non-ASCII outside a string literal, which is
+    /// what makes escaping at the sink equivalent to escaping in the writers.
+    #[test]
+    fn adapter_rewrites_only_non_ascii() {
+        let structural = r#"{"a":[1,-2.5,true,false,null],"b":"x\ty"}"#;
+        assert_eq!(sink(structural), structural);
+        assert_eq!(sink("{\"k\":\"héllo\"}"), "{\"k\":\"h\\u00e9llo\"}");
+        assert_eq!(sink("😀"), "\\ud83d\\ude00");
+        assert_eq!(sink("\u{2028}"), "\\u2028");
+    }
+
+    /// Already-ASCII text survives a second pass unchanged, so a sink that
+    /// also carries output from the DOM path (which escapes for itself) can
+    /// never be double-escaped.
+    #[test]
+    fn adapter_is_idempotent() {
+        for c in corpus() {
+            let once = sink(&yq(&String::from(c)));
+            assert_eq!(sink(&once), once, "{c:?}");
+        }
+    }
+
+    /// The streamers write in many small pieces, one structural character at
+    /// a time included. The adapter keeps no state between calls, so every
+    /// chunking of the same text must produce the same bytes -- including the
+    /// `write_char` fast path, which bypasses `write_str` entirely.
+    #[test]
+    fn adapter_is_chunking_independent() {
+        let text = "{\"k\":\"héllo 😀 \u{2028}\",\"n\":1}";
+        let whole = sink(text);
+        assert_ne!(whole, text, "the sample must actually exercise escaping");
+
+        let mut piecewise = String::new();
+        {
+            let mut w = AsciiEscapeWriter::new(&mut piecewise);
+            for c in text.chars() {
+                w.write_str(&String::from(c)).unwrap();
+            }
+        }
+        assert_eq!(piecewise, whole);
+
+        let mut by_char = String::new();
+        {
+            let mut w = AsciiEscapeWriter::new(&mut by_char);
+            for c in text.chars() {
+                w.write_char(c).unwrap();
+            }
+        }
+        assert_eq!(by_char, whole);
     }
 }

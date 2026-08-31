@@ -2093,28 +2093,125 @@ fn test_ascii_output_still_escapes_in_compact_inplace_mode_1693() -> Result<()> 
     Ok(())
 }
 
-/// #1693 code review: routing `--ascii-output` to the DOM path (the fix
-/// above) reopens `can_stream_pretty_or_colored`'s duplicate-key collapse
-/// (#442/#748/#809) for compact mode specifically -- but pretty mode already
-/// had this exact tradeoff before #1693 touched this function (its own
-/// `can_stream_pretty_or_colored && !ascii_output` gate already forced DOM
-/// for `--ascii-output`, collapse included), so this pins compact mode as
-/// now *consistent* with that pre-existing behavior, not a new regression
-/// introduced from a clean baseline. See the `can_stream_json_output_style`
-/// comment in `yq_runner.rs` and #1700 for the real fix (ASCII-escaping
-/// support in the M2 streamers themselves, which would keep both correct
-/// escaping and duplicate-key safety at once).
+/// #1700: `--ascii-output` keeps duplicate mapping keys. It used to lose
+/// them: #1693 routed the flag to the DOM path because that was the only
+/// renderer that escaped non-ASCII, and an `OwnedValue::Object`'s `IndexMap`
+/// cannot represent a repeated key (#442/#748/#809), so `a: 1 / a: 2` came
+/// back as `{"a":2}` in both compact and pretty mode. This test pinned that
+/// collapse as an accepted tradeoff; it now pins its removal. The escaping
+/// moved to the sink (`json_ascii!` / `AsciiEscapeWriter`), so the flag no
+/// longer needs the DOM path at all and keeps both properties at once.
 #[test]
-fn test_ascii_output_compact_and_pretty_agree_on_duplicate_key_collapse_1693() -> Result<()> {
+fn test_ascii_output_compact_and_pretty_preserve_duplicate_keys_1700() -> Result<()> {
     let yaml = "a: 1\na: 2\n";
 
     let (compact, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0", "--ascii-output"])?;
     assert_eq!(code, 0);
-    assert_eq!(compact, "{\"a\":2}\n");
+    assert_eq!(compact, "{\"a\":1,\"a\":2}\n");
 
     let (pretty, code) = run_yq_stdin(".", yaml, &["-o", "json", "--ascii-output"])?;
     assert_eq!(code, 0);
-    assert_eq!(pretty, "{\n  \"a\": 2\n}\n");
+    assert_eq!(pretty, "{\n  \"a\": 1,\n  \"a\": 2\n}\n");
+
+    // The two properties have to hold *together*: escaping a duplicated key's
+    // non-ASCII value is exactly the combination the DOM fallback could not
+    // serve.
+    let yaml = "a: \"h\u{e9}llo\"\na: \"w\u{f6}rld\"\n";
+    let (both, code) = run_yq_stdin(".", yaml, &["-o", "json", "-I0", "--ascii-output"])?;
+    assert_eq!(code, 0);
+    assert_eq!(both, "{\"a\":\"h\\u00e9llo\",\"a\":\"w\\u00f6rld\"}\n");
+
+    Ok(())
+}
+
+/// #1700: with `--ascii-output` no longer excluded from
+/// `can_stream_json_output_style`, every JSON write route in `yq_runner.rs`
+/// has to apply the escaping itself, via the `json_ascii!` wrap. A route that
+/// missed the wrap would stream raw UTF-8 under the flag rather than fail
+/// loudly, so this walks the ones a real invocation can actually take.
+///
+/// **That is three of the six `json_ascii!` sites, not all six** -- established
+/// by probing each site under every case below, not inferred from the call
+/// graph. The three live ones are both `stream_cursor!` arms (identity and
+/// evaluated) and `--slurp`'s `stream_json_sequence`. Every non-`--slurp` case
+/// here reaches the identity arm, `--inplace` and `-C` included: the file,
+/// multi-document, in-place and colored cases below pin behaviour that a
+/// future re-routing could break, but they do *not* exercise distinct sites
+/// today.
+///
+/// The other three wraps -- the two `stream_json_document` calls and
+/// `--inplace`'s direct `FmtWriter` -- sit in the `_ =>` arms `yq_runner.rs`
+/// itself labels "Defensive fallback only: the root cursor (bp_pos 0) always
+/// reports the virtual document sequence". No input reaches them, so no test
+/// can pin them; they are wrapped as insurance, which is the right call given
+/// that `docs/compliance/yq/limitations.md`'s standing lesson is that routes
+/// move (#757) -- an arm that is unreachable today going live is exactly what
+/// the wrap is there for.
+#[test]
+fn test_ascii_output_covers_every_live_json_route_1700() -> Result<()> {
+    let yaml = "a: \"h\u{e9}llo\"\n";
+    let ascii = ["-o", "json", "-I0", "--ascii-output"];
+    let escaped = "{\"a\":\"h\\u00e9llo\"}\n";
+
+    // `stream_cursor!`, identity arm (`YamlCursor::stream_json`) -- the site
+    // every case below except `--slurp` also lands on.
+    let (out, code) = run_yq_stdin(".", yaml, &ascii)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, escaped);
+
+    // `stream_cursor!`, evaluated arm (`GenericResult::stream_json`).
+    let (out, code) = run_yq_stdin(".a", yaml, &ascii)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\"h\\u00e9llo\"\n");
+
+    // File input rather than stdin. Routes to the identity arm above (the
+    // single-document `stream_json_document` fallback is unreachable); pinned
+    // so a change that split the two inputs apart would be caught.
+    let mut file = NamedTempFile::new()?;
+    write!(file, "{yaml}")?;
+    let (out, code) = run_yq_file(".", file.path().to_str().unwrap(), &ascii)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, escaped);
+
+    // Multi-document file: each document streams through the identity arm in
+    // turn, so the per-document wrap has to hold for every one of them.
+    let mut multi = NamedTempFile::new()?;
+    write!(multi, "a: \"h\u{e9}llo\"\n---\nb: \"w\u{f6}rld\"\n")?;
+    let (out, code) = run_yq_file(".", multi.path().to_str().unwrap(), &ascii)?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\"a\":\"h\\u00e9llo\"}\n{\"b\":\"w\\u00f6rld\"}\n");
+
+    // `--slurp`'s `stream_json_sequence`.
+    let (out, code) = run_yq_file(
+        ".",
+        file.path().to_str().unwrap(),
+        &["-o", "json", "-I0", "--slurp", "--ascii-output"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[{\"a\":\"h\\u00e9llo\"}]\n");
+
+    // `--inplace`: writes through its own buffer with no `ColorSink` at all,
+    // but still via `stream_cursor!`'s identity arm -- the direct `FmtWriter`
+    // site is in the same unreachable fallback arm as the two above.
+    let mut inplace = NamedTempFile::new()?;
+    write!(inplace, "{yaml}")?;
+    let status = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .args(["yq", "-i", "-o", "json", "-I0", "--ascii-output", "."])
+        .arg(inplace.path())
+        .stdin(Stdio::null())
+        .status()?;
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(inplace.path())?, escaped);
+
+    // The buffered `ColorSink` behind `-C`: ANSI codes are themselves ASCII,
+    // so the payload still has to come out escaped.
+    let (colored, code) = run_yq_stdin(".", yaml, &["-C", "-o", "json", "-I0", "--ascii-output"])?;
+    assert_eq!(code, 0);
+    assert!(colored.contains("h\\u00e9llo"), "colored: {colored:?}");
+    assert!(
+        !colored.contains('\u{e9}'),
+        "raw non-ASCII leaked through the colored route: {colored:?}"
+    );
 
     Ok(())
 }
