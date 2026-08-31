@@ -6238,9 +6238,12 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
     finish_fork_generic(out, control.or(stray), optional)
 }
 
-/// Evaluate `first(inner)`/`last(inner)` (and the `Builtin::FirstStream`/
-/// `LastStream` spelling the parser sometimes produces for the same syntax --
-/// see the call sites in `eval_single`/`eval_builtin`), preserving a cursor
+/// Evaluate `first(inner)`/`last(inner)`. `Expr::FirstExpr`/`Expr::LastExpr`
+/// are the only spellings any parseable query produces -- `Builtin::
+/// FirstStream`/`LastStream` are never constructed by the parser (#1986;
+/// see `builtin_first_stream_propagates_bare_halt`), so the call sites in
+/// `eval_single`/`eval_builtin` that also route here for those two variants
+/// are defensive symmetry, not a second live production. Preserves a cursor
 /// through the extraction when `inner`'s stream carries one.
 ///
 /// Mirrors `eval::eval_first_expr`/`eval::eval_last_expr`'s control-flow
@@ -8098,10 +8101,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        // `first(f)`/`last(f)`: the parser's `parse_call` builtin-name path
-        // produces this spelling for the same syntax `Expr::FirstExpr`/
-        // `LastExpr` cover (see their arms in `eval_single`) -- both must
-        // stay cursor-preserving for the same reason (#607).
+        // `first(f)`/`last(f)`: never produced by the parser (#1986) --
+        // `parse_first_expr`/`parse_last_expr` intercept this syntax before
+        // `try_parse_builtin` ever runs, always producing `Expr::FirstExpr`/
+        // `LastExpr` instead (see their arms in `eval_single`). Kept as
+        // defensive symmetry, cursor-preserving for the same reason (#607).
         Builtin::FirstStream(inner) => {
             eval_first_or_last_generic::<S, _>(inner, value, optional, cursor, false)
         }
@@ -12376,13 +12380,15 @@ mod tests {
 
     #[test]
     fn test_json_first_stream_builtin_preserves_duplicate_keys() {
-        // `Builtin::FirstStream`/`LastStream` is the second, older internal
-        // spelling of `first(f)`/`last(f)` that `eval::resolve_node` already
-        // treats as equivalent to `Expr::FirstExpr` (see its comment at
-        // eval.rs's `Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner))`
-        // arm) -- not reachable from `crate::jq::parse` for top-level user
-        // syntax, so built directly here, mirroring how the `IndexExpr` test
-        // above bypasses the parser's own folding.
+        // `Builtin::FirstStream`/`LastStream` is never constructed by the
+        // parser (#1986): `first(f)`/`last(f)` always parse to
+        // `Expr::FirstExpr`/`Expr::LastExpr` instead (see
+        // `builtin_first_stream_propagates_bare_halt` in eval.rs) -- not
+        // reachable from `crate::jq::parse` for any top-level user syntax,
+        // so built directly here, mirroring how the `IndexExpr` test above
+        // bypasses the parser's own folding. `eval::resolve_node`'s matching
+        // `Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner))`
+        // arm still handles this variant, purely as defensive symmetry.
         let json = br#"[{"a":1,"a":2},{"b":3,"b":4}]"#;
         let index = JsonIndex::build(json);
         let expr = Expr::Builtin(Builtin::FirstStream(Box::new(Expr::Iterate)));
