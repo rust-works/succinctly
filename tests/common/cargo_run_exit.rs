@@ -205,6 +205,62 @@ pub fn succinctly_bin() -> &'static str {
 /// (a real code is always present in an `Ok` result) is asserted here
 /// exactly once, via [`exit_code_or_signal_death`], rather than
 /// re-asserted independently at every call site.
+/// Writes `stdin_input` to `child`'s stdin (if it was piped and this is
+/// `Some`), then waits for `child` to exit, reaping it regardless of
+/// whether the write succeeded.
+///
+/// Write, but don't propagate a failure yet (#1891): if the child exits or
+/// closes stdin early (e.g. an argv-parse error before it ever reads
+/// stdin), `write_all` can fail before the child has been waited on.
+/// Returning via `?` at that point would drop `child` without reaping it --
+/// `Child`'s `Drop` does not wait() the OS process, so the early return
+/// would leak a zombie for the rest of this test binary's run.
+/// `wait_with_output()` below doesn't care whether the write succeeded;
+/// call it unconditionally first so the child is always reaped, then
+/// surface the write error if there was one.
+///
+/// Ordering invariant: this write runs to completion (blocking on a full
+/// pipe buffer) *before* `wait_with_output()`'s own concurrent
+/// stdout/stderr draining starts, which is the classic double-pipe
+/// deadlock shape if the child fills its stdout/stderr buffer while
+/// waiting on stdin. Currently safe only because every binary this helper
+/// spawns reads stdin to completion before writing any output, and the
+/// small inputs/outputs these tests use never fill an OS pipe buffer
+/// either way -- not an invariant this function enforces itself.
+///
+/// Extracted (#2016 code review) from [`spawn_with_signal_retry`]'s own
+/// loop body so a caller that can't use that function's whole spawn+retry
+/// wrapper (e.g. `jq_cli_tests.rs`'s `run_jq_interleaved`, which needs its
+/// own file-redirected stdout/stderr for interleaving order) can still
+/// share this write/wait/reap sequencing instead of re-deriving it -- three
+/// call sites had independently done exactly that before this
+/// consolidation.
+pub fn write_stdin_then_wait(
+    mut child: std::process::Child,
+    stdin_input: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    let write_result: std::io::Result<()> =
+        if let (Some(input), Some(mut sin)) = (stdin_input, child.stdin.take()) {
+            use std::io::Write;
+            sin.write_all(input)
+        } else {
+            Ok(())
+        };
+    // Prefer the write error's own diagnostic over `wait_with_output`'s
+    // (#1891 code review): on the rare double failure -- the child is
+    // also reaped or killed by something else (an OOM kill, another
+    // session's `pkill`, `cargo-guard.sh`'s stall guard, all named
+    // above) between the write failing and this wait running --
+    // `wait_with_output` erroring first would otherwise mask *why* the
+    // write itself failed with a more generic wait/I-O error.
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(wait_err) => return Err(write_result.err().unwrap_or(wait_err).into()),
+    };
+    write_result?;
+    Ok(output)
+}
+
 pub fn spawn_with_signal_retry(
     mut build: impl FnMut() -> std::process::Command,
     stdin_input: Option<&[u8]>,
@@ -219,7 +275,7 @@ pub fn spawn_with_signal_retry(
             } else {
                 std::process::Stdio::null()
             });
-        let mut child = match command.spawn() {
+        let child = match command.spawn() {
             Ok(child) => child,
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < MAX_CARGO_RETRIES =>
@@ -229,51 +285,11 @@ pub fn spawn_with_signal_retry(
             }
             Err(e) => return Err(e.into()),
         };
-        // Write, but don't propagate a failure yet (#1891): if the child
-        // exits or closes stdin early (e.g. an argv-parse error before it
-        // ever reads stdin), `write_all` can fail before the child has been
-        // waited on. Returning via `?` at that point would drop `child`
-        // without reaping it -- `Child`'s `Drop` does not wait() the OS
-        // process, so the early return would leak a zombie for the rest of
-        // this test binary's run. `wait_with_output()` below doesn't care
-        // whether the write succeeded; call it unconditionally first so the
-        // child is always reaped, then surface the write error if there was
-        // one.
-        //
-        // Ordering invariant: this write runs to completion (blocking on a
-        // full pipe buffer) *before* `wait_with_output()`'s own concurrent
-        // stdout/stderr draining starts, which is the classic double-pipe
-        // deadlock shape if the child fills its stdout/stderr buffer while
-        // waiting on stdin. Currently safe only because every binary this
-        // helper spawns reads stdin to completion before writing any
-        // output, and the small inputs/outputs these tests use never fill
-        // an OS pipe buffer either way -- not an invariant this function
-        // enforces itself.
-        let write_result: std::io::Result<()> =
-            if let (Some(input), Some(mut sin)) = (stdin_input, child.stdin.take()) {
-                use std::io::Write;
-                sin.write_all(input)
-            } else {
-                Ok(())
-            };
-        // Prefer the write error's own diagnostic over `wait_with_output`'s
-        // (#1891 code review): on the rare double failure -- the child is
-        // also reaped or killed by something else (an OOM kill, another
-        // session's `pkill`, `cargo-guard.sh`'s stall guard, all named
-        // above) between the write failing and this wait running --
-        // `wait_with_output` erroring first would otherwise mask *why* the
-        // write itself failed with a more generic wait/I-O error.
-        let output = match child.wait_with_output() {
-            Ok(output) => output,
-            Err(wait_err) => return Err(write_result.err().unwrap_or(wait_err).into()),
-        };
-        // A write failure returns here unconditionally, same as it always
+        // A write failure surfaces here unconditionally, same as it always
         // has (#1891 code review): only exit-status classification below
         // gets this loop's own retry-on-signal-death treatment, not a
-        // failed write -- unchanged by this fix, which only moved *when*
-        // the child gets reaped relative to this return, not *whether* a
-        // write failure skips the retry path.
-        write_result?;
+        // failed write.
+        let output = write_stdin_then_wait(child, stdin_input)?;
         if let Some(code) = output.status.code() {
             return Ok((output, code));
         }

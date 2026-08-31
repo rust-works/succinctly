@@ -50,9 +50,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::spawn_with_signal_retry;
 
 const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/jq-golden");
 const KNOWN_FAILURES: &str = include_str!("data/jq-golden-known-failures.txt");
@@ -155,42 +158,26 @@ fn known_failures() -> BTreeMap<String, String> {
 /// Run `succinctly jq <args> <filter>` with the case input on stdin and demand
 /// stdout byte-equal to the golden, plus jq's exit code — 0, or the recorded
 /// failing code and stderr for a case that jq fails.
+///
+/// #2016 (code review): routed through `spawn_with_signal_retry` rather
+/// than a hand-rolled spawn/write/wait -- besides closing the #1891
+/// zombie-leak shape, this is the one call site iterating potentially
+/// thousands of fixture cases, so it's also the highest-value place to
+/// pick up the ENOENT/signal-death retry that function provides (an OOM
+/// kill, another session's `pkill`, or `cargo-guard.sh`'s stall guard
+/// catching this specific child was previously a hard failure of the whole
+/// run instead of a retried attempt). `anyhow::Error` bridges to this
+/// function's own `Result<(), String>` via `.to_string()`.
 fn run_case(case: &Case) -> Result<(), String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .args(&case.args)
-        .arg(&case.filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn succinctly: {e}"))?;
-    // #2016: write, but don't propagate a failure yet -- matching
-    // `spawn_with_signal_retry`'s own #1891 fix. A `?` here, before
-    // `wait_with_output()` below, would drop `child` without reaping it on
-    // a write failure (e.g. the child exits before ever reading stdin),
-    // leaking a zombie for the rest of this test binary's run -- driven by
-    // potentially thousands of fixture cases here, so a regression that
-    // hits this path could leak many at once.
-    let write_result = child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(case.input.as_bytes())
-        .map_err(|e| format!("write stdin: {e}"));
-    // Prefer the write error's own diagnostic over `wait_with_output`'s, on
-    // the rare double failure where the child is also reaped or killed by
-    // something else between the write failing and this wait running
-    // (matching `spawn_with_signal_retry`'s own #1891-review priority).
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(wait_err) => {
-            return Err(write_result
-                .err()
-                .unwrap_or_else(|| format!("wait: {wait_err}")))
-        }
-    };
-    write_result?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").args(&case.args).arg(&case.filter);
+            command
+        },
+        Some(case.input.as_bytes()),
+    )
+    .map_err(|e| e.to_string())?;
 
     match case.expected_status {
         None => {

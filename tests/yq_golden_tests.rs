@@ -36,9 +36,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::spawn_with_signal_retry;
 
 const GOLDEN_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/yq-golden");
 const KNOWN_FAILURES: &str = include_str!("data/yq-golden-known-failures.txt");
@@ -146,42 +149,20 @@ fn run_case(case: &Case) -> Result<(), String> {
 }
 
 /// As [`run_case`], but with the document's line breaks possibly rewritten.
+///
+/// #2016 (code review): routed through `spawn_with_signal_retry` -- see
+/// `jq_golden_tests.rs::run_case`'s own #2016 doc comment for why (this is
+/// its yq-mode sibling, iterating the same order of fixture-case volume).
 fn run_case_with_input(case: &Case, input: &str) -> Result<(), String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .args(&case.args)
-        .arg(&case.filter)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn succinctly: {e}"))?;
-    // #2016: write, but don't propagate a failure yet -- matching
-    // `spawn_with_signal_retry`'s own #1891 fix. A `?` here, before
-    // `wait_with_output()` below, would drop `child` without reaping it on
-    // a write failure (e.g. the child exits before ever reading stdin),
-    // leaking a zombie for the rest of this test binary's run -- driven by
-    // potentially thousands of fixture cases here, so a regression that
-    // hits this path could leak many at once.
-    let write_result = child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("write stdin: {e}"));
-    // Prefer the write error's own diagnostic over `wait_with_output`'s, on
-    // the rare double failure where the child is also reaped or killed by
-    // something else between the write failing and this wait running
-    // (matching `spawn_with_signal_retry`'s own #1891-review priority).
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(wait_err) => {
-            return Err(write_result
-                .err()
-                .unwrap_or_else(|| format!("wait: {wait_err}")))
-        }
-    };
-    write_result?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").args(&case.args).arg(&case.filter);
+            command
+        },
+        Some(input.as_bytes()),
+    )
+    .map_err(|e| e.to_string())?;
 
     match case.expected_status {
         None => {
