@@ -1174,70 +1174,44 @@ fn test_parity_has_native_arm_1739() {
     assert_parity(br#"{"a":1,"b":2}"#, r#"[has(("a","z"))]"#);
 }
 
-/// #1909: `Builtin::GetPath`'s new native cursor-walking arm in
-/// `eval_generic.rs` must agree with `eval.rs`'s `builtin_getpath`/
-/// `getpath_one_path` — both for every shape it claims to handle itself and
-/// for every shape it deliberately defers back to that reference
-/// implementation. The whole point of the fast path is that a bounded read
-/// stops paying a whole-document materialize + re-serialize + re-index round
-/// trip, so a silent behavioural drift here would be buying speed with
-/// correctness.
-#[test]
-fn test_parity_getpath_native_arm_1909() {
-    // Shapes the native walk handles itself: string keys into objects,
-    // numeric keys into arrays, and a `null` reached mid-walk.
-    for (json, filter) in [
-        (br#"{"a":{"b":1}}"#.as_slice(), "getpath([])"),
-        (br#"{"a":{"b":1}}"#, r#"getpath(["a"])"#),
-        (br#"{"a":{"b":1}}"#, r#"getpath(["a","b"])"#),
-        // Past the end of the document: `null` short-circuits the rest.
-        (br#"{"a":{"b":1}}"#, r#"getpath(["a","b","c","d"])"#),
-        (br#"{"a":{"b":1}}"#, r#"getpath(["z"])"#),
-        (br#"{"a":{"b":1}}"#, r#"getpath(["z","y"])"#),
-        (br"[10,20,30]", "getpath([0])"),
-        (br"[10,20,30]", "getpath([2])"),
-        (br"[10,20,30]", "getpath([-1])"),
-        (br"[10,20,30]", "getpath([99])"),
-        (br"[10,20,30]", "getpath([1.7])"),
-        (br#"[{"a":[1,2]}]"#, r#"getpath([0,"a",1])"#),
-        (br"null", r#"getpath(["a","b"])"#),
-        (br#"{"a":null}"#, r#"getpath(["a","b"])"#),
-        // A path computed from the document, not a literal.
-        (br#"{"a":{"b":7},"p":["a","b"]}"#, "getpath(.p)"),
-        // The `paths`/`getpath` round trip this fast path exists to make
-        // ordinary rather than exotic.
-        (br#"{"a":{"b":1},"c":[1,2]}"#, "[paths as $p | getpath($p)]"),
-    ] {
-        assert_parity(json, filter);
-    }
+/// `assert_parity` compares only *successful* outputs: `collect_owned`'s
+/// `Error(_) => vec![]` arm swallows the error, so two evaluators that raise
+/// different messages -- or one that raises where the other doesn't -- both
+/// render as `[]` and compare equal (code review, #1909).
+///
+/// This asserts on the error side instead, so a filter that must raise is
+/// actually pinned to raising, with the same message, on both evaluators.
+fn assert_error_parity(json: &[u8], filter: &str) {
+    let index = JsonIndex::build(json);
+    let expr = parse(filter).expect("parse failed");
 
-    // Shapes the native walk refuses, so the reference implementation still
-    // produces the exact error text, `optional` suppression, slice
-    // semantics, and generator fan-out it always did.
-    for (json, filter) in [
-        // Not an array at all: jq's `Path must be specified as an array`.
-        (br#"{"a":1}"#.as_slice(), r#"getpath("a")"#),
-        // A segment kind the walk doesn't accept.
-        (br#"{"a":1}"#, "getpath([null])"),
-        (br#"{"a":1}"#, "getpath([true])"),
-        (br"null", "getpath([null])"),
-        // Slice-descriptor segments.
-        (br"[10,20,30]", r#"getpath([{"start":0,"end":2}])"#),
-        (br#""hello""#, r#"getpath([{"start":1,"end":3}])"#),
-        // Type errors mid-walk, raised and suppressed.
-        (br#"{"a":1}"#, r#"getpath(["a","b"])"#),
-        (br#"{"a":1}"#, r#"try getpath(["a","b"]) catch "E""#),
-        (br#"{"a":1}"#, r#"getpath(["a","b"])?"#),
-        (br"[1,2]", r#"getpath(["a"])"#),
-        (br#"{"a":1}"#, "getpath([0])"),
-        // A generator path fans out one output per path (jq's rule).
-        (br#"{"a":1,"b":2}"#, r#"[getpath((["a"],["b"]))]"#),
-        (br#"{"a":1,"b":2}"#, r#"[getpath([("a","b")])]"#),
-        // An empty path generator produces no output at all.
-        (br#"{"a":1}"#, "[getpath(empty)]"),
-    ] {
-        assert_parity(json, filter);
-    }
+    let full_cursor = index.root(json);
+    let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, JqSemantics>(&expr, full_cursor);
+    let full_err = match full {
+        QueryResult::Error(e) => e.message,
+        other => panic!(
+            "full evaluator did not raise for `{filter}` on `{}`: {:?}",
+            String::from_utf8_lossy(json),
+            other.collect_owned()
+        ),
+    };
+
+    let generic_cursor = index.root(json);
+    let generic = eval_generic::eval_with_cursor(&expr, generic_cursor);
+    let generic_err = match generic {
+        eval_generic::GenericResult::Error(e) => e.message,
+        other => panic!(
+            "generic evaluator did not raise for `{filter}` on `{}`: {other:?}",
+            String::from_utf8_lossy(json)
+        ),
+    };
+
+    assert_eq!(
+        full_err,
+        generic_err,
+        "evaluator error drift for `{filter}` on `{}`",
+        String::from_utf8_lossy(json)
+    );
 }
 
 /// #1909: `Builtin::Path`'s new arm in `eval_generic.rs` calls
@@ -1245,7 +1219,8 @@ fn test_parity_getpath_native_arm_1909() {
 /// `eval_on_owned`'s serialize + `JsonIndex::build` + re-enter bridge (which
 /// landed back in `eval::builtin_path` only for *it* to materialize the same
 /// document a second time). Same evaluator, same input tree — so every
-/// output, including the error and partial-output shapes, must be unchanged.
+/// output must be unchanged, including the multi-output and partial-output
+/// shapes where a later path errors after earlier ones already resolved.
 #[test]
 fn test_parity_path_builtin_bypasses_reindex_bridge_1909() {
     for (json, filter) in [
@@ -1256,19 +1231,78 @@ fn test_parity_path_builtin_bypasses_reindex_bridge_1909() {
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(.a,.c)]"),
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, r#"path(.["a"])"#),
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.c[0])"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.c[-1])"),
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, "path(.c[0:2])"),
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(first(.[]))]"),
         (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(limit(2;.[]))]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(select(true))]"),
+        (
+            br#"{"a":{"b":1},"c":[1,2,3]}"#,
+            "[path(if true then .a else .c end)]",
+        ),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[path(getpath([\"a\"]))]"),
         // A dynamic index resolved against the document itself.
         (br#"{"k":"a","a":1}"#, "path(.[.k])"),
-        // Error and partial-output shapes.
-        (br#"{"a":1}"#, "path(.a[0])"),
-        (br#"{"a":1}"#, r#"try path(.a[0]) catch "E""#),
-        (br#"{"a":{"b":1},"c":1}"#, "[path(.a.b, .c.d)]"),
         (br"null", "path(.a.b)"),
-        // `path` nested in a pipe takes the `Expr::Pipe` bridge instead.
-        (br#"{"a":{"b":1}}"#, ".a | path(.b)"),
-        (br#"{"a":{"b":1}}"#, "[.a | path(.)]"),
+        (br"null", "path(.)"),
+        // A repeated key, which the bypass must resolve the same way the
+        // bridge did (`IndexMap`-collapsed, since both sides walk the same
+        // already-materialized tree).
+        (br#"{"a":1,"a":2}"#, "[path(.[])]"),
+        // Documents whose numbers straddle the `reindex_bridge_is_identity`
+        // guard: a float-free tree takes the bypass, a float-carrying one
+        // falls back to the bridge. Both must agree with the full evaluator.
+        (br#"{"a":{"b":1}}"#, "[path(..)]"),
+        (br#"{"a":{"b":3.5},"c":1e18}"#, "[path(..)]"),
+        (br#"{"a":10000000000000000000.0}"#, "[path(..)]"),
+        // A partial result: `.a.b` resolves, then `.c.d` errors.
+        (br#"{"a":{"b":1},"c":1}"#, "[path(.a.b, .c.d)]"),
+        (br#"{"a":1}"#, r#"try path(.a[0]) catch "E""#),
+    ] {
+        assert_parity(json, filter);
+    }
+
+    // Raising shapes, asserted on the error message rather than through
+    // `assert_parity`, which cannot see them (see `assert_error_parity`).
+    for (json, filter) in [
+        (br#"{"a":1}"#.as_slice(), "path(.a[0])"),
+        (br#"{"a":1}"#, "path(.a.b)"),
+        (br"[1,2,3]", r#"path(.["a"])"#),
+        (br#""s""#, "path(.a)"),
+        (br#"{"a":1}"#, "path(.a[0:2])"),
+    ] {
+        assert_error_parity(json, filter);
+    }
+}
+
+/// The `Expr::Pipe` half of the same #1909 change: a pipe containing
+/// `key`/`parent`/`file_index`/`path` bridges into `eval.rs`'s path-context
+/// evaluator directly rather than re-entering through `eval_pipe`'s own
+/// identical `needs_path_context` gate. `key`/`parent` are succinctly
+/// extensions with no jq oracle, so evaluator parity is the check available.
+#[test]
+fn test_parity_pipe_path_context_bypasses_reindex_bridge_1909() {
+    for (json, filter) in [
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#.as_slice(), ".a | path(.b)"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[.a | path(.)]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, ".a | key"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, ".a.b | key"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, ".a | parent"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, ".a.b | parent(1)"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[.[] | key]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[.c[] | key]"),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, "[.. | key]"),
+        (
+            br#"{"a":{"b":1},"c":[1,2,3]}"#,
+            r#"[.[] | select(key == "a")]"#,
+        ),
+        (br#"{"a":{"b":1},"c":[1,2,3]}"#, ".a | . as $x | key"),
+        // Float-carrying documents fall back to the bridge rather than the
+        // bypass; float-free ones take it. Both must agree.
+        (br#"{"a":{"b":3.5}}"#, ".a | parent"),
+        (br#"{"a":{"b":1}}"#, ".a | parent"),
+        (br#"{"a":10000000000000000000.0}"#, ".a | parent"),
+        (br"null", ". | key"),
     ] {
         assert_parity(json, filter);
     }

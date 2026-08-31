@@ -1696,62 +1696,62 @@ fn query_result_to_generic<V: DocumentValue>(
     }
 }
 
-/// #1909: run a path-context evaluation against an already-materialized
-/// `OwnedValue`, without [`eval_on_owned`]'s reindex bridge.
+/// The `MAX_REUSED_LITERAL_LEN` cap in [`OwnedValue::to_json_for_reindex`]
+/// (`src/jq/value.rs`, #1211): past it, a `NumberLiteral`'s source text is
+/// discarded and replaced by its parsed `NumberRepr`'s own formatting, so the
+/// bridge stops being an identity on that node.
 ///
-/// Both of this function's callers used to hand their `OwnedValue` to
-/// `eval_on_owned`, which serializes it back to JSON, runs
-/// `JsonIndex::build` over that text, and re-enters `eval.rs` -- whose
-/// `eval_pipe`/`builtin_path` then immediately call `to_owned_checked` and
-/// materialize the *same document a second time*, because path resolution
-/// (`resolve_node`/`resolve_seq`/`walk_path`) needs stable `&OwnedValue`
-/// references and can't work off a cursor. Two full trees, one JSON string
-/// and one semi-index, to answer a query whose output is a bounded path.
-/// Measured on a 300,000-element flat array (1.9 MB), release build, medians
-/// of 5, peak RSS alongside:
+/// Duplicated from that function rather than shared because it is a private
+/// `const` inside its body. `test_reindex_bridge_identity_predicate_agrees_1909`
+/// is what keeps the two from drifting: it round-trips a literal either side
+/// of this length and asserts the predicate and the actual round trip agree.
+const REINDEX_LITERAL_LEN_CAP: usize = 256;
+
+/// Whether `eval_on_owned`'s reindex bridge -- serialize with
+/// [`OwnedValue::to_json_for_reindex`], `JsonIndex::build`, then
+/// `to_owned_checked` back on the far side -- is a **semantic identity** on
+/// `value`, so skipping it cannot change what the evaluator downstream sees.
 ///
-/// | query | before | after |
-/// |---|---|---|
-/// | `path(.)` | 0.098s / 104.5 MiB | see the issue's own table |
+/// #1909: the path-context arms below hand `eval.rs` the `OwnedValue` they
+/// already built instead of round-tripping it, which is only sound where the
+/// round trip was pure overhead. It usually is -- but not always, and the
+/// exceptions are all numeric, because `to_json_for_reindex` is a *formatter*
+/// as much as a serializer:
 ///
-/// `optional` is deliberately **not** threaded through: `eval_on_owned`
-/// reaches `eval.rs` through `full_eval`, whose public entry point starts
-/// every evaluation at `optional = false` regardless of what its caller
-/// passed (see `eval_on_owned`'s own comment on this). Passing `false` here
-/// mirrors that exactly, so this bypass cannot change which errors a
-/// trailing `?` suppresses.
+/// - A **bare `Float`** is re-spelled by that formatter's mode-forked rule
+///   (yq keeps a whole number's decimal point at any magnitude, jq keeps the
+///   bare `Display` spelling, #953) and comes back as a `NumberLiteral`
+///   carrying that new text. This is the case the bridge is genuinely
+///   load-bearing for: without the guard, `.outer.big | parent` on
+///   `10000000000000000000.0` prints `1e+19` in yq mode.
+/// - A bare **`Int`** likewise comes back as `NumberLiteral(Int(n), "n")`.
+/// - A **NaN** `NumberLiteral` is replaced by `NAN_SENTINEL`.
+/// - A `NumberLiteral` whose source text exceeds
+///   [`REINDEX_LITERAL_LEN_CAP`] is discarded (#1211).
 ///
-/// The yq float-fidelity fixup (#953/#1168) is re-applied to the result
-/// afterwards for the same reason `Expr::Array`/`Expr::Comma`'s own native
-/// arms apply it: `to_json_for_reindex`'s `S`-gated float formatter is the
-/// only thing that applies yq's "a document-sourced float that overflowed
-/// `i64` keeps its decimal point" rule, and skipping the bridge skips that
-/// formatter too. `yq_float_fidelity_fixup` is a no-op in jq mode and short-
-/// circuits on `contains_float`, so a result with no float anywhere in it --
-/// every `path(...)`/`key`/`parent` output, and any document without a float
-/// -- pays nothing for it.
-fn eval_path_context_on_owned<S: EvalSemantics, V: DocumentValue>(
-    result: QueryResult<'_, Vec<u64>>,
-) -> GenericResult<V> {
-    let generic = query_result_to_generic::<V>(result);
-    if S::TAG != EvalTag::Yq {
-        return generic;
-    }
-    match generic {
-        GenericResult::Owned(v) => match yq_float_fidelity_fixup::<S, V>(vec![v]) {
-            Ok(mut fixed) if fixed.len() == 1 => GenericResult::Owned(fixed.remove(0)),
-            Ok(fixed) => owned_vec_to_generic_result(fixed),
-            Err(result) => result,
-        },
-        GenericResult::ManyOwned(vs) => match yq_float_fidelity_fixup::<S, V>(vs) {
-            Ok(fixed) => GenericResult::ManyOwned(fixed),
-            Err(result) => result,
-        },
-        GenericResult::Partial(vs, control) => match yq_float_fidelity_fixup::<S, V>(vs) {
-            Ok(fixed) => GenericResult::Partial(fixed, control),
-            Err(result) => result,
-        },
-        other => other,
+/// Everything else -- `null`, booleans, strings (escaped and unescaped
+/// symmetrically), object keys, and the overwhelmingly common
+/// document-sourced `NumberLiteral` with short source text, which
+/// `to_json_for_reindex` echoes verbatim -- survives the trip unchanged, so
+/// the bypass applies to it.
+///
+/// Deliberately an **input-side** predicate rather than an output-side fixup.
+/// A first version of this fix re-applied `yq_float_fidelity_fixup` to the
+/// *result* instead; code review showed that isn't the same transformation at
+/// all, and got it wrong in both directions -- re-spell-then-evaluate is not
+/// evaluate-then-re-spell once the pipe does any computing.
+/// `.outer.big|parent|.big|tostring` lost the document spelling
+/// (`"1e+19"`), while `.outer.big|parent|.big+0` wrongly *gained* it for a
+/// value the pipe had just computed. Only a value the bridge would have left
+/// alone can safely skip the bridge.
+fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
+    match value {
+        OwnedValue::Float(_) | OwnedValue::Int(_) => false,
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => false,
+        OwnedValue::NumberLiteral(_, literal) => literal.len() <= REINDEX_LITERAL_LEN_CAP,
+        OwnedValue::Array(items) => items.iter().all(reindex_bridge_is_identity),
+        OwnedValue::Object(fields) => fields.values().all(reindex_bridge_is_identity),
+        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::String(_) => true,
     }
 }
 
@@ -4797,16 +4797,26 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // `eval_on_owned`'s reindex bridge -- which lands in
                 // `eval::eval_pipe`, whose own `needs_path_context` gate
                 // (the same predicate checked just above) materializes the
-                // whole document a second time before calling exactly this
-                // function. See `eval_path_context_on_owned`.
-                return eval_path_context_on_owned::<S, V>(
-                    crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
-                        exprs,
-                        &owned,
-                        &[],
-                        false,
-                    ),
-                );
+                // whole document a *second* time before calling exactly this
+                // function. Only where that bridge was a semantic no-op
+                // (`reindex_bridge_is_identity`); otherwise unchanged.
+                //
+                // `optional` is deliberately not threaded into the bypass,
+                // for the same reason `eval_on_owned` doesn't thread it into
+                // its own `full_eval` call: that entry point restarts every
+                // evaluation at `false` regardless of what its caller
+                // passed, so `false` is what the bridge actually delivered.
+                if reindex_bridge_is_identity(&owned) {
+                    return query_result_to_generic::<V>(
+                        crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
+                            exprs,
+                            &owned,
+                            &[],
+                            false,
+                        ),
+                    );
+                }
+                return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
             }
 
             if exprs.is_empty() {
@@ -7688,122 +7698,6 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// #1909: native, cursor-walking `getpath(P)` for the CLI's generic
-/// evaluator, so a bounded read of one node stops paying for the `_`
-/// fallback's whole-document materialize + re-serialize + re-index round
-/// trip (`eval_on_owned`). Measured on a 300,000-element flat array,
-/// release build: `getpath([0])` was 0.08s / 75.4 MiB peak RSS against
-/// `.[0]`'s 0.01s / 10.7 MiB for byte-identical output -- same semantics,
-/// same one-number result, 7x the memory. `getpath` is not an exotic
-/// introspection builtin: it is how any programmatically-built path is
-/// read, and what `paths`-driven code uses.
-///
-/// Same native-arm precedent, and the same two probe guards, as
-/// [`eval_has_generic`] (#1739) and `eval_limit_generic` (#1607) -- see
-/// `eval_has_generic`'s own doc comment for why a live `input`/`inputs`
-/// queue and a statically-visible top-level `Comma` are both refused
-/// *before* `path_expr` is ever probed, rather than after.
-///
-/// **Success-only by construction.** This walk deliberately covers just the
-/// shapes it can prove match `eval::getpath_one_path` exactly, and returns
-/// `None` -- deferring to that reference implementation via the caller's
-/// pre-existing round trip -- for everything else:
-///
-/// - a path that isn't a single plain `OwnedValue::Array` (a generator
-///   path, `empty`, a decode failure, jq's `path must be specified as an
-///   array` error);
-/// - any segment that isn't a string or a number, so jq's slice-descriptor
-///   segments (`{"start":s,"end":e}` against an array, a string, or -- yq
-///   mode only, #1102 -- an object), and the `null`/`true` segments whose
-///   current behaviour on a `null` receiver already diverges from real jq,
-///   all keep running through the exact code that produces them today;
-/// - **any step that would error or be suppressed by `optional`**, so every
-///   `Cannot index <type> with <key>` message, and every `type_name`
-///   spelling behind it (`tagged_type_name`'s YAML tag resolution included),
-///   is still produced by the reference path rather than re-derived here.
-///
-/// The cost of that conservatism is one wasted partial walk before the
-/// fallback restarts from the root -- O(depth), against the O(document) the
-/// fallback was already going to pay anyway.
-///
-/// A `null` reached mid-walk short-circuits to `null` for the whole
-/// remaining path, matching `getpath_one_path`'s own `(OwnedValue::Null, _)`
-/// arm. That arm fires for *any* segment kind, but every remaining segment
-/// here is already known to be a string or a number (the whole path is
-/// validated up front, before the walk starts), so short-circuiting cannot
-/// swallow a segment kind the reference implementation would have treated
-/// differently.
-///
-/// The final node is materialized through `to_owned_cursor`, **not** handed
-/// back as a bare `GenericResult::OneCursor`. Returning the cursor looks
-/// like a free #607-style duplicate-key/laziness win, but it silently drops
-/// `to_owned_cursor`'s YAML tag resolution (#747), which the reference
-/// path's own root-level `to_owned_with_cursor` applies before its JSON
-/// round trip: caught by differential fuzzing against the pre-change binary,
-/// `a: !!str 1` with `getpath(["a"])` answered `1` instead of `"1"`. This is
-/// a performance issue, so exact equivalence with the reference
-/// implementation's `QueryResult::Owned(current)` is the goal -- the win is
-/// that only the *result subtree* is materialized, never the whole document.
-fn eval_getpath_generic<S: EvalSemantics, V: DocumentValue>(
-    path_expr: &Expr,
-    value: V,
-    optional: bool,
-    cursor: Option<V::Cursor>,
-) -> Option<GenericResult<V>> {
-    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(path_expr) {
-        return None;
-    }
-    if matches!(unwrap_paren(path_expr), Expr::Comma(_)) {
-        return None;
-    }
-    let path_owned = match eval_single::<S, V>(path_expr, value.clone(), optional, cursor) {
-        GenericResult::One(v) => to_owned(&v).ok()?,
-        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
-        GenericResult::Owned(v) => v,
-        _ => return None,
-    };
-    let OwnedValue::Array(segments) = path_owned else {
-        return None;
-    };
-    if !segments.iter().all(|segment| {
-        matches!(
-            segment,
-            OwnedValue::String(_)
-                | OwnedValue::Int(_)
-                | OwnedValue::Float(_)
-                | OwnedValue::NumberLiteral(..)
-        )
-    }) {
-        return None;
-    }
-
-    let mut current = value;
-    let mut current_cursor = cursor;
-    for segment in &segments {
-        match index_one_generic::<V>(current, segment, optional) {
-            GenericResult::OneCursor(c) => {
-                current = c.value();
-                current_cursor = Some(c);
-            }
-            // A missing key or an out-of-bounds index: `null` for the rest
-            // of the path, exactly as `getpath_one_path`'s null arm gives.
-            GenericResult::Owned(OwnedValue::Null) => {
-                return Some(GenericResult::Owned(OwnedValue::Null))
-            }
-            // Every other shape (`Error`, `optional`'s `None`, and the
-            // `Owned(_)` non-null case `index_one_generic` cannot actually
-            // produce) defers to the reference implementation.
-            _ => return None,
-        }
-    }
-    // A decode failure here defers to the reference path too, so its own
-    // `to_owned_checked`/`suppress_or_raise` policy (#1755/#1953) decides
-    // how it surfaces rather than this fast path inventing a second one.
-    Some(GenericResult::Owned(
-        to_owned_with_cursor(&current, current_cursor).ok()?,
-    ))
-}
-
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -8496,35 +8390,24 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        // #1909: same native-arm reasoning as `Builtin::Has` above (#1739)
-        // -- a bounded read of one node has no business paying the `_`
-        // fallback's whole-document round trip. `eval_getpath_generic`
-        // covers only the shapes it can prove match `eval::getpath_one_path`
-        // exactly and returns `None` for the rest, so every error message,
-        // slice-descriptor segment, and generator path still reaches that
-        // reference implementation unchanged.
-        Builtin::GetPath(path_expr) => {
-            match eval_getpath_generic::<S, _>(path_expr, value.clone(), optional, cursor) {
-                Some(result) => result,
-                None => {
-                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                    eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
-                }
-            }
-        }
-
-        // #1909: `path(f)`'s output is a bounded set of path arrays, but
-        // the `_` fallback below charged it a whole-document materialize +
+        // #1909: `path(f)`'s output is a bounded set of path arrays, but the
+        // `_` fallback below charged it a whole-document materialize +
         // re-serialize + re-index round trip *and* a second materialize
-        // inside `eval::builtin_path` itself. `builtin_path_on_owned` is
-        // that function with its own `to_owned_checked` lifted out, so the
-        // tree built here is the only one. See
-        // `eval_path_context_on_owned`.
+        // inside `eval::builtin_path` itself. `builtin_path_on_owned` is that
+        // function with its own `to_owned_checked` lifted out, so the tree
+        // built here is the only one -- taken only where the round trip it
+        // replaces was a semantic no-op, and falling back to that round trip
+        // verbatim otherwise. See `reindex_bridge_is_identity`, and the
+        // `Expr::Pipe` arm above for why `optional` isn't threaded in.
         Builtin::Path(path_expr) => {
             let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-            eval_path_context_on_owned::<S, V>(
-                crate::jq::eval::builtin_path_on_owned::<Vec<u64>, S>(path_expr, &owned, false),
-            )
+            if reindex_bridge_is_identity(&owned) {
+                return query_result_to_generic::<V>(crate::jq::eval::builtin_path_on_owned::<
+                    Vec<u64>,
+                    S,
+                >(path_expr, &owned, false));
+            }
+            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
 
         Builtin::Empty => GenericResult::None,
@@ -8694,6 +8577,154 @@ mod tests {
     use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
+
+    /// #1909: [`reindex_bridge_is_identity`] claims to describe exactly when
+    /// `eval_on_owned`'s serialize + `JsonIndex::build` + `to_owned_checked`
+    /// round trip leaves a value unchanged — the whole basis for the
+    /// path-context arms skipping that round trip. A predicate that says
+    /// "identity" about a value the bridge actually rewrites is a silent
+    /// correctness bug, so assert the two against each other directly rather
+    /// than trusting the reasoning in its doc comment (CLAUDE.md:
+    /// "duplicated predicates diverge silently").
+    ///
+    /// Both directions matter, so the corpus deliberately straddles every
+    /// boundary the predicate draws: a bare `Float` and a bare `Int` (both
+    /// rewritten), a NaN literal (replaced by `NAN_SENTINEL`), and a
+    /// `NumberLiteral` either side of `REINDEX_LITERAL_LEN_CAP` — that last
+    /// pair is what pins the cap itself, which is duplicated from a private
+    /// `const` inside `to_json_for_reindex`'s body and cannot be shared.
+    #[test]
+    fn test_reindex_bridge_identity_predicate_agrees_1909() {
+        // A literal at, and one past, the length cap. Both parse to the same
+        // number; only the longer one loses its text on the round trip.
+        let at_cap = format!("0.{}1", "0".repeat(super::REINDEX_LITERAL_LEN_CAP - 3));
+        let past_cap = format!("0.{}1", "0".repeat(super::REINDEX_LITERAL_LEN_CAP));
+        assert_eq!(at_cap.len(), super::REINDEX_LITERAL_LEN_CAP);
+        assert!(past_cap.len() > super::REINDEX_LITERAL_LEN_CAP);
+        assert!(super::reindex_bridge_is_identity(
+            &OwnedValue::from_number_literal(&at_cap)
+        ));
+        assert!(!super::reindex_bridge_is_identity(
+            &OwnedValue::from_number_literal(&past_cap)
+        ));
+
+        let corpus: Vec<OwnedValue> = vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::String(String::new()),
+            OwnedValue::String("a \" b \\ c \n \u{1f600} \u{7f}".to_string()),
+            OwnedValue::from_number_literal("1"),
+            OwnedValue::from_number_literal("-0"),
+            OwnedValue::from_number_literal("3.5"),
+            OwnedValue::from_number_literal("1e18"),
+            OwnedValue::from_number_literal("10000000000000000000.0"),
+            OwnedValue::from_number_literal("123e400"),
+            OwnedValue::from_number_literal(&at_cap),
+            OwnedValue::from_number_literal(&past_cap),
+            OwnedValue::Int(7),
+            OwnedValue::Float(3.5),
+            OwnedValue::Float(1e19),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Array(Vec::new()),
+            OwnedValue::Object(IndexMap::new()),
+            OwnedValue::Array(vec![
+                OwnedValue::from_number_literal("1"),
+                OwnedValue::String("x".to_string()),
+            ]),
+            // A rewritten value nested under an otherwise-clean container
+            // must make the whole tree fail the predicate.
+            OwnedValue::Object(IndexMap::from([
+                ("ok".to_string(), OwnedValue::from_number_literal("1")),
+                ("bad".to_string(), OwnedValue::Float(1e19)),
+            ])),
+            OwnedValue::Object(IndexMap::from([
+                ("a \" b".to_string(), OwnedValue::from_number_literal("2")),
+                ("\u{1f600}".to_string(), OwnedValue::Bool(false)),
+            ])),
+        ];
+
+        // Soundness, the direction that matters: whenever the predicate
+        // says "identity", the real round trip must actually be one. The
+        // converse is deliberately *not* asserted -- the predicate is allowed
+        // to be conservative (`false` for something the bridge happens to
+        // leave alone costs a missed optimization, never a wrong answer), and
+        // it genuinely is for a very long literal, which Rust's `Display` for
+        // a small-magnitude float re-emits in the same decimal spelling.
+        for value in &corpus {
+            for (tag, actually_identity) in [
+                ("jq", round_trips_unchanged::<JqSemantics>(value)),
+                ("yq", round_trips_unchanged::<YqSemantics>(value)),
+            ] {
+                assert!(
+                    !super::reindex_bridge_is_identity(value) || actually_identity,
+                    "reindex_bridge_is_identity claims the {tag}-mode bridge \
+                     leaves {value:?} unchanged, but it does not"
+                );
+            }
+        }
+
+        // ...and reachability, so a predicate that stays sound by answering
+        // `false` to everything (which would silently un-fix #1909 while
+        // every other test still passed) fails here instead.
+        for value in [
+            &corpus[0],
+            &OwnedValue::from_number_literal("1"),
+            &OwnedValue::from_number_literal("3.5"),
+            &OwnedValue::Array(vec![
+                OwnedValue::from_number_literal("1"),
+                OwnedValue::String("x".to_string()),
+            ]),
+            &OwnedValue::Object(IndexMap::from([(
+                "ok".to_string(),
+                OwnedValue::from_number_literal("1"),
+            )])),
+        ] {
+            assert!(
+                super::reindex_bridge_is_identity(value),
+                "the bypass must fire for an ordinary document-sourced value: {value:?}"
+            );
+        }
+
+        // The shape the guard exists for: a bare `Float`, which #953's
+        // mode-forked re-spelling rewrites. Asserted in both directions --
+        // the predicate refuses it, *and* the bridge really does change it,
+        // so this case can't quietly stop being a real one.
+        let respelled = OwnedValue::Float(1e19);
+        assert!(!super::reindex_bridge_is_identity(&respelled));
+        assert!(
+            !round_trips_unchanged::<YqSemantics>(&respelled),
+            "sanity: the yq-mode bridge really does rewrite {respelled:?}"
+        );
+        assert!(
+            !round_trips_unchanged::<JqSemantics>(&respelled),
+            "sanity: the jq-mode bridge really does rewrite {respelled:?}"
+        );
+    }
+
+    /// The real thing `reindex_bridge_is_identity` predicts: run `value`
+    /// through `eval_on_owned`'s exact bridge (`to_json_for_reindex`,
+    /// `JsonIndex::build`, `to_owned_checked` via `owned_from_standard_json`)
+    /// and report whether it came back unchanged.
+    fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {
+        use crate::json::JsonIndex;
+        let json = value.to_json_for_reindex::<S>();
+        let bytes = json.as_bytes();
+        let index = JsonIndex::build(bytes);
+        let cursor = index.root(bytes);
+        match owned_from_standard_json(&cursor.value()) {
+            // Structural equality, not `==`: `OwnedValue`'s `PartialEq`
+            // compares a `NumberLiteral` by its parsed `NumberRepr` and
+            // ignores the source text, but that text is exactly what #1008's
+            // literal preservation echoes back on output -- so a value whose
+            // spelling the bridge rewrote (`0.000...1` -> `1e-257`) compares
+            // *equal* while behaving differently. The derived `Debug` shows
+            // the text; that is the identity this predicate has to be about.
+            Ok(round_tripped) => format!("{round_tripped:?}") == format!("{value:?}"),
+            // A value the bridge cannot even reparse is certainly not one the
+            // bypass may claim is unchanged.
+            Err(_) => false,
+        }
+    }
 
     /// #1098/#1247: `JsonIndex::build`'s semi-index scan finds string
     /// quote/escape *boundaries* but never decodes/validates the bytes
