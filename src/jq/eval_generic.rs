@@ -1704,7 +1704,10 @@ fn query_result_to_generic<V: DocumentValue>(
 /// Duplicated from that function rather than shared because it is a private
 /// `const` inside its body. `test_reindex_bridge_identity_predicate_agrees_1909`
 /// is what keeps the two from drifting: it round-trips a literal either side
-/// of this length and asserts the predicate and the actual round trip agree.
+/// of this length through the real bridge and checks the predicate never
+/// claims identity where the bridge did not deliver one. If the cap there
+/// ever *shrinks*, a short literal in that test's corpus starts being
+/// rewritten while this predicate still admits it, and the test fails.
 const REINDEX_LITERAL_LEN_CAP: usize = 256;
 
 /// Whether `eval_on_owned`'s reindex bridge -- serialize with
@@ -8607,12 +8610,23 @@ mod tests {
     /// than trusting the reasoning in its doc comment (CLAUDE.md:
     /// "duplicated predicates diverge silently").
     ///
-    /// Both directions matter, so the corpus deliberately straddles every
-    /// boundary the predicate draws: a bare `Float` and a bare `Int` (both
-    /// rewritten), a NaN literal (replaced by `NAN_SENTINEL`), and a
-    /// `NumberLiteral` either side of `REINDEX_LITERAL_LEN_CAP` — that last
-    /// pair is what pins the cap itself, which is duplicated from a private
-    /// `const` inside `to_json_for_reindex`'s body and cannot be shared.
+    /// The corpus straddles every boundary the predicate draws: a bare
+    /// `Float` (re-spelled), a bare `Int` (normalized to a `NumberLiteral`
+    /// carrying the same text it already rendered as — the one sanctioned
+    /// exception, spelled out in `round_trips_unchanged`), a NaN literal
+    /// (replaced by `NAN_SENTINEL`), and a `NumberLiteral` either side of
+    /// `REINDEX_LITERAL_LEN_CAP`, which is duplicated from a private `const`
+    /// inside `to_json_for_reindex`'s body and cannot be shared.
+    ///
+    /// What is asserted is **soundness** — predicate ⟹ the bridge really was
+    /// an identity — not equivalence. Conservatism is free here (a `false`
+    /// for something the bridge happens to leave alone costs a missed
+    /// optimization, never a wrong answer), and the predicate genuinely is
+    /// conservative for a very long literal, which Rust's `Display` for a
+    /// small-magnitude float re-emits in the same decimal spelling. A
+    /// separate reachability block stops that latitude from being abused: a
+    /// predicate that stayed sound by answering `false` to everything would
+    /// silently un-fix #1909 while every other test still passed.
     #[test]
     fn test_reindex_bridge_identity_predicate_agrees_1909() {
         // A literal at, and one past, the length cap. Both parse to the same
