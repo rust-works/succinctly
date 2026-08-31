@@ -2661,6 +2661,22 @@ impl<V: DocumentValue> GenericResult<V> {
         matches!(self, Self::Error(_) | Self::Partial(_, Control::Error(_)))
     }
 
+    /// Whether evaluating this ended in *any* control -- an error, a
+    /// `break`, or a `halt` -- rather than only an error like
+    /// [`Self::is_error`].
+    ///
+    /// The generic twin of `eval::QueryResult::is_escape`, and needed for
+    /// the same reason: it answers "must the caller stop pulling?" without
+    /// consuming the result, which is what lets [`fanout_arg_generic`]
+    /// decide whether a `body` result can be buffered for its single-output
+    /// fast path before it has been flattened (#1531).
+    fn is_escape(&self) -> bool {
+        matches!(
+            self,
+            Self::Error(_) | Self::Break(_) | Self::Halt(_) | Self::Partial(_, _)
+        )
+    }
+
     /// Get the error if this is an error result.
     pub fn error(&self) -> Option<&EvalError> {
         match self {
@@ -6208,38 +6224,30 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
 /// `eval_limit_generic`'s own `None` return, except this function has no
 /// caller to hand a `None` back to, so it performs the bridge/drain itself.
 ///
-/// Guarded exactly like [`eval_limit_generic`], and for the identical two
-/// reasons (see that function's own doc comment): [`limit_or_nth_uses_live_input_queue`]
-/// defers to the bridge *before* touching a live `input`/`inputs` queue, and
-/// a bare top-level `Comma` `n_expr` is detected statically and deferred
-/// without ever evaluating it here first -- so the bridge's own single
-/// `eval_on_owned` call is the only evaluation of `n_expr`, not a second one
-/// stacked on top of a `eval_single` call this function already made. Without
-/// these two checks, `n_expr` would double-evaluate here whenever it fell
-/// through to the bridge below (confirmed live: `first(limit((1,("N"|debug));
-/// 42))` wrote `"N"` to `debug` twice instead of once before this guard
-/// existed) -- exactly the class of leak #1596 exists to close, reintroduced
-/// one arm over.
+/// Guarded exactly like [`eval_limit_generic`] (see that function's own doc
+/// comment): [`limit_or_nth_uses_live_input_queue`] defers to the bridge
+/// *before* touching a live `input`/`inputs` queue, so the bridge's own
+/// single `eval_on_owned` call is the only evaluation of `n_expr`.
 ///
-/// **A generator `n_expr` is a documented residual even once guarded.**
-/// `eval_on_owned`'s own `full_eval` call has no demand to forward -- it
-/// answers with a fully materialized `QueryResult`, collecting every output
-/// across every `n_expr` binding `limit`'s own backtracking arg-passing
-/// contract explores, *before* `drain_result_generic` ever gets a chance to
-/// apply a wrapping `first`/`nth`'s smaller demand to what comes back.
-/// Live-verified against pinned jq 1.7.1: `first(limit((1,2); (1,
-/// ("B"|stderr))))` -- the exact bare-top-level-`Comma` shape this guard
-/// exists to make safe from double-evaluation -- still writes `B` to
-/// stderr here, where jq never explores the `$n=2` binding at all once
-/// `first` is satisfied by `$n=1`'s own single output. A non-`first`/`last`
-/// consumer wanting *every* output (`[limit((1,2); (1, ("B"|stderr)))]`)
-/// correctly writes `B` in both tools -- that shape needs `$n=2`'s
-/// exploration regardless, so the two rows aren't actually inconsistent,
-/// just differently demanding. Closing this needs `eval.rs` to expose a
-/// demand-aware entry point for a generator-`n_expr` `limit` (`each_limit`
-/// only reaches its own generator-`n` case through the same
-/// fully-materializing route today), which is a larger change than this
-/// arm's own scope -- tracked as a residual, not silently reintroduced.
+/// That guard used to have a sibling -- a static "is `n_expr` a bare
+/// top-level `Comma`?" check, deferring without evaluating so the bridge's
+/// evaluation would not be stacked on top of a probe this function had
+/// already made (`first(limit((1,("N"|debug)); 42))` wrote `"N"` twice
+/// before it existed, the class of leak #1596 closed). #1687 removed the
+/// need for it: [`fanout_arg_each_generic`] drives `n_expr` exactly once for
+/// every shape, so there is no probe to double up on and nothing to detect
+/// statically.
+///
+/// **A generator `n_expr` used to be a documented residual here; #1687 closed
+/// it.** The bridge this arm used to take for that shape answers with a fully
+/// materialized `QueryResult`, collecting every output across every `n_expr`
+/// binding before `drain_result_generic` could apply a wrapping `first`/`nth`'s
+/// smaller demand -- so `first(limit((1,2); (1, ("B"|stderr))))` wrote `B` to
+/// stderr where jq never explores the `$n=2` binding at all. Driving `n_expr`
+/// through [`fanout_arg_each_generic`] instead keeps the whole nest
+/// demand-driven, and both tools now write nothing there, while the
+/// genuinely-every-output shape (`[limit((1,2); (1, ("B"|stderr)))]`) still
+/// correctly writes `B` in both.
 fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     n_expr: &Expr,
     expr: &Expr,
@@ -6255,37 +6263,26 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
         expr: Box::new(expr.clone()),
     };
 
-    if limit_or_nth_uses_live_input_queue(n_expr, expr)
-        || matches!(unwrap_paren(n_expr), Expr::Comma(_))
-    {
+    if limit_or_nth_uses_live_input_queue(n_expr, expr) {
         return bridge_to_full_evaluator_flow::<S, V>(&bridged, value, cursor, optional, sink);
     }
 
-    let n_result = eval_single::<S, V>(n_expr, value.clone(), optional, cursor);
-    let n_value = match n_result {
-        GenericResult::One(v) => match to_owned(&v) {
-            Ok(o) => o,
-            Err(e) => return Flow::Escaped(Control::Error(e)),
-        },
-        GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
-            Ok(o) => o,
-            Err(e) => return Flow::Escaped(Control::Error(e)),
-        },
-        GenericResult::Owned(v) => v,
-        GenericResult::None => return Flow::Exhausted,
-        GenericResult::Error(e) => return Flow::Escaped(Control::Error(e)),
-        GenericResult::Break(label) => return Flow::Escaped(Control::Break(label)),
-        GenericResult::Halt(code) => return Flow::Escaped(Control::Halt(code)),
-        // A generator `n_expr` broader than a bare top-level `Comma` (e.g. a
-        // `Pipe` whose middle stage is the comma) still costs a second
-        // `n_expr` evaluation here, same documented residual gap as
-        // `eval_limit_generic`'s own identical fallback -- narrowing it
-        // further isn't needed to fix #1596's own leak.
-        _ => {
-            return bridge_to_full_evaluator_flow::<S, V>(&bridged, value, cursor, optional, sink)
-        }
-    };
+    fanout_arg_each_generic::<S, V, _>(n_expr, value.clone(), optional, cursor, |n_value| {
+        each_limit_with_n_generic::<S, V>(n_value, expr, value.clone(), optional, cursor, sink)
+    })
+}
 
+/// `limit(n; expr)`'s sink-driven work for one already-resolved `n` --
+/// [`each_limit_generic`]'s per-`n` body, split out for the fan-out exactly
+/// as [`limit_with_n_generic`] was split out of [`eval_limit_generic`].
+fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => {
             return eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
@@ -6814,35 +6811,193 @@ fn limit_or_nth_uses_live_input_queue(n_expr: &Expr, expr: &Expr) -> bool {
 /// the eager `_` fallback below would drain the whole remaining queue
 /// instead of stopping at `n`/index `n`.
 ///
-/// Returns `None` to defer to the caller's own fallback rather than
-/// handling every shape `eval.rs`'s `eval_limit`/`fanout_arg` do: only the
-/// common case — `n_expr` evaluates to exactly one plain value — is taken
-/// natively here, via [`eval_each_generic`]'s own demand-driven `Pipe`/
-/// `Iterate`/`LazyKeys` machinery (what keeps `expr`'s duplicate keys
-/// alive). `n_expr` as a *generator* (`limit((1,2); f)`, re-running `expr`
-/// once per `n` value, #1279) is jq's own rarer laziness contract, which
-/// `eval.rs`'s `fanout_arg` already implements correctly for every
-/// document `eval.rs` can represent losslessly — reproducing that richness
-/// here isn't needed to fix this issue's actual bug (a generator `n_expr`
-/// still loses `expr`'s duplicate keys on the deferred fallback path,
-/// exactly as before this fix; tracked as a residual gap, not silently
-/// reintroduced).
+/// Returns `None` only for the live `input`/`inputs` queue, which must reach
+/// `eval.rs` untouched. Every other shape is handled natively, via
+/// [`eval_each_generic`]'s own demand-driven `Pipe`/`Iterate`/`LazyKeys`
+/// machinery -- what keeps `expr`'s duplicate keys alive.
 ///
-/// A **bare top-level `Comma`** (`limit((1,2); f)`, matching #1279's own
-/// canonical example) is detected statically and deferred *without* ever
-/// evaluating `n_expr` here, so the caller's single fallback evaluation is
-/// the only one — closing the double-evaluation this fix would otherwise
-/// cause for exactly that shape. This check is deliberately shallow: it
-/// only recognizes `n_expr` itself being (optionally parenthesized) a
-/// `Comma`, not a `Comma` buried inside some other construct (e.g.
-/// `(1|debug,2|debug)` parses as a `Pipe` whose middle stage is the
-/// `Comma`, not a bare one) — that broader shape, and any other
-/// side-effecting `n_expr` that isn't a plain literal or a bare comma,
-/// still costs a second `n_expr` evaluation on the fallback path.
-/// Live-verified: `debug` inside such an `n_expr` fires twice here where
-/// real jq fires it once. `input`/`inputs` inside `n_expr` is unaffected
-/// by this residual gap — that shape is caught unconditionally by the
-/// input-queue guard above, before any evaluation is attempted.
+/// **A generator `n_expr` is one of those shapes now (#1687 items 2 and 3).**
+/// `limit((1,2); f)` re-runs `expr` once per `n` value (jq's own rarer
+/// laziness contract, #1279); this used to probe `n_expr` with `eval_single`,
+/// discover it was not a single value, and defer -- which cost both the
+/// duplicate keys the native path existed to preserve *and* a second
+/// evaluation of `n_expr`, so a `debug` inside it fired twice where jq fires
+/// it once. [`fanout_arg_generic`] drives `n_expr` once and runs
+/// [`limit_with_n_generic`] per value instead, so neither cost remains, and
+/// the shallow "is it a bare top-level `Comma`?" check that partially
+/// mitigated the second one is gone with them.
+/// Run `body` once per output of `arg_expr`, concatenating the results --
+/// the generic-evaluator twin of `eval::fanout_arg`'s `ArgFanout::All` arm
+/// (#1279), which is the only fan-out mode this file's callers need.
+///
+/// Before this existed, `eval_limit_generic`/`eval_nth_generic`/
+/// `eval_has_generic` each *probed* their argument with `eval_single`, and
+/// on discovering more than one output gave up and re-evaluated the entire
+/// expression through the lossy `OwnedValue` bridge. That cost two things
+/// #1687 names as separate defects: the argument was evaluated twice, so a
+/// `debug`/`stderr` inside it fired twice where jq fires once (item 3); and
+/// the bridge collapsed every duplicate mapping key the native path existed
+/// to preserve (item 2). Driving the argument through [`eval_each_generic`]
+/// once and calling `body` per value fixes both at once, and lets all three
+/// callers drop their private, shallow "is the argument a bare top-level
+/// `Comma`?" guard -- the third copy of which `eval_has_generic`'s own doc
+/// comment already flagged as the wrong pattern.
+///
+/// `pending_first` is load-bearing, not an optimization: it holds `body`'s
+/// result for a first argument value whose successor has not arrived yet, so
+/// the overwhelmingly common single-output case returns that result
+/// *unflattened*. Without it every `limit(3; .[])` would be forced through
+/// `Vec<OwnedValue>` and would lose exactly the `ManyCursor`/`LazySeq` shape
+/// #1607 added it to keep. A second value flushes it into `out` before that
+/// value's own result is appended, so ordering is unaffected.
+/// [`fanout_arg_generic`] for a sink-driven caller: run `body` once per
+/// output of `arg_expr`, and stop pulling further argument values the moment
+/// `body` reports the downstream consumer has had enough.
+///
+/// That last property is the whole reason this exists separately rather than
+/// the eager version being reused. `first(limit((1,2); (1, ("B"|stderr))))`
+/// must never explore the `$n=2` binding at all -- jq does not, because
+/// `first` satisfies itself from `$n=1`'s own single output and the whole
+/// nest is demand-driven. Routing that shape through the eager
+/// `OwnedValue` bridge, as `each_limit_generic` did before #1687, ran every
+/// binding to completion before any demand could apply, writing `B` to
+/// stderr where jq writes nothing -- a divergence `each_limit_generic`'s own
+/// doc comment recorded as a residual and this closes.
+fn fanout_arg_each_generic<S: EvalSemantics, V: DocumentValue, B>(
+    arg_expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    mut body: B,
+) -> Flow
+where
+    B: FnMut(OwnedValue) -> Flow,
+{
+    // Tracked out-of-band for the usual reason: the sink can only answer
+    // `Demand`, so "why did the pull stop" has to be recorded beside it.
+    let mut escape: Option<Control> = None;
+    let mut consumer_stopped = false;
+
+    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        let owned = match generic_item_into_owned(item) {
+            Ok(owned) => owned,
+            Err(control) => {
+                escape = Some(control);
+                return Demand::Stop;
+            }
+        };
+        match body(owned) {
+            // This `n`'s own walk finished; go on to the next one.
+            Flow::Exhausted => Demand::Continue,
+            // The downstream consumer said stop. Its verdict outranks the
+            // argument generator's, exactly as it does inside
+            // `each_limit_generic`'s own inner sink.
+            Flow::Stopped { .. } => {
+                consumer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        // `pending` is dropped for the reason every other lazy consumer
+        // drops it: it belongs to an eager fallback jq would never reach.
+        None if consumer_stopped => Flow::Stopped { pending: None },
+        None => flow,
+    }
+}
+
+fn fanout_arg_generic<S: EvalSemantics, V: DocumentValue, B>(
+    arg_expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    mut body: B,
+) -> GenericResult<V>
+where
+    B: FnMut(OwnedValue) -> GenericResult<V>,
+{
+    let mut out: Vec<OwnedValue> = Vec::new();
+    let mut body_control: Option<Control> = None;
+    let mut pending_first: Option<GenericResult<V>> = None;
+    // An argument value that cannot be decoded at all (#1247). Tracked
+    // out-of-band because the sink can only answer `Demand`, and reported
+    // ahead of `flow` below since it is the reason the pull stopped.
+    let mut decode_err: Option<Control> = None;
+
+    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        let owned = match generic_item_into_owned(item) {
+            Ok(owned) => owned,
+            Err(control) => {
+                decode_err = Some(control);
+                return Demand::Stop;
+            }
+        };
+        if let Some(previous) = pending_first.take() {
+            if let Some(control) = push_generic_owned_values(previous, &mut out) {
+                body_control = Some(control);
+                return Demand::Stop;
+            }
+        }
+        let result = body(owned);
+        // A `body` failure stops the pull *here*, so the argument's
+        // remaining outputs are never evaluated -- `eval::fanout_arg`'s
+        // rules 2/4. Checked before buffering, or an escaping first result
+        // would be parked and the sink would ask for another value anyway.
+        if result.is_escape() {
+            if let Some(control) = push_generic_owned_values(result, &mut out) {
+                body_control = Some(control);
+            }
+            return Demand::Stop;
+        }
+        if out.is_empty() && pending_first.is_none() {
+            pending_first = Some(result);
+        } else if let Some(control) = push_generic_owned_values(result, &mut out) {
+            body_control = Some(control);
+            return Demand::Stop;
+        }
+        Demand::Continue
+    });
+
+    // Whatever `body` already produced still stands in front of the control,
+    // exactly as it does for the argument's own escape below.
+    let flush_pending = |pending: Option<GenericResult<V>>,
+                        out: &mut Vec<OwnedValue>|
+     -> Option<Control> { pending.and_then(|p| push_generic_owned_values(p, out)) };
+
+    if let Some(control) = decode_err {
+        let control = flush_pending(pending_first, &mut out).unwrap_or(control);
+        return partial_generic(out, control);
+    }
+    match flow {
+        // `pending_first` is `Some` here exactly when one value was
+        // delivered and `body` did not escape -- the single-output fast path.
+        Flow::Exhausted => match pending_first {
+            Some(result) => result,
+            None => owned_vec_to_generic_result(out),
+        },
+        // Our sink is the only thing that stops this pull, and it does so
+        // only after recording `body_control`. `pending` is dropped for the
+        // reason every other lazy consumer drops it: it belongs to an eager
+        // fallback jq would never have reached.
+        Flow::Stopped { .. } => match body_control {
+            Some(control) => partial_generic(out, control),
+            None => owned_vec_to_generic_result(out),
+        },
+        // The argument's own control fires only after every body result
+        // already produced, so a buffered first must be flushed ahead of it.
+        Flow::Escaped(control) => {
+            let control = flush_pending(pending_first, &mut out).unwrap_or(control);
+            partial_generic(out, control)
+        }
+    }
+}
+
 fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
     n_expr: &Expr,
     expr: &Expr,
@@ -6853,25 +7008,41 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
     if limit_or_nth_uses_live_input_queue(n_expr, expr) {
         return None;
     }
-    if matches!(unwrap_paren(n_expr), Expr::Comma(_)) {
-        return None;
-    }
+    // `n` is the OUTER loop and `expr` the inner one, re-evaluated once per
+    // `n` output -- `[limit((1,2); (10,20,30))]` is `[10,10,20]`, not
+    // `[10,20,10]` (live-verified against jq 1.7.1, and the rule
+    // `eval::eval_limit`'s own `fanout_arg` call already implements).
+    Some(fanout_arg_generic::<S, V, _>(
+        n_expr,
+        value.clone(),
+        optional,
+        cursor,
+        |n_value| limit_with_n_generic::<S, V>(n_value, expr, value.clone(), optional, cursor),
+    ))
+}
 
-    let n_value = match eval_single::<S, V>(n_expr, value.clone(), optional, cursor) {
-        GenericResult::One(v) => to_owned(&v).ok()?,
-        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
-        GenericResult::Owned(v) => v,
-        _ => return None,
-    };
+/// `limit(n; expr)`'s work for one already-resolved `n` -- the body of
+/// [`eval_limit_generic`], run once per output of its `n` generator.
+///
+/// Split out for #1687 exactly as `eval::limit_with_n` was split out of
+/// `eval::eval_limit` for #1279, and for the same reason: the fan-out needs
+/// a per-`n` body to call.
+fn limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => {
-            return Some(eval_single::<S, V>(expr, value, optional, cursor));
+            return eval_single::<S, V>(expr, value, optional, cursor);
         }
         Ok(LimitN::Take(n)) => n,
-        Err(e) => return Some(GenericResult::Error(e)),
+        Err(e) => return GenericResult::Error(e),
     };
     if n == 0 {
-        return Some(GenericResult::None);
+        return GenericResult::None;
     }
 
     // Pull at most `n`, then stop the generator -- mirrors `eval.rs`'s own
@@ -6889,7 +7060,7 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
             Demand::Continue
         }
     });
-    Some(match flow {
+    match flow {
         // The sink returns `Demand::Stop` the instant `out.len() >= n`, and
         // every `eval_each_generic` arm stops pulling as soon as `Demand`
         // says to -- so an escape can only fire *before* that point, never
@@ -6925,13 +7096,13 @@ fn eval_limit_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(result) => result,
             Err((prefix, control)) => partial_generic(prefix, control),
         },
-    })
+    }
 }
 
 /// Native `Builtin::NthStream`/`Expr::NthExpr` arm for the generic evaluator
 /// (#1607) — [`eval_limit_generic`]'s twin, same root cause, same deferral
 /// contract (see its doc comment, including the input-queue guard and the
-/// static-`Comma` detection). jq defines `nth($n; f)` as
+/// generator-`n` fan-out). jq defines `nth($n; f)` as
 /// `last(limit($n + 1; f))`, so this pulls only as far as index `n` then
 /// stops, mirroring `eval.rs`'s own `each_take_nth`.
 ///
@@ -6952,19 +7123,30 @@ fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
     if limit_or_nth_uses_live_input_queue(n_expr, expr) {
         return None;
     }
-    if matches!(unwrap_paren(n_expr), Expr::Comma(_)) {
-        return None;
-    }
+    // Same outer/inner nesting as `limit` -- `[nth((0,1); (10,20,30))]` is
+    // `[10,20]`, one full walk of `expr` per `n`.
+    Some(fanout_arg_generic::<S, V, _>(
+        n_expr,
+        value.clone(),
+        optional,
+        cursor,
+        |n_value| nth_with_n_generic::<S, V>(n_value, expr, value.clone(), optional, cursor),
+    ))
+}
 
-    let n_value = match eval_single::<S, V>(n_expr, value.clone(), optional, cursor) {
-        GenericResult::One(v) => to_owned(&v).ok()?,
-        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
-        GenericResult::Owned(v) => v,
-        _ => return None,
-    };
+/// `nth(n; expr)`'s work for one already-resolved `n` -- [`eval_nth_generic`]'s
+/// per-`n` body, split out for the fan-out exactly as
+/// [`limit_with_n_generic`] was.
+fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
+    n_value: OwnedValue,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
     let n = match classify_nth_n(n_value) {
         Ok(n) => n,
-        Err(e) => return Some(GenericResult::Error(e)),
+        Err(e) => return GenericResult::Error(e),
     };
 
     let mut seen = 0usize;
@@ -7006,7 +7188,7 @@ fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
     // kept cursor-backed ([`generic_item_to_result`], #607's own
     // conversion) rather than forced through `OwnedValue`, so a duplicate
     // key *inside* it survives too, not just across the walk to reach it.
-    Some(if let Some(item) = wanted {
+    if let Some(item) = wanted {
         generic_item_to_result(item)
     } else if let Some(control) = skipped_err {
         partial_generic(Vec::new(), control)
@@ -7015,7 +7197,7 @@ fn eval_nth_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Stopped { .. } | Flow::Exhausted => GenericResult::None,
             Flow::Escaped(control) => partial_generic(Vec::new(), control),
         }
-    })
+    }
 }
 
 /// Convert a batch of pulled [`GenericItem`]s into the smallest
@@ -7827,27 +8009,34 @@ fn collect_paths_generic<S: EvalSemantics, V: DocumentValue>(
 /// discovers it isn't a single value, leaving the fallback to run against an
 /// already-empty queue (code review, #1739).
 ///
-/// Also mirrors `eval_limit_generic`'s bare-top-level-`Comma` static check
-/// (same doc comment, same reasoning): `has(("a","b"))`'s key is a generator
-/// by construction, so probing it here would run any side effect inside it
-/// (`has(("a"|stderr),"z")`) once during the probe and a second time when
-/// the fallback below re-evaluates the whole, unmodified `key_expr` from
-/// scratch -- detecting the shape statically, without ever calling
-/// `eval_single` on it, keeps the fallback's own evaluation the only one.
+/// Also keeps a static bare-top-level-`Comma` check: `has(("a","b"))`'s key
+/// is a generator by construction, so probing it here would run any side
+/// effect inside it (`has(("a"|stderr),"z")`) once during the probe and a
+/// second time when the fallback below re-evaluates the whole, unmodified
+/// `key_expr` from scratch -- detecting the shape statically, without ever
+/// calling `eval_single` on it, keeps the fallback's own evaluation the only
+/// one.
 ///
-/// This check is deliberately shallow, same as `eval_limit_generic`'s own
-/// (see its doc comment): it only recognizes `key_expr` itself being an
-/// (optionally parenthesized) top-level `Comma`, not one buried inside some
-/// other construct (`if true then ("a"|stderr),"z" else "q" end`, or any
-/// `key_expr` that raises an error rather than yielding a plain value). Such
-/// a shape still gets probed once here, discovers it isn't a single value,
-/// and falls back to a second full evaluation -- a known, already-shipped
-/// residual gap for `limit`/`nth` (#1607, tracked further in #1687 item 3),
-/// not attempted to be closed generally here either. A shared "materialize
-/// N outputs losslessly, without double-evaluating a probe" primitive is
-/// #1687's own suggested direction for actually closing this class; adding
-/// a third one-off native arm with the identical shallow guard isn't that
-/// fix (code review, #1739).
+/// The check is deliberately shallow: it only recognizes `key_expr` itself
+/// being an (optionally parenthesized) top-level `Comma`, not one buried
+/// inside some other construct (`if true then ("a"|stderr),"z" else "q" end`,
+/// or any `key_expr` that raises an error rather than yielding a plain
+/// value). Such a shape still gets probed once here, discovers it isn't a
+/// single value, and falls back to a second full evaluation.
+///
+/// **`limit`/`nth` no longer share this residual; `has` deliberately still
+/// does.** #1687 built [`fanout_arg_generic`] -- the shared "run the body
+/// once per argument output, without double-evaluating a probe" primitive
+/// #1739's own review asked for -- and moved `eval_limit_generic`/
+/// `eval_nth_generic`/`each_limit_generic` onto it, deleting their copies of
+/// this guard. `has` is not moved with them because it needs a fan-out mode
+/// that primitive does not model: real yq takes only a multi-output key's
+/// *first* output where jq fans out (`ArgFanout::yq_native`), and
+/// `fanout_arg_generic` implements `ArgFanout::All` alone, which is all its
+/// three callers need. Reproducing yq's truncation (and
+/// `clear_values_when_yq_argument_escaped`, which rides with it) here would
+/// be a second copy of `eval::fanout_arg`'s non-`All` half -- so `has`
+/// keeps handing that shape to the one existing implementation instead.
 fn eval_has_generic<S: EvalSemantics, V: DocumentValue>(
     key_expr: &Expr,
     value: V,
