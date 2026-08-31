@@ -536,6 +536,31 @@ is the revert that established what the other one costs.
    into `resolve_node`/`resolve_leaf` as a parameter rather than carrying it on the branch,
    which is a materially larger change across that function's ~20-call-site dispatch graph.
 
+   The register is also carried **only across stages this resolver can prove did not move
+   it** (`cannot_move_register`, `src/jq/eval.rs`). jq's register advances on any `INDEX`
+   its own bytecode executes, which includes the ones hidden inside a jq-*defined* builtin
+   (`first` is `.[0]`, `add` is `reduce .[] as $x ...`) or a user function body — stages
+   that reach the resolver as one opaque computed value. Assuming those left the register
+   alone made `path(. as $x \| ([.a]\|first) \| $x)` answer `[]` where jq refuses, and
+   `=`/`|=`/`del()` then wrote through the fabricated path, so the allowlist is deliberately
+   narrow and everything outside it drops the register. Three shapes jq answers therefore
+   refuse here: a construction or interpolation that itself navigates
+   (`path(. as $x \| [.a] \| $x)`, `{k:.a}`, `"\(.a)"` — excluded because jq *also* raises
+   for a `.a` applied to a computed value, which this resolver never sees inside a
+   construction: `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the second `.a`),
+   an `as` whose bind source navigates, and a `def` whose body is a constant
+   (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its body is not something a
+   syntactic predicate can do from a name). All three are refuse-only.
+
+   A fourth refusal is the `null`/`false` half of `register_identical` applied one stage
+   earlier than succinctly reaches: `path(.a \| null)` on `{"a":null}` and `path(.a \| false)`
+   on `{"a":false}` are `["a"]` in jq — the literal never moved the register, and a `null` is
+   `jv_identical` to a `null` whatever node it came from — while succinctly refuses, because
+   `reestablishes_register` only re-establishes a branch that is *already* untracked and a
+   stage sitting directly on a trackable one never gets there. Pre-existing (it predates the
+   register threading), refuse-only, and closing it is a widening that needs its own live
+   matrix.
+
    Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
    marker at all, because `substitute_var_tracked` remains gated on
    `is_identity_passthrough` — so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`,
