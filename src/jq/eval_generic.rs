@@ -1642,7 +1642,20 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
     // arms rather than `.unwrap()`/`.expect()` because the *type* (`Result`)
     // is what lets a real failure, if this invariant is ever violated by a
     // future change, surface as a normal `EvalError` instead of a panic.
-    match full_eval::<Vec<u64>, S>(expr, cursor) {
+    query_result_to_generic::<V>(full_eval::<Vec<u64>, S>(expr, cursor))
+}
+
+/// Convert a `QueryResult` produced by `eval.rs` into the generic
+/// evaluator's own `GenericResult`.
+///
+/// Extracted from [`eval_on_owned`]'s tail (#1909) so the path-context
+/// bypasses below -- which call into `eval.rs` directly, without a reindex
+/// bridge to go through -- share one conversion with it rather than growing
+/// a second copy that can drift.
+fn query_result_to_generic<V: DocumentValue>(
+    result: QueryResult<'_, Vec<u64>>,
+) -> GenericResult<V> {
+    match result {
         QueryResult::One(v) => match owned_from_standard_json(&v) {
             Ok(o) => GenericResult::Owned(o),
             Err(e) => GenericResult::Error(e),
@@ -1680,6 +1693,65 @@ fn eval_on_owned<S: EvalSemantics, V: DocumentValue>(
         QueryResult::Break(label) => GenericResult::Break(label),
         QueryResult::Halt(code) => GenericResult::Halt(code),
         QueryResult::Partial(vs, control) => GenericResult::Partial(vs, control),
+    }
+}
+
+/// #1909: run a path-context evaluation against an already-materialized
+/// `OwnedValue`, without [`eval_on_owned`]'s reindex bridge.
+///
+/// Both of this function's callers used to hand their `OwnedValue` to
+/// `eval_on_owned`, which serializes it back to JSON, runs
+/// `JsonIndex::build` over that text, and re-enters `eval.rs` -- whose
+/// `eval_pipe`/`builtin_path` then immediately call `to_owned_checked` and
+/// materialize the *same document a second time*, because path resolution
+/// (`resolve_node`/`resolve_seq`/`walk_path`) needs stable `&OwnedValue`
+/// references and can't work off a cursor. Two full trees, one JSON string
+/// and one semi-index, to answer a query whose output is a bounded path.
+/// Measured on a 300,000-element flat array (1.9 MB), release build, medians
+/// of 5, peak RSS alongside:
+///
+/// | query | before | after |
+/// |---|---|---|
+/// | `path(.)` | 0.098s / 104.5 MiB | see the issue's own table |
+///
+/// `optional` is deliberately **not** threaded through: `eval_on_owned`
+/// reaches `eval.rs` through `full_eval`, whose public entry point starts
+/// every evaluation at `optional = false` regardless of what its caller
+/// passed (see `eval_on_owned`'s own comment on this). Passing `false` here
+/// mirrors that exactly, so this bypass cannot change which errors a
+/// trailing `?` suppresses.
+///
+/// The yq float-fidelity fixup (#953/#1168) is re-applied to the result
+/// afterwards for the same reason `Expr::Array`/`Expr::Comma`'s own native
+/// arms apply it: `to_json_for_reindex`'s `S`-gated float formatter is the
+/// only thing that applies yq's "a document-sourced float that overflowed
+/// `i64` keeps its decimal point" rule, and skipping the bridge skips that
+/// formatter too. `yq_float_fidelity_fixup` is a no-op in jq mode and short-
+/// circuits on `contains_float`, so a result with no float anywhere in it --
+/// every `path(...)`/`key`/`parent` output, and any document without a float
+/// -- pays nothing for it.
+fn eval_path_context_on_owned<S: EvalSemantics, V: DocumentValue>(
+    result: QueryResult<'_, Vec<u64>>,
+) -> GenericResult<V> {
+    let generic = query_result_to_generic::<V>(result);
+    if S::TAG != EvalTag::Yq {
+        return generic;
+    }
+    match generic {
+        GenericResult::Owned(v) => match yq_float_fidelity_fixup::<S, V>(vec![v]) {
+            Ok(mut fixed) if fixed.len() == 1 => GenericResult::Owned(fixed.remove(0)),
+            Ok(fixed) => owned_vec_to_generic_result(fixed),
+            Err(result) => result,
+        },
+        GenericResult::ManyOwned(vs) => match yq_float_fidelity_fixup::<S, V>(vs) {
+            Ok(fixed) => GenericResult::ManyOwned(fixed),
+            Err(result) => result,
+        },
+        GenericResult::Partial(vs, control) => match yq_float_fidelity_fixup::<S, V>(vs) {
+            Ok(fixed) => GenericResult::Partial(fixed, control),
+            Err(result) => result,
+        },
+        other => other,
     }
 }
 
@@ -4720,7 +4792,21 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // fallback in isolation, which has no path to give it (#554).
             if exprs.iter().any(needs_path_context) {
                 let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
-                return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
+                // #1909: straight into `eval.rs`'s path-context evaluator
+                // with the tree we just built, rather than through
+                // `eval_on_owned`'s reindex bridge -- which lands in
+                // `eval::eval_pipe`, whose own `needs_path_context` gate
+                // (the same predicate checked just above) materializes the
+                // whole document a second time before calling exactly this
+                // function. See `eval_path_context_on_owned`.
+                return eval_path_context_on_owned::<S, V>(
+                    crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
+                        exprs,
+                        &owned,
+                        &[],
+                        false,
+                    ),
+                );
             }
 
             if exprs.is_empty() {
@@ -7602,6 +7688,122 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// #1909: native, cursor-walking `getpath(P)` for the CLI's generic
+/// evaluator, so a bounded read of one node stops paying for the `_`
+/// fallback's whole-document materialize + re-serialize + re-index round
+/// trip (`eval_on_owned`). Measured on a 300,000-element flat array,
+/// release build: `getpath([0])` was 0.08s / 75.4 MiB peak RSS against
+/// `.[0]`'s 0.01s / 10.7 MiB for byte-identical output -- same semantics,
+/// same one-number result, 7x the memory. `getpath` is not an exotic
+/// introspection builtin: it is how any programmatically-built path is
+/// read, and what `paths`-driven code uses.
+///
+/// Same native-arm precedent, and the same two probe guards, as
+/// [`eval_has_generic`] (#1739) and `eval_limit_generic` (#1607) -- see
+/// `eval_has_generic`'s own doc comment for why a live `input`/`inputs`
+/// queue and a statically-visible top-level `Comma` are both refused
+/// *before* `path_expr` is ever probed, rather than after.
+///
+/// **Success-only by construction.** This walk deliberately covers just the
+/// shapes it can prove match `eval::getpath_one_path` exactly, and returns
+/// `None` -- deferring to that reference implementation via the caller's
+/// pre-existing round trip -- for everything else:
+///
+/// - a path that isn't a single plain `OwnedValue::Array` (a generator
+///   path, `empty`, a decode failure, jq's `path must be specified as an
+///   array` error);
+/// - any segment that isn't a string or a number, so jq's slice-descriptor
+///   segments (`{"start":s,"end":e}` against an array, a string, or -- yq
+///   mode only, #1102 -- an object), and the `null`/`true` segments whose
+///   current behaviour on a `null` receiver already diverges from real jq,
+///   all keep running through the exact code that produces them today;
+/// - **any step that would error or be suppressed by `optional`**, so every
+///   `Cannot index <type> with <key>` message, and every `type_name`
+///   spelling behind it (`tagged_type_name`'s YAML tag resolution included),
+///   is still produced by the reference path rather than re-derived here.
+///
+/// The cost of that conservatism is one wasted partial walk before the
+/// fallback restarts from the root -- O(depth), against the O(document) the
+/// fallback was already going to pay anyway.
+///
+/// A `null` reached mid-walk short-circuits to `null` for the whole
+/// remaining path, matching `getpath_one_path`'s own `(OwnedValue::Null, _)`
+/// arm. That arm fires for *any* segment kind, but every remaining segment
+/// here is already known to be a string or a number (the whole path is
+/// validated up front, before the walk starts), so short-circuiting cannot
+/// swallow a segment kind the reference implementation would have treated
+/// differently.
+///
+/// The final node is materialized through `to_owned_cursor`, **not** handed
+/// back as a bare `GenericResult::OneCursor`. Returning the cursor looks
+/// like a free #607-style duplicate-key/laziness win, but it silently drops
+/// `to_owned_cursor`'s YAML tag resolution (#747), which the reference
+/// path's own root-level `to_owned_with_cursor` applies before its JSON
+/// round trip: caught by differential fuzzing against the pre-change binary,
+/// `a: !!str 1` with `getpath(["a"])` answered `1` instead of `"1"`. This is
+/// a performance issue, so exact equivalence with the reference
+/// implementation's `QueryResult::Owned(current)` is the goal -- the win is
+/// that only the *result subtree* is materialized, never the whole document.
+fn eval_getpath_generic<S: EvalSemantics, V: DocumentValue>(
+    path_expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> Option<GenericResult<V>> {
+    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(path_expr) {
+        return None;
+    }
+    if matches!(unwrap_paren(path_expr), Expr::Comma(_)) {
+        return None;
+    }
+    let path_owned = match eval_single::<S, V>(path_expr, value.clone(), optional, cursor) {
+        GenericResult::One(v) => to_owned(&v).ok()?,
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
+        GenericResult::Owned(v) => v,
+        _ => return None,
+    };
+    let OwnedValue::Array(segments) = path_owned else {
+        return None;
+    };
+    if !segments.iter().all(|segment| {
+        matches!(
+            segment,
+            OwnedValue::String(_)
+                | OwnedValue::Int(_)
+                | OwnedValue::Float(_)
+                | OwnedValue::NumberLiteral(..)
+        )
+    }) {
+        return None;
+    }
+
+    let mut current = value;
+    let mut current_cursor = cursor;
+    for segment in &segments {
+        match index_one_generic::<V>(current, segment, optional) {
+            GenericResult::OneCursor(c) => {
+                current = c.value();
+                current_cursor = Some(c);
+            }
+            // A missing key or an out-of-bounds index: `null` for the rest
+            // of the path, exactly as `getpath_one_path`'s null arm gives.
+            GenericResult::Owned(OwnedValue::Null) => {
+                return Some(GenericResult::Owned(OwnedValue::Null))
+            }
+            // Every other shape (`Error`, `optional`'s `None`, and the
+            // `Owned(_)` non-null case `index_one_generic` cannot actually
+            // produce) defers to the reference implementation.
+            _ => return None,
+        }
+    }
+    // A decode failure here defers to the reference path too, so its own
+    // `to_owned_checked`/`suppress_or_raise` policy (#1755/#1953) decides
+    // how it surfaces rather than this fast path inventing a second one.
+    Some(GenericResult::Owned(
+        to_owned_with_cursor(&current, current_cursor).ok()?,
+    ))
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -8292,6 +8494,37 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
                 }
             }
+        }
+
+        // #1909: same native-arm reasoning as `Builtin::Has` above (#1739)
+        // -- a bounded read of one node has no business paying the `_`
+        // fallback's whole-document round trip. `eval_getpath_generic`
+        // covers only the shapes it can prove match `eval::getpath_one_path`
+        // exactly and returns `None` for the rest, so every error message,
+        // slice-descriptor segment, and generator path still reaches that
+        // reference implementation unchanged.
+        Builtin::GetPath(path_expr) => {
+            match eval_getpath_generic::<S, _>(path_expr, value.clone(), optional, cursor) {
+                Some(result) => result,
+                None => {
+                    let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                    eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
+                }
+            }
+        }
+
+        // #1909: `path(f)`'s output is a bounded set of path arrays, but
+        // the `_` fallback below charged it a whole-document materialize +
+        // re-serialize + re-index round trip *and* a second materialize
+        // inside `eval::builtin_path` itself. `builtin_path_on_owned` is
+        // that function with its own `to_owned_checked` lifted out, so the
+        // tree built here is the only one. See
+        // `eval_path_context_on_owned`.
+        Builtin::Path(path_expr) => {
+            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            eval_path_context_on_owned::<S, V>(
+                crate::jq::eval::builtin_path_on_owned::<Vec<u64>, S>(path_expr, &owned, false),
+            )
         }
 
         Builtin::Empty => GenericResult::None,
