@@ -802,9 +802,20 @@ struct GenerateYamlSuite {
 }
 
 /// Command-line JSON processor (jq-compatible CLI)
+///
+/// `args_override_self = true` (#2009): clap's derive default hard-errors on
+/// a repeated flag ("cannot be used multiple times") for every plain bool
+/// field here, unlike real jq, which tolerates any flag given twice (a
+/// wrapper script or alias that already passes e.g. `-c` should not make a
+/// caller's own `-c` a hard failure). Verified live against jq 1.7.1 that
+/// this tolerance isn't specific to `-c` -- `-n -n`, `-r -j`/`-j -r`, etc.
+/// all succeed there too -- so this is set at the command level rather than
+/// per-field. Doesn't affect `Vec`-typed `ArgAction::Append` fields like
+/// `--arg`, which already accumulate correctly regardless of this setting.
 #[derive(Debug, Parser)]
 #[command(name = "jq")]
 #[command(about = "Command-line JSON processor", long_about = None)]
+#[command(args_override_self = true)]
 struct JqCommand {
     /// jq filter expression (e.g., ".", ".foo", ".[]")
     /// If not provided, uses "." (identity)
@@ -843,7 +854,14 @@ struct JqCommand {
 
     // === Output Options ===
     /// Compact output (no pretty printing)
-    #[arg(short = 'c', long)]
+    ///
+    /// `-c`/`--tab`/`--indent` are one output-format knob in real jq --
+    /// whichever is given last wins (#2009, live-verified against jq 1.7.1:
+    /// `jq -c --tab '.'` pretty-prints with tabs, `jq --tab -c '.'` stays
+    /// compact). `overrides_with_all` on each of the three, naming all
+    /// three (itself included, so a later repeat of the same flag still
+    /// wins over an earlier different one), reproduces that ordering.
+    #[arg(short = 'c', long, overrides_with_all = ["compact_output", "tab", "indent"])]
     compact_output: bool,
 
     /// Output raw strings without quotes
@@ -880,11 +898,17 @@ struct JqCommand {
     preserve_input: bool,
 
     /// Use tabs for indentation
-    #[arg(long)]
+    ///
+    /// See `compact_output`'s own doc comment for the shared
+    /// last-flag-wins rationale (#2009).
+    #[arg(long, overrides_with_all = ["compact_output", "tab", "indent"])]
     tab: bool,
 
     /// Use n spaces for indentation (max 7)
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7))]
+    ///
+    /// See `compact_output`'s own doc comment for the shared
+    /// last-flag-wins rationale (#2009).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=7), overrides_with_all = ["compact_output", "tab", "indent"])]
     indent: Option<u8>,
 
     // === Program Input ===
