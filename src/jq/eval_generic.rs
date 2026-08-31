@@ -8753,7 +8753,9 @@ mod tests {
         let bytes = json.as_bytes();
         let index = JsonIndex::build(bytes);
         let cursor = index.root(bytes);
-        match owned_from_standard_json(&cursor.value()) {
+        let round_tripped = owned_from_standard_json(&cursor.value())
+            .expect("the bridge's own serialization must reparse");
+        {
             // Structural equality, not `==`: `OwnedValue`'s `PartialEq`
             // compares a `NumberLiteral` by its parsed `NumberRepr` and
             // ignores the source text, but that text is exactly what #1008's
@@ -8777,16 +8779,13 @@ mod tests {
             // rendering equality alone would also wave through a bare
             // `Float`, whose re-spelling is precisely what this guard
             // exists to catch.
-            Ok(round_tripped) => {
+            {
                 let normalized = match value {
                     OwnedValue::Int(n) => OwnedValue::from_number_literal(&alloc::format!("{n}")),
                     other => other.clone(),
                 };
                 format!("{round_tripped:?}") == format!("{normalized:?}")
             }
-            // A value the bridge cannot even reparse is certainly not one the
-            // bypass may claim is unchanged.
-            Err(_) => false,
         }
     }
 

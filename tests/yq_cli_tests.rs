@@ -27157,6 +27157,18 @@ fn test_yq_namespaced_call_arguments_are_still_resolved_1473() -> Result<()> {
 #[test]
 fn test_path_context_bypass_keeps_yq_float_fidelity_1909() -> Result<()> {
     let doc = "outer:\n  big: 10000000000000000000.0\n  small: 3.5\n";
+    // `path(...)` on the same document exercises `Builtin::Path`'s own
+    // fallback arm rather than the `Expr::Pipe` one: a YAML
+    // `10000000000000000000.0` materializes as a bare `Float` (not a
+    // `NumberLiteral` — it is past what `is_preservable_float_literal`
+    // keeps), which is exactly what `reindex_bridge_is_identity` refuses.
+    let (out, code) = run_yq_stdin("[path(..)]", doc, &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(
+        out.trim(),
+        r#"[[],["outer"],["outer","big"],["outer","small"]]"#
+    );
+
     for (filter, expected) in [
         // Plain read-back of the document float.
         (
