@@ -566,6 +566,71 @@ fn test_custom_indent() -> Result<()> {
     Ok(())
 }
 
+/// #2009: `-c`/`--tab`/`--indent` are one output-format knob in real jq --
+/// whichever is given last wins, live-verified against jq 1.7.1
+/// (`jq -c --tab '.'` pretty-prints with tabs; `jq --tab -c '.'` stays
+/// compact). succinctly used to make `-c` permanently sticky regardless of
+/// what followed it.
+#[test]
+fn test_compact_then_tab_pretty_prints_with_tabs_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["-c", "--tab"])?;
+    assert_eq!(code, 0);
+    assert!(
+        output.contains('\t'),
+        "expected tab indentation: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compact_then_indent_pretty_prints_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["-c", "--indent", "2"])?;
+    assert_eq!(code, 0);
+    assert!(
+        output.contains("  \"a\""),
+        "expected 2-space indentation: {output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_tab_then_compact_stays_compact_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["--tab", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_indent_then_compact_stays_compact_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["--indent", "2", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+/// #2009: real jq tolerates any flag given twice (a wrapper script or alias
+/// that already passes `-c` should not make a caller's own `-c` a hard
+/// failure) -- succinctly's clap-derived parser used to hard-error with
+/// "the argument '--compact-output' cannot be used multiple times" on any
+/// repeated bool flag, not just `-c` specifically (also verified live for
+/// `-n -n` against jq 1.7.1, which succeeds there too).
+#[test]
+fn test_repeated_compact_flag_is_tolerated_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", r#"{"a":1}"#, &["-c", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_repeated_null_input_flag_is_tolerated_2009() -> Result<()> {
+    let (output, code) = run_jq_stdin(".", "", &["-n", "-n", "-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+    Ok(())
+}
+
 // =============================================================================
 // Variable Tests
 // =============================================================================
