@@ -25612,6 +25612,42 @@ fn test_low_surrogate_substitutes_replacement_character_2008() {
     assert!(stderr.contains("invalid unicode escape sequence"));
 }
 
+/// #2008 (code review): a lone low surrogate in an object *key* decodes the
+/// same way as one in a value, so a pair of keys differing only by a lone
+/// low surrogate now collapses like any other duplicate (confirmed live
+/// against the pinned oracle) -- see the updated
+/// `docs/compliance/jq/limitations.md` "A key that will not decode is never
+/// a duplicate" section, which scopes that rule to the *high* surrogate case
+/// only as of this fix.
+#[test]
+fn test_low_surrogate_key_participates_in_duplicate_collapse_2008() {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "."], Some(r#"{"a\udc00":1,"a\udc00":2}"#)).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "{\"a\u{FFFD}\":2}");
+}
+
+/// #2008 (code review): `fromjson`/`tonumber`'s own hand-rolled JSON string
+/// decoder (`parse_json_string_value` in `eval.rs`) is a second,
+/// independent implementation of surrogate handling from
+/// `json::light::decode_escapes` and had the identical gap -- erroring
+/// instead of substituting U+FFFD for a lone low surrogate. Confirmed live
+/// against the pinned oracle before the fix (succinctly errored, real jq
+/// substituted); a valid surrogate pair is an unaffected control.
+#[test]
+fn test_fromjson_low_surrogate_substitutes_replacement_character_2008() {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-r", r#""\"\\udc00\"" | fromjson"#], None).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "\u{FFFD}");
+
+    // Control: a valid surrogate pair is unaffected.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "-r", r#""\"\\ud83d\\ude00\"" | fromjson"#], None).unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "😀");
+}
+
 /// #1642 (was #1247): an undecodable *key* does not silently shrink the
 /// object -- `to_entries` used to return one entry fewer than the document
 /// had, because `effective_fields`' dedup walk dropped any field whose key

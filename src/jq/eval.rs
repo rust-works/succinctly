@@ -11465,6 +11465,14 @@ fn parse_json_string_value(bytes: &[u8], pos: &mut usize) -> Result<OwnedValue, 
                                 result.push('\u{FFFD}');
                                 *pos -= 1;
                             }
+                        } else if (0xDC00..=0xDFFF).contains(&codepoint) {
+                            // #2008: a lone low surrogate isn't a valid Rust
+                            // `char` (falls through `char::from_u32` below),
+                            // but real jq accepts it and substitutes U+FFFD --
+                            // matches the high-surrogate arm above and
+                            // `json::light::decode_escapes`.
+                            result.push('\u{FFFD}');
+                            *pos += 3;
                         } else if let Some(c) = char::from_u32(codepoint) {
                             result.push(c);
                             *pos += 3; // Move past the hex digits (will be incremented again below)
