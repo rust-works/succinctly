@@ -78,6 +78,7 @@ pub mod eval_generic;
 mod expr;
 mod lazy;
 mod parser;
+pub mod resolve;
 mod slice;
 pub mod stream;
 pub mod utf8_document;
@@ -109,6 +110,7 @@ pub use parser::{
     parse, parse_program, parse_program_with_mode, parse_program_with_mode_and_extensions,
     parse_with_mode, parse_with_mode_and_extensions, ParseError, ParserMode,
 };
+pub use resolve::{resolve_func_calls, UnresolvedCall};
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, nesting_depth_exceeded_message, NumberRepr,

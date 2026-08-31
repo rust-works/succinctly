@@ -4221,19 +4221,37 @@ fn test_module_not_found_error() -> Result<()> {
     Ok(())
 }
 
+/// A namespaced call to a namespace that was never `import`ed.
+///
+/// This used to assert the *opposite* -- that the call parsed and failed at
+/// runtime rather than at compile time -- which pinned succinctly's own
+/// divergence, not jq's behaviour. The pinned oracle (`/usr/bin/jq`,
+/// jq-1.7.1) rejects it at compile time with these exact three lines and
+/// exit 3, which is what #1473's resolution pass now produces:
+///
+/// ```text
+/// jq: error: mymod::func/0 is not defined at <top-level>, line 1:
+/// mymod::func
+/// jq: 1 compile error
+/// ```
+///
+/// `rewrite_namespaced_calls` turns every `ns::f` into a `FuncCall` named
+/// `ns::f` regardless of import status, and `ModuleLoader::process_program`
+/// registers an imported module's functions under exactly that name -- so
+/// an *imported* namespace still resolves (see `test_import_with_namespace`)
+/// and only an unimported one fails.
 #[test]
-fn test_namespaced_call_parse() -> Result<()> {
-    // Test that namespaced calls parse correctly
-    let (output, _code) = spawn_jq(&["-n", "mymod::func"], None)?;
+fn test_namespaced_call_to_unimported_namespace_is_a_compile_error_1473() -> Result<()> {
+    let (output, code) = spawn_jq(&["-n", "mymod::func"], None)?;
 
     let stderr = String::from_utf8(output.stderr)?;
 
-    // Should parse but fail at runtime (module not loaded)
-    // Not a compile error, but an eval error
+    assert_eq!(code, 3, "stderr: {stderr}");
     assert!(
-        !stderr.contains("compile error"),
-        "Should parse namespaced call without compile error: {stderr}"
+        stderr.contains("mymod::func/0 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr}"
     );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
 }
 
@@ -17323,29 +17341,34 @@ cover(1)"#,
 }
 
 /// #1016 patch-coverage: calling a `def` with the wrong number of
-/// arguments must still surface a clean, catchable `EvalError` (exit 5),
-/// not a crash or a silently wrong result.
+/// arguments must surface a clean error, not a crash or a silently wrong
+/// result.
 ///
-/// #1376 changed *which* error this is and *where* it comes from.
-/// `expand_func_calls`'s `FuncCall` arm used to hard-error the moment it
-/// found a name-matching, arity-mismatched call, with a dedicated
-/// "function f takes 1 arguments, got 2" message -- but that broke arity
-/// overloading (`def f(x): ...; def f(x;y): ...;`), since a 2-arg call
-/// reached while expanding the 1-arg `f` would error out instead of being
-/// left alone for the 2-arg `f`'s own expansion to find. The arity check
-/// is now folded into that arm's own match guard, so an arity-mismatched
-/// call (with no other overload anywhere to resolve it, as here) falls
-/// through unexpanded and reaches `eval_func_call`'s "undefined function"
-/// fallback instead -- still a clean `EvalError`, now naming the arity too
-/// (`f/2`) rather than the dedicated check's own wording.
+/// #1376 changed *which* error this is: `expand_func_calls`'s `FuncCall`
+/// arm used to hard-error the moment it found a name-matching,
+/// arity-mismatched call, with a dedicated "function f takes 1 arguments,
+/// got 2" message -- but that broke arity overloading (`def f(x): ...;
+/// def f(x;y): ...;`), since a 2-arg call reached while expanding the
+/// 1-arg `f` would error out instead of being left alone for the 2-arg
+/// `f`'s own expansion to find. The arity check moved into that arm's own
+/// match guard, leaving a mismatched call to fall through unexpanded.
+///
+/// #1473 then changed *where* it comes from and *when*: the call is now
+/// rejected by `jq::resolve_func_calls` before evaluation begins, so this
+/// is jq's compile error (exit 3), not succinctly's runtime one (exit 5),
+/// and the wording is jq's own. Captured from the pinned oracle
+/// (`/usr/bin/jq`, jq-1.7.1), which emits exactly these three lines --
+/// modulo trailing padding on the echoed source line, see
+/// `report_unresolved_call` (`src/bin/succinctly/jq_runner.rs`).
 #[test]
 fn test_func_call_arity_mismatch_reports_clean_error_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def f(x): x; f(1;2)"], Some("null"))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("undefined function: f/2"),
+        stderr.contains("f/2 is not defined at <top-level>, line 1:"),
         "stderr: {stderr:?}"
     );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -17397,18 +17420,17 @@ fn test_func_def_same_arity_redefinition_still_shadows_1376() -> Result<()> {
 
 /// #1376 regression guard: calling an arity that no overload defines still
 /// errors cleanly, rather than silently matching the wrong overload or
-/// succeeding with a wrong value.
+/// succeeding with a wrong value. #1473 moved the rejection to compile
+/// time (exit 3, jq's own wording); that it *is* rejected is the part this
+/// test guards.
 #[test]
 fn test_func_def_arity_overload_unmatched_arity_still_errors_1376() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "def f(x): x+1; def f(x;y): x+y; f(1;2;3)"],
         Some("null"),
     )?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
-    assert!(
-        stderr.contains("undefined function: f/3"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("f/3 is not defined"), "stderr: {stderr:?}");
     Ok(())
 }
 
@@ -17428,35 +17450,34 @@ fn test_func_def_three_way_arity_overload_1376() -> Result<()> {
     Ok(())
 }
 
-/// #1376 known gap, tracked by #1473: forward-referencing a not-yet-
-/// defined arity from *within a def's own body* silently computes a value
-/// instead of failing, where real jq rejects it as a compile-time forward
-/// reference (`f/2 is not defined`, exit 3, oracle-verified against jq
-/// 1.7.1). `f/1`'s own body (`f(x; 99)`) textually references `f/2`, which
-/// doesn't exist yet at that lexical point -- but `expand_func_calls`'s
-/// substitution model has no concept of lexical position, so once `f/1`'s
-/// own expansion substitutes that body into `f(1)`'s call site (found
-/// while walking past `f/2`'s own definition), the result becomes
-/// indistinguishable from a call genuinely written after `f/2` and gets
-/// picked up by `f/2`'s own, later expansion pass.
+/// #1473, the severe half: forward-referencing a not-yet-defined arity
+/// from *within a def's own body* used to silently compute a value, where
+/// real jq rejects it as a compile-time forward reference (`f/2 is not
+/// defined`, exit 3, oracle-verified against jq 1.7.1). `f/1`'s own body
+/// (`f(x; 99)`) textually references `f/2`, which doesn't exist yet at that
+/// lexical point -- but `expand_func_calls`'s substitution model has no
+/// concept of lexical position, so once `f/1`'s own expansion substituted
+/// that body into `f(1)`'s call site (found while walking past `f/2`'s own
+/// definition), the result became indistinguishable from a call genuinely
+/// written after `f/2` and was picked up by `f/2`'s own, later expansion
+/// pass. This test pinned `100` as known-wrong output until #1473 landed.
 ///
-/// This isn't fixable by a narrower guard in `#1376`'s own fix (see the
-/// `FuncCall` arm's own doc comment in `src/jq/eval.rs`) -- it needs the
-/// same lexical-scope tracking (or genuine compile-time/runtime
-/// resolution) #1473 already scopes. Pinning the *current* (wrong, known)
-/// behavior here so it can't silently drift further, and so this test
-/// starts failing -- correctly -- the moment #1473 lands a real fix.
+/// The fix is not a narrower guard in that arm -- substitution still has no
+/// lexical position, and still resolves this call if it ever runs.
+/// `jq::resolve_func_calls` rejects the program *before* evaluation begins,
+/// so the mis-resolution is unreachable rather than repaired.
 #[test]
-fn test_func_def_forward_arity_reference_in_own_body_known_gap_1376() -> Result<()> {
+fn test_func_def_forward_arity_reference_in_own_body_1473() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "def f(x): f(x; 99); def f(x; y): x + y; f(1)"],
         Some("null"),
     )?;
-    // NOT the correct behavior -- real jq rejects this at compile time
-    // (`f/2 is not defined`, exit 3). Pinned as documented, tracked-as-
-    // known-wrong output; see this test's own doc comment and #1473.
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "100");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("f/2 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(stdout, "", "a compile error produces no output");
     Ok(())
 }
 
@@ -28121,5 +28142,289 @@ fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
         assert_eq!(stripped, expected, "input {input:?} -- {why}");
         assert_eq!(code, 0, "input {input:?}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #1473: compile-time function resolution.
+//
+// Real jq resolves every function call before reading input: an undefined
+// function -- or an undefined arity of an existing one -- is a compile error,
+// unconditional, uncatchable, exit 3. succinctly resolved calls lazily during
+// evaluation instead, so the error was skippable (an unreached branch),
+// catchable (`try`/`?`), and carried the runtime exit code 5; two forward
+// references real jq rejects computed a value instead.
+//
+// Every expectation below was captured from the pinned oracle (`/usr/bin/jq`,
+// jq-1.7.1) rather than from succinctly's own output.
+// ---------------------------------------------------------------------------
+
+/// A jq builtin succinctly does not implement must still *compile* when it is
+/// mentioned somewhere evaluation never reaches -- real jq compiles it, so
+/// rejecting it would be a regression #1473's resolution pass introduced.
+///
+/// The roster in `src/jq/resolve.rs` is what makes this hold, and
+/// `jq_builtin_roster_matches_the_pinned_capture` (that module's own tests)
+/// checks the roster against `tests/data/jq-builtin-names.txt` entry by entry.
+/// This test covers the other half -- that the roster is actually consulted --
+/// on a representative sample rather than all 218 names: a whole-roster sweep
+/// through the CLI also exercises the *parser*, and `modulemeta` is a
+/// pre-existing parse divergence (succinctly's parser demands
+/// `modulemeta(...)` where jq's builtin is arity 0) unrelated to resolution.
+#[test]
+fn test_unimplemented_jq_builtins_still_compile_when_unreached_1473() -> Result<()> {
+    for call in [
+        "cbrt",
+        "hypot(.; .)",
+        "fma(.; .; .)",
+        "frexp",
+        "JOIN(.; .; .; .)",
+        "format(.)",
+        "input_filename",
+        "get_search_list",
+        "strflocaltime(.)",
+        "significand",
+    ] {
+        let filter = format!("if false then {call} else 1 end");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(code, 0, "{call}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), "1", "{call}: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
+/// A jq builtin succinctly does not implement stays a *runtime* error when the
+/// call is actually reached -- the roster defers it, it does not silence it.
+#[test]
+fn test_unimplemented_jq_builtin_still_errors_when_reached_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "cbrt"], Some("8"))?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("undefined function: cbrt/0"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// An unresolvable call in a branch that is never taken still fails, and fails
+/// before any input is read. jq: `f/3 is not defined`, exit 3.
+#[test]
+fn test_unresolved_call_in_unreached_branch_is_a_compile_error_1473() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x; if false then f(1;2;3) else 1 end"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert!(
+        stderr.contains("f/3 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// `try`/`catch` and `?` cannot swallow it: compilation fails before
+/// evaluation, and thus before `try`, ever begins.
+#[test]
+fn test_unresolved_call_is_not_catchable_1473() -> Result<()> {
+    for filter in [
+        r#"def f(x): x; try f(1;2) catch "caught""#,
+        "def f(x): x; f(1;2)?",
+        r#"try nosuchfn catch "caught""#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 3, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: a compile error produces no output");
+        assert!(
+            stderr.contains("is not defined"),
+            "{filter}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A forward reference across *different* names -- the pre-existing half of
+/// #1473's severe case, which computed `42` where jq rejects the program.
+#[test]
+fn test_forward_reference_across_names_is_a_compile_error_1473() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def f: g; def g: 42; f"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("g/0 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// A nested `def` is scoped to its enclosing body and does not leak out of it
+/// -- previously an exit-5 runtime error, now jq's exit-3 compile error.
+#[test]
+fn test_nested_def_does_not_leak_into_outer_scope_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "def f: def g: 1; g; g"], Some("null"))?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(stderr.contains("g/0 is not defined"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// A `def` parameter binds its bare name as an arity-0 function -- including
+/// the `$`-prefixed form, which jq desugars to `def f(a): a as $a | …`, leaving
+/// `a` callable. Calling one with arguments is `g/1 is not defined`, not a call
+/// to anything in the enclosing scope.
+#[test]
+fn test_def_parameter_binds_arity_zero_only_1473() -> Result<()> {
+    for (filter, want) in [("def f(g): g; f(1)", "1"), ("def f($a): a; f(1)", "1")] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "def f(g): g(1); f(.)"], Some("null"))?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(stderr.contains("g/1 is not defined"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// The resolution pass must not reject anything real jq accepts. Each of these
+/// exercises a scope rule the pass has to get right, and each was run against
+/// the pinned oracle for both its value and its exit code.
+#[test]
+fn test_resolution_pass_accepts_every_legal_scope_shape_1473() -> Result<()> {
+    for (filter, want) in [
+        // A def is visible to later siblings, and to itself.
+        ("def f: 1; def g: f; g", "1"),
+        ("def f(n): if n == 0 then 0 else f(n-1) end; f(3)", "0"),
+        // Arity overloading, in both directions (#1376).
+        (
+            "def f(x): x + 1; def f(x; y): x + y; [f(1), f(2;3)]",
+            "[2,5]",
+        ),
+        ("def f(x): x+1; def f(x;y): (f(x)) + y; f(2;3)", "6"),
+        // A later same-arity def shadows, but the earlier one stays bound
+        // inside anything defined before the redefinition.
+        ("def f: 1; def g: f; def f: 2; g", "1"),
+        // An inner def shadows an outer one for its own extent only.
+        ("def f: 1; [f, (def f: 2; f), f]", "[1,2,1]"),
+        // A def inside a builtin argument, reached through `builtin_kids`.
+        ("def f: 3; [1,2] | map(f)", "[3,3]"),
+        // A parameter shadowing the function's own name.
+        ("def f(f): f; f(7)", "7"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}: stderr {stderr:?}");
+    }
+    Ok(())
+}
+
+/// A plain syntax error is jq's compile error too: exit 3, and no second,
+/// stray `Error: compile error` line from `anyhow`'s own reporting (#1473).
+#[test]
+fn test_syntax_error_exits_with_the_compile_error_code_1473() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "1 +"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("compile error"), "stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("Error: compile error"),
+        "the stray anyhow line is back: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// An unresolvable `include`/`import` is jq's compile error too -- the third
+/// kind, alongside a syntax error and an undefined function, and the last one
+/// still routing through `anyhow` for exit 1 and a stray `Error: module error`
+/// line (#1473). jq 1.7.1 exits 3.
+#[test]
+fn test_module_error_exits_with_the_compile_error_code_1473() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", r#"include "nonexistent_module_xyz"; ."#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module") && stderr.contains("not found"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Error: module error"),
+        "the stray anyhow line is back: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// The reported line is the one the offending identifier is written on, not
+/// always line 1 -- `report_unresolved_call` locates it in the filter source.
+#[test]
+fn test_unresolved_call_reports_its_own_source_line_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "def f: 1;\nf\n| nosuch"], Some("null"))?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuch/0 is not defined at <top-level>, line 3:"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("\n| nosuch"),
+        "the offending line should be echoed: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// The identifier search is word-bounded: an undefined `f` must not report the
+/// line of some longer identifier that merely contains an `f`.
+#[test]
+fn test_unresolved_call_line_search_is_word_bounded_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", "def first_thing: 1;\nfirst_thing\n| f"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("f/0 is not defined at <top-level>, line 3:"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1473: an unresolvable call reached through an `include`d module has no
+/// occurrence in the filter source, so `locate_identifier` finds nothing and
+/// the diagnostic drops the line marker and source echo rather than inventing
+/// a position.
+///
+/// jq names the module file and line here
+/// (`... is not defined at /path/mymod.jq, line 1:` plus the module's own
+/// source line); succinctly reports `at <top-level>` with no location. The
+/// name, arity and exit code match; only the location does not, for the same
+/// reason the in-filter case can cite the wrong occurrence — `Expr::FuncCall`
+/// carries no source position, and modules would additionally need the
+/// originating *file* threaded through `ModuleLoader`. Recorded in
+/// docs/compliance/jq/limitations.md.
+#[test]
+fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("mymod.jq"),
+        "def helper: nosuchfn_in_module;",
+    )?;
+
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.args(["jq", "-n", "-L"])
+                .arg(temp_dir.path())
+                .arg(r#"include "mymod"; helper"#);
+            cmd
+        },
+        None,
+    )?;
+
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert!(
+        stderr.contains("nosuchfn_in_module/0 is not defined at <top-level>"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains(", line "),
+        "no line should be claimed for a call with no in-filter occurrence: {stderr}"
+    );
+    assert!(stderr.contains("jq: 1 compile error"), "stderr: {stderr}");
     Ok(())
 }

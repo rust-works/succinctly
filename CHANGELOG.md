@@ -315,6 +315,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`jq`/`yq`: function calls are resolved at compile time, before any input is
+  read** (#1473). Real jq rejects a call to an undefined function — or to an
+  undefined arity of an existing one — unconditionally, uncatchably, with exit
+  3. succinctly resolved calls lazily during evaluation instead, so the error
+  was skippable, catchable and carried the wrong exit code, and two shapes of
+  *forward reference* silently computed a value:
+
+  ```
+  $ sjq -n 'def f(x): x; if false then f(1;2;3) else 1 end'   # was: 1, exit 0
+  $ sjq -n 'def f(x): x; try f(1;2) catch "caught"'           # was: "caught"
+  $ sjq -n 'def f: g; def g: 42; f'                           # was: 42
+  $ sjq -n 'def f(x): f(x; 99); def f(x; y): x + y; f(1)'     # was: 100
+  ```
+
+  All four now fail with jq's own message and exit 3, matching the pinned
+  oracle line for line (modulo invisible trailing padding on the echoed source
+  line). `jq::resolve_func_calls` (`src/jq/resolve.rs`) is a scope-aware check
+  run before evaluation, not a new resolution mechanism: a residual
+  `Expr::FuncCall` reaching the evaluator was already an unconditional error,
+  so nothing that previously produced a value produces a different one — the
+  programs `expand_func_calls` mis-resolved are simply rejected before it runs.
+
+  The ~45 jq builtins succinctly does not implement (the libm family, `JOIN`,
+  `format/1`, `input_filename`, …) are exempt via a roster captured from the
+  pinned jq, so `if false then cbrt else 1 end` still compiles as it does in
+  real jq; a *reached* call to one still fails at runtime as before.
+
+  `succinctly yq` runs the same pass with yq's uniform `Error: …` wording and
+  exit 1 — real yq has no `def` at all, so this is extension surface, not a
+  behaviour with a reference to match.
+
+- **`jq`: a filter that fails to parse now exits 3, not 1** (#1473). Found while
+  fixing the above: a plain syntax error routed through `anyhow`, which gave
+  jq's usage-ish exit 1 and printed a second, stray `Error: compile error` line
+  that jq does not. `sjq -n '1 +'` now exits 3 with a single diagnostic.
+
+- **`jq`: an unresolvable `include`/`import` now exits 3, not 1** (#1473). The
+  third compile-error kind in the same function, left the same way as the
+  syntax error above -- jq 1.7.1 exits 3 and prints no stray `Error: module
+  error` line.
+
+- **`jq`: a call into a namespace that was never `import`ed is a compile error**
+  (#1473). `sjq -n 'mymod::func'` reported "module not loaded" at runtime; jq
+  1.7.1 reports `mymod::func/0 is not defined` at compile time, exit 3, which
+  succinctly now matches exactly. An imported namespace is unaffected.
+
 - **`jq`: U+FFFD substitution in a non-UTF-8 JSON document is now scoped per
   JSON string, matching jq 1.7.1** (#1743). jq substitutes inside
   `jv_string_sized`, which its lexer calls once per string with that

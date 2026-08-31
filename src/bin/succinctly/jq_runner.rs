@@ -18,7 +18,7 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
     self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
-    OwnedValue, Program, MAX_VALUE_TREE_DEPTH,
+    OwnedValue, Program, UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -954,6 +954,91 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
     eprintln!();
 }
 
+/// Report a call the compile-time resolution pass could not resolve, in jq's
+/// own compile-error shape (#1473):
+///
+/// ```text
+/// jq: error: f/3 is not defined at <top-level>, line 1:
+/// def f(x): x; if false then f(1;2;3) else 1 end
+/// jq: 1 compile error
+/// ```
+///
+/// **The line is located by searching `filter` for the offending identifier,
+/// not read off the AST** — `Expr::FuncCall` carries no source position, and
+/// adding one would perturb `format!("{body:?}").len()`, which #1381's
+/// `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against. A filter that
+/// mentions the same undefined name more than once therefore cites the first
+/// occurrence's line, which may not be the one that failed to resolve; a
+/// filter whose failing call came from an `include`d module or `~/.jq` has no
+/// occurrence in `filter` at all, and drops the line marker and source echo
+/// rather than inventing a position.
+///
+/// jq pads the echoed line with trailing spaces (a `%*s` in its own
+/// `locfile_locate`); the padding width follows the failing node's start
+/// column for a simple undefined name but points elsewhere for an
+/// arity mismatch, so this reproduces the column rule rather than every case.
+/// It is trailing whitespace either way.
+///
+/// Always "1 compile error": [`jq::resolve_func_calls`] stops at the first
+/// unresolvable call, where jq reports all of them. Reporting the rest needs
+/// the same per-call positions.
+fn report_unresolved_call(unresolved: &UnresolvedCall, filter: &str) {
+    let UnresolvedCall { name, arity } = unresolved;
+
+    let Some((line_no, line_text, column)) = locate_identifier(filter, name) else {
+        eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
+        eprintln!("jq: 1 compile error");
+        return;
+    };
+
+    eprintln!("jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:");
+    eprintln!("{line_text}{}", " ".repeat(column));
+    eprintln!("jq: 1 compile error");
+}
+
+/// Find the first occurrence of `name` in `filter` that stands alone as an
+/// identifier, returning its 1-based line, that line's text, and its 0-based
+/// column.
+///
+/// "Stands alone" means neither neighbour is an identifier character, so a
+/// search for `f` does not match the `f` inside `first` — but `::` is allowed
+/// on the left, since a namespaced call arrives here as `ns::f` while the
+/// source spells the two halves either side of the separator.
+fn locate_identifier(filter: &str, name: &str) -> Option<(usize, String, usize)> {
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    let bytes = filter.as_bytes();
+    let mut search_from = 0;
+    let start = loop {
+        let hit = search_from + filter[search_from..].find(name)?;
+        let before_ok = hit == 0 || !is_ident_byte(bytes[hit - 1]);
+        let after = hit + name.len();
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            break hit;
+        }
+        // Advance by one byte, not by `name.len()`: overlapping candidates
+        // (`ff` searched for in `fff`) would otherwise be skipped. `find`
+        // returns a char boundary and `name` is a non-empty identifier, so
+        // `hit + 1` cannot land mid-character.
+        search_from = hit + 1;
+    };
+
+    let line_start = filter[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_no = filter[..line_start].matches('\n').count() + 1;
+    let line_end = filter[line_start..]
+        .find('\n')
+        .map_or(filter.len(), |i| line_start + i);
+
+    Some((
+        line_no,
+        filter[line_start..line_end].to_string(),
+        start - line_start,
+    ))
+}
+
 /// Extract the line containing an error for display.
 fn get_error_line(input: &[u8], line: usize, column: usize) -> Option<(String, usize)> {
     let text = String::from_utf8_lossy(input);
@@ -1025,18 +1110,39 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Get the filter expression
     let filter_str = get_filter(&args)?;
 
-    // Parse the filter as a full program (with module directives)
-    let program = jq::parse_program(&filter_str).map_err(|e| {
-        eprintln!("jq: compile error: {e}");
-        anyhow::anyhow!("compile error")
-    })?;
+    // Parse the filter as a full program (with module directives).
+    //
+    // Returns the exit code rather than an `anyhow` error (#1473): a failed
+    // parse is jq's compile error, exit 3, and routing it through `anyhow`
+    // gave exit 1 *and* printed a second, stray `Error: compile error` line
+    // from `main`'s own reporting. Both were confirmed live against jq 1.7.1,
+    // which exits 3 with no such line. Nothing else distinguished this arm
+    // from a resolution failure below, so the two now answer identically.
+    let program = match jq::parse_program(&filter_str) {
+        Ok(program) => program,
+        Err(e) => {
+            eprintln!("jq: compile error: {e}");
+            return Ok(exit_codes::COMPILE_ERROR);
+        }
+    };
 
-    // Create module loader and process imports/includes
+    // Create module loader and process imports/includes.
+    //
+    // The third compile-error kind, and it left the same way as the parse
+    // failure above (#1473): jq exits 3 for an unresolvable `include`/`import`
+    // (verified against 1.7.1), where routing through `anyhow` gave exit 1 and
+    // a stray `Error: module error` line. Leaving this one behind would make
+    // the runner disagree with itself -- a filter that fails to parse, one
+    // that names an undefined function, and one that includes a missing module
+    // are all "jq could not compile this program".
     let mut module_loader = ModuleLoader::new(&args.library_path);
-    let expr = module_loader.process_program(&program).map_err(|e| {
-        eprintln!("jq: module error: {e}");
-        anyhow::anyhow!("module error")
-    })?;
+    let expr = match module_loader.process_program(&program) {
+        Ok(expr) => expr,
+        Err(e) => {
+            eprintln!("jq: module error: {e}");
+            return Ok(exit_codes::COMPILE_ERROR);
+        }
+    };
 
     // Build the $ARGS special variable
     let args_value = build_args_var(&context);
@@ -1048,6 +1154,22 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     all_vars.push(("ARGS", &args_value));
 
     let expr = jq::substitute_vars(&expr, all_vars);
+
+    // #1473: resolve every function call against the `def`s, parameters and
+    // builtins in scope at its position, exactly as real jq's compiler does —
+    // before any input is read, unconditionally, and beyond the reach of any
+    // `try`/`?` in the filter.
+    //
+    // Placed *after* `process_program`, which is what inlines
+    // `include`/`import`/`~/.jq` definitions as `FuncDef` wrappers and rewrites
+    // `ns::f` into a matching `FuncCall`; running it earlier would report every
+    // module function as undefined. `substitute_vars` above substitutes
+    // `OwnedValue`s, never sub-expressions, so it cannot introduce a call and
+    // running after it rather than before is equivalent.
+    if let Err(unresolved) = jq::resolve_func_calls(&expr) {
+        report_unresolved_call(&unresolved, &filter_str);
+        return Ok(exit_codes::COMPILE_ERROR);
+    }
 
     // Whether the filter references `input`/`inputs`/`input_line_number`
     // (#723), which decides below whether the shared input queue gets seeded
