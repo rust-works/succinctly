@@ -1316,12 +1316,15 @@ That gate is deliberately narrow -- it does not make yq-mode `fromjson` match re
 actual model, which rejects the entire surrogate-pairing mechanism, not just the lone-low
 case. A **valid** surrogate pair still silently decodes successfully in yq mode today
 (`succinctly yq -n '"\"\\ud83d\\ude00\"" | fromjson'` → the emoji, real yq → a parse
-error), and a lone **high** surrogate is wrongly *accepted* (substitutes U+FFFD) in both
-jq and yq mode alike -- a separate, pre-existing bug unrelated to #2008's own scope, filed
-as [#2013](https://github.com/rust-works/succinctly/issues/2013) (also documents a real
-data-loss case: two `fromjson`-parsed object keys differing only by an unpaired high
-surrogate silently collapse, last-value-wins). Fully aligning yq-mode `fromjson` with real
-yq's stricter, non-pairing model is filed separately as
+error). A lone **high** surrogate was also wrongly *accepted* (substituted U+FFFD) in both
+jq and yq mode alike -- a separate, pre-existing bug unrelated to #2008's own scope
+(also caused real data loss: two `fromjson`-parsed object keys differing only by an
+unpaired high surrogate silently collapsed, last-value-wins) -- fixed in both modes by
+[#2013](https://github.com/rust-works/succinctly/issues/2013): `parse_json_string_value`'s
+high-surrogate arm now raises unconditionally (no mode gate needed there, since both real
+jq and real yq reject it -- unlike the lone-low case above, where the two oracles
+disagree). Fully aligning yq-mode `fromjson` with real yq's stricter, non-pairing model
+(the still-open valid-pair gap) is filed separately as
 [#2018](https://github.com/rust-works/succinctly/issues/2018), since it needs its own
 yq-mode branch checked ahead of all of jq's pairing logic, not an arm-by-arm patch.
 
