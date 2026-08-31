@@ -197,7 +197,7 @@ This case is deliberately **absent from the probe corpus**: the captured table i
 file read with `include_str!`, so jq's byte-exact output here is not representable. It is
 recorded in prose instead rather than dropped silently.
 
-## jq's own UTF-8 replacement-character substitution: fixed at function granularity, open at document granularity
+## jq's own UTF-8 replacement-character substitution: matched, at each caller's own granularity
 
 `substitute_invalid_utf8_jq_style` ([src/text/utf8/mod.rs](../../../src/text/utf8/mod.rs),
 #1617) matches jq 1.7.1's maximal-subpart substitution rule for document/raw-input decode,
@@ -231,40 +231,58 @@ $ printf '"8EFC"' | sjq -c '@base64d | explode'
 [65533]
 ```
 
-**The fix only reaches call sites where `input` is already scoped to one string's own
-bytes** — `@base64d`/`@urid`, via `owned_string_from_decoded_bytes`
-([src/jq/eval.rs](../../../src/jq/eval.rs)). It does *not* reach whole-document/whole-file
-callers (`jq_runner.rs`'s `utf8_lossy_document`/`get_inputs`), because those substitute
-an entire file's bytes in one pass before JSON structure is even parsed. Real jq's own
-trigger is scoped to *each JSON string's own closing quote* (document mode) or *each
-line* (`--raw-input`, confirmed live: `printf 'a\xe1\x41\n' | jq -R '.'` drops the byte
-even though the file's own trailing newline follows) — neither of which is "the whole
-buffer's own end" in a realistic multi-field document or multi-line file. jq's own
-trigger condition is not rare (it fires on *any* string/line ending in the right byte
-shape, however much more content follows elsewhere in the file); only succinctly's
-whole-buffer reproduction of it essentially never activates:
+**The algorithm is granularity-independent — it only asks how many bytes remain in the
+slice it was handed — so what a caller passes decides where the quirk fires.** Real jq's
+own trigger is scoped to *each JSON string's own decoded bytes* (document mode, inside
+`jv_string_sized`) or *each line* (`--raw-input`, confirmed live: `printf 'a\xe1\x41\n' |
+jq -R '.'` drops the byte even though the file's own trailing newline follows). Neither is
+"the whole buffer's own end" in a realistic multi-field document or multi-line file, and
+jq's trigger is not rare — it fires on *any* string/line ending in the right byte shape,
+however much more content follows elsewhere in the file — so a whole-file caller would
+essentially never reproduce it. Every caller is now scoped the way jq scopes it:
+
+| Caller                                                 | Scope                                                          | Issue |
+|--------------------------------------------------------|----------------------------------------------------------------|-------|
+| `@base64d`/`@urid` (`owned_string_from_decoded_bytes`) | One decoded string, already                                    | #1719 |
+| `--raw-input` (non-slurp)                              | Per line, split before substituting                            | #1742 |
+| JSON document / `--slurp` / `--seq`                    | Per JSON string                                                | #1743 |
+| `--raw-input --slurp`                                  | Whole buffer — **matching real jq**, which has one string here | —     |
+
+`--input-dsv` also stays whole-buffer: DSV is not JSON (its fields are `""`-doubled, not
+backslash-escaped), and neither oracle reads DSV at all.
 
 ```bash
-$ printf '{"a":"\xe1\x41"}' | jq -c '.a'              # jq drops the 'A'
+$ printf '{"a":"\xe1\x41","b":1}' | jq -c '.a'         # jq drops the 'A'
 "�"
-$ printf '{"a":"\xe1\x41"}' | sjq -c '.a'              # unfixed: still whole-document-scoped
-"�A"
+$ printf '{"a":"\xe1\x41","b":1}' | sjq -c '.a'        # since #1743: matches
+"�"
 ```
 
-Reproducing this quirk for `.a`-style document access would need per-JSON-string
-substitution timing — a bigger architectural change than this issue's own "Low severity,
-narrow trigger" framing anticipated, and not attempted here; tracked separately as
-[#1743](https://github.com/rust-works/succinctly/issues/1743). `--raw-input`'s own gap is
-narrower and more tractable (a caller-side reorder: split into lines before
-substituting, instead of after — the algorithm itself needs no further change), tracked
-separately as [#1742](https://github.com/rust-works/succinctly/issues/1742). Likely an
-off-by-one in jq's own end-of-buffer lookahead rather than a designed rule either way;
-per ADR-0018 rule 4 the correct resolution, where reached, is bug-for-bug replication
-rather than "fixing" the substitution into the more sensible WHATWG-consistent shape. See
+Two things about #1743 are worth recording, because its own issue text got both wrong:
+
+- **The scope is the escape-*decoded* string, not the raw source span.** Escapes only ever
+  shrink a string, so they can push a lead byte over the `len - pos < seq_len` line that
+  its raw span would clear. `"\xe1A"` is seven raw bytes but two decoded — one short
+  of the three the `0xE1` lead declares — and real jq collapses it to a bare U+FFFD,
+  dropping the `A` (oracle-verified, as is the 4-byte analogue `"\xf0\x90A"`). A
+  repair scoped to the raw span keeps the `A` and is wrong.
+- **It needed no per-string substitution *timing*, and did not touch semi-indexing.** The
+  issue assumed decoding had to move to after structural parsing. It did not: both callers
+  already gate on a whole-input SIMD `validate_utf8`, so a valid document never enters the
+  repair at all, and the repair still produces a valid-UTF-8 buffer — preserving the
+  invariant ([docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md))
+  that after the input-boundary pass, `as_str()` can only fail on an *escape* problem,
+  which is what lets the cursor borrow and the printer echo raw spans. Locating string
+  boundaries in non-UTF-8 text needs only a byte-level quote/backslash scan, which is sound
+  because UTF-8 is self-synchronising: `"` and `\` can never occur inside a multi-byte
+  sequence, so the scan agrees with jq's own byte-oriented lexer by construction.
+
+Likely an off-by-one in jq's own end-of-buffer lookahead rather than a designed rule; per
+ADR-0018 rule 4 the correct resolution is bug-for-bug replication rather than "fixing" the
+substitution into the more sensible WHATWG-consistent shape. See
 [docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
-substitution-mechanism history, [#1717](https://github.com/rust-works/succinctly/issues/1717)
-for the algorithm fix itself, and #1743/#1742 above for the two granularity gaps it leaves
-open.
+substitution-mechanism history and
+[#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
 ## Conversion diagnostics beyond a single token
 
