@@ -4062,6 +4062,145 @@ fn test_nul_output_evaluated_1701() -> Result<()> {
     Ok(())
 }
 
+/// #1709: `-0`/`--nul-output` performed no content validation at all --
+/// real yq refuses to emit a result whose rendered bytes contain a raw NUL
+/// byte (ambiguous against the very separator `-0` exists to use), but
+/// succinctly silently emitted it. `\0` inside the YAML double-quoted
+/// scalar below is YAML's own escape spelling (two literal source
+/// characters, not a raw byte -- a raw NUL byte in YAML source is rejected
+/// by the parser itself, regardless of quoting, confirmed live against the
+/// pinned oracle), matching the M2 evaluated (`.a`) fast path.
+#[test]
+fn test_nul_output_rejects_embedded_nul_1709() -> Result<()> {
+    let input = "a: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".a", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(
+        stderr.contains("NUL"),
+        "expected a NUL-content diagnostic, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Same check, identity (P9) fast path -- a separate code path from the
+/// evaluated one above (`is_identity` in `stream_cursor!`).
+#[test]
+fn test_nul_output_rejects_embedded_nul_identity_1709() -> Result<()> {
+    let input = "\"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709: real yq's own flush-then-error atomicity, not check-then-flush --
+/// live-verified against the pinned oracle. Earlier valid results in a
+/// stream are still flushed with their real terminator; the offending
+/// result and everything after it are not, and the whole run fails. This
+/// is the correctness property a prior, closed attempt at this issue (PR
+/// #1767) got wrong by buffering the *entire* stream before writing
+/// anything, discarding already-good output on a later failure.
+#[test]
+fn test_nul_output_flushes_earlier_results_then_stops_1709() -> Result<()> {
+    let input = "- 1\n- 2\n- \"x\\0y\"\n- 4\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".[]", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "1\u{0}2\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709: the `---` document separator has to be decided at the same
+/// per-result granularity as the NUL check itself, not eagerly before the
+/// body renders -- live-verified against the pinned oracle that real yq
+/// does NOT write a document's `---` when that document's first (here,
+/// only) result fails the NUL check, even though the document would
+/// otherwise structurally produce output.
+#[test]
+fn test_nul_output_no_separator_when_first_result_fails_1709() -> Result<()> {
+    let input = "a: \"first\"\n---\na: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".a", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "first\0");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709 counterpart: the separator DOES still appear once at least one
+/// earlier result in the *same* document has already flushed clean --
+/// live-verified against the pinned oracle (a document whose first result
+/// succeeds keeps its `---`, even though a later result in it then fails).
+#[test]
+fn test_nul_output_separator_kept_when_earlier_result_in_doc_succeeds_1709() -> Result<()> {
+    let input = "b:\n  - ignored\n---\nb:\n  - 1\n  - \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".b[]?", input, &["-0"])?;
+    assert_eq!(code, 1);
+    // Own newline-before-`---` divergence (#1701/ADR-0018 carve-out) is
+    // orthogonal to what this test pins -- only that the separator survives.
+    assert!(
+        output.contains("---"),
+        "expected the second document's separator to survive, got: {output:?}"
+    );
+    assert!(output.starts_with("ignored\0"));
+    assert!(output.ends_with("---\n1\0"), "got: {output:?}");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709: the DOM path (`output_value`) needs the identical check --
+/// `.a + 0` is not M2-eligible (arithmetic forces the DOM path, same
+/// technique #1701's own `test_nul_output_multidoc_dom_path_does_not_
+/// corrupt_1701` uses above).
+#[test]
+fn test_nul_output_rejects_embedded_nul_dom_path_1709() -> Result<()> {
+    let input = "a: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".a + \"\"", input, &["-0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709: `-P` also forces the DOM path.
+#[test]
+fn test_nul_output_rejects_embedded_nul_pretty_print_1709() -> Result<()> {
+    let input = "a: \"x\\0y\"\n";
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".a", input, &["-0", "-P"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// #1709: `--null-input` (`-n`) always takes the DOM path (nothing to
+/// stream from).
+#[test]
+fn test_nul_output_rejects_embedded_nul_null_input_1709() -> Result<()> {
+    let (output, stderr, code) =
+        run_yq_stdin_with_stderr("\"x\" + \"\\u0000\" + \"y\"", "", &["-0", "-n"])?;
+    assert_eq!(code, 1);
+    assert_eq!(output, "");
+    assert!(stderr.contains("NUL"), "got: {stderr}");
+    Ok(())
+}
+
+/// Regression guard: ordinary `-0` output with no embedded NUL anywhere is
+/// completely unaffected by #1709's check, on both the M2 and DOM paths.
+#[test]
+fn test_nul_output_unaffected_when_no_nul_present_1709() -> Result<()> {
+    let (output, code) = run_yq_stdin(".a", "a: 1\n", &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\0");
+
+    let (output, code) = run_yq_stdin(".a + 0", "a: 1\n", &["-0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\0");
+
+    Ok(())
+}
+
 /// Same fix, `--inplace` (#1701).
 #[test]
 fn test_nul_output_inplace_1701() -> Result<()> {

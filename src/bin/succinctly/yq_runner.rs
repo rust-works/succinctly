@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
+use std::cell::Cell;
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
@@ -57,6 +58,12 @@ fn absorb_stream_stats(sink: &mut ErrorSink, stats: &succinctly::jq::stream::Str
     }
 }
 
+/// Matches real yq's own message text (Homebrew v4.53.3, live-verified,
+/// #1709) for a `-0`/`--nul-output` result whose rendered bytes contain a
+/// raw NUL character.
+const NUL_OUTPUT_ERROR_MESSAGE: &str =
+    "can't serialise value because it contains NUL char and you are using NUL separated output";
+
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods.
 /// This enables streaming JSON output without intermediate String allocation.
 struct FmtWriter<W>(W);
@@ -77,6 +84,16 @@ impl<W: Write> core::fmt::Write for FmtWriter<W> {
 enum ColorSink<'a, W: Write> {
     Buffered(String, Vec<usize>),
     Direct(FmtWriter<&'a mut W>),
+    /// Per-result NUL-checked buffering (#1709), used instead of `Direct`
+    /// when `-0`/`--nul-output` is active and `--color` isn't. See
+    /// [`NulCheckedSink`]'s own doc comment for why this needs to buffer
+    /// one result at a time rather than either streaming straight through
+    /// (`Direct`, which would leak an invalid result's own already-rendered
+    /// prefix bytes before detecting its embedded NUL) or buffering the
+    /// whole document like `Buffered` does (which would reintroduce the
+    /// #789-class memory regression a prior attempt at this issue, PR
+    /// #1767, measured and got closed over).
+    NulChecked(NulCheckedSink<'a, W>),
 }
 
 impl<W: Write> core::fmt::Write for ColorSink<'_, W> {
@@ -84,7 +101,118 @@ impl<W: Write> core::fmt::Write for ColorSink<'_, W> {
         match self {
             ColorSink::Buffered(buf, _) => buf.write_str(s),
             ColorSink::Direct(w) => w.write_str(s),
+            ColorSink::NulChecked(sink) => sink.buf.write_str(s),
         }
+    }
+}
+
+/// Threads `stream_cursor!`'s own `$doc_streamed`/`no_doc` state into
+/// [`stream_maybe_colored`] for lazy `---` emission (#1709). `None` for
+/// JSON output call sites, which have no document-separator concept at
+/// all.
+struct DocSeparatorArgs<'a> {
+    doc_streamed: &'a mut bool,
+    no_doc: bool,
+}
+
+/// Lazy `---` document-separator state carried inside [`NulCheckedSink`]
+/// (#1709). `emit_yaml_doc_separator`'s ordinary eager write (before the
+/// body even renders) is wrong for NUL-checked output: verified live
+/// against the pinned oracle (Homebrew yq v4.53.3) that real yq does NOT
+/// write a document's `---` when that document's *first* result fails the
+/// NUL check, even though the document would otherwise structurally
+/// produce output -- but DOES keep the separator once at least one earlier
+/// result in the same document already flushed clean. So the separator has
+/// to be decided at the same per-result granularity as the NUL check
+/// itself, not before it.
+struct PendingSeparator<'a> {
+    /// Mirrors `stream_cursor!`'s own `$doc_streamed`: has any *prior*
+    /// document already produced real output. Only ever set, never
+    /// cleared, so a document that fails outright doesn't un-flag one that
+    /// already succeeded earlier.
+    doc_streamed: &'a mut bool,
+    no_doc: bool,
+    /// Whether this document's own separator question has already been
+    /// settled (written, or correctly skipped for `no_doc`/being first) --
+    /// distinct from `doc_streamed`, which is global: without this, every
+    /// result after the first in the *same* document would see
+    /// `doc_streamed` already `true` (set by the first result's own flush)
+    /// and try to insert another `---` before itself.
+    settled: bool,
+}
+
+/// Per-result buffered writer used when `-0`/`--nul-output` is active and
+/// `--color` isn't (#1709). Buffers ONE streamed result's rendered text at
+/// a time -- not the whole document/stream, unlike `ColorSink::Buffered`
+/// above (which exists for an unrelated reason, color re-lexing, and pays
+/// for materializing every result of a whole document up front as an
+/// accepted, pre-existing cost of `--color` specifically). A per-*result*
+/// buffer keeps bounded, O(one result) memory regardless of document size,
+/// matching this crate's M2 streaming architecture's own memory guarantee.
+///
+/// A prior attempt at this exact issue (PR #1767, closed without merging)
+/// buffered the entire rendered stream instead whenever `-0` was set, and
+/// measured +65% peak RSS on a 100MB document as a result -- buffering the
+/// wrong granularity, not buffering itself, was the regression.
+///
+/// Verified live against the pinned oracle (Homebrew yq v4.53.3) that
+/// per-result is also the *correct* granularity, not just the cheap one:
+/// earlier results in a stream flush with their real terminator even when
+/// a later one fails (`1,2,("a"+NUL+"b"),4` under `-0` prints `1\0002\000`
+/// then errors, producing nothing for the third result and never reaching
+/// the fourth) -- exactly the shape one flush-buffer-per-result gives for
+/// free, with no separate "is this scalar being unwrapped" mode predicate
+/// to derive (see the issue's own second post-mortem comment): the gate is
+/// simply "does this result's rendered buffer contain a raw NUL byte."
+struct NulCheckedSink<'a, W: Write> {
+    writer: &'a mut W,
+    buf: String,
+    terminator: Terminator,
+    nul_detected: &'a Cell<bool>,
+    separator: Option<PendingSeparator<'a>>,
+}
+
+impl<W: Write> NulCheckedSink<'_, W> {
+    /// Checks the current per-result buffer for an embedded NUL byte,
+    /// clearing the buffer either way. On success, writes the pending
+    /// `---` separator first (if this is the document's first surviving
+    /// result), then the buffer's own contents -- but not the terminator,
+    /// which callers add separately: [`Self::flush_result`] for the
+    /// evaluated multi-result path's per-result hook, or
+    /// [`stream_maybe_colored`]'s own post-render step for the identity
+    /// path, whose `stream_yaml_as_document` has no per-result callback to
+    /// hook a flush into.
+    fn flush_body(&mut self) -> core::fmt::Result {
+        if self.buf.as_bytes().contains(&0) {
+            self.nul_detected.set(true);
+            self.buf.clear();
+            return Err(core::fmt::Error);
+        }
+        if let Some(sep) = &mut self.separator {
+            if !sep.settled {
+                if *sep.doc_streamed && !sep.no_doc {
+                    write_doc_separator_marker(self.writer, self.terminator)
+                        .map_err(|_| core::fmt::Error)?;
+                }
+                *sep.doc_streamed = true;
+                sep.settled = true;
+            }
+        }
+        self.writer
+            .write_all(self.buf.as_bytes())
+            .map_err(|_| core::fmt::Error)?;
+        self.buf.clear();
+        Ok(())
+    }
+
+    /// [`Self::flush_body`] plus the real terminator -- the evaluated
+    /// multi-result path's per-result hook, reached through
+    /// [`ColorSink::write_result_terminator`].
+    fn flush_result(&mut self, terminator: Terminator) -> core::fmt::Result {
+        self.flush_body()?;
+        terminator
+            .write_io(self.writer)
+            .map_err(|_| core::fmt::Error)
     }
 }
 
@@ -114,11 +242,13 @@ impl<W: Write> ColorSink<'_, W> {
     /// to the real `$writer`/`OutputConfig` outside any `ColorSink` at all)
     /// to keep the two apart when searching this file.
     fn write_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
-        if matches!(self, ColorSink::Buffered(..)) {
-            self.record_boundary();
-            Ok(())
-        } else {
-            terminator.write_fmt(self)
+        match self {
+            ColorSink::Buffered(..) => {
+                self.record_boundary();
+                Ok(())
+            }
+            ColorSink::Direct(_) => terminator.write_fmt(self),
+            ColorSink::NulChecked(sink) => sink.flush_result(terminator),
         }
     }
 }
@@ -203,9 +333,29 @@ macro_rules! json_ascii {
 /// Whatever reached `out` before the failure is still written, colorized path
 /// included — the same keep-the-prefix-and-diagnose trade #1641/#1679 settled
 /// for their own streaming sites.
+///
+/// `terminator`/`separator` (#1709): when `terminator` is `Terminator::Nul`
+/// and `use_color` is false, dispatches to `ColorSink::NulChecked` instead
+/// of `Direct` — see that type's own doc comment for why per-result
+/// buffering, not raw passthrough, is required to match real yq's own
+/// flush-then-error atomicity without regressing this crate's streaming
+/// memory guarantee. `separator` threads `stream_cursor!`'s own
+/// `$doc_streamed`/`no_doc` state through for the YAML call sites' lazy
+/// `---` emission; `None` for JSON, which has no separator concept.
+///
+/// The `use_color` path keeps its existing whole-buffer shape (color
+/// re-lexing already requires materializing the whole rendered document, a
+/// pre-existing cost unrelated to `-0`); a `-0`+`--color` combination is
+/// checked for an embedded NUL over that same already-buffered content
+/// before writing, coarser-grained (whole document, not per-result) than
+/// the no-color path below, but bounded by the same memory this
+/// combination already pays for coloring — see
+/// `docs/compliance/yq/limitations.md` for this scope note.
 fn stream_maybe_colored<W: Write, T>(
     writer: &mut W,
     use_color: bool,
+    terminator: Terminator,
+    separator: Option<DocSeparatorArgs<'_>>,
     colorize: impl FnOnce(&str, &[usize]) -> String,
     render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<T, StreamFailure>,
 ) -> anyhow::Result<Result<T, EvalError>> {
@@ -215,7 +365,64 @@ fn stream_maybe_colored<W: Write, T>(
         let ColorSink::Buffered(buf, boundaries) = sink else {
             unreachable!("stream_maybe_colored always constructs ColorSink::Buffered here")
         };
+        // `separator.is_some()` doubles as "this is a YAML call site"
+        // (#1709): YAML's `Buffered` mode never embeds a raw terminator
+        // character into `buf` itself (`write_result_terminator` records a
+        // boundary offset instead, exactly so `colorize_yaml` can place a
+        // real terminator later, correctly relative to whatever color span
+        // is open there). JSON's own on_value closures write
+        // `terminator.write_fmt(w)` directly, so JSON's buffer *does*
+        // contain raw `\0` terminator bytes between every result when
+        // `-0` is active -- scanning it here would false-positive on the
+        // terminator's own byte, not a value actually containing one.
+        // Narrowing this check to YAML leaves `--color -o=json -0`
+        // unvalidated; that combination already can't be safely consumed
+        // by a NUL-delimited reader once ANSI escapes are mixed in, so
+        // `-0`'s own reason for existing doesn't really apply to it either.
+        if terminator == Terminator::Nul && separator.is_some() && buf.as_bytes().contains(&0) {
+            return Err(anyhow::anyhow!(NUL_OUTPUT_ERROR_MESSAGE));
+        }
         write!(writer, "{}", colorize(&buf, &boundaries))?;
+        match rendered {
+            Ok(value) => Ok(Ok(value)),
+            Err(StreamFailure::Decode(e)) => Ok(Err(e)),
+            Err(StreamFailure::Fmt) => Err(anyhow::anyhow!("Write error")),
+        }
+    } else if terminator == Terminator::Nul {
+        let nul_detected = Cell::new(false);
+        let sink_state = NulCheckedSink {
+            writer,
+            buf: String::new(),
+            terminator,
+            nul_detected: &nul_detected,
+            separator: separator.map(|s| PendingSeparator {
+                doc_streamed: s.doc_streamed,
+                no_doc: s.no_doc,
+                settled: false,
+            }),
+        };
+        let mut sink = ColorSink::NulChecked(sink_state);
+        let rendered = render(&mut sink);
+        let ColorSink::NulChecked(mut sink_state) = sink else {
+            unreachable!("stream_maybe_colored always constructs ColorSink::NulChecked here")
+        };
+        // The identity path leaves exactly one un-flushed result in the
+        // buffer -- `stream_yaml_as_document`/`stream_json_as_document`
+        // have no per-result callback to flush through `write_result_
+        // terminator`, unlike the evaluated multi-result path, whose own
+        // `on_value` calls already drained the buffer via `flush_result`
+        // before `render` ever returns. A no-op there.
+        let rendered = if rendered.is_ok() && !sink_state.buf.is_empty() {
+            match sink_state.flush_body() {
+                Ok(()) => rendered,
+                Err(e) => Err(StreamFailure::from(e)),
+            }
+        } else {
+            rendered
+        };
+        if nul_detected.get() {
+            return Err(anyhow::anyhow!(NUL_OUTPUT_ERROR_MESSAGE));
+        }
         match rendered {
             Ok(value) => Ok(Ok(value)),
             Err(StreamFailure::Decode(e)) => Ok(Err(e)),
@@ -239,11 +446,12 @@ fn stream_maybe_colored<W: Write, T>(
 fn stream_or_report<W: Write>(
     writer: &mut W,
     use_color: bool,
+    terminator: Terminator,
     sink: &mut ErrorSink,
     colorize: impl FnOnce(&str, &[usize]) -> String,
     render: impl FnOnce(&mut ColorSink<'_, W>) -> Result<(), StreamFailure>,
 ) -> anyhow::Result<bool> {
-    match stream_maybe_colored(writer, use_color, colorize, render)? {
+    match stream_maybe_colored(writer, use_color, terminator, None, colorize, render)? {
         Ok(()) => Ok(true),
         Err(e) => {
             report_stream_decode_failure(sink, &e);
@@ -2248,6 +2456,22 @@ fn write_terminator<W: Write>(writer: &mut W, config: &OutputConfig) -> Result<(
 /// (issue #710). Callers with no cursor-derived comment data (JSON input,
 /// `--null-input`, `--raw-input`, `--slurp`, `--inplace`'s slow path) pass
 /// `&CommentTree::empty()`.
+/// DOM-path counterpart to `NulCheckedSink` (#1709) -- `output_value`
+/// already fully materializes its rendered text as an owned `String`
+/// before writing, unlike the M2 streaming path, so the check here needs
+/// no per-result buffering of its own: this isn't a new allocation, only a
+/// new scan over one `output_value` already made. Scans the pre-colorized
+/// text (colorizing only wraps existing content in ANSI codes, never
+/// alters or strips a NUL byte already there), and runs before
+/// `write_terminator`, so a `Terminator::Nul` byte written separately,
+/// after this check, is never mistaken for a rejected value's own content.
+fn reject_nul_output(rendered: &str, config: &OutputConfig) -> Result<()> {
+    if config.nul_output && rendered.contains('\0') {
+        anyhow::bail!(NUL_OUTPUT_ERROR_MESSAGE);
+    }
+    Ok(())
+}
+
 fn output_value<W: Write>(
     writer: &mut W,
     value: &OwnedValue,
@@ -2257,6 +2481,7 @@ fn output_value<W: Write>(
     // Handle raw output for scalars
     if config.raw_output {
         if let OwnedValue::String(s) = value {
+            reject_nul_output(s, config)?;
             write!(writer, "{s}")?;
             write_terminator(writer, config)?;
             return Ok(());
@@ -2340,6 +2565,7 @@ fn output_value<W: Write>(
         } else {
             body
         };
+        reject_nul_output(&output, config)?;
         if config.use_color {
             // No boundary recorded here -- `write_terminator` below writes
             // directly to `writer`, outside this buffer (#1708).
@@ -2377,6 +2603,7 @@ fn output_value<W: Write>(
         },
     );
 
+    reject_nul_output(&json_str, config)?;
     if config.use_color {
         write!(
             writer,
@@ -3940,18 +4167,37 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // `$cursor` here is the whole document being
                     // redisplayed as itself - its own trailing comment,
                     // if any, must be kept (#710).
-                    emit_yaml_doc_separator(
-                        $writer,
-                        $doc_streamed,
-                        true,
-                        $output_config.no_doc,
-                        terminator,
-                    )?;
+                    //
+                    // #1709: when the output is NUL-separated, the
+                    // separator can't be written eagerly here -- real yq
+                    // doesn't emit a document's `---` when that document's
+                    // own (identity mode: only) result fails the NUL
+                    // check, so the decision has to move inside
+                    // `stream_maybe_colored`'s `NulChecked` sink, which
+                    // only learns the outcome after rendering. Every other
+                    // terminator keeps the existing eager write unchanged.
+                    let nul_separator = if terminator == Terminator::Nul {
+                        Some(DocSeparatorArgs {
+                            doc_streamed: $doc_streamed,
+                            no_doc: $output_config.no_doc,
+                        })
+                    } else {
+                        emit_yaml_doc_separator(
+                            $writer,
+                            $doc_streamed,
+                            true,
+                            $output_config.no_doc,
+                            terminator,
+                        )?;
+                        None
+                    };
                     // No boundary recorded here -- the terminator is written
                     // directly to `$writer` below, outside this buffer (#1708).
                     let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
+                        nul_separator,
                         |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                         |out| $cursor.stream_yaml_as_document(out, yaml_indent, sort_keys),
                     )?;
@@ -3979,13 +4225,26 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     // output (`GenericResult::Halt`) answers `false`
                     // there; an output-bearing halt
                     // (`GenericResult::Partial`) answers `true`.
-                    emit_yaml_doc_separator(
-                        $writer,
-                        $doc_streamed,
-                        result.produces_output(),
-                        $output_config.no_doc,
-                        terminator,
-                    )?;
+                    // #1709: see the identity branch's own comment above --
+                    // `result.produces_output()` predicts the STRUCTURE of
+                    // the result, not whether its first NUL-checked result
+                    // will actually survive, so a NUL-separated document's
+                    // separator has to be decided lazily too.
+                    let nul_separator = if terminator == Terminator::Nul {
+                        Some(DocSeparatorArgs {
+                            doc_streamed: $doc_streamed,
+                            no_doc: $output_config.no_doc,
+                        })
+                    } else {
+                        emit_yaml_doc_separator(
+                            $writer,
+                            $doc_streamed,
+                            result.produces_output(),
+                            $output_config.no_doc,
+                            terminator,
+                        )?;
+                        None
+                    };
                     // #1708: the per-result terminator write runs *inside*
                     // this buffered render callback, so a real terminator
                     // byte here would become part of what gets colorized --
@@ -3999,6 +4258,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     let stats = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
+                        nul_separator,
                         |s, boundaries| colorize_yaml(s, terminator, boundaries),
                         |out| {
                             result
@@ -4044,6 +4305,8 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     let rendered = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
+                        None,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
@@ -4068,12 +4331,34 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     let stats = stream_maybe_colored(
                         $writer,
                         $use_color,
+                        terminator,
+                        None,
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
                                 result
                                     .stream_json(out, json_indent, sort_keys, |w| {
-                                        terminator.write_fmt(w)
+                                        // #1709: `--color`'s `Buffered` mode
+                                        // needs the raw terminator byte
+                                        // written straight into its buffer
+                                        // (JSON's own colorizer re-lexes
+                                        // that unmodified, unlike YAML's
+                                        // boundary-based one -- see
+                                        // `stream_maybe_colored`'s own
+                                        // comment on this). `write_result_
+                                        // terminator` would silently drop
+                                        // it there. Every other mode
+                                        // (`Direct`, `NulChecked`) is
+                                        // unaffected either way -- `Direct`'s
+                                        // own arm is exactly `terminator.
+                                        // write_fmt(self)`, and `NulChecked`
+                                        // needs the dispatch to trigger its
+                                        // per-result flush.
+                                        if $use_color {
+                                            terminator.write_fmt(w)
+                                        } else {
+                                            w.write_result_terminator(terminator)
+                                        }
                                     })
                                     .map_err(StreamFailure::from)
                             })
@@ -4174,6 +4459,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 stream_or_report(
                                     &mut writer,
                                     output_config.use_color,
+                                    terminator_from_config(&output_config),
                                     &mut sink,
                                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                                     |out| root.stream_yaml_document(out, yaml_indent, sort_keys),
@@ -4182,6 +4468,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 stream_or_report(
                                     &mut writer,
                                     output_config.use_color,
+                                    terminator_from_config(&output_config),
                                     &mut sink,
                                     |s, _boundaries| {
                                         output::colorize_json(s, &ColorScheme::default())
@@ -4311,6 +4598,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     stream_or_report(
                                         &mut writer,
                                         output_config.use_color,
+                                        terminator_from_config(&output_config),
                                         &mut sink,
                                         |s, boundaries| {
                                             colorize_yaml(s, Terminator::None, boundaries)
@@ -4323,6 +4611,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     stream_or_report(
                                         &mut writer,
                                         output_config.use_color,
+                                        terminator_from_config(&output_config),
                                         &mut sink,
                                         |s, _boundaries| {
                                             output::colorize_json(s, &ColorScheme::default())
@@ -4744,6 +5033,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 stream_or_report(
                     &mut writer,
                     output_config.use_color,
+                    terminator_from_config(&output_config),
                     &mut sink,
                     |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                     |sink| {
@@ -4765,6 +5055,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 stream_or_report(
                     &mut writer,
                     output_config.use_color,
+                    terminator_from_config(&output_config),
                     &mut sink,
                     |s, boundaries| colorize_yaml(s, Terminator::None, boundaries),
                     |out| {
