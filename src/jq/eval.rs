@@ -24319,6 +24319,13 @@ fn reestablishes_register(
 ///   ambient value on the very transition that drops trackability, the only
 ///   place that value is still in hand — or, once already untracked, from
 ///   the branch's own carried copy.
+///
+/// That last arm clones the carried `Cow`, which is a deep copy when the
+/// register has been forced owned (`into_owned_value`, #668) and the stage
+/// fans out into several outputs. `Rc` would make the clone O(1) but would
+/// cost an allocation at *every* recording, including the overwhelmingly
+/// common case where the register is never consulted again; the borrow
+/// `resolve_leaf` records today costs nothing. Kept as `Cow` deliberately.
 fn carry_register<'a>(
     facts: StepRegisterFacts,
     reestablished: bool,
@@ -24480,9 +24487,6 @@ fn resolve_seq<'a, S: EvalSemantics>(
             value: current,
             trackable: branch_trackable,
             snapshot: branch_snapshot,
-            register: branch_register,
-        } in branches
-        {
             // The path register as it stands *entering* this stage (#1573).
             //
             // While `branch_trackable` holds, the register is `current`
@@ -24494,7 +24498,9 @@ fn resolve_seq<'a, S: EvalSemantics>(
             // by hand is the *already*-untracked case, where the register
             // is live somewhere behind us and no step below can see it any
             // more.
-            let carried_register = branch_register;
+            register: carried_register,
+        } in branches
+        {
             // #986: each branch carries its own trackability now, so this
             // passes *that* rather than the single outer parameter. It is
             // what makes `1 | .[K]` reach `resolve_index_expr` already
