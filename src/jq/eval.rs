@@ -11246,19 +11246,22 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::type_error("number", "null")),
     };
 
-    // Evaluate expr and skip first n results
+    // Evaluate expr and skip first n results. #1989: each of these three
+    // arms used bare `to_owned` -- an undecodable string in a real,
+    // navigated `expr` output silently became "" instead of raising, with
+    // no guard at all (unlike its sibling `n`-classification arms above).
     let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => {
             if n == 0 {
-                QueryResult::Owned(to_owned(&v))
+                QueryResult::Owned(to_owned_checked_or_suppress!(&v, optional))
             } else {
                 QueryResult::None
             }
         }
         QueryResult::OneCursor(c) => {
             if n == 0 {
-                QueryResult::Owned(to_owned(&c.value()))
+                QueryResult::Owned(to_owned_checked_or_suppress!(&c.value(), optional))
             } else {
                 QueryResult::None
             }
@@ -11271,9 +11274,15 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         QueryResult::Many(results) => {
-            let skipped: Vec<OwnedValue> =
-                results.into_iter().skip(n).map(|v| to_owned(&v)).collect();
-            owned_vec_to_result(skipped)
+            let skipped: Result<Vec<OwnedValue>, EvalError> = results
+                .into_iter()
+                .skip(n)
+                .map(|v| to_owned_checked(&v))
+                .collect();
+            match skipped {
+                Ok(skipped) => owned_vec_to_result(skipped),
+                Err(e) => suppress_or_raise(e, optional),
+            }
         }
         QueryResult::ManyOwned(results) => {
             let skipped: Vec<OwnedValue> = results.into_iter().skip(n).collect();
@@ -67955,6 +67964,39 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "Invalid path expression with result 0");
             }
+        );
+    }
+
+    /// #1989: `builtin_skip`'s three output-conversion arms (`One`,
+    /// `OneCursor`, `Many`) all used bare `to_owned`, with no
+    /// decode-failure guard at all -- unlike its sibling `n`-classification
+    /// arms above, which already error correctly. An undecodable string in
+    /// `expr`'s real output silently became garbage instead of raising.
+    #[test]
+    fn test_builtin_skip_raises_on_output_decode_failure_1989() {
+        // `Many` arm: skip(1; .[]) surfaces the second element.
+        query!(
+            &b"[\"good\",\"\xff\xfe\"]"[..],
+            "skip(1; .[])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // A genuine decode failure is never suppressed by `optional` (#1620).
+        query!(
+            &b"[\"good\",\"\xff\xfe\"]"[..],
+            "(skip(1; .[]))?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive control: valid data is unaffected.
+        query!(
+            br#"["good","also-good"]"#,
+            "skip(1; .[])",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "also-good")
+        );
+        // `One` arm: n == 0 takes expr's single output directly.
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "skip(0; .)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
         );
     }
 }
