@@ -28672,3 +28672,96 @@ fn test_sort_family_still_collapses_in_plain_jq_mode_1687() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1687: the error and control paths through the new native arms, which the
+/// happy-path tests above never reach — `sort_key_generic`'s `Err`, the
+/// `sort_family_control` conversion, `fanout_arg_generic`'s `body`-escape and
+/// argument-escape arms, and `reduce`'s input-control propagation.
+///
+/// Every row is real jq 1.7.1's own output and exit code, captured live: these
+/// are all shapes with a jq oracle, so there is no reason to pin anything
+/// weaker than parity.
+#[test]
+fn test_1687_native_arms_propagate_errors_like_jq() -> Result<()> {
+    let input = "[10,20,30,40]";
+
+    // An error raised while computing a sort key aborts the whole builtin with
+    // no partial output — the atomicity `eval::builtin_min_by` and friends
+    // already had, now also on the cursor-native path.
+    for filter in [
+        "sort_by(error(\"x\"))",
+        "min_by(error(\"x\"))",
+        "unique_by(error(\"x\"))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stderr {stderr}");
+        assert_eq!(stdout, "", "{filter}: no partial output");
+        assert!(stderr.contains(": x"), "{filter}: stderr {stderr}");
+    }
+
+    // An error inside `limit`'s `n` generator, and inside its body, both reach
+    // the caller through `fanout_arg_generic` rather than being swallowed.
+    for filter in ["[limit((1,error(\"x\")); .[])]", "[limit(2; error(\"x\"))]"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stderr {stderr}");
+        assert_eq!(stdout, "", "{filter}");
+        assert!(stderr.contains(": x"), "{filter}: stderr {stderr}");
+    }
+
+    // `reduce` is single-shot, so a control anywhere in its input stream
+    // discards the prefix and propagates alone — and `?` suppresses an
+    // ordinary error there, matching `eval::eval_reduce`'s `suppress_or_raise`.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "reduce (1,error(\"x\")) as $x (0; .+1)"],
+        Some(input),
+    )?;
+    assert_eq!(code, 5, "stderr {stderr}");
+    assert_eq!(stdout, "");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "reduce (1,error(\"x\")) as $x (0; .+1)?"],
+        Some(input),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // An empty array answers `null` for all four min/max spellings, before any
+    // key is computed.
+    for filter in ["min", "max", "min_by(.)", "max_by(.)"] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some("[]"))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, "null\n", "{filter}");
+    }
+
+    Ok(())
+}
+
+/// #1687: `limit`/`nth` must still hand a live `input`/`inputs` queue to
+/// `eval.rs` untouched — the #1309 guard is the one deferral
+/// `fanout_arg_generic` did *not* replace, because probing the queue here
+/// would drain it as a side effect before the fallback ever ran.
+///
+/// This covers both bridges: `bridge_to_full_evaluator_flow` (reached from
+/// `each_limit_generic`, i.e. `limit` under a demand-driven consumer) and
+/// `Expr::NthExpr`'s own. Both rows are jq 1.7.1's own output.
+#[test]
+fn test_1687_limit_and_nth_still_bridge_a_live_input_queue() -> Result<()> {
+    let inputs = "1\n2\n3\n4\n";
+
+    // `first(...)` routes through `each_limit_generic`, the sink-side arm.
+    let (stdout, code) = run_jq_stdin("first(limit(inputs; 10,20,30))", inputs, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "10\n");
+
+    // Bare `limit`: `inputs` yields 2,3,4 against the first document, so the
+    // body runs once per value of `n`.
+    let (stdout, code) = run_jq_stdin("[limit(inputs; 10,20)]", inputs, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[10,20,10,20,10,20]\n");
+
+    let (stdout, code) = run_jq_stdin("nth(inputs; 10,20,30)", inputs, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "30\n");
+
+    Ok(())
+}
