@@ -15,8 +15,9 @@
 use alloc::borrow::Cow;
 #[cfg(not(test))]
 use alloc::boxed::Box;
-// `BTreeSet`, not `HashSet`: this crate is `no_std`, and `alloc` has no hasher.
-use alloc::collections::BTreeSet;
+// `BTreeSet`/`BTreeMap`, not the `Hash*` pair: this crate is `no_std`, and
+// `alloc` has no hasher.
+use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(not(test))]
 use alloc::format;
 #[cfg(not(test))]
@@ -35,7 +36,7 @@ use std::rc::Rc;
 
 use core::cell::Cell;
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 
 use super::document::{
     effective_fields, effective_fields_checked, effective_keys, effective_len, key_display_string,
@@ -17107,7 +17108,7 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // fail in practice; falling back to `NotChecked` on the (unreachable)
     // `Err` arm just means the caller re-derives from scratch, same as
     // before this function existed.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
         Ok(paths) => paths,
         Err(_) => return Ok(YqAssignNoopCheck::NotChecked),
     };
@@ -17224,7 +17225,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(pristine) => pristine,
                 Err(e) => return suppress_or_raise(e, optional),
             };
-            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
+            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
                 Ok(paths) => paths,
                 // `?` swallows only a genuine error; a halt always escapes,
                 // so `(.[(halt_error(3))] = 1)?` still halts instead of
@@ -17316,7 +17317,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false, false) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
@@ -17528,7 +17529,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false, false) {
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes (#791).
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
@@ -24620,6 +24621,279 @@ fn resolve_seq<'a, S: EvalSemantics>(
     }
 }
 
+/// Flatten each resolved [`PathBranch`]'s persistent `Rc<PathPrefix>` chain
+/// into one fully-static path `Expr`.
+///
+/// The one O(depth)-per-branch operation in path resolution, and the reason
+/// `del()` bypasses it entirely for a multi-branch match set (#1690): with
+/// `b` branches at depth `d` this is `O(b * d)` however much structure the
+/// branches share, because each output `Expr` is an independent owned tree.
+/// See [`DeleteTrie`] for the shared-structure alternative.
+fn assemble_path_branches(branches: Vec<PathBranch<'_>>) -> Vec<Expr> {
+    branches
+        .into_iter()
+        .map(|branch| assemble_one_branch(&branch))
+        .collect()
+}
+
+/// [`assemble_path_branches`] for a single branch. Also `del()`'s own escape
+/// hatch back to a flat `Expr` for the handful of branches that genuinely
+/// need one (a yq slice-rule rewrite, or a match set small enough that the
+/// trie buys nothing) — see [`builtin_del`].
+fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
+    // #701: the one O(depth) flattening op, paid exactly once per branch
+    // here — never duplicated upstream during construction, unlike the
+    // `Vec<Expr>` this replaced.
+    let components: Vec<Expr> = branch
+        .path
+        .to_vec()
+        .into_iter()
+        .map(strip_resolved_optional)
+        .collect();
+    match components.len() {
+        0 => Expr::Identity,
+        1 => components.into_iter().next().expect("len checked"),
+        _ => Expr::Pipe(components),
+    }
+}
+
+/// Raise on the first branch that was computed rather than navigated to.
+///
+/// This is the genuinely terminal position (#986): `resolve_dynamic_indexes`
+/// is the top-level entry for all four of `path()`, `del()`, `=` and `|=`,
+/// so by definition nothing follows a branch that reaches here — which
+/// makes it the one place that can answer "is this untracked value
+/// actually an error?" with a plain yes.
+///
+/// It has to live here rather than in `resolve_seq`, for two reasons that
+/// each break the alternative on their own. `resolve_seq` never runs at
+/// all for a non-`Pipe` expression, so `path(1)` and — far worse —
+/// `del(1)` would sail past every check and be assembled into
+/// `Expr::Identity` below, silently deleting the whole document (the
+/// shapes pinned in #1284). And `resolve_seq` cannot know whether it is
+/// terminal even when it does run, because it is also reached as an
+/// `IndexExpr`/`SliceExpr` target, where its own tail is empty but the
+/// enclosing key still has to be navigated.
+///
+/// `near_iterate` picks the wording: `true` when a trailing bare iterate
+/// was stripped off `branches`' own path expression and will be spliced
+/// back on below (#888) — these branches are exactly the ones that would
+/// otherwise have reached `resolve_node`'s own `Expr::Iterate` arm, whose
+/// `if !trackable` guard raises `invalid_path_expression_near_iterate`,
+/// not the generic message this function raises for every other shape.
+/// Without it `path(1 | .[])` would report "Invalid path expression with
+/// result 1" where jq says "near attempt to iterate through 1".
+///
+/// Branches already produced ahead of the offending one are kept and
+/// returned as the `Err` prefix, matching jq's never-un-emit streaming.
+///
+/// `skip_untracked` (#1764): when set, an untracked terminal branch is
+/// real yq's own silent no-op, not an error -- confirmed live against
+/// yq v4.53.3, and **not specific to `Expr::Comma`** despite this
+/// function's own name: a single bare untracked expression with no
+/// comma at all is the identical no-op (`(1) = 5` on `{a: 1}` leaves
+/// it unchanged, matching `(.a, 1) = 5`'s "skip only the untracked
+/// one") -- the real rule is "any untracked terminal branch, however
+/// many others accompany it, however it was produced." That also
+/// covers a branch an *upstream* mechanism (not a bare literal)
+/// leaves untracked, e.g. `select`/`getpath` run as a `try`/`catch`
+/// handler on a caught error's payload: `try (.a, error({"y":99}))
+/// catch select(true) = "X"` writes `.a` and silently drops the
+/// caught, untracked branch, the same "skip only the untracked one"
+/// result as the bare-literal case, since by the time either reaches
+/// this function they are computationally identical -- there is no
+/// way, or reason, for this check to tell them apart. Confirmed
+/// position-independent for a genuine multi-branch comma too (`(.a,
+/// 1) = 5`, `(1, .a, .c) = 5`, `(.a, .c, 1) = 5`, all-branches-
+/// untracked): every trackable branch is still written normally and
+/// the untracked one(s) contribute nothing. `near_iterate`'s own
+/// wording distinction is moot when `skip_untracked` is set: there is
+/// no error to word either way. A genuine error/break/halt produced
+/// *while computing* what would otherwise be an untracked value is
+/// not itself untracked and still propagates normally -- confirmed
+/// live, `(.a, error("boom")) = 5` still raises `boom`, not a no-op.
+///
+/// **Only reachable call shapes are patched.** `path()` passes
+/// `near_iterate = true` here for a trailing bare iterate stripped
+/// off its own path expression (`defer_trailing_iterate = true`,
+/// #888) -- that case *is* covered (confirmed live: `path(1 | .[])`
+/// in yq mode now no-ops rather than raising jq's "near attempt to
+/// iterate" wording, matching the same general rule above). `=`/
+/// `|=`/compound-assigns never defer a trailing iterate at all, so an
+/// untracked branch followed by further navigation in *those*
+/// contexts (`(.a, 1 | .[]) = 5`) never reaches this function --
+/// `resolve_node`'s own `Expr::Iterate` arm (and `resolve_index_expr`'s
+/// analogous dynamic-key check) each raise independently and
+/// unconditionally first. That gap is real (confirmed live: real yq
+/// still no-ops there too) and deliberately not fixed by this patch --
+/// tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868),
+/// since fixing it needs `skip_untracked`-equivalent awareness
+/// threaded into `resolve_node`, a 21-call-site function with its own
+/// independent jq-mode-verified history at each scattered check, not
+/// just this one terminal position.
+///
+/// `del()` (`skip_untracked == false`) is deliberately **excluded**
+/// from the skip and keeps raising here, unlike its three siblings: real yq's
+/// `del()` turns out not to share their simple per-branch-independent
+/// model at all. Confirmed live: `del(.a, 1)` on `{a: 1, b: 2}` deletes
+/// *nothing* (`a: 1\nb: 2`, both keys survive) where `del(1, .a)` -- the
+/// same two arguments, reversed -- deletes `.a` (`b: 2`), and
+/// `del(.a, .c, 1)` on a 3-key document deletes only `.c`, not `.a`,
+/// even though `.a` comes *before* the untracked `1` in the argument
+/// list. The pattern (verified across argument-order permutations) is
+/// consistent with real yq's `del()` processing its targets in
+/// *reverse* of the given order and aborting the remaining ones --
+/// without undoing whatever already completed -- the moment it hits an
+/// untracked one; simply mirroring the other three operations' skip
+/// here would make `del()` delete *more* than real yq does for some
+/// orderings (e.g. `del(.a, 1)` would delete `.a`, which real yq
+/// leaves alone) -- a data-loss-shaped divergence in the wrong
+/// direction, not merely a cosmetic one. Left on the pre-existing raise
+/// until that ordering is implemented for real; tracked as a follow-up
+/// rather than guessed at here.
+fn reject_untracked_at_terminal(
+    branches: Vec<PathBranch<'_>>,
+    near_iterate: bool,
+    skip_untracked: bool,
+) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
+    let mut kept = vec_with_capacity(branches.len());
+    for branch in branches {
+        if !branch.trackable {
+            if skip_untracked {
+                continue;
+            }
+            let error = if near_iterate {
+                EvalError::invalid_path_expression_near_iterate(&branch.value).into()
+            } else {
+                EvalError::invalid_path_expression(&branch.value).into()
+            };
+            return Err((kept, error));
+        }
+        kept.push(branch);
+    }
+    Ok(kept)
+}
+
+/// Same terminal check as [`reject_untracked_at_terminal`], but also run
+/// over whatever a *later* sibling's own escape stopped resolution with.
+///
+/// jq validates each `Expr::Comma` sibling's path-validity the instant it
+/// is produced, before the next sibling ever runs (confirmed live:
+/// `path(.a | (1, error("boom")))` raises "Invalid path expression with
+/// result 1" -- the first branch's own violation -- and never reaches
+/// `error("boom")` at all; jq prints nothing to stdout). `resolve_node`'s
+/// `Expr::Comma` arm cannot replicate that ordering on its own (#986
+/// Stage 2's reasoning still holds: mid-pipe, it does not yet know
+/// whether it is terminal), so it always resolves every sibling before
+/// returning. When a *later* sibling's own escape is what stopped that
+/// resolution, the branches collected before it still carry whatever an
+/// earlier, terminal-but-untracked sibling produced -- and without this,
+/// that branch skips the terminal check an all-`Ok` result gets, both
+/// surfacing the later sibling's error instead of jq's real one and
+/// leaking that untracked branch's stale path into the assembled prefix
+/// (#1560).
+fn reject_untracked_prefix_too(
+    result: PathResolveResult<'_>,
+    near_iterate: bool,
+    skip_untracked: bool,
+) -> PathResolveResult<'_> {
+    let (prefix, escape) = match result {
+        Ok(branches) => (branches, None),
+        Err((prefix, e)) => (prefix, Some(e)),
+    };
+    // `?` here is the priority rule: a terminal violation found in
+    // `prefix` propagates immediately, discarding `escape` (a later
+    // sibling's own error/break/halt that never got the chance to run
+    // in real jq either) -- exactly `path_result`'s own `Some`/`None`
+    // combine once a violation-free `prefix` reaches it. When
+    // `skip_untracked` is set, `reject_untracked_at_terminal` never
+    // returns `Err` at all (#1764), so this `?` is a no-op there and
+    // `escape` -- a genuine error/break/halt, never just an untracked
+    // value -- still always propagates through `path_result` below
+    // unchanged.
+    let checked = reject_untracked_at_terminal(prefix, near_iterate, skip_untracked)?;
+    path_result(checked, escape)
+}
+
+/// What `del()`'s own path prepass resolved a `del(f)` argument to.
+///
+/// The write-side siblings (`=`, `|=`, `path()`) all want the flattened
+/// `Vec<Expr>` [`resolve_dynamic_indexes`] hands back; `del()` is the one
+/// caller that would rather have the resolved [`PathBranch`]es themselves,
+/// because their `Rc<PathPrefix>` chains still *share* every prefix their
+/// producer shared (#701) and a [`DeleteTrie`] can consume that sharing
+/// directly instead of paying `assemble`'s O(depth) flatten per branch
+/// (#1690).
+enum DelPaths<'a> {
+    /// [`needs_path_prepass`] said no: the original expression is already
+    /// static and is its own single path (it may still contain a literal
+    /// `Expr::Iterate`, which is why it stays an `Expr` rather than being
+    /// resolved into branches).
+    Verbatim,
+    /// The document root itself was one of the resolved paths (#1651).
+    ///
+    /// `..`/bare `recurse`/`recurse(f)`/`recurse(f;cond)` all emit it
+    /// unconditionally (`push_recursive_branches` pushes the current node
+    /// before recursing into children, and `recurse`'s own definition emits
+    /// `.` regardless of what `f` does). Deleting the root subsumes every
+    /// other resolved path — `delete_expr_paths_at`'s `paths.iter().any(|p|
+    /// p.len() == start)` check and `delete_at_path`'s `Expr::Identity` arm
+    /// both already collapse the whole value to `null` on exactly this
+    /// condition — so the remaining branches are never flattened at all.
+    /// This is what makes `del(..)` O(d) rather than O(d²) on a depth-`d`
+    /// document; the *filtered* descent that misses the root is what
+    /// [`DeleteTrie`] is for.
+    Root,
+    /// One entry per resolved path, still as a structurally-shared
+    /// `Rc<PathPrefix>` chain.
+    Branches(Vec<PathBranch<'a>>),
+}
+
+/// [`resolve_dynamic_indexes`] for `del()`: same prepass, but stopping one
+/// step short of flattening (see [`DelPaths`]).
+///
+/// Two deliberate differences from its sibling, both `del()`-specific and
+/// both previously spelled as the `short_circuit_del_root` flag this
+/// replaces:
+///
+/// - **The document-root short-circuit** ([`DelPaths::Root`], #1651).
+/// - **`skip_untracked = false`, even in yq mode** (#1764). `=`/`|=`/
+///   `path()` treat an untracked terminal branch as real yq's own silent
+///   no-op; `del()` deliberately keeps raising, because real yq's `del()`
+///   does not share their per-branch-independent model at all — it appears
+///   to process targets in *reverse* of the given order and abort the rest
+///   the moment it hits an untracked one, so mirroring the skip here would
+///   make `del()` delete *more* than real yq does for some argument
+///   orderings (`del(.a, 1)` deletes nothing in real yq; `del(1, .a)`
+///   deletes `.a`). See [`reject_untracked_at_terminal`]'s own doc comment
+///   for the live-verified permutations.
+///
+/// The `Err` half is just the escape: `builtin_del` discards the assembled
+/// prefix its sibling builds (`Err((_, escape))` at every one of its match
+/// arms), so that flatten — itself O(depth) per already-produced branch — is
+/// never paid here at all.
+fn resolve_del_path_branches<'a, S: EvalSemantics>(
+    expr: &Expr,
+    input: &'a OwnedValue,
+) -> Result<DelPaths<'a>, EvalEscape> {
+    if !needs_path_prepass(expr) {
+        return Ok(DelPaths::Verbatim);
+    }
+    // `input` is this call's own fresh document root — never itself a frozen
+    // `$x` snapshot, so ambient `snapshot` starts `false` (#1591), same as
+    // `resolve_dynamic_indexes`'s own top-level entry.
+    match reject_untracked_prefix_too(resolve_node::<S>(expr, input, true, false), false, false) {
+        Ok(branches) => {
+            if branches.iter().any(|b| b.path.depth() == 0) {
+                Ok(DelPaths::Root)
+            } else {
+                Ok(DelPaths::Branches(branches))
+            }
+        }
+        Err((_prefix, escape)) => Err(escape),
+    }
+}
+
 /// Rewrite every computed key in a path expression into the static component it
 /// denotes for `input`, and fan a top-level `Comma` out into one path per
 /// branch, yielding one fully-static path expression per resolved path.
@@ -24683,239 +24957,19 @@ fn resolve_seq<'a, S: EvalSemantics>(
 /// reason this flag is `false`; they are not a prerequisite for `del`'s
 /// scaling.
 ///
-/// `short_circuit_del_root` (#1651): when `true`, and any resolved branch's
-/// path is empty (`PathBranch::path.depth() == 0` — the document root
-/// itself was one of the resolved paths), returns `[Expr::Identity]`
-/// immediately, without calling `assemble()`. This is `del()`'s own
-/// exhausted-path rule (`delete_expr_paths_at`'s `paths.iter().any(|path|
-/// path.len() == start)` check, and `delete_at_path`'s `Expr::Identity`
-/// arm both already collapse the whole value to `null` once any branch is
-/// the root) applied *before* paying `assemble`'s `PathPrefix::to_vec()` —
-/// O(depth) per branch — for every other, now-irrelevant branch. `..`/bare
-/// `recurse`/`recurse(f)`/`recurse(f;cond)` all emit the root branch
-/// unconditionally (`push_recursive_branches` pushes the current node
-/// before recursing into children, and `recurse`'s own definition emits
-/// `.` regardless of what `f` does), so this turns `del(..)` from O(d²)
-/// (one O(depth) flatten per one of `d+1` branches) into O(d) (one O(1)
-/// `.depth()` check per branch) on a depth-`d` document — the residual
-/// term #701/#1631 left unfixed. Left `false` for `path()`/`=`/`|=`: they
-/// need every resolved branch regardless of whether one is the root
-/// (`path(.., .)` still reports every path; `(.., .) = 9` still writes
-/// every one), so a root branch carries no shortcut meaning for them.
-///
-/// Deliberately narrow: a filtered descent whose match set does *not*
-/// include the root (`del(.. | select(cond))` where `cond` rejects `.`)
-/// never finds a `depth() == 0` branch here and pays the full flatten
-/// regardless — that shape is tracked separately, not fixed by this flag.
-///
-/// Also feeds `reject_untracked_at_terminal`/`reject_untracked_prefix_too`'s
-/// own `skip_untracked` parameter below (#1764 review), via `skip_untracked
-/// = S::TAG == EvalTag::Yq && !short_circuit_del_root`: since this flag's
-/// own value is already exactly "is this call `del()`'s call shape," it
-/// happens to be the identical condition those two functions need to gate
-/// their own, entirely separate concern (does an untracked terminal branch
-/// raise, or silently no-op) on. The two concerns are independent --
-/// nothing here requires them to always travel together -- they simply
-/// have not yet needed to diverge, since `del()` remains the only caller
-/// wanting either non-default behavior. If a future caller needs one
-/// without the other, this flag should be
-/// split into two.
+/// `del()` does **not** call this function: it needs the resolved
+/// [`PathBranch`]es themselves, not the flattened `Expr` paths `assemble`
+/// produces, so it goes through [`resolve_del_path_branches`] instead —
+/// which is also where #1651's document-root short-circuit and #1764's
+/// `skip_untracked = false` exception now live. Everything below therefore
+/// always takes the `path()`/`=`/`|=` reading of both.
 fn resolve_dynamic_indexes<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     defer_trailing_iterate: bool,
-    short_circuit_del_root: bool,
 ) -> Result<Vec<Expr>, (Vec<Expr>, EvalEscape)> {
-    debug_assert!(
-        !(short_circuit_del_root && defer_trailing_iterate),
-        "short_circuit_del_root is only meaningful for del()'s own call \
-         shape, which always passes defer_trailing_iterate=false"
-    );
     if !needs_path_prepass(expr) {
         return Ok(vec![expr.clone()]);
-    }
-
-    fn assemble(branches: Vec<PathBranch<'_>>) -> Vec<Expr> {
-        branches
-            .into_iter()
-            .map(
-                |PathBranch {
-                     path: components, ..
-                 }| {
-                    // #701: the one O(depth) flattening op, paid exactly once
-                    // per branch here — never duplicated upstream during
-                    // construction, unlike the `Vec<Expr>` this replaced.
-                    let components: Vec<Expr> = components
-                        .to_vec()
-                        .into_iter()
-                        .map(strip_resolved_optional)
-                        .collect();
-                    match components.len() {
-                        0 => Expr::Identity,
-                        1 => components.into_iter().next().expect("len checked"),
-                        _ => Expr::Pipe(components),
-                    }
-                },
-            )
-            .collect()
-    }
-
-    /// Raise on the first branch that was computed rather than navigated to.
-    ///
-    /// This is the genuinely terminal position (#986): `resolve_dynamic_indexes`
-    /// is the top-level entry for all four of `path()`, `del()`, `=` and `|=`,
-    /// so by definition nothing follows a branch that reaches here — which
-    /// makes it the one place that can answer "is this untracked value
-    /// actually an error?" with a plain yes.
-    ///
-    /// It has to live here rather than in `resolve_seq`, for two reasons that
-    /// each break the alternative on their own. `resolve_seq` never runs at
-    /// all for a non-`Pipe` expression, so `path(1)` and — far worse —
-    /// `del(1)` would sail past every check and be assembled into
-    /// `Expr::Identity` below, silently deleting the whole document (the
-    /// shapes pinned in #1284). And `resolve_seq` cannot know whether it is
-    /// terminal even when it does run, because it is also reached as an
-    /// `IndexExpr`/`SliceExpr` target, where its own tail is empty but the
-    /// enclosing key still has to be navigated.
-    ///
-    /// `near_iterate` picks the wording: `true` when a trailing bare iterate
-    /// was stripped off `branches`' own path expression and will be spliced
-    /// back on below (#888) — these branches are exactly the ones that would
-    /// otherwise have reached `resolve_node`'s own `Expr::Iterate` arm, whose
-    /// `if !trackable` guard raises `invalid_path_expression_near_iterate`,
-    /// not the generic message this function raises for every other shape.
-    /// Without it `path(1 | .[])` would report "Invalid path expression with
-    /// result 1" where jq says "near attempt to iterate through 1".
-    ///
-    /// Branches already produced ahead of the offending one are kept and
-    /// returned as the `Err` prefix, matching jq's never-un-emit streaming.
-    ///
-    /// `skip_untracked` (#1764): when set, an untracked terminal branch is
-    /// real yq's own silent no-op, not an error -- confirmed live against
-    /// yq v4.53.3, and **not specific to `Expr::Comma`** despite this
-    /// function's own name: a single bare untracked expression with no
-    /// comma at all is the identical no-op (`(1) = 5` on `{a: 1}` leaves
-    /// it unchanged, matching `(.a, 1) = 5`'s "skip only the untracked
-    /// one") -- the real rule is "any untracked terminal branch, however
-    /// many others accompany it, however it was produced." That also
-    /// covers a branch an *upstream* mechanism (not a bare literal)
-    /// leaves untracked, e.g. `select`/`getpath` run as a `try`/`catch`
-    /// handler on a caught error's payload: `try (.a, error({"y":99}))
-    /// catch select(true) = "X"` writes `.a` and silently drops the
-    /// caught, untracked branch, the same "skip only the untracked one"
-    /// result as the bare-literal case, since by the time either reaches
-    /// this function they are computationally identical -- there is no
-    /// way, or reason, for this check to tell them apart. Confirmed
-    /// position-independent for a genuine multi-branch comma too (`(.a,
-    /// 1) = 5`, `(1, .a, .c) = 5`, `(.a, .c, 1) = 5`, all-branches-
-    /// untracked): every trackable branch is still written normally and
-    /// the untracked one(s) contribute nothing. `near_iterate`'s own
-    /// wording distinction is moot when `skip_untracked` is set: there is
-    /// no error to word either way. A genuine error/break/halt produced
-    /// *while computing* what would otherwise be an untracked value is
-    /// not itself untracked and still propagates normally -- confirmed
-    /// live, `(.a, error("boom")) = 5` still raises `boom`, not a no-op.
-    ///
-    /// **Only reachable call shapes are patched.** `path()` passes
-    /// `near_iterate = true` here for a trailing bare iterate stripped
-    /// off its own path expression (`defer_trailing_iterate = true`,
-    /// #888) -- that case *is* covered (confirmed live: `path(1 | .[])`
-    /// in yq mode now no-ops rather than raising jq's "near attempt to
-    /// iterate" wording, matching the same general rule above). `=`/
-    /// `|=`/compound-assigns never defer a trailing iterate at all, so an
-    /// untracked branch followed by further navigation in *those*
-    /// contexts (`(.a, 1 | .[]) = 5`) never reaches this function --
-    /// `resolve_node`'s own `Expr::Iterate` arm (and `resolve_index_expr`'s
-    /// analogous dynamic-key check) each raise independently and
-    /// unconditionally first. That gap is real (confirmed live: real yq
-    /// still no-ops there too) and deliberately not fixed by this patch --
-    /// tracked as [#1868](https://github.com/rust-works/succinctly/issues/1868),
-    /// since fixing it needs `skip_untracked`-equivalent awareness
-    /// threaded into `resolve_node`, a 21-call-site function with its own
-    /// independent jq-mode-verified history at each scattered check, not
-    /// just this one terminal position.
-    ///
-    /// `del()` (`skip_untracked == false`) is deliberately **excluded**
-    /// from the skip and keeps raising here, unlike its three siblings: real yq's
-    /// `del()` turns out not to share their simple per-branch-independent
-    /// model at all. Confirmed live: `del(.a, 1)` on `{a: 1, b: 2}` deletes
-    /// *nothing* (`a: 1\nb: 2`, both keys survive) where `del(1, .a)` -- the
-    /// same two arguments, reversed -- deletes `.a` (`b: 2`), and
-    /// `del(.a, .c, 1)` on a 3-key document deletes only `.c`, not `.a`,
-    /// even though `.a` comes *before* the untracked `1` in the argument
-    /// list. The pattern (verified across argument-order permutations) is
-    /// consistent with real yq's `del()` processing its targets in
-    /// *reverse* of the given order and aborting the remaining ones --
-    /// without undoing whatever already completed -- the moment it hits an
-    /// untracked one; simply mirroring the other three operations' skip
-    /// here would make `del()` delete *more* than real yq does for some
-    /// orderings (e.g. `del(.a, 1)` would delete `.a`, which real yq
-    /// leaves alone) -- a data-loss-shaped divergence in the wrong
-    /// direction, not merely a cosmetic one. Left on the pre-existing raise
-    /// until that ordering is implemented for real; tracked as a follow-up
-    /// rather than guessed at here.
-    fn reject_untracked_at_terminal(
-        branches: Vec<PathBranch<'_>>,
-        near_iterate: bool,
-        skip_untracked: bool,
-    ) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
-        let mut kept = vec_with_capacity(branches.len());
-        for branch in branches {
-            if !branch.trackable {
-                if skip_untracked {
-                    continue;
-                }
-                let error = if near_iterate {
-                    EvalError::invalid_path_expression_near_iterate(&branch.value).into()
-                } else {
-                    EvalError::invalid_path_expression(&branch.value).into()
-                };
-                return Err((kept, error));
-            }
-            kept.push(branch);
-        }
-        Ok(kept)
-    }
-
-    /// Same terminal check as [`reject_untracked_at_terminal`], but also run
-    /// over whatever a *later* sibling's own escape stopped resolution with.
-    ///
-    /// jq validates each `Expr::Comma` sibling's path-validity the instant it
-    /// is produced, before the next sibling ever runs (confirmed live:
-    /// `path(.a | (1, error("boom")))` raises "Invalid path expression with
-    /// result 1" -- the first branch's own violation -- and never reaches
-    /// `error("boom")` at all; jq prints nothing to stdout). `resolve_node`'s
-    /// `Expr::Comma` arm cannot replicate that ordering on its own (#986
-    /// Stage 2's reasoning still holds: mid-pipe, it does not yet know
-    /// whether it is terminal), so it always resolves every sibling before
-    /// returning. When a *later* sibling's own escape is what stopped that
-    /// resolution, the branches collected before it still carry whatever an
-    /// earlier, terminal-but-untracked sibling produced -- and without this,
-    /// that branch skips the terminal check an all-`Ok` result gets, both
-    /// surfacing the later sibling's error instead of jq's real one and
-    /// leaking that untracked branch's stale path into the assembled prefix
-    /// (#1560).
-    fn reject_untracked_prefix_too(
-        result: PathResolveResult<'_>,
-        near_iterate: bool,
-        skip_untracked: bool,
-    ) -> PathResolveResult<'_> {
-        let (prefix, escape) = match result {
-            Ok(branches) => (branches, None),
-            Err((prefix, e)) => (prefix, Some(e)),
-        };
-        // `?` here is the priority rule: a terminal violation found in
-        // `prefix` propagates immediately, discarding `escape` (a later
-        // sibling's own error/break/halt that never got the chance to run
-        // in real jq either) -- exactly `path_result`'s own `Some`/`None`
-        // combine once a violation-free `prefix` reaches it. When
-        // `skip_untracked` is set, `reject_untracked_at_terminal` never
-        // returns `Err` at all (#1764), so this `?` is a no-op there and
-        // `escape` -- a genuine error/break/halt, never just an untracked
-        // value -- still always propagates through `path_result` below
-        // unchanged.
-        let checked = reject_untracked_at_terminal(prefix, near_iterate, skip_untracked)?;
-        path_result(checked, escape)
     }
 
     /// Is this a bare trailing iterate — `Expr::Iterate` or
@@ -24986,8 +25040,10 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     // comparison would monomorphize (and so duplicate the compiled code
     // for) both of them per `EvalSemantics` impl, for zero behavioral
     // benefit over resolving the same fact once, here, where `S` is
-    // already bound.
-    let skip_untracked = S::TAG == EvalTag::Yq && !short_circuit_del_root;
+    // already bound. Unconditional now that `del()` -- the one caller that
+    // wanted `false` in yq mode -- resolves through
+    // `resolve_del_path_branches` instead (#1690).
+    let skip_untracked = S::TAG == EvalTag::Yq;
 
     if trailing.is_empty() {
         // `input` is this call's own fresh document root — never itself a
@@ -24999,13 +25055,8 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
             false,
             skip_untracked,
         ) {
-            Ok(branches) => {
-                if short_circuit_del_root && branches.iter().any(|b| b.path.depth() == 0) {
-                    return Ok(vec![Expr::Identity]);
-                }
-                Ok(assemble(branches))
-            }
-            Err((prefix, e)) => Err((assemble(prefix), e)),
+            Ok(branches) => Ok(assemble_path_branches(branches)),
+            Err((prefix, e)) => Err((assemble_path_branches(prefix), e)),
         };
     }
     trailing.reverse();
@@ -25019,12 +25070,12 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         true,
         skip_untracked,
     ) {
-        Ok(branches) => Ok(assemble(branches)
+        Ok(branches) => Ok(assemble_path_branches(branches)
             .into_iter()
             .map(|e| append_trailing(e, &trailing))
             .collect()),
         Err((prefix, e)) => Err((
-            assemble(prefix)
+            assemble_path_branches(prefix)
                 .into_iter()
                 .map(|e| append_trailing(e, &trailing))
                 .collect(),
@@ -30929,7 +30980,7 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
     // a later one errors (confirmed live) — so that prefix is walked below
     // exactly like a successful resolution, and only the *error* is deferred
     // to the end.
-    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, owned, true, false) {
+    let (exprs, resolve_error) = match resolve_dynamic_indexes::<S>(expr, owned, true) {
         Ok(exprs) => (exprs, None),
         Err((exprs, e)) => (exprs, Some(e)),
     };
@@ -32235,150 +32286,6 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
     }
 }
 
-/// Delete every resolved `del` path in `paths` from `value`, the way
-/// [`delete_paths_sorted`] deletes `delpaths`' runtime path arrays: paths
-/// sharing a container at this depth are grouped, and their keys are removed
-/// from it together, so a negative index resolves against the length the
-/// container had before any sibling here was removed (#424) — one at a time,
-/// `[10,20,30,40] | del(.[(-1,-2)])` took the last element, shortened the
-/// array, and then took what was *now* second-to-last, giving `[10,30]` where
-/// jq gives `[10,20]`.
-///
-/// Unlike `delete_paths_sorted`, paths here are still `Expr` steps rather
-/// than resolved `OwnedValue` keys, so navigating a `Field`/`Index` still
-/// raises the type and bounds errors `del` has always raised (`delete_keys`
-/// cannot yet, #415) — `delete_keys` itself is reused for the part that does
-/// not need that: removing a container's own keys simultaneously once they
-/// are known.
-///
-/// Every path here comes from one `del` argument's single expression tree, so
-/// whichever branch a computed key took, the shape that follows is *usually*
-/// identical — only the concrete `Field`/`Index` values differ — which is
-/// what lets every path be exactly as long as its siblings. It is not always
-/// identical in *kind*, though: `null` accepts a string key, a numeric key,
-/// or `.[]` without erroring (`null | .a`, `null | .[0]`, and `null | .[]`
-/// are all `null`), so `.[("a",0)]` resolved against a null target yields one
-/// `Field("a")` path and one `Index(0)` path at the same position. Partition
-/// by actual shape below rather than trusting `paths[0]` to speak for the
-/// rest, which used to panic on exactly that input. Nor always identical in
-/// *length*: a bare `.` sibling flattens to zero steps while the rest of the
-/// comma keeps going, so the leaf check below scans every sibling rather than
-/// trusting `paths[0]` to be exhausted (or not) for all of them (#505).
-fn delete_expr_paths_at(
-    mut value: OwnedValue,
-    paths: &[&[DeleteStep]],
-    start: usize,
-) -> Result<OwnedValue, EvalError> {
-    if paths.is_empty() {
-        return Ok(value);
-    }
-    if paths.iter().any(|path| path.len() == start) {
-        // `del(.)`, a path wrapped in enough `?`/`()` to flatten to nothing,
-        // or `.` as one branch of a comma whose other branches still have
-        // components left (#505): replace the whole value reached here, as
-        // `delete_at_path`'s `Expr::Identity` arm does for the single-path
-        // case. An exhausted sibling deletes this entire subtree, which
-        // subsumes whatever any other sibling here would have deleted from
-        // within it — the same short-circuit `delpaths` gets from sorting
-        // the empty path first (`Some([]) => Ok(OwnedValue::Null)`), just
-        // without needing a sort, since `paths[0]` isn't assumed
-        // representative of every sibling's length either.
-        return Ok(OwnedValue::Null);
-    }
-
-    let mut fields: Vec<&[DeleteStep]> = Vec::new();
-    let mut indices: Vec<&[DeleteStep]> = Vec::new();
-    for &path in paths {
-        match &path[start].component {
-            Expr::Field(_) => fields.push(path),
-            // A `Slice` joins the `Index` bucket rather than getting one of
-            // its own: `delete_expr_array_paths` funnels every terminal key
-            // into a single `delete_keys` call, and that one batch is what
-            // makes overlapping ranges union instead of compound. Split into
-            // two calls, `del(.[0:2], .[1:3])` on `[1,2,3,4]` would resolve
-            // the second range against the already-shortened array and give
-            // `[3]` where jq gives `[4]`.
-            Expr::Index(_)
-            | Expr::IndexNumber { .. }
-            | Expr::Slice { .. }
-            | Expr::SliceNumber { .. } => indices.push(path),
-            // See `needs_fanout_pass`'s doc comment for why a bare
-            // `Expr::Iterate` can never reach this position (#1382). Flagged
-            // loudly in debug/test builds via `debug_assert` rather than
-            // silently -- but still falls through to the same graceful `Err`
-            // the general catch-all below returns for every other
-            // unsupported shape, not `unreachable!()`: this invariant spans
-            // several functions and a future edit anywhere in that chain
-            // could break it, and `unreachable!()` panics unconditionally in
-            // release builds too, turning a user-supplied `del()` expression
-            // into a process crash instead of an ordinary error (the same
-            // failure mode #1098 removed elsewhere in this crate).
-            Expr::Iterate => {
-                debug_assert!(
-                    false,
-                    "a bare .[] should have been fanned out into concrete Field/Index \
-                     components before reaching delete_expr_paths_at (#1382)"
-                );
-                return Err(EvalError::new("cannot use expression as delete target"));
-            }
-            // `flatten_delete_path` only ever leaves Field/Index/Slice
-            // components behind at a position more than one sibling path can
-            // reach; anything else is a path shape `del` has never supported
-            // here, matching `delete_at_path`'s catch-all.
-            _ => return Err(EvalError::new("cannot use expression as delete target")),
-        }
-    }
-
-    // `value` can only be one concrete type at a time, so at most one of
-    // these two actually mutates it — the other sees a container of the
-    // wrong shape and takes that branch's optional-vs-error path (see
-    // `delete_expr_object_paths`/`delete_expr_array_paths`). Both can be
-    // non-empty only when `value` is `null`, per the doc comment above.
-    if !fields.is_empty() {
-        value = delete_expr_object_paths(value, &fields, start)?;
-    }
-    if !indices.is_empty() {
-        value = delete_expr_array_paths(value, &indices, start)?;
-    }
-    Ok(value)
-}
-
-/// Walk what is left of `paths` against the `null` that a step naming nothing
-/// reads as, for its errors alone.
-///
-/// `del(f)` is `delpaths([path(f)])`, and the two halves treat a dead end
-/// differently: `path()` reads a missing object key, an out-of-range index, or
-/// any key of `null` as `null` and keeps walking, and only then does
-/// `delpaths` skip what named nothing. So a dead end is not the end of the
-/// walk — the *tail* decides. Every step `null` tolerates is a no-op
-/// (`{"a":{}} | del(.a.b.c)`, `null | del(.a.b)`), but `.[]` refuses `null`
-/// even there, so `{"a":{}} | del(.a.b.c[])` is jq's `Cannot iterate over null
-/// (null)` rather than a no-op (#527).
-///
-/// Returning early instead — which every one of these sites used to do —
-/// exempts the whole rest of the path on the strength of one step, which is
-/// how the `.[]` case got lost. Nothing can be written back through a `null`
-/// root, so the rebuilt values are discarded and the container the dead end
-/// named is left exactly as it was: jq does not vivify it either.
-///
-/// A path that ends at `start` has no tail to walk and is skipped; the caller
-/// passes the position *after* the step that named nothing.
-fn delete_expr_paths_through_absent(
-    paths: &[&[DeleteStep]],
-    start: usize,
-) -> Result<(), EvalError> {
-    for path in paths {
-        if path.len() > start {
-            let deleted = delete_expr_paths_at(OwnedValue::Null, &[*path], start)?;
-            debug_assert!(
-                matches!(deleted, OwnedValue::Null),
-                "deleting through a synthetic null produced a value to write back"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// [`delete_expr_paths_through_absent`]'s single-path counterpart, for
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
@@ -32389,263 +32296,6 @@ fn delete_at_path_through_absent(
 ) -> Result<(), EvalError> {
     let mut absent = OwnedValue::Null;
     delete_at_path(&mut absent, rest, optional, yq_mode)
-}
-
-/// [`delete_expr_paths_at`]'s `Field` case: group by field name, delete the
-/// terminal ones from `value` together via [`delete_keys`], and recurse into
-/// the rest.
-fn delete_expr_object_paths(
-    mut value: OwnedValue,
-    paths: &[&[DeleteStep]],
-    start: usize,
-) -> Result<OwnedValue, EvalError> {
-    // `null` tolerates any field key unconditionally — `null | del(.a)` is
-    // `null` — so every sibling path here is a no-op regardless of
-    // `optional`, the same exemption `delete_keys`/`delete_paths_under`
-    // already give a runtime key (#476). The exemption is per *step*, though:
-    // returning outright would hand it to every later step too, including the
-    // `.[]` #476 deliberately withheld it from, so the tails still get walked
-    // (#527).
-    if matches!(value, OwnedValue::Null) {
-        delete_expr_paths_through_absent(paths, start + 1)?;
-        return Ok(value);
-    }
-    // Insertion-ordered *and* hashed (#1301). Both structures used to be a
-    // plain `Vec` scanned linearly for a match, which is O(siblings) per
-    // sibling — fine for the handful a hand-written comma produces, quadratic
-    // once a computed key ahead of a trailing iterate turns every element into
-    // its own sibling (`del(.items[(0,1)].foo[])` over an object-valued
-    // `.foo`). The insertion order is load-bearing, not incidental: the
-    // recursion below visits groups in source order, which is the order jq
-    // dies in, so `IndexMap`/`IndexSet` rather than a `BTreeMap` — they keep
-    // that order structurally instead of leaving it to a parallel side index.
-    let mut terminal: IndexSet<&str> = IndexSet::new();
-    let mut groups: IndexMap<&str, Vec<&[DeleteStep]>> = IndexMap::new();
-    for path in paths {
-        let Expr::Field(name) = &path[start].component else {
-            unreachable!("delete_expr_paths_at only dispatches Field paths here")
-        };
-        let name = name.as_str();
-        if path.len() == start + 1 {
-            terminal.insert(name);
-            continue;
-        }
-        groups.entry(name).or_default().push(*path);
-    }
-
-    // Every path here is Field-kind, so `resolve_node` (invoked by
-    // `resolve_dynamic_indexes` before `delete_expr_paths_at` ever runs)
-    // already validated `value` as field-indexable for each path — raising
-    // the same `Cannot index … with …` error itself — before grouping ever
-    // sees a non-object root. `null` is excluded by the check above, so this
-    // can only fire if that earlier validation regresses.
-    let OwnedValue::Object(entries) = &mut value else {
-        unreachable!("delete_expr_object_paths reached a non-object, non-null root")
-    };
-    for (name, group) in &groups {
-        match entries.get_mut(*name) {
-            Some(slot) => {
-                let old = core::mem::replace(slot, OwnedValue::Null);
-                *slot = delete_expr_paths_at(old, group, start + 1)?;
-            }
-            // A field the object doesn't have is a dead end, not an error:
-            // `del(.a.b.c, .a.b.d)` is a no-op in jq where this used to raise
-            // succinctly's own `field 'b' not found` (#527). The tail decides
-            // whether it stays one, so it is walked rather than skipped — see
-            // `delete_expr_paths_through_absent`. `optional` gets no say: a
-            // `?` marks a *failure to index* as tolerable, and a key that is
-            // merely absent never failed, which is why jq raises for
-            // `del(.a.b?[])` just as it does for `del(.a.b[])`.
-            None => delete_expr_paths_through_absent(group, start + 1)?,
-        }
-    }
-
-    if !terminal.is_empty() {
-        let owned_keys: Vec<OwnedValue> = terminal
-            .iter()
-            .map(|name| OwnedValue::String((*name).to_string()))
-            .collect();
-        let key_refs: Vec<&OwnedValue> = owned_keys.iter().collect();
-        value = delete_keys(value, &key_refs)?;
-    }
-
-    Ok(value)
-}
-
-/// [`delete_expr_paths_at`]'s `Index` case: group by index, delete the
-/// terminal ones from `value` together via [`delete_keys`] — the one call
-/// that resolves every negative index against `value`'s length once, rather
-/// than once per deletion — and recurse into the rest.
-fn delete_expr_array_paths(
-    mut value: OwnedValue,
-    paths: &[&[DeleteStep]],
-    start: usize,
-) -> Result<OwnedValue, EvalError> {
-    // Same per-step `null` exemption as `delete_expr_object_paths` above —
-    // applies to both a bare index and a slice component (#476), and likewise
-    // covers only this step, so the tails are still walked (#527).
-    if matches!(value, OwnedValue::Null) {
-        delete_expr_paths_through_absent(paths, start + 1)?;
-        return Ok(value);
-    }
-    // Insertion-ordered *and* hashed — see the matching comment in
-    // `delete_expr_object_paths` for why both properties are needed (#1301).
-    // This is the arm the issue's own repro lands on: `del(.items[(0,1)].foo[])`
-    // resolves the trailing `[]` into one distinct `Index(i)` sibling per
-    // element, and the linear `find`/scan these two used to do never matched,
-    // so every sibling walked the whole growing list. 99.9% of a 200,000-element
-    // run's samples sat in those two loops.
-    //
-    // `IndexSet<ArrayStep>`, not `IndexMap<ArrayStep, bool>`: an earlier form
-    // (both here and in the pre-#1301 `Vec` version) also merged each step's
-    // `optional` flag (`*entry.or_insert(false) |= path[start].optional`) to
-    // cover every occurrence rather than just whichever sibling was inserted
-    // first. That merged bool had no reader -- the one consumer below
-    // (building `owned_keys` for `delete_keys`) already discarded it. Dropped,
-    // not because the flag can never be `true` here (#1331's investigation
-    // found the broader claim that it can't doesn't generalize past this
-    // specific dead-write site -- see the `debug_assert` a little further
-    // down in this same function for the narrower, verified version of that
-    // claim), but because deleting a *terminal* index/slice always goes
-    // through `delete_keys`, which already silently skips a step naming
-    // nothing to delete (#415/#477) -- `optional` never had anything left
-    // to gate once it reached this merge, whether or not it was ever
-    // `true`. Order-independence for `del(.[(0,5)], .[5]?)` (either
-    // argument order) still holds: `IndexSet::insert` already dedupes a
-    // repeated `step` regardless of which occurrence's own `?` set the
-    // (now-untracked) flag.
-    let mut terminal: IndexSet<ArrayStep> = IndexSet::new();
-    let mut groups: IndexMap<ArrayStep, Vec<&[DeleteStep]>> = IndexMap::new();
-    for path in paths {
-        let step = match &path[start].component {
-            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
-            Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
-                ArrayStep::Slice(*start, *end)
-            }
-            _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
-        };
-        if path.len() == start + 1 {
-            terminal.insert(step);
-            continue;
-        }
-        groups.entry(step).or_default().push(*path);
-    }
-
-    // Unlike the object case above, this is NOT dead code: `resolve_node`
-    // validates a `Slice` component by evaluating it as a *read*, and slicing
-    // a string is a legal read (`"hi" | .[0:1]` is `"h"`) even though `del`
-    // through that same slice is not. `"hi" | del(.[0:1], .[1:2])` reaches
-    // here with `value` still a `String`, so this gate is load-bearing —
-    // dd2df4d1 removed it as believed-unreachable and #504's CI caught the
-    // regression via `test_del_static_comma_type_error_reports_the_first_sibling`.
-    if !matches!(value, OwnedValue::Array(_)) {
-        // A non-array container fails every path here identically, so a
-        // single non-optional path among the siblings has to raise even
-        // when others are optional -- unconditional since #1322 found the
-        // old `paths.iter().all(|p| p[start].optional)` gate dead:
-        // `resolve_dynamic_indexes`'s `assemble` strips every
-        // `Expr::Optional` before any comma-grouped `del()` path reaches
-        // `flatten_delete_path`, so no `DeleteStep` here can carry
-        // `optional == true`. Verified (not just asserted in a comment,
-        // #1331), with one confirmed exception this crate's usual "optional
-        // never forced true" pattern (#928/#1003/#1034) doesn't cover:
-        // `yq_del_slice_outcome`'s own `wrap` closure is a different,
-        // non-comma-grouped consumer of the same `DeleteStep.optional`
-        // field, reachable via `del(.a?[1:3])`-shaped input, where an
-        // identically-worded claim was found wrong -- so this function's
-        // own version of the claim needed its own verification, not an
-        // assumption that it generalizes.
-        debug_assert!(
-            !paths.iter().any(|p| p[start].optional),
-            "delete_expr_array_paths: no DeleteStep here should ever carry optional == true -- \
-             resolve_dynamic_indexes strips Expr::Optional before any comma-grouped del() path \
-             reaches this function (#1331)"
-        );
-        // *Which* sentence comes from `paths[0]` specifically, because jq
-        // walks the paths in source order and dies on the first: the
-        // `Slice { .. } => "object"`/catch-all `"number"` arms below are
-        // themselves not known to be live-reachable (a bare or nested
-        // number root fails earlier, during `resolve_dynamic_indexes`'s
-        // own navigation, confirmed via a debug probe) -- kept rather than
-        // removed, since the string arm above proves this `match` is not
-        // uniformly dead and proving the other two arms are needs
-        // exhaustively tracing every `resolve_node` arm, out of #1322's
-        // own scope.
-        return Err(match &paths[0][start].component {
-            Expr::Slice { .. } | Expr::SliceNumber { .. }
-                if matches!(value, OwnedValue::String(_)) =>
-            {
-                EvalError::cannot_delete_fields_from("string")
-            }
-            Expr::Slice { .. } | Expr::SliceNumber { .. } => {
-                EvalError::cannot_index_with_type(owned_type_name(&value), "object")
-            }
-            // #1326: `Expr::IndexNumber` was already dispatched here
-            // alongside `Expr::Index` (both push to `indices` above), but
-            // had no arm of its own -- a float-spelled index reaching this
-            // error path (e.g. `del(.[2.0])` on a string) would have hit
-            // the catch-all `unreachable!()` instead of this same error,
-            // a pre-existing #1088 gap closed as a byproduct of adding
-            // `SliceNumber` here consistently.
-            Expr::Index(_) | Expr::IndexNumber { .. } => {
-                EvalError::cannot_index_with_type(owned_type_name(&value), "number")
-            }
-            _ => unreachable!("delete_expr_paths_at only dispatches Index/Slice paths here"),
-        });
-    }
-
-    if let OwnedValue::Array(arr) = &mut value {
-        for (step, group) in &groups {
-            match step {
-                ArrayStep::Index(idx) => {
-                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
-                        Some(actual) => {
-                            let slot = &mut arr[actual];
-                            let old = core::mem::replace(slot, OwnedValue::Null);
-                            *slot = delete_expr_paths_at(old, group, start + 1)?;
-                        }
-                        None => {
-                            // An out-of-range index names nothing to delete
-                            // through, so jq's delpaths silently skips the
-                            // step itself, `?` or not (#477) — but the tail
-                            // still decides: `del(.[5].a)` stays a no-op
-                            // while `del(.[5][])` raises `Cannot iterate
-                            // over null (null)` (#527/#529).
-                            delete_expr_paths_through_absent(group, start + 1)?;
-                        }
-                    }
-                }
-                // Deleting *through* a slice deletes inside the sub-array and
-                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`.
-                ArrayStep::Slice(s, e) => {
-                    let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
-                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                    let OwnedValue::Array(items) = delete_expr_paths_at(sub, group, start + 1)?
-                    else {
-                        unreachable!("deleting from an array yields an array")
-                    };
-                    arr.splice(range, items);
-                }
-            }
-        }
-    }
-
-    // Terminal indices are deleted below via `delete_keys`, which already
-    // silently drops an index that names nothing (`delpaths` has always done
-    // that, #415) — including an out-of-range one, `?` or not (#477).
-    if !terminal.is_empty() {
-        let owned_keys: Vec<OwnedValue> = terminal
-            .iter()
-            .map(|step| match step {
-                ArrayStep::Index(idx) => OwnedValue::Int(*idx),
-                ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
-            })
-            .collect();
-        let key_refs: Vec<&OwnedValue> = owned_keys.iter().collect();
-        value = delete_keys(value, &key_refs)?;
-    }
-
-    Ok(value)
 }
 
 /// One array-level step of a `del` path: a bare index, or a slice.
@@ -32662,6 +32312,686 @@ fn delete_expr_array_paths(
 enum ArrayStep {
     Index(i64),
     Slice(Option<i64>, Option<i64>),
+}
+
+/// The root of every [`DeleteTrie`]: the document itself, before any step.
+const DELETE_TRIE_ROOT: u32 = 0;
+
+/// One node of a [`DeleteTrie`] — one *distinct* path prefix across the whole
+/// resolved match set, however many resolved paths run through it.
+struct DeleteTrieNode {
+    /// This node's own prefix is itself one of the resolved `del()` paths.
+    ///
+    /// Read only by this node's *parent*, when it batches its terminal
+    /// children into one [`delete_keys`] call — never by the node itself on
+    /// the way in. That mirrors [`delete_expr_paths_at`], whose own
+    /// exhausted-path check (`paths.iter().any(|path| path.len() == start)`)
+    /// is unreachable for `start > 0`: everything a `groups` bucket collects
+    /// there has `len() >= start + 2`, so only the top-level call can ever
+    /// see a path exhausted at its own position. Checking it here instead
+    /// would be a real behaviour change, not a shortcut — `{"a":"s"} |
+    /// del(.a, .a[0])` raises `Cannot delete fields from string` today
+    /// because the recursion into `.a` still runs even though `.a` is
+    /// already doomed, and short-circuiting on `terminal` would silently
+    /// swallow that.
+    terminal: bool,
+    /// Child edges keyed by object field name, in first-occurrence order
+    /// across the resolved paths — [`delete_expr_object_paths`]'s `terminal`
+    /// `IndexSet` and `groups` `IndexMap` merged into one map, with
+    /// `terminal` above and `field_groups` below recovering each half.
+    fields: IndexMap<String, u32>,
+    /// Child edges keyed by array index/slice, same ordering contract.
+    indices: IndexMap<ArrayStep, u32>,
+    /// Positions within `fields` of the children that have children of their
+    /// own, in the order they first acquired one.
+    ///
+    /// This is exactly [`delete_expr_object_paths`]'s `groups` iteration
+    /// order — "the order of the first resolved path that continues past
+    /// this key" — which is load-bearing for jq's error priority (#1301) and
+    /// is *not* the same as `fields`' own order (`del(.a, .b.x, .a.y)` has
+    /// `fields` ordered `[a, b]` but `groups` ordered `[b, a]`, because `.a`
+    /// first appears as a terminal path).
+    field_groups: Vec<usize>,
+    /// `field_groups` for `indices`.
+    index_groups: Vec<usize>,
+    /// Where this node hangs off its parent, so gaining a first child can
+    /// append this node to the right one of the parent's two `*_groups`
+    /// lists. `DELETE_TRIE_ROOT` has no parent and these are meaningless.
+    parent: u32,
+    slot: usize,
+    keyed_by_field: bool,
+    /// Whether any resolved path reaching this node carried a `?` at this
+    /// step — [`delete_expr_array_paths`]'s `paths.iter().any(|p|
+    /// p[start].optional)`, precomputed. Only read by a `debug_assert!`;
+    /// see there for why the claim it guards is narrower than it looks
+    /// (#1331).
+    optional: bool,
+}
+
+impl DeleteTrieNode {
+    fn new(parent: u32, slot: usize, keyed_by_field: bool, optional: bool) -> Self {
+        Self {
+            terminal: false,
+            fields: IndexMap::new(),
+            indices: IndexMap::new(),
+            field_groups: Vec::new(),
+            index_groups: Vec::new(),
+            parent,
+            slot,
+            keyed_by_field,
+            optional,
+        }
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.fields.is_empty() && self.indices.is_empty()
+    }
+}
+
+/// Every resolved `del()` path, merged into one tree keyed by path step.
+///
+/// # Why this exists
+///
+/// `del()`'s multi-path route used to flatten each resolved branch into its
+/// own independent `Vec<Expr>` ([`assemble_path_branches`]) and then into its
+/// own independent `Vec<DeleteStep>` ([`flatten_delete_path`]), and
+/// [`delete_expr_paths_at`] then re-grouped those flat paths against each
+/// other one position at a time. All three are O(depth) *per branch*, so a
+/// match set that grows with depth — the shape a filtered recursive descent
+/// (`del(.. | select(cond))` where `cond` rejects `.`) produces — cost O(d²)
+/// (#1690; measured exponent 2.02-2.04 over depths 30..240, with the
+/// resolved-path count held constant to confirm depth is the term).
+///
+/// The trie is O(d) amortized instead, because sibling branches under a
+/// shared ancestor literally share the same `Rc<PathPrefix>` allocation for
+/// that ancestor: `push_recursive_branches` clones the *same* parent `Rc`
+/// into every child, so a `d+1`-branch traversal creates exactly `d`
+/// distinct `PathPrefix::Node`s, not O(d²). Interning by pointer identity
+/// (see [`DeleteTrieBuilder::intern`]) means each branch only does new work
+/// for the part of its chain no earlier branch already walked, and the apply
+/// walk below then visits each *distinct prefix* once instead of once per
+/// path running through it.
+///
+/// # Fidelity
+///
+/// The three apply functions ([`delete_trie_apply`], [`delete_trie_object`],
+/// [`delete_trie_array`]) are deliberately structural mirrors of
+/// [`delete_expr_paths_at`], [`delete_expr_object_paths`] and
+/// [`delete_expr_array_paths`] — same per-step `null` tolerance (#476/#527),
+/// same non-array type-error wording and ordering (#1322/#1331), same
+/// single-batch [`delete_keys`] call for terminal keys (#424), same
+/// insertion-ordered grouping (#1301). The one thing they do *not* mirror is
+/// the per-position re-grouping, which is what the trie replaces.
+struct DeleteTrie {
+    nodes: Vec<DeleteTrieNode>,
+}
+
+impl DeleteTrie {
+    fn node(&self, id: u32) -> &DeleteTrieNode {
+        &self.nodes[id as usize]
+    }
+
+    /// Whether one of the resolved paths was the document root itself.
+    ///
+    /// [`DelPaths::Root`] already intercepts a zero-*depth* branch before a
+    /// trie is ever built, so this can only fire for a branch whose
+    /// components all flatten away to nothing (an `Expr::Identity`
+    /// component, or one wrapped in enough `?`/`()` to leave no step
+    /// behind) — [`delete_expr_paths_at`]'s own `path.len() == start` case
+    /// at `start == 0`, which collapses the whole document to `null`.
+    fn root_is_terminal(&self) -> bool {
+        self.node(DELETE_TRIE_ROOT).terminal
+    }
+}
+
+/// Builds a [`DeleteTrie`] from resolved [`PathBranch`]es, interning each
+/// branch's `Rc<PathPrefix>` chain by pointer identity.
+struct DeleteTrieBuilder {
+    trie: DeleteTrie,
+    /// `Rc<PathPrefix>` address -> trie node id.
+    ///
+    /// Pointer identity is sound here *only* because every chain stays alive
+    /// for the whole build: the caller holds the `Vec<PathBranch>`, whose
+    /// leaves keep their ancestors alive through `PathPrefix::Node.parent`,
+    /// and nothing is dropped before the builder is finished — so no address
+    /// recorded here can be freed and handed back out to a different node.
+    /// The map is only ever an accelerator: correctness comes from the
+    /// `IndexMap` keying in [`Self::child_of`], which merges two chains that
+    /// spell the same path without sharing an allocation just as happily.
+    ///
+    /// `BTreeMap` keyed by `usize`, not a hash map — `alloc` has no hasher
+    /// (see this module's own import comment), and no hashing is wanted for
+    /// what is already a machine word.
+    memo: BTreeMap<usize, u32>,
+    /// Reused across [`Self::push_component`] calls so flattening one chain
+    /// component doesn't allocate per node.
+    scratch: Vec<DeleteStep>,
+}
+
+impl DeleteTrieBuilder {
+    fn new() -> Self {
+        Self {
+            trie: DeleteTrie {
+                nodes: vec![DeleteTrieNode::new(DELETE_TRIE_ROOT, 0, true, false)],
+            },
+            memo: BTreeMap::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Get or create the child of `parent` reached by one atomic path step.
+    ///
+    /// Rejects any component shape [`delete_expr_paths_at`]'s own dispatch
+    /// rejects, with the identical message. Doing it here rather than during
+    /// the walk is not an ordering change: every one of those shapes produces
+    /// the *same* `cannot use expression as delete target` error, and
+    /// `builtin_del` discards the whole result on any error, so nothing
+    /// observable depends on which of them is found first.
+    fn child_of(
+        &mut self,
+        parent: u32,
+        component: &Expr,
+        optional: bool,
+    ) -> Result<u32, EvalError> {
+        let parent_was_leaf = self.trie.node(parent).is_leaf();
+        let id = match component {
+            Expr::Field(name) => {
+                let map = &self.trie.nodes[parent as usize].fields;
+                match map.get(name.as_str()) {
+                    Some(&id) => {
+                        self.trie.nodes[id as usize].optional |= optional;
+                        id
+                    }
+                    None => {
+                        let slot = map.len();
+                        let id = self.push_node(parent, slot, true, optional);
+                        self.trie.nodes[parent as usize]
+                            .fields
+                            .insert(name.clone(), id);
+                        id
+                    }
+                }
+            }
+            // A `Slice` shares the `Index` bucket rather than getting one of
+            // its own, for the reason `delete_expr_paths_at` spells out:
+            // `delete_trie_array` funnels every terminal key into a single
+            // `delete_keys` call, and that one batch is what makes
+            // overlapping ranges union instead of compound.
+            Expr::Index(_)
+            | Expr::IndexNumber { .. }
+            | Expr::Slice { .. }
+            | Expr::SliceNumber { .. } => {
+                let step = match component {
+                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
+                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                        ArrayStep::Slice(*start, *end)
+                    }
+                    _ => unreachable!("outer match admitted only Index/Slice shapes"),
+                };
+                let map = &self.trie.nodes[parent as usize].indices;
+                match map.get(&step) {
+                    Some(&id) => {
+                        self.trie.nodes[id as usize].optional |= optional;
+                        id
+                    }
+                    None => {
+                        let slot = map.len();
+                        let id = self.push_node(parent, slot, false, optional);
+                        self.trie.nodes[parent as usize].indices.insert(step, id);
+                        id
+                    }
+                }
+            }
+            // See `needs_fanout_pass`'s doc comment for why a bare
+            // `Expr::Iterate` can never reach a comma-grouped `del()` path
+            // (#1382) — flagged loudly in debug/test builds, but still
+            // falling through to the same graceful `Err` as every other
+            // unsupported shape rather than `unreachable!()`, which would
+            // turn a user-supplied `del()` expression into a process crash
+            // in release builds too (#1098).
+            Expr::Iterate => {
+                debug_assert!(
+                    false,
+                    "a bare .[] should have been fanned out into concrete Field/Index \
+                     components before reaching the delete trie (#1382)"
+                );
+                return Err(EvalError::new("cannot use expression as delete target"));
+            }
+            _ => return Err(EvalError::new("cannot use expression as delete target")),
+        };
+        if parent_was_leaf && parent != DELETE_TRIE_ROOT {
+            // `parent` just gained its first child, so it moves from "a
+            // terminal key its own parent batches into `delete_keys`" to
+            // "a group its own parent recurses into" — appended in exactly
+            // the order `delete_expr_object_paths`/`delete_expr_array_paths`
+            // would have first inserted it into their `groups` map.
+            let node = self.trie.node(parent);
+            let (grandparent, slot, by_field) = (node.parent, node.slot, node.keyed_by_field);
+            let gp = &mut self.trie.nodes[grandparent as usize];
+            if by_field {
+                gp.field_groups.push(slot);
+            } else {
+                gp.index_groups.push(slot);
+            }
+        }
+        Ok(id)
+    }
+
+    fn push_node(&mut self, parent: u32, slot: usize, keyed_by_field: bool, optional: bool) -> u32 {
+        let id = u32::try_from(self.trie.nodes.len())
+            .expect("a del() match set cannot exceed u32::MAX distinct path prefixes");
+        self.trie
+            .nodes
+            .push(DeleteTrieNode::new(parent, slot, keyed_by_field, optional));
+        id
+    }
+
+    /// Insert one resolved `PathPrefix` chain component, as the exact
+    /// sequence of [`DeleteStep`]s the old route would have produced for it.
+    ///
+    /// The old route was `strip_resolved_optional` per component (in
+    /// [`assemble_one_branch`]) and then [`flatten_delete_path`] over the
+    /// assembled `Expr::Pipe` (in `builtin_del`); doing both here, per
+    /// component, is the same composition. It also removes the need to prove
+    /// that one chain component never flattens to more than one step: if it
+    /// does, it simply becomes that many trie edges.
+    fn push_component(&mut self, parent: u32, component: &Expr) -> Result<u32, EvalError> {
+        let mut steps = core::mem::take(&mut self.scratch);
+        steps.clear();
+        flatten_delete_path(
+            &strip_resolved_optional(component.clone()),
+            false,
+            &mut steps,
+        );
+        let mut id = parent;
+        let mut failed = None;
+        for step in &steps {
+            match self.child_of(id, &step.component, step.optional) {
+                Ok(next) => id = next,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.scratch = steps;
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(id),
+        }
+    }
+
+    /// Walk one branch's chain leaf-to-root until an already-interned prefix
+    /// (or the root) is reached, then create the missing nodes root-ward.
+    ///
+    /// Iterative rather than recursive on purpose: a `PathPrefix` chain is
+    /// only depth-bounded when `push_recursive_branches` built it, and a
+    /// long *static* prefix ahead of a computed key (`del(.a.a.a…a[.k])`)
+    /// has no such bound — recursing would turn a deep query into a stack
+    /// overflow.
+    fn intern(&mut self, path: &Rc<PathPrefix>) -> Result<u32, EvalError> {
+        let mut pending: Vec<(usize, &Expr)> = Vec::new();
+        let mut cur = path;
+        let mut id = loop {
+            let key = Rc::as_ptr(cur) as usize;
+            if let Some(&id) = self.memo.get(&key) {
+                break id;
+            }
+            match &**cur {
+                PathPrefix::Root => {
+                    self.memo.insert(key, DELETE_TRIE_ROOT);
+                    break DELETE_TRIE_ROOT;
+                }
+                PathPrefix::Node {
+                    parent, component, ..
+                } => {
+                    pending.push((key, component));
+                    cur = parent;
+                }
+            }
+        };
+        while let Some((key, component)) = pending.pop() {
+            id = self.push_component(id, component)?;
+            self.memo.insert(key, id);
+        }
+        Ok(id)
+    }
+
+    fn insert_branch(&mut self, path: &Rc<PathPrefix>) -> Result<(), EvalError> {
+        let id = self.intern(path)?;
+        self.trie.nodes[id as usize].terminal = true;
+        Ok(())
+    }
+
+    /// Insert an already-flat path `Expr` — yq's slice rules produce one by
+    /// rewriting a branch, so it has no `PathPrefix` chain to intern.
+    ///
+    /// No `strip_resolved_optional` here, unlike [`Self::push_component`]:
+    /// this mirrors `builtin_del`'s own pre-#1690 handling of a rewritten
+    /// path, which flattened `yq_del_slice_outcome`'s output directly. (Its
+    /// `wrap` closure can in principle re-add an `Expr::Optional`, but only
+    /// from a `DeleteStep` that carried one — and the path it is handed here
+    /// was already stripped by [`assemble_one_branch`], so in this call shape
+    /// it never does. See `delete_trie_array`'s `debug_assert!`.)
+    fn insert_expr(&mut self, path: &Expr) -> Result<(), EvalError> {
+        let mut steps = core::mem::take(&mut self.scratch);
+        steps.clear();
+        flatten_delete_path(path, false, &mut steps);
+        let mut id = DELETE_TRIE_ROOT;
+        let mut failed = None;
+        for step in &steps {
+            match self.child_of(id, &step.component, step.optional) {
+                Ok(next) => id = next,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.scratch = steps;
+        match failed {
+            Some(e) => Err(e),
+            None => {
+                self.trie.nodes[id as usize].terminal = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> DeleteTrie {
+        self.trie
+    }
+}
+
+/// Assemble just the resolved branches whose path contains a slice
+/// component, leaving the rest as `None`.
+///
+/// yq mode has two extra `del()` rules ([`is_yq_scalar_slice_assign_path`]'s
+/// bare-root no-op and [`yq_del_slice_outcome`]'s chained parent-key drop) and
+/// both are inert unless the path contains a slice — the latter says so as its
+/// own first line. Both also need a flat `Expr`, which is the O(depth)
+/// flatten [`DeleteTrie`] exists to avoid; asking the cheap question first
+/// confines that cost to the branches that can actually use it, instead of
+/// charging every branch of a slice-free match set for a rule that will
+/// decline it. A slice-free match set — which is every filtered recursive
+/// descent, the shape #1690 is about — pays nothing here beyond one
+/// pointer-memoized walk of the shared chain.
+///
+/// Returns an empty `Vec` in jq mode, where neither rule exists at all.
+///
+/// Memoized on the same pointer identity [`DeleteTrieBuilder::intern`] uses,
+/// and sound for the same reason: every chain is alive for the whole call.
+fn del_branch_slice_paths<S: EvalSemantics>(branches: &[PathBranch<'_>]) -> Vec<Option<Expr>> {
+    if S::TAG != EvalTag::Yq {
+        return Vec::new();
+    }
+
+    fn chain_has_slice(memo: &mut BTreeMap<usize, bool>, path: &Rc<PathPrefix>) -> bool {
+        let mut pending: Vec<(usize, &Expr)> = Vec::new();
+        let mut cur = path;
+        let mut found = loop {
+            let key = Rc::as_ptr(cur) as usize;
+            if let Some(&seen) = memo.get(&key) {
+                break seen;
+            }
+            match &**cur {
+                PathPrefix::Root => {
+                    memo.insert(key, false);
+                    break false;
+                }
+                PathPrefix::Node {
+                    parent, component, ..
+                } => {
+                    pending.push((key, component));
+                    cur = parent;
+                }
+            }
+        };
+        let mut steps = Vec::new();
+        while let Some((key, component)) = pending.pop() {
+            if !found {
+                steps.clear();
+                flatten_delete_path(component, false, &mut steps);
+                found = steps.iter().any(|s| s.component.is_slice());
+            }
+            memo.insert(key, found);
+        }
+        found
+    }
+
+    let mut memo = BTreeMap::new();
+    branches
+        .iter()
+        .map(|branch| chain_has_slice(&mut memo, &branch.path).then(|| assemble_one_branch(branch)))
+        .collect()
+}
+
+/// [`delete_expr_paths_at`] against a [`DeleteTrie`] node instead of a
+/// position across a slice of flat paths.
+fn delete_trie_apply(
+    mut value: OwnedValue,
+    trie: &DeleteTrie,
+    id: u32,
+) -> Result<OwnedValue, EvalError> {
+    let node = trie.node(id);
+    // `delete_expr_paths_at`'s `paths.is_empty()` guard. Only the root can
+    // actually reach it (every recursive call below is made against a node
+    // already known to have children), but it costs nothing and keeps the
+    // two functions readable side by side.
+    if node.is_leaf() {
+        return Ok(value);
+    }
+    // `node.terminal` is deliberately not consulted here — see the field's
+    // own doc comment.
+    //
+    // `value` can only be one concrete type at a time, so at most one of
+    // these two actually mutates it; the other sees a container of the wrong
+    // shape and takes that branch's optional-vs-error path. Both maps can be
+    // non-empty only when `value` is `null`, which accepts a string key, a
+    // numeric key or `.[]` alike.
+    if !node.fields.is_empty() {
+        value = delete_trie_object(value, trie, id)?;
+    }
+    if !node.indices.is_empty() {
+        value = delete_trie_array(value, trie, id)?;
+    }
+    Ok(value)
+}
+
+/// Walk a doomed subtree against the `null` that a step naming nothing reads
+/// as — [`delete_expr_paths_through_absent`]'s trie counterpart.
+///
+/// Every arm this can reach is `null`-tolerant and every unsupported
+/// component shape was already rejected when the trie was built, so this
+/// cannot currently raise. It is kept, rather than elided as provably inert,
+/// because that is a property of the *current* component set: a future
+/// `DeleteStep` shape that is not `null`-tolerant (the way `.[]` is not,
+/// #527) would otherwise silently skip validation here instead of raising.
+fn delete_trie_through_absent(trie: &DeleteTrie, id: u32) -> Result<(), EvalError> {
+    let deleted = delete_trie_apply(OwnedValue::Null, trie, id)?;
+    debug_assert!(
+        matches!(deleted, OwnedValue::Null),
+        "deleting through a synthetic null produced a value to write back"
+    );
+    Ok(())
+}
+
+/// [`delete_expr_object_paths`]'s trie counterpart.
+fn delete_trie_object(
+    mut value: OwnedValue,
+    trie: &DeleteTrie,
+    id: u32,
+) -> Result<OwnedValue, EvalError> {
+    let node = trie.node(id);
+    // `null` tolerates any field key unconditionally — `null | del(.a)` is
+    // `null` (#476) — but the exemption is per *step*, so the tails are still
+    // walked (#527).
+    if matches!(value, OwnedValue::Null) {
+        for &slot in &node.field_groups {
+            let (_, &child) = node
+                .fields
+                .get_index(slot)
+                .expect("field_groups holds live fields indices");
+            delete_trie_through_absent(trie, child)?;
+        }
+        return Ok(value);
+    }
+
+    // Every edge here is Field-kind, so `resolve_node` (invoked by
+    // `resolve_del_path_branches` before any of this runs) already validated
+    // `value` as field-indexable for each path — raising the same `Cannot
+    // index … with …` error itself — before the trie was ever built. `null`
+    // is excluded above, so this can only fire if that earlier validation
+    // regresses.
+    let OwnedValue::Object(entries) = &mut value else {
+        unreachable!("delete_trie_object reached a non-object, non-null root")
+    };
+    for &slot in &node.field_groups {
+        let (name, &child) = node
+            .fields
+            .get_index(slot)
+            .expect("field_groups holds live fields indices");
+        match entries.get_mut(name.as_str()) {
+            Some(target) => {
+                let old = core::mem::replace(target, OwnedValue::Null);
+                *target = delete_trie_apply(old, trie, child)?;
+            }
+            // A field the object doesn't have is a dead end, not an error
+            // (#527) — and the tail decides whether it stays one.
+            None => delete_trie_through_absent(trie, child)?,
+        }
+    }
+
+    let doomed: Vec<OwnedValue> = node
+        .fields
+        .iter()
+        .filter(|(_, &child)| trie.node(child).terminal)
+        .map(|(name, _)| OwnedValue::String(name.clone()))
+        .collect();
+    if !doomed.is_empty() {
+        let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
+        value = delete_keys(value, &key_refs)?;
+    }
+
+    Ok(value)
+}
+
+/// [`delete_expr_array_paths`]'s trie counterpart.
+fn delete_trie_array(
+    mut value: OwnedValue,
+    trie: &DeleteTrie,
+    id: u32,
+) -> Result<OwnedValue, EvalError> {
+    let node = trie.node(id);
+    // Same per-step `null` exemption as `delete_trie_object` — applies to a
+    // bare index and a slice component alike (#476), and likewise covers only
+    // this step (#527).
+    if matches!(value, OwnedValue::Null) {
+        for &slot in &node.index_groups {
+            let (_, &child) = node
+                .indices
+                .get_index(slot)
+                .expect("index_groups holds live indices indices");
+            delete_trie_through_absent(trie, child)?;
+        }
+        return Ok(value);
+    }
+
+    if !matches!(value, OwnedValue::Array(_)) {
+        // Not dead code: `resolve_node` validates a `Slice` component by
+        // evaluating it as a *read*, and slicing a string is a legal read
+        // (`"hi" | .[0:1]` is `"h"`) even though `del` through that slice is
+        // not — so `"hi" | del(.[0:1], .[1:2])` reaches here with `value`
+        // still a `String` (#504).
+        debug_assert!(
+            !node
+                .indices
+                .values()
+                .any(|&child| trie.node(child).optional),
+            "delete_trie_array: no trie edge here should ever carry optional == true -- \
+             assemble_one_branch's strip_resolved_optional runs per component before any \
+             comma-grouped del() path reaches the trie (#1331)"
+        );
+        // *Which* sentence comes from the first-inserted step specifically,
+        // because jq walks the paths in source order and dies on the first —
+        // the same `paths[0]` rule `delete_expr_array_paths` follows, and
+        // insertion order here is that same source order. The non-string
+        // slice arm and the index arm are not known to be live-reachable (a
+        // bare or nested number root fails earlier, during path navigation);
+        // kept for the reason #1322 kept them.
+        let (step, _) = node
+            .indices
+            .get_index(0)
+            .expect("caller checked indices is non-empty");
+        return Err(match step {
+            ArrayStep::Slice(..) if matches!(value, OwnedValue::String(_)) => {
+                EvalError::cannot_delete_fields_from("string")
+            }
+            ArrayStep::Slice(..) => {
+                EvalError::cannot_index_with_type(owned_type_name(&value), "object")
+            }
+            ArrayStep::Index(_) => {
+                EvalError::cannot_index_with_type(owned_type_name(&value), "number")
+            }
+        });
+    }
+
+    if let OwnedValue::Array(arr) = &mut value {
+        for &slot in &node.index_groups {
+            let (step, &child) = node
+                .indices
+                .get_index(slot)
+                .expect("index_groups holds live indices indices");
+            match step {
+                ArrayStep::Index(idx) => {
+                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                        Some(actual) => {
+                            let target = &mut arr[actual];
+                            let old = core::mem::replace(target, OwnedValue::Null);
+                            *target = delete_trie_apply(old, trie, child)?;
+                        }
+                        // An out-of-range index names nothing to delete
+                        // through, so `delpaths` silently skips the step
+                        // itself, `?` or not (#477) — but the tail still
+                        // decides (#527/#529).
+                        None => delete_trie_through_absent(trie, child)?,
+                    }
+                }
+                // Deleting *through* a slice deletes inside the sub-array and
+                // splices it back: `[1,[2],[3]] | del(.[1:3][0])` is
+                // `[1,[3]]`.
+                ArrayStep::Slice(s, e) => {
+                    let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
+                    let sub = OwnedValue::Array(arr[range.clone()].to_vec());
+                    let OwnedValue::Array(items) = delete_trie_apply(sub, trie, child)? else {
+                        unreachable!("deleting from an array yields an array")
+                    };
+                    arr.splice(range, items);
+                }
+            }
+        }
+    }
+
+    // Terminal indices go through `delete_keys`, which already silently drops
+    // an index that names nothing — including an out-of-range one, `?` or not
+    // (#415/#477) — and resolves every negative index against the length the
+    // array had on entry, in one batch, so overlapping ranges union rather
+    // than compound (#424).
+    let doomed: Vec<OwnedValue> = node
+        .indices
+        .iter()
+        .filter(|(_, &child)| trie.node(child).terminal)
+        .map(|(step, _)| match step {
+            ArrayStep::Index(idx) => OwnedValue::Int(*idx),
+            ArrayStep::Slice(s, e) => slice::literal_component(*s, *e),
+        })
+        .collect();
+    if !doomed.is_empty() {
+        let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
+        value = delete_keys(value, &key_refs)?;
+    }
+
+    Ok(value)
 }
 
 /// Recursively rewrite every already-static branch of `expr` with
@@ -32794,36 +33124,121 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // branch below rather than `delete_expr_paths_at`'s comma-grouped one
     // (#1382).
     //
-    // `short_circuit_del_root=true` (#1651): if any resolved branch is the
-    // document root, this returns `[Expr::Identity]` here without paying
-    // `assemble`'s O(depth)-per-branch flatten for every other branch —
-    // `delete_expr_paths_at`/`delete_at_path` would collapse the whole
-    // document to `null` once they got there anyway, on exactly this
-    // condition (see `resolve_dynamic_indexes`'s doc comment).
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false, true) {
-        Ok(paths) => paths,
+    // `resolve_del_path_branches`, not `resolve_dynamic_indexes`: `del()` is
+    // the one path-resolving caller that can consume the resolved branches
+    // *before* they are flattened, and both of the flag-shaped exceptions it
+    // used to ask its sibling for (#1651's document-root short-circuit,
+    // #1764's `skip_untracked = false`) live there now.
+    let resolved = match resolve_del_path_branches::<S>(path_expr, &result) {
+        Ok(resolved) => resolved,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
-        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-        Err((_, escape)) => return escape.into(),
+        Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
+        Err(escape) => return escape.into(),
     };
+
+    // #1690: every match set with more than one resolved path merges into a
+    // `DeleteTrie` and skips flattening entirely. `assemble_one_branch`,
+    // `flatten_delete_path` and the old `delete_expr_paths_at`'s
+    // per-position sibling re-grouping were each O(depth) *per branch*, so a
+    // filtered recursive descent whose match set grows with depth
+    // (`del(.. | select(cond))` where `cond` rejects `.`) cost O(d^2).
+    // Measured at a fixed depth of 240, the per-branch marginal cost drops
+    // from ~37.5us to ~5.9us. See `DeleteTrie`.
+    let trie = match &resolved {
+        DelPaths::Branches(branches) if branches.len() > 1 => {
+            // yq mode's two extra `del()` slice rules both need a flat
+            // `Expr`, so the branches that can actually use one — and only
+            // those — get assembled. Empty in jq mode.
+            let slice_paths = del_branch_slice_paths::<S>(branches);
+
+            // yq's bare-root slice `del()` no-op (#1101's scalar case,
+            // widened to every target type by #1162). Real yq no-ops a comma
+            // of bare slices exactly as it does the single-path case, for
+            // every target type, so this is checked once up front over every
+            // resolved path rather than taught to the walk below. A path with
+            // no slice in it can never satisfy `is_yq_scalar_slice_assign_path`
+            // (which asks whether the whole path *is* a slice), so an
+            // unassembled `None` here settles the `all` immediately.
+            if S::TAG == EvalTag::Yq
+                && slice_paths
+                    .iter()
+                    .all(|p| p.as_ref().is_some_and(is_yq_scalar_slice_assign_path))
+            {
+                return QueryResult::Owned(result);
+            }
+
+            let mut builder = DeleteTrieBuilder::new();
+            let mut failed = None;
+            for (index, branch) in branches.iter().enumerate() {
+                // #1116's chained-scalar-slice rule, generalized by #1219 to
+                // a whole trailing slice-run: rewrite the path to delete the
+                // parent key outright, or drop this one sibling entirely.
+                // Applied per branch *before* the branch is merged into the
+                // trie, which is the only point at which a rewrite that
+                // shortens or removes a path can still be expressed —
+                // `filter_map`'s dropped sibling and `DropParent`'s truncated
+                // one both stop existing once branches share nodes.
+                let inserted = match slice_paths.get(index).and_then(Option::as_ref) {
+                    None => builder.insert_branch(&branch.path),
+                    Some(path) => match yq_del_slice_outcome(path, &result, false) {
+                        YqDelSliceOutcome::DropParent(rewritten) => builder.insert_expr(&rewritten),
+                        YqDelSliceOutcome::Noop => Ok(()),
+                        YqDelSliceOutcome::NotApplicable => builder.insert_expr(path),
+                    },
+                };
+                if let Err(e) = inserted {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            match failed {
+                Some(_) if optional => return QueryResult::None,
+                Some(e) => return QueryResult::Error(e),
+                None => Some(builder.finish()),
+            }
+        }
+        _ => None,
+    };
+    if let Some(trie) = trie {
+        // The old `delete_expr_paths_at`'s `path.len() == start` case at
+        // `start == 0`: an exhausted path deletes this entire subtree, which
+        // subsumes whatever any sibling would have deleted from within it.
+        if trie.root_is_terminal() {
+            return QueryResult::Owned(OwnedValue::Null);
+        }
+        // Releases the borrow the branches hold on `result`, so the apply
+        // walk below can take it by value.
+        drop(resolved);
+        return match delete_trie_apply(result, &trie, DELETE_TRIE_ROOT) {
+            Ok(result) => QueryResult::Owned(result),
+            Err(_) if optional => QueryResult::None,
+            Err(e) => e.into(),
+        };
+    }
+
+    // Everything reaching here resolved to at most one path — a match set of
+    // two or more went through the trie above. That is what makes the
+    // per-path walk below safe: the sibling-shifting `delete_expr_paths_at`
+    // existed for (#424, a negative index resolving against a length an
+    // earlier sibling already shortened) needs a sibling to shift under it.
+    let paths: Vec<Expr> = match resolved {
+        DelPaths::Verbatim => vec![path_expr.clone()],
+        DelPaths::Root => vec![Expr::Identity],
+        DelPaths::Branches(branches) => assemble_path_branches(branches),
+    };
+    debug_assert!(
+        paths.len() <= 1,
+        "a multi-path del() match set should have been merged into a DeleteTrie (#1690)"
+    );
 
     // yq's bare-root slice `del()` no-op (#1101's scalar case; #1162 widened
     // this to every target type, matching real yq's bare-root behavior
     // being type-uniform the same way the *chained* case is — see
-    // `yq_del_slice_outcome`'s doc comment) — the `paths.len()
-    // <= 1` branch below already checks this per path, but
-    // `delete_expr_paths_at` (the `paths.len() > 1` branch after it) is a
-    // completely separate sibling-grouping walker that has no equivalent
-    // check at all, so a multi-path `del()` (e.g. `del(.[0:1], .[2:3])`, or
-    // any comma that resolves to 2+ paths) skipped the no-op entirely —
-    // confirmed live against real yq (a comma of bare slices still no-ops
-    // there, same as the single-path case, for every target type). Checked
-    // once, up front, for the common case where every resolved path
-    // individually qualifies — rather than teaching
-    // `delete_expr_paths_at`'s own sibling-comparison logic about it, which
-    // is complex, heavily-tested machinery this fix doesn't otherwise need
-    // to touch.
+    // `yq_del_slice_outcome`'s doc comment). The multi-path form of this
+    // same check lives at the trie's own entry above, for the same reason it
+    // is up front here: a comma of bare slices no-ops in real yq exactly as
+    // the single-path case does, for every target type (confirmed live).
     //
     // No `is_yq_slice_empty_container_scalar(&result)` type gate here
     // (#1162 removed it) — only `is_yq_scalar_slice_assign_path`'s *shape*
@@ -32835,14 +33250,14 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(result);
     }
 
-    // The overwhelmingly common case — no computed key at all, or one that
-    // resolved to a single value — has no sibling that could shift under it,
-    // so it keeps the simple per-path walk. (#1101's no-op is already fully
-    // handled by the upfront `paths.iter().all(...)` check above — for
-    // `paths.len() <= 1` specifically, "all paths qualify" and "the one
-    // path qualifies" are the same condition, so a second per-path check
-    // here would be unreachable dead code, not a real fallback.)
-    if paths.len() <= 1 {
+    // At most one path — no computed key at all, or one that resolved to a
+    // single value — so there is no sibling that could shift under it and
+    // the simple per-path walk applies. (#1101's no-op is already fully
+    // handled by the upfront `paths.iter().all(...)` check above: for one
+    // path, "all paths qualify" and "the one path qualifies" are the same
+    // condition, so a second per-path check here would be unreachable dead
+    // code, not a real fallback.)
+    {
         let mut result = result;
         for path in &paths {
             // yq's chained-scalar-slice del() rule (#1116, generalized by
@@ -32900,79 +33315,6 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         return QueryResult::Owned(result);
-    }
-
-    // More than one resolved path happens when a computed key produced
-    // several values (`.[(0,2)]`, `.[.a,.b]`, …), or when a top-level `Comma`
-    // names more than one static path outright (`.a, .b`, #475) — either way
-    // the same shape #424 got wrong by deleting them one at a time.
-    // `flatten_delete_path` reduces each resolved `Expr` to the same
-    // atomic-steps shape so `delete_expr_paths_at` can delete every resolved
-    // path together.
-    //
-    // Each path is rewritten by #1116's chained-scalar-slice del() rule
-    // first, same as the `paths.len() <= 1` branch above — `flatten_delete_path`/
-    // `delete_expr_paths_at` are complex, heavily-tested sibling-grouping
-    // machinery this fix doesn't otherwise need to touch, so the rewrite
-    // happens once, per path, before either ever sees it, rather than
-    // teaching them the rule directly.
-    //
-    // #1219's *other* half (a chained slice-run followed by something that
-    // isn't itself a slice no-ops the whole `del()` call) applies per
-    // sibling here too — live-verified `del(.a[1:3][0], .c)` on
-    // `{"a":[1,2,3,4],"c":9}` leaves `.a` completely untouched while still
-    // deleting `.c`, the same independent-per-path treatment #1162's rule
-    // already gets one line up. `filter_map` drops a no-op sibling's steps
-    // from `rewritten` entirely rather than passing its original,
-    // unrewritten path through — `delete_expr_paths_at` already treats an
-    // empty path list as a no-op (its own `paths.is_empty()` guard), so
-    // this composes cleanly even when every sibling turns out to be a
-    // no-op.
-    //
-    // `paths.into_iter()` (#1384): `paths` is never read again after this
-    // loop, so `path` can be moved into `rewritten`/passed by reference to
-    // `yq_del_slice_outcome` instead of being cloned -- a real allocation
-    // win at scale (a `k`-branch computed key ahead of an `n`-element
-    // trailing `[]` resolves to `k*n` paths here, each a multi-component
-    // `Expr` tree), measured at an 18-28% peak-RSS reduction for `del()`
-    // on `.items[(0,1)].foo[]` across 100k/400k/800k elements.
-    let rewritten: Vec<Expr> = paths
-        .into_iter()
-        .filter_map(|path| {
-            if S::TAG != EvalTag::Yq {
-                return Some(path);
-            }
-            match yq_del_slice_outcome(&path, &result, false) {
-                YqDelSliceOutcome::DropParent(rewritten) => Some(rewritten),
-                YqDelSliceOutcome::Noop => None,
-                YqDelSliceOutcome::NotApplicable => Some(path),
-            }
-        })
-        .collect();
-    // `rewritten.into_iter()`: `rewritten` is never read again after this
-    // loop either, so each `Expr` tree can be dropped as soon as its own
-    // `flatten_delete_path` call finishes instead of staying resident until
-    // `builtin_del`'s scope ends (locals drop in reverse declaration order,
-    // not at last use -- `.iter()` alone doesn't change that). Not a clone
-    // elimination like `paths.into_iter()` above (`flatten_delete_path`
-    // still takes `&Expr` and pays the same per-leaf `component.clone()`
-    // either way); this only shrinks the window where the full `rewritten`
-    // buffer overlaps with `flatten_delete_path`'s own clone-heavy pass and
-    // the subsequent `delete_expr_paths_at` call (#1569).
-    let flattened: Vec<Vec<DeleteStep>> = rewritten
-        .into_iter()
-        .map(|path| {
-            let mut steps = Vec::new();
-            flatten_delete_path(&path, false, &mut steps);
-            steps
-        })
-        .collect();
-    let refs: Vec<&[DeleteStep]> = flattened.iter().map(Vec::as_slice).collect();
-
-    match delete_expr_paths_at(result, &refs, 0) {
-        Ok(result) => QueryResult::Owned(result),
-        Err(_) if optional => QueryResult::None,
-        Err(e) => e.into(),
     }
 }
 
@@ -64889,8 +65231,17 @@ mod tests {
         );
     }
 
+    /// Build a single-step [`DeleteTrie`] whose one edge is `component`.
+    fn one_step_trie(component: Expr) -> DeleteTrie {
+        let mut builder = DeleteTrieBuilder::new();
+        builder
+            .insert_expr(&component)
+            .expect("supported component");
+        builder.finish()
+    }
+
     /// #1326 review: adding `Expr::SliceNumber` alongside `Expr::Slice` in
-    /// `delete_expr_array_paths`'s error-construction match exposed that
+    /// the array walker's error-construction match exposed that
     /// `Expr::IndexNumber` had no arm of its own there either -- a
     /// pre-existing #1088 gap (a float-spelled index reaching this path
     /// would have hit the catch-all `unreachable!()` instead of the same
@@ -64898,17 +65249,18 @@ mod tests {
     /// deliberate target. Called directly rather than through a jq query:
     /// `5 | del(.[2.0])`-shaped repros exit through a different,
     /// higher-level dispatch before ever reaching this specific match.
+    /// (#1690 moved the match from `delete_expr_array_paths` to
+    /// `delete_trie_array`; the arm and its wording are unchanged, and
+    /// `ArrayStep` collapses the `Index`/`IndexNumber` pair into one key
+    /// before it, which is what this asserts.)
     #[test]
     fn test_delete_expr_array_paths_reports_index_number_like_plain_index_1326() {
-        let steps = [DeleteStep {
-            component: Expr::IndexNumber {
-                idx: 2,
-                key: NumberKey::Literal(2.0, "2.0".into()),
-            },
-            optional: false,
-        }];
-        let err =
-            delete_expr_array_paths(OwnedValue::Int(5), &[&steps], 0).expect_err("not an array");
+        let trie = one_step_trie(Expr::IndexNumber {
+            idx: 2,
+            key: NumberKey::Literal(2.0, "2.0".into()),
+        });
+        let err = delete_trie_array(OwnedValue::Int(5), &trie, DELETE_TRIE_ROOT)
+            .expect_err("not an array");
         assert_eq!(err.message, "Cannot index number with number");
     }
 
@@ -64923,20 +65275,17 @@ mod tests {
     /// asserted here).
     #[test]
     fn test_delete_expr_array_paths_reports_slice_number_like_plain_slice_1827() {
-        let steps = [DeleteStep {
-            component: Expr::SliceNumber {
-                start: Some(1),
-                end: Some(3),
-                start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
-                end_key: None,
-            },
-            optional: false,
-        }];
-        let err = delete_expr_array_paths(OwnedValue::String("hi".into()), &[&steps], 0)
+        let trie = one_step_trie(Expr::SliceNumber {
+            start: Some(1),
+            end: Some(3),
+            start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
+            end_key: None,
+        });
+        let err = delete_trie_array(OwnedValue::String("hi".into()), &trie, DELETE_TRIE_ROOT)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot delete fields from string");
 
-        let err = delete_expr_array_paths(OwnedValue::Bool(true), &[&steps], 0)
+        let err = delete_trie_array(OwnedValue::Bool(true), &trie, DELETE_TRIE_ROOT)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot index boolean with object");
     }
@@ -65862,35 +66211,40 @@ mod tests {
     fn flatten_delete_path_identity_arm_called_directly() {
         // Before #1651, a comma branch that flattened to the document root
         // (a bare `.` sibling, `del(., .a)`) reached this `Expr::Identity`
-        // arm through `builtin_del`'s own multi-path walk. `resolve_dynamic_indexes`'s
-        // `short_circuit_del_root` flag now catches every such branch first
-        // and returns `[Expr::Identity]` before `flatten_delete_path` is ever
-        // called on it, so that route is gone -- the arm's only remaining
-        // caller through the CLI is `yq_del_slice_outcome`'s bare,
-        // non-comma `del(.)`-shaped yq path. Exercised directly here rather
-        // than depending on that indirect route to keep it covered.
+        // arm through `builtin_del`'s own multi-path walk. `DelPaths::Root`
+        // (#1651, moved to `resolve_del_path_branches` by #1690) now catches
+        // every such branch first, before any flattening happens at all, so
+        // that route is gone -- the arm's only remaining caller through the
+        // CLI is `yq_del_slice_outcome`'s bare, non-comma `del(.)`-shaped yq
+        // path. Exercised directly here rather than depending on that
+        // indirect route to keep it covered.
         let mut steps = Vec::new();
         flatten_delete_path(&Expr::Identity, false, &mut steps);
         assert!(steps.is_empty());
     }
 
     #[test]
-    fn delete_expr_paths_at_exhausted_sibling_guard_called_directly() {
-        // #1651's `short_circuit_del_root` flag intercepts every comma
-        // branch that resolves to the document root before `builtin_del`
-        // ever calls `delete_expr_paths_at`, and `delete_expr_object_paths`/
-        // `delete_expr_array_paths` both filter an exhausted sibling into
-        // their own `terminal` set before recursing back in -- so this
-        // guard's `paths.iter().any(|path| path.len() == start)` arm can no
-        // longer be reached from any parseable query. Kept anyway: it is
-        // the panic-preventing check standing in front of
-        // `delete_expr_object_paths`/`delete_expr_array_paths`'s own
-        // `path[start]` indexing, which would panic on an empty path
-        // instead of returning cleanly if a future caller ever violated the
-        // invariant. Exercised directly, the same way the parser-unreachable
+    fn delete_trie_exhausted_root_path_guard_called_directly() {
+        // `DelPaths::Root` intercepts every branch that resolves to the
+        // document root before a trie is ever built, so `root_is_terminal`
+        // can only fire for a branch whose components all flatten away to
+        // nothing -- and no parseable query is currently known to produce
+        // one. Kept anyway, because it is what stands between an empty path
+        // and `delete_trie_apply`'s children-only walk silently treating
+        // `del(.)` as `del()`: an exhausted path has to collapse the whole
+        // value to `null`, the way the pre-#1690 walker's own
+        // `paths.iter().any(|path| path.len() == start)` arm did.
+        // Exercised directly, the same way the parser-unreachable
         // `builtin_*` functions above are.
-        let empty: &[DeleteStep] = &[];
-        match delete_expr_paths_at(OwnedValue::Null, &[empty], 0) {
+        let mut builder = DeleteTrieBuilder::new();
+        builder
+            .insert_expr(&Expr::Identity)
+            .expect("Identity flattens to no steps at all");
+        let trie = builder.finish();
+        assert!(trie.root_is_terminal());
+        // ... and the empty walk itself is still a clean no-op, not a panic:
+        // `terminal` is never consulted by the node it sits on.
+        match delete_trie_apply(OwnedValue::Null, &trie, DELETE_TRIE_ROOT) {
             Ok(OwnedValue::Null) => {}
             other => panic!("expected Ok(Null), got {other:?}"),
         }
