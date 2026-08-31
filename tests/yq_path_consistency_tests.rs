@@ -32,10 +32,13 @@
 #![cfg(feature = "cli")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde_json::Value;
+
+#[path = "common/cargo_run_exit.rs"]
+mod cargo_run_exit;
+use cargo_run_exit::spawn_with_signal_retry;
 
 const CORPUS: &str = include_str!("data/yaml-test-suite-2022-01-17.json");
 const KNOWN_FAILURES: &str = include_str!("data/yq-path-consistency-known-failures.txt");
@@ -66,28 +69,26 @@ fn canonicalize(value: Value) -> Value {
 }
 
 /// Run `succinctly yq <args> '.'` with `yaml` on stdin and classify the result.
+/// #2016 (code review): routed through `spawn_with_signal_retry` (was a
+/// hand-rolled `spawn()` + `write_all(...).expect(...)` +
+/// `wait_with_output()`) -- an `.expect(...)` on the write, before the
+/// wait, unwinds past it the same way a `?` early-return would, dropping
+/// `child` without reaping it on a write failure and leaking a zombie for
+/// the rest of this test binary's run (matching `spawn_with_signal_retry`'s
+/// own #1891 fix). Also picks up the ENOENT/signal-death retry that
+/// function provides, and its write-error-vs-wait-error diagnostic
+/// priority on a double failure, neither of which this hand-rolled version
+/// had.
 fn run_path(args: &[&str], yaml: &str) -> PathResult {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .args(args)
-        .arg(".")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn succinctly");
-    // #2016: write, but don't panic yet -- an `.expect(...)` here, before
-    // `wait_with_output()` below, unwinds past the wait the same way a `?`
-    // early-return would, dropping `child` without reaping it on a write
-    // failure and leaking a zombie for the rest of this test binary's run
-    // (matching `spawn_with_signal_retry`'s own #1891 fix).
-    let write_result = child
-        .stdin
-        .take()
-        .expect("stdin piped")
-        .write_all(yaml.as_bytes());
-    let output = child.wait_with_output().expect("wait");
-    write_result.expect("write stdin");
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").args(args).arg(".");
+            command
+        },
+        Some(yaml.as_bytes()),
+    )
+    .expect("spawn succinctly");
 
     if !output.status.success() {
         return PathResult::Errored;
