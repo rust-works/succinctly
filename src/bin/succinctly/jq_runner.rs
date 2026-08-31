@@ -2820,12 +2820,126 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             // materialized text too would silently rewrite the value's
             // source spelling.
             let normalized = normalize_leading_zero_numbers(s);
-            if normalized == s || validate_json_str(&normalized).is_err() {
-                return Err(e).with_context(|| format!("Invalid JSON: {s}"));
+            if normalized != s && validate_json_str(&normalized).is_ok() {
+                return crate::output::json_bytes_to_owned_value(s.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
             }
-            crate::output::json_bytes_to_owned_value(s.as_bytes())
-                .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))
+
+            // A lone *low* surrogate escape (`\uDC00`-`\uDFFF`) (#2012):
+            // `serde_json` rejects it outright, but real jq accepts it and
+            // substitutes U+FFFD -- the same leniency #2008 already gave
+            // this crate's own decoder (`json::light::decode_escapes_into`),
+            // which `json_bytes_to_owned_value` below reaches. Same retry
+            // shape as the leading-zero case above: validate a normalized
+            // copy, materialize from the original `s` either way, since the
+            // decoder already does the right thing on its own.
+            let surrogate_fixed = normalize_lone_low_surrogates(s);
+            if surrogate_fixed != s && validate_json_str(&surrogate_fixed).is_ok() {
+                return crate::output::json_bytes_to_owned_value(s.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
+            }
+
+            Err(e).with_context(|| format!("Invalid JSON: {s}"))
         }
+    }
+}
+
+/// Whether `bytes[i..]` starts with a JSON `\uXXXX` escape -- if so, its
+/// codepoint value and the position just past the escape's 6 bytes.
+/// `None` if the 4 hex digits aren't well-formed; left for the retried
+/// `serde_json` validation to reject on its own terms, since this
+/// function's only job is finding surrogate escapes to normalize, not
+/// validating everything else in `s`.
+fn parse_u_escape(bytes: &[u8], i: usize) -> Option<(u16, usize)> {
+    if bytes.get(i) != Some(&b'\\') || bytes.get(i + 1) != Some(&b'u') {
+        return None;
+    }
+    let hex = bytes.get(i + 2..i + 6)?;
+    let hex_str = core::str::from_utf8(hex).ok()?;
+    let value = u16::from_str_radix(hex_str, 16).ok()?;
+    Some((value, i + 6))
+}
+
+/// Replace every lone (unpaired) low-surrogate `\uXXXX` escape
+/// (`\uDC00`-`\uDFFF`) in `s` with the literal escape `\ufffd`, leaving a
+/// valid high+low surrogate *pair* untouched -- so `validate_json_str`'s
+/// `serde_json` gate, which rejects any lone surrogate half outright, can
+/// validate what remains. A lone *high* surrogate is left exactly as
+/// written and stays rejected either way -- out of this issue's scope
+/// (#2013 covers a different, unrelated high-surrogate leniency bug in a
+/// different decoder).
+///
+/// Only ever invoked as a retry after `validate_and_materialize_json`
+/// already rejected `s` (see `parse_json_value`) -- the *materialized*
+/// value always comes from the original, untouched `s` afterward, whose
+/// own decoder (`json::light::decode_escapes_into`, #2008) already
+/// substitutes U+FFFD for exactly this shape, matching real jq. This
+/// function exists solely to get a validation *copy* of `s` past
+/// `serde_json`'s stricter gate, not to change what gets stored.
+fn normalize_lone_low_surrogates(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let Some(end) = find_string_end(bytes, i) else {
+                out.extend_from_slice(&bytes[i..]);
+                break;
+            };
+            normalize_string_span_low_surrogates(&bytes[i..end], &mut out);
+            i = end;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect(
+        "only ever copies span's own bytes verbatim, or substitutes one \\uXXXX escape for another of equal byte length within an already-delimited string span",
+    )
+}
+
+/// Normalize one already-delimited string span (`span[0]` is the opening
+/// quote, `span`'s last byte the closing one) into `out`, substituting
+/// lone low surrogates as `normalize_lone_low_surrogates` describes.
+fn normalize_string_span_low_surrogates(span: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    // Set right after copying a high surrogate escape that is immediately
+    // followed by a valid low surrogate escape -- the pair `serde_json`
+    // already accepts, so the low half must be copied verbatim too rather
+    // than substituted.
+    let mut next_low_is_paired = false;
+    while i < span.len() {
+        if let Some((value, next)) = parse_u_escape(span, i) {
+            if (0xD800..=0xDBFF).contains(&value) {
+                out.extend_from_slice(&span[i..next]);
+                next_low_is_paired = parse_u_escape(span, next)
+                    .is_some_and(|(low, _)| (0xDC00..=0xDFFF).contains(&low));
+                i = next;
+                continue;
+            }
+            if (0xDC00..=0xDFFF).contains(&value) && !next_low_is_paired {
+                out.extend_from_slice(b"\\ufffd");
+            } else {
+                out.extend_from_slice(&span[i..next]);
+            }
+            next_low_is_paired = false;
+            i = next;
+            continue;
+        }
+        next_low_is_paired = false;
+        if span[i] == b'\\' && i + 1 < span.len() {
+            // Any other escape (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`,
+            // `\t`, or a malformed `\u` this retry doesn't need to
+            // understand) is exactly two bytes; copying both keeps the
+            // byte-for-byte pass-through property `find_string_end`'s own
+            // scan already relies on elsewhere in this file.
+            out.push(span[i]);
+            out.push(span[i + 1]);
+            i += 2;
+            continue;
+        }
+        out.push(span[i]);
+        i += 1;
     }
 }
 
@@ -5905,6 +6019,40 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_lone_low_surrogates_2012() {
+        // A lone low surrogate is substituted with the literal escape text
+        // `\ufffd` -- this function's output only ever feeds `serde_json`'s
+        // validation gate, never gets materialized itself (see the
+        // function's own doc comment), so the substitution is the escape
+        // *sequence*, not a decoded replacement character.
+        assert_eq!(normalize_lone_low_surrogates(r#""\udc00""#), r#""\ufffd""#);
+        // Multiple lone low surrogates, each independently.
+        assert_eq!(
+            normalize_lone_low_surrogates(r#""a\udc00b\udc01""#),
+            r#""a\ufffdb\ufffd""#
+        );
+        // A valid high+low surrogate pair is left untouched.
+        assert_eq!(normalize_lone_low_surrogates(r#""𐀀""#), r#""𐀀""#);
+        // A lone high surrogate is left untouched -- out of this issue's
+        // scope (#2013 covers that case in a different decoder).
+        assert_eq!(normalize_lone_low_surrogates(r#""\ud800""#), r#""\ud800""#);
+        // Object keys are reached the same way values are.
+        assert_eq!(
+            normalize_lone_low_surrogates(r#"{"a\udc00":1}"#),
+            r#"{"a\ufffd":1}"#
+        );
+        // An escaped quote inside a string doesn't end the string early.
+        assert_eq!(
+            normalize_lone_low_surrogates(r#"["a\"\udc00b",1]"#),
+            r#"["a\"\ufffdb",1]"#
+        );
+        // Content outside strings, and a string with no surrogate escape
+        // at all, are unaffected.
+        assert_eq!(normalize_lone_low_surrogates("[1,2]"), "[1,2]");
+        assert_eq!(normalize_lone_low_surrogates(r#""hello""#), r#""hello""#);
+    }
+
+    #[test]
     fn test_jq_compat_formatter_format_raw_number() {
         // Finite numbers fall through the NaN/Infinity guard unchanged.
         assert_eq!(JqCompatFormatter.format_raw_number(b"42").as_ref(), "42");
@@ -6059,6 +6207,43 @@ mod tests {
     #[test]
     fn test_parse_json_value_still_rejects_trailing_garbage_1058() {
         assert!(parse_json_value("42 garbage").is_err());
+    }
+
+    /// #2012: `--argjson`/`--jsonargs`' JSON parser accepts a lone low
+    /// surrogate escape and substitutes U+FFFD, matching real jq -- rather
+    /// than rejecting outright the way `serde_json`'s own validation gate
+    /// does on its own. Verified live against jq 1.7.1
+    /// (`jq -n --argjson x '"\udc00"' '$x'` => `"�"`, exit 0).
+    #[test]
+    fn test_parse_json_value_accepts_lone_low_surrogate_2012() {
+        assert_eq!(
+            parse_json_value(r#""\udc00""#).unwrap().to_json(),
+            "\"\u{FFFD}\""
+        );
+        // Multiple lone low surrogates in the same value.
+        assert_eq!(
+            parse_json_value(r#""a\udc00b\udc01""#).unwrap().to_json(),
+            "\"a\u{FFFD}b\u{FFFD}\""
+        );
+        // A valid surrogate pair still decodes to the real supplementary
+        // character, not U+FFFD -- this retry must not clobber it.
+        assert_eq!(
+            parse_json_value(r#""𐀀""#).unwrap().to_json(),
+            "\"\u{10000}\""
+        );
+        // Reached through an object value too, not just a bare string.
+        assert_eq!(
+            parse_json_value(r#"{"a":"\udc00"}"#).unwrap().to_json(),
+            "{\"a\":\"\u{FFFD}\"}"
+        );
+    }
+
+    /// #2012 regression guard: a lone *high* surrogate must stay rejected
+    /// -- that's #2013's own (different-decoder) scope, not this fix's.
+    /// Verified live: `jq -n --argjson x '"\ud800"' '$x'` errors, exit 2.
+    #[test]
+    fn test_parse_json_value_still_rejects_lone_high_surrogate_2012() {
+        assert!(parse_json_value(r#""\ud800""#).is_err());
     }
 
     #[test]
