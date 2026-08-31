@@ -254,6 +254,17 @@ impl<'a, W: Write> AsciiEscapeWriter<'a, W> {
     pub fn new(inner: &'a mut W) -> Self {
         Self { inner }
     }
+
+    /// Reborrow the wrapped writer directly, bypassing this wrapper's own
+    /// ASCII-escaping `Write` impl -- for a caller that needs one of the
+    /// inner writer's own non-`Write`-trait methods (`succinctly yq`'s
+    /// `ColorSink::write_result_terminator`, #1709), not a `write_str`
+    /// call. Sound to bypass escaping for: every terminator this crate
+    /// writes (`\0`, `\n`, or nothing) is already ASCII, so routing it
+    /// through this wrapper would be a no-op anyway.
+    pub fn inner_mut(&mut self) -> &mut W {
+        self.inner
+    }
 }
 
 impl<W: Write> Write for AsciiEscapeWriter<'_, W> {

@@ -253,6 +253,32 @@ impl<W: Write> ColorSink<'_, W> {
     }
 }
 
+/// Reaches [`ColorSink::write_result_terminator`] through whichever of the
+/// two concrete types a `json_ascii!`-wrapped `on_value` callback actually
+/// holds (#1709): a bare `ColorSink` when `--ascii-output` is off, or an
+/// `AsciiEscapeWriter` around one when it's on. `write_result_terminator`
+/// is a `ColorSink`-specific method, not part of `core::fmt::Write`, so it
+/// isn't reachable through the wrapper's own `Write` impl the way a plain
+/// `terminator.write_fmt(w)` call is -- and going through the wrapper's
+/// escaping for the terminator's own bytes would be a no-op in any case
+/// (every terminator this crate writes is already ASCII), so bypassing it
+/// via [`AsciiEscapeWriter::inner_mut`] is sound, not just convenient.
+trait DispatchResultTerminator {
+    fn dispatch_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result;
+}
+
+impl<W: Write> DispatchResultTerminator for ColorSink<'_, W> {
+    fn dispatch_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
+        self.write_result_terminator(terminator)
+    }
+}
+
+impl<W: Write> DispatchResultTerminator for AsciiEscapeWriter<'_, ColorSink<'_, W>> {
+    fn dispatch_result_terminator(&mut self, terminator: Terminator) -> core::fmt::Result {
+        self.inner_mut().write_result_terminator(terminator)
+    }
+}
+
 /// Apply `--ascii-output` to a JSON render (#1700).
 ///
 /// Wraps `$sink` in [`AsciiEscapeWriter`] when the flag is set and passes it
@@ -4353,11 +4379,18 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                         // own arm is exactly `terminator.
                                         // write_fmt(self)`, and `NulChecked`
                                         // needs the dispatch to trigger its
-                                        // per-result flush.
+                                        // per-result flush. `dispatch_
+                                        // result_terminator` (not
+                                        // `write_result_terminator`
+                                        // directly) since `--ascii-output`
+                                        // wraps `w` in `AsciiEscapeWriter`
+                                        // here, which has no
+                                        // `ColorSink`-specific methods of
+                                        // its own.
                                         if $use_color {
                                             terminator.write_fmt(w)
                                         } else {
-                                            w.write_result_terminator(terminator)
+                                            w.dispatch_result_terminator(terminator)
                                         }
                                     })
                                     .map_err(StreamFailure::from)
