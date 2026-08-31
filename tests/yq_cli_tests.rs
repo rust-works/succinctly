@@ -27024,3 +27024,126 @@ fn test_yq_fromjson_low_surrogate_still_rejected_2008() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #1473: compile-time function resolution in yq mode.
+//
+// Real yq has no `def` at all -- its lexer rejects `def f: 42; f` outright
+// (`Error: 1:1: lexer: invalid input text "def f: 42; f"`, verified live
+// against v4.53.3) -- so succinctly's `def` support here is an extension and
+// ADR-0018's reference-fidelity rule sets no expectation to match. What yq
+// *does* establish is that an unknown identifier fails at lex time, before any
+// document is read, which is the direction this pass already takes. The wording
+// and exit code stay yq's own uniform `Error: …` / 1, not jq's compile-error
+// shape.
+// ---------------------------------------------------------------------------
+
+/// An undefined function is rejected before any document is parsed, with yq's
+/// wording and its uniform failure code.
+#[test]
+fn test_yq_undefined_function_is_rejected_up_front_1473() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("nosuchfn", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "no document should be emitted");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// The same forward references the jq runner rejects are rejected here --
+/// `def f: g; def g: 42; f` silently computed `42` before #1473.
+#[test]
+fn test_yq_forward_reference_is_rejected_1473() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("def f: g; def g: 42; f", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("g/0 is not defined"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// Legal `def` usage in yq mode is untouched, including the `$`-parameter form
+/// this file's comment-preservation tests already rely on.
+#[test]
+fn test_yq_legal_defs_still_resolve_1473() -> Result<()> {
+    for (filter, want) in [
+        ("def f: 42; f", "42"),
+        (
+            "def f(x): x + 1; def f(x; y): x + y; [f(1), f(2;3)]",
+            "[2,5]",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// `--jq-extensions` gating is a *parse* error, so a gated jq-only builtin
+/// never reaches the resolution pass as a residual call -- the two must not
+/// start reporting each other's errors (#1512, #1473).
+#[test]
+fn test_yq_gated_jq_builtin_still_reports_the_gating_error_1473() -> Result<()> {
+    let (_stdout, stderr, code) = run_yq_stdin_with_stderr("[paths]", "a: 1\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("not part of yq's syntax"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("is not defined"),
+        "gating must not be reworded as a resolution failure: {stderr:?}"
+    );
+
+    let (stdout, code) = run_yq_stdin(
+        "[paths]",
+        "a: 1\n",
+        &["--jq-extensions", "-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#"[["a"]]"#);
+    Ok(())
+}
+
+/// #1473: `--split-exp` is a second, independently parsed program, so it gets
+/// its own resolution pass — the main filter's says nothing about it. The
+/// message names which expression failed, since both are compiled in one run.
+#[test]
+fn test_yq_split_exp_undefined_function_is_rejected_1473() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".", "a: 1\n", &["--split-exp", "nosuchfn"])?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined in --split-exp expression"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1473: yq mode has no module system, so `rewrite_namespaced_calls` never
+/// runs and an `ns::f` call reaches the resolver as a live
+/// `Expr::NamespacedCall`. The call itself is left alone — `eval` reports
+/// "module not loaded" for it, which is yq mode's pre-existing answer — but
+/// its *arguments* are ordinary expressions written at the call site and are
+/// still resolved.
+#[test]
+fn test_yq_namespaced_call_arguments_are_still_resolved_1473() -> Result<()> {
+    // The call itself: unchanged, still eval's "module not loaded".
+    let (_stdout, stderr, code) = run_yq_stdin_with_stderr("mymod::func", "a: 1\n", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(stderr.contains("not loaded"), "stderr: {stderr:?}");
+    assert!(
+        !stderr.contains("is not defined"),
+        "the call itself must not be claimed undefined here: {stderr:?}"
+    );
+
+    // Its argument: resolved like any other expression.
+    let (_stdout, stderr, code) = run_yq_stdin_with_stderr("mymod::func(nosuchfn)", "a: 1\n", &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nosuchfn/0 is not defined"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}

@@ -38541,24 +38541,23 @@ pub(crate) fn expand_func_calls(
         // reaches `eval_func_call`'s "undefined function" fallback if none
         // ever does.
         //
-        // **Known gap** (code review, #1473): this fallthrough can also
-        // let a call resolve that real jq would reject as a forward
-        // reference. If `func_name`'s own body (here, `body`) itself
-        // contains a call to a not-yet-defined arity of the same name
-        // (`def f(x): f(x; 99); def f(x; y): x + y; f(1)`), that call gets
-        // substituted into the tree at `f(1)`'s position -- inside `f/2`'s
-        // own `then` -- and `f/2`'s own later expansion pass then resolves
-        // it, even though at `f/1`'s own lexical position `f/2` isn't in
-        // scope yet (jq: `f/2 is not defined`, compile error; succinctly:
-        // silently computes `100`). This isn't fixable by a narrower guard
-        // here -- it needs the substitution architecture to track lexical
-        // position (or a real compile-time/runtime resolution pass), which
-        // is the same class of work #1473 already scopes. Confirmed the
-        // same root cause also explains a pre-existing, non-arity case
-        // (`def f: g; def g: 42; f` also wrongly resolves); this arm's
-        // #1376 fix didn't introduce that general gap, only re-exposed one
-        // arity-flavored sub-case of it that a since-removed blanket arity
-        // error happened to catch by accident.
+        // **This arm still cannot tell a forward reference from an
+        // ordinary call, and #1473 did not change that** -- it made the
+        // difference unobservable. If `func_name`'s own body (here,
+        // `body`) contains a call to a not-yet-defined arity of the same
+        // name (`def f(x): f(x; 99); def f(x; y): x + y; f(1)`), that call
+        // is substituted into the tree at `f(1)`'s position -- inside
+        // `f/2`'s own `then` -- and `f/2`'s own later expansion pass
+        // resolves it, even though at `f/1`'s lexical position `f/2` isn't
+        // in scope yet. Substitution has no lexical position to consult, so
+        // no guard here can distinguish the two; the same root cause also
+        // resolved a non-arity case (`def f: g; def g: 42; f`).
+        //
+        // `jq::resolve_func_calls` (`src/jq/resolve.rs`) now rejects both
+        // programs before evaluation begins, which is where jq rejects them
+        // -- so expansion is never handed one. Do not read the fallthrough
+        // below as *permitting* a forward reference: it is unreachable for
+        // one, and would still mis-resolve it if that pass were bypassed.
         Expr::FuncCall { name, args } if name == func_name && args.len() == params.len() => {
             // #1016: a self-recursive `def` (e.g. `def deep(n): if n == 0
             // then . else [deep(n-1)] end;`) has no base case at expansion
@@ -39752,6 +39751,14 @@ fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) 
 /// the dedicated check it replaced, and edges closer to real jq's own
 /// `name/arity is not defined` wording without fully matching its
 /// compile-time-error format.
+///
+/// #1473: for `succinctly jq`/`succinctly yq` this is now reached only by a
+/// call `jq::resolve_func_calls` deliberately let through -- a jq builtin
+/// succinctly does not implement (`cbrt`, `JOIN`, `format/1`, the libm
+/// family), which real jq compiles and only fails on if evaluated. An
+/// undefined *name* never gets this far through either CLI; it is a compile
+/// error before any input is read. Library callers evaluating an `Expr`
+/// without running that pass still land here for both.
 fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
     name: &str,
     args: &[Expr],

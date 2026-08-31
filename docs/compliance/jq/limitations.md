@@ -1323,7 +1323,7 @@ This does not extend to `=`/`|=`/`del()`: jq's write-side path resolution is ato
 (`(.a, 1) = 5` produces no output at all in jq), so those three still discard any partial
 prefix exactly as before.
 
-## Undefined functions and arity mismatches are runtime errors, not compile errors
+## Undefined functions and arity mismatches — closed by #1473
 
 Real jq resolves every function call at compile time, before any input is read: a call to
 an undefined function, or an undefined arity of an existing one, fails immediately and
@@ -1332,33 +1332,51 @@ unconditionally — `jq: error: f/2 is not defined at <top-level>, line 1: ...`,
 caught by `try`/`catch` or `?` (compilation fails before evaluation, and thus before
 `try`, ever begins).
 
-`succinctly jq` resolves user-defined `def` calls via `expand_func_calls`'s static AST
-substitution (`src/jq/eval.rs`), which turns an unresolvable call into an `Expr::Error`
-node rather than failing immediately. That node is then evaluated lazily like any other
-expression, so:
+`succinctly jq` resolved user-defined `def` calls only through `expand_func_calls`'s static
+AST substitution (`src/jq/eval.rs`), which runs *during* evaluation, so an unresolvable call
+became an `Expr::Error` node discovered lazily. That diverged four ways: an unreached branch
+never errored; `try`/`?` swallowed the error; the exit code was 5, not 3; and two shapes of
+*forward reference* silently computed a value, because substitution has no notion of lexical
+position — a body substituted into a later call site is indistinguishable from a call
+genuinely written there, so a later `def`'s own expansion pass resolves it.
 
-```
-$ jq -n 'def f(x): x; if false then f(1;2;3) else 1 end'
-jq: error: f/3 is not defined at <top-level>, line 1:   # compile error, exit 3, unconditional
-$ succinctly jq -n 'def f(x): x; if false then f(1;2;3) else 1 end'
-1                                                        # exit 0 -- the branch is never reached
-$ jq -n 'def f(x): x; try f(1;2) catch "caught"'
-jq: error: f/2 is not defined ...                        # exit 3, try never runs
-$ succinctly jq -n 'def f(x): x; try f(1;2) catch "caught"'
-"caught"                                                  # exit 0
-```
+[#1473](https://github.com/rust-works/succinctly/issues/1473) closed all four with
+`jq::resolve_func_calls` (`src/jq/resolve.rs`), a scope-aware pass the runners call before
+evaluation begins. It is a *check*, not a new resolution mechanism: `src/jq/eval.rs` has
+exactly one evaluation arm for `Expr::FuncCall` and it always errors, so a residual call was
+already an error — the pass only moves the error earlier and extends it to the cases jq also
+rejects. `expand_func_calls`'s substitution model is unchanged; the programs it mis-resolves
+are now rejected before it runs.
 
-Exit code for the surfaced case is succinctly's general runtime-error code, 5, not jq's
-compile-error code, 3. A related, narrower symptom of the same root cause
-also lets a `def` forward-reference a not-yet-defined arity of itself and silently
-compute a value instead of failing — see
-[`test_func_def_forward_arity_reference_in_own_body_known_gap_1376`](../../../tests/jq_cli_tests.rs)
-for the pinned repro.
+Two deliberate remainders:
 
-Fixing this properly needs genuine compile-time (or runtime-call) function resolution —
-the same architectural change [#1371](https://github.com/rust-works/succinctly/issues/1371)
-already scopes for self-recursive `def`s — rather than a narrow patch to the substitution
-walker; tracked as [#1473](https://github.com/rust-works/succinctly/issues/1473).
+- **The reported line is located by searching the filter source for the offending
+  identifier**, since `Expr::FuncCall` carries no source position. A filter mentioning the
+  same undefined name more than once cites the first occurrence's line, and only the first
+  unresolvable call is reported (`jq: 1 compile error`) where jq reports all of them. Adding
+  a position to the AST would perturb `format!("{body:?}").len()`, which #1381's
+  `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against.
+- **A call reached through an `include`d module or `~/.jq` reports no location at all.** It
+  has no occurrence in the filter source to locate, so the line marker and source echo are
+  dropped rather than a position invented: `nosuchfn/0 is not defined at <top-level>` where
+  jq says `... is not defined at /path/mymod.jq, line 1:` and echoes the module's own line.
+  Name, arity and exit code match. Naming the file would additionally need the originating
+  module threaded through `ModuleLoader`.
+- **jq's trailing padding on the echoed source line is not reproduced exactly.** jq pads with
+  a `%*s` whose width follows the failing node's start column for a simple undefined name but
+  points elsewhere for an arity mismatch; succinctly reproduces the column rule. It is
+  trailing whitespace either way.
+
+The ~45 jq builtins succinctly does not implement (the libm family, `JOIN`, `format/1`,
+`input_filename`, …) are exempt from the pass via a roster captured from the pinned oracle
+(`tests/data/jq-builtin-names.txt`, regenerated by `./scripts/sync-jq-builtin-names.sh`):
+real jq compiles a mention of one, so rejecting it would be a regression. A *reached* call to
+one still fails at runtime as before.
+
+`succinctly yq` runs the same pass, keeping yq's uniform `Error: …` wording and exit 1. Real
+yq has no `def` at all — its lexer rejects `def f: 42; f` outright — so succinctly's `def`
+support there is an extension (ADR-0018 rule 5) rather than a behaviour with a reference to
+match.
 
 ## `input`/`inputs` residuals after #1309
 

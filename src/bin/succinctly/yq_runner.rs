@@ -3983,6 +3983,26 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     all_vars.push(("ARGS", &args_value));
     program.expr = jq::substitute_vars(&program.expr, all_vars.iter().copied());
 
+    // #1473: same compile-time function resolution the jq runner does, before
+    // any document is read.
+    //
+    // Real yq has no `def` at all — its lexer rejects `def f: 42; f` outright
+    // (`invalid input text`, verified against v4.53.3) — so succinctly's `def`
+    // support is an extension here and ADR-0018's reference-fidelity rule sets
+    // no expectation to match. Rejecting an unresolvable call up front is the
+    // directionally yq-ish answer anyway, since yq rejects an unknown
+    // identifier at lex time; the wording and exit code stay yq's own uniform
+    // `Error: …` / 1, not jq's compile-error shape.
+    //
+    // No `ModuleLoader` here (yq has no module system), so unlike the jq
+    // runner there is nothing that must run first; the only ordering
+    // constraint is that `--jq-extensions` gating already happened, which it
+    // did — a gated jq-only builtin is a *parse* error above, never a residual
+    // `FuncCall` reaching this pass.
+    if let Err(unresolved) = jq::resolve_func_calls(&program.expr) {
+        anyhow::bail!("{unresolved}");
+    }
+
     // Parse the --split-exp expression, if given, once up front, applying
     // the same --arg/--argjson/$ARGS substitution as the main filter --
     // otherwise a filename expression referencing `--arg`-provided values
@@ -3993,9 +4013,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         .split_exp
         .as_deref()
         .map(|s| {
-            jq::parse_program_with_mode_and_extensions(s, jq::ParserMode::Yq, args.jq_extensions)
-                .map(|p| jq::substitute_vars(&p.expr, all_vars.iter().copied()))
-                .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))
+            let expr = jq::parse_program_with_mode_and_extensions(
+                s,
+                jq::ParserMode::Yq,
+                args.jq_extensions,
+            )
+            .map(|p| jq::substitute_vars(&p.expr, all_vars.iter().copied()))
+            .map_err(|e| anyhow::anyhow!("parse error in --split-exp expression: {e}"))?;
+            // #1473: the filename expression is a second, independently parsed
+            // program, so it needs its own resolution pass -- the main
+            // filter's says nothing about it.
+            if let Err(unresolved) = jq::resolve_func_calls(&expr) {
+                anyhow::bail!("{unresolved} in --split-exp expression");
+            }
+            Ok(expr)
         })
         .transpose()?;
 
