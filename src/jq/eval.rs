@@ -2924,6 +2924,20 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
             Item::Owned(v) => v,
         }
     }
+
+    /// Fallible twin of [`Self::into_owned`], raising
+    /// [`EvalError::decode_failure`] on an undecodable borrowed string
+    /// instead of silently substituting `""` (#1972) -- used where the
+    /// caller already has somewhere to route the error (`binary_fanout_each`
+    /// routes it exactly like `combine`'s own error), unlike the many other
+    /// [`Self::into_owned`] call sites that predate this fix and remain
+    /// unchecked.
+    fn into_owned_checked(self) -> Result<OwnedValue, EvalError> {
+        match self {
+            Item::Borrowed(v) => to_owned_checked(&v),
+            Item::Owned(v) => Ok(v),
+        }
+    }
 }
 
 /// How a generator stopped producing.
@@ -4480,10 +4494,28 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     let mut abort: Option<Flow> = None;
 
     let outer = each_operand(right, &mut |right_item: Item<'a, W>| {
-        let right_val = right_item.into_owned();
+        // #1972: `into_owned_checked`, not `into_owned` -- an undecodable
+        // borrowed operand used to silently become `""` instead of raising.
+        // Unlike `combine`'s own error a few lines below, a decode failure
+        // is never suppressed by `optional` (#1247/#1620), so this always
+        // escapes via `Flow::Escaped` regardless.
+        let right_val = match right_item.into_owned_checked() {
+            Ok(v) => v,
+            Err(e) => {
+                abort = Some(Flow::Escaped(Control::Error(e)));
+                return Demand::Stop;
+            }
+        };
 
         let inner = each_operand(left, &mut |left_item: Item<'a, W>| {
-            match combine(left_item.into_owned(), right_val.clone()) {
+            let left_val = match left_item.into_owned_checked() {
+                Ok(v) => v,
+                Err(e) => {
+                    abort = Some(Flow::Escaped(Control::Error(e)));
+                    return Demand::Stop;
+                }
+            };
+            match combine(left_val, right_val.clone()) {
                 Ok(v) => sink(Item::Owned(v)),
                 Err(e) => {
                     // The sink-world spelling of the eager body's
@@ -9508,12 +9540,22 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
             StringPart::Expr(expr) => {
                 let val = eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor();
                 let s = match val {
-                    QueryResult::One(v) => owned_to_string::<S>(&to_owned(&v)),
+                    // #1972: to_owned_checked, not to_owned -- an
+                    // undecodable borrowed slot value used to silently
+                    // become `""` instead of raising, same root cause as
+                    // #1932/#1943's own fast-path consumers.
+                    QueryResult::One(v) => match to_owned_checked(&v) {
+                        Ok(v) => owned_to_string::<S>(&v),
+                        Err(e) => return QueryResult::Error(e),
+                    },
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => owned_to_string::<S>(&v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            owned_to_string::<S>(&to_owned(v))
+                            match to_owned_checked(v) {
+                                Ok(v) => owned_to_string::<S>(&v),
+                                Err(e) => return QueryResult::Error(e),
+                            }
                         } else {
                             String::new()
                         }
@@ -39634,6 +39676,56 @@ mod tests {
                         OwnedValue::Int(4)
                     ]
                 );
+            }
+        );
+    }
+
+    /// #1972: `eval_single`'s fully-open `Expr::Slice` fast path (the same
+    /// root cause #1932/#1943 each patched at one consumer) is itself
+    /// unguarded -- `binary_fanout_each`'s own `Item::into_owned` call used
+    /// to silently substitute `""` for an undecodable borrowed operand
+    /// instead of raising, so a comparison/arithmetic op over a fully-open
+    /// slice produced no error signal at all (worse than #1932/#1943's own
+    /// manifestation, which at least raised a masked error). Fixed via
+    /// `Item::into_owned_checked`, exercised via `Expr::Compare`
+    /// (`eval_compare` -> `eval_binary_fanout` -> `binary_fanout_core` ->
+    /// `binary_fanout_each`).
+    #[test]
+    fn test_binary_fanout_raises_on_operand_decode_failure_1972() {
+        query!(
+            &b"[1,2,\"\xff\xfe\",4]"[..],
+            ".[:] == .[:]",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data is unaffected.
+        query!(
+            br#"[1,2,"ok",4]"#,
+            ".[:] == .[:]",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    /// #1972 sibling: `eval_string_interpolation_single_value` (yq mode
+    /// only) shared the same unguarded-fast-path bug -- a `\(...)` slot
+    /// value produced by a fully-open slice used to silently embed `""`
+    /// instead of raising.
+    #[test]
+    fn test_yq_string_interpolation_raises_on_slot_decode_failure_1972() {
+        yq_query!(
+            &b"[1,2,\"\xff\xfe\",4]"[..],
+            r#""\(.[:])""#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data is unaffected.
+        yq_query!(
+            br#"[1,2,"ok",4]"#,
+            r#""\(.[:])""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, r#"[1,2,"ok",4]"#);
             }
         );
     }
