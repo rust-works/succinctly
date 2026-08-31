@@ -28,9 +28,10 @@ use indexmap::IndexMap;
 
 use super::document::{
     collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
-    effective_keys, effective_len_checked, key_delimiter_ok, key_display_string, key_is_malformed,
-    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor,
-    DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    effective_keys, effective_len_checked, key_delimiter_ok, key_display_string,
+    key_display_string_kind, key_is_malformed, resolve_display_key, value_delimiter_ok,
+    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
@@ -2226,17 +2227,74 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
     assert_nesting_depth(depth);
     let value = c.value();
     if let Some(fields) = value.as_object() {
+        // The #1642 collision map is built lazily, only from the point an
+        // undecodable key actually appears (#2061).
+        //
+        // `DisplayKeyGuard::check` reports a collision only when
+        // `map.contains_key(key)` *and* a fallback key is involved -- either
+        // this one, or an earlier one it recorded. So until the first
+        // fallback key, `collides` is false for every key no matter what the
+        // map holds, and the only thing building it accomplishes is one
+        // `String` allocation per key. That was the entire cost of this
+        // walk: it is what made `path(.[0])` over a 1,000,000-object array
+        // take 577ms, against 50ms with the walk removed altogether.
+        //
+        // When a fallback key *does* appear at position `k`, the map has to
+        // hold keys `0..k` before that key can be checked against them -- a
+        // later fallback can collide with an earlier clean key -- so the
+        // prefix is re-walked then, and only then. That keeps the error
+        // *order* identical to the eager version (a value's error at an
+        // earlier field still wins over a collision at a later one), which
+        // a cheaper "check all keys afterwards" split would have changed.
+        // Same cheap-probe shape `collapsed_fields` uses (#1514).
         let mut map: IndexMap<String, ()> = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
+        let mut seen_fallback = false;
+        let mut index = 0usize;
         let mut f = fields;
         while let Some((field, rest)) = f.uncons() {
-            match resolve_display_key(&field.key, &map, &mut guard) {
-                Ok(Some(key)) => {
-                    map.insert(key, ());
+            if !seen_fallback {
+                match key_display_string_kind(&field.key) {
+                    None => return Some(Control::Error(f.malformed_member_error())),
+                    // Clean key, no fallback seen yet: no collision is
+                    // possible, so nothing is recorded and nothing allocated.
+                    Some((_, false)) => {}
+                    Some((_, true)) => {
+                        seen_fallback = true;
+                        // Re-walk this object's first `index` keys to seed
+                        // the map, then let the guarded path below handle
+                        // this key and every one after it.
+                        if let Some(prefix) = value.as_object() {
+                            let mut p = prefix;
+                            for _ in 0..index {
+                                let Some((earlier, rest)) = p.uncons() else {
+                                    break;
+                                };
+                                match resolve_display_key(&earlier.key, &map, &mut guard) {
+                                    Ok(Some(key)) => {
+                                        map.insert(key, ());
+                                    }
+                                    Ok(None) => {
+                                        return Some(Control::Error(p.malformed_member_error()))
+                                    }
+                                    Err(e) => return Some(Control::Error(e)),
+                                }
+                                p = rest;
+                            }
+                        }
+                    }
                 }
-                Ok(None) => return Some(Control::Error(f.malformed_member_error())),
-                Err(e) => return Some(Control::Error(e)),
             }
+            if seen_fallback {
+                match resolve_display_key(&field.key, &map, &mut guard) {
+                    Ok(Some(key)) => {
+                        map.insert(key, ());
+                    }
+                    Ok(None) => return Some(Control::Error(f.malformed_member_error())),
+                    Err(e) => return Some(Control::Error(e)),
+                }
+            }
+            index += 1;
             if let Some(control) =
                 push_generic_truthiness_cursor_error(&field.value_cursor, depth + 1)
             {
