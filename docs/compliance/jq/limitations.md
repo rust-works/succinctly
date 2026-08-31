@@ -1375,21 +1375,41 @@ raises once per top-level document, matching jq — see
 the mechanism.
 
 **The bridge is not free, and it is not universal.** It re-serialises and re-indexes each
-document on top of the index `evaluate_input` already built, so its cost scales with
-document size. An interleaved wall-clock spot check with
-`[.[] | select(.id != null) | .id], (input | [.[] | .id])` over two copies of one generated
-file, outputs byte-identical either way, put the penalty near **1.7x** and growing linearly:
-1 MB 0.06 s → 0.10 s, 2 MB 0.12 s → 0.23 s, 4 MB 0.24 s → 0.43 s. A filter with no input
-builtin is untouched (0.01 s on both), so the guard itself is free — only the programs it
-fires for pay.
+document on top of the index `evaluate_input` already built, so its cost scales with document
+size.
 
-Treat that ratio as indicative, not as a benchmark result: it is `/usr/bin/time` over three
-interleaved repetitions on an Apple M5 Max **laptop running on battery**, which
-[the benchmarking guide](../../guides/benchmarking.md#ab-benchmarking-method) rules out for
-a number worth quoting, and x86_64 was not measured at all. What the check does establish is
-the shape — a per-document, size-proportional penalty, matching the mechanism — and that it
-is confined to filters using an input builtin. Re-measure on pinned hardware before treating
-1.7x as the figure.
+Measured on both pinned boxes, idle, interleaved within each repetition, medians of 5, with an
+output-identity gate (#1603). Isolating the bridge needs **four** variants over one corpus, not
+two, because a naive "with `input`" vs "without `input`" pairing varies document count, pipeline
+count *and* the bridge all at once:
+
+| | variant | docs | pipelines | bridge |
+|---|---|---|---|---|
+| **A** | `[.users[] \| select(.id != null) \| .id]`, 1-doc file | 1 | 1 | no |
+| **C** | that filter plus `, ([.users[] \| .id])`, 1-doc file | 1 | 2 | no |
+| **D** | the same two-pipeline filter, 2-doc file | 2 | 2 | no |
+| **B** | `..., (input \| [.users[] \| .id])`, 2-doc file | 2 | 2 | **yes** |
+
+14 MB `-p users`:
+
+| box | A | C | D | B | C/A | D/C | **B/D — the bridge** |
+|---|---|---|---|---|---|---|---|
+| M4 Pro | 125 ms | 176 ms | 340 ms | 929 ms | 1.41x | 1.93x | **2.73x** |
+| 7950X | 158 ms | 223 ms | 439 ms | 1407 ms | 1.41x | 1.97x | **3.21x** |
+
+`D/C ≈ 1.95` is just "two documents cost about twice one document" — the term a two-variant
+comparison folds into the bridge. The bridge itself is **2.7x on ARM, 3.2x on x86_64**, not the
+~1.7x recorded here previously; that figure came from a battery-powered laptop run whose
+comparison was not work-matched, and it understated the cost. Comparing whole commands (B/A)
+instead gives 7.4x/8.9x, which overstates it by the same conflation in the other direction.
+
+The multiplier is **stable across document size**, not growing: 7950X B/D measures 3.14x at
+4 MB, 3.25x at 14 MB and 3.36x at 40 MB, with both D and B themselves growing linearly. So the
+overhead is proportional to document size — the earlier "growing linearly" wording described the
+absolute cost, which is true but says nothing the multiplier does not.
+
+A filter with no input builtin is untouched, so the guard itself is free — only the programs it
+fires for pay.
 
 It is also **carved back out for cursor-metadata builtins**. `eval.rs` has no cursor to
 answer position questions from: `line`/`column`/`document_index`/`anchor`/`style`/
