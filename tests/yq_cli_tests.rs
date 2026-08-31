@@ -27025,6 +27025,20 @@ fn test_yq_fromjson_low_surrogate_still_rejected_2008() -> Result<()> {
     Ok(())
 }
 
+/// #2013 (code review): the lone-*high*-surrogate fix in
+/// `parse_json_string_value` has no `yq_mode` gate at all (unlike the
+/// lone-low case above, real jq and real yq *agree* here -- both reject
+/// it), so it applies to both modes at once. Pins that yq mode picked up
+/// the fix too, not just jq mode's own
+/// `test_fromjson_lone_high_surrogate_raises_2013`.
+#[test]
+fn test_yq_fromjson_lone_high_surrogate_raises_2013() -> Result<()> {
+    let (_stdout, stderr, code) =
+        run_yq_stdin_with_stderr(r#""\"x\\ud800y\"" | fromjson"#, "", &["-n"])?;
+    assert_ne!(code, 0, "stderr: {stderr}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // #1473: compile-time function resolution in yq mode.
 //
