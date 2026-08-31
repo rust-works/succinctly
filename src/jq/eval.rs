@@ -32634,8 +32634,16 @@ impl DeleteTrieBuilder {
     /// Iterative rather than recursive on purpose: a `PathPrefix` chain is
     /// only depth-bounded when `push_recursive_branches` built it, and a
     /// long *static* prefix ahead of a computed key (`del(.a.a.a…a[.k])`)
-    /// has no such bound — recursing would turn a deep query into a stack
-    /// overflow.
+    /// has no such bound.
+    ///
+    /// That removes the overflow from *interning* only — it does not make
+    /// a deep `del()` safe end to end. [`delete_trie_apply`] and its two
+    /// arms still recurse once per trie level, over exactly the same
+    /// unbounded depth, so a long enough static path still overflows (a
+    /// 20,000-step one does; 2,000 is fine — measured, and identical on the
+    /// pre-#1690 walker, which recursed here too). Making the whole route
+    /// depth-safe means giving the apply walk an explicit stack as well,
+    /// which #1690 did not attempt.
     fn intern(&mut self, path: &Rc<PathPrefix>) -> Result<u32, EvalError> {
         let mut pending: Vec<(usize, &Expr)> = Vec::new();
         let mut cur = path;
