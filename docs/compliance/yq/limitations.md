@@ -1198,6 +1198,56 @@ through `--arg`/`-P` still silently drops one entry rather than raising. Tracked
 in the `load()` builtin's own separate YAML-mapping conversion, which has no collision
 guard at all.
 
+### `any`/`all`/`flatten`/`group_by`/`unique`/`unique_by`/`from_entries` on a non-array — resolved, real yq has its own wording per builtin, not jq's "Cannot iterate" template
+
+Found during code review of [#1494](https://github.com/rust-works/succinctly/issues/1494)/PR
+#1900 (the `cannot_iterate_with` `EvalTag` threading fix): that PR correctly threads the real
+evaluation mode through to `cannot_iterate_with`'s value-preview formatting, but real yq
+doesn't use this jq-pinned "Cannot iterate over `<type>` (`<value>`)" *template* at all for
+these seven builtins — it has its own, unrelated, per-builtin wording with no value preview,
+confirmed live against pinned Homebrew yq v4.53.3:
+
+```console
+$ printf 'null\n' | yq '5 | any'                          # any only supports arrays, was !!int
+$ printf 'null\n' | yq '5 | all'                          # all only supports arrays, was !!int
+$ printf 'null\n' | yq '5 | flatten'                      # only arrays are supported for flatten
+$ printf 'null\n' | yq '5 | group_by(.)'                  # only arrays are supported for group by
+$ printf 'null\n' | yq '5 | unique'                       # only arrays are supported for unique
+$ printf 'null\n' | yq '5 | unique_by(.)'                 # only arrays are supported for unique (not "unique by")
+$ printf 'null\n' | yq '5 | from_entries'                 # from entries only runs against arrays
+```
+
+[#1901](https://github.com/rust-works/succinctly/issues/1901) also found real yq rejects an
+**object** input the same as a scalar for all seven — a second axis jq disagrees with it on:
+jq's own semantics let `any`/`all`/`flatten` succeed on an object (iterating its
+values/entries) and give `group_by`/`unique`/`unique_by` a different, jq-specific "object and
+array cannot be sorted" pairing error (`{"a":3,"b":1} | group_by(.)` — a quirk of jq's own
+`map([f])`-based definition) — none of that carries over to yq mode, where every one of these
+seven raises the identical wording for an object as for a scalar. Fixed via
+`EvalError::yq_only_supports_arrays`/`yq_only_arrays_supported_for`/
+`yq_from_entries_requires_array` (`src/jq/error.rs`), gated by `S::TAG == EvalTag::Yq` at each
+of the seven builtins' object and scalar arms in `src/jq/eval.rs` — jq mode's own
+`cannot_iterate_with`/`object_pair_type_error` paths are untouched.
+
+**Two related items found but not fixed here, needing materially different implementation
+shapes:**
+
+- **`sort`/`sort_by` on a non-array/map**: real yq's wording is `"node at path <path> is not
+  an array or map (it's a <tag>)"`, where `<path>` genuinely varies with navigation depth
+  (confirmed live: `[]` at the top level, `[a.b]` after `.a.b`, `[[2]]` after `.[2]`) — unlike
+  the seven builtins above, whose wording never names a path. `builtin_sort`/`builtin_sort_by`
+  receive only a bare value with no path context today, so this needs real path-tracking
+  plumbing threaded into these builtins, not just a wording swap.
+- **`.[]`'s own read-side behavior on a scalar**: real yq treats this as a **silent no-op**
+  (exit 0, no output) rather than an error at all (`5 | .[]` prints nothing on real yq).
+  succinctly raises `cannot_iterate_with` here in yq mode too, matching jq's own `.[]`
+  semantics (correct for jq mode, not yq's). Whether this shares one root cause with the seven
+  builtins above or needs its own fix is unresolved — bare `Expr::Iterate` has 20+ dispatch
+  arms across `eval.rs`'s value/path/assignment-mode evaluators, so scoping this properly
+  needs its own investigation.
+
+Both filed together as [#1998](https://github.com/rust-works/succinctly/issues/1998).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

@@ -23899,6 +23899,113 @@ fn test_jq_error_value_preview_still_reformats_number_literal_1055() -> Result<(
     Ok(())
 }
 
+/// #1901: real yq doesn't use jq's "Cannot iterate over <type> (<value>)"
+/// template at all for `any`/`all`/`flatten`/`group_by`/`unique`/
+/// `unique_by`/`from_entries` -- confirmed live against pinned Homebrew yq
+/// v4.53.3, byte-for-byte, for both a scalar and an object input. Unlike jq
+/// (which iterates an object's values/entries for several of these), real
+/// yq rejects an object the same as a scalar for every one of them.
+#[test]
+fn test_yq_iterate_adjacent_builtins_use_real_yq_wording_1901() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        ("any", "any only supports arrays, was !!int"),
+        ("all", "all only supports arrays, was !!int"),
+        ("flatten", "only arrays are supported for flatten"),
+        ("group_by(.)", "only arrays are supported for group by"),
+        ("unique", "only arrays are supported for unique"),
+        ("unique_by(.)", "only arrays are supported for unique"),
+        ("from_entries", "from entries only runs against arrays"),
+    ];
+    for (builtin, expected) in cases {
+        let (_out, stderr, code) =
+            run_yq_stdin_with_stderr(&format!("5 | {builtin}"), "null", &[])?;
+        assert_ne!(code, 0, "`5 | {builtin}` unexpectedly succeeded");
+        assert!(
+            stderr.contains(expected),
+            "`5 | {builtin}` -- expected {expected:?}, got stderr={stderr:?}"
+        );
+        assert!(
+            !stderr.contains("Cannot iterate"),
+            "`5 | {builtin}` -- still using jq's own template: stderr={stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1901 sibling: the object-input arms specifically -- real yq rejects an
+/// object outright for all seven builtins, where jq's own semantics differ
+/// per builtin (`any`/`all`/`flatten` succeed on an object; `group_by`/
+/// `unique`/`unique_by` hit a different, jq-specific pairing error;
+/// `from_entries` succeeds). The `!!map` tag (not `!!int`) confirms this
+/// reaches the *object* arm, not a fallthrough to the scalar one.
+#[test]
+fn test_yq_iterate_adjacent_builtins_reject_object_unlike_jq_1901() -> Result<()> {
+    let doc = r#"{"a":3,"b":1}"#;
+    let cases: &[(&str, &str)] = &[
+        (
+            r#"{"a":3,"b":1} | any"#,
+            "any only supports arrays, was !!map",
+        ),
+        (
+            r#"{"a":3,"b":1} | all"#,
+            "all only supports arrays, was !!map",
+        ),
+        (
+            r#"{"a":3,"b":1} | flatten"#,
+            "only arrays are supported for flatten",
+        ),
+        (
+            r#"{"a":3,"b":1} | group_by(.)"#,
+            "only arrays are supported for group by",
+        ),
+        (
+            r#"{"a":3,"b":1} | unique"#,
+            "only arrays are supported for unique",
+        ),
+        (
+            r#"{"a":3,"b":1} | unique_by(.)"#,
+            "only arrays are supported for unique",
+        ),
+        (
+            r#"{"a":3,"b":1} | from_entries"#,
+            "from entries only runs against arrays",
+        ),
+    ];
+    for (filter, expected) in cases {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` unexpectedly succeeded");
+        assert!(
+            stderr.contains(expected),
+            "`{filter}` -- expected {expected:?}, got stderr={stderr:?}"
+        );
+    }
+
+    // jq mode is unaffected: any/all/flatten succeed on an object, matching
+    // jq's own "iterate the values" semantics.
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("any", doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "true");
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("flatten", doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[3,1]");
+
+    Ok(())
+}
+
+/// #1901: well-formed array input is unaffected in either mode.
+#[test]
+fn test_yq_iterate_adjacent_builtins_well_formed_array_unaffected_1901() -> Result<()> {
+    let (out, code) = run_yq_stdin("[1,2,1] | unique", "null", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2]");
+
+    let (out, code) = run_yq_stdin("[1,\"a\"] | any", "null", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "true");
+
+    Ok(())
+}
+
 /// Known gap (#1495's own review, not fixed here -- see the scope note
 /// above and #1494): a non-finite `Float` in a yq-mode error preview
 /// renders as JSON's `null` substitution (`stream_owned_value_json`'s
