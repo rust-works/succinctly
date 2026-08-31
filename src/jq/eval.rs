@@ -2568,6 +2568,14 @@ fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// QueryResult::None, Err(e) => QueryResult::Error(e)` arm-pair that
 /// `eval_reduce`/`eval_foreach`'s input/INIT streams otherwise repeat at
 /// every checked-conversion and bare-error site.
+///
+/// Not universal, though: `builtin_recurse_f`/`builtin_recurse_cond`'s own
+/// `to_owned_checked` sites deliberately do *not* route through here (#1953)
+/// -- see `builtin_recurse_f`'s own doc comment for why (its `optional`
+/// parameter is unused throughout the rest of the function, matching real
+/// jq's own `recurse` having no internal optional-suppression concept).
+/// That's a principled exemption, not an oversight -- don't "complete the
+/// sweep" by wiring it in there without re-reading that reasoning first.
 fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryResult<'a, W> {
     if suppresses(&e, optional) {
         QueryResult::None
@@ -5972,12 +5980,14 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
             // #1953: `to_owned_checked`'s own materialization error here can
             // be a genuine decode failure (never suppressed by `optional`,
-            // #1247/#1620) or a #1194 malformed-member/#1642 collision
-            // error (an ordinary error like any other, which `optional`
-            // legitimately suppresses) -- `suppress_or_raise` already draws
-            // that exact distinction via `is_decode_failure()`, the same
-            // helper this function's own `None` arm below now uses too, so
-            // there's no risk of conflating the two.
+            // #1247/#1620 -- a #1642 collision error counts as one too, per
+            // `EvalError::colliding_display_key`'s own delegation to
+            // `decode_failure`) or a #1194 malformed-member error (an
+            // ordinary error like any other, which `optional` legitimately
+            // suppresses) -- `suppress_or_raise` already draws that exact
+            // distinction via `is_decode_failure()`, the same helper this
+            // function's own `None` arm below now uses too, so there's no
+            // risk of conflating the two.
             let checked = match &msg_result {
                 QueryResult::One(v) => Some(to_owned_checked(v)),
                 QueryResult::Many(vs) => vs.first().map(to_owned_checked),
@@ -6004,12 +6014,16 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // the *payload* verbatim (per this function's own doc comment
         // above), so an undecodable string used to silently become the `""`
         // payload instead of raising its own decode failure. A genuine
-        // decode failure bypasses `optional`'s suppression below entirely,
-        // matching #1247/#1620's established "a decode failure is never
-        // suppressed by `?`" rule; a #1194/#1642 non-decode-failure error is
+        // decode failure (a #1642 collision counts as one -- see the `Some`
+        // arm's own comment above) bypasses `optional`'s suppression below
+        // entirely, matching #1247/#1620's established "a decode failure is
+        // never suppressed by `?`" rule; a #1194 malformed-member error is
         // ordinary like any other and `suppress_or_raise` lets `optional`
-        // suppress it the same way an ordinary `error(...)?` already can via
-        // this function's own `if optional` branch below.
+        // suppress it here -- via a *different* mechanism than the `if
+        // optional` block below (that one gates the raised-error *result*
+        // once payload conversion has already succeeded; this one gates the
+        // conversion itself), not the same code path, even though both
+        // answer to the same ambient `optional`.
         None => match to_owned_checked(&value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
@@ -12254,11 +12268,11 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // #1755/#1953: to_owned_checked, not to_owned -- an undecodable root
     // value must raise, not silently become "" and get walked as if it were
-    // the real value. A genuine decode failure is unconditional regardless
-    // of `optional` (that flag only governs the path-shape check above,
-    // never a decode failure); a #1194/#1642 non-decode-failure error is
-    // ordinary like any other and `suppress_or_raise` lets `optional`
-    // suppress it instead.
+    // the real value. A genuine decode failure (a #1642 collision counts as
+    // one) is unconditional regardless of `optional` (that flag only
+    // governs the path-shape check above, never a decode failure); a #1194
+    // malformed-member error is ordinary like any other and
+    // `suppress_or_raise` lets `optional` suppress it instead.
     let mut current = match to_owned_checked(value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
@@ -26609,10 +26623,13 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // suppression, but that's this comment's own sibling function, not a
     // guarantee this early return depends on). #1953: `to_owned_checked`'s
     // `Err` can also carry a non-decode-failure error (a #1194 malformed
-    // member or #1642 collision) that's an ordinary error like any other --
-    // `suppress_or_raise` respects `optional` for that case the same way
-    // the sibling `finish_fork` call two lines down already does, while
-    // still raising a genuine decode failure unconditionally either way.
+    // member -- a #1642 collision counts as a decode failure, per
+    // `EvalError::colliding_display_key`'s own delegation to
+    // `decode_failure`, and so is unaffected by this) that's an ordinary
+    // error like any other -- `suppress_or_raise` respects `optional` for
+    // that case the same way the sibling `finish_fork` call two lines down
+    // already does, while still raising a genuine decode failure
+    // unconditionally either way.
     let initial = match to_owned_checked(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
@@ -40439,6 +40456,14 @@ mod tests {
     /// real `?`/`try` syntax today either -- fixed anyway for internal
     /// consistency). `recurse`'s own sibling sites are deliberately *not*
     /// included -- see `builtin_recurse_f`'s own doc comment for why.
+    ///
+    /// Each of these seven tests also has a decode-failure positive
+    /// control: `optional: true` must NOT suppress a genuine decode
+    /// failure, only the #1194 malformed-member kind above -- the asymmetry
+    /// `suppress_or_raise`/`suppresses` exists to enforce. Without this half
+    /// of the contract, a regression that suppressed *every* error
+    /// (swapping `suppresses`'s `&&` for `||`, say) would still pass the
+    /// malformed-member assertion above.
     #[test]
     fn test_eval_until_respects_optional_for_malformed_member_error_1953() {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
@@ -40453,6 +40478,14 @@ mod tests {
         match eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), false) {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
+        }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match eval_until::<Vec<u64>, JqSemantics>(&cond, &update, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
     }
 
@@ -40474,6 +40507,14 @@ mod tests {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match eval_while::<Vec<u64>, JqSemantics>(&cond, &update, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
     }
 
     /// See `test_eval_until_respects_optional_for_malformed_member_error_1953`'s
@@ -40492,6 +40533,14 @@ mod tests {
         match eval_repeat::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
+        }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match eval_repeat::<Vec<u64>, JqSemantics>(&expr, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
     }
 
@@ -40512,13 +40561,23 @@ mod tests {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match builtin_walk::<Vec<u64>, JqSemantics>(&f, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
     }
 
     /// #1953 continued: `getpath_one_path`'s root-value conversion had the
     /// same gap. Exercised via `builtin_getpath` (the public entry point)
     /// rather than the private helper directly, since the helper's own
     /// `optional` plumbing is identical either way and this matches how
-    /// `builtin_getpath` is actually reached from a query.
+    /// `builtin_getpath` is actually reached from a query. Also carries a
+    /// decode-failure positive control -- see the loop-family tests above
+    /// for why.
     #[test]
     fn test_getpath_respects_optional_for_malformed_member_error_1953() {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
@@ -40533,12 +40592,21 @@ mod tests {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match builtin_getpath::<Vec<u64>, JqSemantics>(&path_expr, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
     }
 
     /// #1953 continued: `eval_error`'s `Some(msg_expr)` branch (checked-
     /// materialization of the message expression's own output) and `None`
     /// branch (bare `error`, raising the input value as the payload) both
-    /// had the same gap.
+    /// had the same gap. Also carries a decode-failure positive control --
+    /// see the loop-family tests above for why.
     #[test]
     fn test_eval_error_none_arm_respects_optional_for_malformed_member_error_1953() {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
@@ -40551,6 +40619,14 @@ mod tests {
         match eval_error::<Vec<u64>, JqSemantics>(None, cursor.value(), false) {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
+        }
+
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match eval_error::<Vec<u64>, JqSemantics>(None, df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
     }
 
@@ -40570,6 +40646,17 @@ mod tests {
         match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), cursor.value(), false) {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
+        }
+
+        // `msg_expr`'s own output (not the root value here -- `Identity`
+        // makes them the same document, but the site under test is the
+        // `Some` arm's `msg_result` conversion) is the undecodable one.
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let df_index = JsonIndex::build(decode_failure_bytes);
+        let df_cursor = df_index.root(decode_failure_bytes);
+        match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), df_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
     }
 
