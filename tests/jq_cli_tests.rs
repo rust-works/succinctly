@@ -30021,3 +30021,43 @@ fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1872: a fold source that produces a *trackable* branch falls back to
+/// #1467's two-pass shape instead of reusing the resolved values, because
+/// jq's own fold then clobbers its path register and refuses to emit at all
+/// (#2031). These pin the fallback: stdout stays empty and the exit code
+/// stays 5, exactly as in jq — only the *message* differs, which is #2031's
+/// divergence and not this one's.
+///
+/// This is the arm that randomised differential fuzzing against jq 1.7.1
+/// added: without it, eleven of four thousand generated folds streamed a
+/// prefix jq never streams. No golden can pin it, since a golden compares
+/// stderr byte-for-byte on a failing case and the message diverges.
+#[test]
+fn fold_source_trackable_branch_falls_back_to_two_pass_1872() -> Result<()> {
+    for (input, filter, why) in [
+        (
+            r#"{"a":1}"#,
+            "path(foreach (.[], keys[]) as $k (.; .))",
+            "`.[]` navigates successfully, so its branches are trackable",
+        ),
+        (
+            r#"{"a":{"b":2},"b":3}"#,
+            "path(foreach (limit(3; .[], keys[]), .a[]) as $k (.; .))",
+            "a trackable branch under a bound counts the same",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(stdout, "", "{why} -- jq streams nothing here either");
+        assert_eq!(code, 5, "{why}");
+        // The message is #2031's divergence: jq blames its own clobbered
+        // register ("Invalid path expression with result ..."), succinctly
+        // blames the navigation. Both exit 5 with no output, which is what
+        // this test exists to keep true.
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "{why} -- {stderr}"
+        );
+    }
+    Ok(())
+}

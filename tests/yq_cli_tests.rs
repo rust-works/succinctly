@@ -27620,5 +27620,16 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[]");
 
+    // A halt inside a navigating source still reaches the CLI unconditionally
+    // through the yq arm's own fatal-escape branch -- `halt_error(3)` writes
+    // its payload to stderr with no trailing newline and exits 3.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "path(foreach (1,2,(.a|tostring|halt_error(3))) as $k (.; .))",
+        "a: 1\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 3, "stderr: {stderr}");
+    assert_eq!(stderr, "1");
+
     Ok(())
 }
