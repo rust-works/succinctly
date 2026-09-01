@@ -564,11 +564,6 @@ pub enum Expr {
 pub struct BoundBody(core::cell::OnceCell<Rc<Expr>>);
 
 impl BoundBody {
-    /// The bound body, computing it with `bind` on first call.
-    pub fn get_or_init(&self, bind: impl FnOnce() -> Rc<Expr>) -> &Rc<Expr> {
-        self.0.get_or_init(bind)
-    }
-
     /// The bound body, computing it with a fallible `bind` on first call.
     ///
     /// A failure (the recursion-depth guard) is deliberately **not** cached:
@@ -1999,5 +1994,52 @@ mod tests {
         assert!(prog.module.is_none());
         assert!(prog.imports.is_empty());
         assert!(prog.includes.is_empty());
+    }
+
+    /// #1371: `BoundBody` is derived state, so it must not participate in
+    /// either of the two things `Expr` derives around it.
+    ///
+    /// **Equality** — two calls with the same definition, arguments and frame
+    /// count are the same call, whether or not one of them has been evaluated
+    /// yet. If the cache took part, a node would stop comparing equal to
+    /// itself the moment it ran, which would silently change what every
+    /// `assert_eq!` over an `Expr` in this crate means.
+    ///
+    /// **`Debug`** — the rendering must not change once the body is cached
+    /// either. A cache that prints is the exact shape that made `assert_eq!`
+    /// on `{:?}` unreliable for YAML's own sequential-cursor cache, where a
+    /// shared index leaked its `Cell` into the formatted output.
+    #[test]
+    fn test_bound_body_is_invisible_to_eq_and_debug_1371() {
+        let call = || Expr::DefCall {
+            def: Rc::new(FuncDefData {
+                name: "f".into(),
+                params: alloc_vec(["n"]),
+                body: Expr::Identity,
+            }),
+            args: vec![Expr::Literal(Literal::Int(1))],
+            frames: 3,
+            bound: BoundBody::default(),
+        };
+        let cold = call();
+        let warm = call();
+        let Expr::DefCall { bound, .. } = &warm else {
+            unreachable!("just built a DefCall")
+        };
+        // Populate one side's cache; the two must stay indistinguishable.
+        let _ = bound.get_or_try_init(|| Ok::<_, ()>(Rc::new(Expr::Identity)));
+
+        assert_eq!(cold, warm, "the cache must not affect equality");
+        assert_eq!(
+            format!("{cold:?}"),
+            format!("{warm:?}"),
+            "the cache must not affect Debug output"
+        );
+    }
+
+    /// Helper: `Vec<String>` from string literals, without repeating the
+    /// `to_string` dance at each call site.
+    fn alloc_vec<const N: usize>(names: [&str; N]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
     }
 }
