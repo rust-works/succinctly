@@ -7378,6 +7378,67 @@ fn test_limit_path_context_resolves_1765() -> Result<()> {
     Ok(())
 }
 
+/// #2074: `Expr::FirstExpr`/`Expr::LastExpr` had no arm in either
+/// `needs_path_context` or `eval_pipe_with_path_context_internal`, so
+/// `first(key)`/`last(key)` silently answered `null` where the sibling
+/// `limit(1; key)` (tested above) answered correctly.
+#[test]
+fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [first(key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[\"a\"]");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [last(key)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[\"a\"]");
+
+    // `first`/`last` distinguish which output they take, unlike `limit(1;
+    // ...)` above -- confirms the path threaded through matches the actual
+    // output picked, not just any one of them.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [first(.[] | key)]"],
+        Some(r#"{"a":[10,20,30]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[0]");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | [last(.[] | key)]"],
+        Some(r#"{"a":[10,20,30]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[2]");
+
+    // The `rest`-continues-from-the-taken-output's-own-path shape from the
+    // issue's own repro: `key` sits *after* `first(...)`/`last(...)` in the
+    // pipe, not inside it, so this exercises the `path_probe_stage`/
+    // `continue_rest_with_paths` pairing, not just the body-evaluation arm.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | first(.[]) | key"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | last(.[]) | key"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2");
+
+    // `last(empty)` still answers `null`, not nothing (#1521) -- the
+    // path-context arm must preserve that, not just the ordinary one.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | [last(empty)]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[null]");
+
+    // The common case (no path-context builtin in the body) is unaffected.
+    let (stdout, _, code) = run_jq_full(&["-c", "[first(.[])]"], Some(r"[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1]");
+    let (stdout, _, code) = run_jq_full(&["-c", "[last(.[])]"], Some(r"[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[3]");
+
+    Ok(())
+}
+
 /// #1964 (found in review of the `Expr::Limit` path-context fix above, then
 /// fixed by #1964 itself): `eval_pipe_with_path_context_internal`'s
 /// `Expr::Comma` arm routes every branch through this same evaluator,

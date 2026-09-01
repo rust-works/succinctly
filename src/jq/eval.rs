@@ -807,13 +807,12 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
-        // No `Expr::FirstExpr`/`Expr::LastExpr` arm, and no matching arm in
-        // `eval_pipe_with_path_context_internal` either, so `first(key)` and
-        // `last(key)` silently answer `null` where the sibling
-        // `limit(1; key)` answers correctly (#2074). Both halves are needed
-        // to close it -- the same pairing `Label` (#715) and `FuncDef`
-        // (#1306) each required -- so it is tracked rather than half-fixed
-        // here.
+        // `first(expr)`/`last(expr)` (#2074): same reasoning as `Limit`
+        // above -- whatever the wrapped expression needs, the wrapper
+        // needs too. Paired with matching arms in
+        // `eval_pipe_with_path_context_internal` below, the same pairing
+        // `Label` (#715) and `FuncDef` (#1306) each required.
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
         // `[key]`/`[parent]`/`[file_index]` (#1302): an array literal is
         // still just "collect this inner expression's outputs", the same
@@ -31299,6 +31298,133 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
             continue_rest_with_context::<W, S>(
                 limited,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `first(expr)` (#2074): the same shape as `Expr::Limit { n: 1,
+        // expr }` above -- eagerly evaluate `expr` through this evaluator
+        // (trading #820's stop-early optimization for correctness, same
+        // accepted cost as `Limit`'s own arm), then take the first output.
+        // A `Partial` with at least one output already reached is still
+        // satisfied (first can short-circuit once satisfied, same as
+        // `Limit`'s `n=1` case), matching `each_take_first`'s semantics.
+        Expr::FirstExpr(expr)
+            if needs_path_context(expr) || rest.iter().any(needs_path_context) =>
+        {
+            let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+            let mut body_stages = vec![(**expr).clone()];
+            if paired {
+                body_stages.push(path_probe_stage());
+            }
+            let body_result = eval_pipe_with_path_context_internal::<W, S>(
+                &body_stages,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let first = match body_result {
+                QueryResult::Owned(v) => QueryResult::Owned(v),
+                QueryResult::ManyOwned(mut vs) => {
+                    vs.truncate(1);
+                    owned_vec_to_result(vs)
+                }
+                QueryResult::None => QueryResult::None,
+                QueryResult::Error(e) => QueryResult::Error(e),
+                QueryResult::Break(label) => QueryResult::Break(label),
+                QueryResult::Halt(code) => QueryResult::Halt(code),
+                QueryResult::Partial(mut vs, control) => {
+                    if !vs.is_empty() {
+                        vs.truncate(1);
+                        owned_vec_to_result(vs)
+                    } else {
+                        partial(vs, control)
+                    }
+                }
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
+                    )
+                }
+            };
+            if paired {
+                return continue_rest_with_paths::<W, S>(
+                    first,
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+            }
+            continue_rest_with_context::<W, S>(
+                first,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
+        // `last(expr)` (#2074): same shape as `first(expr)` above, but
+        // takes the LAST output instead of truncating to the first --
+        // mirrors `eval_last_expr`'s own semantics (empty stream -> null;
+        // `Partial` always drops its prefix and surfaces the control since
+        // `last` cannot short-circuit -- verified `last(1,2,error("x"))`
+        // raises, it does not answer `2`), restricted to the narrower
+        // `QueryResult` variant set this evaluator ever produces.
+        Expr::LastExpr(expr) if needs_path_context(expr) || rest.iter().any(needs_path_context) => {
+            let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+            let mut body_stages = vec![(**expr).clone()];
+            if paired {
+                body_stages.push(path_probe_stage());
+            }
+            let body_result = eval_pipe_with_path_context_internal::<W, S>(
+                &body_stages,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
+            let last = match body_result {
+                QueryResult::Owned(v) => QueryResult::Owned(v),
+                QueryResult::ManyOwned(vs) => match vs.into_iter().next_back() {
+                    Some(last) => QueryResult::Owned(last),
+                    None => QueryResult::Owned(OwnedValue::Null),
+                },
+                QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+                QueryResult::Error(e) => QueryResult::Error(e),
+                QueryResult::Break(label) => QueryResult::Break(label),
+                QueryResult::Halt(code) => QueryResult::Halt(code),
+                QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
+                QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
+                QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!(
+                        "eval_pipe_with_path_context_internal only ever produces \
+                         Owned/ManyOwned/None/Error/Break/Partial"
+                    )
+                }
+            };
+            if paired {
+                return continue_rest_with_paths::<W, S>(
+                    last,
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                );
+            }
+            continue_rest_with_context::<W, S>(
+                last,
                 rest,
                 root,
                 file_origin,
