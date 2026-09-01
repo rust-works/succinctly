@@ -13822,39 +13822,18 @@ fn test_713_merge_flags_after_equals() -> Result<()> {
 /// must not regress just because yq mode gained it.
 #[test]
 fn test_713_jq_mode_unaffected() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq")
-        .arg(".a * .b")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
-    let output = child.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
-    assert_ne!(code, 0, "array * array must still error in jq mode");
-
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq")
-        .arg(".a *+ .b")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"a":[1,2],"b":[3,4]}"#)?;
-    let output = child.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (_stdout, stderr, code) =
+        run_jq_stdin_with_stderr(".a * .b", r#"{"a":[1,2],"b":[3,4]}"#, &[])?;
     assert_ne!(
         code, 0,
-        "flag suffixes must still be unrecognized in jq mode"
+        "array * array must still error in jq mode: {stderr}"
+    );
+
+    let (_stdout, stderr, code) =
+        run_jq_stdin_with_stderr(".a *+ .b", r#"{"a":[1,2],"b":[3,4]}"#, &[])?;
+    assert_ne!(
+        code, 0,
+        "flag suffixes must still be unrecognized in jq mode: {stderr}"
     );
 
     Ok(())
