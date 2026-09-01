@@ -19623,13 +19623,13 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 /// in the pipe, or -- unconditionally -- `resolve_recurse` resolving `f`):
 /// can its "nothing left needs resolving" fast path assume the remaining
 /// tail is single-valued? For `Iterate` the answer is no --
-/// `value_after_components` silently collapses any component producing != 1
-/// output to `Null`, which `resolve_recurse` treats as "no children" and
-/// prunes, silently dropping every result whenever a trailing
-/// `.foo[]`/`.foo[]?` reaches a 2+-element container (#682). Fanning it out
-/// through the same loop already used for a genuine computed key fixes that,
-/// without touching `resolve_dynamic_indexes`'s much more common
-/// no-computed-key fast path.
+/// [`value_after_components`] treats any component producing zero or more
+/// than one output as pruning the whole branch (`Ok(None)`, #2124), which
+/// `resolve_recurse` reads as "no children" and drops, silently discarding
+/// every result whenever a trailing `.foo[]`/`.foo[]?` reaches a 2+-element
+/// container (#682). Fanning it out through the same loop already used for
+/// a genuine computed key fixes that, without touching
+/// `resolve_dynamic_indexes`'s much more common no-computed-key fast path.
 ///
 /// No `Expr::Pipe` arm: this function's only caller (`resolve_seq`) always
 /// calls it on `flat`'s already-`push_path_components`-flattened elements,
@@ -24347,7 +24347,7 @@ fn resolve_slice_bound<S: EvalSemantics>(
 fn value_after_components<S: EvalSemantics>(
     components: &[Expr],
     value: &OwnedValue,
-) -> Result<OwnedValue, EvalEscape> {
+) -> Result<Option<OwnedValue>, EvalEscape> {
     let mut current = value.clone();
     for component in components {
         let mut values = eval_owned_multi::<S>(component, &current)?;
@@ -24367,10 +24367,27 @@ fn value_after_components<S: EvalSemantics>(
         );
         match values.len() {
             1 => current = values.pop().expect("len checked"),
-            _ => return Ok(OwnedValue::Null),
+            // Zero outputs here can only come from a `?`-suppressed step
+            // that failed to navigate (#2124): every component reaching
+            // this loop is a bare `Field`/`Index`/`Slice`-family step
+            // (`needs_fanout_pass` routes anything else, `Iterate`
+            // included, through the real fan-out loop instead), and a
+            // *present* container always yields exactly one output for
+            // one of those -- `null` for a missing key, never nothing.
+            // The whole tail is pruned once any step in it prunes --
+            // `resolve_node`'s own `Expr::Optional` arm already does
+            // exactly this when the `?` isn't buried inside this fast
+            // path's flattened tail; returning `None` here propagates the
+            // same verdict instead of fabricating a `null` result at a
+            // path the input doesn't actually have this shape at. Fixes
+            // `=`/`|=` raising where jq treats a `?`-guarded comma sibling
+            // with a failing navigation as a no-write once it has a
+            // surviving sibling (`path()`/`del()` were already correct
+            // here via other means -- #2049/#2108).
+            _ => return Ok(None),
         }
     }
-    Ok(current)
+    Ok(Some(current))
 }
 
 /// [`value_after_components`], except when `trackable` is false (#843): then
@@ -24396,7 +24413,7 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     components: &[Expr],
     value: &OwnedValue,
     trackable: bool,
-) -> Result<OwnedValue, (Vec<PathBranch<'a>>, EvalEscape)> {
+) -> Result<Option<OwnedValue>, (Vec<PathBranch<'a>>, EvalEscape)> {
     if !trackable {
         let error = match components.first().and_then(navigation_element) {
             Some(element) => EvalError::invalid_path_expression_near_access(&element, value),
@@ -24451,7 +24468,13 @@ fn apply_static_tail<'a, S: EvalSemantics>(
             current
         } else {
             match resolve_static_tail::<S>(tail, &current, trackable) {
-                Ok(end) => Cow::Owned(end),
+                Ok(Some(end)) => Cow::Owned(end),
+                // A `?`-suppressed step in `tail` prunes this branch
+                // entirely (#2124) — the same verdict a plain Comma sibling
+                // with no `?` failure at all would give by simply
+                // contributing zero branches, not one fabricated `null`
+                // branch at a path the value doesn't have this shape at.
+                Ok(None) => continue,
                 Err((_, e)) => return Err((out, e)),
             }
         };
@@ -24652,7 +24675,14 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // bespoke message for it — still a hard error either way, never the
     // silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
-        let end = resolve_static_tail::<S>(&flat, value, trackable)?;
+        let end = match resolve_static_tail::<S>(&flat, value, trackable)? {
+            Some(end) => end,
+            // A `?`-suppressed step somewhere in this purely-static pipe
+            // prunes the whole branch (#2124) — zero output, not a
+            // fabricated `null` one; see `value_after_components`'s own
+            // doc comment for why zero can only mean that here.
+            None => return Ok(Vec::new()),
+        };
         // `resolve_static_tail` above already raised for an untracked
         // value, so this is `true` in practice — carried rather than
         // asserted so the two can't drift.

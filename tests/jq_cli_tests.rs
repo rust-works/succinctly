@@ -30185,3 +30185,78 @@ fn fold_source_trackable_branch_falls_back_to_two_pass_1872() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2124: a `?`-guarded comma branch that fails to navigate is pruned when
+/// it is the *only* branch, but `=`/`|=` used to keep it (and raise its
+/// navigation error) once it had a surviving sibling -- `path()`/`del()`
+/// were already correct for this shape via unrelated fixes (#2049/#2108),
+/// but `=`/`|=`'s own resolution path (`resolve_seq`'s no-computed-key fast
+/// path, `value_after_components`) shared none of that. Root cause: a
+/// component reaching that fast path is proven single-valued by
+/// construction, so the only way it produces zero outputs is a
+/// `?`-suppressed failure -- that used to fabricate a `null` result instead
+/// of pruning the whole branch. All rows verified against jq 1.7.1.
+#[test]
+fn test_optional_comma_sibling_prunes_for_assignment_2124() -> Result<()> {
+    for (filter, why) in [
+        ("(.b, .c.a?) = 9", "plain assignment"),
+        ("(.b, .c.a?) |= 9", "update assignment"),
+        ("(.c.a?, .b) = 9", "argument order must not matter"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"c":1}"#))?;
+        assert_eq!(code, 0, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "{\"c\":1,\"b\":9}\n", "{why}");
+    }
+    Ok(())
+}
+
+/// #2124 sibling: the same pruning fix across non-object scalar shapes for
+/// `.c`, confirming it isn't accidentally keyed to a specific value type.
+/// Verified live against jq 1.7.1.
+#[test]
+fn test_optional_comma_sibling_prune_holds_across_scalar_shapes_for_assignment_2124() -> Result<()>
+{
+    for doc in [r#"{"c":"s"}"#, r#"{"c":true}"#, r#"{"c":[]}"#] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", "(.b, .c.a?) = 9"], Some(doc))?;
+        assert_eq!(
+            code, 0,
+            "doc={doc} -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        let expected = format!("{}\n", doc.trim_end_matches('}').to_owned() + ",\"b\":9}");
+        assert_eq!(stdout, expected, "doc={doc}");
+    }
+    Ok(())
+}
+
+/// #2124's fix has two call sites, not one: `resolve_seq`'s fully-static
+/// fast path (every test above) and `apply_static_tail`'s per-branch tail
+/// application, reached only once a *real* dynamic/computed element
+/// precedes the `?`-guarded step in the same pipe. `.[(0,1)].a?` fans out
+/// over the computed index first (dynamic), then applies `.a? = 9` as each
+/// branch's own static tail -- branch `0` (a scalar) must prune without
+/// disturbing branch `1` (an object, which resolves and writes normally).
+/// Verified against jq 1.7.1: the whole filter is a no-op here because both
+/// branches' writes are themselves no-ops (branch 0 prunes, branch 1's `.a`
+/// already holds `9`).
+#[test]
+fn test_optional_tail_after_dynamic_fanout_prunes_only_its_own_branch_2124() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(0,1)].a? = 9"], Some(r#"[1, {"a":9}]"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,{\"a\":9}]\n");
+    Ok(())
+}
+
+/// #2124 regression guard: `path()` and `del()` were already correct for
+/// this shape before this fix (via #2049/#2108, unrelated code paths) --
+/// this pins that the shared `resolve_seq` fix doesn't disturb them.
+#[test]
+fn test_optional_comma_sibling_prune_still_correct_for_path_and_del_2124() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[path(.b, .c.a?)]"], Some(r#"{"c":1}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[[\"b\"]]\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "del(.b, .c.a?)"], Some(r#"{"c":1}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"c\":1}\n");
+    Ok(())
+}
