@@ -6576,7 +6576,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::BSearch(x) => builtin_bsearch::<W, S>(x, value, optional),
 
         // Phase 10: Object functions
-        Builtin::ModuleMeta(name) => builtin_modulemeta::<W>(name, value, optional),
+        Builtin::ModuleMeta => builtin_modulemeta::<W>(value, optional),
         Builtin::Pick(keys) => builtin_pick::<W, S>(keys, value, optional),
         Builtin::Omit(keys) => builtin_omit::<W, S>(keys, value, optional),
 
@@ -39190,12 +39190,12 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
 
 // Object functions
 
-/// Builtin: modulemeta(name) - get module metadata (stub for compatibility)
-fn builtin_modulemeta<'a, W: Clone + AsRef<[u64]>>(
-    _name: &Expr,
-    _value: StandardJson<'a, W>,
+/// Builtin: modulemeta - get module metadata for the input module name
+/// (stub for compatibility). Arity 0, matching real jq (#2035).
+fn builtin_modulemeta<W: Clone + AsRef<[u64]>>(
+    _value: StandardJson<'_, W>,
     _optional: bool,
-) -> QueryResult<'a, W> {
+) -> QueryResult<'_, W> {
     // Return null as we don't support modules
     QueryResult::Owned(OwnedValue::Null)
 }
@@ -58125,8 +58125,8 @@ mod tests {
 
     #[test]
     fn test_modulemeta() {
-        // modulemeta returns null (stub)
-        query!(b"null", r#"modulemeta("test")"#, QueryResult::Owned(OwnedValue::Null) => {});
+        // modulemeta is arity 0 in real jq (#2035); returns null (stub).
+        query!(b"null", "modulemeta", QueryResult::Owned(OwnedValue::Null) => {});
     }
 
     #[test]

@@ -3465,15 +3465,12 @@ impl<'a> Parser<'a> {
         }
 
         // Phase 10: Object functions
+        // modulemeta - real jq's builtin is arity 0 (takes the module name
+        // via `.`, not a paren'd argument); succinctly previously required
+        // `modulemeta(...)` here, inverted from jq's actual grammar (#2035).
         if self.matches_keyword("modulemeta") {
             self.consume_keyword("modulemeta");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let name = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::ModuleMeta(Box::new(name))));
+            return Ok(Some(Builtin::ModuleMeta));
         }
 
         // pick(keys) - yq: select only specified keys from object/array
