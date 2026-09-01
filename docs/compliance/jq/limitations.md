@@ -1439,6 +1439,44 @@ yq has no `def` at all — its lexer rejects `def f: 42; f` outright — so succ
 support there is an extension (ADR-0018 rule 5) rather than a behaviour with a reference to
 match.
 
+## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
+
+`succinctly jq` used to substitute a `def`'s body into each call site before evaluating
+anything, which cannot terminate for a self-recursive `def` (expansion has no way to see
+that `n == 0` will eventually hold) and so had to be bounded by three guards. The
+consequence was not a deep-recursion edge case: `sum_to(100)` was refused where jq returns
+`5050`, and a *branching* body — naive `fib` — failed at every depth including zero,
+because expansion unrolled the `else` arm it could not know a given input would never take.
+
+[#1371](https://github.com/rust-works/succinctly/issues/1371) replaced that with real
+runtime calls (ADR-0020): a call is bound to its definition when the `def` is evaluated and
+substituted when evaluation reaches it, with each argument captured behind a shared,
+substitution-opaque node. Recursion now stops at the base case the program itself
+evaluates. `sum_to(100)`, `sum_to(10000)`, `fib`, and #1381's chained-`def` repro all match
+jq 1.7.1 byte for byte.
+
+Three differences remain, all in the direction of erroring rather than aborting:
+
+- **A non-terminating `def` errors; jq dies.** `def deep: [deep]; deep` and `def f: [f, f];
+  f` exceed `MAX_EVAL_FRAMES` and raise a catchable error, exit 5. Real jq aborts on both
+  with `cannot allocate memory` and exit 134 (confirmed live). Divergence in the only
+  direction ADR-0018 permits: matching would take the process down.
+- **A heavy body runs out of depth sooner than jq's does.** jq evaluates on a
+  heap-allocated VM stack, so its recursion depth is unaffected by how much structure a
+  body holds live across its own recursive call; this evaluator recurses natively, so it is
+  not. A body wrapping its call in 40 array constructors stops at ~900 levels where jq
+  reaches 12,000+. The ceiling counts live frames rather than calls precisely because the
+  two differ by 10x across body shapes — see `MAX_EVAL_FRAMES` (`src/jq/eval.rs`).
+- **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
+  limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
+  1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
+  exits 5. Before #1371 this shape could not recurse far enough to reach the ceiling at
+  all.
+
+Recursion is quadratic in time in both tools — a call-by-name parameter is re-evaluated at
+each use, so reading one at depth `d` costs `O(d)`. Measured interleaved on one machine,
+`sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
+
 ## `input`/`inputs` residuals after #1309
 
 [#1309](https://github.com/rust-works/succinctly/issues/1309) closed four of the five gaps
