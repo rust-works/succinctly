@@ -57,7 +57,7 @@ pub enum BuiltinKids<'a> {
 /// is paid silently and repeatedly by everyone downstream.
 pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
     match builtin {
-        // --- No sub-expression (125) ---------------------------------------
+        // --- No sub-expression (126) ---------------------------------------
         Builtin::Type
         | Builtin::IsNull
         | Builtin::IsBoolean
@@ -149,6 +149,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Ltrim
         | Builtin::Rtrim
         | Builtin::Transpose
+        | Builtin::ModuleMeta
         | Builtin::Tag
         | Builtin::Anchor
         | Builtin::Style
@@ -184,7 +185,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::FromUnix
         | Builtin::ToUnix => BuiltinKids::None,
 
-        // --- One sub-expression (60) ---------------------------------------
+        // --- One sub-expression (59) ---------------------------------------
         Builtin::Has(e)
         | Builtin::In(e)
         | Builtin::UpperIn(e)
@@ -228,7 +229,6 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::HaltErrorCode(e)
         | Builtin::EnvVar(e)
         | Builtin::BSearch(e)
-        | Builtin::ModuleMeta(e)
         | Builtin::Pick(e)
         | Builtin::Omit(e)
         | Builtin::Del(e)
@@ -345,7 +345,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 /// sub-expression-carrying arms at all.
 pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr) -> Builtin {
     match builtin {
-        // --- No sub-expression (125) ---------------------------------------
+        // --- No sub-expression (126) ---------------------------------------
         Builtin::Type
         | Builtin::IsNull
         | Builtin::IsBoolean
@@ -437,6 +437,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::Ltrim
         | Builtin::Rtrim
         | Builtin::Transpose
+        | Builtin::ModuleMeta
         | Builtin::Tag
         | Builtin::Anchor
         | Builtin::Style
@@ -472,7 +473,7 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::FromUnix
         | Builtin::ToUnix => builtin.clone(),
 
-        // --- One sub-expression (60) ---------------------------------------
+        // --- One sub-expression (59) ---------------------------------------
         Builtin::Has(e) => Builtin::Has(Box::new(f(e))),
         Builtin::In(e) => Builtin::In(Box::new(f(e))),
         Builtin::UpperIn(e) => Builtin::UpperIn(Box::new(f(e))),
@@ -516,7 +517,6 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::HaltErrorCode(e) => Builtin::HaltErrorCode(Box::new(f(e))),
         Builtin::EnvVar(e) => Builtin::EnvVar(Box::new(f(e))),
         Builtin::BSearch(e) => Builtin::BSearch(Box::new(f(e))),
-        Builtin::ModuleMeta(e) => Builtin::ModuleMeta(Box::new(f(e))),
         Builtin::Pick(e) => Builtin::Pick(Box::new(f(e))),
         Builtin::Omit(e) => Builtin::Omit(Box::new(f(e))),
         Builtin::Del(e) => Builtin::Del(Box::new(f(e))),

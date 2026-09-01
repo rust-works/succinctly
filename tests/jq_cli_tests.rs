@@ -28893,9 +28893,9 @@ fn test_seq_pending_literal_at_boundary_is_truncated_1928() -> Result<()> {
 /// checks the roster against `tests/data/jq-builtin-names.txt` entry by entry.
 /// This test covers the other half -- that the roster is actually consulted --
 /// on a representative sample rather than all 218 names: a whole-roster sweep
-/// through the CLI also exercises the *parser*, and `modulemeta` is a
-/// pre-existing parse divergence (succinctly's parser demands
-/// `modulemeta(...)` where jq's builtin is arity 0) unrelated to resolution.
+/// through the CLI also exercises the *parser*, which is a separate concern
+/// from resolution (`modulemeta` used to diverge there -- #2035 -- until its
+/// parser arity was fixed to match jq's actual `modulemeta/0`).
 #[test]
 fn test_unimplemented_jq_builtins_still_compile_when_unreached_1473() -> Result<()> {
     for call in [
@@ -28928,6 +28928,29 @@ fn test_unimplemented_jq_builtin_still_errors_when_reached_1473() -> Result<()> 
         stderr.contains("undefined function: cbrt/0"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// `modulemeta` is arity 0 in real jq (it reads the module name from `.`, not
+/// a paren'd argument) -- succinctly's parser previously demanded
+/// `modulemeta(...)`, inverted from jq's actual grammar. Confirmed against
+/// the pinned oracle (`/usr/bin/jq`, jq-1.7.1) (#2035).
+#[test]
+fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
+    // Bare `modulemeta`, no parens, must parse -- matching `if false then
+    // modulemeta else 1 end` => 1 in real jq (an unreached call still has to
+    // compile).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "if false then modulemeta else 1 end"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+
+    // Reached, bare `modulemeta` must not error (succinctly stubs module
+    // support out entirely rather than doing real module resolution).
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "modulemeta"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "null");
+
     Ok(())
 }
 

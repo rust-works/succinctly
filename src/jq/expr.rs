@@ -1097,8 +1097,9 @@ pub enum Builtin {
     BSearch(Box<Expr>),
 
     // Phase 10: Object functions
-    /// `modulemeta(name)` - get module metadata (stub for compatibility)
-    ModuleMeta(Box<Expr>),
+    /// `modulemeta` - get module metadata for the input module name (stub
+    /// for compatibility). Real jq's builtin is arity 0, not arity 1 (#2035).
+    ModuleMeta,
     /// `pick(keys)` - select only specified keys from object/array (yq)
     Pick(Box<Expr>),
     /// `omit(keys)` - remove specified keys from object/indices from array (yq)

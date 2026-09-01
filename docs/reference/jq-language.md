@@ -208,7 +208,7 @@ below and [ADR-0019](../adrs/adr-0019.md).
 - [x] `recurse` / `recurse(f)` / `recurse(f; cond)`
 - [x] `walk(f)`
 - [x] `isvalid(expr)`
-- [x] `modulemeta(name)` (stub)
+- [x] `modulemeta` (stub, arity 0 like real jq's — #2035)
 - [x] `tojsonstream` / `fromjsonstream`
 - [x] `tostream` / `fromstream(f)` / `truncate_stream(f)` — jq's standard streaming
   builtins (#396). Distinct from `tojsonstream`/`fromjsonstream` above, which predate
