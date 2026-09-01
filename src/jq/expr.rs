@@ -487,6 +487,9 @@ pub enum Expr {
         /// 4,000 and 8,000. Charging the structural nesting at each call site
         /// tracks that difference; a count cannot.
         frames: u32,
+        /// The substituted body, remembered after the first evaluation of
+        /// this node.
+        bound: BoundBody,
     },
 
     /// Namespaced function call: `module::func` or `module::func(args)`
@@ -537,6 +540,68 @@ pub enum Expr {
         /// Default value expression (right side)
         value: Box<Self>,
     },
+}
+
+/// A [`Expr::DefCall`]'s substituted body, computed on first evaluation and
+/// reused afterwards (#1371).
+///
+/// Binding a call is a pure function of the node — substitute its `args` into
+/// a copy of `def.body`, then install the definition over the result — so for
+/// a given node the answer never changes and can be computed once. Without
+/// this, moving substitution from "once, before evaluation" to "at the call"
+/// charges it *per call*: a `def` used inside `.[]` over 200,000 elements
+/// re-substituted its body 200,000 times, measured at +8% for one call per
+/// element and +27% for three chained ones. With it, a repeated call site
+/// pays once, and a recursion still substitutes per level because each level
+/// installs its own fresh nodes.
+///
+/// Cloned along with the node it belongs to, which is safe wherever `args`
+/// come along unchanged. **The two substitution passes rebuild `args` and so
+/// must reset this** — they construct a fresh `BoundBody` rather than
+/// carrying the old node's, since a cache keyed on arguments that just
+/// changed is exactly a stale one.
+#[derive(Clone, Default)]
+pub struct BoundBody(core::cell::OnceCell<Rc<Expr>>);
+
+impl BoundBody {
+    /// The bound body, computing it with `bind` on first call.
+    pub fn get_or_init(&self, bind: impl FnOnce() -> Rc<Expr>) -> &Rc<Expr> {
+        self.0.get_or_init(bind)
+    }
+
+    /// The bound body, computing it with a fallible `bind` on first call.
+    ///
+    /// A failure (the recursion-depth guard) is deliberately **not** cached:
+    /// it depends on nothing this node owns that could change, but leaving it
+    /// uncached keeps the cache holding only successful, reusable results and
+    /// costs nothing — a node that failed the guard is not evaluated again.
+    pub fn get_or_try_init<E>(
+        &self,
+        bind: impl FnOnce() -> Result<Rc<Expr>, E>,
+    ) -> Result<&Rc<Expr>, E> {
+        if let Some(cached) = self.0.get() {
+            return Ok(cached);
+        }
+        let bound = bind()?;
+        Ok(self.0.get_or_init(|| bound))
+    }
+}
+
+/// Two `DefCall`s are equal when their definition, arguments and frame count
+/// are — whether either has been evaluated yet is derived state, not identity.
+impl PartialEq for BoundBody {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Deliberately opaque: printing the cached body would make a node's `Debug`
+/// output depend on whether it had been evaluated, which is the shape that
+/// made `assert_eq!` on `{:?}` unreliable for YAML's own cursor cache.
+impl core::fmt::Debug for BoundBody {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BoundBody")
+    }
 }
 
 /// The three parts of a `def` that [`Expr::DefCall`] carries from the

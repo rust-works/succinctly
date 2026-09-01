@@ -298,8 +298,8 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, MergeFlags,
-    NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, StringPart,
+    ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal,
+    MergeFlags, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, StringPart,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -1301,9 +1301,12 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // above (which only ever errors, since an unbound call is a compile
         // error `resolve.rs` rejects earlier), this is where a user-defined
         // function actually runs.
-        Expr::DefCall { def, args, frames } => {
-            eval_def_call::<W, S>(def, args, *frames, value, optional)
-        }
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => eval_def_call::<W, S>(def, args, *frames, bound, value, optional),
 
         // #1371: an argument captured at call time. Transparent to
         // evaluation -- it is the substitution passes, not this one, that
@@ -3403,8 +3406,13 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // not just slower: `isempty(def f: (1, ("B"|stderr)); f)` printed `B`
         // where jq prints nothing, because the second branch ran after the
         // answer was already known.
-        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
-            Ok(bound) => eval_each::<W, S>(&bound, value, optional, sink),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
+            Ok(bound) => eval_each::<W, S>(bound, value, optional, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Lazy only for an argument the *user* wrote, not for a link in a
@@ -20547,8 +20555,13 @@ fn resolve_node<'a, S: EvalSemantics>(
         // uses -- a runaway recursion inside `path()` must not be able to
         // exhaust the stack just because it is being resolved rather than
         // evaluated.
-        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
-            Ok(bound) => resolve_node::<S>(&bound, value, trackable, snapshot),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
+            Ok(bound) => resolve_node::<S>(bound, value, trackable, snapshot),
             Err(e) => Err((Vec::new(), e.into())),
         },
         // Transparent, like `Paren`: the wrapped argument is ordinary code
@@ -25388,13 +25401,18 @@ fn substitute_var_impl(
         // `1 as $x | f($x)`. The definition itself is not descended into --
         // it was captured with every variable in scope at its own definition
         // site already substituted, and its body is a fresh scope per call.
-        Expr::DefCall { def, args, frames } => Expr::DefCall {
+        Expr::DefCall {
+            def, args, frames, ..
+        } => Expr::DefCall {
             def: Rc::clone(def),
             args: args
                 .iter()
                 .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
                 .collect(),
             frames: *frames,
+            // Fresh: `args` just changed, so anything cached against the old
+            // ones would be stale.
+            bound: BoundBody::default(),
         },
         Expr::Var(name) if name == var_name => {
             if mark_trackable {
@@ -30727,10 +30745,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // as an untrackable leaf rather than seeing through to the
         // navigation. Binding here and continuing in this same evaluator is
         // what the `FuncDef` arm just below already does one step earlier.
-        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
             Err(e) => QueryResult::Error(e),
             Ok(bound) => {
-                let mut stages = vec![bound];
+                let mut stages = vec![(**bound).clone()];
                 stages.extend(rest.iter().cloned());
                 eval_pipe_with_path_context_internal::<W, S>(
                     &stages,
@@ -40049,23 +40072,26 @@ const MAX_EVAL_FRAMES: u32 = 40_000;
 ///   pass stops at a `Shared`, so a binder inside the body (`3 as $x`, a
 ///   `reduce` pattern) cannot reach into an argument that mentions `$x`
 ///   (#2077).
-pub(crate) fn bind_def_call(
+pub(crate) fn bind_def_call<'e>(
     def: &Rc<FuncDefData>,
     args: &[Expr],
     frames: u32,
-) -> Result<Expr, EvalError> {
-    if frames >= MAX_EVAL_FRAMES {
-        return Err(EvalError::new(format!(
-            "{}/{} exceeded maximum recursion depth",
-            def.name,
-            def.params.len()
-        )));
-    }
-    let mut bound = def.body.clone();
-    for (param, arg) in def.params.iter().zip(args.iter()) {
-        bound = substitute_func_param(&bound, param, &Expr::Shared(Rc::new(arg.clone())));
-    }
-    Ok(install_def_calls(&bound, def, frames + 1))
+    bound: &'e BoundBody,
+) -> Result<&'e Rc<Expr>, EvalError> {
+    bound.get_or_try_init(|| {
+        if frames >= MAX_EVAL_FRAMES {
+            return Err(EvalError::new(format!(
+                "{}/{} exceeded maximum recursion depth",
+                def.name,
+                def.params.len()
+            )));
+        }
+        let mut body = def.body.clone();
+        for (param, arg) in def.params.iter().zip(args.iter()) {
+            body = substitute_func_param(&body, param, &Expr::Shared(Rc::new(arg.clone())));
+        }
+        Ok(Rc::new(install_def_calls(&body, def, frames + 1)))
+    })
 }
 
 /// Evaluate an `Expr::DefCall` in the plain evaluator (#1371).
@@ -40073,11 +40099,12 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     def: &Rc<FuncDefData>,
     args: &[Expr],
     frames: u32,
+    cache: &BoundBody,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match bind_def_call(def, args, frames) {
-        Ok(bound) => eval_single::<W, S>(&bound, value, optional),
+    match bind_def_call(def, args, frames, cache) {
+        Ok(bound) => eval_single::<W, S>(bound, value, optional),
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -40144,6 +40171,7 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                     .map(|a| install_def_calls(a, def, frames + 1))
                     .collect(),
                 frames,
+                bound: BoundBody::default(),
             }
         }
         // Recursively expand in all subexpressions
@@ -40453,10 +40481,14 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
             def: d,
             args,
             frames: n,
+            bound,
         } => Expr::DefCall {
             def: Rc::clone(d),
             args: args.clone(),
             frames: *n,
+            // `args` come through unchanged, so whatever this node has
+            // already bound is still exactly what it would bind again.
+            bound: bound.clone(),
         },
         Expr::Break(name) => Expr::Break(name.clone()),
     }
@@ -40477,13 +40509,17 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         // binds `n` here, through the inner call. Reached whenever an outer
         // definition was installed over a body before this one's parameters
         // were bound, which is the ordinary case for two sibling `def`s.
-        Expr::DefCall { def, args, frames } => Expr::DefCall {
+        Expr::DefCall {
+            def, args, frames, ..
+        } => Expr::DefCall {
             def: Rc::clone(def),
             args: args
                 .iter()
                 .map(|a| substitute_func_param(a, param, arg))
                 .collect(),
             frames: *frames,
+            // Fresh, for the reason `substitute_var_impl`'s own arm gives.
+            bound: BoundBody::default(),
         },
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),

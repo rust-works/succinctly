@@ -5694,8 +5694,13 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // #1371: mirrors `eval.rs`'s own `DefCall`/`Shared` pair -- see there
         // for why the generic fallback is not good enough (a consumer that
         // stops early must not have already run the rest of the body).
-        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
-            Ok(bound) => eval_each_generic::<S, V>(&bound, value, optional, cursor, sink),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
+            Ok(bound) => eval_each_generic::<S, V>(bound, value, optional, cursor, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Same split as `eval.rs`'s own `Shared` arm, for the same measured
