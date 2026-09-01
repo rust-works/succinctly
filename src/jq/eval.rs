@@ -301,7 +301,7 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, MergeFlags, NumberKey,
-    ObjectEntry, ObjectKey, Pattern, StringPart,
+    ObjectEntry, ObjectKey, Pattern, PatternEntry, StringPart,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -25970,6 +25970,131 @@ fn pattern_binds_var(pattern: &Pattern, var_name: &str) -> bool {
     }
 }
 
+/// Replace every binding occurrence of `old_name` in a pattern with
+/// `new_name`, leaving every other name untouched.
+///
+/// #2077: applies an alpha-rename decided by [`capturing_pattern_renames`]
+/// to the pattern itself, so the renamed binder and its own body stay in
+/// sync (`reduce`/`foreach`/`?//` alternatives, and `as`-patterns).
+fn rename_pattern_var(pattern: &Pattern, old_name: &str, new_name: &str) -> Pattern {
+    match pattern {
+        Pattern::Var(name) if name == old_name => Pattern::Var(new_name.to_string()),
+        Pattern::Var(name) => Pattern::Var(name.clone()),
+        Pattern::Object(entries) => Pattern::Object(
+            entries
+                .iter()
+                .map(|entry| PatternEntry {
+                    key: entry.key.clone(),
+                    pattern: rename_pattern_var(&entry.pattern, old_name, new_name),
+                })
+                .collect(),
+        ),
+        Pattern::Array(patterns) => Pattern::Array(
+            patterns
+                .iter()
+                .map(|p| rename_pattern_var(p, old_name, new_name))
+                .collect(),
+        ),
+    }
+}
+
+/// A synthetic replacement for `name` that no real jq/yq program can ever
+/// spell.
+///
+/// #2077: `#` cannot appear in a jq/yq identifier (`Parser::parse_ident`
+/// stops at the first non-alphanumeric, non-`_`, and -- in yq mode -- non-`-`
+/// character), so appending it always produces a name distinct from every
+/// binder the user actually wrote, however many times the source name has
+/// already been through this rename (nested captures just grow more `#`s).
+/// No counter is needed for global uniqueness: each rename only rewrites
+/// occurrences strictly within the one binder's own scope (via
+/// [`substitute_func_param`]'s existing shadow-aware recursion), so two
+/// unrelated renames of the same source name can never see each other's
+/// output.
+fn fresh_var_name(name: &str) -> String {
+    format!("{name}#")
+}
+
+/// Whether `expr` contains a free-standing `$name` reference anywhere.
+///
+/// #2077: used to decide whether substituting `arg` into a binder's scope
+/// would let that binder recapture one of `arg`'s own variable references.
+/// Deliberately not scope-aware over `expr` itself -- a `$name` that is
+/// actually bound *within* `expr` (not free) still trips this, which only
+/// costs an unnecessary rename. Renaming a binder that would not actually
+/// have captured anything is still alpha-equivalent, so over-approximating
+/// here is safe, unlike the rename itself (see [`capturing_pattern_renames`]),
+/// which must not touch a binder that isn't actually `name`.
+fn expr_mentions_var(expr: &Expr, name: &str) -> bool {
+    any_subexpr(expr, &mut |e| matches!(e, Expr::Var(n) if n == name))
+}
+
+/// For every distinct name `patterns` binds that also appears as a free
+/// `$name` reference in `arg`, pick a fresh replacement -- the alpha-renames
+/// [`substitute_func_param`]'s binder arms (`As`, `Reduce`, `Foreach`,
+/// `AsPattern`, and a nested `FuncDef`'s own parameters, the latter wrapped
+/// one `Pattern::Var` per parameter by its caller) must apply before
+/// substituting `param -> arg` into that binder's own scope.
+///
+/// #2077: without this, `def f(g): 5 as $x | g; 2 as $x | f($x)` silently
+/// returns `5` instead of `2` -- substituting `g -> $x` (the caller's `$x`)
+/// into `5 as $x | g` places a fresh `$x` reference *inside* the callee's
+/// own `$x` binding, which then captures it. Real jq binds a function
+/// argument as a closure over the caller's environment, so the callee's own
+/// `as $x` can never observe it.
+fn capturing_pattern_renames(patterns: &[Pattern], arg: &Expr) -> Vec<(String, String)> {
+    let mut bound_names = Vec::new();
+    for p in patterns {
+        collect_pattern_var_names(p, &mut bound_names);
+    }
+    bound_names.sort();
+    bound_names.dedup();
+    bound_names
+        .into_iter()
+        .filter(|name| expr_mentions_var(arg, name))
+        .map(|name| {
+            let fresh = fresh_var_name(&name);
+            (name, fresh)
+        })
+        .collect()
+}
+
+/// Apply every `(old, new)` rename from [`capturing_pattern_renames`] to a
+/// pattern list, in order.
+fn apply_pattern_renames(patterns: &[Pattern], renames: &[(String, String)]) -> Vec<Pattern> {
+    if renames.is_empty() {
+        return patterns.to_vec();
+    }
+    let mut result = patterns.to_vec();
+    for (old_name, new_name) in renames {
+        result = result
+            .iter()
+            .map(|p| rename_pattern_var(p, old_name, new_name))
+            .collect();
+    }
+    result
+}
+
+/// Apply every `(old, new)` rename from [`capturing_pattern_renames`] to an
+/// expression that lives in the renamed binder's scope (a `reduce`/`foreach`
+/// `update`/`extract`, an `as`/`as`-pattern `body`, or a nested `FuncDef`'s
+/// own `body`).
+///
+/// Reuses [`substitute_func_param`] itself as the rename primitive: replacing
+/// `old_name` with `Expr::Var(new_name)` is exactly a variable rename, and
+/// doing it this way gets the same shadow-aware recursion the real
+/// substitution needs for free -- a *further* nested binder that rebinds
+/// `old_name` again (e.g. `reduce .[] as $x ($init; reduce .[] as $x (...))`)
+/// correctly stops the rename at its own boundary, the same as it stops
+/// substitution.
+fn apply_scope_renames(scope: &Expr, renames: &[(String, String)]) -> Expr {
+    let mut result = scope.clone();
+    for (old_name, new_name) in renames {
+        result = substitute_func_param(&result, old_name, &Expr::Var(new_name.clone()));
+    }
+    result
+}
+
 /// Substitute variable in a builtin expression.
 fn substitute_var_in_builtin(
     builtin: &Builtin,
@@ -40929,10 +41054,22 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                     body: body.clone(),
                 }
             } else {
+                // #2077: `var` doesn't shadow `param`, but it can still
+                // *capture* `arg` if `arg` itself references a `$var` of the
+                // same name -- alpha-rename `var` within `body` first so the
+                // substituted-in reference stays free.
+                let renames = capturing_pattern_renames(
+                    core::slice::from_ref(&Pattern::Var(var.clone())),
+                    arg,
+                );
+                let new_var = renames
+                    .first()
+                    .map_or_else(|| var.clone(), |(_, new_name)| new_name.clone());
+                let renamed_body = apply_scope_renames(body, &renames);
                 Expr::As {
                     expr: Box::new(substitute_func_param(expr, param, arg)),
-                    var: var.clone(),
-                    body: Box::new(substitute_func_param(body, param, arg)),
+                    var: new_var,
+                    body: Box::new(substitute_func_param(&renamed_body, param, arg)),
                 }
             }
         }
@@ -40950,11 +41087,17 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                     update: update.clone(),
                 }
             } else {
+                // #2077: `patterns` doesn't shadow `param`, but its own
+                // bound names can still capture `arg`'s free variables (the
+                // last repro row in the issue: `reduce`'s pattern variable
+                // captures a substituted-in `$x` the same way `as` does).
+                let renames = capturing_pattern_renames(patterns, arg);
+                let renamed_update = apply_scope_renames(update, &renames);
                 Expr::Reduce {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    patterns: patterns.clone(),
+                    patterns: apply_pattern_renames(patterns, &renames),
                     init: Box::new(substitute_func_param(init, param, arg)),
-                    update: Box::new(substitute_func_param(update, param, arg)),
+                    update: Box::new(substitute_func_param(&renamed_update, param, arg)),
                 }
             }
         }
@@ -40974,14 +41117,20 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                     extract: extract.clone(),
                 }
             } else {
+                // #2077: same capture risk as `Reduce` above -- `update`
+                // *and* `extract` both see the pattern's bindings, so both
+                // need the same renames applied.
+                let renames = capturing_pattern_renames(patterns, arg);
+                let renamed_update = apply_scope_renames(update, &renames);
                 Expr::Foreach {
                     input: Box::new(substitute_func_param(input, param, arg)),
-                    patterns: patterns.clone(),
+                    patterns: apply_pattern_renames(patterns, &renames),
                     init: Box::new(substitute_func_param(init, param, arg)),
-                    update: Box::new(substitute_func_param(update, param, arg)),
-                    extract: extract
-                        .as_ref()
-                        .map(|e| Box::new(substitute_func_param(e, param, arg))),
+                    update: Box::new(substitute_func_param(&renamed_update, param, arg)),
+                    extract: extract.as_ref().map(|e| {
+                        let renamed_extract = apply_scope_renames(e, &renames);
+                        Box::new(substitute_func_param(&renamed_extract, param, arg))
+                    }),
                 }
             }
         }
@@ -41019,14 +41168,21 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             body,
         } => {
             let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
-            Expr::AsPattern {
-                expr: Box::new(substitute_func_param(expr, param, arg)),
-                patterns: patterns.clone(),
-                body: if shadowed {
-                    body.clone()
-                } else {
-                    Box::new(substitute_func_param(body, param, arg))
-                },
+            if shadowed {
+                Expr::AsPattern {
+                    expr: Box::new(substitute_func_param(expr, param, arg)),
+                    patterns: patterns.clone(),
+                    body: body.clone(),
+                }
+            } else {
+                // #2077: same capture risk as plain `As`/`Reduce` above.
+                let renames = capturing_pattern_renames(patterns, arg);
+                let renamed_body = apply_scope_renames(body, &renames);
+                Expr::AsPattern {
+                    expr: Box::new(substitute_func_param(expr, param, arg)),
+                    patterns: apply_pattern_renames(patterns, &renames),
+                    body: Box::new(substitute_func_param(&renamed_body, param, arg)),
+                }
             }
         }
         Expr::FuncDef {
@@ -41035,16 +41191,57 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             body,
             then,
         } => {
-            let shadowed = params.contains(&param.to_string());
+            // #2077 defect B: a nested `def` of the same name *and arity*
+            // (zero, matching how a function parameter is referenced --
+            // see the `FuncCall` arm below) shadows `param` in `then` too,
+            // not just in `body` -- `def f(g): def g: 99; g; f(1)` must
+            // leave the `g` in `then` alone so the evaluator's own
+            // innermost-first def lookup resolves it to the nested `def g`,
+            // not to `param`'s substituted argument.
+            let then_shadowed = name == param && params.is_empty();
+            // A nested def's own parameter list shadows `param` within its
+            // own body the same way an outer `as $param` would.
+            let body_shadowed = params.contains(&param.to_string());
+
+            let (new_params, new_body) = if body_shadowed {
+                (params.clone(), body.clone())
+            } else {
+                // #2077 defect A: the nested def's own parameters are
+                // binders too (its `body` sees them the same way an
+                // `as`-bound scope sees its variable), so they can capture
+                // `arg`'s free variables exactly like `as`/`reduce`/
+                // `foreach` do.
+                let as_patterns: Vec<Pattern> = params.iter().cloned().map(Pattern::Var).collect();
+                let renames = capturing_pattern_renames(&as_patterns, arg);
+                let new_params = if renames.is_empty() {
+                    params.clone()
+                } else {
+                    params
+                        .iter()
+                        .map(|p| {
+                            renames
+                                .iter()
+                                .find(|(old_name, _)| old_name == p)
+                                .map_or_else(|| p.clone(), |(_, new_name)| new_name.clone())
+                        })
+                        .collect()
+                };
+                let renamed_body = apply_scope_renames(body, &renames);
+                (
+                    new_params,
+                    Box::new(substitute_func_param(&renamed_body, param, arg)),
+                )
+            };
+
             Expr::FuncDef {
                 name: name.clone(),
-                params: params.clone(),
-                body: if shadowed {
-                    body.clone()
+                params: new_params,
+                body: new_body,
+                then: if then_shadowed {
+                    then.clone()
                 } else {
-                    Box::new(substitute_func_param(body, param, arg))
+                    Box::new(substitute_func_param(then, param, arg))
                 },
-                then: Box::new(substitute_func_param(then, param, arg)),
             }
         }
         Expr::FuncCall { name, args } => {
