@@ -27449,6 +27449,141 @@ fn test_path_context_bypass_keeps_yq_float_fidelity_1909() -> Result<()> {
     Ok(())
 }
 
+/// #2061: `key`/`path`/`parent`/`parent(n)` answer from the path a cursor
+/// walk accumulates, instead of materializing the whole document first.
+///
+/// Every expectation is `main`'s own byte-for-byte output for the same
+/// filter: this arm exists to be faster, not to behave differently, and a
+/// 6,930-case differential against the pre-change binary (jq and yq mode,
+/// JSON and YAML input) is the actual gate. These pin the shapes that
+/// differential covers so a regression names itself.
+#[test]
+fn test_path_context_cursor_walk_shapes_2061() -> Result<()> {
+    const NESTED: &str = r#"{"a":{"b":{"c":1,"d":2}}}"#;
+    for (filter, input, want) in [
+        // The path itself: `key` is its last component, `path` is all of it.
+        (".a.b.c | key", NESTED, r#""c""#),
+        (".a.b.c | path", NESTED, r#"["a","b","c"]"#),
+        // `parent` returns the ancestor node...
+        (".a.b.c | parent", NESTED, r#"{"c":1,"d":2}"#),
+        (".a.b.c | parent(2)", NESTED, r#"{"b":{"c":1,"d":2}}"#),
+        (".a.b | parent(0) | key", r#"{"a":{"b":1}}"#, r#""b""#),
+        // ...and moves the position, so a following stage sees the ancestor's
+        // own path. These emit no value at all -- pure stack arithmetic.
+        (".a.b.c | parent | key", NESTED, r#""b""#),
+        (".a.b.c | parent | parent | key", NESTED, r#""a""#),
+        (".a.b.c | parent | path", NESTED, r#"["a","b"]"#),
+        // A step back down through the ancestor.
+        (".a.b.c | parent | .d", NESTED, "2"),
+        // Fan-out: iteration and comma, and the `Expr::Array` shape whose
+        // stage 0 needs path context while the rest of the pipe does not.
+        ("[.[] | key]", r#"[{"k":1},{"k":2}]"#, "[0,1]"),
+        ("[.[] | key] | length", r#"[{"k":1},{"k":2}]"#, "2"),
+        (
+            "[.[].k | path]",
+            r#"[{"k":1},{"k":2}]"#,
+            r#"[[0,"k"],[1,"k"]]"#,
+        ),
+        ("[(.a,.b) | key]", r#"{"a":1,"b":2}"#, r#"["a","b"]"#),
+    ] {
+        // Both modes: `key`/`parent` are yq builtins, but `succinctly jq`
+        // supports them too and must not drift from `succinctly yq`.
+        let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "yq `{filter}` on `{input}`: {out:?}");
+        assert_eq!(out.trim(), want, "yq `{filter}` on `{input}`");
+
+        let (out, _, code) = run_jq_stdin_with_stderr(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "jq `{filter}` on `{input}`: {out:?}");
+        assert_eq!(out.trim(), want, "jq `{filter}` on `{input}`");
+    }
+    Ok(())
+}
+
+/// #2061: the shapes the cursor walk deliberately hands back to the
+/// materializing bridge, each of which would otherwise answer differently.
+///
+/// Bailing out is safe here only because every shape the walk accepts is
+/// pure navigation -- no builtin that computes, no `stderr`, no user
+/// function -- so re-running the pipe on the bridge cannot repeat a side
+/// effect. That is the constraint that sank #2053's `getpath` prototype.
+#[test]
+fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
+    for (filter, input, want) in [
+        // An absent node. The bridge *loses* path context through a missing
+        // field (`null`, not `"a"`) and *raises* on an out-of-bounds index
+        // where plain `.[0]` does not. Real yq v4.53.3 does neither -- it
+        // answers `"a"` and auto-vivifies -- so all three disagree, and the
+        // walk declines to invent a fourth answer inside a perf change.
+        (".a | key", "{}", "null"),
+        (".a.b | key", "{}", "null"),
+        (".missing | path", r#"{"a":1}"#, "null"),
+        (".a | parent", "{}", "null"),
+        // `parent` back at the root would materialize the whole document --
+        // exactly what the bridge already does, and the walk would pay its
+        // validity gate on top for a net loss.
+        (".a | parent", r#"{"a":1}"#, r#"{"a":1}"#),
+        // `parent(n)` past the root: the bridge answers with a synthetic
+        // empty object that is not a document node.
+        (".a.b | parent(5)", r#"{"a":{"b":1}}"#, "{}"),
+        // A computed `n` would have to materialize the current value to
+        // evaluate it -- the very cost being removed.
+        (".a.b | parent(1 - 1) | key", r#"{"a":{"b":1}}"#, r#""b""#),
+        // `key` replaces the position with a computed value, so a later
+        // stage has no document node to navigate from.
+        (".a | key | length", r#"{"a":1}"#, "1"),
+        // A stage the walk does not model at all.
+        (
+            "[.[] | select(. != null) | key]",
+            r#"{"a":1,"b":null}"#,
+            r#"["a"]"#,
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}` on `{input}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}` on `{input}`");
+    }
+
+    // An out-of-bounds index still raises, as it does on the bridge.
+    let (out, code) = run_yq_stdin(".[0] | key", "[]", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(out.trim(), "");
+
+    Ok(())
+}
+
+/// #2061: the validity gate is kept, only the tree build is dropped.
+///
+/// `to_owned_with_cursor` doubles as a decode-failure gate (#1755/#1953), so
+/// a walk that reached the answer without decoding everything would silently
+/// start accepting documents these pipes reject today.
+/// `push_generic_truthiness_cursor_error` is that same traversal and
+/// validation without the `OwnedValue` construction.
+#[test]
+fn test_path_context_cursor_walk_keeps_the_validity_gate_2061() -> Result<()> {
+    // An undecodable *sibling* the walk never visits still raises.
+    for input in [
+        r#"{"a":"\ud800","d":{"e":5}}"#,
+        r#"{"a":"\uZZZZ","d":{"e":5}}"#,
+        r#"{"a":"\x","d":{"e":5}}"#,
+        r#"{"a":"\u12","d":{"e":5}}"#,
+    ] {
+        for filter in [".d.e | key", ".d.e | path", ".d.e | parent"] {
+            let (out, _, code) = run_jq_stdin_with_stderr(filter, input, &["-c"])?;
+            assert_ne!(code, 0, "`{filter}` on `{input}` must still raise: {out:?}");
+            assert_eq!(out, "", "`{filter}` on `{input}`");
+        }
+    }
+
+    // A well-formed document with the same shape answers normally, so the
+    // gate is not simply rejecting everything.
+    let (out, _, code) =
+        run_jq_stdin_with_stderr(".d.e | key", r#"{"a":"ok","d":{"e":5}}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#""e""#);
+
+    Ok(())
+}
+
 /// #1687: `sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/`max`/`max_by`
 /// and `reverse` all answer a permutation or subset of their input's *own*
 /// elements, yet every one of them routed through `eval_generic.rs`'s `_`
