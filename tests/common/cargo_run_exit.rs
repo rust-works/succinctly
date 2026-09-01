@@ -29,7 +29,10 @@
 
 #![allow(dead_code)] // Each consumer uses a different subset.
 
-use anyhow::{Context, Result};
+// `anyhow::Context` is no longer imported: every remaining stage tag in
+// this file is `anyhow::Error::new(e).context(..)`, an inherent method, and
+// the last `Result::context` call site went with #2057's `BrokenPipe` arm.
+use anyhow::Result;
 
 #[path = "../../src/bin/succinctly/exit_status.rs"]
 mod exit_status;
@@ -157,7 +160,10 @@ pub fn succinctly_bin() -> &'static str {
 /// would leak a zombie for the rest of this test binary's run.
 /// `wait_with_output()` below doesn't care whether the write succeeded;
 /// call it unconditionally first so the child is always reaped, then
-/// surface the write error if there was one.
+/// surface the write error if there was one -- except a `BrokenPipe`,
+/// which that same early-exit case makes routine rather than exceptional
+/// and which carries no information once the child has been waited on
+/// (#2057; see the match at the end of the body).
 ///
 /// Ordering invariant: this write runs to completion (blocking on a full
 /// pipe buffer) *before* `wait_with_output()`'s own concurrent
@@ -207,7 +213,66 @@ pub fn write_stdin_then_wait(
     // into this shared function had silently dropped that stage-tagging
     // (a bare `io::Error`'s own `Display` doesn't say *which* fallible step
     // produced it), making a real failure harder to triage than before.
-    write_result.context("write stdin")?;
+    match write_result {
+        Ok(()) => {}
+        // A child that has already exited has closed the read end, so a
+        // write to it fails with `BrokenPipe` -- and note that this is
+        // independent of how much room the pipe buffer has. Buffer capacity
+        // only decides anything while a reader still holds the pipe open,
+        // so for an already-exited child the sole discriminator is "did the
+        // child exit before this write started".
+        //
+        // For every CLI test whose filter fails to *compile*, that is the
+        // normal ordering rather than a contention symptom: `succinctly jq`
+        // reports the error and exits 3 without ever reading stdin. All
+        // four recorded observations of #2057 are that shape
+        // (`test_unresolved_call_is_not_catchable_1473`,
+        // `test_forward_reference_across_names_is_a_compile_error_1473`,
+        // and `test_func_def_arity_overload_unmatched_arity_still_errors_1376`
+        // twice).
+        //
+        // The race is *biased*, not decided: with the few-byte payloads
+        // those tests use, a parent that reaches its write first succeeds
+        // outright, since the bytes simply sit in the buffer that the child
+        // then never reads. Anything delaying the parent between `spawn()`
+        // and its first write -- coverage instrumentation, scheduler
+        // pressure from concurrent spawns -- pushes the bias toward the
+        // child. Three of the four observations are on `Coverage` legs and
+        // one is on a plain `Test` leg, so instrumentation amplifies it but
+        // is not required. A bias sitting high enough explains consecutive
+        // re-runs both failing without the outcome being strictly
+        // determined, which is what was seen on #2071.
+        //
+        // Once this point is reached the failed write carries no
+        // information: `wait_with_output` above already succeeded, so the
+        // child's real exit status, stdout and stderr are in hand, and those
+        // are what every caller asserts on. Swallowing it is what lets a
+        // compile-error test assert its compile error rather than die with a
+        // stack trace naming whichever test happened to be running.
+        //
+        // Deliberately *not* routed through `spawn_with_signal_retry`'s
+        // retry instead: re-spawning re-observes the same compile error at
+        // the same bias, so a retry mostly converts a fast failure into a
+        // slow one. A child killed by a signal mid-write is still caught, by
+        // that function's own exit-status check.
+        //
+        // Deliberately *not* narrowed to a non-zero exit status either,
+        // though that would preserve one diagnostic worth naming: a child
+        // that genuinely consumes stdin, exits 0, and whose write failed
+        // partway for a real reason now surfaces as a downstream assertion
+        // on truncated output instead of "write stdin failed". Narrowing
+        // trades that back for a spurious failure whenever a child exits 0
+        // *without* reading its input -- `-n` with no `inputs`, say -- which
+        // is precisely the flake class this fix exists to remove, and it
+        // would reintroduce it in a form no test here currently covers. The
+        // broad swallow is the safer side of that trade for a harness whose
+        // job is to make real assertions legible; revisit if a truncated-
+        // write case ever actually bites.
+        //
+        // Every other write error still surfaces with its stage tag.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(anyhow::Error::new(e).context("write stdin")),
+    }
     Ok(output)
 }
 
