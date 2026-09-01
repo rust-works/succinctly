@@ -11,6 +11,11 @@
 //! thread's life -- kept to its own test binary (this file compiles to a
 //! separate process) so it can't leak into any other test file's shared
 //! process or test-thread pool.
+//!
+//! `seed_remaining_inputs` itself is `#[cfg(feature = "std")]` (`src/jq/mod.rs`),
+//! so this whole file compiles to nothing under `--no-default-features` (#2083).
+
+#![cfg(feature = "std")]
 
 use succinctly::jq::eval_generic::eval_using;
 use succinctly::jq::{parse, seed_remaining_inputs, JqSemantics, OwnedValue};

@@ -59891,6 +59891,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_parse_simple_tz_offset_errors_gracefully_on_overflow_894() {
         // #894: `hours * 3600`/`minutes * 60`/the final sign multiply were
         // unchecked, panicking on a malformed/adversarial `TZ` env var
