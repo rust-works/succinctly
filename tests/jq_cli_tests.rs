@@ -28933,8 +28933,13 @@ fn test_unimplemented_jq_builtin_still_errors_when_reached_1473() -> Result<()> 
 
 /// `modulemeta` is arity 0 in real jq (it reads the module name from `.`, not
 /// a paren'd argument) -- succinctly's parser previously demanded
-/// `modulemeta(...)`, inverted from jq's actual grammar. Confirmed against
-/// the pinned oracle (`/usr/bin/jq`, jq-1.7.1) (#2035).
+/// `modulemeta(...)`, inverted from jq's actual grammar. The arity/parse
+/// dimension below is confirmed against the pinned oracle (`/usr/bin/jq`,
+/// jq-1.7.1) (#2035). The second assertion pins succinctly's current stub
+/// behavior (always `null`), not oracle-matched output -- real jq's
+/// `modulemeta` always errors instead (see
+/// docs/compliance/jq/limitations.md and #2111, which tracks closing that
+/// separate, pre-existing gap).
 #[test]
 fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
     // Bare `modulemeta`, no parens, must parse -- matching `if false then
@@ -28945,8 +28950,8 @@ fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "1");
 
-    // Reached, bare `modulemeta` must not error (succinctly stubs module
-    // support out entirely rather than doing real module resolution).
+    // Reached, bare `modulemeta` does not error -- succinctly's stub
+    // (#2111, not real jq's own behavior, which always errors).
     let (stdout, stderr, code) = run_jq_full(&["-nc", "modulemeta"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "null");

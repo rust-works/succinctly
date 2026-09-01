@@ -26,12 +26,12 @@ use super::{Builtin, Expr, ObjectKey, StringPart};
 /// The sub-expressions a [`Builtin`] owns, in source order.
 ///
 /// Four shapes because that is all `Builtin` actually uses: of its 207
-/// variants, 125 carry no sub-expression, 60 carry one, 20 carry two and 2
+/// variants, 126 carry no sub-expression, 59 carry one, 20 carry two and 2
 /// carry three.
 #[derive(Debug, Clone, Copy)]
 pub enum BuiltinKids<'a> {
     /// A builtin with no sub-expression — `length`, `keys`, `inputs`, and the
-    /// 122 others, including the two that carry a non-expression payload
+    /// 123 others, including the two that carry a non-expression payload
     /// (`$ENV`-style `EnvObject(String)` and `StrEnv(String)`).
     None,
     /// One sub-expression — `map(f)`, `select(f)`, `first(f)`, …
@@ -326,7 +326,7 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
 /// guessing) to a tail call into the derived `<Builtin as Clone>::clone` --
 /// its own ~200-arm switch re-deciding the variant a second time -- rather
 /// than the old hand-written code's zero-cost direct materialization
-/// (`Builtin::Type => Builtin::Type`) for each of the 125 fieldless
+/// (`Builtin::Type => Builtin::Type`) for each of the 126 fieldless
 /// variants. Neither cost is new to this function; #1506 is what newly
 /// exposes both to genuinely hot per-element callers instead of only
 /// `rewrite_namespaced_calls`'s one-shot parse-time one. Measured
