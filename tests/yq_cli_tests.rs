@@ -27567,6 +27567,18 @@ fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
             r#"{"a":1,"b":null}"#,
             r#"["a"]"#,
         ),
+        // More than one ancestor materialization. Decoding an ancestor is a
+        // backward jump against YAML's document-wide sequential-cursor
+        // cache, so a fan-out that does it once per element is handed back
+        // to the bridge, which decodes forwards exactly once. Measured at
+        // +22.6%/+27.4% on an M4 Pro before the cap. `parent | key`
+        // materializes nothing and keeps the fast path.
+        ("[.[] | .k | parent] | length", r#"[{"k":1},{"k":2}]"#, "2"),
+        (
+            "[(.a.x, .b.y) | parent] | length",
+            r#"{"a":{"x":1},"b":{"y":2}}"#,
+            "2",
+        ),
     ] {
         let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
         assert_eq!(code, 0, "`{filter}` on `{input}`: {out:?}");
