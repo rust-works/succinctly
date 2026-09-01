@@ -1375,7 +1375,7 @@ fn main() -> Result<()> {
     let child = std::thread::Builder::new()
         .stack_size(EVAL_STACK_SIZE)
         .spawn(run_main)
-        .expect("failed to spawn the evaluation thread");
+        .context("failed to spawn the evaluation thread")?;
     match child.join() {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
