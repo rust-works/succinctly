@@ -2935,7 +2935,15 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// (`1e400`, #1095) that motivated using `serde_json::Value` here in the
 /// first place. Worth revisiting if a third leniency shows up (#2012 code
 /// review, altitude angle).
-fn normalize_json_leniently(s: &str) -> String {
+///
+/// `pub(crate)`: also called from `yq_runner::parse_json_value` (#2051) --
+/// `succinctly yq --argjson`/`--jsonargs` has its own, separate parser with
+/// no oracle-fidelity obligation to match jq's leniency (real mikefarah/yq
+/// has no `--argjson` flag at all), but sharing this one function keeps the
+/// two CLI modes from silently re-diverging on the same input the way they
+/// did between #1094/#2012 landing here and yq's copy not getting either
+/// fix.
+pub(crate) fn normalize_json_leniently(s: &str) -> String {
     normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s))
 }
 
