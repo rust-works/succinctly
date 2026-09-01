@@ -29481,7 +29481,7 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// non-negative integer; every negative, non-finite, or non-numeric input
 /// is a hard error instead of picking one of the two disagreeing legacy
 /// behaviors.
-fn classify_parent_n<S: EvalSemantics>(
+pub(crate) fn classify_parent_n<S: EvalSemantics>(
     n_value: &OwnedValue,
     depth: usize,
 ) -> Result<usize, EvalError> {

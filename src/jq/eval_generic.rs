@@ -35,16 +35,16 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
-    cannot_reserve_cross_product, classify_limit_n, classify_nth_n, collapse_vec,
-    collect_pattern_var_names, compare_values, enter_def_call_frame, eval as full_eval,
-    eval_each_owned, eval_foreach_with_values, eval_reduce_with_values, extract_pattern_bindings,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_pure_chain_link, literal_to_owned,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
-    substitute_vars, suppresses, tonumber_from_str, try_reserve_product, vec_with_capacity,
-    Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult,
-    YqSemantics,
+    cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
+    collapse_vec, collect_pattern_var_names, compare_values, enter_def_call_frame,
+    eval as full_eval, eval_each_owned, eval_foreach_with_values, eval_reduce_with_values,
+    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_component_value,
+    index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
+    literal_to_owned, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    owned_bound_to_i64, owned_to_string, slice_object_as_yq_children, slice_owned_value_read,
+    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, try_reserve_product,
+    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -5011,6 +5011,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // letting a later stage fall through `eval_builtin`'s per-builtin
             // fallback in isolation, which has no path to give it (#554).
             if exprs.iter().any(needs_path_context) {
+                // #2061: `key`/`path`/`parent` answer from the path the walk
+                // accumulates, so for a purely navigational pipe there is no
+                // reason to build an `OwnedValue` tree for the document
+                // first. `.[0] | key` cost 519 MiB on a 20 MB array to
+                // answer `0`. Anything the walk does not model returns
+                // `None` and falls through to the bridge below, unchanged.
+                if let Some(root) = cursor {
+                    if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
+                        return result;
+                    }
+                }
                 let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
                 // #1909: straight into `eval.rs`'s path-context evaluator
                 // with the tree we just built, rather than through
@@ -8762,7 +8773,13 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 // than batched -- the same per-output shape `Expr::Iterate`
                 // needs below.
                 let mut heads = Vec::new();
-                let stepped = path_step_generic::<S, V>(first, node, path, &mut heads);
+                let stepped = path_step_generic::<S, V>(
+                    first,
+                    node,
+                    path,
+                    S::COLLAPSE_DUPLICATE_KEYS,
+                    &mut heads,
+                );
                 let rest_expr = if rest.len() == 1 {
                     rest[0].clone()
                 } else {
@@ -8782,7 +8799,8 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // A terminal navigation step: take it, then emit each resulting path.
         _ => {
             let mut heads = Vec::new();
-            let stepped = path_step_generic::<S, V>(expr, node, path, &mut heads);
+            let stepped =
+                path_step_generic::<S, V>(expr, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
             for (p, _) in heads {
                 out.push(OwnedValue::Array(p));
             }
@@ -8797,6 +8815,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     node: &PathNode<V>,
     path: &[OwnedValue],
+    collapse_duplicate_keys: bool,
     out: &mut Vec<(Vec<OwnedValue>, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     match expr {
@@ -8804,7 +8823,9 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             out.push((path.to_vec(), node.clone()));
             Ok(())
         }
-        Expr::Paren(inner) => path_step_generic::<S, V>(inner, node, path, out),
+        Expr::Paren(inner) => {
+            path_step_generic::<S, V>(inner, node, path, collapse_duplicate_keys, out)
+        }
         Expr::Field(name) => {
             let next = match node {
                 PathNode::Absent => PathNode::Absent,
@@ -8881,7 +8902,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // emitted `[["a"],["a"]]` for `[path(.[])]` on
                     // `{"a":1,"a":2}`, where jq mode collapses to `[["a"]]`
                     // (#1385); caught by the evaluator-parity suite.
-                    for field in effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS)? {
+                    for field in effective_fields_checked(&fields, collapse_duplicate_keys)? {
                         let Some(key) = key_display_string(&field.key) else {
                             return Err(fields.malformed_member_error());
                         };
@@ -8898,7 +8919,18 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                     Ok(())
                 } else {
-                    Err(EvalError::cannot_iterate_with(EvalTag::Jq, &to_owned(&v)?))
+                    // `to_owned_cursor`, not `to_owned`: only the cursor
+                    // resolves an explicit YAML tag (#747), and the
+                    // materializing resolver quotes the *tagged* value back.
+                    // With `to_owned` here, `a: !!str 5 | .[] | .[]` read
+                    // "Cannot iterate over number (5)" where every other
+                    // route says `string ("5")` -- the sibling
+                    // `path_node_type_name` above already goes through the
+                    // cursor for exactly this reason.
+                    Err(EvalError::cannot_iterate_with(
+                        EvalTag::Jq,
+                        &to_owned_cursor(c)?,
+                    ))
                 }
             }
         },
@@ -8915,10 +8947,18 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                 out.push((path.to_vec(), node.clone()));
                 Ok(())
             }
-            Some((first, [])) => path_step_generic::<S, V>(first, node, path, out),
+            Some((first, [])) => {
+                path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, out)
+            }
             Some((first, rest)) => {
                 let mut heads = Vec::new();
-                let stepped = path_step_generic::<S, V>(first, node, path, &mut heads);
+                let stepped = path_step_generic::<S, V>(
+                    first,
+                    node,
+                    path,
+                    collapse_duplicate_keys,
+                    &mut heads,
+                );
                 let rest_expr = if rest.len() == 1 {
                     rest[0].clone()
                 } else {
@@ -8928,14 +8968,14 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                 // before `stepped`'s own error surfaces, for the same
                 // generator-order reason as `path_walk_generic`'s `Pipe` arm.
                 for (p, n) in heads {
-                    path_step_generic::<S, V>(&rest_expr, &n, &p, out)?;
+                    path_step_generic::<S, V>(&rest_expr, &n, &p, collapse_duplicate_keys, out)?;
                 }
                 stepped
             }
         },
         Expr::Comma(exprs) => {
             for e in exprs {
-                path_step_generic::<S, V>(e, node, path, out)?;
+                path_step_generic::<S, V>(e, node, path, collapse_duplicate_keys, out)?;
             }
             Ok(())
         }
@@ -8943,13 +8983,447 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             // Same rule as `path_walk_generic`'s own `Optional` arm: the
             // error is swallowed, the positions already reached are not.
             let mut branch = Vec::new();
-            let _ = path_step_generic::<S, V>(inner, node, path, &mut branch);
+            let _ =
+                path_step_generic::<S, V>(inner, node, path, collapse_duplicate_keys, &mut branch);
             out.append(&mut branch);
             Ok(())
         }
         // `path_expr_is_cursor_navigable` gates every caller, so nothing else
         // can arrive here.
         other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),
+    }
+}
+
+/// Whether a pipe stage carrying path context can be resolved by walking
+/// cursors instead of materializing the whole document (#2061).
+///
+/// The sibling of [`path_expr_is_cursor_navigable`], for the *other* half of
+/// #2061: `path` (no-arg), `key`, `parent` and `parent(n)` need the path
+/// accumulated across a pipe rather than a path expression resolved in one
+/// go, so `Expr::Pipe`'s bridge -- not `Builtin::Path`'s -- is what they
+/// reach.
+///
+/// Two deliberate exclusions, both narrower than the `path()` predicate:
+///
+/// * `Expr::Optional`. `?` in path context is not the same rule as `?` in a
+///   path expression -- `eval_pipe_with_path_context_internal` gives it three
+///   separate arms, one of them a bracket carve-out shared with the plain
+///   evaluator. Reproducing that here would be re-deriving semantics rather
+///   than reusing them, so `?` defers.
+/// * `parent(n)` with a computed `n`. `n` is evaluated against the *current*
+///   value, which the walk would have to materialize to do -- exactly the
+///   cost being removed. A literal covers the real uses.
+///
+/// `Expr::Array` is included so `[.[] | key]` -- whose outputs are one
+/// bounded array, not one per element -- stays on the walk too.
+fn path_context_is_cursor_walkable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Iterate | Expr::Field(_) => true,
+        Expr::Index(_) | Expr::IndexNumber { .. } => true,
+        Expr::Paren(inner) | Expr::Array(inner) => path_context_is_cursor_walkable(inner),
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_context_is_cursor_walkable),
+        Expr::Builtin(Builtin::PathNoArg | Builtin::Key | Builtin::Parent) => true,
+        Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
+        _ => false,
+    }
+}
+
+/// A position reached during a path-context walk: the node, the path that
+/// reached it, and the node at every proper prefix of that path.
+///
+/// `ancestors[i]` is the node at `path[..i]`, so `ancestors.len() ==
+/// path.len()` and `parent(n)` is a truncation of both rather than a
+/// re-navigation from the root -- which is what `resolve_ancestor_path` has
+/// to do once the document is an `OwnedValue` tree.
+///
+/// Retaining a stack of cursors is cheap and already an established pattern
+/// here: `V::Cursor` is `Copy` and 32 bytes, and `LazySource::Cursors` and
+/// `GenericResult::ManyCursor` both hold arbitrary cursor vectors across
+/// evaluation.
+struct PathContextPos<V: DocumentValue> {
+    node: PathNode<V>,
+    path: Vec<OwnedValue>,
+    ancestors: Vec<PathNode<V>>,
+}
+
+impl<V: DocumentValue> Clone for PathContextPos<V> {
+    fn clone(&self) -> Self {
+        Self {
+            node: self.node.clone(),
+            path: self.path.clone(),
+            ancestors: self.ancestors.clone(),
+        }
+    }
+}
+
+/// Why a path-context cursor walk stopped.
+enum PathContextAbort {
+    /// A genuine evaluation error, worded by the same constructors the
+    /// materializing evaluator uses.
+    Error(EvalError),
+    /// A shape this walk does not model. The caller discards whatever the
+    /// walk produced and re-runs the unmodified pipe through the
+    /// materializing bridge.
+    ///
+    /// Safe precisely because every shape the walk accepts is pure
+    /// navigation -- no builtins that compute, no `stderr`, no user
+    /// functions -- so re-running cannot repeat a side effect. That is the
+    /// constraint that sank #2053's `getpath` prototype
+    /// (`getpath(("a"|stderr))` printed `a` twice); it does not apply here.
+    Unsupported,
+}
+
+/// Emit the value at `node`, which is what a path-context pipe yields once
+/// its stages run out.
+///
+/// `to_owned_cursor` is the same helper the bridge's own
+/// `to_owned_with_cursor` reaches, so the `OwnedValue` is identical by
+/// construction -- same tag resolution (#747), same `canonicalize_numbers`
+/// (#978), same duplicate-key collapse. The difference is only that it is
+/// applied to the node actually being returned rather than to the whole
+/// document.
+///
+/// An absent node is `null`, matching the bridge continuing a missing field
+/// with `OwnedValue::Null`.
+fn path_context_emit_value<V: DocumentValue>(
+    pos: &PathContextPos<V>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), PathContextAbort> {
+    // Emitting the *root* means materializing the whole document, which is
+    // exactly what the bridge already does -- and the walk would then pay
+    // the validity gate on top of it, for a net loss. Measured on a 5.9 MB
+    // array, `.[0] | parent | length` went 0.56s -> 0.67s before this guard.
+    // So a `parent` that lands back at the root stays on the bridge; one
+    // that lands on a proper subtree still skips the whole-document tree.
+    if pos.path.is_empty() {
+        return Err(PathContextAbort::Unsupported);
+    }
+    match &pos.node {
+        PathNode::At(c) => {
+            out.push(to_owned_cursor(c).map_err(PathContextAbort::Error)?);
+            Ok(())
+        }
+        PathNode::Absent => {
+            out.push(OwnedValue::Null);
+            Ok(())
+        }
+    }
+}
+
+/// Hop `n` levels towards the root, by truncating the path and the ancestor
+/// stack rather than re-navigating from the document root.
+///
+/// `resolve_ancestor_path` answers an **empty object** -- not the root, and
+/// not the ancestor -- both when `n` overshoots the root and when the
+/// ancestor path does not resolve. That synthetic value is not a document
+/// node, so there is no cursor to continue from, and a following
+/// `.b`/`.[0]`/`.[]` would behave differently from an absent one. Hand both
+/// cases back to the bridge instead of modelling them.
+fn path_context_hop<V: DocumentValue>(
+    pos: &PathContextPos<V>,
+    n: usize,
+) -> Result<PathContextPos<V>, PathContextAbort> {
+    let len = pos
+        .path
+        .len()
+        .checked_sub(n)
+        .ok_or(PathContextAbort::Unsupported)?;
+    let node = if len == pos.path.len() {
+        pos.node.clone()
+    } else {
+        pos.ancestors[len].clone()
+    };
+    if matches!(node, PathNode::Absent) {
+        return Err(PathContextAbort::Unsupported);
+    }
+    Ok(PathContextPos {
+        node,
+        path: pos.path[..len].to_vec(),
+        ancestors: pos.ancestors[..len].to_vec(),
+    })
+}
+
+/// One path-context pipe stage that leaves the walk at a document node:
+/// a navigation step, or an ancestor hop.
+///
+/// Navigation delegates to [`path_step_generic`] rather than re-deriving it,
+/// so the mode's duplicate-key rule (#1385), the float index spelling
+/// (#1088) and every error message stay shared with the `path()` walk. Only
+/// the four steps that extend the path by exactly one component are
+/// delegated -- `Pipe`/`Comma` are composed here instead, because
+/// `path_step_generic` would grow the path by an unknown amount and the
+/// ancestor stack could not be kept in step with it.
+fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), PathContextAbort> {
+    match expr {
+        Expr::Identity => {
+            out.push(pos.clone());
+            Ok(())
+        }
+        Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
+        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate => {
+            let mut heads = Vec::new();
+            // `true`, not `S::COLLAPSE_DUPLICATE_KEYS`: the bridge this
+            // replaces materializes the document into an
+            // `OwnedValue::Object(IndexMap<String, _>)`, which collapses a
+            // repeated key structurally in *both* modes, and real yq agrees
+            // (`{"a":1,"a":2} | [.[] | key]` is `["a"]` in v4.53.3).
+            // `path()`'s own walk keeps the mode's flag, because it is not
+            // replacing a materialization.
+            let stepped = path_step_generic::<S, V>(expr, &pos.node, &pos.path, true, &mut heads);
+            for (path, node) in heads {
+                // An absent node is where the bridge and this walk genuinely
+                // disagree, so it is handed back rather than answered.
+                //
+                // The bridge *loses* path context through a missing field --
+                // `{} | .a | key` is `null` there -- and *raises* on an
+                // out-of-bounds index, where plain `.[0]` on `[]` does not.
+                // Real yq does neither: it answers `"a"`, and it
+                // auto-vivifies the missing node (`{} | .a | parent` is
+                // `{"a":null}`, `[] | .[0] | key` is `0`), all confirmed
+                // against v4.53.3. Continuing the walk here would silently
+                // change all three into a fourth answer inside a performance
+                // change, so absent positions stay on the bridge and keep
+                // today's behaviour exactly. Filed separately.
+                if matches!(node, PathNode::Absent) {
+                    return Err(PathContextAbort::Unsupported);
+                }
+                // All four steps append exactly one component, so the node
+                // they were reached from is the new position's last
+                // ancestor. Anything else means this function and
+                // `path_step_generic` have drifted apart; bail rather than
+                // record an ancestor stack that lies.
+                if path.len() != pos.path.len() + 1 {
+                    return Err(PathContextAbort::Unsupported);
+                }
+                let mut ancestors = pos.ancestors.clone();
+                ancestors.push(pos.node.clone());
+                out.push(PathContextPos {
+                    node,
+                    path,
+                    ancestors,
+                });
+            }
+            stepped.map_err(PathContextAbort::Error)
+        }
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                path_context_step_generic::<S, V>(e, pos, out)?;
+            }
+            Ok(())
+        }
+        Expr::Pipe(exprs) => match exprs.split_first() {
+            None => {
+                out.push(pos.clone());
+                Ok(())
+            }
+            Some((first, [])) => path_context_step_generic::<S, V>(first, pos, out),
+            Some((first, rest)) => {
+                let mut heads = Vec::new();
+                let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
+                for head in heads {
+                    path_context_step_generic::<S, V>(&Expr::Pipe(rest.to_vec()), &head, out)?;
+                }
+                stepped
+            }
+        },
+        // `parent`/`parent(n)` move the position without emitting anything,
+        // so `.a.b | parent | key` and `parent | parent | path` never build
+        // a value at all -- they are pure stack arithmetic.
+        Expr::Builtin(Builtin::Parent) => {
+            out.push(path_context_hop(pos, 1)?);
+            Ok(())
+        }
+        Expr::Builtin(Builtin::ParentN(n_expr)) => {
+            let Expr::Literal(lit) = &**n_expr else {
+                return Err(PathContextAbort::Unsupported);
+            };
+            // `classify_parent_n` carries yq mode's negative-wraparound rule
+            // and the `-0.5` hard error (#791/#1476), shared rather than
+            // re-derived.
+            let n = classify_parent_n::<S>(&literal_to_owned(lit), pos.path.len())
+                .map_err(PathContextAbort::Error)?;
+            out.push(path_context_hop(pos, n)?);
+            Ok(())
+        }
+        _ => Err(PathContextAbort::Unsupported),
+    }
+}
+
+/// Walk one path-context expression from `pos`, appending each emitted value
+/// to `out` (#2061).
+fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), PathContextAbort> {
+    match expr {
+        Expr::Paren(inner) => path_context_walk_generic::<S, V>(inner, pos, out),
+        Expr::Pipe(exprs) => path_context_walk_pipe::<S, V>(exprs, pos, out),
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                path_context_walk_generic::<S, V>(e, pos, out)?;
+            }
+            Ok(())
+        }
+        Expr::Array(inner) => {
+            // An error inside the collection discards the array entirely --
+            // `[path(.[]|.b)]` on a mixed object emits nothing and raises,
+            // where the same body outside brackets emits its resolved prefix
+            // first (jq 1.7.1).
+            let mut items = Vec::new();
+            path_context_walk_generic::<S, V>(inner, pos, &mut items)?;
+            out.push(OwnedValue::Array(items));
+            Ok(())
+        }
+        // The three stages that answer from the path itself. Each is bounded
+        // by the query's own depth, never by the document's size -- which is
+        // the whole point of #2061.
+        Expr::Builtin(Builtin::PathNoArg) => {
+            out.push(OwnedValue::Array(pos.path.clone()));
+            Ok(())
+        }
+        Expr::Builtin(Builtin::Key) => {
+            // At the root there is no key; the bridge answers `null` there.
+            out.push(pos.path.last().cloned().unwrap_or(OwnedValue::Null));
+            Ok(())
+        }
+        // Everything else is a step, after which the reached value is what
+        // the pipe yields.
+        _ => {
+            let mut heads = Vec::new();
+            let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
+            for head in heads {
+                path_context_emit_value(&head, out)?;
+            }
+            stepped
+        }
+    }
+}
+
+/// [`path_context_walk_generic`] over a pipe's stages, without cloning them
+/// into an `Expr::Pipe` first.
+fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    pos: &PathContextPos<V>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), PathContextAbort> {
+    match exprs.split_first() {
+        None => path_context_emit_value(pos, out),
+        Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, out),
+        Some((first, rest)) => {
+            // `key` and `path` replace the position with a *computed* value,
+            // so no document node is left for a later stage to navigate
+            // from. The bridge continues such a pipe against the ambient
+            // path; the walk does not model that, so hand it back.
+            if matches!(first, Expr::Builtin(Builtin::Key | Builtin::PathNoArg)) {
+                return Err(PathContextAbort::Unsupported);
+            }
+            let mut heads = Vec::new();
+            let stepped = path_context_step_generic::<S, V>(first, pos, &mut heads);
+            // Positions reached before a failing sibling are earlier in jq's
+            // generator order than the failure, so they are walked first.
+            for head in heads {
+                path_context_walk_pipe::<S, V>(rest, &head, out)?;
+            }
+            stepped
+        }
+    }
+}
+
+/// #2061: answer a path-context pipe from cursors, or return `None` to leave
+/// it to the materializing bridge.
+///
+/// `Expr::Pipe`'s bridge calls `to_owned_with_cursor` over the **whole
+/// document** before the first stage runs -- plus a second O(document) scan
+/// in `reindex_bridge_is_identity` -- because
+/// `eval_pipe_with_path_context_internal` operates on an `OwnedValue` tree.
+/// `.[0] | key` cost 519 MiB on a 20 MB array to answer `0`.
+///
+/// Two accepted shapes:
+///
+/// * the whole pipe is walkable; or
+/// * stage 0 is walkable and no later stage needs path context, so the rest
+///   folds through the ordinary evaluator. This is what covers
+///   `[.[] | key] | length`, whose stage 0 is an `Expr::Array`.
+///
+/// A *navigable prefix* is deliberately never split off the front: the path
+/// accumulates across stages, so evaluating `.a` separately would make
+/// `.a | (.b | path)` report `["b"]` instead of `["a","b"]`.
+fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    root: V::Cursor,
+) -> Option<GenericResult<V>> {
+    let first = exprs.first()?;
+    let (walked, rest): (&[Expr], &[Expr]) = if exprs.iter().all(path_context_is_cursor_walkable) {
+        (exprs, &[])
+    } else if path_context_is_cursor_walkable(first) && !exprs[1..].iter().any(needs_path_context) {
+        (&exprs[..1], &exprs[1..])
+    } else {
+        return None;
+    };
+
+    // The whole-document walk is not skipped, only the tree build:
+    // `to_owned_with_cursor` doubles as a validity gate (#1755/#1953), so
+    // dropping it would make these pipes start accepting documents they
+    // reject today. `push_generic_truthiness_cursor_error` is that same
+    // traversal and validation with the `OwnedValue` construction removed --
+    // the same gate `Builtin::Path` runs, for the same reason.
+    if let Some(control) = push_generic_truthiness_cursor_error(&root, 0) {
+        return Some(match control {
+            Control::Error(e) => GenericResult::Error(e),
+            Control::Break(label) => GenericResult::Break(label),
+            Control::Halt(code) => GenericResult::Halt(code),
+        });
+    }
+
+    let root_pos = PathContextPos {
+        node: PathNode::At(root),
+        path: Vec::new(),
+        ancestors: Vec::new(),
+    };
+    let mut out = Vec::new();
+    let walked_result = path_context_walk_pipe::<S, V>(walked, &root_pos, &mut out);
+
+    // #953/#1909's hazard, and the second constraint #2061's own body names.
+    // When the materialized document is *not* a reindex-bridge identity, the
+    // bridge does not merely evaluate -- it re-serializes through
+    // `to_json_for_reindex`, which re-spells a bare `Float` per mode, and
+    // every later stage sees that respelling. A YAML
+    // `10000000000000000000.0` is exactly such a float (past what
+    // `is_preservable_float_literal` keeps), so `.outer.big | parent | .big
+    // | tostring` answers with the document's spelling rather than `1e+19`.
+    //
+    // The walk emits values straight from the cursor and never crosses that
+    // bridge, so anything it produces that the bridge would have re-spelled
+    // has to go back. Checking the *emitted* values rather than the whole
+    // document keeps `key`/`path` -- whose outputs are path components --
+    // fast on a document that contains such a float somewhere else.
+    if !out.iter().all(reindex_bridge_is_identity) {
+        return None;
+    }
+
+    match walked_result {
+        Err(PathContextAbort::Unsupported) => None,
+        // Whatever resolved before the failure still stands: jq's generator
+        // never un-emits an output it already produced.
+        Err(PathContextAbort::Error(e)) => Some(partial_generic(out, Control::Error(e))),
+        Ok(()) => {
+            let resolved = owned_vec_to_generic_result::<V>(out);
+            Some(if rest.is_empty() {
+                resolved
+            } else {
+                // `false`, not the caller's `optional`, for the same reason
+                // the bridge this replaces passes `false`: that entry point
+                // restarts every evaluation at `false` regardless of what
+                // its caller passed, so `false` is what it actually
+                // delivered.
+                fold_pipe_stages::<S, V>(resolved, rest, false)
+            })
+        }
     }
 }
 
