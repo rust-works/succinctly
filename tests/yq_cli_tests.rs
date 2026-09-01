@@ -27475,6 +27475,16 @@ fn test_path_context_cursor_walk_shapes_2061() -> Result<()> {
         (".a.b.c | parent | path", NESTED, r#"["a","b"]"#),
         // A step back down through the ancestor.
         (".a.b.c | parent | .d", NESTED, "2"),
+        // A comma as a *terminal* stage (both branches answer from the path)
+        // and as a non-terminal *step*, plus a bare parenthesised stage.
+        (".a | (key, path)", r#"{"a":{"b":1}}"#, "\"a\"\n[\"a\"]"),
+        ("(.a, .b) | key", r#"{"a":1,"b":2}"#, "\"a\"\n\"b\""),
+        (
+            "[(.a.b, .a.c) | path]",
+            r#"{"a":{"b":1,"c":2}}"#,
+            r#"[["a","b"],["a","c"]]"#,
+        ),
+        ("(.a) | key", r#"{"a":{"b":1}}"#, r#""a""#),
         // Fan-out: iteration and comma, and the `Expr::Array` shape whose
         // stage 0 needs path context while the rest of the pipe does not.
         ("[.[] | key]", r#"[{"k":1},{"k":2}]"#, "[0,1]"),
