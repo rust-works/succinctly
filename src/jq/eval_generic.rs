@@ -17431,4 +17431,85 @@ mod tests {
             other => panic!("expected Control::Error, got {other:?}"),
         }
     }
+
+    /// Drive `expr` through [`eval_each_with_cursor_using`] against `json`,
+    /// returning how many outputs reached the sink and the terminating
+    /// control, if any. The demand-aware `keys_unsorted[]` arm
+    /// ([`each_lazy_keys_iterate_sink`]) is reachable only from this entry
+    /// point -- the CLI's default M2 route still uses the eager
+    /// `eval_with_cursor` (#1653) -- so these tests call it directly rather
+    /// than through a CLI round trip that would exercise the other evaluator.
+    fn drive_each(json: &[u8], expr: &str) -> (usize, Option<Control>) {
+        let expr = parse(expr).unwrap();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let mut count = 0usize;
+        let mut on_value = |_item: GenericResult<_>| {
+            count += 1;
+            true
+        };
+        let control = eval_each_with_cursor_using::<JqSemantics, _>(&expr, cursor, &mut on_value);
+        (count, control)
+    }
+
+    /// #1653: the terminal half of the #1194 check -- an unpaired tail or a
+    /// #1677 delimiter fault, neither of which has a per-key signal -- is
+    /// asked once the `keys_unsorted[]` walk reaches exhaustion, so a
+    /// consumer that walked the whole object gets the same verdict
+    /// `fold_lazy_keys_stage`'s eager arms already gave via
+    /// `walk_distinct_keys_checked`.
+    ///
+    /// The outputs produced *before* the fault are asserted too: the walk
+    /// finds it only on arrival, so the prefix has already reached the sink.
+    /// That is the same shape #1770 accepted for `limit(2;
+    /// keys_unsorted[])`, and it is what the eager route (which returns one
+    /// batched `Error` and emits nothing) does not do.
+    #[test]
+    fn each_lazy_keys_iterate_sink_raises_on_terminal_fault_at_exhaustion_1653() {
+        for json in [
+            &b"{\"a\":1,\"b\"}"[..],
+            &b"{\"a\":1,\"a\":2,\"b\"}"[..],
+            &b"{\"a\":1, invalid}"[..],
+        ] {
+            let (count, control) = drive_each(json, "keys_unsorted[]");
+            match control {
+                Some(Control::Error(err)) => assert!(
+                    err.message.contains("Invalid JSON text"),
+                    "json {json:?}: message: {}",
+                    err.message
+                ),
+                other => panic!("json {json:?}: expected Control::Error, got {other:?}"),
+            }
+            assert_eq!(count, 1, "json {json:?}: the prefix before the fault");
+        }
+    }
+
+    /// #1770's divergence, still scoped to early exit after #1653's terminal
+    /// check: a truncating consumer stops before the walk reaches the tail,
+    /// so it returns `Flow::Stopped` and is never charged for the
+    /// whole-object probe it exists to avoid. The same three documents that
+    /// raise for a bare `keys_unsorted[]` above answer at no error here.
+    #[test]
+    fn each_lazy_keys_iterate_sink_early_exit_still_skips_the_terminal_fault_1770() {
+        for json in [
+            &b"{\"a\":1,\"b\"}"[..],
+            &b"{\"a\":1,\"a\":2,\"b\"}"[..],
+            &b"{\"a\":1, invalid}"[..],
+        ] {
+            let (count, control) = drive_each(json, "first(keys_unsorted[])");
+            assert!(control.is_none(), "json {json:?}: control: {control:?}");
+            assert_eq!(count, 1, "json {json:?}");
+        }
+    }
+
+    /// The check costs a well-formed object nothing but a verdict: every key
+    /// still reaches the sink and no control is raised. Guards against the
+    /// `is_malformed()` call being asked before exhaustion, where
+    /// `ended_unpaired` is not yet meaningful.
+    #[test]
+    fn each_lazy_keys_iterate_sink_well_formed_object_is_unaffected_1653() {
+        let (count, control) = drive_each(b"{\"a\":1,\"b\":2,\"c\":3}", "keys_unsorted[]");
+        assert!(control.is_none(), "control: {control:?}");
+        assert_eq!(count, 3);
+    }
 }
