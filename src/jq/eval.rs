@@ -16299,7 +16299,8 @@ impl PathAssignOutcome {
 /// only answers the per-path question.
 ///
 /// `path` is flattened via [`push_path_components`] first -- the same
-/// flattener `split_at_slice` already uses internally -- rather than
+/// flattener `set_path`'s own walk already uses (via
+/// [`flatten_path_components`]) -- rather than
 /// matched directly (bare component vs. `Expr::Pipe`), so a nested
 /// `Pipe`/`Paren`/`Optional` anywhere in the chain (`(.a|.b)[0] = v`,
 /// structurally the same target as `.a.b[0] = v`) is seen through
@@ -16309,8 +16310,9 @@ impl PathAssignOutcome {
 /// the prefix walk, silently disagreeing with itself on two spellings of
 /// the identical target (`.a.b[0] = error(...)` correctly no-op'd while
 /// `(.a|.b)[0] = error(...)` didn't) -- the exact "mirroring a precedent
-/// without its fix" pattern `get_path_mut`'s own #1287/#1294 nested-`Pipe`
-/// splice already had to solve once for the write side. `?` anywhere in
+/// without its fix" pattern #1287/#1294's own nested-`Pipe` splice already
+/// had to solve once for the write side (then inside `get_path_mut`'s walk,
+/// now done once up front by the same flattener named above -- #1429). `?` anywhere in
 /// the chain (whole-path, terminal, or a middle component) is transparent
 /// through the same flattening + [`unwrap_path_component`] the checks
 /// below use -- `?` introduces no evaluation of its own to worry about
@@ -16398,11 +16400,11 @@ fn yq_assign_classify(path: &Expr, root: &OwnedValue) -> PathAssignOutcome {
 /// `Array`/`Object` elements whenever a mid-chain `Expr::Iterate` fans into
 /// a real container, instead of `navigate_read_only`'s own unconditional
 /// `Absent` for that case (#1432) -- a read-only, non-mutating dry run of
-/// `set_path_through_iterate`'s own per-element recursion, restricted to
+/// [`set_path_steps`]'s own per-element `Iterate` recursion, restricted to
 /// the `Field`/`Index`/`IndexNumber`/`Iterate` step vocabulary that's all
 /// `yq_assign_classify`'s own slice/terminal-shape gates ever let through.
 /// `TotalNoop` whenever a fanned-into container is empty --
-/// `set_path_through_iterate` itself does nothing when there are no
+/// [`set_path_steps`]'s own `Iterate` arm does nothing when there are no
 /// elements to iterate -- and `RhsUnusedButChanges` (not `TotalNoop`)
 /// whenever a mid-chain `Iterate` reaches `Null`: real yq's `.a[].b = v` on
 /// `a: null` autovivifies `null` to `[]` as part of the write itself
@@ -16507,7 +16509,7 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
 /// `.all()`-based walks' own short-circuit), and otherwise aggregates
 /// `TotalNoop`/`RhsUnusedButChanges` across all of them -- `TotalNoop` only
 /// if every element was (vacuously true for zero elements, matching
-/// `set_path_through_iterate`'s own no-op-on-empty behavior), the wider
+/// [`set_path_steps`]'s own `Iterate` arm doing nothing when empty), the wider
 /// `RhsUnusedButChanges` as soon as even one element autovivified.
 fn classify_yq_assign_fanout<'a>(
     elements: impl Iterator<Item = &'a OwnedValue>,
@@ -16772,7 +16774,7 @@ fn yq_del_slice_outcome(
 
 /// Read-only navigation used by [`yq_del_slice_outcome`]'s prefix peek: does
 /// every step of `steps` resolve, through `root`, to an existing value?
-/// Unlike `get_path_mut`, never autovivifies (a peek must not create
+/// Unlike [`set_path_steps`], never autovivifies (a peek must not create
 /// structure the caller's own real walker would otherwise leave untouched).
 ///
 /// Used to return a three-way `Resolved`/`HitScalar`/`Absent` outcome
@@ -16790,7 +16792,7 @@ fn yq_del_slice_outcome(
 /// (#1863).
 ///
 /// A second, hand-synchronized walker rather than a shared traversal
-/// `get_path_mut` itself could call — code review flagged this against the
+/// [`set_path_steps`] itself could call — code review flagged this against the
 /// same "duplicated predicates diverge silently" lesson `is_owned_container`
 /// was factored out to avoid (#106). Kept separate anyway: the two have
 /// different write permissions (this one is read-only by design, the other
@@ -17896,38 +17898,6 @@ fn reaches_iterate(expr: &Expr) -> bool {
     }
 }
 
-/// #1428: does reaching `tail` from a *freshly created* parent actually write
-/// anything?
-///
-/// Walking to a write target autovivifies every missing step on the way, but
-/// some tails then write nothing at all -- an `Iterate` over the `Null` that
-/// autovivification just produced has no elements to assign to. jq treats path
-/// collection as read-only until a write is confirmed, so it leaves the
-/// document alone; succinctly used to leave the fabricated chain behind
-/// (`null | .a[]? = 9` gave `{"a":null}` instead of `null`).
-///
-/// Running the real tail against a detached `Null` answers the question
-/// without touching the document, and without a second copy of the walking
-/// rules that could drift from the one that does the writing:
-///
-/// * it raises -> the error propagates and the document stays pristine
-///   (matching jq, which emits no document for `null | .a[] = 9` either);
-/// * it leaves the probe `Null` -> nothing would be written, so the caller
-///   must not create anything;
-/// * it leaves a value behind -> something genuinely wants that parent. yq's
-///   own `null`-to-`[]` autovivify (#1181: `null | .a[] = 99` is `{"a": []}`
-///   in real yq) lands here, so the caller goes on to build the chain.
-///
-/// Only called when the parent is known to be missing, so the common case
-/// pays nothing.
-fn tail_writes_from_fresh_parent(
-    run: impl FnOnce(&mut OwnedValue) -> Result<(), EvalError>,
-) -> Result<bool, EvalError> {
-    let mut probe = OwnedValue::Null;
-    run(&mut probe)?;
-    Ok(!matches!(probe, OwnedValue::Null))
-}
-
 /// Set a value at a path in an owned value.
 fn set_path<S: EvalSemantics>(
     root: &mut OwnedValue,
@@ -17970,194 +17940,42 @@ fn set_path<S: EvalSemantics>(
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
-            // For chained paths like .a.b.c, navigate to parent and set at last element
-            if exprs.len() == 1 {
-                set_path::<S>(root, &exprs[0], new_value, scalar_noop, container_noop)
-            } else if let Some(split) = split_at_iterate(exprs) {
-                // #1428: walking to `split.before` autovivifies every missing
-                // step along the way, but an `Iterate` over the `Null` that
-                // creates yields *no* elements, so the tail writes nothing and
-                // the fabricated chain is stranded -- `null | .a[]? = 9` gave
-                // `{"a":null}` where jq leaves `null` untouched. jq treats path
-                // collection as read-only until a write is confirmed.
-                //
-                // Ask first whether `before` already resolves. If it does, no
-                // creation can happen and this is the pre-existing path,
-                // unchanged. If it does not, run the *same* tail against a
-                // detached `Null` to learn what reaching it would actually do,
-                // without touching `root`:
-                //
-                // * it raises (`.a[] = 9`, no `?`) -> propagate, `root` still
-                //   pristine, matching jq, which also emits no document;
-                // * it writes nothing -> return without creating anything;
-                // * it leaves a value behind -> yq's own `null`-to-`[]`
-                //   autovivify (#1181, `null | .a[] = 99` is `{"a": []}` in
-                //   real yq) genuinely wants the chain, so fall through and
-                //   build it for real.
-                //
-                // Probing costs one extra walk only when `before` is missing,
-                // and `new_value` is an already-computed value, so evaluating
-                // the tail twice cannot double any side effect.
-                let mut would_create = false;
-                if get_path_mut(root, &split.before, scalar_noop, false, &mut would_create)?
-                    .is_none()
-                    // Only when the parent is genuinely *missing*. A `None`
-                    // because an earlier component was `?`-suppressed
-                    // (`5 | .a?.b[].c = 9`) means the write is already
-                    // cancelled, and probing the tail from a `Null` would
-                    // manufacture a "Cannot iterate over null" that jq never
-                    // raises -- the creating walk below returns `Ok(())` for
-                    // that case on its own, exactly as it did before #1428.
-                    && would_create
-                    && !tail_writes_from_fresh_parent(|probe| {
-                        set_path_through_iterate::<S>(
-                            probe,
-                            split.optional,
-                            &split.tail,
-                            new_value.clone(),
-                            scalar_noop,
-                            container_noop,
-                        )
-                    })?
-                {
-                    return Ok(());
-                }
-                match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
-                    None => Ok(()),
-                    Some(target) => set_path_through_iterate::<S>(
-                        target,
-                        split.optional,
-                        &split.tail,
-                        new_value,
-                        scalar_noop,
-                        container_noop,
-                    ),
-                }
-            } else if let Some(split) = split_at_slice(exprs) {
-                // #1428, the slice twin of the `split_at_iterate` guard above.
-                // A slice write on a missing parent usually *does* write
-                // (`null | .a[0:1] = [9]` is `{"a":[9]}`), which is why this
-                // arm was originally left alone -- but a slice can also be a
-                // read-through step whose own tail declines to write
-                // (`null | .a[0:1][]? = 9`), and then the `.a` built to reach
-                // it is stranded exactly as before.
-                //
-                // No `reaches_iterate` test is needed here: `through_slice`'s
-                // `Null` arm returns `Ok` with the probe still `Null` only
-                // when nothing was written at all, and a terminal slice
-                // assignment of `null` raises rather than landing there. So
-                // "the probe is still `Null`" is an exact reading on this
-                // path.
-                //
-                // jq mode only (`container_noop` is `S::TAG == EvalTag::Yq`
-                // at every call site, the same reading `through_slice`'s own
-                // `Null` arm relies on). Real yq keeps the chain here even
-                // though its container no-op discards the write itself:
-                // `null | .a[0:1] = 9` is `a: null` in yq v4.53.3, so the
-                // probe -- which sees only that nothing was written -- would
-                // wrongly skip creating `.a`.
-                let mut would_create = false;
-                if !container_noop
-                    && get_path_mut(root, &split.before, scalar_noop, false, &mut would_create)?
-                        .is_none()
-                    && would_create
-                    && !tail_writes_from_fresh_parent(|probe| {
-                        through_slice(
-                            probe,
-                            split.start,
-                            split.end,
-                            SliceEditFlags {
-                                optional: split.optional,
-                                scalar_noop,
-                                container_noop,
-                                terminal_write: matches!(split.tail, Expr::Identity),
-                            },
-                            // `set_path` (`=`) has no `|= empty` concept --
-                            // its RHS is always a real, already-materialized
-                            // value (#1877/#1894, see `always_wrote`).
-                            |sub| {
-                                always_wrote(set_path::<S>(
-                                    sub,
-                                    &split.tail,
-                                    new_value.clone(),
-                                    scalar_noop,
-                                    container_noop,
-                                ))
-                            },
-                        )
-                        .map(|_| ())
-                    })?
-                {
-                    return Ok(());
-                }
-                match get_path_mut(root, &split.before, scalar_noop, true, &mut false)? {
-                    None => Ok(()),
-                    Some(parent) => through_slice(
-                        parent,
-                        split.start,
-                        split.end,
-                        SliceEditFlags {
-                            optional: split.optional,
-                            scalar_noop,
-                            container_noop,
-                            // `split_at_slice` gives an `Identity` tail
-                            // when the slice is genuinely the *last* path
-                            // component (`.a[0:1] = v`, nothing after
-                            // it) — that's a terminal write in disguise,
-                            // not a mid-chain read-through, however this
-                            // arm reached it (#1321).
-                            terminal_write: matches!(split.tail, Expr::Identity),
-                        },
-                        // See the probe closure above for why this always
-                        // reports `true`.
-                        |sub| {
-                            always_wrote(set_path::<S>(
-                                sub,
-                                &split.tail,
-                                new_value,
-                                scalar_noop,
-                                container_noop,
-                            ))
-                        },
-                    )
-                    .map(|_| ()),
-                }
+            // #1429: one flat, peel-one-component-and-recurse walk, the shape
+            // `update_path` and `delete_at_path` already use -- not a
+            // pre-scan for special constructs ahead of a separate
+            // one-mutable-slot navigation pass. `get_path_mut` could only
+            // ever hand back a single slot, so every construct naming *many*
+            // slots (`.[]`, `[a:b]`) needed its own flatten-then-scan-then-
+            // bail helper bolted in front of it (`split_at_iterate`,
+            // `split_at_slice`), and "the leftmost such construct wins" was
+            // an invariant maintained by call-site ordering plus reciprocal
+            // bail checks between those helpers rather than by the code's
+            // shape. Walking one component at a time makes leftmost-wins
+            // structural: whichever construct comes first is simply the
+            // first arm [`set_path_steps`] reaches.
+            //
+            // Flattened at most once, here, rather than once per helper and
+            // again at every recursion level: `.items[].containers[].env[] =
+            // v` used to re-flatten an already-flat tail on each fan-out
+            // step, and `(.a|.c)[0] = 9` -- a nested group with neither an
+            // iterate nor a slice in it -- used to pay *both* helpers' full
+            // flatten before either concluded it had nothing to do.
+            if exprs.iter().all(is_atomic_path_component) {
+                // The overwhelmingly common shape (`.a.b.c[0] = 9`) is
+                // already flat, so walk it borrowed. Strictly fewer
+                // allocations than before, not merely parity:
+                // `get_path_mut` used to clone the component list
+                // (`path_parts.to_vec()`) plus a parallel `vec![false; len]`
+                // for this same case.
+                set_path_steps::<S>(root, exprs, new_value, scalar_noop, container_noop)
             } else {
-                // Navigate to parent
-                let parent_path = &exprs[..exprs.len() - 1];
-                let last_path = &exprs[exprs.len() - 1];
-
-                // #1428, same guard as the `split_at_iterate` arm above --
-                // needed separately because a *terminal* `Iterate`
-                // (`.a[]? = 9`) is explicitly not `split_at_iterate`'s case
-                // and lands here instead. A terminal `Field`/`Index` probe
-                // writes into the detached `Null` and so falls straight
-                // through, leaving `null | .a = 9` and friends untouched.
-                let mut would_create = false;
-                if reaches_iterate(last_path)
-                    && get_path_mut(root, parent_path, scalar_noop, false, &mut would_create)?
-                        .is_none()
-                    // See the `split_at_iterate` arm above.
-                    && would_create
-                    && !tail_writes_from_fresh_parent(|probe| {
-                        set_path::<S>(
-                            probe,
-                            last_path,
-                            new_value.clone(),
-                            scalar_noop,
-                            container_noop,
-                        )
-                    })?
-                {
-                    return Ok(());
-                }
-
-                match get_path_mut(root, parent_path, scalar_noop, true, &mut false)? {
-                    None => Ok(()),
-                    Some(parent) => {
-                        set_path::<S>(parent, last_path, new_value, scalar_noop, container_noop)
-                    }
-                }
+                set_path_steps::<S>(
+                    root,
+                    &flatten_path_components(exprs),
+                    new_value,
+                    scalar_noop,
+                    container_noop,
+                )
             }
         }
         Expr::Optional(inner) => {
@@ -18245,6 +18063,289 @@ fn set_path<S: EvalSemantics>(
         _ => Err(EvalError::new(
             "cannot use expression as assignment target".to_string(),
         )),
+    }
+}
+
+/// Is this path component already atomic — something [`set_path_steps`] can
+/// match directly, with no flattening needed?
+///
+/// [`unwrap_path_component`] is what the walker itself uses to look through
+/// `Optional`/`Paren` wrappers, so those are transparent here too: only a
+/// `Pipe` (or a `Pipe` hiding inside one of those wrappers), an `Identity`
+/// that has to be dropped, or an unresolved computed component makes a list
+/// non-atomic and sends it through [`flatten_path_components`] first.
+fn is_atomic_path_component(expr: &Expr) -> bool {
+    matches!(
+        unwrap_path_component(expr).0,
+        Expr::Field(_)
+            | Expr::Index(_)
+            | Expr::IndexNumber { .. }
+            | Expr::Iterate
+            | Expr::Slice { .. }
+            | Expr::SliceNumber { .. }
+    )
+}
+
+/// Walk a *flat* list of atomic path components, peeling one per call, and
+/// write `new_value` at the end (#1429).
+///
+/// The single walker behind `=`'s chained-path handling, replacing the
+/// `split_at_iterate`/`split_at_slice`/`get_path_mut` trio. `steps` is flat
+/// by construction — either already atomic (see [`is_atomic_path_component`])
+/// or run through [`flatten_path_components`] by the caller — so there is no
+/// `Pipe` arm here and no per-level re-flatten: `#1287`/`#1294`'s nested-pipe
+/// splicing and per-group `?` scoping are done once by
+/// [`push_path_components`], which recursively flattens an `Optional`'s own
+/// contents and re-wraps each resulting component individually (#1311),
+/// exactly as [`splice_optional_group`] does for `update_path`.
+///
+/// Mirrors `update_path`'s `Expr::Pipe` arm arm-for-arm, including its
+/// undo-after-write treatment of #1428's stranded autovivification: walking
+/// toward a write target creates every missing step on the way, but a tail
+/// that turns out to write nothing (an `Iterate` over the `Null` that
+/// autovivification just produced has no elements) must leave the document
+/// alone. `set_path` used to answer that by *probing* a detached `Null`
+/// before committing, because `get_path_mut`'s loop could not be walked back
+/// up; here the frame that created the slot is still live when the recursion
+/// returns, so it simply undoes it. An error on the way out needs no undo:
+/// `fork_rhs_over_paths` discards the whole partially-written document for
+/// that RHS output, so a half-built chain is never observable.
+fn set_path_steps<S: EvalSemantics>(
+    root: &mut OwnedValue,
+    steps: &[Expr],
+    new_value: OwnedValue,
+    scalar_noop: bool,
+    container_noop: bool,
+) -> Result<(), EvalError> {
+    let (first, rest) = match steps {
+        // Everything was `Identity` (`(. | .) = 9`), so this *is* the write.
+        [] => {
+            *root = new_value;
+            return Ok(());
+        }
+        [last] => {
+            // A `?`-marked *terminal slice* reached through a chain
+            // (`.a[0:1]? = 9`) is the one component that must not go through
+            // `set_path`'s `Expr::Optional` catch-and-swallow arm: the split
+            // this replaced threaded the `?` into `through_slice`'s own
+            // bounds gate instead (#1303), which suppresses an out-of-range
+            // slice while still leaving `slice_assign_non_array`/
+            // `cannot_update_string_slices` to raise. Catch-and-swallow
+            // would abandon the whole write instead. Every other terminal
+            // component -- including a `?`-marked `Field`/`Index`/`Iterate`,
+            // which the split-based walker also routed through
+            // catch-and-swallow -- delegates unchanged.
+            let (component, optional) = unwrap_path_component(last);
+            if let Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } = component {
+                return through_slice(
+                    root,
+                    *start,
+                    *end,
+                    SliceEditFlags {
+                        optional,
+                        scalar_noop,
+                        container_noop,
+                        // The slice genuinely is the last path component, so
+                        // this call's own `edit` is the write (#1321).
+                        terminal_write: true,
+                    },
+                    // Always `true` -- `=`'s RHS is an already-materialized
+                    // value, it has no `|= empty` concept (#1877/#1894).
+                    |sub| {
+                        *sub = new_value;
+                        Ok(true)
+                    },
+                )
+                .map(|_| ());
+            }
+            return set_path::<S>(root, last, new_value, scalar_noop, container_noop);
+        }
+        [first, rest @ ..] => (first, rest),
+    };
+
+    let (component, optional) = unwrap_path_component(first);
+    // #1232, as `get_path_mut` computed it: a scalar hit *before* the last
+    // path component (`.a.b = 99` on a scalar root) no-ops in yq mode rather
+    // than erroring. Computed once per frame rather than at each arm's own
+    // `else if`: `autovivify_object`/`autovivify_array` only ever convert
+    // `Null` into a container, and `is_yq_field_index_noop_scalar` already
+    // excludes `Null`, so the answer is identical before or after they run.
+    let noop_here = scalar_noop && is_yq_field_index_noop_scalar(root);
+    // #1428's undo, jq mode only -- the same gate `update_path` calls
+    // `undo_stranded`. Real yq *wants* the chain a suppressed write leaves
+    // behind (`null | .a[] = 99` is `{"a": []}` there, #1181), and the probe
+    // this replaced was already inert in yq mode for exactly that reason:
+    // yq's own `null`-to-`[]` autovivify made every probe come back
+    // non-`Null`, so it always fell through and built the chain.
+    let undo_stranded = S::TAG != EvalTag::Yq;
+    // Only an `Iterate` can decline to write over the `Null` this frame just
+    // created, so only when one is somewhere in `rest` does "the slot is
+    // still `Null`" mean "nothing was written" -- for every other component
+    // a write whose value happens to be `null` is indistinguishable from no
+    // write at all by looking at the slot (`null | (.a|.) = null` must keep
+    // `{"a": null}`). Checked across the whole remaining chain, not just its
+    // head: a frame two levels above the iterate still has to undo its own
+    // slot, and the inner frame restores *its* parent to `Null` on the way
+    // out, so the outer frame's reading is accurate again by the time it
+    // looks.
+    let rest_reaches_iterate = rest.iter().any(reaches_iterate);
+
+    match component {
+        // `push_path_components` drops these, but the borrowed fast path
+        // does not run it -- an `Identity` is simply nothing to navigate.
+        Expr::Identity => set_path_steps::<S>(root, rest, new_value, scalar_noop, container_noop),
+        Expr::Field(name) => {
+            let root_was_null = matches!(root, OwnedValue::Null);
+            autovivify_object(root);
+            if let OwnedValue::Object(map) = root {
+                let created = !map.contains_key(name);
+                let (result, stranded) = {
+                    let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
+                    let result =
+                        set_path_steps::<S>(current, rest, new_value, scalar_noop, container_noop);
+                    let stranded = created
+                        && undo_stranded
+                        && rest_reaches_iterate
+                        && result.is_ok()
+                        && matches!(*current, OwnedValue::Null);
+                    (result, stranded)
+                };
+                if stranded {
+                    map.shift_remove(name);
+                    if root_was_null && map.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                }
+                result
+            } else if optional || noop_here {
+                Ok(())
+            } else {
+                Err(EvalError::cannot_index_with_field(
+                    owned_type_name(root),
+                    name,
+                ))
+            }
+        }
+        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            let root_was_null = matches!(root, OwnedValue::Null);
+            autovivify_array(root);
+            if let OwnedValue::Array(arr) = root {
+                let original_len = arr.len();
+                let (result, stranded) = {
+                    // A still-negative index after counting back from the
+                    // end is jq's write-time bounds check, which `?` never
+                    // covers -- so `write_index`'s error propagates here
+                    // rather than being folded into the `optional` branch
+                    // below, exactly as `get_path_mut` had it.
+                    let current = write_index(arr, *idx)?;
+                    let result =
+                        set_path_steps::<S>(current, rest, new_value, scalar_noop, container_noop);
+                    let stranded = undo_stranded
+                        && rest_reaches_iterate
+                        && result.is_ok()
+                        && matches!(*current, OwnedValue::Null);
+                    (result, stranded)
+                };
+                // `write_index` pads with `Null`s to reach a positive
+                // out-of-range index, so the undo restores the original
+                // length rather than removing a single slot -- and does
+                // nothing at all when the slot already existed.
+                if stranded && arr.len() > original_len {
+                    arr.truncate(original_len);
+                    if root_was_null && arr.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                }
+                result
+            } else if optional || noop_here {
+                Ok(())
+            } else {
+                Err(EvalError::cannot_index_with_type(
+                    owned_type_name(root),
+                    "number",
+                ))
+            }
+        }
+        Expr::Iterate => {
+            // `.[]` names every element/value, not one slot, so the write
+            // fans out and each element re-applies the whole remaining chain
+            // independently (#1298). Deliberately the same rules as
+            // `set_path`'s own terminal `Expr::Iterate` arm -- a mid-chain
+            // `.[]` is not semantically different from a terminal one, just
+            // followed by more path -- including #1181's yq-only
+            // `null`-to-`[]` autovivify, which unlike `Field`/`Index`'s
+            // unconditional autovivify is gated on `scalar_noop` rather than
+            // run up front.
+            if scalar_noop {
+                autovivify_array(root);
+            }
+            match root {
+                OwnedValue::Array(arr) => {
+                    for elem in arr.iter_mut() {
+                        set_path_steps::<S>(
+                            elem,
+                            rest,
+                            new_value.clone(),
+                            scalar_noop,
+                            container_noop,
+                        )?;
+                    }
+                    Ok(())
+                }
+                OwnedValue::Object(map) => {
+                    for (_, elem) in map.iter_mut() {
+                        set_path_steps::<S>(
+                            elem,
+                            rest,
+                            new_value.clone(),
+                            scalar_noop,
+                            container_noop,
+                        )?;
+                    }
+                    Ok(())
+                }
+                _ if optional || noop_here => Ok(()),
+                _ => Err(EvalError::cannot_iterate_with(S::TAG, root)),
+            }
+        }
+        // The chain continues *inside* the slice, so the rest of the walk
+        // runs against the extracted sub-array and is spliced back.
+        // `terminal_write` is always `false` here: `steps` is flat and this
+        // is not its last element, so there is real path left after the
+        // slice for `edit` to navigate (#1321).
+        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
+            root,
+            *start,
+            *end,
+            SliceEditFlags {
+                optional,
+                scalar_noop,
+                container_noop,
+                terminal_write: false,
+            },
+            // See the terminal-slice call above for why this is always `true`.
+            |sub| {
+                always_wrote(set_path_steps::<S>(
+                    sub,
+                    rest,
+                    new_value,
+                    scalar_noop,
+                    container_noop,
+                ))
+            },
+        )
+        .map(|_| ()),
+        // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
+        // into a static component before this runs. Explicit rather than left
+        // to the catch-all so a missed install point fails loudly here instead
+        // of being reported as a user error.
+        Expr::IndexExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed index in path component",
+        )),
+        Expr::SliceExpr { .. } => Err(EvalError::new(
+            "internal error: unresolved computed slice in path component",
+        )),
+        _ => Err(EvalError::new("invalid path component")),
     }
 }
 
@@ -18643,412 +18744,21 @@ fn through_slice<E: From<EvalError>>(
     }
 }
 
-/// Where a chained path crosses a slice, as [`split_at_slice`] found it.
-struct SliceSplit {
-    /// The components to navigate before reaching the slice.
-    before: Vec<Expr>,
-    start: Option<i64>,
-    end: Option<i64>,
-    /// Whether the slice itself carried a `?` (`.a[0:1]?[0] = 9`) — threaded
-    /// into `through_slice`'s own `optional` parameter so a genuinely
-    /// non-sliceable target there is suppressed the same way a bare
-    /// `.a[0:1]? = 9` already is (#1303). Write-time application errors
-    /// (`slice_assign_non_array`/`cannot_update_string_slices`) are
-    /// unaffected either way — `through_slice` never gates those on
-    /// `optional` at all, matching real jq never suppressing them via an
-    /// inline `?`.
-    optional: bool,
-    /// Everything left to apply *inside* the slice, as one expression.
-    tail: Expr,
-}
-
-/// Flatten `exprs` via [`push_path_components`] — shared by [`split_at_slice`]
-/// and [`split_at_iterate`], which both need the identical flatten before
-/// their own scan (the first for the first `Slice`, the second for the
-/// first non-terminal `Iterate`).
+/// Flatten `exprs` into a list of atomic path components via
+/// [`push_path_components`] — nested `Pipe`/`Paren` groups spliced in place,
+/// `Identity` dropped, and an `Optional` group's own contents re-wrapped
+/// component by component (#1311) so a `?` on a whole group stays scoped to
+/// that group.
+///
+/// Run at most once per assignment, by `set_path`'s `Expr::Pipe` arm, and
+/// only when the components are not already atomic — [`set_path_steps`]
+/// then walks the result without ever flattening again (#1429).
 fn flatten_path_components(exprs: &[Expr]) -> Vec<Expr> {
     let mut flat = vec_with_capacity(exprs.len());
     for e in exprs {
         push_path_components(&mut flat, e);
     }
     flat
-}
-
-/// Split a chained path at its first slice, if it has one.
-///
-/// A slice names a *range*, not a slot, so `get_path_mut` cannot navigate
-/// through one — `.a[1:2][0] = 9` would fail on the middle component — and the
-/// walker has to hand off to [`through_slice`] there instead.
-///
-/// Flattens via [`flatten_path_components`] before scanning, so a slice
-/// nested inside a parenthesized sub-path that is itself only one of several
-/// top-level components — `(.a[0:1])[0] = 9`, where `(.a[0:1])` arrives as a
-/// single `Expr::Pipe([Field("a"), Slice{..}])` slot — is still found (#1292).
-/// A single-element Pipe never reaches here: `set_path`'s own `Paren`/`Pipe`
-/// arms already unwrap that case before calling this function, so the slice
-/// would already be at the top level of a *fresh* call. This function only
-/// has to handle a compound sub-path sitting *alongside* other components.
-///
-/// Each flattened element is matched via [`unwrap_path_component`] (not a
-/// bare `matches!`), so a `?`-marked slice — `.a[0:1]?[0] = 9`, or
-/// `(.a[0:1]?)[0] = 9` once `push_path_components` has flattened the
-/// enclosing parens away — is still found (#1303).
-///
-/// Also reaches through a `Pipe`/`Paren` nested *inside* an `Optional`
-/// wrapper — e.g. a `?` on a whole multi-component group ahead of a further
-/// step, `((.a[0:1])? | .[0]) = 9` — since `push_path_components` (#1311)
-/// recursively flattens an `Expr::Optional`'s own contents and re-wraps each
-/// resulting component individually, rather than leaving the wrapper
-/// opaque. Unlike the glued-postfix form (`(.a|.c)?[0] = 9`, confirmed a jq
-/// parse error), the `|`-separated spelling above genuinely parses in both
-/// real jq and here (`path((.a[0:1])? | .[0])` resolves fine), and now
-/// resolves through `=` too, matching jq.
-fn split_at_slice(exprs: &[Expr]) -> Option<SliceSplit> {
-    // Cheap common-case guard: the overwhelming majority of assignment
-    // targets (`.a.b.c[2] = 9`) contain neither a slice nor a nested
-    // `Pipe`/`Paren`/`Optional` component that could hide one, so skip the
-    // allocate-and-clone flatten below entirely when nothing here could
-    // possibly need it. Exactly equivalent to running the flatten and
-    // finding nothing: `push_path_components` only ever transforms a
-    // `Pipe`/`Paren` element, and the scan below only ever looks *through*
-    // `Optional`/`Paren` wrappers via `unwrap_path_component` — so a
-    // top-level element whose own unwrapped core is none of `Slice`/`Pipe`
-    // reaches the flattened list (and this scan) completely unchanged.
-    if exprs.iter().all(|e| {
-        let component = unwrap_path_component(e).0;
-        !component.is_slice() && !matches!(component, Expr::Pipe(_))
-    }) {
-        return None;
-    }
-    let mut flat = flatten_path_components(exprs);
-    let at = flat
-        .iter()
-        .position(|e| unwrap_path_component(e).0.is_slice())?;
-    let (optional, start, end) = match unwrap_path_component(&flat[at]) {
-        (Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }, optional) => {
-            (optional, *start, *end)
-        }
-        _ => unreachable!("position matched a Slice"),
-    };
-    let rest = flat.split_off(at + 1);
-    flat.truncate(at);
-    Some(SliceSplit {
-        before: flat,
-        start,
-        end,
-        optional,
-        // An empty tail means the slice itself is the target, which `Identity`
-        // against the extracted sub-array says exactly.
-        tail: if rest.is_empty() {
-            Expr::Identity
-        } else {
-            Expr::Pipe(rest)
-        },
-    })
-}
-
-/// Where a chained path crosses a *non-terminal* `Iterate` (`.[]`), as
-/// [`split_at_iterate`] found it.
-struct IterateSplit {
-    /// The components to navigate before reaching the `Iterate`.
-    before: Vec<Expr>,
-    /// Whether the `Iterate` itself carried a `?` (`.a[]?[0] = 9`).
-    optional: bool,
-    /// Everything left to apply to *each* fanned-out element, as one
-    /// expression.
-    tail: Expr,
-}
-
-/// Split a chained path at its first *non-terminal* `Iterate`, if it has
-/// one.
-///
-/// `.[]` names every element/value in a container, not one slot, so
-/// `get_path_mut` cannot navigate through it the way it does a `Field`/
-/// `Index` — `.a[][0] = 9` has to fan out and apply `[0] = 9` independently
-/// to each of `.a`'s own elements, not find one shared parent slot to hand
-/// back (#1298). A *terminal* `Iterate` (`.a[] = 9`, nothing left after it)
-/// needs none of this: it already reaches `set_path`'s own top-level
-/// `Iterate` arm correctly via the ordinary `parent_path`/`last_path`
-/// split, so this function deliberately returns `None` for that shape —
-/// `at == flat.len() - 1` below is exactly that check.
-///
-/// Checked *before* [`split_at_slice`] in `set_path`'s `Pipe` arm: an
-/// `Iterate` fans out into independent per-element writes, each of which
-/// then re-resolves whatever slice/index/field remains in its own
-/// recursive `set_path` call — including a slice that comes *after* the
-/// `Iterate` in the chain (`.a[][0:2] = v`). A slice that comes *before*
-/// the `Iterate` is the opposite ordering, and is deliberately left to
-/// `split_at_slice` instead: this function bails (`None`) whenever a slice
-/// exists earlier in the flattened chain than the `Iterate` it would
-/// otherwise split on, so `split_at_slice` runs first, hands the residual
-/// `Iterate` to `through_slice`'s own closure as part of its `tail`, and
-/// this function gets a fresh, slice-free look at it on the next
-/// recursive `set_path` call. Without that check, this function's own
-/// `before` could itself contain the earlier slice — a component
-/// `get_path_mut` (which this function's caller navigates `before` with)
-/// cannot walk through any more than it can walk through an `Iterate`.
-///
-/// Flattens via [`flatten_path_components`] first, same as `split_at_slice`,
-/// so a `.[]` nested inside a parenthesized sub-path (`(.a[])[0] = 9`) is
-/// still found.
-fn split_at_iterate(exprs: &[Expr]) -> Option<IterateSplit> {
-    // Cheap common-case guard, mirroring `split_at_slice`'s own: skip the
-    // flatten entirely when nothing here could possibly hide an `Iterate`.
-    if exprs.iter().all(|e| {
-        let component = unwrap_path_component(e).0;
-        !matches!(component, Expr::Iterate | Expr::Pipe(_))
-    }) {
-        return None;
-    }
-    let mut flat = flatten_path_components(exprs);
-    let at = flat
-        .iter()
-        .position(|e| matches!(unwrap_path_component(e).0, Expr::Iterate))?;
-    if at == flat.len() - 1 {
-        // Terminal position -- not this function's case.
-        return None;
-    }
-    if flat[..at]
-        .iter()
-        .any(|e| unwrap_path_component(e).0.is_slice())
-    {
-        // An earlier slice takes precedence -- see the doc comment above.
-        return None;
-    }
-    let (_, optional) = unwrap_path_component(&flat[at]);
-    let rest = flat.split_off(at + 1);
-    flat.truncate(at);
-    // `rest` can never be empty here: the terminal-position check above
-    // already excluded `at == flat.len() - 1`, so there is always at least
-    // one component left after the `Iterate` -- self-checking rather than
-    // relying on a reader trusting this comment, since `SliceSplit`'s own
-    // `tail` (two structs above) visibly branches on an empty `rest`
-    // instead and it would be an easy, silently-wrong "fix" to copy that
-    // branch here by analogy.
-    debug_assert!(!rest.is_empty());
-    Some(IterateSplit {
-        before: flat,
-        optional,
-        tail: Expr::Pipe(rest),
-    })
-}
-
-/// Fan a `=` write out over every element/value of `target` — the
-/// non-terminal `Iterate` case [`split_at_iterate`] found (#1298).
-/// `get_path_mut` can only ever return one mutable slot, so a mid-chain
-/// `.[]` can't reuse its loop the way `Field`/`Index` do; each element
-/// instead gets its own independent recursive `set_path` call against
-/// `split.tail`. Mirrors `set_path`'s own top-level `Expr::Iterate` arm
-/// (the terminal-position case, #1181) for the yq-only null-to-`[]`
-/// autovivify and the scalar-target no-op — deliberately the same rules, a
-/// mid-chain `.[]` isn't semantically different from a terminal one, just
-/// followed by more path.
-fn set_path_through_iterate<S: EvalSemantics>(
-    target: &mut OwnedValue,
-    optional: bool,
-    tail: &Expr,
-    new_value: OwnedValue,
-    scalar_noop: bool,
-    container_noop: bool,
-) -> Result<(), EvalError> {
-    if scalar_noop {
-        autovivify_array(target);
-    }
-    match target {
-        OwnedValue::Array(arr) => {
-            for elem in arr.iter_mut() {
-                set_path::<S>(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
-            }
-            Ok(())
-        }
-        OwnedValue::Object(map) => {
-            for (_, elem) in map.iter_mut() {
-                set_path::<S>(elem, tail, new_value.clone(), scalar_noop, container_noop)?;
-            }
-            Ok(())
-        }
-        _ if optional || (scalar_noop && is_yq_field_index_noop_scalar(target)) => Ok(()),
-        _ => Err(EvalError::cannot_iterate_with(S::TAG, target)),
-    }
-}
-
-/// Get a mutable reference to the parent named by `path_parts`, or `None` if
-/// a component along the way could not be walked and was itself marked
-/// optional (`?`).
-///
-/// Autovivification means a *wrong-type* mismatch — the only failure this can
-/// still raise — can only be reached through data the document already held:
-/// `Null` always vivifies into whatever the next step needs, so nothing this
-/// function creates can itself go on to fail. That is what makes per-step `?`
-/// safe to honour here without any risk of leaving a half-built container
-/// behind.
-///
-/// Each component's own `?` is scoped to that component only, mirroring
-/// `update_path`'s `Pipe`-chain arm: `{"a":5} | .a?.b.c = 1` still raises on
-/// `.c` (unprotected) even though `.a?` (protected, but never triggered here
-/// since `.a` reads fine) precedes it. This used to drop the bit entirely —
-/// "every path reaching a walker has already been resolved" is only true of
-/// the *computed-key* pre-pass (`resolve_dynamic_indexes`/`resolve_node`); a
-/// plain static chain like `.a?.b = 1` never goes through it at all
-/// (`needs_path_prepass` says no), so `get_path_mut` was the last word on
-/// whether `?` applied and was ignoring it: `"str" | .a?.b = 1` raised
-/// `Cannot index string with string "a"` instead of leaving `"str"`
-/// untouched, matching jq.
-fn get_path_mut<'a>(
-    root: &'a mut OwnedValue,
-    path_parts: &[Expr],
-    scalar_noop: bool,
-    create: bool,
-    would_create: &mut bool,
-) -> Result<Option<&'a mut OwnedValue>, EvalError> {
-    let mut current = root;
-    // A working copy, not a plain slice iteration: `resolve_node`'s `?` arm
-    // can emit `Optional(Pipe([…]))` when a branch resolves to more than one
-    // component, and a parenthesized static chain with no computed key at
-    // all (`(.a|.c)[0] = 9`) hands this walker an un-flattened `Pipe`
-    // directly, since `needs_path_prepass` never routes it through a
-    // flattening pass first. Splicing the nested `Pipe`'s components in
-    // place and reprocessing from the same position, rather than recursing,
-    // keeps this function's loop-based shape.
-    let mut parts = path_parts.to_vec();
-    // Parallel to `parts`: whether that slot's own failure should be
-    // suppressed because it came from splicing an `Optional(Pipe(inner))`
-    // group. `(.a|.c)?` is `try (.a|.c)` — real jq catches a failure from
-    // *either* `.a` or `.c`, confirmed live (`{"a":"notobj"} |
-    // ((.a|.c)? | .y) = 9` no-ops), but NOT from a pipe stage after the
-    // closing paren (confirmed live too: `{"a":{"c":5}} | ((.a|.c)? | .y) =
-    // 9` still raises `Cannot index number with string "y"` — `.y` is
-    // outside the `try`'s scope). A single carried-forward `optional` flag,
-    // the way `update_path`'s own `Expr::Pipe(inner)` arm handles this
-    // (line ~12045), does not draw that boundary: live-verified that arm's
-    // `|=` equivalent incorrectly no-ops the second case instead of
-    // erroring, over-suppressing everything after the group. Marking only
-    // the spliced-in slots keeps the suppression scoped to the group that
-    // was actually wrapped in `?`, leaving whatever follows unaffected.
-    let mut inherited_optional = vec![false; parts.len()];
-    let mut i = 0;
-
-    while i < parts.len() {
-        let (part, own_optional) = unwrap_path_component(&parts[i]);
-        let optional = own_optional || inherited_optional[i];
-
-        if let Expr::Pipe(inner) = part {
-            let inner = inner.clone();
-            let len = inner.len();
-            parts.splice(i..=i, inner);
-            inherited_optional.splice(i..=i, vec![optional; len]);
-            continue;
-        }
-
-        // #1232: same terminal-position no-op #1181 gave `set_path`'s own
-        // `Field`/`Index` arms, applied here so a scalar hit *before* the
-        // last path component (`.a.b = 99` on a scalar root) no-ops instead
-        // of erroring while still navigating toward the parent. Computed
-        // once per iteration rather than at each arm's own `else if`
-        // (previously duplicated across both): `autovivify_object`/
-        // `autovivify_array` below only ever convert `Null` into a
-        // container, and `is_yq_field_index_noop_scalar` already excludes
-        // `Null`, so the answer is identical whether checked before or
-        // after autovivification runs.
-        let noop_here = scalar_noop && is_yq_field_index_noop_scalar(current);
-
-        current = match part {
-            Expr::Identity => current,
-            Expr::Field(name) => {
-                if create {
-                    autovivify_object(current);
-                } else if matches!(current, OwnedValue::Null) {
-                    // #1428 probe mode: a `Null` here is exactly what the
-                    // creating walk would autovivify, so report "absent".
-                    *would_create = true;
-                    return Ok(None);
-                }
-                if let OwnedValue::Object(map) = current {
-                    if create {
-                        map.entry(name.clone()).or_insert(OwnedValue::Null)
-                    } else {
-                        // Probe mode: a missing key is likewise something the
-                        // creating walk would add.
-                        match map.get_mut(name) {
-                            Some(existing) => existing,
-                            None => {
-                                *would_create = true;
-                                return Ok(None);
-                            }
-                        }
-                    }
-                } else if optional || noop_here {
-                    return Ok(None);
-                } else {
-                    // Probe mode falls through to the *same* error the
-                    // creating walk raises. Reporting "absent" here instead
-                    // would let the caller skip a genuine type error --
-                    // `[] | .a[]? = 9` must still raise `Cannot index array
-                    // with string "a"`, because the `?` is on the iterate,
-                    // not on the field.
-                    return Err(EvalError::cannot_index_with_field(
-                        owned_type_name(current),
-                        name,
-                    ));
-                }
-            }
-            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
-                if create {
-                    autovivify_array(current);
-                } else if matches!(current, OwnedValue::Null) {
-                    // Probe mode, as in the `Field` arm above.
-                    *would_create = true;
-                    return Ok(None);
-                }
-                if let OwnedValue::Array(arr) = current {
-                    if !create {
-                        // Probe mode. `resolve_setpath_index` is shared with
-                        // `write_index`, so the index arithmetic (negative
-                        // indices in particular) cannot drift between the
-                        // probing and the creating walk; an index past the end
-                        // is what `write_index` would pad to, i.e. absent.
-                        let actual = resolve_setpath_index(&OwnedValue::Int(*idx), arr.len())?;
-                        match arr.get_mut(actual) {
-                            Some(existing) => existing,
-                            None => {
-                                *would_create = true;
-                                return Ok(None);
-                            }
-                        }
-                    } else {
-                        // A still-negative index is the write-time bounds check,
-                        // not a walking failure, so `?` never covers it here
-                        // either — same reasoning as `set_path`'s `Expr::Optional`
-                        // arm, just with nothing to catch: `write_index` never
-                        // returns that error for a component this function can
-                        // itself elect to suppress.
-                        write_index(arr, *idx)?
-                    }
-                } else if optional || noop_here {
-                    return Ok(None);
-                } else {
-                    return Err(EvalError::cannot_index_with_type(
-                        owned_type_name(current),
-                        "number",
-                    ));
-                }
-            }
-            Expr::IndexExpr { .. } => {
-                return Err(EvalError::new(
-                    "internal error: unresolved computed index in path component",
-                ))
-            }
-            Expr::SliceExpr { .. } => {
-                return Err(EvalError::new(
-                    "internal error: unresolved computed slice in path component",
-                ))
-            }
-            _ => return Err(EvalError::new("invalid path component")),
-        };
-        i += 1;
-    }
-
-    Ok(Some(current))
 }
 
 /// Update a value at a path by applying a filter.
@@ -19375,17 +19085,17 @@ fn update_path<S: EvalSemantics>(
 
                 match first {
                     Expr::Field(name) => {
-                        // #1428: mirror of the guard in `set_path`'s own
-                        // chain arms, in the shape this recursive walker
-                        // allows. `set_path` probes a detached `Null` up
-                        // front because its parent chain is built inside
+                        // #1428: the same guard `set_path_steps` applies on
+                        // the `=` side, and now the same shape too. `set_path`
+                        // used to *probe* a detached `Null` up front instead,
+                        // because its parent chain was built inside
                         // `get_path_mut`'s loop, which cannot be walked back
-                        // up; here the frame that creates the slot is still
-                        // live when the recursion returns, so it can simply
-                        // undo it. Probing would be wrong on this side
-                        // anyway: `filter_expr` is a *filter*, and running it
-                        // once to decide and again for real would double any
-                        // side effect it has.
+                        // up; #1429 replaced that loop with a peel-and-recurse
+                        // walker, so both sides now simply undo the slot from
+                        // the frame that created it. Probing would be wrong on
+                        // this side anyway: `filter_expr` is a *filter*, and
+                        // running it once to decide and again for real would
+                        // double any side effect it has.
                         //
                         // A mid-chain slot left `Null` by the recursion was
                         // never written: every component that can follow one
@@ -19651,7 +19361,7 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 // Computed keys in path expressions (#360)
 // =============================================================================
 //
-// `set_path`, `get_path_mut`, `update_path`, `delete_at_path` and `walk_path`
+// `set_path`, `set_path_steps`, `update_path`, `delete_at_path` and `walk_path`
 // all understand only *static* path components: `Identity`, `Field`, `Index`,
 // `Iterate`, `Slice`. Rather than teach every walker about computed keys, the
 // key is resolved to the concrete component it denotes *before* they run, so
@@ -19667,7 +19377,7 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
 /// has to run to turn it into concrete `Field`/`Index`/`Slice` components?
 ///
 /// Written as an exclusion rather than a whitelist on purpose (#483): the
-/// single-path walkers (`walk_path`, `get_path_mut`, `set_path`,
+/// single-path walkers (`walk_path`, `set_path`, `set_path_steps`,
 /// `update_path`, `delete_at_path`) only understand `Identity`/`Field`/
 /// `Index`/`Slice`/`Iterate`, nested arbitrarily under `Pipe`/`Paren`/
 /// `Optional` — so *everything else* needs `resolve_node` first, whether
@@ -19749,10 +19459,10 @@ fn needs_fanout_pass(expr: &Expr) -> bool {
 /// Append `expr` to a path component list, splicing nested pipes and dropping
 /// `Identity`.
 ///
-/// `get_path_mut` matches a `&[Expr]` element-wise against
-/// `Identity | Field | Index` and rejects anything else as "invalid path
-/// component", so a nested `Pipe` emitted by the pre-pass would break
-/// assignment with a message that reads like user error.
+/// [`set_path_steps`] matches a `&[Expr]` element-wise against
+/// `Identity | Field | Index | Iterate | Slice` and rejects anything else as
+/// "invalid path component", so a nested `Pipe` emitted by the pre-pass
+/// would break assignment with a message that reads like user error.
 fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
     match expr {
         Expr::Identity => {}
@@ -19767,11 +19477,12 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
         // that `?` -- the same reasoning `splice_optional_group` already
         // applies for `update_path`/`delete_at_path` (#1294) -- rather
         // than being pushed as one opaque `Optional(Pipe(...))` element.
-        // Without this, neither `split_at_slice`'s slice scan (which
-        // unwraps `Optional`/`Paren` but not into a `Pipe` inside them)
-        // nor `get_path_mut`'s own per-step `Identity | Field | Index`
-        // match can see through it, and the whole thing falls to
-        // "invalid path component" (#1311).
+        // Without this, `set_path_steps`' own per-step match (which
+        // unwraps `Optional`/`Paren` via `unwrap_path_component`, but not
+        // into a `Pipe` inside them) cannot see through it, and the whole
+        // thing falls to "invalid path component" (#1311). Before #1429 the
+        // same blindness was shared by `split_at_slice`'s own slice scan
+        // and `get_path_mut`'s per-step `Identity | Field | Index` match.
         Expr::Optional(inner) => {
             let mut group = Vec::new();
             push_path_components(&mut group, inner);
@@ -20929,7 +20640,7 @@ fn resolve_node<'a, S: EvalSemantics>(
         // than routing `.[]?` through `resolve_recurse` is both simpler and
         // what keeps the components bare: resolving under a `?` wraps each
         // one in `Expr::Optional`, which the walkers that *write*
-        // (`get_path_mut`, `update_path`, `delete_at_path`) then have to
+        // (`set_path_steps`, `update_path`, `delete_at_path`) then have to
         // unwrap. They do, but there is no reason to make them.
         //
         // Reached only when `trackable` — the guard arm above already
@@ -25267,9 +24978,17 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// later step's failure outranks an earlier deferred one" ordering. The
 /// write-side callers cannot, on four counts measured against jq 1.7.1:
 ///
-/// - `get_path_mut`/`update_path` reject two adjacent `Iterate` components
-///   as an invalid path component, so `(.[("a","b")][][]) = 9` — which jq
-///   applies happily — would stop working entirely.
+/// - ~~Adjacent `Iterate` components are rejected as an invalid path
+///   component.~~ No longer true, and re-checked live while #1429 was
+///   restructuring `=`'s walker: `(.[("a","b")][][]) = 9` matches jq 1.7.1
+///   exactly, as does the plain `.a[][] = 9`/`.a[][] |= 9` pair. `.[]` has
+///   had a real mid-chain fan-out arm on the `=` side since #1298 and on
+///   the `|=` side for longer; the `get_path_mut` loop this count was
+///   written against never saw an `Iterate` after #1298 and is gone
+///   entirely since #1429. Kept, struck through, rather than deleted: the
+///   three counts below are what still carry the decision, and silently
+///   dropping a retired one would leave a reader wondering whether it was
+///   ever weighed.
 /// - The spliced-back components never pass through `assemble()`'s
 ///   `strip_resolved_optional`, so a deferred `.foo[]?` would carry its `?`
 ///   into `set_path`, which then suppresses a *write*-time failure jq raises
@@ -49978,7 +49697,7 @@ mod tests {
     }
 
     /// #1494: `builtin_any`/`builtin_all`/`builtin_flatten`/`builtin_from_entries`
-    /// (plus `set_path`/`set_path_through_iterate`, exercised separately by
+    /// (plus `set_path`/`set_path_steps`, exercised separately by
     /// `test_set_path_cannot_iterate_uses_the_real_mode_tag_1494`) used the
     /// jq-pinned `EvalError::cannot_iterate` shim unconditionally, so a
     /// yq-mode error message always carried jq's own value-preview
@@ -61381,9 +61100,11 @@ mod tests {
 
     #[test]
     fn test_yq_assign_through_parenthesized_pipe_target_noops_on_non_container_1287() {
-        // `get_path_mut`'s `Expr::Pipe` splice is shared by both evaluators
-        // -- before it, yq mode hit the exact same "invalid path component"
-        // internal error jq mode did, in place of the no-op real yq gives
+        // The nested-`Expr::Pipe` flattening is shared by both evaluators
+        // (`get_path_mut`'s in-walk splice when #1287 landed, the up-front
+        // `flatten_path_components` since #1429) -- before it, yq mode hit
+        // the exact same "invalid path component" internal error jq mode
+        // did, in place of the no-op real yq gives
         // for writing through a scalar (`scalar_noop`/`container_noop`,
         // #1101/#1142). Live-verified against real yq v4.53.3: all three
         // shapes leave the document unchanged, exit 0.
@@ -61414,11 +61135,12 @@ mod tests {
             (b"{}", ".a.b += 1", Ok(r#"{"a":{"b":1}}"#)),
             (b"{}", ".a.b //= 9", Ok(r#"{"a":{"b":9}}"#)),
             (b"[1,2]", ".[5] |= 9", Ok("[1,2,null,null,null,9]")),
-            // `|=`/`+=`/etc. walk a path recursively rather than looping like
-            // `get_path_mut` does for plain `=`, so a mid-path (not the last
-            // segment) `Index` step is a separate call site with its own
-            // autovivify_array + write_index calls — exercised only by an
-            // Index step that still has more path left after it.
+            // `|=`/`+=`/etc. have their own mid-chain `Index` arm, distinct
+            // from the terminal one, with its own autovivify_array +
+            // write_index calls — exercised only by an `Index` step that
+            // still has more path left after it. (`=` has the same split
+            // since #1429 gave it a peel-and-recurse walker of its own; it
+            // used to reach the same slot through `get_path_mut`'s loop.)
             (b"{}", ".a[0].b |= 9", Ok(r#"{"a":[{"b":9}]}"#)),
             (b"[{},{}]", ".[0].x += 1", Ok(r#"[{"x":1},{}]"#)),
         ]);
@@ -61889,7 +61611,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_path_and_get_path_mut_autovivify_null_directly() {
+    fn test_set_path_and_set_path_steps_autovivify_null_directly() {
         // Direct-function coverage for the three walkers `autovivify_object`/
         // `autovivify_array`/`write_index` touch (#486), bypassing the parser.
         let mut root = OwnedValue::Null;
@@ -61925,29 +61647,35 @@ mod tests {
             ])
         );
 
-        // `get_path_mut` vivifies each intermediate as it walks a multi-part
-        // parent path, not just the first step.
+        // `set_path_steps` vivifies each intermediate as it walks a
+        // multi-part chain, not just the first step (#1429: this used to be
+        // `get_path_mut`'s job, and its own direct-call coverage).
         let mut root = OwnedValue::Object(IndexMap::new());
-        let slot = get_path_mut(
+        set_path_steps::<JqSemantics>(
             &mut root,
-            &[Expr::Field("a".to_string()), Expr::Field("b".to_string())],
+            &[
+                Expr::Field("a".to_string()),
+                Expr::Field("b".to_string()),
+                Expr::Field("c".to_string()),
+            ],
+            OwnedValue::Int(7),
             false,
-            true,
-            &mut false,
+            false,
         )
-        .unwrap()
         .unwrap();
-        assert_eq!(*slot, OwnedValue::Null);
         assert_eq!(
             root,
             OwnedValue::Object(IndexMap::from([(
                 "a".to_string(),
-                OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Null)])),
+                OwnedValue::Object(IndexMap::from([(
+                    "b".to_string(),
+                    OwnedValue::Object(IndexMap::from([("c".to_string(), OwnedValue::Int(7))])),
+                )])),
             )]))
         );
     }
 
-    /// #1494: `set_path`/`set_path_through_iterate` threaded `S:
+    /// #1494: `set_path`/`set_path_steps` threaded `S:
     /// EvalSemantics` through to `cannot_iterate_with(S::TAG, ...)`,
     /// matching the other four call sites this issue covers.
     ///
@@ -61978,28 +61706,21 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err.message, "Cannot iterate over number (3)");
 
+        // The mid-chain fan-out arm, which #1429 folded out of
+        // `set_path_through_iterate` and into `set_path_steps` -- reached
+        // with a real tail after the `.[]` so it is the mid-chain arm and
+        // not the terminal one above that raises.
+        let steps = [Expr::Iterate, Expr::Field("b".to_string())];
         let mut target = OwnedValue::Float(3.0);
-        let err = set_path_through_iterate::<YqSemantics>(
-            &mut target,
-            false,
-            &Expr::Identity,
-            OwnedValue::Int(9),
-            false,
-            false,
-        )
-        .unwrap_err();
+        let err =
+            set_path_steps::<YqSemantics>(&mut target, &steps, OwnedValue::Int(9), false, false)
+                .unwrap_err();
         assert_eq!(err.message, "Cannot iterate over number (3.0)");
 
         let mut target = OwnedValue::Float(3.0);
-        let err = set_path_through_iterate::<JqSemantics>(
-            &mut target,
-            false,
-            &Expr::Identity,
-            OwnedValue::Int(9),
-            false,
-            false,
-        )
-        .unwrap_err();
+        let err =
+            set_path_steps::<JqSemantics>(&mut target, &steps, OwnedValue::Int(9), false, false)
+                .unwrap_err();
         assert_eq!(err.message, "Cannot iterate over number (3)");
     }
 
@@ -62423,9 +62144,11 @@ mod tests {
         );
         // The slice itself as the terminal write target (nothing after
         // it) must still refuse, whether reached bare-root or through a
-        // preceding field -- this is `split_at_slice`'s `Identity`-tail
-        // case, which looks structurally identical to the mid-chain case
-        // above but must NOT get the same treatment (code review, #1321:
+        // preceding field -- this is the terminal-slice case (#1429's
+        // `set_path_steps` reaches it as a one-element `steps`; before that
+        // it was `split_at_slice`'s `Identity` tail), which looks
+        // structurally identical to the mid-chain case above but must NOT
+        // get the same treatment (code review, #1321:
         // an earlier version of this fix mis-classified it and silently
         // no-op'd `.a[0:1] = v` instead of erroring).
         query!(br#"{"a":"hello"}"#, r#".a[0:1] = ["x"]"#,
@@ -65859,10 +65582,21 @@ mod tests {
         }
 
         #[test]
-        fn test_get_path_mut_refuses_an_unresolved_key() {
+        fn test_set_path_steps_refuses_an_unresolved_key() {
+            // Two components, not one: a single-component list is the
+            // terminal case `set_path_steps` delegates straight to
+            // `set_path`, which has its own (differently-worded) guard
+            // above. The mid-chain arm tested here is the one that used to
+            // live in `get_path_mut` (#1429).
             let mut root = OwnedValue::Null;
-            let err =
-                get_path_mut(&mut root, &[unresolved()], false, true, &mut false).unwrap_err();
+            let err = set_path_steps::<JqSemantics>(
+                &mut root,
+                &[unresolved(), Expr::Field("a".to_string())],
+                OwnedValue::Int(1),
+                false,
+                false,
+            )
+            .unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in path component"
@@ -65958,10 +65692,21 @@ mod tests {
         }
 
         #[test]
-        fn test_get_path_mut_refuses_an_unresolved_slice() {
+        fn test_set_path_steps_refuses_an_unresolved_slice() {
+            // Two components, not one: a single-component list is the
+            // terminal case `set_path_steps` delegates straight to
+            // `set_path`, which has its own (differently-worded) guard
+            // above. The mid-chain arm tested here is the one that used to
+            // live in `get_path_mut` (#1429).
             let mut root = OwnedValue::Null;
-            let err =
-                get_path_mut(&mut root, &[unresolved()], false, true, &mut false).unwrap_err();
+            let err = set_path_steps::<JqSemantics>(
+                &mut root,
+                &[unresolved(), Expr::Field("a".to_string())],
+                OwnedValue::Int(1),
+                false,
+                false,
+            )
+            .unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in path component"
