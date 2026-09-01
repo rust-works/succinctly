@@ -55537,6 +55537,58 @@ mod tests {
     }
 
     #[test]
+    fn test_func_arg_array_destructure_pattern_does_not_capture_caller_var_2077() {
+        // #2077 defect A, array-destructuring pattern: exercises
+        // `rename_pattern_var`'s `Array` arm, and its non-matching `Var`
+        // arm for `$b` (only `$a` collides with the substituted-in `$a`) --
+        // confirmed against jq 1.7.1: `5`, not `1`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): reduce ([1,2]) as [$a,$b] (0; . + g); 5 as $a | f($a)"
+            ),
+            ["5"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_object_destructure_pattern_does_not_capture_caller_var_2077() {
+        // #2077 defect A, object-destructuring pattern: exercises
+        // `rename_pattern_var`'s `Object` arm -- confirmed against jq
+        // 1.7.1: `5`, not the destructured `1`.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"def f(g): {"a":1,"b":2} as {a: $x, b: $y} | g; 5 as $x | f($x)"#
+            ),
+            ["5"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_as_pattern_shadowed_by_param_name_leaves_body_untouched_2077() {
+        // #2077 control: an `as`-pattern that binds a name identical to the
+        // outer parameter shadows it, so `body` must not be substituted at
+        // all (the pre-existing `pattern_binds_var` shadow check, now on
+        // the restructured `if`/`else` in the `AsPattern` arm) -- confirmed
+        // against jq 1.7.1: `3` (the pattern's own $g=1, $y=2 summed),
+        // regardless of what `f` was called with.
+        assert_eq!(
+            outputs(b"null", "def f(g): [1,2] as [$g, $y] | $g + $y; f(99)"),
+            ["3"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_nested_def_own_param_shadows_outer_param_in_body_2077() {
+        // #2077 control: a nested `def`'s own parameter of the same name
+        // as the outer parameter shadows it within the nested def's own
+        // `body` (the pre-existing `body_shadowed` check) -- confirmed
+        // against jq 1.7.1: `1` (h's own g=1), not `2` (f's outer g).
+        assert_eq!(outputs(b"null", "def f(g): def h(g): g; h(1); f(2)"), ["1"]);
+    }
+
+    #[test]
     fn test_until_budget_exceeded_errors() {
         // `cond` is always falsy, so `until_step`'s single-output fast path
         // never emits anything before the `WHILE_UNTIL_MAX_STEPS` cap trips.
