@@ -27556,6 +27556,10 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
     for (filter, args) in [
         ("def f: [f]; f", &[][..]),
         ("isempty(def f: [f]; f)", &["--jq-extensions"][..]),
+        // `first` reaches the generic evaluator's *demand-driven* `DefCall`
+        // arm, a separate one from `isempty`'s route above.
+        ("first(def f: [f]; f)", &["--jq-extensions"][..]),
+        ("[limit(1; def f: [f]; f)]", &["--jq-extensions"][..]),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", args)?;
         assert_eq!(code, 1, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");

@@ -17425,8 +17425,8 @@ fn test_bound_call_argument_stays_lazy_1371() -> Result<()> {
 /// #1371: the installer walks the whole expression tree to bind call sites, so
 /// a `def` body built out of unusual forms -- `?`, a computed object key,
 /// unary minus, comparison and boolean operators, string interpolation,
-/// `last`, an assignment's own path, `label`/`break`, an optional call -- must
-/// come through it unchanged.
+/// `last`, `repeat`, an assignment's own path, `label`/`break`, an optional
+/// call -- must come through it unchanged.
 ///
 /// Every arm is pure structural recursion, which is exactly the shape that
 /// looks obviously correct and stays untested until one arm forgets to
@@ -17449,6 +17449,7 @@ fn test_def_body_covering_varied_expression_forms_1371() -> Result<()> {
         ((x > 0) and (x != 3)),
         "n=\(x)",
         ([1, 2, 3] | last),
+        ([limit(2; repeat(x))] | length),
         ({} | .deep.path = x | .deep.path),
         (if x == 1 then break $done else empty end),
         cover(x - 1)
@@ -17457,7 +17458,7 @@ fn test_def_body_covering_varied_expression_forms_1371() -> Result<()> {
 cover(3) | flatten | length"#;
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":7}}"#))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "12");
+    assert_eq!(stdout.trim_end(), "14");
     Ok(())
 }
 
