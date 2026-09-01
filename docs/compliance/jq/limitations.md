@@ -565,9 +565,10 @@ is the revert that established what the other one costs.
    trackability. **yq mode deliberately keeps the pre-#2044 refuse-only behavior for this
    shape** rather than gaining the same widening: real yq no-ops a field/index access
    against a scalar (#1181's convention) instead of navigating through it, a rule this
-   widening doesn't know about and that isn't consulted at this call site yet for a *plain*,
-   non-computed key
-   ([#2107](https://github.com/rust-works/succinctly/issues/2107)) — applying jq's own
+   widening doesn't know about — the `resolve_leaf` fallback this call site ultimately
+   reaches for a literal is part of the "dynamic-prepass" family
+   [#1419](https://github.com/rust-works/succinctly/issues/1419) already tracks as having
+   no yq-mode exception anywhere — so applying jq's own
    write-through answer to yq mode here would silently corrupt data (confirmed live against
    yq v4.53.3: `(null \| .a) = 5` on `null` is a no-op, not the write jq's own `{"a":5}`
    answer would become) rather than merely refuse, which is the direction ADR-0018 never
