@@ -785,20 +785,19 @@ fn test_config_file_pattern() {
 #[test]
 fn test_now_returns_timestamp() {
     // now returns the current Unix timestamp as a float (std), or a fixed
-    // 0.0 fallback in no_std context (builtin_now has no clock there).
-    #[cfg(feature = "std")]
+    // 0.0 fallback in no_std context (builtin_now has no clock there) --
+    // same variant either way, so one query! call covers both.
     query!(b"null", "now",
         QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
-            // Verify it's a reasonable timestamp (after 2024-01-01 and not too far in the future)
-            let jan_2024 = 1704067200.0; // 2024-01-01 00:00:00 UTC
-            let jan_2100 = 4102444800.0; // 2100-01-01 00:00:00 UTC
-            assert!(ts > jan_2024, "timestamp {ts} should be after 2024-01-01");
-            assert!(ts < jan_2100, "timestamp {ts} should be before 2100-01-01");
-        }
-    );
-    #[cfg(not(feature = "std"))]
-    query!(b"null", "now",
-        QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
+            #[cfg(feature = "std")]
+            {
+                // Verify it's a reasonable timestamp (after 2024-01-01 and not too far in the future)
+                let jan_2024 = 1704067200.0; // 2024-01-01 00:00:00 UTC
+                let jan_2100 = 4102444800.0; // 2100-01-01 00:00:00 UTC
+                assert!(ts > jan_2024, "timestamp {ts} should be after 2024-01-01");
+                assert!(ts < jan_2100, "timestamp {ts} should be before 2100-01-01");
+            }
+            #[cfg(not(feature = "std"))]
             assert_eq!(ts, 0.0, "now should fall back to 0.0 in no_std context");
         }
     );
@@ -806,17 +805,16 @@ fn test_now_returns_timestamp() {
 
 #[test]
 fn test_now_ignores_input() {
-    // now ignores its input
-    #[cfg(feature = "std")]
+    // now ignores its input; no_std fallback is the same fixed 0.0 as
+    // test_now_returns_timestamp above.
     query!(br#"{"foo": "bar"}"#, "now",
         QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
-            let jan_2024 = 1704067200.0;
-            assert!(ts > jan_2024, "timestamp {ts} should be after 2024-01-01");
-        }
-    );
-    #[cfg(not(feature = "std"))]
-    query!(br#"{"foo": "bar"}"#, "now",
-        QueryResult::Owned(succinctly::jq::OwnedValue::Float(ts)) => {
+            #[cfg(feature = "std")]
+            {
+                let jan_2024 = 1704067200.0;
+                assert!(ts > jan_2024, "timestamp {ts} should be after 2024-01-01");
+            }
+            #[cfg(not(feature = "std"))]
             assert_eq!(ts, 0.0, "now should fall back to 0.0 in no_std context");
         }
     );

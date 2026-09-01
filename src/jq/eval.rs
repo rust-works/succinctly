@@ -41469,6 +41469,37 @@ mod tests {
         );
     }
 
+    /// `bind_def_call`'s own `frames >= MAX_EVAL_FRAMES` guard (the check
+    /// the two tests above exercise *composed with* `ambient_frame_depth`)
+    /// is itself unconditional, feature-independent code -- calling it
+    /// directly with a hand-built `frames` value, bypassing `bind_def`/
+    /// `ambient_frame_depth` entirely, reaches it under `no_std` too. Added
+    /// alongside #2083's `no_std` test-gating fixes: without this, no test
+    /// anywhere exercises this guard under `--no-default-features` (the
+    /// two tests above are `std`-only, and the CLI-level recursion tests in
+    /// `tests/jq_cli_tests.rs`/`tests/yq_cli_tests.rs` require the `cli`
+    /// feature, which pulls in `std`) -- a future regression in the guard
+    /// itself would go undetected in a no_std build.
+    #[test]
+    fn test_bind_def_call_guard_fires_without_ambient_depth_2083() {
+        let def = Rc::new(FuncDefData {
+            name: "f".to_string(),
+            params: vec![],
+            body: Expr::FuncCall {
+                name: "f".to_string(),
+                args: vec![],
+            },
+        });
+        let bound = BoundBody::default();
+        let err = bind_def_call(&def, &[], MAX_EVAL_FRAMES, &bound)
+            .expect_err("frames at the ceiling must refuse the call, not run it");
+        assert!(
+            err.message.contains("exceeded maximum recursion depth"),
+            "message: {}",
+            err.message
+        );
+    }
+
     #[test]
     fn test_catch_error_under_optional_full_truth_table_1888() {
         type W = Vec<u64>;
@@ -57973,17 +58004,35 @@ mod tests {
         });
     }
 
+    /// Shared no_std assertion for the four `$ENV`/`env` field/bracket
+    /// accessors below: each falls back to `Null` under `no_std` (`$ENV`/
+    /// `env` are an empty object there, same as `test_dollar_env`'s own
+    /// std/no_std split).
+    #[cfg(not(feature = "std"))]
+    fn assert_env_field_access_null_in_no_std(expr: &str) {
+        query!(b"null", expr, QueryResult::Owned(OwnedValue::Null) => {});
+    }
+
+    /// Shared no_std assertion for `env(VAR)`/`strenv(VAR)` below: both
+    /// raise an `EvalError` mentioning `"no_std"` (no env vars are ever
+    /// provided there).
+    #[cfg(not(feature = "std"))]
+    fn assert_env_call_errors_in_no_std(expr: &str) {
+        query!(b"null", expr, QueryResult::Error(e) => {
+            assert!(e.message.contains("no_std"), "expected no_std env error, got: {}", e.message);
+        });
+    }
+
     #[test]
     fn test_dollar_env_field_access() {
         // $ENV.VAR should return the environment variable value (std), or
-        // null in no_std context ($ENV is an empty object there, same as
-        // test_dollar_env's own std/no_std split).
+        // null in no_std context.
         #[cfg(feature = "std")]
         query!(b"null", "$ENV.PATH", QueryResult::Owned(OwnedValue::String(s)) => {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", "$ENV.PATH", QueryResult::Owned(OwnedValue::Null) => {});
+        assert_env_field_access_null_in_no_std("$ENV.PATH");
     }
 
     #[test]
@@ -58007,22 +58056,20 @@ mod tests {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", r#"$ENV["PATH"]"#, QueryResult::Owned(OwnedValue::Null) => {});
+        assert_env_field_access_null_in_no_std(r#"$ENV["PATH"]"#);
     }
 
     #[test]
     fn test_env_var() {
         // env(VAR) returns the environment variable value (std), or an
-        // EvalError in no_std context (no env vars are ever provided
-        // there). This test uses PATH which should always exist under std.
+        // EvalError in no_std context. This test uses PATH which should
+        // always exist under std.
         #[cfg(feature = "std")]
         query!(b"null", "env(PATH)", QueryResult::Owned(OwnedValue::String(s)) => {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", "env(PATH)", QueryResult::Error(e) => {
-            assert!(e.message.contains("no_std"), "expected no_std env error, got: {}", e.message);
-        });
+        assert_env_call_errors_in_no_std("env(PATH)");
     }
 
     #[test]
@@ -58034,9 +58081,7 @@ mod tests {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", "strenv(PATH)", QueryResult::Error(e) => {
-            assert!(e.message.contains("no_std"), "expected no_std env error, got: {}", e.message);
-        });
+        assert_env_call_errors_in_no_std("strenv(PATH)");
     }
 
     #[test]
@@ -58048,7 +58093,7 @@ mod tests {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", "env.PATH", QueryResult::Owned(OwnedValue::Null) => {});
+        assert_env_field_access_null_in_no_std("env.PATH");
     }
 
     #[test]
@@ -58059,7 +58104,7 @@ mod tests {
             assert!(!s.is_empty(), "PATH should be non-empty");
         });
         #[cfg(not(feature = "std"))]
-        query!(b"null", r#"env["PATH"]"#, QueryResult::Owned(OwnedValue::Null) => {});
+        assert_env_field_access_null_in_no_std(r#"env["PATH"]"#);
     }
 
     #[test]
@@ -59920,6 +59965,9 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
     }
 
+    // `#[cfg(feature = "std")]`: `parse_simple_tz_offset` itself is
+    // `std`-only (it exists solely to parse `std::env::var("TZ")`), so
+    // this test cannot compile under `no_std` at all.
     #[test]
     #[cfg(feature = "std")]
     fn test_parse_simple_tz_offset_errors_gracefully_on_overflow_894() {
@@ -64368,19 +64416,19 @@ mod tests {
     #[test]
     fn test_now() {
         // now returns current Unix timestamp as a float (std), or a fixed
-        // 0.0 fallback in no_std context (builtin_now has no clock there).
-        #[cfg(feature = "std")]
+        // 0.0 fallback in no_std context (builtin_now has no clock there) --
+        // same variant either way, so one query! call covers both, same as
+        // test_env/test_dollar_env above.
         query!(b"null", "now",
             QueryResult::Owned(OwnedValue::Float(n)) => {
-                // Should be a reasonable Unix timestamp (after year 2020)
-                assert!(n > 1577836800.0, "timestamp should be after 2020");
-                // Should be before year 2100
-                assert!(n < 4102444800.0, "timestamp should be before 2100");
-            }
-        );
-        #[cfg(not(feature = "std"))]
-        query!(b"null", "now",
-            QueryResult::Owned(OwnedValue::Float(n)) => {
+                #[cfg(feature = "std")]
+                {
+                    // Should be a reasonable Unix timestamp (after year 2020)
+                    assert!(n > 1577836800.0, "timestamp should be after 2020");
+                    // Should be before year 2100
+                    assert!(n < 4102444800.0, "timestamp should be before 2100");
+                }
+                #[cfg(not(feature = "std"))]
                 assert_eq!(n, 0.0, "now should fall back to 0.0 in no_std context");
             }
         );
