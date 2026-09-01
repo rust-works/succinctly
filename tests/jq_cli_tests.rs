@@ -28864,3 +28864,39 @@ fn test_sort_family_propagates_halt_like_jq_1687() -> Result<()> {
     assert_eq!(stderr, "10\n");
     Ok(())
 }
+
+/// #2057: a child that exits *without reading stdin* must not fail the test
+/// with `Broken pipe`.
+///
+/// Every filter here fails to compile, so `succinctly jq` reports the error
+/// and exits 3 having never touched stdin. Writing to that closed pipe is
+/// then the normal outcome, not a symptom of load -- which is why the four
+/// recorded #2057 failures were all compile-error tests, and why re-running
+/// the job did not clear them.
+///
+/// In CI the race is only *biased*, not decided: the few-byte payloads those
+/// tests use land in the pipe buffer and succeed whenever the parent reaches
+/// its write first. This test removes the bias instead of relying on it. The
+/// payload spans many `write` calls, so the child -- which exits in
+/// milliseconds -- is certain to have exited before the last of them,
+/// whichever side started first. That is the narrower case where payload
+/// size is the discriminator at all; for an already-exited child `BrokenPipe`
+/// does not depend on buffer capacity.
+///
+/// Without the `BrokenPipe` arm in `write_stdin_then_wait` this therefore
+/// fails every run rather than occasionally, which is what makes it a usable
+/// pin for a bug whose own signature in CI is intermittent.
+#[test]
+fn test_compile_error_with_unread_stdin_is_not_a_broken_pipe_2057() -> Result<()> {
+    let payload = "0\n".repeat(2 * 1024 * 1024);
+    for filter in ["nosuchfn", "def f(x): x; f(1;2)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&payload))?;
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: a compile error produces no output");
+        assert!(
+            stderr.contains("is not defined"),
+            "{filter}: stderr {stderr:?}"
+        );
+    }
+    Ok(())
+}
