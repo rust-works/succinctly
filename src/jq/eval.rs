@@ -18097,13 +18097,20 @@ fn set_path<S: EvalSemantics>(
 ///
 /// [`unwrap_path_component`] is what the walker itself uses to look through
 /// `Optional`/`Paren` wrappers, so those are transparent here too: only a
-/// `Pipe` (or a `Pipe` hiding inside one of those wrappers), an `Identity`
-/// that has to be dropped, or an unresolved computed component makes a list
-/// non-atomic and sends it through [`flatten_path_components`] first.
+/// `Pipe` (or a `Pipe` hiding inside one of those wrappers) or an unresolved
+/// computed component makes a list non-atomic and sends it through
+/// [`flatten_path_components`] first.
+///
+/// `Identity` counts as atomic even though the flattener would drop it
+/// (`push_path_components`): the walker has a one-line arm for it, and
+/// treating it as non-atomic would send an otherwise-flat `.a | . | .b`
+/// through a full allocate-and-clone flatten purely to delete a step that
+/// costs nothing to skip.
 fn is_atomic_path_component(expr: &Expr) -> bool {
     matches!(
         unwrap_path_component(expr).0,
-        Expr::Field(_)
+        Expr::Identity
+            | Expr::Field(_)
             | Expr::Index(_)
             | Expr::IndexNumber { .. }
             | Expr::Iterate
@@ -18144,7 +18151,13 @@ fn set_path_steps<S: EvalSemantics>(
     container_noop: bool,
 ) -> Result<(), EvalError> {
     let (first, rest) = match steps {
-        // Everything was `Identity` (`(. | .) = 9`), so this *is* the write.
+        // Nothing left to navigate, so this *is* the write. Reached when a
+        // group that needed flattening turns out to hold only `Identity`
+        // steps, which `push_path_components` drops -- `((.|.)) = 9`, whose
+        // outer `Paren(Pipe(..))` is what forces the flatten in the first
+        // place. A bare `(.|.) = 9` never gets here: every component is
+        // already atomic, so it stays on the borrowed path and the trailing
+        // `Identity` is the terminal component.
         [] => {
             *root = new_value;
             return Ok(());
@@ -18217,8 +18230,10 @@ fn set_path_steps<S: EvalSemantics>(
     let rest_reaches_iterate = rest.iter().any(reaches_iterate);
 
     match component {
-        // `push_path_components` drops these, but the borrowed fast path
-        // does not run it -- an `Identity` is simply nothing to navigate.
+        // Only ever reached on the borrowed fast path: `.a | . | .b = 9` keeps
+        // its `Identity` because `is_atomic_path_component` accepts one, where
+        // `flatten_path_components` would have dropped it. Nothing to
+        // navigate either way.
         Expr::Identity => set_path_steps::<S>(root, rest, new_value, scalar_noop, container_noop),
         Expr::Field(name) => {
             let root_was_null = matches!(root, OwnedValue::Null);
@@ -60958,6 +60973,39 @@ mod tests {
         ]);
     }
 
+    /// #1429: an `Identity` inside a chain is a step to skip, not a shape to
+    /// flatten around.
+    ///
+    /// `is_atomic_path_component` accepts `Identity` so `.a | . | .b` stays on
+    /// the borrowed fast path, which makes `set_path_steps`' own `Identity`
+    /// arm the thing that skips it; the flattener would have dropped it
+    /// instead, at the cost of an allocate-and-clone pass. The two spellings
+    /// therefore take genuinely different routes and are pinned together.
+    /// All four confirmed against real jq 1.7.1.
+    #[test]
+    fn test_assign_identity_steps_inside_a_chain_1429() {
+        assert_outcomes(&[
+            // Borrowed path, `Identity` skipped mid-chain.
+            (
+                br#"{"a":{"b":1}}"#,
+                "(.a | . | .b) = 9",
+                Ok(r#"{"a":{"b":9}}"#),
+            ),
+            (
+                br#"{"a":{"b":1}}"#,
+                "(. | .a.b) = 9",
+                Ok(r#"{"a":{"b":9}}"#),
+            ),
+            // Borrowed path, `Identity` as the *terminal* component: the
+            // whole document is the write target.
+            (br#"{"a":{"b":1}}"#, "(.|.) = 9", Ok("9")),
+            // Forced through the flattener by the outer `Paren(Pipe(..))`,
+            // which drops every `Identity` and leaves an empty step list --
+            // the one route to `set_path_steps`' `[]` arm.
+            (br#"{"a":{"b":1}}"#, "((.|.)) = 9", Ok("9")),
+        ]);
+    }
+
     /// #1429: `=` walks a long chain by recursion now, where it used to loop
     /// inside `get_path_mut`.
     ///
@@ -65475,6 +65523,30 @@ mod tests {
                 err.message,
                 "internal error: unresolved computed index in assignment path"
             );
+        }
+
+        /// The mid-chain catch-all itself, reached with a component that is
+        /// neither a known path step nor an unresolved computed one.
+        ///
+        /// Unreachable through the public API for the same reason the two
+        /// guards below are -- `needs_path_prepass` routes everything but
+        /// `Identity`/`Field`/`Index`/`Slice`/`Iterate` (and the
+        /// `Pipe`/`Paren`/`Optional` wrappers) through `resolve_node` first --
+        /// and pinned here for the same reason: the wording is the signal that
+        /// a new path context was wired up without that pre-pass, so it has to
+        /// stay the wording a reader will actually recognise (#1429).
+        #[test]
+        fn test_set_path_steps_refuses_an_unwalkable_component() {
+            let mut root = OwnedValue::Null;
+            let err = set_path_steps::<JqSemantics>(
+                &mut root,
+                &[Expr::Var("k".to_string()), Expr::Field("a".to_string())],
+                OwnedValue::Int(1),
+                false,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(err.message, "invalid path component");
         }
 
         #[test]
