@@ -26017,16 +26017,33 @@ fn fresh_var_name(name: &str) -> String {
 
 /// Whether `expr` contains a free-standing `$name` reference anywhere.
 ///
+/// Every `$name` referenced anywhere in `expr`.
+///
 /// #2077: used to decide whether substituting `arg` into a binder's scope
 /// would let that binder recapture one of `arg`'s own variable references.
 /// Deliberately not scope-aware over `expr` itself -- a `$name` that is
-/// actually bound *within* `expr` (not free) still trips this, which only
-/// costs an unnecessary rename. Renaming a binder that would not actually
-/// have captured anything is still alpha-equivalent, so over-approximating
-/// here is safe, unlike the rename itself (see [`capturing_pattern_renames`]),
-/// which must not touch a binder that isn't actually `name`.
-fn expr_mentions_var(expr: &Expr, name: &str) -> bool {
-    any_subexpr(expr, &mut |e| matches!(e, Expr::Var(n) if n == name))
+/// actually bound *within* `expr` (not free) still ends up in the set, which
+/// only costs an unnecessary rename. Renaming a binder that would not
+/// actually have captured anything is still alpha-equivalent, so
+/// over-approximating here is safe, unlike the rename itself (see
+/// [`capturing_pattern_renames`]), which must not touch a binder that isn't
+/// actually free in `arg`.
+///
+/// One walk regardless of how many names are later checked against it --
+/// [`capturing_pattern_renames`] used to call an `any_subexpr`-per-name
+/// membership test instead, which re-walked `arg` from scratch for every
+/// bound name (a wide `?//` alternation or a many-parameter nested `def`
+/// turned that into a multiplicative cost, and this runs fresh on every
+/// evaluation of a `def` node -- `expand_func_calls` is not cached).
+fn expr_free_vars(expr: &Expr) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    any_subexpr(expr, &mut |e| {
+        if let Expr::Var(n) = e {
+            names.insert(n.clone());
+        }
+        false
+    });
+    names
 }
 
 /// For every distinct name `patterns` binds that also appears as a free
@@ -26049,9 +26066,14 @@ fn capturing_pattern_renames(patterns: &[Pattern], arg: &Expr) -> Vec<(String, S
     }
     bound_names.sort();
     bound_names.dedup();
+    if bound_names.is_empty() {
+        return Vec::new();
+    }
+
+    let free_vars = expr_free_vars(arg);
     bound_names
         .into_iter()
-        .filter(|name| expr_mentions_var(arg, name))
+        .filter(|name| free_vars.contains(name.as_str()))
         .map(|name| {
             let fresh = fresh_var_name(&name);
             (name, fresh)
@@ -41213,19 +41235,16 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                 // `foreach` do.
                 let as_patterns: Vec<Pattern> = params.iter().cloned().map(Pattern::Var).collect();
                 let renames = capturing_pattern_renames(&as_patterns, arg);
-                let new_params = if renames.is_empty() {
-                    params.clone()
-                } else {
-                    params
-                        .iter()
-                        .map(|p| {
-                            renames
-                                .iter()
-                                .find(|(old_name, _)| old_name == p)
-                                .map_or_else(|| p.clone(), |(_, new_name)| new_name.clone())
-                        })
-                        .collect()
-                };
+                let new_params = apply_pattern_renames(&as_patterns, &renames)
+                    .into_iter()
+                    .map(|p| match p {
+                        Pattern::Var(name) => name,
+                        // `as_patterns` above is built entirely from
+                        // `Pattern::Var`, and `apply_pattern_renames` never
+                        // changes a pattern's shape, only its bound names.
+                        _ => unreachable!("FuncDef params are always wrapped as Pattern::Var"),
+                    })
+                    .collect();
                 let renamed_body = apply_scope_renames(body, &renames);
                 (
                     new_params,
