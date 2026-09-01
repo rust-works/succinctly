@@ -809,6 +809,13 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
+        // No `Expr::FirstExpr`/`Expr::LastExpr` arm, and no matching arm in
+        // `eval_pipe_with_path_context_internal` either, so `first(key)` and
+        // `last(key)` silently answer `null` where the sibling
+        // `limit(1; key)` answers correctly (#2074). Both halves are needed
+        // to close it -- the same pairing `Label` (#715) and `FuncDef`
+        // (#1306) each required -- so it is tracked rather than half-fixed
+        // here.
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
         // `[key]`/`[parent]`/`[file_index]` (#1302): an array literal is
         // still just "collect this inner expression's outputs", the same
@@ -29835,7 +29842,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // (#1409), which would work here too -- but adopting it for
         // `Optional` also stops `rest` inheriting this arm's suppression,
         // an evaluator-wide model change #1826/#1869 both build on, so it
-        // is deliberately left for its own change. This arm
+        // is deliberately left for its own change -- #2073, which also
+        // records what that suppression currently costs: `.a | (.[])? |
+        // (key, error("boom"))` swallows an error real jq raises. This arm
         // must not regress the path threading meanwhile, so it only takes
         // the fast, isolated path when `rest` doesn't consult path context
         // in the first place, and otherwise falls back to evaluating
