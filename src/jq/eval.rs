@@ -4157,29 +4157,49 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut escape: Option<Control> = None;
+    // `Cell`, not a plain `Option`, because `emit` below and the
+    // `from`/`to`/`step` closures that call it are separate closures live
+    // at the same time -- each needs to *set* an escape it discovers on its
+    // own, which a shared `&mut Option<Control>` can't give more than one
+    // of simultaneously (#2089: `emit` gained its own write here once
+    // `eval_range_values`/`_f64` could raise on `MAX_RANGE`).
+    let escape: core::cell::Cell<Option<Control>> = core::cell::Cell::new(None);
     let mut sink_stopped = false;
 
     // One (from, to, step) combination's values, forwarded to the wrapping
     // `sink`. Reuses `eval_range_values`/`_f64` and `drain_result` verbatim
-    // -- `MAX_RANGE` is unaffected: each combination still eagerly builds
-    // one capped `Vec` exactly as the eager path does (#1556 is scoped to
-    // the bound expressions, not that pre-existing cap).
+    // -- each combination still eagerly builds one `MAX_RANGE`-capped `Vec`
+    // exactly as before (#1556 is scoped to the bound expressions, not that
+    // pre-existing cap). #2089: whether truncation should actually raise
+    // depends on what `sink` does with the capped batch, not merely on
+    // whether it happened -- `eval_range`'s own sink (used by `[range(...)]`,
+    // `reduce`, ...) always answers `Continue`, so for it `Flow::Exhausted`
+    // means "delivered everything I had and the caller still wants more",
+    // exactly the silent-wrong-data case this issue is about. A
+    // demand-driven sink (`first`, `limit`, ...) that stops partway through
+    // the capped batch never reaches that branch at all -- confirmed live:
+    // `first(range(1e18))` still returns `0` instantly, no error, while
+    // `[range(1e18)]`/`reduce range(1e18) as $x (0;.+$x)` now raise instead
+    // of silently returning a 100000-element/-sum prefix.
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
-        let one = match (from_val, to_val, step_val) {
+        let (one, truncated) = match (from_val, to_val, step_val) {
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
                 eval_range_values::<W>(f, t, st)
             }
             (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
         };
         match drain_result(one, sink) {
+            Flow::Exhausted if truncated => {
+                escape.set(Some(Control::Error(range_max_exceeded_error())));
+                Demand::Stop
+            }
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
                 sink_stopped = true;
                 Demand::Stop
             }
-            // `owned_vec_to_result` only ever yields `None`/`Owned`/
-            // `ManyOwned`, so `drain_result` can only answer `Exhausted` or
+            // `owned_vec_to_result` never yields `Error`/`Break`/`Halt`/
+            // `Partial`, so `drain_result` can only answer `Exhausted` or
             // `Stopped { pending: None }` here.
             Flow::Escaped(_) => unreachable!(
                 "eval_range_values(_f64) never produces an Error/Break/Halt/Partial result"
@@ -4191,7 +4211,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let from_val = match range_num(&item_to_owned(from_item)) {
             Ok(n) => n,
             Err(e) => {
-                escape = Some(Control::Error(e));
+                escape.set(Some(Control::Error(e)));
                 return Demand::Stop;
             }
         };
@@ -4213,7 +4233,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let to_val = match range_num(&item_to_owned(to_item)) {
                 Ok(n) => n,
                 Err(e) => {
-                    escape = Some(Control::Error(e));
+                    escape.set(Some(Control::Error(e)));
                     return Demand::Stop;
                 }
             };
@@ -4226,7 +4246,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             let step_val = match range_num(&item_to_owned(step_item)) {
                                 Ok(n) => n,
                                 Err(e) => {
-                                    escape = Some(Control::Error(e));
+                                    escape.set(Some(Control::Error(e)));
                                     return Demand::Stop;
                                 }
                             };
@@ -4236,7 +4256,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         Flow::Exhausted => Demand::Continue,
                         Flow::Stopped { .. } => Demand::Stop,
                         Flow::Escaped(control) => {
-                            escape = Some(control);
+                            escape.set(Some(control));
                             Demand::Stop
                         }
                     }
@@ -4248,7 +4268,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
             Flow::Escaped(control) => {
-                escape = Some(control);
+                escape.set(Some(control));
                 Demand::Stop
             }
         }
@@ -4257,7 +4277,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if sink_stopped {
         return Flow::Stopped { pending: None };
     }
-    match escape {
+    match escape.into_inner() {
         Some(control) => Flow::Escaped(control),
         None => from_flow,
     }
@@ -28316,15 +28336,45 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// shared by [`eval_range_values`] and [`eval_range_values_f64`] (#1029: was
 /// two independent `const MAX_RANGE` copies, the structural twin of the
 /// `MAX_ITEMS` triplication #1023 fixed for the recurse family).
+///
+/// Real jq's `range` is bounded only by memory; this exists purely as a
+/// resource-exhaustion guard against a single materializing call
+/// (`[range(1e18)]`, `reduce range(1e18) as $x (0; .+$x)`, ...) trying to
+/// allocate an unbounded `Vec` in one shot, the same reasoning
+/// [`REDUCE_FOREACH_MAX_STEPS`]/[`WHILE_UNTIL_MAX_STEPS`] already establish
+/// for their own guards. Kept at the same magnitude as
+/// `REDUCE_FOREACH_MAX_STEPS` rather than re-derived, so the three share one
+/// "how much may a single eager accumulation hold" answer.
+///
+/// Exhausting it now *raises*, matching every sibling guard in this file --
+/// #2089 found it silently truncating to a wrong, unflagged answer at exit 0
+/// instead, the one guard in the file that chose that failure mode. See
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
+/// for the recorded divergence (real jq has no such cap at all).
 const MAX_RANGE: usize = 100000;
 
-/// Helper to generate range values.
+/// The error [`each_range`]'s `emit` raises once a caller that actually
+/// wanted every value (its sink kept answering [`Demand::Continue`]) hits a
+/// [`MAX_RANGE`]-truncated batch -- shared so callers can't drift in wording.
+fn range_max_exceeded_error() -> EvalError {
+    EvalError::new("range: maximum iterations exceeded")
+}
+
+/// Helper to generate range values, capped at [`MAX_RANGE`] per call.
+///
+/// Returns whether the cap actually cut the range short (`true`) or the
+/// range finished naturally within it (`false`) -- deliberately *not* an
+/// error here: this has no visibility into whether the caller's own sink
+/// would have stopped asking before the cap anyway (`first`/`limit`'s
+/// demand-driven early exit, #2089), only [`each_range`]'s `emit` does, so
+/// the truncation verdict is reported back rather than acted on locally.
 fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
     to: i64,
     step: i64,
-) -> QueryResult<'a, W> {
+) -> (QueryResult<'a, W>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
+    let mut truncated = false;
 
     if step > 0 {
         let mut i = from;
@@ -28332,18 +28382,22 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
             values.push(OwnedValue::Int(i));
             i += step;
         }
+        truncated = i < to;
     } else if step < 0 {
         let mut i = from;
         while i > to && values.len() < MAX_RANGE {
             values.push(OwnedValue::Int(i));
             i += step;
         }
+        truncated = i > to;
     }
 
-    owned_vec_to_result(values)
+    (owned_vec_to_result(values), truncated)
 }
 
-/// Helper to generate range values over floats.
+/// Helper to generate range values over floats, capped at [`MAX_RANGE`] per
+/// call -- see [`eval_range_values`]'s own doc comment for why truncation is
+/// reported rather than raised here.
 ///
 /// Accumulates by repeated addition of `step` (jq semantics), so results carry
 /// the same floating-point drift as jq (e.g. `range(0;1;0.3)` ends at
@@ -28352,24 +28406,32 @@ fn eval_range_values_f64<'a, W: Clone + AsRef<[u64]>>(
     from: f64,
     to: f64,
     step: f64,
-) -> QueryResult<'a, W> {
+) -> (QueryResult<'a, W>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
+    let mut truncated = false;
 
+    // The cap check rides in the loop's own compound condition, not a
+    // `break` inside it, so the float comparison is never clippy's sole
+    // `while` condition (`while_float` fires on that shape specifically,
+    // not on one ANDed with another term) -- matching how the pre-#2089
+    // version of this loop already avoided the lint by coincidence.
     if step > 0.0 {
         let mut i = from;
         while i < to && values.len() < MAX_RANGE {
             values.push(OwnedValue::Float(i));
             i += step;
         }
+        truncated = i < to;
     } else if step < 0.0 {
         let mut i = from;
         while i > to && values.len() < MAX_RANGE {
             values.push(OwnedValue::Float(i));
             i += step;
         }
+        truncated = i > to;
     }
 
-    owned_vec_to_result(values)
+    (owned_vec_to_result(values), truncated)
 }
 
 /// Builtin: recurse (recurse(.[]))
