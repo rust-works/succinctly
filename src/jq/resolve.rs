@@ -576,12 +576,24 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         }
 
         // The check itself. Arguments are checked in the *caller's* scope, not
-        // the callee's — an argument is an expression written at the call site.
+        // the callee's — an argument is an expression written at the call
+        // site — but only when the callee itself resolves. Real jq's compiler
+        // binds a call's argument closures to the callee's parameter slots,
+        // which requires already having found the callee; an unresolved
+        // callee means there is no such binding to attempt, so jq never
+        // compiles the arguments at all and reports only the callee
+        // (verified live: `nosucha(nosuchb; nosuchc)` is `nosucha/2 is not
+        // defined`, one error, not three). Checking the arguments anyway —
+        // the pre-#2037 code did, via `?`-propagation that just happened to
+        // discard the extra errors by stopping at the first one — would
+        // report errors real jq's compiler never reaches once every call is
+        // collected instead of just the first (#2037).
         Expr::FuncCall { name, args } => {
-            for a in args {
-                check(a, scope, errors);
-            }
-            if !(in_scope(scope, name, args.len()) || is_jq_builtin(name, args.len())) {
+            if in_scope(scope, name, args.len()) || is_jq_builtin(name, args.len()) {
+                for a in args {
+                    check(a, scope, errors);
+                }
+            } else {
                 errors.push(UnresolvedCall {
                     name: name.clone(),
                     arity: args.len(),
