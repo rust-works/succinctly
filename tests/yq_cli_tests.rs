@@ -8995,6 +8995,40 @@ fn test_argjson_bare_negative_number_1150() -> Result<()> {
     Ok(())
 }
 
+/// #2051: `succinctly yq --argjson` had its own, separate parser with no
+/// leniency retry, so it silently drifted from `succinctly jq` once #1094
+/// (leading zero) and #2012 (lone low surrogate) gave jq mode's `--argjson`
+/// that leniency and yq mode's copy never got the fix. Both diverged inputs,
+/// plus needing both leniencies in the same value at once.
+#[test]
+fn test_argjson_shares_jq_leniency_2051() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".n = $n",
+        "{}",
+        &["--argjson", "n", "007", "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"n":7}"#);
+
+    let (output, code) = run_yq_stdin(
+        ".s = $s",
+        "{}",
+        &["--argjson", "s", r#""\udc00""#, "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{\"s\":\"\u{fffd}\"}");
+
+    let (output, code) = run_yq_stdin(
+        ".x = $x",
+        "{}",
+        &["--argjson", "x", r#"[007,"\udc00"]"#, "-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{\"x\":[7,\"\u{fffd}\"]}");
+
+    Ok(())
+}
+
 #[test]
 fn test_arg_hyphen_prefixed_string_value_1150() -> Result<()> {
     let (output, code) = run_yq_stdin("$n", "a: 1", &["--arg", "n", "-hello"])?;

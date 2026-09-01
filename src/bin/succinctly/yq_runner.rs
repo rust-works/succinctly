@@ -3611,14 +3611,33 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
 /// `to_owned_canonicalizing_numbers`). Adding fidelity only here would make
 /// `--argjson` *inconsistent* with that established convention rather than
 /// fix a real divergence.
+///
+/// On the initial strict parse's failure, retries against
+/// `jq_runner::normalize_json_leniently`'s output (#1094's leading zero,
+/// #2012's lone low surrogate) -- the same two leniencies `succinctly jq`
+/// already accepts, shared from one definition rather than a second,
+/// independently-maintained copy (#2051: before this, the two modes had
+/// silently drifted apart on this exact input). Reparsing the *normalized*
+/// text directly (not the original, unlike `jq_runner`'s retry) is
+/// sufficient here precisely because this function already discards number
+/// fidelity -- there is no original spelling left to preserve.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
-    let value: serde_json::Value =
-        serde_json::from_str(s).with_context(|| format!("invalid JSON: {s}"))?;
-    Ok(serde_json_to_owned(&value))
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(value) => Ok(serde_json_to_owned(&value)),
+        Err(e) => {
+            let normalized = crate::jq_runner::normalize_json_leniently(s);
+            if normalized != s {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
+                    return Ok(serde_json_to_owned(&value));
+                }
+            }
+            Err(e).with_context(|| format!("invalid JSON: {s}"))
+        }
+    }
 }
 
 /// Convert a `serde_json::Value` into an `OwnedValue`.
