@@ -1029,6 +1029,16 @@ narrower, already-fixed-write case where only the RHS-discard *optimization* is 
 (`0 as $k | .[$k] = error("boom")` on a scalar root still raises `boom` where real yq no-ops
 silently, even though the write itself — `.[$k] = 99` — already correctly no-ops).
 
+A pipe-literal reaches the same `resolve_leaf` fallback, not just a computed key or
+`Comma`-grouped LHS: `(null | .a) = 5` on `null` errors "Invalid path expression near
+attempt to access element \"a\" of null" in `succinctly yq`, where real yq no-ops to `null`
+unchanged (live-verified against yq v4.53.3, [#2044](https://github.com/rust-works/succinctly/issues/2044)).
+
+```bash
+$ printf 'null\n' | yq            '(null | .a) = 5'   # null, no-op
+$ printf 'null\n' | succinctly yq '(null | .a) = 5'   # Error: Invalid path expression near attempt to access element "a" of null
+```
+
 **Fixed by [#1298](https://github.com/rust-works/succinctly/issues/1298):** `get_path_mut`
 (the walker #1232 widened) used to have no `Expr::Iterate` arm at all, so a mid-chain `.[]`
 under plain `=` (`.a[].b = 99`) always errored "invalid path component" — in both jq and yq
