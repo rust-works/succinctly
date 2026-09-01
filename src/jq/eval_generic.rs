@@ -17395,7 +17395,13 @@ mod tests {
     /// evaluator" wildcard arm) by driving the constructed `Expr::DefCall`
     /// straight through [`eval_each_with_cursor_using`], which calls
     /// `eval_each_generic` as its own entry point.
+    ///
+    /// `#[cfg(feature = "std")]`: reaches `MAX_EVAL_FRAMES` via the
+    /// ambient-depth guard (`eval.rs`'s `ambient_frame_depth` module),
+    /// which is a no-op under `no_std` by design -- there is no no_std
+    /// variant of this mechanism to test.
     #[test]
+    #[cfg(feature = "std")]
     fn eval_each_generic_reports_defcall_binding_failure_1371() {
         let Expr::FuncDef {
             name,
