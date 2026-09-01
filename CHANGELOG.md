@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A non-terminating `def` still fails, now as a catchable error rather than the abort real
   jq produces for the same input. Deep recursion in a body that holds a lot of structure
-  live stops earlier than jq's heap-allocated VM stack does; both are recorded in
+  live stops earlier than jq's heap-allocated VM stack does (confirmed against jq 1.7.1's
+  source, not just its behavior — see ADR-0020); both are recorded in
   [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md).
 
 ### Added

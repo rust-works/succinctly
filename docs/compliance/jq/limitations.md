@@ -1507,11 +1507,15 @@ Three differences remain, all in the direction of erroring rather than aborting:
   with `cannot allocate memory` and exit 134 (confirmed live). Divergence in the only
   direction ADR-0018 permits: matching would take the process down.
 - **A heavy body runs out of depth sooner than jq's does.** jq evaluates on a
-  heap-allocated VM stack, so its recursion depth is unaffected by how much structure a
-  body holds live across its own recursive call; this evaluator recurses natively, so it is
-  not. A body wrapping its call in 40 array constructors stops at ~900 levels where jq
-  reaches 12,000+. The ceiling counts live frames rather than calls precisely because the
-  two differ by 10x across body shapes — see `MAX_EVAL_FRAMES` (`src/jq/eval.rs`).
+  heap-allocated VM stack (confirmed against jq 1.7.1's source: `exec_stack.h`'s
+  `struct stack` grows via `realloc` through `jv_mem_realloc`, and `execute.c`'s
+  `CALL_JQ` opcode pushes a frame onto it and continues the same bytecode-dispatch loop
+  rather than recursing through a C function call), so its recursion depth is unaffected
+  by how much structure a body holds live across its own recursive call; this evaluator
+  recurses natively, so it is not. A body wrapping its call in 40 array constructors stops
+  at ~900 levels where jq reaches 12,000+. The ceiling counts live frames rather than
+  calls precisely because the two differ by 10x across body shapes — see
+  `MAX_EVAL_FRAMES` (`src/jq/eval.rs`).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
