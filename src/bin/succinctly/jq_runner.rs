@@ -2936,13 +2936,15 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// first place. Worth revisiting if a third leniency shows up (#2012 code
 /// review, altitude angle).
 ///
-/// `pub(crate)`: also called from `yq_runner::parse_json_value` (#2051) --
-/// `succinctly yq --argjson`/`--jsonargs` has its own, separate parser with
-/// no oracle-fidelity obligation to match jq's leniency (real mikefarah/yq
-/// has no `--argjson` flag at all), but sharing this one function keeps the
-/// two CLI modes from silently re-diverging on the same input the way they
-/// did between #1094/#2012 landing here and yq's copy not getting either
-/// fix.
+/// `pub(crate)`: as of #2051, called from three sites total --
+/// `parse_json_value` and `seq_value_is_valid` in this file, plus
+/// `yq_runner::parse_json_value` (yq mode has only `--argjson`, no
+/// `--jsonargs`/positional args at all -- see `yq_runner::build_args_var`).
+/// yq's own `--argjson` has no oracle-fidelity obligation to match jq's
+/// leniency (real mikefarah/yq has no `--argjson` flag at all), but sharing
+/// this one function keeps the two CLI modes from silently re-diverging on
+/// the same input the way they did between #1094/#2012 landing here and
+/// yq's copy not getting either fix.
 pub(crate) fn normalize_json_leniently(s: &str) -> String {
     normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s))
 }

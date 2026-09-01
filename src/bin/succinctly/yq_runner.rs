@@ -3614,30 +3614,40 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
 ///
 /// On the initial strict parse's failure, retries against
 /// `jq_runner::normalize_json_leniently`'s output (#1094's leading zero,
-/// #2012's lone low surrogate) -- the same two leniencies `succinctly jq`
-/// already accepts, shared from one definition rather than a second,
-/// independently-maintained copy (#2051: before this, the two modes had
-/// silently drifted apart on this exact input). Reparsing the *normalized*
-/// text directly (not the original, unlike `jq_runner`'s retry) is
-/// sufficient here precisely because this function already discards number
-/// fidelity -- there is no original spelling left to preserve.
+/// #2012's lone low surrogate) -- the same two leniencies `succinctly jq`'s
+/// own `--argjson` already accepts (yq mode has no `--jsonargs` at all, see
+/// `build_args_var` below), shared from one definition rather than a
+/// second, independently-maintained copy (#2051: before this, the two
+/// modes had silently drifted apart on this exact input). Reparsing the
+/// *normalized* text directly (not the original, unlike `jq_runner`'s
+/// retry) is sufficient here precisely because this function already
+/// discards number fidelity -- there is no original spelling left to
+/// preserve. That includes *magnitude*, not just cosmetic spelling, for an
+/// integer too large for `f64` to represent exactly: stripping a leading
+/// zero from `0099999999999999999999999` now reaches the same lossy
+/// `serde_json_to_owned` path a plain `99999999999999999999999` (no
+/// leading zero) already went through before this fix, and already
+/// materializes as `1e+23` there too (#978's own established, deliberate
+/// convention) -- this leniency retry does not introduce a new precision
+/// class, it makes a leading-zero-prefixed integer behave exactly as if
+/// the leading zero were never there, consistent with every other digit
+/// string this function accepts.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(OwnedValue::Null);
     }
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(value) => Ok(serde_json_to_owned(&value)),
-        Err(e) => {
-            let normalized = crate::jq_runner::normalize_json_leniently(s);
-            if normalized != s {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
-                    return Ok(serde_json_to_owned(&value));
-                }
-            }
-            Err(e).with_context(|| format!("invalid JSON: {s}"))
-        }
+    // A no-op normalization reparses byte-identical text and fails
+    // identically -- no `normalized != s` guard needed before retrying.
+    let e = match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(value) => return Ok(serde_json_to_owned(&value)),
+        Err(e) => e,
+    };
+    let normalized = crate::jq_runner::normalize_json_leniently(s);
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&normalized) {
+        return Ok(serde_json_to_owned(&value));
     }
+    Err(e).with_context(|| format!("invalid JSON: {s}"))
 }
 
 /// Convert a `serde_json::Value` into an `OwnedValue`.
