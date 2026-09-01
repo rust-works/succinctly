@@ -29138,62 +29138,75 @@ fn test_path_cursor_native_keeps_output_before_a_later_error_2061() -> Result<()
 }
 
 /// #2061: the validity walk's lazy #1642 collision map, whose fallback branch
-/// only runs once an undecodable key actually appears.
+/// only runs once an undecodable *key* actually appears.
 ///
-/// All three layouts matter and are checked separately, because the branch
+/// All four layouts matter and are checked separately, because the branch
 /// re-walks the object's *preceding* keys to seed the map: a fallback key
 /// first exercises the empty-prefix case, a fallback key after a clean one
-/// exercises the re-walk itself, and two fallback keys exercise the guard
-/// finding a genuine collision. Byte-identical to the eager map on all three,
-/// verified against `main` before this change landed.
+/// exercises the re-walk itself, two fallback keys exercise the map holding
+/// more than one, and a fallback key whose display form collides with a real
+/// key exercises the guard actually raising. Byte-identical to the eager map
+/// on all four, verified against `main`.
 ///
-/// Raw invalid UTF-8 rather than a `\uXXXX` escape: succinctly's semi-index
-/// accepts these bytes (real jq does too, substituting U+FFFD), where every
-/// bad-escape form is rejected at parse time and never reaches this walk.
+/// **The key must be undecodable, not merely lossy.** An earlier version of
+/// this test used raw invalid UTF-8 (`"\xff\xfe"`) and reached none of this:
+/// those bytes decode lossily, `string_decode_error()` answers `None`, and
+/// `key_display_string_kind` therefore reports them as ordinary keys, so the
+/// eager path never engages. Only the `\uXXXX` family produces a genuine
+/// decode failure. An undecodable *value* does not reach it either -- that is
+/// the walk's separate scalar arm. Confirmed by planting a probe in the
+/// branch and checking which documents actually execute it, rather than
+/// assuming from the test passing.
 #[test]
 fn test_path_validity_walk_lazy_collision_map_2061() -> Result<()> {
-    let replacement = "\u{fffd}\u{fffd}";
-
     // Fallback key first: the re-walk runs with an empty prefix.
-    let (out, code) = run_jq_binary_stdin("[path(.[])]", b"{\"\xff\xfe\": 1, \"a\": 2}", &["-c"])?;
+    let (stdout, code) = run_jq_stdin("[path(.[])]", r#"{"\ud800":1,"a":2}"#, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(
-        String::from_utf8_lossy(&out).trim(),
-        format!("[[\"{replacement}\"],[\"a\"]]")
-    );
+    assert_eq!(stdout, "[[\"\\\\ud800\"],[\"a\"]]\n");
 
     // Fallback key after a clean one: the re-walk has a prefix to seed from.
-    let (out, code) = run_jq_binary_stdin(
-        "[path(.[])]",
-        b"{\"a\": 1, \"\xff\xfe\": 2, \"b\": 3}",
-        &["-c"],
-    )?;
+    let (stdout, code) = run_jq_stdin("[path(.[])]", r#"{"a":1,"\ud800":2}"#, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(
-        String::from_utf8_lossy(&out).trim(),
-        format!("[[\"a\"],[\"{replacement}\"],[\"b\"]]")
-    );
+    assert_eq!(stdout, "[[\"a\"],[\"\\\\ud800\"]]\n");
 
-    // Two fallback keys whose display forms collide: `keys` collapses them,
-    // and the walk must not raise for an ordinary repeat.
-    let (out, code) = run_jq_binary_stdin(
-        "[path(.[])]",
-        b"{\"\xff\xfe\": 1, \"\xff\xfd\": 2}",
-        &["-c"],
-    )?;
+    // Two distinct fallback keys, and a clean key on either side of one.
+    let (stdout, code) = run_jq_stdin("[path(.[])]", r#"{"\ud800":1,"\ud801":2}"#, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(
-        String::from_utf8_lossy(&out).trim(),
-        format!("[[\"{replacement}\"]]")
-    );
+    assert_eq!(stdout, "[[\"\\\\ud800\"],[\"\\\\ud801\"]]\n");
+
+    let (stdout, code) = run_jq_stdin("[path(.[])]", r#"{"a":1,"\ud800":2,"b":3}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\"],[\"\\\\ud800\"],[\"b\"]]\n");
 
     // A navigation that never visits the undecodable key still sees it,
-    // because the walk validates the whole document -- this is the behaviour
-    // #2061 deliberately preserved rather than trading away for speed.
-    let (out, code) = run_jq_binary_stdin("path(.a)", b"{\"\xff\xfe\": 1, \"a\": 2}", &["-c"])?;
+    // because the walk validates the whole document -- the behaviour #2061
+    // deliberately preserved rather than trading away for speed.
+    let (stdout, code) = run_jq_stdin("path(.a)", r#"{"\ud800":1,"a":2}"#, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(String::from_utf8_lossy(&out).trim(), "[\"a\"]");
+    assert_eq!(stdout, "[\"a\"]\n");
 
+    Ok(())
+}
+
+/// #2061: the collision the lazy map's guard exists to catch still raises --
+/// an undecodable key whose display spelling collides with a real key of that
+/// same name, which a display-keyed map cannot hold both of (#1642).
+///
+/// Checked in all three positions relative to the clean key, since the lazy
+/// map only seeds itself from the prefix once a fallback key appears: getting
+/// the seeding wrong would turn one of these into a silent success.
+#[test]
+fn test_path_validity_walk_still_raises_on_a_colliding_key_2061() -> Result<()> {
+    for doc in [
+        r#"{"\\ud800":1,"\ud800":2}"#,
+        r#"{"\ud800":1,"\ud800":2}"#,
+        r#"{"a":1,"\ud800":2,"\ud800":3}"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.a)", doc, &["-c"])?;
+        assert_eq!(code, 5, "{doc}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{doc}");
+        assert!(stderr.contains("is ambiguous"), "{doc}: {stderr}");
+    }
     Ok(())
 }
 
