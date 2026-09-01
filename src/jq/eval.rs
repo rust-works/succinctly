@@ -33758,9 +33758,13 @@ fn delete_trie_apply(
     //
     // `value` can only be one concrete type at a time, so at most one of
     // these two actually mutates it; the other sees a container of the wrong
-    // shape and takes that branch's optional-vs-error path. Both maps can be
-    // non-empty only when `value` is `null`, which accepts a string key, a
-    // numeric key or `.[]` alike.
+    // shape and takes that branch's optional-vs-error path. Both maps being
+    // non-empty isn't limited to `value` being `null` (which accepts a
+    // string key, a numeric key or `.[]` alike): a mixed-kind multi-branch
+    // computed key that skips `resolve_node`'s validation (#2049) can
+    // populate both maps against a non-null scalar root too -- the fields
+    // arm no-ops through it (below), and the indices arm raises its own
+    // type-mismatch error.
     if !node.fields.is_empty() {
         value = delete_trie_object(value, trie, id)?;
     }
@@ -33825,11 +33829,8 @@ fn delete_trie_object(
     // a no-op through the unvalidated root rather than the `unreachable!()`
     // that used to sit here and abort the process on this exact input
     // (#2049).
-    if !matches!(value, OwnedValue::Object(_)) {
+    let Some(entries) = value.as_object_mut() else {
         return Ok(value);
-    }
-    let OwnedValue::Object(entries) = &mut value else {
-        unreachable!("checked above")
     };
     for &slot in &node.field_groups {
         let (name, &child) = node

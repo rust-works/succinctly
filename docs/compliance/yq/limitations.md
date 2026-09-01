@@ -935,6 +935,44 @@ what distinguishes its call shape from its three siblings') until the real rever
 abort-without-rollback algorithm is implemented, tracked as
 [#1865](https://github.com/rust-works/succinctly/issues/1865) rather than guessed at here.
 
+### `del()` with a field key against a scalar root: errors instead of no-op
+
+Deleting a field key from a scalar document raises `Cannot index <type> with string
+"<key>"` in succinctly yq; real yq (v4.53.3) silently no-ops instead, returning the
+input unchanged at exit 0. Confirmed live for a static key, a single-branch computed
+key, and (after [#2049](https://github.com/rust-works/succinctly/issues/2049)'s fix
+for a live `unreachable!()` on this same shape) a mixed field+index multi-branch
+computed key:
+
+```bash
+$ echo '2.5' | yq            'del(.k0)'            # 2.5, no-op
+$ echo '2.5' | succinctly yq 'del(.k0)'             # Error: Cannot index number with string "k0"
+
+$ echo '2.5' | yq            'del(.[("k0",0)])'     # 2.5, no-op
+$ echo '2.5' | succinctly yq 'del(.[("k0",0)])'     # Error: Cannot index number with number
+```
+
+A purely-field multi-branch computed key (`del(.[("k0","k1")])`) *does* already
+no-op correctly — #2049's fix landed there as a side effect of removing the panic,
+since that shape reaches `delete_trie_object`'s trie walker directly rather than
+`resolve_node`'s earlier, always-erroring field-indexable check. The static,
+single-branch-computed and mixed-key shapes above still go through that earlier
+check (or, for the mixed case, `delete_trie_array`'s own separate non-array gate)
+and still error.
+
+A `null` root against that same purely-field multi-branch key is a third,
+non-erroring divergence in the same family: real yq materializes an object shape
+(`{}`) rather than leaving it `null`.
+
+```bash
+$ echo 'null' | yq            'del(.[("k0","k1")])'   # {}, materializes an object
+$ echo 'null' | succinctly yq 'del(.[("k0","k1")])'   # null, unchanged
+```
+
+`delete_trie_object`'s pre-existing `Null` branch (untouched by #2049's fix) always
+returns the root unchanged. Tracked, along with the field-key-on-scalar-root shapes
+above, as [#2106](https://github.com/rust-works/succinctly/issues/2106).
+
 ### Comma-grouped scalar-target assignment no-op
 
 [#1233](https://github.com/rust-works/succinctly/issues/1233) taught `=`/`+=`/`-=`/`*=`/`//=`
