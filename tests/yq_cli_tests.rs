@@ -9026,6 +9026,40 @@ fn test_argjson_shares_jq_leniency_2051() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "{\"x\":[7,\"\u{fffd}\"]}");
 
+    // A leading-zero integer too large for f64 to represent exactly must
+    // materialize *identically* to its non-leading-zero counterpart --
+    // yq's --argjson already discards integer-magnitude fidelity beyond
+    // f64's exact range (#978), and this leniency retry deliberately makes
+    // the leading zero invisible to that existing behavior rather than
+    // carving out a magnitude-preserving exception just for values that
+    // happen to need the leniency retry (code review on #2051).
+    let (with_zero, code) = run_yq_stdin(
+        ".x = $x",
+        "{}",
+        &[
+            "--argjson",
+            "x",
+            "0099999999999999999999999",
+            "-o=json",
+            "-I=0",
+        ],
+    )?;
+    assert_eq!(code, 0);
+    let (without_zero, code) = run_yq_stdin(
+        ".x = $x",
+        "{}",
+        &[
+            "--argjson",
+            "x",
+            "99999999999999999999999",
+            "-o=json",
+            "-I=0",
+        ],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(with_zero.trim(), without_zero.trim());
+    assert_eq!(with_zero.trim(), r#"{"x":1e+23}"#);
+
     Ok(())
 }
 
