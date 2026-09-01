@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Self-recursive and branching user-defined `def`s now evaluate** (#1371). `def
+  sum_to(n): if n == 0 then 0 else n + sum_to(n-1) end; sum_to(100)` returns `5050`, and
+  `sum_to(10000)` returns `50005000`, both matching jq 1.7.1; naive `fib` works where
+  every branching recursion previously failed at *any* depth, zero included.
+
+  `def` bodies were substituted into their call sites before evaluation began, which
+  cannot terminate for a self-recursive definition — expansion has no way to observe that
+  a runtime base case will be reached — and so was bounded by three guards that refused
+  ordinary recursive filters. Calls are now bound to their definition and substituted per
+  call, when evaluation reaches them, with arguments captured behind a shared node that
+  keeps the recursion linear rather than quadratic. See
+  [ADR-0020](docs/adrs/adr-0020.md).
+
+  A non-terminating `def` still fails, now as a catchable error rather than the abort real
+  jq produces for the same input. Deep recursion in a body that holds a lot of structure
+  live stops earlier than jq's heap-allocated VM stack does; both are recorded in
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md).
+
 ### Added
 
 - **`reduce`/`foreach`'s own `as` clause accepts a full destructuring pattern**

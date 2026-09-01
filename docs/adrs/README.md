@@ -46,6 +46,7 @@ by Michael Nygard.
 | [ADR-0017](adr-0017.md) | ✅ Accepted | 2026-08-11 | Presentation-Metadata Side-Trees over a Mutable YAML Document |
 | [ADR-0018](adr-0018.md) | ✅ Accepted | 2026-08-22 | Reference-Tool Fidelity, Decided by Mode Rather than Format   |
 | [ADR-0019](adr-0019.md) | ✅ Accepted | 2026-08-22 | Reject Regex-Engine Swap for jq's l/n Flag Gaps (#920, #922)  |
+| [ADR-0020](adr-0020.md) | ✅ Accepted | 2026-09-01 | Evaluate User-Defined `def`s as Runtime Calls (#1371)         |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.

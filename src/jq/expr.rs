@@ -539,13 +539,14 @@ pub enum Expr {
     },
 }
 
-/// The three parts of a `def` that [`Expr::PendingDef`] carries between
-/// recursion levels (#1371).
+/// The three parts of a `def` that [`Expr::DefCall`] carries from the
+/// definition to each of its call sites (#1371).
 ///
 /// Split out of [`Expr::FuncDef`]'s inline fields so one `Rc` can hold all
-/// three: re-declaring the definition around each newly substituted body is
-/// the innermost step of every recursive call, and cloning a `body` there
-/// would reintroduce the per-level copy this design exists to remove.
+/// three: re-installing the definition over each newly substituted body is
+/// the innermost step of every recursive call, and cloning the definition
+/// there -- rather than bumping one refcount -- would put a per-level copy
+/// back into the path this design exists to keep flat.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDefData {
     /// Function name.
