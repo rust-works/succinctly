@@ -22472,14 +22472,16 @@ fn cannot_move_register(expr: &Expr) -> bool {
 /// the same filter with `false` on `{"a":false}` both answer `["a"]`, while
 /// `false` against `{"a":true}` raises).
 ///
-/// jq applies that same `null`/`bool` arm one step earlier than succinctly
-/// does: `path(.a | null)` on `{"a":null}` is `["a"]` in jq, because the
-/// literal never moved the register and `null` is identical to it — while
-/// succinctly refuses, since `reestablishes_register` only re-establishes a
-/// branch that is *already* untracked and a stage sitting directly on a
-/// trackable one never gets there. Refuse-only, pre-existing, and recorded
-/// in `docs/compliance/jq/limitations.md`; do not read the arm below as
-/// claiming that shape works.
+/// jq applies that same `null`/`bool` arm regardless of whether the branch
+/// reaching it was already untracked or is only just now stepping off a
+/// still-trackable one: `path(.a | null)` on `{"a":null}` is `["a"]` in jq,
+/// because the literal never moved the register and `null` is identical to
+/// it. `reestablishes_register`'s jq-mode call site handles both cases
+/// (#2044 widened it to also cover a still-trackable branch's own step,
+/// which used to be excluded and refuse this shape).
+///
+/// yq mode does **not** get this widening — see
+/// [`trackable_step_register_eligible`] for why.
 ///
 /// So a value is identical to the register when it equals it *and* is
 /// either
@@ -22487,12 +22489,6 @@ fn cannot_move_register(expr: &Expr) -> bool {
 /// - a frozen `as`-binding snapshot (`PathBranch::snapshot`) — a value jq is
 ///   still holding by the very same pointer, never rebuilt — or
 /// - a `null`/`true`/`false`.
-///
-/// A *trackable* branch never needs this: it navigated to a real path, and
-/// its caller places it directly. Both callers keep their own separate
-/// `trackable` precondition (a dead register can never match anything)
-/// rather than folding it in here, so this stays a pure statement about the
-/// two values.
 ///
 /// Kept as one function precisely because it is now consulted from two
 /// unrelated places: a second, hand-inlined copy of this rule would be free
@@ -24596,6 +24592,36 @@ struct StepRegisterFacts {
     step_snapshot: bool,
 }
 
+/// Whether a still-trackable branch's own step -- one that itself drops out
+/// of trackability, per [`StepRegisterFacts::branch_trackable`] being `true`
+/// entering it -- is eligible to have that step's `resolve_leaf`-recorded
+/// register (#2044) consulted for re-establishment or carried forward to
+/// the next stage. Shared by [`reestablishes_register`]'s own consultation
+/// and [`carry_register`]'s forwarding decision so the mode gate cannot
+/// independently drift between the two the way this file's history already
+/// shows it can ("#1573's register re-establishment had already been fixed
+/// in the `Ok` arm alone once before the `Err` arm's identical omission was
+/// noticed" — the same class of bug, here between two different functions
+/// rather than two arms of one).
+///
+/// jq mode only: real yq no-ops a field/index access against a scalar
+/// (#1181's convention) rather than navigating through it, a rule neither
+/// call site knows about and that isn't consulted at either one yet for a
+/// *plain*, non-computed key (#2107's own, separately-tracked gap) — so yq
+/// mode treats a still-trackable branch's own step as ineligible
+/// unconditionally, leaving it exactly as refuse-only as it was pre-#2044
+/// in both the single-step (`reestablishes_register`) and carried-forward,
+/// multi-step (`carry_register`) shapes. Both confirmed live against yq
+/// v4.53.3: `(null | .a) = 5` and `(null | null | .a) = 5` are both no-ops
+/// on `null` input, never the write jq's own `{"a":5}` answer would become
+/// if either call site treated this as eligible in yq mode — silently
+/// corrupting data is a worse outcome than the refusal it would replace.
+/// The already-untracked case (this function's `false` branch) is
+/// unaffected by the mode gate in either direction.
+fn trackable_step_register_eligible<S: EvalSemantics>(branch_trackable: bool) -> bool {
+    branch_trackable && S::TAG == EvalTag::Jq
+}
+
 /// Whether one pipe stage's output re-establishes the path register, and so
 /// is trackable again despite arriving on an already-untracked branch
 /// (#1573).
@@ -24646,6 +24672,11 @@ struct StepRegisterFacts {
 /// (`resolve_leaf` records the ambient value as `step_register` on the
 /// very transition that drops trackability — see [`carry_register`]).
 ///
+/// **jq mode only for the still-trackable case** — the caller gates which
+/// `register` it passes in through [`trackable_step_register_eligible`];
+/// see that function's own doc comment for why yq mode stays refuse-only
+/// here.
+///
 /// This only ever turns a refusal into an answer, so getting it *wrong*
 /// costs an accepted path jq refuses — the dangerous direction, and why
 /// every clause above is a conjunct rather than a heuristic.
@@ -24688,7 +24719,19 @@ fn reestablishes_register(
 /// cost an allocation at *every* recording, including the overwhelmingly
 /// common case where the register is never consulted again; the borrow
 /// `resolve_leaf` records today costs nothing. Kept as `Cow` deliberately.
-fn carry_register<'a>(
+///
+/// The "trackable again" arm is gated by [`trackable_step_register_eligible`]
+/// (#2044), the same jq-only eligibility [`reestablishes_register`]'s own
+/// caller checks — carrying `step_register` forward here for an ineligible
+/// (yq-mode) transition would let a *later* already-untracked step
+/// reestablish from it despite [`reestablishes_register`]'s own call site
+/// never being eligible to use it directly, reopening the exact data-
+/// corruption gap that mode gate exists to close, just one step later
+/// (confirmed live: `(null | null | .a) = 5` in yq mode). When ineligible,
+/// `carried` is `None` by construction anyway (a still-trackable branch
+/// never had anything carried), so this still answers `None`, matching
+/// pre-#2044 behavior exactly.
+fn carry_register<'a, S: EvalSemantics>(
     facts: StepRegisterFacts,
     reestablished: bool,
     carried: &Option<Cow<'a, OwnedValue>>,
@@ -24696,7 +24739,7 @@ fn carry_register<'a>(
 ) -> Option<Cow<'a, OwnedValue>> {
     if reestablished || facts.navigated || !facts.stage_preserves_register {
         None
-    } else if facts.branch_trackable {
+    } else if trackable_step_register_eligible::<S>(facts.branch_trackable) {
         step_register
     } else {
         carried.clone()
@@ -24902,9 +24945,9 @@ fn resolve_seq<'a, S: EvalSemantics>(
                 // and `resolve_leaf` records that value as `step_register`
                 // on exactly the transition that drops trackability --
                 // `carried_register` is only ever populated once already
-                // untracked (see `reestablishes_register`'s own doc
-                // comment).
-                let register_entering = if branch_trackable {
+                // untracked. See `trackable_step_register_eligible` for the
+                // jq-only mode gate this shares with `carry_register` below.
+                let register_entering = if trackable_step_register_eligible::<S>(branch_trackable) {
                     step_register.as_deref()
                 } else {
                     carried_register.as_deref()
@@ -24916,7 +24959,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     PathPrefix::extend_many(&prefix, components.to_vec())
                 };
                 PathBranch {
-                    register: carry_register(
+                    register: carry_register::<S>(
                         facts,
                         reestablished,
                         &carried_register,
@@ -70304,6 +70347,57 @@ mod tests {
         query!(b"null", r"path((try . catch 1) as $v | null | .[0] | $v)",
             QueryResult::Owned(OwnedValue::Array(path)) => {
                 assert_eq!(path, vec![OwnedValue::Int(0)]);
+            }
+        );
+
+        // The same reestablishment through an assignment's write-target
+        // resolution, not just `path()` -- live-verified against jq 1.7.1:
+        // `(null | .a) = 5` on `null` is `{"a":5}`.
+        query!(b"null", r"(null | .a) = 5",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("a"), Some(&OwnedValue::Int(5)));
+            }
+        );
+    }
+
+    /// #2044 code review: widening `reestablishes_register` for a
+    /// still-trackable branch must stay jq-mode-only. Real yq no-ops a
+    /// field/index access against a scalar (#1181's convention) rather than
+    /// navigating through it -- that convention isn't consulted at this
+    /// particular site yet (#2107's own, separately-tracked gap for a
+    /// *plain*, non-computed key), so applying jq's own "write through a
+    /// freshly-computed null" answer to yq mode too would silently corrupt
+    /// data instead of either erroring (this resolver's own pre-#2044
+    /// behavior) or no-oping (what real yq actually does). Live-verified
+    /// against yq v4.53.3: `(null | .a) = 5` on `null` is a no-op (`null`
+    /// unchanged), not a write.
+    #[test]
+    fn test_reestablishes_register_stays_jq_mode_only_2044() {
+        yq_query!(b"null", r"(null | .a) = 5",
+            QueryResult::Error(e) => {
+                assert!(e.is_untracked_navigation_error());
+            }
+        );
+    }
+
+    /// #2044 code review, second round: a *pre-existing* bug (reproduces
+    /// identically on `main` before this PR touched anything) found while
+    /// verifying the fix above -- `carry_register`'s own `branch_trackable`
+    /// arm carried a still-trackable step's `step_register` forward
+    /// unconditionally, so an already-untracked *later* step's own
+    /// `reestablishes_register` check (which was never gated by mode at
+    /// all, pre-#2044) could reestablish from the leaked value one step
+    /// after the direct site. Same underlying mechanism as the test above,
+    /// just delayed by one pipe stage -- fixed by extending
+    /// `trackable_step_register_eligible`'s mode gate to `carry_register`
+    /// too rather than leaving it as a second, independently-drifting copy
+    /// of the same eligibility rule. Live-verified against yq v4.53.3:
+    /// `(null | null | .a) = 5` on `null` is a no-op, not a write.
+    #[test]
+    fn test_reestablishes_register_stays_jq_mode_only_multi_step_2044() {
+        yq_query!(b"null", r"(null | null | .a) = 5",
+            QueryResult::Error(e) => {
+                assert!(e.is_untracked_navigation_error());
             }
         );
     }
