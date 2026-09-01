@@ -40205,7 +40205,7 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
 /// Real jq does not manage this on the same input -- `def deep: [deep]; deep`
 /// dies there with `cannot allocate memory`, exit 134 (confirmed live) -- so
 /// erroring instead is a divergence in the only direction ADR-0018 permits.
-const MAX_EVAL_FRAMES: u32 = 40_000;
+pub(crate) const MAX_EVAL_FRAMES: u32 = 40_000;
 
 /// Evaluate one call to a user-defined function (#1371).
 ///
@@ -65896,6 +65896,85 @@ mod tests {
             substitute_func_param(&slice_number, "x", &Expr::Identity),
             slice_number
         );
+    }
+
+    /// #1371: `Expr::NthExpr` is never constructed by the parser -- a CLI
+    /// `nth(n; expr)` always parses through `Builtin::NthStream` instead (see
+    /// `eval_nth_expr_n_argument_propagates_halt`'s doc comment) -- so
+    /// `install_def_calls`'s own rebuild arm for it can only be reached by a
+    /// direct call. Unlike `Expr::SliceNumber` above (a leaf `install_def_calls`
+    /// just clones), `NthExpr` carries two sub-expressions it must actually
+    /// recurse into: both `n` and `expr` need their own call to `f` rewritten
+    /// to a `DefCall`, not silently left as an unresolvable `FuncCall`.
+    #[test]
+    fn install_def_calls_descends_into_nth_expr_1371() {
+        let def = Rc::new(FuncDefData {
+            name: "f".into(),
+            params: Vec::new(),
+            body: Expr::Identity,
+        });
+        let call_f = || Expr::FuncCall {
+            name: "f".into(),
+            args: Vec::new(),
+        };
+        let nth = Expr::NthExpr {
+            n: Box::new(call_f()),
+            expr: Box::new(call_f()),
+        };
+
+        match install_def_calls(&nth, &def, 0) {
+            Expr::NthExpr { n, expr } => {
+                assert!(
+                    matches!(*n, Expr::DefCall { .. }),
+                    "n must be installed, got {n:?}"
+                );
+                assert!(
+                    matches!(*expr, Expr::DefCall { .. }),
+                    "expr must be installed, got {expr:?}"
+                );
+            }
+            other => panic!("expected NthExpr, got {other:?}"),
+        }
+    }
+
+    /// #1371: `Expr::NamespacedCall`'s own name is never this pass's call to
+    /// resolve -- `f` and `ns::f` are different names -- so only its `args`
+    /// can carry a call to `f`, checked the same way `Expr::FuncCall`'s own
+    /// arm checks its own `args`. Pinned directly for the same reason as
+    /// `install_def_calls_descends_into_nth_expr_1371` above: nothing in this
+    /// crate's own test suite otherwise builds a `def` in scope alongside a
+    /// namespaced call, so the CLI can't be relied on to reach this arm.
+    #[test]
+    fn install_def_calls_descends_into_namespaced_call_args_1371() {
+        let def = Rc::new(FuncDefData {
+            name: "f".into(),
+            params: Vec::new(),
+            body: Expr::Identity,
+        });
+        let ns_call = Expr::NamespacedCall {
+            namespace: "ns".into(),
+            name: "g".into(),
+            args: vec![Expr::FuncCall {
+                name: "f".into(),
+                args: Vec::new(),
+            }],
+        };
+
+        match install_def_calls(&ns_call, &def, 0) {
+            Expr::NamespacedCall {
+                namespace,
+                name,
+                args,
+            } => {
+                assert_eq!(namespace, "ns");
+                assert_eq!(name, "g");
+                assert!(
+                    matches!(args.as_slice(), [Expr::DefCall { .. }]),
+                    "arg must be installed, got {args:?}"
+                );
+            }
+            other => panic!("expected NamespacedCall, got {other:?}"),
+        }
     }
 
     /// Build a single-step [`DeleteTrie`] whose one edge is `component`.

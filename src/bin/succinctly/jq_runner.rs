@@ -6062,6 +6062,33 @@ mod tests {
         assert!(!should_force_read_under_null_input(true, true, true, true));
     }
 
+    /// #1371: `rewrite_namespaced_calls` runs once, on the freshly parsed
+    /// program, strictly before evaluation ever builds an `Expr::Shared` or
+    /// `Expr::DefCall` -- so this pass can never actually receive one from
+    /// its real caller. Named rather than wildcarded (see the arm's own
+    /// comment), so exercised directly here: each node must come back
+    /// unchanged, not e.g. have its nested args silently dropped or
+    /// rewritten as if it were some other variant.
+    #[test]
+    fn test_rewrite_namespaced_calls_passes_through_shared_and_defcall_1371() {
+        use std::rc::Rc;
+
+        let shared = Expr::Shared(Rc::new(Expr::Identity));
+        assert_eq!(rewrite_namespaced_calls(shared.clone()), shared);
+
+        let def_call = Expr::DefCall {
+            def: Rc::new(jq::FuncDefData {
+                name: "f".to_string(),
+                params: Vec::new(),
+                body: Expr::Identity,
+            }),
+            args: vec![Expr::Literal(jq::Literal::Int(1))],
+            frames: 3,
+            bound: jq::BoundBody::default(),
+        };
+        assert_eq!(rewrite_namespaced_calls(def_call.clone()), def_call);
+    }
+
     /// #1154: direct unit coverage for the extracted token-boundary
     /// finder, independent of the CLI-level `--argjson` tests (which
     /// already cover `normalize_leading_zero_numbers`'s end-to-end

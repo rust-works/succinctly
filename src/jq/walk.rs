@@ -992,6 +992,59 @@ mod tests {
         assert_eq!(seen, 2);
     }
 
+    /// #1371: unlike `resolve::check` (which runs once on the freshly parsed
+    /// program and so can never actually see an `Expr::DefCall`),
+    /// `any_subexpr` answers callers -- `streams_unbounded`, `has_navigation`
+    /// and others -- that run *during* evaluation, after `def` calls have
+    /// been installed. Both halves of the arm's `||` need their own case: a
+    /// predicate matching only inside the resolved definition's body, and one
+    /// matching only inside the call's own (unsubstituted) arguments, so a
+    /// regression that dropped either operand would still fail here even
+    /// though the other made the whole expression true.
+    #[test]
+    fn any_subexpr_descends_into_defcall_body_and_args() {
+        use alloc::rc::Rc;
+
+        let marker = || Expr::Var("marker".into());
+        let mut is_marker = |e: &Expr| matches!(e, Expr::Var(name) if name == "marker");
+
+        let in_body = Expr::DefCall {
+            def: Rc::new(crate::jq::FuncDefData {
+                name: "f".into(),
+                params: Vec::new(),
+                body: marker(),
+            }),
+            args: vec![Expr::Identity],
+            frames: 0,
+            bound: crate::jq::BoundBody::default(),
+        };
+        assert!(any_subexpr(&in_body, &mut is_marker));
+
+        let in_args = Expr::DefCall {
+            def: Rc::new(crate::jq::FuncDefData {
+                name: "f".into(),
+                params: Vec::new(),
+                body: Expr::Identity,
+            }),
+            args: vec![marker()],
+            frames: 0,
+            bound: crate::jq::BoundBody::default(),
+        };
+        assert!(any_subexpr(&in_args, &mut is_marker));
+
+        let neither = Expr::DefCall {
+            def: Rc::new(crate::jq::FuncDefData {
+                name: "f".into(),
+                params: Vec::new(),
+                body: Expr::Identity,
+            }),
+            args: vec![Expr::Identity],
+            frames: 0,
+            bound: crate::jq::BoundBody::default(),
+        };
+        assert!(!any_subexpr(&neither, &mut is_marker));
+    }
+
     fn find_builtin(filter: &str) -> Builtin {
         let expr = parse(filter).expect("filter should parse");
         let mut found = None;

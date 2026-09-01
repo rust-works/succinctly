@@ -850,4 +850,61 @@ mod tests {
     fn a_later_same_arity_def_shadows_but_the_earlier_one_stays_resolvable() {
         assert_eq!(resolve("def f: 1; def g: f; def f: 2; g"), Ok(()));
     }
+
+    /// #1371: `Shared`/`DefCall` can never actually reach `check` -- this pass
+    /// runs once, on the freshly parsed program, strictly before evaluation
+    /// ever builds either variant. Named rather than folded into the leaf
+    /// group regardless (see the arm's own comment), so exercised directly
+    /// here via `check` itself rather than through `resolve_func_calls`'s
+    /// parser-only entry point: each arm must actually recurse into its
+    /// payload, not just be present and silently report "no unresolved
+    /// calls" the way the leaf arms correctly do for real leaves.
+    #[test]
+    fn check_recurses_through_shared_and_defcall() {
+        use alloc::rc::Rc;
+
+        let unresolved = || Expr::FuncCall {
+            name: "nosuchfn".into(),
+            args: Vec::new(),
+        };
+
+        let mut scope = Scope::new();
+        let mut errors = Vec::new();
+        check(
+            &Expr::Shared(Rc::new(unresolved())),
+            &mut scope,
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            [UnresolvedCall {
+                name: "nosuchfn".into(),
+                arity: 0,
+            }]
+        );
+
+        let mut scope = Scope::new();
+        let mut errors = Vec::new();
+        check(
+            &Expr::DefCall {
+                def: Rc::new(crate::jq::FuncDefData {
+                    name: "f".into(),
+                    params: Vec::new(),
+                    body: Expr::Identity,
+                }),
+                args: alloc::vec![unresolved()],
+                frames: 0,
+                bound: crate::jq::BoundBody::default(),
+            },
+            &mut scope,
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            [UnresolvedCall {
+                name: "nosuchfn".into(),
+                arity: 0,
+            }]
+        );
+    }
 }
