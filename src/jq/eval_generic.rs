@@ -9040,16 +9040,21 @@ fn path_context_is_cursor_walkable(expr: &Expr) -> bool {
 /// here: `V::Cursor` is `Copy` and 32 bytes, and `LazySource::Cursors` and
 /// `GenericResult::ManyCursor` both hold arbitrary cursor vectors across
 /// evaluation.
+/// The absent case is deliberately *not* representable. A step that reaches
+/// one is refused at the single boundary where it can arise (see
+/// [`path_context_step_generic`]), so every position the walk holds is a real
+/// document node, and neither `parent` nor value emission carries an
+/// "absent" branch that could not be reached to be tested.
 struct PathContextPos<V: DocumentValue> {
-    node: PathNode<V>,
+    node: V::Cursor,
     path: Vec<OwnedValue>,
-    ancestors: Vec<PathNode<V>>,
+    ancestors: Vec<V::Cursor>,
 }
 
 impl<V: DocumentValue> Clone for PathContextPos<V> {
     fn clone(&self) -> Self {
         Self {
-            node: self.node.clone(),
+            node: self.node,
             path: self.path.clone(),
             ancestors: self.ancestors.clone(),
         }
@@ -9098,16 +9103,8 @@ fn path_context_emit_value<V: DocumentValue>(
     if pos.path.is_empty() {
         return Err(PathContextAbort::Unsupported);
     }
-    match &pos.node {
-        PathNode::At(c) => {
-            out.push(to_owned_cursor(c).map_err(PathContextAbort::Error)?);
-            Ok(())
-        }
-        PathNode::Absent => {
-            out.push(OwnedValue::Null);
-            Ok(())
-        }
-    }
+    out.push(to_owned_cursor(&pos.node).map_err(PathContextAbort::Error)?);
+    Ok(())
 }
 
 /// Hop `n` levels towards the root, by truncating the path and the ancestor
@@ -9129,13 +9126,10 @@ fn path_context_hop<V: DocumentValue>(
         .checked_sub(n)
         .ok_or(PathContextAbort::Unsupported)?;
     let node = if len == pos.path.len() {
-        pos.node.clone()
+        pos.node
     } else {
-        pos.ancestors[len].clone()
+        pos.ancestors[len]
     };
-    if matches!(node, PathNode::Absent) {
-        return Err(PathContextAbort::Unsupported);
-    }
     Ok(PathContextPos {
         node,
         path: pos.path[..len].to_vec(),
@@ -9173,7 +9167,13 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             // (`{"a":1,"a":2} | [.[] | key]` is `["a"]` in v4.53.3).
             // `path()`'s own walk keeps the mode's flag, because it is not
             // replacing a materialization.
-            let stepped = path_step_generic::<S, V>(expr, &pos.node, &pos.path, true, &mut heads);
+            let stepped = path_step_generic::<S, V>(
+                expr,
+                &PathNode::At(pos.node),
+                &pos.path,
+                true,
+                &mut heads,
+            );
             for (path, node) in heads {
                 // An absent node is where the bridge and this walk genuinely
                 // disagree, so it is handed back rather than answered.
@@ -9188,9 +9188,9 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                 // change all three into a fourth answer inside a performance
                 // change, so absent positions stay on the bridge and keep
                 // today's behaviour exactly. Filed separately.
-                if matches!(node, PathNode::Absent) {
+                let PathNode::At(node) = node else {
                     return Err(PathContextAbort::Unsupported);
-                }
+                };
                 // All four steps append exactly one component, so the node
                 // they were reached from is the new position's last
                 // ancestor. Anything else means this function and
@@ -9200,7 +9200,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     return Err(PathContextAbort::Unsupported);
                 }
                 let mut ancestors = pos.ancestors.clone();
-                ancestors.push(pos.node.clone());
+                ancestors.push(pos.node);
                 out.push(PathContextPos {
                     node,
                     path,
@@ -9381,7 +9381,7 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
     }
 
     let root_pos = PathContextPos {
-        node: PathNode::At(root),
+        node: root,
         path: Vec::new(),
         ancestors: Vec::new(),
     };

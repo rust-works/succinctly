@@ -27499,6 +27499,36 @@ fn test_path_context_cursor_walk_shapes_2061() -> Result<()> {
     Ok(())
 }
 
+/// #2061: composite pipe stages inside a path-context walk -- a
+/// parenthesised multi-stage pipe used as one stage, and `Identity` used as a
+/// non-final stage.
+///
+/// Both compose positions rather than taking a single navigation step, so
+/// they exercise the walk's own `Pipe` folding instead of
+/// `path_step_generic`'s. Expectations are `main`'s own output.
+#[test]
+fn test_path_context_cursor_walk_composite_stages_2061() -> Result<()> {
+    const DEEP: &str = r#"{"a":{"b":{"c":{"d":1}}}}"#;
+    const AB: &str = r#"{"a":{"b":1}}"#;
+    for (filter, input, want) in [
+        // A parenthesised pipe of three stages as a single stage: the tail is
+        // re-folded rather than stepped one component at a time.
+        ("(.a|.b|.c)|.d|key", DEEP, r#""d""#),
+        ("(.a|.b|.c)|.d|path", DEEP, r#"["a","b","c","d"]"#),
+        ("path((.a|.b|.c)|.d)", DEEP, r#"["a","b","c","d"]"#),
+        // `.` as a stage neither extends the path nor moves the position.
+        (".|.a.b|key", AB, r#""b""#),
+        (".|.a|.b|path", AB, r#"["a","b"]"#),
+        (".a|.|.b|key", AB, r#""b""#),
+        (".a.b|.|parent|key", AB, r#""a""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}` on `{input}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}` on `{input}`");
+    }
+    Ok(())
+}
+
 /// #2061: the shapes the cursor walk deliberately hands back to the
 /// materializing bridge, each of which would otherwise answer differently.
 ///
