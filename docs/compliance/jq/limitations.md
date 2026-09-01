@@ -1472,10 +1472,29 @@ Three differences remain, all in the direction of erroring rather than aborting:
   1,200 levels; jq prints it, succinctly reports `nesting depth exceeds limit of 384` and
   exits 5. Before #1371 this shape could not recurse far enough to reach the ceiling at
   all.
+- **A self-recursive comma generator streams for thousands of elements, not
+  indefinitely.** `def naturals: 0, (naturals|.+1); [limit(100000; naturals)]` errors
+  (`naturals/0 exceeded maximum recursion depth`) somewhere between 10,000 and 20,000
+  pulled elements; jq streams it without limit. Every element the demand-driven evaluator
+  (`eval_each`) pulls from a self-recursive generator is a genuinely deeper native call —
+  that evaluator's own sink-based, non-tail-recursive design measures at ~70x the native
+  stack per level that the plain evaluator's does (see `Expr::Shared`'s doc comment,
+  `src/jq/eval.rs`) — so the guard is catching a real, not merely counted, native-stack
+  cost. Fixing this needs a trampolined or otherwise bounded-stack `eval_each`, not an
+  accounting change; tracked separately as a future architectural improvement, not part of
+  #1371's scope.
 
 Recursion is quadratic in time in both tools — a call-by-name parameter is re-evaluated at
 each use, so reading one at depth `d` costs `O(d)`. Measured interleaved on one machine,
 `sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
+
+`MAX_EVAL_FRAMES`'s ceiling is calibrated against the 256 MB (release) / 2 GB (debug)
+stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/main.rs`).
+A library caller invoking `succinctly::jq::eval` directly, on a thread sized for anything
+smaller, does not get that guarantee — the same recursion that errors cleanly under the CLI
+can still abort the process with a native stack overflow on an ordinary (e.g. default 8 MB)
+thread. Callers embedding this crate and expecting to run recursive `def`s at any real depth
+should evaluate on a thread reserved at a comparable size.
 
 ## `input`/`inputs` residuals after #1309
 
