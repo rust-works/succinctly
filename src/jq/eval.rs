@@ -3412,7 +3412,10 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => eval_each::<W, S>(bound, value, optional, sink),
+            Ok(bound) => {
+                let _guard = enter_def_call_frame(*frames);
+                eval_each::<W, S>(bound, value, optional, sink)
+            }
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Lazy only for an argument the *user* wrote, not for a link in a
@@ -3430,18 +3433,39 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally. Nothing is gained there either: an arithmetic
         // chain is single-valued, so there is no demand to forward.
         //
-        // A link is exactly an argument that already contains a `Shared`,
-        // which `any_subexpr` reports without walking the chain (its
-        // predicate fires on the first one, at depth 1). But that predicate
-        // cannot tell a computed chain link (`Shared(prev) - 1`: an operator
-        // applied *around* a `Shared`, always single-valued if `prev` is)
-        // from a bare pass-through (`inner` *is itself* a `Shared`: an
-        // ordinary parameter threaded unchanged into a nested call, one more
-        // wrapper deep than the level below). A pass-through can be anything
-        // the user wrote inside it -- multi-valued, infinite, side-effecting
-        // -- so treating it as a settled single value ran a branch first()/
-        // limit() would never have asked for, and re-ran it once per level
-        // the value was threaded through un-memoized.
+        // A link is a *pure, single-valued* combination of the previous
+        // level's `Shared` and literals -- `is_pure_chain_link` recognizes
+        // exactly that shape (see its own doc comment). This used to be
+        // `any_subexpr(inner, |e| matches!(e, Expr::Shared(_)))`: "does a
+        // `Shared` appear anywhere in this subtree" -- which fires on any
+        // node that merely *mentions* one, not just a computed chain link
+        // built around one. Two ways that misfired, both confirmed live:
+        //
+        // - A composed argument that mixes a genuine chain-link reference
+        //   with an unrelated side-effecting/multi-valued branch in the same
+        //   expression -- not a bare double-`Shared`, so the pass-through
+        //   peel below doesn't catch it either, but `any_subexpr` still
+        //   found the `Shared` and took the eager path anyway
+        //   (`def f(n; g): if n==0 then g else f(n-1; (g, "SIDE"|debug)) end;
+        //   isempty(f(1; 1))` ran the debug branch `isempty` never asked
+        //   for).
+        // - `any_subexpr`'s own `DefCall` arm walks into `def.body` too (so
+        //   it can answer "is X called anywhere", a question other callers
+        //   of `any_subexpr` legitimately need) -- so a *nested* `def` that
+        //   merely closes over an already-`Shared`-wrapped outer parameter
+        //   reports a "nested `Shared`" match via its own frozen body,
+        //   despite the call site itself carrying no argument at all
+        //   (`def outer(g): def inner: g; def id(x): x; first(id(inner));
+        //   outer((1, ("SIDE"|stderr)))` ran the stderr branch `first` never
+        //   asked for).
+        //
+        // `is_pure_chain_link` is a whitelist instead: it never recurses
+        // into what a `Shared` node wraps (any `Shared` is trivially "pure"
+        // here -- its own producer already went through this same
+        // classification), and it only recognizes `Shared`/literals combined
+        // by pure, single-valued operators. Anything else -- `Comma`,
+        // `Pipe`, a `FuncCall`/`DefCall`, a builtin -- is not in the
+        // whitelist and falls through to the always-correct lazy path below.
         //
         // Peel a bare pass-through first, by re-entering this same arm on
         // what it wraps -- `eval_each` dispatches straight back here for
@@ -3451,7 +3475,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_each::<W, S>(inner, value, optional, sink)
         }
         Expr::Shared(inner) => {
-            if any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
+            if is_pure_chain_link(inner) {
                 drain_result(eval_single::<W, S>(inner, value, optional), sink)
             } else {
                 eval_each::<W, S>(inner, value, optional, sink)
@@ -30767,6 +30791,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         } => match bind_def_call(def, args, *frames, bound) {
             Err(e) => QueryResult::Error(e),
             Ok(bound) => {
+                let _guard = enter_def_call_frame(*frames);
                 let mut stages = vec![(**bound).clone()];
                 stages.extend(rest.iter().cloned());
                 eval_pipe_with_path_context_internal::<W, S>(
@@ -40010,6 +40035,77 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     eval_single::<W, S>(&bound_then, value, optional)
 }
 
+/// Ambient "how many frames deep is the recursion the caller is already
+/// inside" counter, consulted by [`bind_def`] in place of hardcoding `0`.
+///
+/// A `def` declared *inside* another `def`'s recursively-called body gets a
+/// brand new [`FuncDefData`] and a brand new `install_def_calls` pass every
+/// time `bind_def` runs for it — there is no pre-existing `DefCall` node to
+/// carry a `frames` count forward, because none of the inner def's own calls
+/// have been installed yet. Without this, that fresh install always started
+/// counting from `0`, so `MAX_EVAL_FRAMES` never saw how much native stack
+/// the *enclosing* recursion had already spent: a `def` nested inside a
+/// separately-recursing `def`, each individually well under the guard's
+/// ceiling, could still overflow the stack outright — a raw abort, exactly
+/// what #1098/#1016 exist to prevent (confirmed live: `def outer(n): if n ==
+/// 0 then 0 else (def inner(m): if m == 0 then 0 else inner(m-1) end;
+/// inner(2000)) + outer(n-1) end; outer(2000)` — 2,000 well under 40,000 on
+/// both axes individually — crashed with `fatal runtime error: stack
+/// overflow` before this existed).
+///
+/// Mirrors `remaining_inputs`' own "reach outside the pure per-document
+/// evaluation model via ambient state" shape (see its doc comment) rather
+/// than threading a depth parameter through every evaluator signature —
+/// consistent with this codebase having no environment parameter anywhere.
+/// `#[cfg(feature = "std")]` only, same rationale as `remaining_inputs`: a
+/// `no_std` embedding has no `thread_local!`. This leaves `no_std` exactly as
+/// exposed to the gap above as it already was, not more — the guard itself
+/// (`MAX_EVAL_FRAMES`, checked via the ordinary `frames` parameter) still
+/// applies unconditionally in both configurations.
+#[cfg(feature = "std")]
+mod ambient_frame_depth {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CURRENT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn get() -> u32 {
+        CURRENT.with(Cell::get)
+    }
+
+    /// Raises the ambient depth to at least `frames` for the caller's scope,
+    /// restoring the previous value on drop — so a call that has returned
+    /// (or a sibling call not nested inside this one) never inherits it.
+    #[must_use]
+    pub(crate) struct Guard(u32);
+
+    pub(crate) fn enter(frames: u32) -> Guard {
+        let previous = get();
+        CURRENT.with(|c| c.set(previous.max(frames)));
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod ambient_frame_depth {
+    pub(crate) fn get() -> u32 {
+        0
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_frames: u32) -> Guard {
+        Guard
+    }
+}
+
 /// Install `def name(params): body` over `then`, the shared first half of
 /// every `Expr::FuncDef` evaluation arm (#1371).
 ///
@@ -40023,7 +40119,50 @@ pub(crate) fn bind_def(name: &str, params: &[String], body: &Expr, then: &Expr) 
         params: params.to_vec(),
         body: body.clone(),
     });
-    install_def_calls(then, &def, 0)
+    install_def_calls(then, &def, ambient_frame_depth::get())
+}
+
+/// Widens the ambient frame-depth floor (see [`ambient_frame_depth`]) to
+/// `frames` for the duration of evaluating one `DefCall`'s bound body — every
+/// `Expr::DefCall` evaluation arm wraps its recursive call into the bound
+/// body with this, so a `def` reached while that body evaluates (via
+/// [`bind_def`]) inherits how deep this call already is instead of starting
+/// over at `0` (#1371 follow-up).
+pub(crate) fn enter_def_call_frame(frames: u32) -> ambient_frame_depth::Guard {
+    ambient_frame_depth::enter(frames)
+}
+
+/// Whether `expr` is a pure, single-valued combination of `Shared` nodes and
+/// literals -- safe for `eval_each`'s `Expr::Shared` arm to evaluate eagerly
+/// instead of preserving demand-driven laziness (#1371 follow-up).
+///
+/// A whitelist, not a blacklist, on purpose: this replaces `any_subexpr(expr,
+/// |e| matches!(e, Expr::Shared(_)))`, which asked "does a `Shared` appear
+/// *anywhere* in this subtree" -- true for a genuine chain link
+/// (`Shared(prev) - 1`), but also true for a `Comma`/`Pipe`/call that merely
+/// *contains* one alongside unrelated multi-valued or side-effecting code, or
+/// for a nested `def` whose own frozen body happens to close over an
+/// already-`Shared`-wrapped outer parameter. Both shapes leaked side effects
+/// past a demand-driven consumer (`first`/`isempty`/`limit`) that never asked
+/// for them -- see the call site's own doc comment for both confirmed
+/// repros.
+///
+/// Never recurses into what a `Shared` node wraps: that value's own producer
+/// already went through this same classification when *it* was evaluated, so
+/// treating any `Shared` as trivially pure here does not re-open the hole
+/// above. Everything not explicitly recognized -- `Comma`, `Pipe`, a
+/// `FuncCall`/`DefCall`, a builtin, `Index`/`Field` navigation -- is
+/// conservatively *not* a pure chain link, which only ever costs the slower,
+/// always-correct lazy path, never correctness.
+pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
+    match expr {
+        Expr::Shared(_) | Expr::Literal(_) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) => is_pure_chain_link(inner),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            is_pure_chain_link(left) && is_pure_chain_link(right)
+        }
+        _ => false,
+    }
 }
 
 /// How much live native evaluation a user-defined function may accumulate
@@ -40118,7 +40257,10 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match bind_def_call(def, args, frames, cache) {
-        Ok(bound) => eval_single::<W, S>(bound, value, optional),
+        Ok(bound) => {
+            let _guard = enter_def_call_frame(frames);
+            eval_single::<W, S>(bound, value, optional)
+        }
         Err(e) => QueryResult::Error(e),
     }
 }
@@ -41047,6 +41189,103 @@ mod tests {
     /// gap in both at once. Every case names the exact
     /// `(shape, optional, atomic)` combination it covers; `type W = Vec<u64>`
     /// is an arbitrary concrete choice, the function is generic over it.
+    /// #1371 follow-up (code-review regression): `bind_def` used to
+    /// hardcode `install_def_calls`'s starting `frames` at `0`, so a `def`
+    /// reached while evaluation was already deep inside another `def`'s own
+    /// recursion started counting from scratch -- bypassing
+    /// `MAX_EVAL_FRAMES` entirely for the nested `def` and letting composed
+    /// recursion overflow the native stack outright (confirmed live: `def
+    /// outer(n): if n == 0 then 0 else (def inner(m): if m == 0 then 0 else
+    /// inner(m-1) end; inner(2000)) + outer(n-1) end; outer(2000)` --
+    /// `2000` well under `MAX_EVAL_FRAMES` on both axes individually --
+    /// crashed with `fatal runtime error: stack overflow, aborting` before
+    /// this fix; see `enter_def_call_frame`'s own doc comment).
+    ///
+    /// Exercised directly against `bind_def`/`ambient_frame_depth` here
+    /// rather than through a CLI-level deep recursion, which would need
+    /// many thousands of levels -- prohibitively slow in a debug build --
+    /// to actually reach `MAX_EVAL_FRAMES`; this white-box check reaches
+    /// the same boundary in one call.
+    #[test]
+    fn test_bind_def_seeds_defcall_frames_from_ambient_depth_1371() {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } = parse("def f: f; f").unwrap()
+        else {
+            panic!("expected a top-level FuncDef");
+        };
+
+        // No ambient depth entered yet: a fresh top-level `def` still seeds
+        // from `0`, matching every evaluator's actual call site.
+        match bind_def(&name, &params, &body, &then) {
+            Expr::DefCall { frames, .. } => assert_eq!(frames, 0),
+            other => panic!("expected DefCall, got {other:?}"),
+        }
+
+        // Simulates evaluation already being `MAX_EVAL_FRAMES - 1` frames
+        // deep inside an *enclosing* `def`'s own recursion (what
+        // `enter_def_call_frame` wraps around every `Expr::DefCall`
+        // evaluation arm) when it reaches this nested `def name: ...`
+        // FuncDef node.
+        {
+            let _guard = enter_def_call_frame(MAX_EVAL_FRAMES - 1);
+            match bind_def(&name, &params, &body, &then) {
+                Expr::DefCall { frames, .. } => assert_eq!(frames, MAX_EVAL_FRAMES - 1),
+                other => panic!("expected DefCall, got {other:?}"),
+            }
+        }
+
+        // The guard's `Drop` must restore the previous ambient value, so a
+        // `def` reached *after* the nested call returns -- a sibling, not
+        // something nested inside it -- does not inherit a depth that no
+        // longer applies to it.
+        match bind_def(&name, &params, &body, &then) {
+            Expr::DefCall { frames, .. } => assert_eq!(frames, 0),
+            other => panic!("expected DefCall, got {other:?}"),
+        }
+    }
+
+    /// Companion to the test above: confirms the ambient floor it pins is
+    /// exactly what makes `MAX_EVAL_FRAMES` catch a nested `def` instead of
+    /// letting it run unguarded off the end of the native stack. A `def`
+    /// whose own recursion would need only one more frame to matter is
+    /// refused immediately once the ambient floor alone already meets the
+    /// ceiling -- this is the guard actually firing, not just the frame
+    /// count being recorded correctly (the test above).
+    #[test]
+    fn test_ambient_frame_depth_composes_with_defcall_guard_1371() {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } = parse("def f: f; f").unwrap()
+        else {
+            panic!("expected a top-level FuncDef");
+        };
+
+        let _guard = enter_def_call_frame(MAX_EVAL_FRAMES);
+        let Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } = bind_def(&name, &params, &body, &then)
+        else {
+            panic!("expected DefCall");
+        };
+        let err = bind_def_call(&def, &args, frames, &bound)
+            .expect_err("ambient depth at the ceiling must refuse the call, not run it");
+        assert!(
+            err.message.contains("exceeded maximum recursion depth"),
+            "message: {}",
+            err.message
+        );
+    }
+
     #[test]
     fn test_catch_error_under_optional_full_truth_table_1888() {
         type W = Vec<u64>;

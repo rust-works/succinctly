@@ -17245,6 +17245,36 @@ fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()
     Ok(())
 }
 
+/// #1371 follow-up code-review: end-to-end companion to
+/// `jq::eval::tests::test_bind_def_seeds_defcall_frames_from_ambient_depth_1371`
+/// (a fast, white-box pin of the same mechanism -- see its own doc comment
+/// for why the guard-tripping boundary itself is tested there rather than
+/// through CLI-level deep recursion, which needs many thousands of levels
+/// to reach `MAX_EVAL_FRAMES` and is prohibitively slow in a debug build).
+/// This is the ordinary-usage half: a `def` declared *inside* another
+/// `def`'s recursively-called body, at depths too modest to approach any
+/// guard or native-stack boundary, must still just work and match jq --
+/// confirming the ambient-depth fix does not disturb everyday nested `def`
+/// usage while it was closing the crash this issue's other test pins.
+#[test]
+fn test_nested_def_inside_recursive_def_matches_jq_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def outer(n): \
+               if n == 0 then 0 \
+               else (def inner(m): if m == 0 then 0 else inner(m-1) end; inner(5)) \
+                    + outer(n-1) \
+               end; \
+             outer(5)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "0");
+    Ok(())
+}
+
 /// #1371 code-review regression: `generic_result_to_jq_values`'s three
 /// `GenericResult::Partial` arms (the already-produced outputs of a
 /// generator that later failed, #400/#494) used to convert via the
@@ -23958,6 +23988,53 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             &[
                 "-cn",
                 r#"first(def f(n; x): if n <= 0 then x else f(n-1; x) end; f(3; (1, ("B"|stderr))))"#,
+            ],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // #1371 follow-up code-review: the fix above (`Expr::Shared`'s
+        // eager/lazy split) only special-cased a *literal* double-`Shared`
+        // pass-through -- the underlying `any_subexpr(inner, |e| matches!(e,
+        // Expr::Shared(_)))` heuristic itself stayed coarse: "does a
+        // `Shared` appear *anywhere* in this subtree", true not just for a
+        // bare pass-through but for any subtree that merely *mentions* one
+        // alongside unrelated code. Here the recursive call's second
+        // argument composes the threaded parameter with an unrelated,
+        // side-effecting `Comma` branch (`g` is a `Shared`, but the argument
+        // as a whole is `(g, ("SIDE"|stderr))`, not a bare chain link) --
+        // `any_subexpr` still found the nested `Shared` and took the eager
+        // path, running `stderr` before `isempty`'s early exit ever asked
+        // for it. Replaced by `is_pure_chain_link`, a whitelist that only
+        // recognizes `Shared`/literals combined by pure single-valued
+        // operators, so anything built around a `Comma` stays lazy.
+        (
+            &[
+                "-cn",
+                r#"isempty(def f(n; g): if n == 0 then g else f(n - 1; (g, ("SIDE"|stderr))) end; f(1; 1))"#,
+            ],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // #1371 follow-up code-review: a second, distinct way the same
+        // coarse heuristic misfired -- `any_subexpr`'s own `DefCall` arm
+        // walks into `def.body` (needed so other callers of `any_subexpr`
+        // can answer "is X called anywhere"), so a *nested* `def` (`inner`)
+        // that merely closes over an already-`Shared`-wrapped outer
+        // parameter (`g`) reports a "nested `Shared`" match via its own
+        // frozen body -- even though the call site `inner` itself carries no
+        // argument at all. `first(id(inner))` never demands past its first
+        // value, but the eager path forced `inner`'s body (and the `stderr`
+        // buried in its closed-over `g`) to run anyway. `is_pure_chain_link`
+        // does not recognize `DefCall` at all, so this now stays lazy.
+        (
+            &[
+                "-n",
+                "def outer(g): def inner: g; def id(x): x; first(id(inner)); \
+                 outer((1, (\"SIDE\" | stderr)))",
             ],
             None,
             "1\n",
