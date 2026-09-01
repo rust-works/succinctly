@@ -30137,6 +30137,56 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 )
             }
         }
+        // `.[EXPR]?`/`.[S:E]?`: the same carve-out `eval_single` and
+        // `eval_each` each already make for this shape (their matching arms
+        // carry the full jq-1.7.1 derivation), missing here until #1410.
+        // `?` on a bare bracket guards only the *final* index/slice step,
+        // never evaluation of the bracket's own key/bounds sub-expression --
+        // and `eval_index_expr`/`eval_slice_expr` already implement that
+        // split internally (they hardcode key/bounds evaluation to
+        // `optional: false` and let `optional` reach only `index_one` /
+        // the final resolved-bounds application). So forward `optional:
+        // true` straight in, exactly as the plain evaluator does, instead
+        // of falling through to the isolate-and-atomically-catch arms
+        // below, which treat the whole `IndexExpr`/`SliceExpr` subtree as
+        // one unit to catch and so swallow the key error too.
+        //
+        // This arm exists because a *sibling* elsewhere in the same
+        // expression (`key`, `parent`, `file_index`) can flip the whole
+        // filter into path-context evaluation, which is what made the
+        // divergence easy to miss: `.a | .[error("boom")]?` correctly
+        // raises, but `.a | (.[error("boom")]?, key)` silently exited 0.
+        // There is no jq oracle for it -- every `needs_path_context`
+        // trigger but `path` is a succinctly extension, and all five
+        // jq-expressible path-context shapes (`path(...)`, `|=`, `del(...)`,
+        // ...) already agreed with jq 1.7.1 -- so the plain evaluator's own
+        // behavior is the reference this restores consistency with.
+        //
+        // Deliberately not `eval_and_continue_with_context`, which the
+        // `_ =>` catch-all below uses for the identical no-`?` case: its
+        // `Error(_) if optional => None` safety net would re-swallow the
+        // very key/bounds error this arm exists to let escape. This is that
+        // helper minus that one net. `rest` still gets the *ambient*
+        // `optional`, never the forced `true` -- it must not inherit this
+        // bracket's suppression. An escaping `Break` likewise propagates
+        // rather than being caught, matching `eval_index_expr`'s own
+        // `QueryResult::Break(label) => return ...` and `eval_single`'s
+        // carve-out, which never wraps this shape in `eval_try`.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            match eval_owned_input::<W, S>(inner, value, true) {
+                QueryResult::None => QueryResult::None,
+                result => continue_rest_with_context::<W, S>(
+                    result,
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                ),
+            }
+        }
         // This node *is* the `?`. Isolates `inner` with `optional` forced to
         // `false` (the same technique the Array arm's #1302 fix uses, not
         // eval_try's ambient-forwarding -- a leaf mustn't self-swallow
