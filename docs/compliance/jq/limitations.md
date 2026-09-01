@@ -2086,58 +2086,64 @@ same way.
 
 ### `reduce`/`foreach`'s own step budget (#695/#2079): bounds genuine fanout, not ordinary element count
 
-Both evaluators charge a shared `REDUCE_FOREACH_MAX_STEPS` step budget against
-`reduce`/`foreach` (once per UPDATE eval, and -- `foreach` only -- once more
-per EXTRACT eval), independently in value mode (`eval_reduce_with_values`/
-`eval_foreach_with_values`) and path mode (`resolve_reduce`/`resolve_foreach`).
-[#695](https://github.com/rust-works/succinctly/issues/695) introduced it as a
-resource-exhaustion guard against a genuinely unbounded product: `reduce
-(range(100000)) as $x ((range(100000)); .+$x)` forks INIT into 100,000
-independent runs, each walking a 100,000-element stream -- 1e10 round trips,
-with no cap at all before #695.
+`REDUCE_FOREACH_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget charged
+against `reduce`/`foreach` once per UPDATE eval, and -- `foreach` only --
+once more per EXTRACT eval, independently in value mode and path mode.
+[#695](https://github.com/rust-works/succinctly/issues/695) introduced it
+(originally `10000`) as a resource-exhaustion guard against a genuinely
+unbounded product: `reduce (range(100000)) as $x ((range(100000)); .+$x)`
+forks INIT into 100,000 independent runs, each walking a 100,000-element
+stream -- 1e10 round trips, with no cap at all before #695.
 
-The budget that shipped charged one unit per UPDATE/EXTRACT invocation
-regardless of *why* the invocation happened, which degenerates into a plain
-cap on the input-element count whenever there is exactly one INIT fork and a
-single-output UPDATE -- the overwhelmingly common shape for an ordinary
-`reduce`/`foreach`, and not the multiplicative fanout #695 was actually
-guarding against. At the original `10000`,
-[#2079](https://github.com/rust-works/succinctly/issues/2079) found this
-refusing everyday folds real jq performs without issue:
-
-```console
-$ succinctly jq -c 'reduce .[] as $x (0; . + $x)' <(python3 -c 'import json;print(json.dumps(list(range(50000))))')
-jq: error (at <stdin>:1): reduce: maximum iterations exceeded
-$ jq -c 'reduce .[] as $x (0; . + $x)' <(python3 -c 'import json;print(json.dumps(list(range(50000))))')
-1249975000
-```
-
-`foreach`'s three-argument form (explicit EXTRACT) compounded this: since
-EXTRACT charges the same shared budget a second time per element, its
-effective ceiling was *half* `REDUCE_FOREACH_MAX_STEPS` -- a filter's element
-limit silently depended on whether it passed two or three arguments to
-`foreach`.
+Charging one flat unit per invocation regardless of *why* it happened
+degenerates into a plain cap on input-element count for the overwhelmingly
+common single-INIT-fork, single-output shape -- not the multiplicative fanout
+#695 was actually guarding against, and not something real jq caps at all
+(it streams the fold, bounded only by memory).
+[#2079](https://github.com/rust-works/succinctly/issues/2079) found the
+original `10000` refusing everyday folds as a result (`reduce .[] as $x (0; .
++ $x)` on a 50,000-element array; `succinctly` refused, real jq answered
+`1249975000`), with `foreach`'s three-argument form (explicit EXTRACT)
+compounding it further -- EXTRACT's second charge per element halved its
+effective ceiling again, so a filter's element limit silently depended on
+whether it passed two or three arguments to `foreach`.
 
 **Fix**: split the previously-coincidental sharing between this budget and
 `repeat`'s own unrelated per-round width cap (`REPEAT_WIDTH_BUDGET`, previous
-section) into two independent constants, then raised
-`REDUCE_FOREACH_MAX_STEPS` 100x (`10000` to `1_000_000`) now that doing so no
-longer also loosens `repeat`'s guard. This is accepted under ADR-0018 rule 4c
-(preventing a resource-exhaustion vector, not matching real jq's own
-memory-only bound) rather than removing the cap outright: real jq streams the
-fold with no cap of its own, bounded only by memory, and a fully faithful fix
-would need to bound the true fanout *product* (INIT-fork count x element
-count x UPDATE/EXTRACT output width) rather than a flat total -- tracked as a
-possible follow-up, not attempted here given the risk of a bespoke
-product-precomputation formula silently drifting from the four call sites'
-(value/path mode x pattern-alternative-matrix) subtly different shapes. The
-raised flat ceiling keeps #695's original protection (a genuine fork x
-element explosion still aborts, just at a higher, no-longer-accidentally-
-reachable threshold) while giving ordinary single-fork usage generous
-headroom -- 20x above this issue's own 50,000-element repro, and comfortably
-past any array size a `succinctly jq`/`yq` invocation is likely to see in
-practice (the CLI's own inputs must fit in memory as a document to index in
-the first place).
+section — raising one to fix #2079 must not silently loosen the other), then
+raised `REDUCE_FOREACH_MAX_STEPS` 10x, `10000` to `100000` -- 2x above this
+issue's own 50,000-element repro. Accepted under ADR-0018 rule 4c (preventing
+a resource-exhaustion vector, not matching real jq's own memory-only bound)
+rather than removing the cap outright.
+
+**Why 10x and not more, and why a flat count rather than a true fanout-product
+bound**: raising the flat per-invocation count also raises the worst-case CPU
+burned *before* the cap fires, for any UPDATE/EXTRACT body whose own
+per-invocation cost is superlinear -- concretely, repeated string growth:
+`reduce range(N) as $x (""; . + "x")` measures O(N²) in succinctly (`""`
+concatenation reallocates the whole accumulator each step) --
+**not** a divergence to accept under this section, but a genuine succinctly
+performance gap against real jq, which answers the identical query in
+apparently-linear time (`jq -cn '[range(N)] | length'`-scale cost, confirmed
+live: N=50,000/100,000/1,000,000 measure 0.01s/0.02s/0.15s against jq 1.7.1,
+vs. succinctly's 1.9s/7.8s at just the first two of those); filed separately
+as [#2086](https://github.com/rust-works/succinctly/issues/2086) rather than
+chased down here. Until that closes, this budget's real-world worst case
+before erroring is whatever that gap's own scaling implies at
+`REDUCE_FOREACH_MAX_STEPS` iterations -- measured directly at `100000`
+(this budget's own value): ~7.8s. A precomputed fanout-product bound
+(INIT-fork count x element count, both known before either loop starts)
+would not avoid this either way -- for the single-INIT-fork case #2079
+reports, fork count is 1, so the product collapses to the element count and
+the effective ceiling is identical to the flat count's; a product bound only
+changes *when* multi-fork cases are rejected (upfront vs. after partial
+work), not the single-fork ceiling this issue is about. A materially better
+bound would need to weight each invocation by its own body's cost, not just
+count invocations -- out of scope here; `10000 -> 100000` was chosen as a
+value with real headroom over #2079's own repro while keeping the
+pathological-body worst case in the single-digit seconds (measured, not
+extrapolated) rather than the tens of minutes a further 10x would cost at
+the same pathological shape.
 
 ### `path(repeat(f))` tracking (#1906/#1935) only reaches `limit`/`first`'s *direct* child, not `nth` or a combinator-nested `repeat`
 

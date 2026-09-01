@@ -103,9 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two-argument ceiling. Fixed by splitting `REDUCE_FOREACH_MAX_STEPS` from
   `repeat`'s own, unrelated per-round width cap (previously the same
   constant by coincidence — now `REPEAT_WIDTH_BUDGET`, still `10000`) and
-  raising `reduce`/`foreach`'s own budget 100x, to `1_000_000` — the genuine
-  fanout-explosion case #695 introduced this guard for still errors, just at
-  a much higher, no-longer-accidentally-reachable-by-ordinary-use ceiling.
+  raising `reduce`/`foreach`'s own budget 10x, to `100_000` (2x above this
+  issue's own 50,000-element repro) — the genuine fanout-explosion case
+  #695 introduced this guard for still errors, just at a higher,
+  no-longer-accidentally-reachable-by-ordinary-use ceiling. See
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md)
+  for why the raise stops at 10x rather than further: it bounds round-trip
+  *count*, not per-round-trip *cost*, and a superlinear-cost UPDATE/EXTRACT
+  body still burns real CPU proportional to the ceiling before erroring
+  (measured, not just theoretical — surfaced a separate O(n²)
+  string-accumulation gap against real jq's own near-linear cost, filed
+  as #2086).
 
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped

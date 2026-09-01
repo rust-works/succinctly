@@ -26094,40 +26094,27 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// today is coincidence, not a relationship a shared symbol should
 /// encode.
 ///
-/// #2079: originally `10000`, which degenerates into a plain cap on the
-/// *input-element count* whenever there is exactly one INIT fork and a
-/// single-output UPDATE/EXTRACT (the overwhelmingly common shape) — an
-/// ordinary `reduce .[] as $x (0; . + $x)` over an 11,000-element array
-/// refused with no jq equivalent (real jq streams the fold, bounded only
-/// by memory). #695's actual concern was the *product* of INIT-fork
-/// count, element count, and UPDATE/EXTRACT output width (its own
-/// motivating example was a 100,000-fork × 100,000-element reduce, 1e10
-/// round trips) — a genuinely unbounded multiplicative blow-up, not an
-/// ordinary linear walk. Raised by 100x so realistic single-fork/
-/// single-output usage (this issue's own repro tops out at 50,000
-/// elements) has generous headroom, while a genuine fanout explosion
-/// still aborts (after this many round trips, not all of them) rather
-/// than running unbounded — see
-/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
-/// for the accepted-divergence writeup. No longer shared with `repeat`
-/// (see [`REPEAT_WIDTH_BUDGET`]) — that coupling was coincidental, not a
-/// relationship that should force the two to move together, and `repeat`
-/// has its own dedicated test pinning its cap to stay at `10000`
-/// (`test_path_repeat_width_budget_matches_value_mode_1933`).
-pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 1_000_000;
+/// #2079: originally `10000`, which degenerated into a plain cap on
+/// *input-element count* for the overwhelmingly common single-INIT-fork,
+/// single-output shape, rather than the multiplicative fanout it was
+/// meant to bound. Raised 10x, and no longer shared with `repeat` (see
+/// [`REPEAT_WIDTH_BUDGET`] — that coupling was coincidental). This bounds
+/// round-trip *count*, not per-round-trip *cost*: a superlinear-cost
+/// UPDATE/EXTRACT body (e.g. repeated string/array growth) can still
+/// consume real CPU time before the cap is reached, same as it already
+/// could at the old, lower count. Full rationale, the chosen magnitude's
+/// tradeoffs, and why a true fanout-product bound wasn't implemented
+/// instead: [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
+pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 100_000;
 
 /// `repeat(f)`'s own step budget — bounds how many values a *single*
 /// round may fork into at once (`resolve_repeat_bounded`/`each_repeat`),
 /// and separately (`eval_repeat`) the total output size of the eager,
 /// non-demand-driven fallback path. Split from [`REDUCE_FOREACH_MAX_STEPS`]
-/// by #2079: the two were previously the same constant by coincidence
-/// (both `10000`), which meant raising `reduce`/`foreach`'s cap to fix
-/// its own bug would have silently also loosened `repeat`'s unrelated
-/// per-round width cap. Kept at the original `10000` — see each call
-/// site's own doc comment, and
-/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md),
-/// for why `repeat` needs a materialize-before-emit memory-safety net
-/// that `reduce`/`foreach` do not.
+/// by #2079 (previously the same constant by coincidence); kept at the
+/// original `10000` — see each call site's own doc comment for why
+/// `repeat` needs a materialize-before-emit memory-safety net that
+/// `reduce`/`foreach` do not.
 pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 
 /// Check-and-charge one unit against a shared step budget (#695), the
@@ -55189,21 +55176,19 @@ mod tests {
 
     #[test]
     fn test_reduce_budget_exceeded_errors() {
-        // #2079: genuine fanout -- 2 INIT forks, each walking an
-        // 1,099,989-element source stream (`range(11) | range(99999)`,
-        // nested to stay under `range`'s own unrelated `MAX_RANGE =
-        // 100000` per-call cap) -- is exactly the resource-exhaustion
-        // shape #695 introduced this budget to bound (its own motivating
-        // example was a 100,000-fork x 100,000-element reduce, 1e10 round
-        // trips). The raised REDUCE_FOREACH_MAX_STEPS still aborts it,
-        // just at a much higher, no-longer-accidentally-reachable-by-
-        // ordinary-use ceiling. A single fork's own element count already
-        // exceeds the whole budget, so the very first fork never
-        // completes -- `reduce` only pushes output once a fork's fold
-        // completes, so no output survives to make this a `Partial`
-        // regardless of the second fork never being reached.
-        query!(b"null", r"reduce (range(11) | range(99999)) as $x ((0,1); .+$x)",
-            QueryResult::Error(e) => {
+        // #2079: genuine fanout -- 2 INIT forks (`(0,1)`), each walking
+        // the same 50,001-element source stream, 100,002 UPDATE evals
+        // total -- is exactly the resource-exhaustion shape #695
+        // introduced this budget to bound (its own motivating example was
+        // a 100,000-fork x 100,000-element reduce, 1e10 round trips).
+        // Neither dimension alone exceeds the 100,000 budget (50,001 <
+        // 100,000), only their product does. The first fork completes
+        // (50,001 charges) and its result survives as the `Partial`
+        // prefix; the second fork burns the remaining 49,999 charges
+        // before erroring partway through, contributing nothing.
+        query!(b"null", r"reduce range(50001) as $x ((0,1); .+$x)",
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix, [OwnedValue::Int(1_250_025_000)]);
                 assert!(e.message.contains("reduce: maximum iterations exceeded"));
             }
         );
@@ -55211,11 +55196,13 @@ mod tests {
 
     #[test]
     fn test_foreach_budget_exceeded_errors() {
-        // #2079: same genuine-fanout shape as the `reduce` case above,
-        // via 1001 INIT forks over a 1001-element stream (no EXTRACT, so
-        // only the per-input-element UPDATE charge fires). Outputs
-        // already produced survive as the `Partial` prefix.
-        query!(b"null", r"foreach range(1001) as $x (range(1001); .+1)",
+        // #2079: same genuine-fanout shape as the `reduce` case above --
+        // 2 INIT forks over the same 50,001-element stream, no EXTRACT,
+        // so only the per-input-element UPDATE charge fires. `foreach`
+        // emits progressively rather than per-fork, so exactly `budget`
+        // outputs survive as the `Partial` prefix regardless of which
+        // fork was mid-flight when it ran out.
+        query!(b"null", r"foreach range(50001) as $x ((0,1); .+1)",
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS);
                 assert!(e.message.contains("foreach: maximum iterations exceeded"));
@@ -55225,17 +55212,17 @@ mod tests {
 
     #[test]
     fn test_foreach_extract_fanout_charged_independently_of_input_length() {
-        // A single input element whose UPDATE fans out far past the
-        // budget (1,099,989 outputs, via `range(11) | range(99999)` --
-        // nested to stay under `range`'s own unrelated `MAX_RANGE =
-        // 100000` per-call cap); each output gets its own EXTRACT eval
-        // (#695). Pins that EXTRACT fanout is charged on its own — a
-        // design charging only once per input element would never trip
-        // here, since there is only one. Scaled to #2079's raised
-        // REDUCE_FOREACH_MAX_STEPS.
-        query!(b"null", r"foreach (1) as $x (0; range(11) | range(99999); .)",
+        // Two input elements (far fewer than the budget) whose UPDATE
+        // each fans out to 50,001 outputs; each output gets its own
+        // EXTRACT eval (#695). Pins that EXTRACT fanout is charged
+        // independently of input-element count -- a design charging only
+        // once per input element would never trip here, since there are
+        // only two. 2 UPDATE charges (one per element) precede the
+        // EXTRACT fan-out, so `REDUCE_FOREACH_MAX_STEPS - 2` outputs
+        // survive before the budget is exhausted mid-fanout.
+        query!(b"null", r"foreach (1,2) as $x (0; range(50001); .)",
             QueryResult::Partial(prefix, Control::Error(e)) => {
-                assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS - 1);
+                assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS - 2);
                 assert!(e.message.contains("foreach: maximum iterations exceeded"));
             }
         );
