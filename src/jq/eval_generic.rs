@@ -7803,8 +7803,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 // of this fix did) reopens the #1017/#1612/#1634/#1669
                 // abort-on-allocation-failure class of bug for real
                 // traffic, not just a narrower fallback path). Reserved on
-                // whichever accumulator is *currently* live, matching
-                // where the loop below will actually push.
+                // whichever accumulator is *currently* live -- this covers
+                // every push below only when that liveness doesn't change
+                // mid-loop; the per-push `try_reserve(1)` calls on each arm
+                // below are what cover the case where it does (an earlier
+                // target in this same `ts` flips `any_owned` partway
+                // through, past the point this reservation could see it).
                 let reserved = if any_owned {
                     owned.try_reserve(ts.len())
                 } else {
@@ -7823,8 +7827,31 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                                 // this one. The already-indexed prefix must
                                 // survive as `Partial`, same as the
                                 // `GenericResult::Error` arm below.
+                                //
+                                // The reservation above only covers `owned`
+                                // when `any_owned` was *already* true before
+                                // this key's loop started -- if a sibling
+                                // target earlier in this same `ts` flipped
+                                // it mid-loop (via the `Owned` arm below),
+                                // that upfront reservation landed on
+                                // `cursors` instead and covers none of the
+                                // pushes here. `try_reserve(1)` is a cheap
+                                // capacity check when the upfront batch
+                                // reservation already covers this push (the
+                                // common case), and the only real guard when
+                                // it doesn't (review finding: an unreserved
+                                // `push` after a mid-loop flip re-admits the
+                                // #1017/#1612/#1634/#1669 abort class this
+                                // guard exists to close).
                                 match to_owned_cursor(&c) {
-                                    Ok(v) => owned.push(v),
+                                    Ok(v) => {
+                                        if owned.try_reserve(1).is_err() {
+                                            escape_generic!(Control::Error(
+                                                cannot_reserve_cross_product(&[1])
+                                            ));
+                                        }
+                                        owned.push(v);
+                                    }
                                     Err(e) => escape_generic!(Control::Error(e)),
                                 }
                             } else {
@@ -7832,7 +7859,15 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                             }
                         }
                         GenericResult::Owned(v) => {
+                            // Same mid-loop-flip gap as the cursor arm above
+                            // -- `ensure_owned!` converts what `cursors`
+                            // already held, but has no knowledge of the
+                            // still-pending items in *this* `ts` loop, so it
+                            // reserves nothing for them.
                             ensure_owned!();
+                            if owned.try_reserve(1).is_err() {
+                                escape_generic!(Control::Error(cannot_reserve_cross_product(&[1])));
+                            }
                             owned.push(v);
                         }
                         GenericResult::None => {}
