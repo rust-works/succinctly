@@ -5739,7 +5739,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// wrapping `sink` does.
 ///
 /// Two independent caps, mirroring `eval.rs`'s own `each_repeat` exactly:
-/// a per-*round* `REDUCE_FOREACH_MAX_STEPS` budget, reset at the start of
+/// a per-*round* `REPEAT_WIDTH_BUDGET` budget, reset at the start of
 /// every round and charged one output at a time via `charge_budget` --
 /// bounding how many values a single round may fork into at once (a
 /// succinctly-only memory-safety net for a wide `f` like `.[]`, not jq
@@ -5779,7 +5779,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
         let mut stopped = false;
         let mut produced_any = false;
         let mut budget_control = None;
-        let mut budget = super::eval::REDUCE_FOREACH_MAX_STEPS;
+        let mut budget = super::eval::REPEAT_WIDTH_BUDGET;
         let flow = eval_each_owned::<S>(f, &owned, optional, &mut |v| {
             produced_any = true;
             if let Some(control) = super::eval::charge_budget(&mut budget, "repeat") {
