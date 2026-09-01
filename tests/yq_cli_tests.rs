@@ -20220,6 +20220,63 @@ fn test_del_field_and_index_key_noop_on_scalar_root_2106() -> Result<()> {
     Ok(())
 }
 
+/// #2106 (delpaths half): `delpaths()` is a completely separate
+/// implementation from `del()` (`delete_paths_sorted`/`delete_paths_under`/
+/// `delete_keys`, not `delete_at_path`/`delete_trie_*`), and the codebase's
+/// own comments treat the two as meant to share semantics -- fixing only
+/// `del()` would have left a fresh divergence (`del(.k0)` no-ops but
+/// `delpaths([["k0"]])` still errors, on the exact same input) where the two
+/// used to agree, if only by both being wrong.
+#[test]
+fn test_delpaths_noop_on_scalar_root_2106() -> Result<()> {
+    for scalar in ["2.5", "0", r#""a""#, "true", "false"] {
+        // Terminal single-component path (field-shaped key).
+        let (out, code) = run_yq_stdin(r#"delpaths([["k0"]])"#, scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "delpaths field key, scalar root {scalar}: {out}");
+        assert_eq!(
+            out.trim(),
+            scalar,
+            "delpaths field key, scalar root {scalar}"
+        );
+
+        // Terminal single-component path (index-shaped key).
+        let (out, code) = run_yq_stdin(r"delpaths([[0]])", scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "delpaths index key, scalar root {scalar}: {out}");
+        assert_eq!(
+            out.trim(),
+            scalar,
+            "delpaths index key, scalar root {scalar}"
+        );
+    }
+
+    // A mid-chain scalar (`delete_paths_under`'s own catch-all) no-ops the
+    // whole remaining path too, matching `del(.a.b)`'s equivalent shape.
+    let (out, code) = run_yq_stdin(
+        r#"delpaths([["a","b"]])"#,
+        r#"{"a": 5}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "delpaths nested field, scalar mid-chain: {out}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // An array root still errors, same as `del()`'s equivalent shape.
+    let (_out, code) = run_yq_stdin(r#"delpaths([["k0"]])"#, "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "array root must still error for delpaths");
+
+    // jq mode is unaffected -- real jq still errors here (confirmed live).
+    let (_output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").arg(r#"delpaths([["k0"]])"#);
+            command
+        },
+        Some(b"2.5"),
+    )?;
+    assert_eq!(code, 5, "jq mode must still error on a scalar root");
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
 /// multiple values) — the multi-path delete walk never sees the original

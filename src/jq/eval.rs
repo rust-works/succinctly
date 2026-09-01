@@ -32985,6 +32985,7 @@ fn delete_paths_sorted(
     mut value: OwnedValue,
     paths: &[&[OwnedValue]],
     start: usize,
+    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     debug_assert!(
         paths.iter().all(|p| p.len() > start),
@@ -33005,11 +33006,11 @@ fn delete_paths_sorted(
         if paths[i].len() == start + 1 {
             del_keys.push(key);
         } else {
-            value = delete_paths_under(value, key, &paths[i..j], start + 1)?;
+            value = delete_paths_under(value, key, &paths[i..j], start + 1, yq_mode)?;
         }
         i = j;
     }
-    delete_keys(value, &del_keys)
+    delete_keys(value, &del_keys, yq_mode)
 }
 
 /// Recurse into the child of `value` under `key`. A key that names nothing is
@@ -33019,6 +33020,7 @@ fn delete_paths_under(
     key: &OwnedValue,
     paths: &[&[OwnedValue]],
     start: usize,
+    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     match value {
         OwnedValue::Object(mut entries) => match key {
@@ -33028,7 +33030,7 @@ fn delete_paths_under(
                     // jq leaves an existing key where it was, and `IndexMap`
                     // would move it to the end after a `shift_remove`.
                     let old = core::mem::replace(slot, OwnedValue::Null);
-                    *slot = delete_paths_sorted(old, paths, start)?;
+                    *slot = delete_paths_sorted(old, paths, start, yq_mode)?;
                 }
                 Ok(OwnedValue::Object(entries))
             }
@@ -33044,7 +33046,8 @@ fn delete_paths_under(
             OwnedValue::Object(desc) => {
                 let range = SliceBounds::from_descriptor(desc)?.resolve(arr.len());
                 let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                let OwnedValue::Array(items) = delete_paths_sorted(sub, paths, start)? else {
+                let OwnedValue::Array(items) = delete_paths_sorted(sub, paths, start, yq_mode)?
+                else {
                     unreachable!("deleting from an array yields an array")
                 };
                 arr.splice(range, items);
@@ -33053,7 +33056,7 @@ fn delete_paths_under(
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
                 if let Some(index) = resolve_read_index(key, arr.len()) {
                     let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
-                    arr[index] = delete_paths_sorted(old, paths, start)?;
+                    arr[index] = delete_paths_sorted(old, paths, start, yq_mode)?;
                 }
                 Ok(OwnedValue::Array(arr))
             }
@@ -33064,6 +33067,14 @@ fn delete_paths_under(
         // jq reads the child with `jv_get`: a `null` is skipped, and any other
         // scalar is `Cannot index <type> with <key>`.
         OwnedValue::Null => Ok(OwnedValue::Null),
+        // #2106 (delpaths half): real yq no-ops a delpaths() path component
+        // against a genuine scalar root, the same way `del()` does -- an
+        // array root still errors below, matching `is_yq_field_index_noop_scalar`'s
+        // established scalar-vs-array distinction (delpaths_one's own
+        // upfront validation already rejects any non-string/int component in
+        // yq mode, so `key` here is never a slice descriptor when
+        // `yq_mode` is true).
+        other if yq_mode && is_yq_field_index_noop_scalar(&other) => Ok(other),
         other => Err(EvalError::cannot_index(other.type_name(), key)),
     }
 }
@@ -33072,7 +33083,11 @@ fn delete_paths_under(
 /// pass. Keys naming nothing are ignored, and every array index resolves
 /// against the length the array had on entry, so one deletion cannot shift the
 /// array under its siblings.
-fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, EvalError> {
+fn delete_keys(
+    value: OwnedValue,
+    keys: &[&OwnedValue],
+    yq_mode: bool,
+) -> Result<OwnedValue, EvalError> {
     if keys.is_empty() {
         return Ok(value);
     }
@@ -33148,6 +33163,14 @@ fn delete_keys(value: OwnedValue, keys: &[&OwnedValue]) -> Result<OwnedValue, Ev
         // `null` has no fields to begin with, so deleting one is a no-op —
         // jq agrees. Every other scalar is `Cannot delete fields from <type>`.
         OwnedValue::Null => Ok(OwnedValue::Null),
+        // #2106 (delpaths half): real yq no-ops a delpaths() terminal
+        // deletion against a genuine scalar root too (reached for a
+        // single-component path, e.g. `2.5 | delpaths([["k0"]])`), the same
+        // `is_yq_field_index_noop_scalar` rule as `delete_paths_under`'s own
+        // mid-chain catch-all above -- an array root still errors below (it
+        // has its own dedicated `OwnedValue::Array` arm, never reaching
+        // here).
+        other if yq_mode && is_yq_field_index_noop_scalar(&other) => Ok(other),
         other => Err(EvalError::cannot_delete_fields_from(other.type_name())),
     }
 }
@@ -33811,7 +33834,7 @@ fn delete_trie_object(
         .collect();
     if !doomed.is_empty() {
         let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
-        value = delete_keys(value, &key_refs)?;
+        value = delete_keys(value, &key_refs, yq_mode)?;
     }
 
     Ok(value)
@@ -33874,8 +33897,17 @@ fn delete_trie_array(
         // with number`), so this is gated to yq mode only, unlike
         // `delete_trie_object`'s sibling no-op above (which real jq's own
         // earlier `resolve_node` validation already keeps this function
-        // from ever seeing in a way that would need to differ).
-        if yq_mode && is_yq_field_index_noop_scalar(&value) {
+        // from ever seeing in a way that would need to differ). Scoped to
+        // `ArrayStep::Index` specifically, not `Slice` -- succinctly's
+        // parser currently rejects mixing a slice with any other step
+        // inside one computed multi-branch group, so a `Slice` step can
+        // never actually reach here today, but real yq's own behaviour for
+        // that (unreachable) shape is a hard arity error even against a
+        // scalar root ("expected to find 1 number, got 2 instead",
+        // confirmed live), not a no-op -- narrowing here keeps that
+        // correct if the parser gap ever closes, rather than silently
+        // no-oping a case real yq still rejects.
+        if yq_mode && matches!(step, ArrayStep::Index(_)) && is_yq_field_index_noop_scalar(&value) {
             return Ok(value);
         }
         return Err(match step {
@@ -33944,7 +33976,7 @@ fn delete_trie_array(
         .collect();
     if !doomed.is_empty() {
         let key_refs: Vec<&OwnedValue> = doomed.iter().collect();
-        value = delete_keys(value, &key_refs)?;
+        value = delete_keys(value, &key_refs, yq_mode)?;
     }
 
     Ok(value)
@@ -38034,7 +38066,8 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let result = match paths.first() {
         None => to_owned_checked(value),
         Some([]) => Ok(OwnedValue::Null),
-        Some(_) => to_owned_checked(value).and_then(|v| delete_paths_sorted(v, &paths, 0)),
+        Some(_) => to_owned_checked(value)
+            .and_then(|v| delete_paths_sorted(v, &paths, 0, S::TAG == EvalTag::Yq)),
     };
     match result {
         Ok(v) => QueryResult::Owned(v),
@@ -66651,6 +66684,30 @@ mod tests {
         let err = delete_trie_array(OwnedValue::Bool(true), &trie, DELETE_TRIE_ROOT, false)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot index boolean with object");
+    }
+
+    /// #2106: `delete_trie_array`'s new yq-mode scalar no-op is gated on the
+    /// failing step being `ArrayStep::Index`, not just on `value`'s own
+    /// shape -- called directly (bypassing the parser, which currently
+    /// rejects mixing a `Slice` step with any other step inside one
+    /// computed multi-branch group, so this exact input has no live CLI
+    /// repro today) to pin that a `Slice` step still errors under
+    /// `yq_mode: true` rather than silently no-oping a shape real yq itself
+    /// treats as a hard arity error, not a no-op.
+    #[test]
+    fn test_delete_trie_array_yq_mode_noop_scoped_to_index_step_2106() {
+        let index_trie = one_step_trie(Expr::Index(0));
+        let value = delete_trie_array(OwnedValue::Int(5), &index_trie, DELETE_TRIE_ROOT, true)
+            .expect("index step scalar no-op in yq mode");
+        assert_eq!(value, OwnedValue::Int(5));
+
+        let slice_trie = one_step_trie(Expr::Slice {
+            start: Some(1),
+            end: Some(3),
+        });
+        let err = delete_trie_array(OwnedValue::Int(5), &slice_trie, DELETE_TRIE_ROOT, true)
+            .expect_err("slice step must still error even in yq mode");
+        assert_eq!(err.message, "Cannot index number with object");
     }
 
     // #694: `collect_owned()`/`eval_owned_multi` silently dropped a
