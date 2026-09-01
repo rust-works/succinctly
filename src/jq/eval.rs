@@ -55438,6 +55438,86 @@ mod tests {
     }
 
     #[test]
+    fn test_func_arg_as_binder_does_not_capture_caller_var_2077() {
+        // #2077 defect A: substituting `g -> $n` (the caller's own `$n`)
+        // into `add`'s body must not let `add`'s own `100 as $n | ...`
+        // recapture it -- confirmed against jq 1.7.1: `101`, not `200`.
+        assert_eq!(
+            outputs(b"null", "def add(g): 100 as $n | g + $n; 1 as $n | add($n)"),
+            ["101"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_reduce_pattern_does_not_capture_caller_var_2077() {
+        // #2077 defect A, `reduce`'s own pattern variable (not just `as`)
+        // -- confirmed against jq 1.7.1: `14`, not `1`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): reduce range(2) as $x (0; . + g); 7 as $x | f($x)"
+            ),
+            ["14"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_foreach_pattern_and_extract_do_not_capture_caller_var_2077() {
+        // #2077 defect A extended to `foreach`: both `update` and `extract`
+        // see the pattern's binding, so both must be renamed when the
+        // pattern's own name shadows a substituted-in caller variable.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): [foreach (1,2) as $x (0; .; g)]; 5 as $x | f($x)"
+            ),
+            ["[5,5]"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_nested_def_dollar_param_does_not_capture_caller_var_2077() {
+        // #2077 defect A, "scope note": a nested `def`'s own `$`-parameter
+        // is a binder too, not just `as`/`reduce`/`foreach`/`?//` patterns.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): def h($n): g + $n; h(100); 1 as $n | f($n)"
+            ),
+            ["101"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_nested_def_same_name_and_arity_shadows_param_2077() {
+        // #2077 defect B: a nested `def` of the same name *and* arity as
+        // the outer parameter must shadow it -- confirmed against jq
+        // 1.7.1: `99`, not `1`. `expand_func_calls` leaves the reference
+        // in `then` alone so the evaluator's own innermost-first def
+        // lookup resolves it to the nested `def g`.
+        assert_eq!(outputs(b"null", "def f(g): def g: 99; g; f(1)"), ["99"]);
+    }
+
+    #[test]
+    fn test_func_arg_nested_def_different_arity_does_not_shadow_param_2077() {
+        // #2077 defect B control: a nested def of a *different* arity
+        // must not shadow a bare (zero-arity) parameter reference --
+        // confirmed against jq 1.7.1: `1`.
+        assert_eq!(outputs(b"null", "def f(g): def g(x): x; g; f(1)"), ["1"]);
+    }
+
+    #[test]
+    fn test_func_arg_value_param_shadowed_by_later_as_is_not_renamed_2077() {
+        // #2077 control: ordinary lexical shadowing (a *later*, unrelated
+        // same-named binder in the body) is not capture and must not be
+        // alpha-renamed -- confirmed against jq 1.7.1: `9`.
+        assert_eq!(
+            outputs(b"null", "def f($v): 9 as $v | $v; 1 as $q | f($q)"),
+            ["9"]
+        );
+    }
+
+    #[test]
     fn test_until_budget_exceeded_errors() {
         // `cond` is always falsy, so `until_step`'s single-output fast path
         // never emits anything before the `WHILE_UNTIL_MAX_STEPS` cap trips.
