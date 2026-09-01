@@ -17461,6 +17461,59 @@ cover(3) | flatten | length"#;
     Ok(())
 }
 
+/// #1371 (companion to the above): the rest of the installer's structural
+/// arms, reached through a `def` body that uses them -- `try`/`catch`, `or`,
+/// `first`/`last`/`nth`, `until`, `while`, `|=`, `+=`, `//=`, an `as`-binding
+/// and an optional (`?`) sub-expression, each wrapped around a recursive call
+/// so the walk has to descend through them to find it.
+///
+/// Byte-for-byte against jq 1.7.1 (confirmed live), including the two-output
+/// fan-out this body produces -- an arm that dropped a sub-expression would
+/// change the value, and one that dropped a *branch* would change the count.
+#[test]
+fn test_def_body_covering_control_and_assignment_forms_1371() -> Result<()> {
+    let filter = r#"def cover(x):
+  if x == 0 then {n: 0}
+  else
+    (cover(x - 1)) as $prev
+    | {n: ($prev.n + 1)}
+    | .try_arm = (try (x, error("no")) catch "caught")
+    | .or_arm = ((x > 5) or (x == 1))
+    | .first_arm = first(range(x))
+    | .last_arm = last(range(x + 1))
+    | .nth_arm = nth(0; range(x + 1))
+    | .until_arm = (0 | until(. >= x; . + 1))
+    | .while_arm = ([1 | while(. < x; . * 2)] | length)
+    | .n |= .
+    | .n += 0
+    | .alt //= "kept"
+    | .opt_call = ((cover(x - 1) | .n)?)
+  end;
+cover(3)
+| [.n, .try_arm, .or_arm, .first_arm, .last_arm, .nth_arm, .until_arm, .while_arm, .alt, .opt_call]"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    // 128 lines, two distinct: the `try (x, error) catch` arm forks each of
+    // the three levels, and `cover` is called twice per level. Asserted as
+    // count-plus-set rather than a 128-line blob -- an arm that dropped a
+    // sub-expression changes the values, one that dropped a branch changes
+    // the count, and both stay legible. Byte-identical to jq 1.7.1's own 128
+    // lines (confirmed live by direct diff).
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 128, "stdout: {stdout:?}");
+    let mut distinct: Vec<&str> = lines.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        vec![
+            r#"[3,"caught",false,0,3,0,3,2,"kept",2]"#,
+            r#"[3,3,false,0,3,0,3,2,"kept",2]"#,
+        ]
+    );
+    Ok(())
+}
+
 /// #1371: the depth guard reached through `path()`'s own resolver and through
 /// the path-context pipeline, the two evaluators whose `DefCall` arms are
 /// separate from both the plain and the demand-driven one.
