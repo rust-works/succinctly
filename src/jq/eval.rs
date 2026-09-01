@@ -18151,13 +18151,17 @@ fn set_path_steps<S: EvalSemantics>(
     container_noop: bool,
 ) -> Result<(), EvalError> {
     let (first, rest) = match steps {
-        // Nothing left to navigate, so this *is* the write. Reached when a
-        // group that needed flattening turns out to hold only `Identity`
-        // steps, which `push_path_components` drops -- `((.|.)) = 9`, whose
-        // outer `Paren(Pipe(..))` is what forces the flatten in the first
-        // place. A bare `(.|.) = 9` never gets here: every component is
-        // already atomic, so it stays on the borrowed path and the trailing
-        // `Identity` is the terminal component.
+        // Nothing left to navigate, so this *is* the write. Reached only via
+        // the flattener, when every step it produces is an `Identity` it then
+        // drops -- which needs a nested group sitting *alongside* another
+        // component, `((.|.) | .) = 9` or `(.|(.|.)) = 9`, since that is what
+        // makes the list non-atomic in the first place. Neither `((.|.)) = 9`
+        // nor `(.|.) = 9` gets here: `set_path`'s own `Paren` arm unwraps the
+        // outer parens, leaving a list that is already atomic (`Identity`
+        // counts, see `is_atomic_path_component`), so both stay on the
+        // borrowed path with the trailing `Identity` as the terminal
+        // component. Confirmed by instrumenting this arm and running all
+        // four spellings.
         [] => {
             *root = new_value;
             return Ok(());
@@ -61206,10 +61210,15 @@ mod tests {
             // Borrowed path, `Identity` as the *terminal* component: the
             // whole document is the write target.
             (br#"{"a":{"b":1}}"#, "(.|.) = 9", Ok("9")),
-            // Forced through the flattener by the outer `Paren(Pipe(..))`,
-            // which drops every `Identity` and leaves an empty step list --
-            // the one route to `set_path_steps`' `[]` arm.
+            // Still the borrowed path: `set_path`'s `Paren` arm unwraps the
+            // outer parens before the list is ever classified.
             (br#"{"a":{"b":1}}"#, "((.|.)) = 9", Ok("9")),
+            // A nested group *alongside* another component is what makes the
+            // list non-atomic, so these two go through the flattener -- which
+            // drops every `Identity` and leaves an empty step list, the one
+            // route to `set_path_steps`' `[]` arm.
+            (br#"{"a":{"b":1}}"#, "((.|.) | .) = 9", Ok("9")),
+            (br#"{"a":{"b":1}}"#, "(.|(.|.)) = 9", Ok("9")),
         ]);
     }
 
