@@ -8730,17 +8730,19 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Paren(inner) => path_walk_generic::<S, V>(inner, node, path, out),
         Expr::Optional(inner) => {
-            // `?` discards this branch's outputs as well as its error,
-            // matching `path(.a?)` on an array emitting nothing at all
-            // rather than a partial prefix (verified live against jq 1.7.1).
+            // `?` swallows the error but *not* the outputs the branch had
+            // already produced before it: `[1] | path((.[0],.a)?)` emits
+            // `[0]` and then stops (jq 1.7.1). Discarding the whole branch
+            // made that emit nothing, where the non-navigable fallback
+            // (`path((.[0],.a[0:1])?)`, same shape) correctly emitted `[0]`.
+            //
+            // `path(.a?)` on an array still emits nothing, because there the
+            // error comes before anything is produced -- which is the case
+            // the discarded-branch version was checked against.
             let mut branch = Vec::new();
-            match path_walk_generic::<S, V>(inner, node, &mut path.clone(), &mut branch) {
-                Ok(()) => {
-                    out.append(&mut branch);
-                    Ok(())
-                }
-                Err(_) => Ok(()),
-            }
+            let _ = path_walk_generic::<S, V>(inner, node, &mut path.clone(), &mut branch);
+            out.append(&mut branch);
+            Ok(())
         }
         Expr::Comma(exprs) => {
             for e in exprs {
@@ -8760,26 +8762,31 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 // than batched -- the same per-output shape `Expr::Iterate`
                 // needs below.
                 let mut heads = Vec::new();
-                path_step_generic::<S, V>(first, node, path, &mut heads)?;
+                let stepped = path_step_generic::<S, V>(first, node, path, &mut heads);
                 let rest_expr = if rest.len() == 1 {
                     rest[0].clone()
                 } else {
                     Expr::Pipe(rest.to_vec())
                 };
+                // Heads the step produced *before* failing are earlier in
+                // jq's generator order than its own error, so they are walked
+                // first and only then is the error propagated -- the same
+                // "never un-emit an output already produced" rule the
+                // `Builtin::Path` arm applies at the top level.
                 for (mut next_path, next_node) in heads {
                     path_walk_generic::<S, V>(&rest_expr, &next_node, &mut next_path, out)?;
                 }
-                Ok(())
+                stepped
             }
         },
         // A terminal navigation step: take it, then emit each resulting path.
         _ => {
             let mut heads = Vec::new();
-            path_step_generic::<S, V>(expr, node, path, &mut heads)?;
+            let stepped = path_step_generic::<S, V>(expr, node, path, &mut heads);
             for (p, _) in heads {
                 out.push(OwnedValue::Array(p));
             }
-            Ok(())
+            stepped
         }
     }
 }
@@ -8895,6 +8902,51 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         },
+        // `Paren` is transparent, so a parenthesised pipe/comma/optional
+        // reaches this function as the *head* of an outer pipe:
+        // `path(((.a|.b)|.c))` steps `Pipe([.a, .b])`, `path((.a,.b)|.c)`
+        // steps `Comma([.a, .b])`, and `path((.a?)|.c)` steps
+        // `Optional(.a)`. `path_expr_is_cursor_navigable` accepts all three,
+        // so before these arms existed each one hit the `unreachable!` below
+        // and aborted the process with exit 101 -- a live, CLI-reachable
+        // panic, not a can't-happen.
+        Expr::Pipe(exprs) => match exprs.split_first() {
+            None => {
+                out.push((path.to_vec(), node.clone()));
+                Ok(())
+            }
+            Some((first, [])) => path_step_generic::<S, V>(first, node, path, out),
+            Some((first, rest)) => {
+                let mut heads = Vec::new();
+                let stepped = path_step_generic::<S, V>(first, node, path, &mut heads);
+                let rest_expr = if rest.len() == 1 {
+                    rest[0].clone()
+                } else {
+                    Expr::Pipe(rest.to_vec())
+                };
+                // Positions completed through the whole chain land in `out`
+                // before `stepped`'s own error surfaces, for the same
+                // generator-order reason as `path_walk_generic`'s `Pipe` arm.
+                for (p, n) in heads {
+                    path_step_generic::<S, V>(&rest_expr, &n, &p, out)?;
+                }
+                stepped
+            }
+        },
+        Expr::Comma(exprs) => {
+            for e in exprs {
+                path_step_generic::<S, V>(e, node, path, out)?;
+            }
+            Ok(())
+        }
+        Expr::Optional(inner) => {
+            // Same rule as `path_walk_generic`'s own `Optional` arm: the
+            // error is swallowed, the positions already reached are not.
+            let mut branch = Vec::new();
+            let _ = path_step_generic::<S, V>(inner, node, path, &mut branch);
+            out.append(&mut branch);
+            Ok(())
+        }
         // `path_expr_is_cursor_navigable` gates every caller, so nothing else
         // can arrive here.
         other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),

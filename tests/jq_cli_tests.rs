@@ -30008,6 +30008,95 @@ fn test_catch_handler_outputs_keep_ambient_path_1409() -> Result<()> {
     Ok(())
 }
 
+/// #2061: a parenthesised pipe, comma or `?` used as a *pipe head* inside
+/// `path()` -- `path(((.a|.b)|.c))` and friends.
+///
+/// `path_expr_is_cursor_navigable` accepts all three, but `path_step_generic`
+/// had arms for none of them, so each one reached its `unreachable!` and
+/// aborted the process with exit 101. That is a live, CLI-reachable panic,
+/// which is why it is asserted here at the CLI level rather than as a unit
+/// test: a panic in the library is a failed assertion, a panic in the binary
+/// is a crash.
+///
+/// Every expectation is jq 1.7.1's own output, captured live.
+#[test]
+fn test_path_cursor_walk_accepts_composite_pipe_heads_2061() -> Result<()> {
+    for (filter, input, want) in [
+        // A parenthesised pipe as the head of an outer pipe.
+        (
+            "path(((.a|.b)|.c))",
+            "{\"a\":{\"b\":{\"c\":1}}}",
+            "[\"a\",\"b\",\"c\"]\n",
+        ),
+        ("path((.a|.b)|.c)", "null", "[\"a\",\"b\",\"c\"]\n"),
+        (
+            "[path((.a|.b)|.[])]",
+            "{\"a\":{\"b\":[10,20]}}",
+            "[[\"a\",\"b\",0],[\"a\",\"b\",1]]\n",
+        ),
+        // A parenthesised comma as the head: both branches continue.
+        (
+            "[path((.a,.b)|.c)]",
+            "{\"a\":{\"c\":1},\"b\":{\"c\":2}}",
+            "[[\"a\",\"c\"],[\"b\",\"c\"]]\n",
+        ),
+        (
+            "[path((.a, .a) | .b)]",
+            "{\"a\":{\"b\":{}}}",
+            "[[\"a\",\"b\"],[\"a\",\"b\"]]\n",
+        ),
+        // A parenthesised `?` as the head.
+        ("path((.a?)|.c)", "{\"a\":{\"c\":1}}", "[\"a\",\"c\"]\n"),
+        // Nesting to three levels, and a comma whose branches disagree in
+        // length -- both were reachable through the same missing arms.
+        ("path(((.a)))", "{\"a\":1}", "[\"a\"]\n"),
+        (
+            "[path((.a|.b), (.a))]",
+            "{\"a\":{\"b\":1}}",
+            "[[\"a\",\"b\"],[\"a\"]]\n",
+        ),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on `{input}`");
+        assert_eq!(stdout, want, "`{filter}` on `{input}`");
+    }
+    Ok(())
+}
+
+/// #2061: `?` inside `path()` swallows the error but not the outputs the
+/// branch had already produced before it.
+///
+/// The cursor walk discarded the whole branch, so `[1] | path((.[0],.a)?)`
+/// emitted nothing where jq 1.7.1 emits `[0]`. The regression was invisible
+/// against `path(.a?)`, whose error comes before anything is produced, and
+/// the non-navigable fallback for the very same shape
+/// (`path((.[0],.a[0:1])?)`, which defers to `builtin_path_on_owned`) had it
+/// right all along -- so the two resolvers disagreed with each other.
+#[test]
+fn test_path_cursor_walk_optional_keeps_earlier_outputs_2061() -> Result<()> {
+    // The regression case, and the same shape routed through the
+    // materializing resolver by making one branch non-navigable. Both must
+    // agree, and both must equal jq.
+    for filter in ["path((.[0],.a)?)", "path((.[0],.a[0:1])?)"] {
+        let (stdout, code) = run_jq_stdin(filter, "[1]", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(stdout, "[0]\n", "`{filter}`");
+    }
+
+    // `?` covers only its own parens: the position it produced is still fed
+    // to the following stage, whose own error is *not* suppressed.
+    let (stdout, code) = run_jq_stdin("path((.[0],.a)? | .z)", "[1]", &["-c"])?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "");
+
+    // Unchanged: an error before any output still yields nothing at all.
+    let (stdout, code) = run_jq_stdin("[path(.a?)]", "[1]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    Ok(())
+}
+
 /// #2061: every arm of the cursor-native `path()` walk, exercised through the
 /// CLI so it reaches `eval_generic.rs`'s `Builtin::Path` rather than
 /// `eval.rs`'s library-only entry point.
