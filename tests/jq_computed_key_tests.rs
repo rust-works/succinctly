@@ -2213,6 +2213,15 @@ fn test_del_filtered_recursive_descent_1690() {
 #[test]
 fn test_del_multi_branch_optional_field_step_over_array_root_2049() {
     check("[]", "del(.[0], .[1:2].b?[2:3])", Outcome::values(&["[]"]));
+    // Same shape, but with a non-empty array reaching the no-op arm --
+    // `.[9]` is out of range (a dead end, not an error) and `.[0:2].b?`
+    // still swallows its own type error, so the whole filter is still the
+    // identity, not just the empty-array degenerate case above.
+    check(
+        "[1,2,3]",
+        "del(.[9], .[0:2].b?[2:3])",
+        Outcome::values(&["[1,2,3]"]),
+    );
 }
 
 /// #1322: `delete_expr_array_paths`'s multi-path type-mismatch check used to
