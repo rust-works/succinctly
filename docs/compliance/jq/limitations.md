@@ -1928,7 +1928,7 @@ underlying exit-code divergence properly needs `get_inputs` to be able to raise 
 fatal `EvalError` from this specific condition rather than only ever warning or returning
 values — not attempted here.
 
-## Real-time stdout/stderr interleaving: every route but the M2 lazy path
+## Real-time stdout/stderr interleaving
 
 Real jq is a lazy generator, so a filter that both writes to stdout and triggers a stderr
 side effect (`debug`, `stderr`, `halt_error`) or raises mid-stream interleaves the two as it
@@ -1937,19 +1937,12 @@ it, so every stderr write had already happened by the time the first stdout writ
 which no amount of buffering could fix, `--unbuffered`'s per-write `flush()` included
 ([#1653](https://github.com/rust-works/succinctly/issues/1653)).
 
-Fixed for every route except the M2 lazy path below — `-n`, `--slurp`, `--input-dsv`, the
-`input`/`inputs` bridge, and any flag that forces materialization (`-S`, `-a`, `-R`,
-`--seq`, `--args`) — all of which now write each output as the evaluator produces it
-(`evaluate_input_streaming`,
+Every route now writes each output as the evaluator produces it. `-n`, `--slurp`,
+`--input-dsv`, the `input`/`inputs` bridge and the materializing flags (`-S`, `-a`, `-R`,
+`--seq`, `--args`) go through `evaluate_input_streaming`; the M2 lazy path — a document read
+from a file or stdin, the default — goes through `evaluate_bytes_streaming`, both in
 [src/bin/succinctly/jq_runner.rs](../../../src/bin/succinctly/jq_runner.rs), over
-`eval_each_with_cursor`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
-
-```
-$ jq            --unbuffered -cn '1, debug, 2'   2>&1     # 1 / ["DEBUG:",null] / null / 2
-$ succinctly jq --unbuffered -cn '1, debug, 2'   2>&1     # same
-```
-
-**Still batched: a document read from a file or stdin** — the M2 lazy path:
+`eval_each_with_cursor` in [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs).
 
 ```
 $ echo '[1,2]' | jq            --unbuffered -c '.[]|debug'   2>&1
@@ -1957,29 +1950,60 @@ $ echo '[1,2]' | jq            --unbuffered -c '.[]|debug'   2>&1
 1
 ["DEBUG:",2]
 2
-$ echo '[1,2]' | succinctly jq --unbuffered -c '.[]|debug'   2>&1
-["DEBUG:",1]
-["DEBUG:",2]
-1
-2
+$ echo '[1,2]' | succinctly jq --unbuffered -c '.[]|debug'   2>&1     # same
 ```
 
-Not an oversight, and not merely unfinished: streaming that path means routing the CLI's
-*default* route through the demand-driven evaluator, whose `each_lazy_keys_iterate_sink`
-deliberately skips the malformed-key check (#1194) that
-[#1629](https://github.com/rust-works/succinctly/issues/1629) added so that bare
-`keys_unsorted[]` *would* raise. [#1770](https://github.com/rust-works/succinctly/issues/1770)
-closed that gap as an accepted trade for early-exit consumers like `first(...)` — see
-"A truncating consumer of `keys_unsorted[]` skips a malformed member it never needed" above
-— on the reasoning that detecting it requires the full walk such a consumer exists to avoid.
-Making it the default route would silently generalise that trade to every query. Tried and
-reverted while fixing #1653: it regressed six tests across #1642/#1629/#1770's
-undecodable-key handling, including `.,.` on a document with colliding undecodable keys
-emitting them twice at exit 0 instead of raising.
+Two things about the M2 path are worth stating, because neither is obvious from the output
+above.
 
-`test_streamed_ordering_not_yet_reached_on_m2_path_1653`
-([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)) pins the current batched output, so
-this stops being silent the moment it changes.
+### The M2 path streams only a cursor-transparent filter
+
+`expr_is_cursor_transparent` (jq_runner.rs) gates it. A filter that can emit the **root**
+cursor unchanged through an arm whose eager twin would have materialized it — `.,.`,
+`(., debug)`, `label $x | .`, `def f: .; f`, `try (1+1)`, `1+1` — still batches, and so still
+shows #1653's original ordering.
+
+That is not a leftover: the eager evaluator's `to_owned_with_cursor` on the ambient value
+doubles as a validity gate (#1194's structural checks, #1642's colliding-display-key raise)
+and also decides an undecodable key's spelling, and `eval_each_generic`'s native arms (#1596)
+do neither. Streaming such a filter would drop those checks.
+[#2103](https://github.com/rust-works/succinctly/issues/2103) tracks separating the two jobs;
+until it lands, those shapes stay on the eager route.
+
+The gate reaches further than the root, though: past a first stage that *descends* (`.[]`,
+`.a`, `.[0]`) the ambient value is a proper descendant, so everything downstream streams —
+`.[] | (., stderr)`, `.[] | if … end`, `.users[] | .name` all interleave. The set is measured
+by `scripts/jq-m2-streaming-sweep.sh`, which diffs both routes against each other and against
+pinned jq 1.7.1, not derived from first principles.
+
+### A fault found by walking to it leaves the prefix on stdout
+
+succinctly is a semi-index and finds a malformed document only when the walk reaches the
+fault, so outputs produced before it are already written. Real jq emits nothing at all here,
+because its strict parser rejects the document before any filter runs:
+
+```
+$ printf '[1,,3]' | jq            --unbuffered -c '.[]'   2>&1
+jq: parse error: Expected value before ',' at line 1, column 4      # exit 5, no stdout
+$ printf '[1,,3]' | succinctly jq --unbuffered -c '.[]'   2>&1
+1                                                                   # exit 5, with the prefix
+jq: error (at <stdin>:0): Invalid JSON text: expected JSON value, found ','
+```
+
+(`--unbuffered` only so the merged order above is deterministic; the prefix is on stdout
+either way.)
+
+The exit code agrees; only the prefix differs. This is the same shape
+[#1770](https://github.com/rust-works/succinctly/issues/1770) already accepted for
+`limit(2; keys_unsorted[])`, which exits 5 with `"a"` already on stdout — see "A truncating
+consumer of `keys_unsorted[]` skips a malformed member it never needed" above. Suppressing it
+would mean validating the whole document up front, which is the cost semi-indexing exists to
+avoid.
+
+Pinned by `test_unbuffered_interleaves_stdout_and_stderr_1653`,
+`test_array_iterate_lazy_skips_later_malformed_comma_1597` and
+`test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
+([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
 ## Deliberate divergences (ADR-0018 rule 4)
 

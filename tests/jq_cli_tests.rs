@@ -18137,11 +18137,24 @@ fn test_identity_query_rejects_exactly_384_boundary_1819() -> Result<()> {
 /// first pass. Confirmed live before this follow-up fix: `succinctly jq -e
 /// '.[0]'` on a 200,000-level-deep document raw-stack-overflowed (SIGABRT,
 /// exit 134) even with `print_json`'s guard already in place.
+///
+/// **Exit 5, not the 101 this pinned until #1653.** `-e`'s `materialize()`
+/// call used to sit in the CLI's per-result write loop, *outside* the
+/// `catch_unwind` that #1793 wraps evaluation in, so `lazy.rs`'s guard
+/// panicked all the way out of the process. Streaming the M2 path folds that
+/// write loop inside the guard, so the panic is now caught and reported
+/// through the same channel as every other #1793 nesting diagnostic.
+///
+/// That is the outcome #1793's own rationale argues for -- it exists to turn
+/// this ceiling "into an ordinary, recoverable diagnostic" rather than a
+/// hard, uncontrolled process exit -- and the guard is still doing its job:
+/// the depth limit is enforced, the message is unchanged, and the run still
+/// fails. Only the manner of failing moved, from abort to diagnostic.
 #[test]
 fn test_exit_status_query_rejects_adversarial_nesting_998() -> Result<()> {
     let input = nested_arrays(500);
     let (_stdout, stderr, code) = run_jq_full(&["-e", "-c", ".[0]"], Some(&input))?;
-    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
     assert!(
         stderr.contains("nesting depth exceeds limit of 256"),
         "stderr: {stderr:?}"
@@ -19961,9 +19974,13 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
         );
     }
 
+    // `.[]` streams since #1653, so the element before the missing delimiter
+    // is written before the walk reaches it. The raise is unchanged; the
+    // prefix is. See `test_array_iterate_lazy_skips_later_malformed_comma_1597`
+    // for why that prefix is accepted rather than suppressed.
     let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1 2, 3]"))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
-    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert_eq!(out, "1\n", "unexpected output {out:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     let (out, stderr, code) = run_jq_full(&["-c", "add"], Some("[1 2, 3]"))?;
@@ -24945,14 +24962,20 @@ fn test_array_iterate_lazy_skips_later_malformed_comma_1597() -> Result<()> {
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
 
     // Plain `.[]` (no truncation) still walks the whole array and always
-    // catches it, unaffected by this change -- and produces no output at
-    // all, not just a nonzero exit, since it never routes through the new
-    // lazy arm in the first place (`evaluate_bytes_lazy`'s bare `.[]` path
-    // calls `eval_single` directly). Asserting `stdout` too, not just
-    // `code`, so this stays a real regression guard if a future change
-    // ever does route a top-level bare `.[]` through `eval_each_generic`.
+    // catches it. #1653 routed a top-level bare `.[]` through
+    // `eval_each_generic` -- the very change this assertion was written to
+    // catch -- so the element before the malformed comma is now written
+    // before the walk reaches the fault, where the eager route returned a
+    // single batched `Error` and emitted nothing. The exit code is
+    // unchanged; only the prefix is new.
+    //
+    // Real jq emits nothing here, because its strict parser rejects the
+    // document before any filter runs. That divergence is inherent to
+    // finding a fault by walking to it, and is the same shape #1770 already
+    // accepted for `limit(2; keys_unsorted[])`, which exits 5 with `"a"`
+    // already on stdout. Recorded in `docs/compliance/jq/limitations.md`.
     let (stdout, stderr, code) = run_jq_full(&["-c", ".[]"], Some("[1,,3]"))?;
-    assert_eq!((stdout.as_str(), code), ("", 5), "stderr: {stderr:?}");
+    assert_eq!((stdout.as_str(), code), ("1\n", 5), "stderr: {stderr:?}");
 
     Ok(())
 }
@@ -28267,9 +28290,16 @@ fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
 /// (`run_jq_interleaved`) -- separately-captured pipes would pass even with
 /// the batching bug, since each stream's own contents were always correct.
 ///
-/// The `-n` and `--slurp` forms are the routes this fix streams; a document
-/// read on the M2 lazy path is deliberately not asserted here (see
-/// `test_streamed_ordering_not_yet_reached_on_m2_path_1653`).
+/// The `-n` and `--slurp` forms were the first routes to stream (PR #1892).
+/// The M2 rows -- a document read from stdin, the CLI's default -- were added
+/// once that route was gated on `expr_is_cursor_transparent` and streamed
+/// too: `.[]|debug` is the shape the issue was filed about, and the `stderr`,
+/// `error` and `halt_error` rows check that a side effect mid-generator lands
+/// between the outputs either side of it rather than ahead of all of them.
+///
+/// A filter the gate rejects still batches. That is not asserted here; it is
+/// recorded in `docs/compliance/jq/limitations.md` and tracked by #2103,
+/// which owns the evaluator divergence the gate exists to avoid.
 #[test]
 fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
     // (args, stdin, combined stdout+stderr, exit code) -- all four captured
@@ -28340,6 +28370,43 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             "1\n[\"DEBUG:\",{}]\n{}\n2\n",
             0,
         ),
+        // The M2 lazy path: a document read from stdin. `.[]|debug` is
+        // #1653's own repro -- every one of these was captured from jq
+        // 1.7.1 byte for byte, same as the rows above.
+        (
+            vec!["--unbuffered", "-c", ".[]|debug"],
+            Some("[1,2]"),
+            "[\"DEBUG:\",1]\n1\n[\"DEBUG:\",2]\n2\n",
+            0,
+        ),
+        // `stderr` writes its input and passes it through, so each element
+        // appears twice, adjacent -- not all the stderr copies first.
+        (
+            vec!["--unbuffered", "-c", ".[] | (., stderr)"],
+            Some("[1,2]"),
+            "1\n11\n2\n22\n",
+            0,
+        ),
+        // An error mid-document: the element before it is already written.
+        (
+            vec![
+                "--unbuffered",
+                "-c",
+                ".[] | if .==2 then error(\"x\") else . end",
+            ],
+            Some("[1,2,3]"),
+            "1\njq: error (at <stdin>:0): x\n",
+            5,
+        ),
+        // `halt_error` stops the process, so only what preceded it survives
+        // -- the `1` on stdout, then its own `2` on stderr. Exit 5, jq's
+        // default for a bare `halt_error`, not the halted value.
+        (
+            vec!["--unbuffered", "-c", ".[] | (., (2|halt_error))"],
+            Some("[1,2]"),
+            "1\n2\n",
+            5,
+        ),
     ] {
         let (combined, code) = run_jq_interleaved(&args, input)?;
         assert_eq!(combined, expected, "args {args:?} input {input:?}");
@@ -28348,31 +28415,6 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
         // `error(...)`/`halt_error` rows.
         assert_eq!(code, expected_code, "exit code for {args:?}");
     }
-    Ok(())
-}
-
-/// #1653: the M2 lazy path (a document read from stdin/a file) still batches.
-///
-/// Pinned deliberately rather than left untested. Streaming it means routing
-/// the CLI's default path through the demand-driven evaluator, and
-/// `each_lazy_keys_iterate_sink` there skips the #1194 malformed-key check
-/// that #1629 added specifically so bare `keys_unsorted[]` *would* raise --
-/// a gap #1770 closed as an accepted trade for early-exit consumers like
-/// `first(...)`, not one that may be universalized to the default path.
-/// Routing M2 through it was tried and reverted: it regressed six tests
-/// across #1642/#1629/#1770's undecodable-key handling.
-///
-/// When that is resolved, this test should start failing -- at which point
-/// the expectation becomes jq's own
-/// `["DEBUG:",1]\n1\n["DEBUG:",2]\n2\n` and it moves into the test above.
-#[test]
-fn test_streamed_ordering_not_yet_reached_on_m2_path_1653() -> Result<()> {
-    let (combined, code) = run_jq_interleaved(&["--unbuffered", "-c", ".[]|debug"], Some("[1,2]"))?;
-    assert_eq!(code, 0);
-    assert_eq!(
-        combined, "[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n1\n2\n",
-        "M2 path still batches; see this test's doc comment"
-    );
     Ok(())
 }
 

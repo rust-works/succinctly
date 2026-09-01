@@ -1400,6 +1400,20 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
+        // #1653: stream each output as the evaluator produces it, so a
+        // `debug`/`stderr` side effect interleaves with stdout the way real
+        // jq's lazy generator does. Gated on `expr_is_cursor_transparent`,
+        // whose doc comment explains what the demand-driven evaluator would
+        // otherwise change beyond ordering, and why the set is measured
+        // (`scripts/jq-m2-streaming-sweep.sh`) rather than reasoned out.
+        // `SUCCINCTLY_JQ_M2_EVAL` overrides the gate in either direction so
+        // that sweep can diff both routes out of one binary; it is a
+        // verification hook, not a supported interface.
+        let use_streaming = match m2_eval_override().as_deref() {
+            Some("stream") => true,
+            Some("eager") => false,
+            _ => expr_is_cursor_transparent(&expr),
+        };
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
             let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
@@ -1477,10 +1491,76 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // reverted (#1021): only the two outermost call sites
                 // reachable from ordinary CLI usage are wrapped here, not
                 // the guard itself.
-                let results = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink)
-                })) {
-                    Ok(results) => results,
+                //
+                // The write now happens *inside* the guard, because a
+                // streaming filter panics from within the sink callback
+                // rather than before the caller's loop starts. That puts
+                // `out`, `sink`, `had_output` and `last_output` under
+                // `AssertUnwindSafe`, which is sound here for the same reason
+                // the single `sink` was already: `assert_nesting_depth`
+                // panics unconditionally *before* any `write_all`, so `out`'s
+                // writer is never mid-record when the stack unwinds, and the
+                // other three are plain data.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut on_value =
+                        |sink: &mut ErrorSink, result: JqValue<'_, Vec<u64>>| -> Result<bool> {
+                            had_output = true;
+                            // For exit_status tracking, we need to check the last value
+                            if args.exit_status {
+                                // `-e` is the flag that forces materialization at
+                                // all, so it is where a decode failure first
+                                // becomes observable here (#1247). Report and skip
+                                // the value rather than letting an undecodable
+                                // string count as a truthiness answer; `sink`
+                                // drives the exit code.
+                                match result.materialize() {
+                                    Ok(owned) => last_output = Some(owned),
+                                    Err(e) => {
+                                        sink.report(DiagStyle::Jq, &e, &at);
+                                        return Ok(true);
+                                    }
+                                }
+                            }
+                            // A malformed document is a data error, not an I/O
+                            // one: it belongs in jq's diagnostic channel (exit 5)
+                            // rather than aborting the process through `anyhow`
+                            // (#1194). Stop emitting results for *this* document,
+                            // but fall through to the halt check below and carry
+                            // on with the rest of the stream (#355) -- real jq
+                            // stops at the first parse error instead, a
+                            // divergence recorded in
+                            // `docs/compliance/jq/limitations.md`.
+                            let stop = route_write_error(
+                                sink,
+                                &mut out,
+                                || at.clone(),
+                                |o| write_output_jq_value(o, &result, &output_config),
+                            )?;
+                            Ok(!stop)
+                        };
+                    if use_streaming {
+                        evaluate_bytes_streaming(
+                            json_bytes,
+                            &expr,
+                            &index,
+                            &at,
+                            &mut sink,
+                            &mut on_value,
+                        )
+                    } else {
+                        // Consume results to free memory after each value is written
+                        for result in evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink)
+                        {
+                            if !on_value(&mut sink, result)? {
+                                break;
+                            }
+                            // result is dropped here, freeing its memory immediately
+                        }
+                        Ok(())
+                    }
+                }));
+                match outcome {
+                    Ok(written) => written?,
                     Err(payload) => {
                         // `&*payload`, not `&payload` -- `payload` is a
                         // `Box<dyn Any + Send>`, and a bare `&payload`
@@ -1514,52 +1594,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                         // skip straight past that check for this iteration
                         // (review: every other early-exit in this loop still
                         // reaches it on the same iteration; this one didn't).
-                        if let Some(code) = sink.halted() {
-                            out.flush()?;
-                            return Ok(code);
-                        }
-                        continue;
                     }
-                };
-
-                // Consume results to free memory after each value is written
-                for result in results {
-                    had_output = true;
-                    // For exit_status tracking, we need to check the last value
-                    if args.exit_status {
-                        // `-e` is the flag that forces materialization at
-                        // all, so it is where a decode failure first becomes
-                        // observable here (#1247). Report and skip the value
-                        // rather than letting an undecodable string count as
-                        // a truthiness answer; `sink` drives the exit code.
-                        match result.materialize() {
-                            Ok(owned) => last_output = Some(owned),
-                            Err(e) => {
-                                sink.report(DiagStyle::Jq, &e, &at);
-                                continue;
-                            }
-                        }
-                    }
-                    // A malformed document is a data error, not an I/O one: it
-                    // belongs in jq's diagnostic channel (exit 5) rather than
-                    // aborting the process through `anyhow` (#1194). Stop
-                    // emitting results for *this* document, but fall through
-                    // to the halt check below and carry on with the rest of
-                    // the stream (#355) -- real jq stops at the first parse
-                    // error instead, a divergence recorded in
-                    // `docs/compliance/jq/limitations.md`.
-                    if route_write_error(
-                        &mut sink,
-                        &mut out,
-                        || at.clone(),
-                        |o| write_output_jq_value(o, &result, &output_config),
-                    )? {
-                        break;
-                    }
-                    // result is dropped here, freeing its memory immediately
                 }
                 // halt/halt_error (#791) outranks everything else, including
-                // remaining values/files still to process.
+                // remaining values/files still to process. The panic arm above
+                // used to `continue` past this check and repeat it itself;
+                // with the write loop folded into the guard there is nothing
+                // left between the two, so the single check below now covers
+                // both paths.
                 if let Some(code) = sink.halted() {
                     out.flush()?;
                     return Ok(code);
@@ -4239,6 +4281,101 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .then(|| text.to_string())
 }
 
+/// Whether every value this filter can emit is either a *proper descendant*
+/// cursor or a freshly-built value -- never the ambient root cursor forwarded
+/// on, and never an object key pulled from a lazy keys walk.
+///
+/// This is the gate on #1653's M2 streaming flip. Routing a filter through
+/// the demand-driven evaluator is not only an ordering change: the eager
+/// `eval_single`'s wildcard materializes the ambient value via
+/// `to_owned_with_cursor`, and that call is doing two jobs beyond producing a
+/// value -- validating the document (#1194's structural checks, #1642's
+/// colliding-display-key raise) and choosing an undecodable key's spelling.
+/// `eval_each_generic`'s native arms (#1596) do neither, so a filter whose
+/// eager twin is that wildcard answers differently on the two routes. #2103
+/// tracks splitting those two jobs apart; until it lands, such a filter stays
+/// on the eager route and only the shapes below stream.
+///
+/// The set is derived from `scripts/jq-m2-streaming-sweep.sh`, not from
+/// first principles: every shape admitted here measures byte-identical on
+/// stdout, stderr and exit code across both routes, on all eleven of the
+/// sweep's documents. Note `.a, .b` is admitted while `.,.` is not -- the
+/// divergence tracks the *root* cursor, not the comma -- which is why
+/// `Expr::Comma` is admitted only when no branch can yield the root.
+///
+/// Conservative by construction: a shape left out merely keeps today's
+/// batching, so the cost of omission is a missed improvement, never a wrong
+/// answer. `keys`/`length`/`to_entries`/`first(...)` all measure clean and
+/// are still omitted, because admitting builtins wholesale would also admit
+/// `keys_unsorted[]`, which does not.
+fn expr_is_cursor_transparent(expr: &jq::Expr) -> bool {
+    // A pipe is free from its first *descending* stage onwards. Past `.[]` or
+    // `.a` the ambient value is a proper descendant, so a downstream branch
+    // forwarding it is not forwarding the root, and the divergence this gate
+    // exists for cannot arise. Measured, not assumed: every `.[] | ...` and
+    // `.a | ...` shape in the sweep -- including `(., debug)`, `if`, `try`,
+    // `label`, `def`, `1+1`, the very shapes that diverge at the root -- is
+    // byte-identical on both routes across all eleven documents.
+    if let jq::Expr::Pipe(stages) = expr {
+        if let Some(cut) = stages.iter().position(expr_descends) {
+            return stages[..cut].iter().all(expr_is_root_safe);
+        }
+    }
+    expr_is_root_safe(expr)
+}
+
+/// Whether this stage necessarily moves off the ambient value onto a child
+/// (or onto a freshly-built `null` for a missing field), so nothing after it
+/// can still be holding the root cursor.
+fn expr_descends(expr: &jq::Expr) -> bool {
+    match expr {
+        jq::Expr::Field(_)
+        | jq::Expr::Index(_)
+        | jq::Expr::IndexNumber { .. }
+        | jq::Expr::Iterate => true,
+        jq::Expr::Paren(inner) => expr_descends(inner),
+        _ => false,
+    }
+}
+
+/// The conservative set for a filter still operating on the root: every shape
+/// here emits either a descendant cursor or a freshly-built value, never the
+/// ambient root cursor forwarded on through an arm whose eager twin would
+/// have materialized it.
+fn expr_is_root_safe(expr: &jq::Expr) -> bool {
+    match expr {
+        jq::Expr::Identity
+        | jq::Expr::Field(_)
+        | jq::Expr::Index(_)
+        | jq::Expr::IndexNumber { .. }
+        | jq::Expr::Iterate => true,
+        // `debug` forwards its input untouched, so it is root-safe for the
+        // same reason `.` is -- and it is the builtin #1653's own repro
+        // (`.[] | debug`) is built from.
+        jq::Expr::Builtin(jq::Builtin::Debug) => true,
+        jq::Expr::Paren(inner) => expr_is_root_safe(inner),
+        jq::Expr::Pipe(stages) => stages.iter().all(expr_is_root_safe),
+        jq::Expr::Comma(branches) => branches
+            .iter()
+            .all(|b| !expr_can_yield_root(b) && expr_is_root_safe(b)),
+        _ => false,
+    }
+}
+
+/// Whether `expr` can emit the ambient value unchanged. Only used to keep a
+/// root-forwarding branch out of an otherwise-root-safe `Expr::Comma`:
+/// `.,.` and `(., debug)` are exactly the shapes whose eager twin
+/// materializes, and so exactly the ones that diverge.
+fn expr_can_yield_root(expr: &jq::Expr) -> bool {
+    match expr {
+        jq::Expr::Identity | jq::Expr::Builtin(jq::Builtin::Debug) => true,
+        jq::Expr::Paren(inner) => expr_can_yield_root(inner),
+        jq::Expr::Pipe(stages) => stages.iter().all(expr_can_yield_root),
+        jq::Expr::Comma(branches) => branches.iter().any(expr_can_yield_root),
+        _ => false,
+    }
+}
+
 /// Read `SUCCINCTLY_JQ_M2_EVAL` (#1653). See its use in
 /// [`evaluate_bytes_lazy`]; `scripts/jq-m2-streaming-sweep.sh` is the only
 /// intended caller.
@@ -4246,10 +4383,20 @@ fn m2_eval_override() -> Option<String> {
     std::env::var("SUCCINCTLY_JQ_M2_EVAL").ok()
 }
 
+/// One M2 output, handed to the caller's writer. Named so the `&mut dyn`
+/// spelling below stays inside clippy's `type_complexity` budget.
+type JqValueSink<'a, 'w> = dyn FnMut(&mut ErrorSink, JqValue<'a, Vec<u64>>) -> Result<bool> + 'w;
+
 /// Evaluate expression against raw JSON bytes, returning lazy JqValues.
 ///
 /// This function preserves original number formatting by working directly
 /// with the source bytes instead of parsing through serde_json.
+///
+/// The eager half of #1653's migration: it evaluates the whole filter before
+/// the caller writes any of it, so a `debug`/`stderr` side effect reaches
+/// stderr ahead of stdout output that was logically produced first. Reached
+/// only by filters [`expr_is_cursor_transparent`] rejects; everything else
+/// goes through [`evaluate_bytes_streaming`].
 fn evaluate_bytes_lazy<'a>(
     json_bytes: &'a [u8],
     expr: &jq::Expr,
@@ -4258,28 +4405,65 @@ fn evaluate_bytes_lazy<'a>(
     sink: &mut ErrorSink,
 ) -> Vec<JqValue<'a, Vec<u64>>> {
     let cursor = index.root(json_bytes);
-    // #1653: the M2 route is mid-migration from the eager cursor evaluator to
-    // the demand-driven one. `SUCCINCTLY_JQ_M2_EVAL=eager|stream` selects a
-    // leg explicitly so `scripts/jq-m2-streaming-sweep.sh` can diff the two
-    // routes out of one binary; unset takes this build's own default. The
-    // variable exists for that sweep and is not a supported interface.
-    if m2_eval_override().as_deref() == Some("stream") {
-        let mut acc: Vec<JqValue<'a, Vec<u64>>> = Vec::new();
-        let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
-            acc.extend(generic_result_to_jq_values(result, cursor, at, sink));
-            true
-        });
-        match control {
-            None => {}
-            Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at),
-            Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at),
-            Some(jq::Control::Halt(code)) => sink.request_halt(code),
-        }
-        return acc;
-    }
     // Use eval_with_cursor to preserve cursor context for position-based navigation
     let result = eval_with_cursor(expr, cursor);
     generic_result_to_jq_values(result, cursor, at, sink)
+}
+
+/// Evaluate against raw JSON bytes, handing each output to `on_value` the
+/// moment the evaluator produces it (#1653).
+///
+/// The M2 counterpart of [`evaluate_input_streaming`], and deliberately not a
+/// call into it: that one takes an already-materialized `OwnedValue` and
+/// re-indexes `input.to_json()`, where this streams from the `JsonIndex` the
+/// caller already built and keeps the lazy [`write_output_jq_value`] writer,
+/// so a transparent filter still writes raw source spans rather than
+/// materializing every output.
+///
+/// `on_value` returns `false` to stop the generator. `sink` is passed *into*
+/// it rather than captured, so this function can keep its own `&mut` for the
+/// control arms below -- the same shape `evaluate_input_streaming` uses.
+fn evaluate_bytes_streaming<'a>(
+    json_bytes: &'a [u8],
+    expr: &jq::Expr,
+    index: &'a JsonIndex,
+    at: &InputLocation,
+    sink: &mut ErrorSink,
+    on_value: &mut JqValueSink<'a, '_>,
+) -> Result<()> {
+    let cursor = index.root(json_bytes);
+    let mut write_err: Option<anyhow::Error> = None;
+    let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
+        // `generic_result_to_jq_values` reports a per-result failure to
+        // `sink` and yields nothing for it, the same "report and keep going"
+        // contract the batched loop relied on (#355).
+        for value in generic_result_to_jq_values(result, cursor, at, sink) {
+            match on_value(sink, value) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => {
+                    write_err = Some(e);
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    // Reported *before* any write error is surfaced, for the reason
+    // `evaluate_input_streaming` gives at its own copy of this match: the
+    // eager path reported the control during evaluation, always before the
+    // caller's write loop could fail, so returning `Err` first here would let
+    // an I/O failure swallow the evaluator's own diagnostic.
+    match control {
+        None => {}
+        Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at),
+        Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at),
+        Some(jq::Control::Halt(code)) => sink.request_halt(code),
+    }
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Convert GenericResult to JqValue, preserving lazy cursor references.
