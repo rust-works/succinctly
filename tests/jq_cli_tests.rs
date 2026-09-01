@@ -28602,6 +28602,78 @@ fn test_unresolved_call_from_included_module_omits_the_location_1473() -> Result
     Ok(())
 }
 
+/// #2037: jq reports *every* unresolvable call in one compile pass, not just
+/// the first -- `jq: N compile errors`. Captured live against the pinned
+/// oracle (`/usr/bin/jq` 1.7.1); this filter and its exact three-error output
+/// (including each line's trailing padding) are copied byte-for-byte from
+/// that capture.
+#[test]
+fn test_all_unresolved_calls_are_reported_not_just_the_first_2037() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-n", "def f: 1; f, nosuch, nosuch(1;2), nosuch"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: nosuch/0 is not defined at <top-level>, line 1:\n\
+         def f: 1; f, nosuch, nosuch(1;2), nosuch             \n\
+         jq: error: nosuch/2 is not defined at <top-level>, line 1:\n\
+         def f: 1; f, nosuch, nosuch(1;2), nosuch                     \n\
+         jq: error: nosuch/0 is not defined at <top-level>, line 1:\n\
+         def f: 1; f, nosuch, nosuch(1;2), nosuch                                  \n\
+         jq: 3 compile errors\n"
+    );
+    Ok(())
+}
+
+/// #2037: a repeated undefined name no longer always cites the first
+/// occurrence's line -- each successive report resumes the source search
+/// right after the previous match, so the second and third `nosuch1` in
+/// `nosuch1 | nosuch2 | nosuch1` are told apart even though `locate_identifier`
+/// still has no real AST position to work from. Captured live against the
+/// pinned oracle, which reports the same three errors in the same order.
+#[test]
+fn test_repeated_unresolved_name_cites_its_own_occurrence_2037() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nosuch1 | nosuch2 | nosuch1"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: nosuch1/0 is not defined at <top-level>, line 1:\n\
+         nosuch1 | nosuch2 | nosuch1\n\
+         jq: error: nosuch2/0 is not defined at <top-level>, line 1:\n\
+         nosuch1 | nosuch2 | nosuch1          \n\
+         jq: error: nosuch1/0 is not defined at <top-level>, line 1:\n\
+         nosuch1 | nosuch2 | nosuch1                    \n\
+         jq: 3 compile errors\n"
+    );
+    Ok(())
+}
+
+/// #2037's original repro (from the issue that motivated this fix): both
+/// `nosuch` calls fail to resolve, and jq reports both, one per line, in
+/// source order -- not just the first, with `jq: 1 compile error` claiming a
+/// count that doesn't match what was actually printed.
+#[test]
+fn test_original_2037_repro_reports_both_lines() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "def f: 1;\nnosuch\n| nosuch"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert!(
+        stderr.contains("nosuch/0 is not defined at <top-level>, line 2:"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nosuch/0 is not defined at <top-level>, line 3:"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("jq: 2 compile errors"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1687 on the jq side. Plain `succinctly jq` collapses duplicate keys on
 /// purpose (#1385, matching real jq), so the observable surface here is
 /// `--preserve-input`, the extension whose stated job is keeping the input's
