@@ -8366,6 +8366,121 @@ fn test_optional_wrapped_navigation_still_threads_path_into_rest_1335() -> Resul
     Ok(())
 }
 
+/// `?` on a bare bracket guards only the final index/slice step, never the
+/// bracket's own key/bounds sub-expression -- in path-context evaluation too
+/// (#1410).
+///
+/// The plain evaluator has carved this out since #693 (`eval_single`'s and
+/// `eval_each`'s `Expr::Optional(IndexExpr|SliceExpr)` arms). The
+/// path-context evaluator had no equivalent, so its isolate-and-atomically-
+/// catch `Expr::Optional` arm (#1335) treated the whole `IndexExpr`/
+/// `SliceExpr` subtree as one unit to catch and swallowed the key error too.
+///
+/// What makes this easy to miss is that nothing in the bracket triggers it:
+/// a *sibling* `key`/`parent`/`file_index` elsewhere in the same expression
+/// flips the whole filter into path-context mode. Hence every case below
+/// pairs the bracket with such a sibling, and pins the sibling-free spelling
+/// as the control it must now agree with.
+///
+/// No jq oracle exists for the repro itself -- every `needs_path_context`
+/// trigger but `path` is a succinctly extension, and real jq rejects `key/0`
+/// at compile time (exit 3). The jq-expressible path-context shapes are
+/// pinned separately below; all of them already agreed with jq 1.7.1 before
+/// this fix and must continue to.
+#[test]
+fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
+    // The headline repro: the sibling `key` forces path context, and the
+    // key sub-expression's error must still escape.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a | (.[error("boom")]?, key)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // `parent` forces path context the same way `key` does.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a | (.[error("boom")]?, parent)"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    // Both slice bounds, not just the start: `eval_slice_expr` evaluates
+    // `S` outer and `T` middle, each with its own hardcoded `optional:
+    // false`, so an error in either must escape.
+    for filter in [
+        r#".a | (.[error("boom"):1]?, key)"#,
+        r#".a | (.[0:error("boom")]?, key)"#,
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 5, "{filter} -- stderr: {stderr}");
+        assert!(stderr.contains("boom"), "{filter} -- stderr: {stderr}");
+    }
+
+    // Controls that were already correct and must stay so: the same bracket
+    // with no path-context sibling (plain evaluator), and with the `?`
+    // removed (the path-context evaluator's own no-`?` route through the
+    // `_ =>` catch-all). The fix makes the repro above agree with these two.
+    for filter in [
+        r#".a | .[error("boom")]?"#,
+        r#".a | (.[error("boom")], key)"#,
+        r#".a | (.[error("boom")]?, 1)"#,
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 5, "{filter} -- stderr: {stderr}");
+        assert!(stderr.contains("boom"), "{filter} -- stderr: {stderr}");
+    }
+
+    // The other half of the carve-out: `?` must *still* suppress the final
+    // index step itself. Forwarding `optional: true` into
+    // `eval_index_expr`/`eval_slice_expr` (rather than `false` plus an outer
+    // catch) is what keeps both halves true at once.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[null]?, key)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".[null]?"], Some("{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // A multi-output key generator still fans out normally -- the new arm
+    // must not collapse `QueryResult::ManyOwned` on its way through
+    // `continue_rest_with_context`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#".a | (.[("b","c")]?, key)"#],
+        Some(r#"{"a":{"b":1,"c":2}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1\n2\n\"a\"");
+
+    // `rest` gets the *ambient* `optional`, never the forced `true` this arm
+    // hands the bracket -- so a later stage's own error is not suppressed.
+    let (_stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a | (.[null]?, key) | error("later")"#],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("later"), "stderr: {stderr}");
+
+    // The jq-expressible path-context shapes: `path`, not a succinctly
+    // extension, is the one `needs_path_context` trigger with an oracle.
+    // All five agree with jq 1.7.1 (verified live) and must stay that way.
+    for (filter, input) in [
+        (r#"path(.a[error("boom")]?)"#, r#"{"a":{"b":1}}"#),
+        (r#"[path(.a[error("boom")]?, .b)]"#, r#"{"a":{"b":1}}"#),
+        (r#"path(.. | .[error("boom")]?)"#, r#"{"a":{"b":1}}"#),
+        (r#".a |= (.[error("boom")]?)"#, r#"{"a":{"b":1}}"#),
+        (r#"del(.a[error("boom")]?)"#, r#"{"a":{"b":1}}"#),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter} -- stderr: {stderr}");
+        assert!(stderr.contains("boom"), "{filter} -- stderr: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that

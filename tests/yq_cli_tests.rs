@@ -1511,6 +1511,35 @@ fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<(
     Ok(())
 }
 
+/// #1410's yq-mode twin. Like #1869's test just above, the fixed arm lives
+/// in `eval_pipe_with_path_context_internal` -- generic over `EvalSemantics`
+/// and shared verbatim by both modes -- and `eval_generic.rs` bridges the
+/// whole pipe there whenever `needs_path_context` fires, so yq reproduced
+/// the divergence identically. Before the fix this printed `"a"` and exited
+/// 0; the bracket's own key error must escape instead.
+#[test]
+fn test_yq_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#".a | (.[error("boom")]?, key)"#,
+        "a: 1\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_ne!(code, 0, "stdout: {stdout}, stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert_eq!(stdout, "");
+
+    // The final index step itself must still be suppressed by the `?`.
+    let (stdout, code) = run_yq_stdin(
+        ".a | (.[null]?, key)",
+        "a: 1\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    Ok(())
+}
+
 /// #1251: `.a` field access on `--input-format json` input with a
 /// duplicate key must resolve to the *last* value, matching real jq /
 /// RFC 8259 convention -- the JSON-side sibling of #174's YAML fix, and
