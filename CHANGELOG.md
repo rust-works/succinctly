@@ -136,6 +136,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string-accumulation gap against real jq's own near-linear cost, filed
   as #2086).
 
+- **`while`/`until`'s own step budget (`WHILE_UNTIL_MAX_STEPS`, #534, above)
+  no longer refuses an ordinary loop over more than 10,000 iterations**
+  (#2087): the identical bug shape #2079 (above) fixed for
+  `reduce`/`foreach` — a flat count charged once per state visited,
+  regardless of genuine backtracking fanout vs. an ordinary non-forking
+  loop — so `0 | until(. >= 50000; . + 1)` refused with `until: maximum
+  iterations exceeded` where real jq returns `50000`. Fixed the same way:
+  raised `WHILE_UNTIL_MAX_STEPS` 10x, `10000` to `100_000`, 2x above this
+  issue's own 50,000-iteration repro. See
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md)
+  for the same superlinear-cost-body caveat #2079/#2086 already
+  established, measured again here for `while`/`until`'s own evaluation
+  path rather than assumed to carry over unchanged.
+
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped
   field**, on nearly every route that turns lazily-indexed JSON/YAML into an

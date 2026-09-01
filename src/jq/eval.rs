@@ -27723,8 +27723,19 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Total recursive fork budget for `while`/`until` (#534): shared across the
 /// whole backtracking tree (decremented once per state visited, regardless
 /// of branching), not per-branch, so the common non-forking case bounds
-/// total work to the same 10000-step cap the old flat loop used.
-const WHILE_UNTIL_MAX_STEPS: usize = 10000;
+/// total work to the same step cap the old flat loop used.
+///
+/// #2087: originally `10000`, which -- the identical bug shape
+/// [`REDUCE_FOREACH_MAX_STEPS`] had before #2079 -- degenerated into a
+/// plain cap on ordinary iteration count for the overwhelmingly common
+/// non-forking case, rather than the genuine backtracking-fanout explosion
+/// #534 introduced this guard for; real jq has no such cap at all. Raised
+/// 10x, matching #2079's own precedent exactly (same rationale: 2x
+/// headroom over the reporting issue's own repro, worst-case CPU for a
+/// superlinear-cost cond/update body kept in the single-digit seconds,
+/// measured rather than assumed). Full rationale:
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
+const WHILE_UNTIL_MAX_STEPS: usize = 100_000;
 
 /// Evaluate `until(cond; update)` - apply update until cond is true.
 ///
@@ -55865,6 +55876,26 @@ mod tests {
                 assert!(prefix.iter().all(|v| *v == OwnedValue::Int(1)));
                 assert!(e.message.contains("while: maximum iterations exceeded"));
             }
+        );
+    }
+
+    #[test]
+    fn test_2087_until_ordinary_loop_over_50000_iterations_succeeds() {
+        // #2087: a single-output, non-forking `until` loop is ordinary
+        // iteration, not the backtracking fanout WHILE_UNTIL_MAX_STEPS
+        // exists to bound -- before the fix, this refused with "until:
+        // maximum iterations exceeded" where real jq (1.7.1) answers
+        // 50000 (confirmed live against the pinned oracle).
+        assert_eq!(outputs(b"null", r"0 | until(. >= 50000; . + 1)"), ["50000"]);
+    }
+
+    #[test]
+    fn test_2087_while_ordinary_loop_over_50000_iterations_succeeds() {
+        // #2087: `while`'s own non-forking shape has the identical bug --
+        // real jq's `[0 | while(. < 50000; . + 1)] | length` is `50000`.
+        assert_eq!(
+            outputs(b"null", r"[0 | while(. < 50000; . + 1)] | length"),
+            ["50000"]
         );
     }
 

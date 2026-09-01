@@ -2321,6 +2321,54 @@ pathological-body worst case in the single-digit seconds (measured, not
 extrapolated) rather than the tens of minutes a further 10x would cost at
 the same pathological shape.
 
+### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
+
+`WHILE_UNTIL_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget for
+`while`/`until`'s backtracking-generator evaluation, decremented once per
+state visited across the whole recursion tree regardless of branching --
+[#534](https://github.com/rust-works/succinctly/issues/534) introduced it
+(originally `10000`) as the same class of resource-exhaustion guard
+`REDUCE_FOREACH_MAX_STEPS` was introduced for (previous section): without
+it, a multi-output `cond`/`update` forks the rest of the loop per output,
+and a genuinely all-forking loop is unbounded.
+
+Exactly the same degeneration [#2079](https://github.com/rust-works/succinctly/issues/2079)
+found for `reduce`/`foreach` applies here unchanged: a flat count charged
+once per state visited, regardless of whether the visit came from genuine
+branching or an ordinary single-output loop, collapses into a plain cap on
+iteration count for the overwhelmingly common non-forking case -- not the
+fanout explosion #534 was actually guarding against, and not something real
+jq caps at all. [#2087](https://github.com/rust-works/succinctly/issues/2087)
+found the original `10000` refusing an everyday counting loop as a result:
+
+```console
+$ echo 'null' | jq -c '0 | until(. >= 50000; . + 1)'
+50000
+$ echo 'null' | succinctly jq -c '0 | until(. >= 50000; . + 1)'
+jq: error (at <stdin>:1): until: maximum iterations exceeded
+```
+
+**Fix**: raised `WHILE_UNTIL_MAX_STEPS` 10x, `10000` to `100000`, matching
+#2079's own precedent exactly -- same 2x-headroom-over-the-repro reasoning,
+same "flat count over a true fanout-product bound" tradeoff (a product
+bound wouldn't change the single-fork ceiling this issue is about, only
+when a genuinely multi-fork case is rejected), same ADR-0018 rule 4c
+acceptance (bounding a resource-exhaustion vector, not matching real jq's
+own memory-only bound).
+
+**The same superlinear-cost caveat #2079/#2086 already found for
+`reduce`/`foreach` applies here too, via the identical underlying
+mechanism** (`OwnedValue` string-append reallocates the whole accumulator
+per step): `[0,""] | until(.[0] >= N; [.[0]+1, .[1] + "x"]) | .[1] | length`
+measures ~15-16s at N approaching the new `100000` ceiling in this build,
+against real jq's own apparently-linear ~0.1-0.2s at the same N (confirmed
+live) -- somewhat higher than #2086's own ~7.8s figure for the analogous
+`reduce` shape (both walk the same O(N²) string-append path; the gap
+between the two isn't attributed further here), but the same accepted
+tradeoff: not chased down as part of this fix, since #2086 already tracks
+the underlying performance gap and a second, until/while-flavoured report
+would just be the same root cause observed through a different builtin.
+
 ### `path(repeat(f))` tracking (#1906/#1935) only reaches `limit`/`first`'s *direct* child, not `nth` or a combinator-nested `repeat`
 
 [#1906](https://github.com/rust-works/succinctly/issues/1906)/PR #1933 added `Expr::Repeat`
