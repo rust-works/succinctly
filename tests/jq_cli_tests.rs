@@ -30260,3 +30260,84 @@ fn test_optional_comma_sibling_prune_still_correct_for_path_and_del_2124() -> Re
     assert_eq!(stdout, "{\"c\":1}\n");
     Ok(())
 }
+
+/// #2089: `range`'s `MAX_RANGE` accumulation cap used to truncate silently
+/// (a success, exit 0, wrong data) instead of raising -- the one guard in
+/// `eval.rs` that chose that failure mode, unlike its
+/// `until`/`while`/`reduce`/`foreach` siblings. All rows verified against
+/// jq 1.7.1, which has no such cap at all (bounded only by memory).
+#[test]
+fn test_range_max_exceeded_raises_instead_of_truncating_2089() -> Result<()> {
+    for (filter, why) in [
+        ("[range(100001)] | length", "the issue's own minimal repro"),
+        (
+            "reduce range(150000) as $x (0; . + $x)",
+            "an aggregation is exactly where a silent truncation is most \
+             dangerous -- a plausible-looking wrong number, not a crash",
+        ),
+        ("[range(0;200000)] | length", "the two-argument form"),
+        (
+            "[range(0;200000;1)] | length",
+            "the three-argument integer form",
+        ),
+        (
+            "[range(0;-200000;-1)] | length",
+            "a descending integer range",
+        ),
+        ("[range(0;200000;0.5)] | length", "a float step"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 5, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{why}");
+        assert!(
+            stderr.contains("range: maximum iterations exceeded"),
+            "{why} -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2089 boundary: landing exactly on the cap must not raise -- only
+/// genuinely exceeding it should. Verified against jq 1.7.1 (`100000`).
+#[test]
+fn test_range_at_max_exactly_does_not_raise_2089() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "[range(100000)] | length"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "100000\n");
+    Ok(())
+}
+
+/// #2089 sibling: the fix must not regress the demand-driven fast path a
+/// consumer that stops well short of the cap already relied on --
+/// `each_range`'s `emit` only raises when the sink is still asking for more
+/// once a capped batch is exhausted, never when the sink stops early on its
+/// own. Verified against jq 1.7.1: both return instantly, no error, no hang.
+#[test]
+fn test_range_early_stop_consumer_unaffected_by_cap_2089() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "first(range(1000000000))"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "0\n");
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "[limit(3; range(200000))]"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0,1,2]\n");
+    Ok(())
+}
+
+/// #2089 sibling: a demand-driven consumer that *does* ask past the cap
+/// (unlike the early-stop cases above) must still raise -- this was already
+/// silently wrong before #2089 (returning a truncated 100000-element/-index
+/// answer at exit 0), just not the shape the issue's own repro table
+/// happened to list. Verified against jq 1.7.1: `200000`/`150000`, no cap.
+#[test]
+fn test_range_demand_driven_consumer_past_cap_still_raises_2089() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "[limit(200000; range(1000000))] | length"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("range: maximum iterations exceeded"));
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "nth(150000; range(1000000))"], None)?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("range: maximum iterations exceeded"));
+    Ok(())
+}

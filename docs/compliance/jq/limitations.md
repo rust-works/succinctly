@@ -2511,6 +2511,58 @@ discard no write, and cannot crash the process -- so per rule 4 it is recorded h
 still-open gap rather than an accepted-forever divergence. Tracked in
 [#2111](https://github.com/rust-works/succinctly/issues/2111).
 
+### `range`'s own accumulation cap (#2089): a resource-exhaustion guard, now raising instead of silently truncating
+
+`MAX_RANGE` (`src/jq/eval.rs`, `100000`, shared by `eval_range_values` and
+`eval_range_values_f64`) caps how many values a single `(from, to, step)`
+combination will accumulate before raising, mirroring
+`REDUCE_FOREACH_MAX_STEPS`'s own resource-exhaustion rationale two sections
+above -- real jq's `range` is bounded only by memory, and a single
+materializing call (`[range(1e18)]`, `reduce range(1e18) as $x (0;.+$x)`)
+could otherwise try to allocate an unbounded `Vec` in one shot.
+
+```console
+$ echo null | jq -c '[range(100001)] | length'             # jq 1.7.1
+100001
+$ echo null | succinctly jq -c '[range(100001)] | length'
+jq: error (at <stdin>:1): range: maximum iterations exceeded    # exit 5
+```
+
+Before this fix, exceeding the cap silently returned the truncated prefix as
+a **success** (`100000`, wrong, exit 0, empty stderr) instead of raising --
+the one guard in this file that chose that failure mode, found auditing
+#2079's own fix. `range: maximum iterations exceeded` now matches the
+`until`/`while`/`reduce`/`foreach`/`repeat` wording convention. Accepted
+under ADR-0018 rule 4c, same as `REDUCE_FOREACH_MAX_STEPS`.
+
+**The cap is per-combination and demand-aware, not a hard ceiling on
+`range`'s total output**: whether truncation actually raises depends on
+whether the *consumer* still wanted more once the capped batch was
+delivered. `first`/`limit`/`nth`'s own early stop never sees it —
+`first(range(1e18))` still returns `0` instantly, no error, because the
+consumer stopped asking within the first few (well under `100000`) values
+`each_range`'s sink was ever offered. A demand-driven consumer that *does*
+ask past the cap (`[limit(200000; range(1000000))]`, `nth(150000;
+range(1000000))`) raises just like the eager materializing shapes above —
+real jq answers `200000`/`150000` for both (confirmed live), so these are
+genuine, if narrower, instances of the same pre-existing divergence #2089's
+own repro table didn't happen to list, not new ones introduced by this fix.
+
+**Two known gaps this fix doesn't close, found reviewing it:**
+
+- `range(...)?`/`try range(...)` still lets the truncated prefix through as
+  ordinary output (`[range(100001)?] | length` => `100000`, exit 0) — `?`
+  suppresses the raised error, but `drain_result` has already delivered the
+  capped batch to the sink before `emit` decides whether to raise, so
+  nothing distinguishes it from a genuine result once the error itself is
+  swallowed. Not specific to `range` (`[while(true;.+1)?]` shows the same
+  pattern for `WHILE_UNTIL_MAX_STEPS`), so tracked as a general evaluator
+  question rather than here: [#2132](https://github.com/rust-works/succinctly/issues/2132).
+- `eval_range_values`'s integer stepping (`i += step`) has no overflow
+  guard — pre-existing, reproduces identically before this fix too, and
+  needs its own oracle verification before choosing a direction. Tracked as
+  [#2131](https://github.com/rust-works/succinctly/issues/2131).
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
