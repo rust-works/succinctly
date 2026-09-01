@@ -21541,9 +21541,9 @@ fn resolve_limit_one_n<'a, S: EvalSemantics>(
 /// value-only semantics (its doc comment: "evaluates `expr` with the
 /// original input each time").
 ///
-/// `MAX_ITERATIONS` (round count) and `budget` (total branch count, shared
-/// with `reduce`/`foreach` via [`REDUCE_FOREACH_MAX_STEPS`]) together
-/// mirror `eval_repeat`'s own identical two-tier backstop
+/// `MAX_ITERATIONS` (round count) and `budget` (total branch count, via
+/// [`REPEAT_WIDTH_BUDGET`]) together mirror `eval_repeat`'s own identical
+/// two-tier backstop
 /// (`src/jq/eval.rs`) -- documented as a deliberate divergence from real
 /// jq's own hang/unbounded-allocation in
 /// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md),
@@ -21573,7 +21573,7 @@ fn resolve_repeat_bounded<'a, S: EvalSemantics>(
     n: usize,
 ) -> PathResolveResult<'a> {
     const MAX_ITERATIONS: usize = 1000;
-    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    let mut budget = REPEAT_WIDTH_BUDGET;
     let mut branches: Vec<PathBranch<'a>> = Vec::new();
     for _ in 0..MAX_ITERATIONS {
         if branches.len() >= n {
@@ -26093,7 +26093,42 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// pair per recursion-tree node there), so the shared numeric value
 /// today is coincidence, not a relationship a shared symbol should
 /// encode.
-pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 10000;
+///
+/// #2079: originally `10000`, which degenerates into a plain cap on the
+/// *input-element count* whenever there is exactly one INIT fork and a
+/// single-output UPDATE/EXTRACT (the overwhelmingly common shape) — an
+/// ordinary `reduce .[] as $x (0; . + $x)` over an 11,000-element array
+/// refused with no jq equivalent (real jq streams the fold, bounded only
+/// by memory). #695's actual concern was the *product* of INIT-fork
+/// count, element count, and UPDATE/EXTRACT output width (its own
+/// motivating example was a 100,000-fork × 100,000-element reduce, 1e10
+/// round trips) — a genuinely unbounded multiplicative blow-up, not an
+/// ordinary linear walk. Raised by 100x so realistic single-fork/
+/// single-output usage (this issue's own repro tops out at 50,000
+/// elements) has generous headroom, while a genuine fanout explosion
+/// still aborts (after this many round trips, not all of them) rather
+/// than running unbounded — see
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md)
+/// for the accepted-divergence writeup. No longer shared with `repeat`
+/// (see [`REPEAT_WIDTH_BUDGET`]) — that coupling was coincidental, not a
+/// relationship that should force the two to move together, and `repeat`
+/// has its own dedicated test pinning its cap to stay at `10000`
+/// (`test_path_repeat_width_budget_matches_value_mode_1933`).
+pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 1_000_000;
+
+/// `repeat(f)`'s own step budget — bounds how many values a *single*
+/// round may fork into at once (`resolve_repeat_bounded`/`each_repeat`),
+/// and separately (`eval_repeat`) the total output size of the eager,
+/// non-demand-driven fallback path. Split from [`REDUCE_FOREACH_MAX_STEPS`]
+/// by #2079: the two were previously the same constant by coincidence
+/// (both `10000`), which meant raising `reduce`/`foreach`'s cap to fix
+/// its own bug would have silently also loosened `repeat`'s unrelated
+/// per-round width cap. Kept at the original `10000` — see each call
+/// site's own doc comment, and
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md),
+/// for why `repeat` needs a materialize-before-emit memory-safety net
+/// that `reduce`/`foreach` do not.
+pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 
 /// Check-and-charge one unit against a shared step budget (#695), the
 /// same check `until_step`/`while_step` each inline for their own cap.
@@ -27595,7 +27630,7 @@ fn while_step<S: EvalSemantics>(
 /// still needs two safety nets, neither of which may cap the *round count*
 /// itself or that guarantee breaks:
 ///
-/// - **Per-round `budget`** (`REDUCE_FOREACH_MAX_STEPS`, reset at the start
+/// - **Per-round `budget`** (`REPEAT_WIDTH_BUDGET`, reset at the start
 ///   of *every* round and charged one output at a time before a value
 ///   reaches `sink`): bounds how many values a single round may fork into
 ///   at once, independent of how many rounds run in total. Without it,
@@ -27663,7 +27698,7 @@ fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             continue;
         }
         empty_rounds = 0;
-        let mut budget = REDUCE_FOREACH_MAX_STEPS;
+        let mut budget = REPEAT_WIDTH_BUDGET;
         for val in vals {
             if let Some(control) = charge_budget(&mut budget, "repeat") {
                 return Flow::Escaped(control);
@@ -27720,7 +27755,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // produces removes that implicit cap unless charged explicitly here,
     // the same "width needs its own accounting" reasoning `foreach`'s own
     // per-EXTRACT charge already documents.
-    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+    let mut budget = REPEAT_WIDTH_BUDGET;
 
     for _ in 0..MAX_ITERATIONS {
         // Evaluate expr with the original input each time, extending
@@ -55109,11 +55144,65 @@ mod tests {
     }
 
     #[test]
+    fn test_2079_reduce_ordinary_linear_fold_over_10001_elements_succeeds() {
+        // #2079: a single INIT fork walking an 11,000+ element source
+        // stream is an ordinary linear fold, not the multiplicative
+        // fanout REDUCE_FOREACH_MAX_STEPS exists to bound — before the
+        // fix, this refused with "reduce: maximum iterations exceeded"
+        // where real jq (1.7.1) answers 50005000. Value confirmed live
+        // against the pinned oracle.
+        assert_eq!(
+            outputs(b"null", r"reduce range(10001) as $x (0; .+$x)"),
+            ["50005000"]
+        );
+    }
+
+    #[test]
+    fn test_2079_foreach_ordinary_linear_fold_over_10001_elements_succeeds() {
+        // #2079: `foreach`'s two-argument form (no EXTRACT) has the same
+        // single-fork linear shape as the `reduce` case above and must
+        // not be capped at REDUCE_FOREACH_MAX_STEPS's old 10000 either —
+        // real jq's own `[foreach range(10001) as $x (0; .+$x)] | length`
+        // is `10001`.
+        assert_eq!(
+            outputs(b"null", r"[foreach range(10001) as $x (0; .+$x)] | length"),
+            ["10001"]
+        );
+    }
+
+    #[test]
+    fn test_2079_foreach_with_extract_over_5001_elements_succeeds() {
+        // #2079: three-argument `foreach` (explicit EXTRACT) used to cap
+        // at *half* the two-argument ceiling, since EXTRACT charges the
+        // same shared budget a second time per element -- a filter's
+        // effective element limit should not depend on whether it passes
+        // two or three arguments. Real jq's
+        // `[foreach range(5001) as $x (0; .+$x; .)] | length` is `5001`.
+        assert_eq!(
+            outputs(
+                b"null",
+                r"[foreach range(5001) as $x (0; .+$x; .)] | length"
+            ),
+            ["5001"]
+        );
+    }
+
+    #[test]
     fn test_reduce_budget_exceeded_errors() {
-        // 10001 UPDATE evals against a single INIT fork exceeds
-        // REDUCE_FOREACH_MAX_STEPS; `reduce` only pushes output after its
-        // fold completes, so no output survives to make this a `Partial`.
-        query!(b"null", r"reduce range(10001) as $x (0; .+$x)",
+        // #2079: genuine fanout -- 2 INIT forks, each walking an
+        // 1,099,989-element source stream (`range(11) | range(99999)`,
+        // nested to stay under `range`'s own unrelated `MAX_RANGE =
+        // 100000` per-call cap) -- is exactly the resource-exhaustion
+        // shape #695 introduced this budget to bound (its own motivating
+        // example was a 100,000-fork x 100,000-element reduce, 1e10 round
+        // trips). The raised REDUCE_FOREACH_MAX_STEPS still aborts it,
+        // just at a much higher, no-longer-accidentally-reachable-by-
+        // ordinary-use ceiling. A single fork's own element count already
+        // exceeds the whole budget, so the very first fork never
+        // completes -- `reduce` only pushes output once a fork's fold
+        // completes, so no output survives to make this a `Partial`
+        // regardless of the second fork never being reached.
+        query!(b"null", r"reduce (range(11) | range(99999)) as $x ((0,1); .+$x)",
             QueryResult::Error(e) => {
                 assert!(e.message.contains("reduce: maximum iterations exceeded"));
             }
@@ -55122,9 +55211,11 @@ mod tests {
 
     #[test]
     fn test_foreach_budget_exceeded_errors() {
-        // No EXTRACT, so only the per-input-element UPDATE charge fires;
-        // outputs already produced survive as the `Partial` prefix.
-        query!(b"null", r"foreach range(20000) as $x (0; .+1)",
+        // #2079: same genuine-fanout shape as the `reduce` case above,
+        // via 1001 INIT forks over a 1001-element stream (no EXTRACT, so
+        // only the per-input-element UPDATE charge fires). Outputs
+        // already produced survive as the `Partial` prefix.
+        query!(b"null", r"foreach range(1001) as $x (range(1001); .+1)",
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS);
                 assert!(e.message.contains("foreach: maximum iterations exceeded"));
@@ -55135,11 +55226,14 @@ mod tests {
     #[test]
     fn test_foreach_extract_fanout_charged_independently_of_input_length() {
         // A single input element whose UPDATE fans out far past the
-        // budget; each output gets its own EXTRACT eval (#695). Pins that
-        // EXTRACT fanout is charged on its own — a design charging only
-        // once per input element would never trip here, since there is
-        // only one.
-        query!(b"null", r"foreach (1) as $x (0; range(20000); .)",
+        // budget (1,099,989 outputs, via `range(11) | range(99999)` --
+        // nested to stay under `range`'s own unrelated `MAX_RANGE =
+        // 100000` per-call cap); each output gets its own EXTRACT eval
+        // (#695). Pins that EXTRACT fanout is charged on its own — a
+        // design charging only once per input element would never trip
+        // here, since there is only one. Scaled to #2079's raised
+        // REDUCE_FOREACH_MAX_STEPS.
+        query!(b"null", r"foreach (1) as $x (0; range(11) | range(99999); .)",
             QueryResult::Partial(prefix, Control::Error(e)) => {
                 assert_eq!(prefix.len(), REDUCE_FOREACH_MAX_STEPS - 1);
                 assert!(e.message.contains("foreach: maximum iterations exceeded"));
@@ -69259,6 +69353,31 @@ mod tests {
         assert_eq!(
             outputs(br#"{"a":1}"#, "path(foreach (1,2) as $i (.; empty))"),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn test_2079_path_reduce_ordinary_linear_fold_over_10001_elements_succeeds() {
+        // #2079: `resolve_reduce` (path-mode) has its own separate
+        // budget-charging loop from `eval_reduce_with_values` (value
+        // mode), so the fix needs its own coverage here too. UPDATE is
+        // `.` (identity) so the accumulator stays trackable throughout —
+        // only the sheer element count is under test, previously capped
+        // at 10000 by the since-raised REDUCE_FOREACH_MAX_STEPS.
+        assert_eq!(
+            outputs(b"1", "path(reduce range(10001) as $x (.; .))"),
+            ["[]"]
+        );
+    }
+
+    #[test]
+    fn test_2079_path_foreach_ordinary_linear_fold_over_10001_elements_succeeds() {
+        // #2079: same fix, `resolve_foreach`'s own path-mode loop. Each
+        // step emits the (unchanged, trackable) root path, so a
+        // successful run over all 10001 elements produces 10001 `[]`s.
+        assert_eq!(
+            outputs(b"1", "[path(foreach range(10001) as $x (.; .))] | length"),
+            ["10001"]
         );
     }
 

@@ -13244,9 +13244,12 @@ fn test_repeat_value_budget_bounds_total_output_independent_of_fan_out() -> Resu
     // wrongly called it a succinctly extension with no upstream builtin to
     // compare against), but this specific budget-exceeded contract at this
     // exact threshold is succinctly's own choice, not something to compare
-    // against jq for: the budget (`REDUCE_FOREACH_MAX_STEPS`, shared with
-    // `reduce`/`foreach`) cuts the stream at exactly 10000 values with a
-    // clear error, not an unbounded allocation.
+    // against jq for: the budget (`REPEAT_WIDTH_BUDGET`) cuts the stream
+    // at exactly 10000 values with a clear error, not an unbounded
+    // allocation. #2079 split this constant from `reduce`/`foreach`'s own
+    // `REDUCE_FOREACH_MAX_STEPS` (previously the same value by
+    // coincidence) so raising the latter's much-too-low cap didn't also
+    // loosen this one.
     let (stdout, stderr, code) = run_jq_full(&["-c", "repeat(range(20001))"], Some("null"))?;
     assert_eq!(code, 5, "stderr: {stderr:?}");
     assert_eq!(stdout.lines().count(), 10000, "stdout: {stdout:?}");
@@ -13336,7 +13339,7 @@ fn test_path_repeat_error_dropped_once_limit_satisfied_1933() -> Result<()> {
 
 /// Code review on PR #1933: an earlier version of `resolve_repeat_bounded`
 /// had no per-branch budget at all, unlike `eval_repeat`'s value-mode
-/// sibling (`REDUCE_FOREACH_MAX_STEPS`) -- letting a large `limit()`-
+/// sibling (`REPEAT_WIDTH_BUDGET`) -- letting a large `limit()`-
 /// supplied `n` combined with a wide-fanning-out body allocate far more
 /// than value-mode allows for the identical query shape. Both modes now
 /// cut at exactly 10000 branches with the same "repeat: maximum

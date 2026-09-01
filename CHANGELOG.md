@@ -91,6 +91,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is left unbudgeted, since it does no evaluator work of its own and
   charging it too would wrongly cap legitimate high-cardinality output.
 
+- **`reduce`/`foreach`'s step budget (#695, above) no longer refuses an
+  ordinary fold over more than 10,000 elements** (#2079): with exactly one
+  INIT fork and a single-output UPDATE — the overwhelmingly common shape —
+  the shared budget degenerated into a plain cap on input-element count
+  rather than the multiplicative INIT-fork × element × UPDATE/EXTRACT-width
+  fanout it was meant to bound, so `reduce .[] as $x (0; . + $x)` on a
+  50,000-element array refused with `reduce: maximum iterations exceeded`
+  where real jq returns `1249975000`. `foreach`'s three-argument form
+  (explicit EXTRACT) compounded this further, capping at *half* the
+  two-argument ceiling. Fixed by splitting `REDUCE_FOREACH_MAX_STEPS` from
+  `repeat`'s own, unrelated per-round width cap (previously the same
+  constant by coincidence — now `REPEAT_WIDTH_BUDGET`, still `10000`) and
+  raising `reduce`/`foreach`'s own budget 100x, to `1_000_000` — the genuine
+  fanout-explosion case #695 introduced this guard for still errors, just at
+  a much higher, no-longer-accidentally-reachable-by-ordinary-use ceiling.
+
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped
   field**, on nearly every route that turns lazily-indexed JSON/YAML into an
