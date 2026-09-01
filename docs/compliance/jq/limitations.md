@@ -555,15 +555,24 @@ is the revert that established what the other one costs.
    (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its body is not something a
    syntactic predicate can do from a name). All three are refuse-only.
 
-   A fourth refusal is the `null`/`false` half of `register_identical` applied one stage
-   earlier than succinctly reaches: `path(.a \| null)` on `{"a":null}` and `path(.a \| false)`
-   on `{"a":false}` are `["a"]` in jq — the literal never moved the register, and a `null` is
-   `jv_identical` to a `null` whatever node it came from — while succinctly refuses, because
-   `reestablishes_register` only re-establishes a branch that is *already* untracked and a
-   stage sitting directly on a trackable one never gets there. Pre-existing (it predates the
-   register threading), refuse-only, and closing it is a widening that needs its own live
-   matrix; tracked as [#2044](https://github.com/rust-works/succinctly/issues/2044), which
-   carries the same root cause under its own repro (`path(null \| .a)` on `null`).
+   A fourth case, the `null`/`false` half of `register_identical` applied one stage earlier
+   than succinctly used to reach — `path(.a \| null)` on `{"a":null}` and `path(.a \| false)`
+   on `{"a":false}` are `["a"]` in jq, because the literal never moved the register and a
+   `null` is `jv_identical` to a `null` whatever node it came from — is now closed for jq
+   mode: [#2044](https://github.com/rust-works/succinctly/issues/2044) widened
+   `reestablishes_register` to also cover a still-trackable branch's own step, sourcing the
+   register from what `resolve_leaf` records on the exact transition that drops
+   trackability. **yq mode deliberately keeps the pre-#2044 refuse-only behavior for this
+   shape** rather than gaining the same widening: real yq no-ops a field/index access
+   against a scalar (#1181's convention) instead of navigating through it, a rule this
+   widening doesn't know about and that isn't consulted at this call site yet for a *plain*,
+   non-computed key
+   ([#2107](https://github.com/rust-works/succinctly/issues/2107)) — applying jq's own
+   write-through answer to yq mode here would silently corrupt data (confirmed live against
+   yq v4.53.3: `(null \| .a) = 5` on `null` is a no-op, not the write jq's own `{"a":5}`
+   answer would become) rather than merely refuse, which is the direction ADR-0018 never
+   permits. Refuse-only for yq mode remains pre-existing and tracked the same way the three
+   shapes above are.
 
    Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
    marker at all, because `substitute_var_tracked` remains gated on
