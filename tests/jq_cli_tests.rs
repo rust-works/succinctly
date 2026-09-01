@@ -17366,6 +17366,93 @@ fn test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371() -> Res
     Ok(())
 }
 
+/// #1371: the depth guard has to be reachable from every evaluator, not just
+/// the plain one, and each reports it differently. A runaway recursion under a
+/// *truncating* consumer goes through `eval_each`'s own `DefCall` arm, and one
+/// inside `path()` through `resolve_node`'s -- neither of which the plain
+/// evaluator's arm covers.
+///
+/// Real jq survives none of these: `isempty`/`first` over `def f: [f]; f` die
+/// with `cannot allocate memory` (exit 134) and `path(def f: f; f)` never
+/// terminates at all (confirmed live, killed at timeout). Erroring is the
+/// deliberate divergence ADR-0018 permits; what this pins is that it stays an
+/// *error* on all three routes rather than an abort on any of them.
+#[test]
+fn test_recursion_guard_reaches_lazy_and_path_evaluators_1371() -> Result<()> {
+    for filter in [
+        "isempty(def f: [f]; f)",
+        "first(def f: [f]; f)",
+        "path(def f: f; f)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("f/0 exceeded maximum recursion depth"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1371: an argument the user wrote stays demand-driven through a bound call.
+/// `Expr::Shared` is opaque to substitution but must not be opaque to a
+/// consumer that stops early -- the eager fallback would run the second branch
+/// after `isempty` already knew its answer, which is observable through
+/// `stderr`. Pinned against jq 1.7.1, which prints nothing on stderr here.
+///
+/// The second case is the one that separates "lazy" from "lazy for the right
+/// node": a call whose argument is itself another bound call exercises
+/// `any_subexpr`'s own `DefCall` arm while deciding which path to take.
+#[test]
+fn test_bound_call_argument_stays_lazy_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", r#"def f(g): g; isempty(f(1, ("B"|stderr)))"#],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "false");
+    assert_eq!(stderr, "", "the second branch must not have run");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-cn", "[limit(1; def a(n): n; def b(g): g; b(a(1)))]"],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1]");
+    Ok(())
+}
+
+/// #1371: recursion depth well past anything static expansion could reach,
+/// pinned against jq 1.7.1's own answer (confirmed live). The old ceiling was
+/// 49 for this exact shape.
+///
+/// **2,000, not the 10,000 the issue was filed over**, purely for test
+/// runtime: a call-by-name parameter is re-read at every level in both tools,
+/// so the shape is quadratic in *both* (jq included -- measured, 4x the time
+/// per 2x the depth on each), and 10,000 takes ~79 s in an unoptimized build
+/// against ~2 s here. That depth was verified by hand and is recorded in
+/// `MAX_EVAL_FRAMES`'s own doc comment; what needs a standing test is that the
+/// ceiling is no longer anywhere near the substitution-era one, which 2,000
+/// pins 40x over.
+///
+/// Kept to a shape whose *value* stays shallow: a recursively built value is
+/// separately capped at `MAX_VALUE_TREE_DEPTH`, which
+/// `test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371`
+/// covers.
+#[test]
+fn test_recursion_reaches_depth_far_past_expansion_era_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "def sum_to(n): if n == 0 then 0 else n + sum_to(n-1) end; sum_to(2000)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2001000");
+    Ok(())
+}
+
 /// #1016 patch-coverage: `expand_func_calls_in_builtin`'s ~150-arm match
 /// forwards `budget`/`chain_depth` identically at every arm, verified
 /// mechanically correct by /code-review's exhaustive line-by-line trace of

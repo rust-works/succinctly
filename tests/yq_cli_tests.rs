@@ -27491,3 +27491,78 @@ fn test_reduce_and_foreach_over_repeat_still_raise_1687() -> Result<()> {
     }
     Ok(())
 }
+
+/// #1371: `succinctly yq` shares the evaluator, so the runtime-call model has
+/// to reach `eval_generic`'s own arms too -- the cursor-based evaluator has a
+/// separate `DefCall`/`Shared` pair from `eval.rs`'s, and nothing in the jq
+/// suite exercises it.
+///
+/// `def` is a succinctly extension here (real yq's lexer rejects `def f: 42;
+/// f` outright, ADR-0018 rule 5), so these pin succinctly's own behaviour
+/// rather than a reference tool's. The values still match what `succinctly jq`
+/// returns for the same filters, which are in turn pinned against jq 1.7.1.
+#[test]
+fn test_recursive_def_evaluates_in_yq_mode_1371() -> Result<()> {
+    // Depth far past the 49 static expansion allowed.
+    let (stdout, code) = run_yq_stdin(
+        "def sum_to(n): if n == 0 then 0 else n + sum_to(n - 1) end; sum_to(100)",
+        "a: 1\n",
+        &[],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "5050");
+
+    // Branching recursion, which could not succeed at any depth before.
+    let (stdout, code) = run_yq_stdin(
+        "def fib(n): if n < 2 then n else fib(n - 1) + fib(n - 2) end; fib(12)",
+        "a: 1\n",
+        &[],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "144");
+    Ok(())
+}
+
+/// #1371: the generic evaluator's own demand-driven `DefCall`/`Shared` arms.
+/// A truncating consumer must not run the rest of a definition's body, nor the
+/// rest of an argument, after it already has its answer -- the same property
+/// `eval.rs`'s pair carries, reached through the cursor evaluator instead.
+///
+/// `isempty`/`first` are jq-only builtins that yq's own lexer rejects, hence
+/// `--jq-extensions` (#1512).
+#[test]
+fn test_bound_call_stays_lazy_in_yq_mode_1371() -> Result<()> {
+    for filter in ["isempty(def f: (1, 2); f)", "def f(g): g; isempty(f(1, 2))"] {
+        let (stdout, code) = run_yq_stdin(filter, "a: 1\n", &["--jq-extensions"])?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?}");
+        assert_eq!(stdout.trim_end(), "false", "{filter}");
+    }
+
+    let (stdout, code) = run_yq_stdin(
+        "def f(g): [first(g)]; f(1, 2)",
+        "a: 1\n",
+        &["--jq-extensions"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "- 1");
+    Ok(())
+}
+
+/// #1371: a `def` that never reaches a base case must fail cleanly in yq mode
+/// too -- through the generic evaluator's eager arm and its demand-driven one
+/// alike, since a stack overflow is an abort whichever path reaches it.
+#[test]
+fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
+    for (filter, args) in [
+        ("def f: [f]; f", &[][..]),
+        ("isempty(def f: [f]; f)", &["--jq-extensions"][..]),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", args)?;
+        assert_eq!(code, 1, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("f/0 exceeded maximum recursion depth"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
