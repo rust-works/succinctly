@@ -300,6 +300,19 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features simd,scalar-yaml
 
+      # Same no_std cargo-test rationale as test-x86 (#2114) -- this leg needs
+      # its own copy rather than relying on that one, because it's the only
+      # place the target_arch="aarch64"-gated NEON/SVE2 test modules
+      # (src/util/simd/neon.rs, sve2.rs; src/yaml/simd/neon.rs;
+      # src/dsv/simd/neon.rs, sve2.rs; src/json/simd/neon.rs, sve2.rs) ever
+      # get built at all -- an x86_64 runner can't compile them regardless of
+      # cargo subcommand or feature flags, so a #2083-class std-only-symbol
+      # bug inside any of them was invisible to every CI leg until this one
+      # (#2123).
+      - name: Check no_std compatibility (build + run tests)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --no-default-features --verbose
+
       # No clippy job runs on aarch64, so every target_arch="aarch64"-gated kernel —
       # yaml/simd/neon.rs, yaml/simd/broadword.rs, the NEON popcount path in
       # src/bits/popcount.rs, plus the DSV/JSON/util NEON+SVE2 kernels — has only ever
@@ -377,6 +390,15 @@ jobs:
       - name: Run tests (portable-popcount feature)
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features portable-popcount
+
+      # Same no_std cargo-test rationale as test-x86 (#2114) -- macOS ARM64 is
+      # the only leg that builds the target_arch="aarch64"-gated NEON test
+      # modules under Apple's own toolchain rather than Linux's; a
+      # #2083-class std-only-symbol bug reachable only there was invisible to
+      # every CI leg until this one (#2123).
+      - name: Check no_std compatibility (build + run tests)
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --no-default-features --verbose
 
   # Upstream-toolchain leg (#203). Runs the x86_64 test suite on beta and nightly
   # to catch upcoming-compiler breakage (lint changes, soundness fixes, stdlib
