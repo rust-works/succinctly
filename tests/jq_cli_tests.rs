@@ -17422,6 +17422,70 @@ fn test_bound_call_argument_stays_lazy_1371() -> Result<()> {
     Ok(())
 }
 
+/// #1371: the installer walks the whole expression tree to bind call sites, so
+/// a `def` body built out of unusual forms -- `?`, a computed object key,
+/// unary minus, comparison and boolean operators, string interpolation,
+/// `last`, an assignment's own path, `label`/`break`, an optional call -- must
+/// come through it unchanged.
+///
+/// Every arm is pure structural recursion, which is exactly the shape that
+/// looks obviously correct and stays untested until one arm forgets to
+/// recurse; a body that never reaches it would then silently keep an unbound
+/// `FuncCall`. Pinned end-to-end against jq 1.7.1's own output (confirmed
+/// live) rather than by calling the walker directly, so it fails if any arm
+/// drops a sub-expression *or* if evaluation of the rebuilt tree diverges.
+///
+/// Companion to `test_self_recursive_def_wrapping_varied_builtins_1016`, which
+/// covers the parallel `Builtin` walk.
+#[test]
+fn test_def_body_covering_varied_expression_forms_1371() -> Result<()> {
+    let filter = r#"def cover(x):
+  if x == 0 then []
+  else
+    label $done
+    | [
+        (.a.b? // 99),
+        ({("k" + (x | tostring)): (-x)} | keys[0]),
+        ((x > 0) and (x != 3)),
+        "n=\(x)",
+        ([1, 2, 3] | last),
+        ({} | .deep.path = x | .deep.path),
+        (if x == 1 then break $done else empty end),
+        cover(x - 1)
+      ]
+  end;
+cover(3) | flatten | length"#;
+    let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":7}}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "12");
+    Ok(())
+}
+
+/// #1371: the depth guard reached through `path()`'s own resolver and through
+/// the path-context pipeline, the two evaluators whose `DefCall` arms are
+/// separate from both the plain and the demand-driven one.
+///
+/// Real jq hangs indefinitely on all three (confirmed live, killed at
+/// timeout), so there is no oracle output to match here -- what is pinned is
+/// that the guard is reachable from these routes at all, rather than the
+/// recursion running until the native stack gives out.
+#[test]
+fn test_recursion_guard_reaches_path_routes_1371() -> Result<()> {
+    for filter in [
+        "def f: f; path(f)",
+        "def f: f; path(.a | f)",
+        "def f: f; .a | f | key",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":{"b":1}}"#))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("f/0 exceeded maximum recursion depth"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #1371: recursion depth well past anything static expansion could reach,
 /// pinned against jq 1.7.1's own answer (confirmed live). The old ceiling was
 /// 49 for this exact shape.
