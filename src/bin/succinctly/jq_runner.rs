@@ -4239,6 +4239,13 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .then(|| text.to_string())
 }
 
+/// Read `SUCCINCTLY_JQ_M2_EVAL` (#1653). See its use in
+/// [`evaluate_bytes_lazy`]; `scripts/jq-m2-streaming-sweep.sh` is the only
+/// intended caller.
+fn m2_eval_override() -> Option<String> {
+    std::env::var("SUCCINCTLY_JQ_M2_EVAL").ok()
+}
+
 /// Evaluate expression against raw JSON bytes, returning lazy JqValues.
 ///
 /// This function preserves original number formatting by working directly
@@ -4251,6 +4258,25 @@ fn evaluate_bytes_lazy<'a>(
     sink: &mut ErrorSink,
 ) -> Vec<JqValue<'a, Vec<u64>>> {
     let cursor = index.root(json_bytes);
+    // #1653: the M2 route is mid-migration from the eager cursor evaluator to
+    // the demand-driven one. `SUCCINCTLY_JQ_M2_EVAL=eager|stream` selects a
+    // leg explicitly so `scripts/jq-m2-streaming-sweep.sh` can diff the two
+    // routes out of one binary; unset takes this build's own default. The
+    // variable exists for that sweep and is not a supported interface.
+    if m2_eval_override().as_deref() == Some("stream") {
+        let mut acc: Vec<JqValue<'a, Vec<u64>>> = Vec::new();
+        let control = jq::eval_generic::eval_each_with_cursor(expr, cursor, &mut |result| {
+            acc.extend(generic_result_to_jq_values(result, cursor, at, sink));
+            true
+        });
+        match control {
+            None => {}
+            Some(jq::Control::Error(e)) => sink.report(DiagStyle::Jq, &e, at),
+            Some(jq::Control::Break(label)) => sink.report_break(DiagStyle::Jq, &label, at),
+            Some(jq::Control::Halt(code)) => sink.request_halt(code),
+        }
+        return acc;
+    }
     // Use eval_with_cursor to preserve cursor context for position-based navigation
     let result = eval_with_cursor(expr, cursor);
     generic_result_to_jq_values(result, cursor, at, sink)
