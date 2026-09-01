@@ -4338,21 +4338,28 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// a query that walks every key and matches none. Carrying the value
 /// through instead removes that redundancy without changing output.
 /// **Deliberate divergence, sibling of `each_lazy_seq_iterate_sink`'s own
-/// (#725/#1565): a malformed key past whatever the consumer actually pulls
-/// is never detected.** #1629 taught the non-demand-aware `keys_unsorted`
-/// arms (`fold_lazy_keys_stage`) to raise on a #1194 malformed member by
-/// walking the whole object -- correct there because those arms already pay
-/// for a full walk regardless. This function exists specifically so
-/// `first(keys_unsorted[])`/`limit(n; keys_unsorted[])` do NOT pay for a
-/// full walk, so an unconditional whole-object check would defeat the
-/// point. What it *can* do for free: `DistinctKeyCursors::next` already
-/// decodes every key it yields (to hash it), so a key the consumer actually
-/// pulls is checked below at no extra cost -- but a malformed key, or an
-/// unpaired tail, sitting *after* the last element the consumer pulled is
-/// never reached, the same way `each_lazy_seq_iterate_sink`'s doc comment
-/// above describes for a `map(f)` failure past what `first` needed. Pinned
-/// by the `..._1770` tests below; recorded in
-/// `docs/compliance/jq/limitations.md`.
+/// (#725/#1565): a malformed key past whatever the consumer pulls is never
+/// detected *when the consumer stops early*.** #1629 taught the
+/// non-demand-aware `keys_unsorted` arms (`fold_lazy_keys_stage`) to raise
+/// on a #1194 malformed member by walking the whole object -- correct there
+/// because those arms already pay for a full walk regardless. This function
+/// exists specifically so `first(keys_unsorted[])`/`limit(n;
+/// keys_unsorted[])` do NOT pay for a full walk, so an unconditional
+/// whole-object check would defeat the point.
+///
+/// Two halves, and only one of them is a gap. **Per key**, for free:
+/// `DistinctKeyCursors::next` already decodes every key it yields (to hash
+/// it), so a key the consumer actually pulls is checked below at no extra
+/// cost. **Terminally** -- `ended_unpaired`/`delimiter_fault`, which have no
+/// per-key signal at all -- the check runs when, and only when, the walk
+/// reached exhaustion (#1653): a consumer that ran to the end already paid
+/// for the whole walk, so asking costs it two bool reads, while a consumer
+/// that stopped early is never charged. What remains a gap is therefore
+/// exactly what #1770 scoped it to: a malformed key, or an unpaired tail,
+/// sitting *after* the last element a truncating consumer pulled -- the same
+/// way `each_lazy_seq_iterate_sink`'s doc comment above describes for a
+/// `map(f)` failure past what `first` needed. Pinned by the `..._1770`
+/// tests below; recorded in `docs/compliance/jq/limitations.md`.
 fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     fields: &V::Fields,
     sorted: bool,
@@ -4362,8 +4369,15 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     if !sorted {
-        return drive_pipe_elements_generic::<S, V>(
-            DistinctKeyCursors::new(fields, collapse).map(|(value, cursor)| {
+        // Held by `by_ref` rather than moved into the `map` closure so the
+        // *terminal* half of the #1194 check is still reachable once the
+        // walk ends: `ended_unpaired`/`delimiter_fault` have no per-key
+        // signal (`uncons_key` returns the same `None` either way), so only
+        // the walk that finished can tell them apart. `DistinctKeyCursors`
+        // owns clones of `fields`, so this borrow conflicts with nothing.
+        let mut cursors = DistinctKeyCursors::new(fields, collapse);
+        let flow = drive_pipe_elements_generic::<S, V>(
+            cursors.by_ref().map(|(value, cursor)| {
                 if key_is_malformed(&value) {
                     Err(Control::Error(fields.malformed_member_error()))
                 } else {
@@ -4374,6 +4388,18 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
             optional,
             sink,
         );
+        // Only on exhaustion. A consumer that stopped early (`first`,
+        // `limit`) returns `Flow::Stopped` without the walk ever reaching
+        // the tail, and charging it for one would restore exactly the whole-
+        // object probe such a consumer exists to avoid (#1514/#1599) --
+        // which is the divergence #1770 accepted, scoped to early exit.
+        if matches!(flow, Flow::Exhausted) && cursors.is_malformed() {
+            return drain_result_generic(
+                GenericResult::Error(cursors.malformed_member_error()),
+                sink,
+            );
+        }
+        return flow;
     }
 
     let mut keys = match effective_keys(fields, collapse) {
