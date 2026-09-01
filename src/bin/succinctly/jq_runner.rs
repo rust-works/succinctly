@@ -954,8 +954,8 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
     eprintln!();
 }
 
-/// Report a call the compile-time resolution pass could not resolve, in jq's
-/// own compile-error shape (#1473):
+/// Report every call the compile-time resolution pass could not resolve, in
+/// jq's own compile-error shape (#1473, extended to all of them by #2037):
 ///
 /// ```text
 /// jq: error: f/3 is not defined at <top-level>, line 1:
@@ -963,54 +963,81 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// jq: 1 compile error
 /// ```
 ///
-/// **The line is located by searching `filter` for the offending identifier,
+/// **Each line is located by searching `filter` for the offending identifier,
 /// not read off the AST** — `Expr::FuncCall` carries no source position, and
 /// adding one would perturb `format!("{body:?}").len()`, which #1381's
-/// `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against. A filter that
-/// mentions the same undefined name more than once therefore cites the first
-/// occurrence's line, which may not be the one that failed to resolve; a
-/// filter whose failing call came from an `include`d module or `~/.jq` has no
-/// occurrence in `filter` at all, and drops the line marker and source echo
-/// rather than inventing a position.
+/// `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against. To still locate a
+/// *repeated* undefined name's calls individually rather than always citing
+/// the first occurrence, each successive lookup for the same name resumes the
+/// search right after the previous one's match — matching jq's own output
+/// whenever `resolve_func_calls_all`'s traversal order (which follows source
+/// order for every existing `Expr` variant) agrees with a left-to-right
+/// textual scan, which is the common case but not a guarantee for every
+/// conceivable AST shape (there is no *positional* proof, only a textual
+/// heuristic). A filter whose failing call came from an `include`d module or
+/// `~/.jq` has no occurrence in `filter` at all, and drops the line marker and
+/// source echo rather than inventing a position.
 ///
 /// jq pads the echoed line with trailing spaces (a `%*s` in its own
 /// `locfile_locate`); the padding width follows the failing node's start
 /// column for a simple undefined name but points elsewhere for an
 /// arity mismatch, so this reproduces the column rule rather than every case.
 /// It is trailing whitespace either way.
-///
-/// Always "1 compile error": [`jq::resolve_func_calls`] stops at the first
-/// unresolvable call, where jq reports all of them. Reporting the rest needs
-/// the same per-call positions.
-fn report_unresolved_call(unresolved: &UnresolvedCall, filter: &str) {
-    let UnresolvedCall { name, arity } = unresolved;
+fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
+    // Byte offset to resume searching from, per name, so a second call to the
+    // same undefined name finds its own occurrence rather than repeating the
+    // first one's.
+    let mut resume_from: Vec<(&str, usize)> = Vec::new();
 
-    let Some((line_no, line_text, column)) = locate_identifier(filter, name) else {
-        eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
-        eprintln!("jq: 1 compile error");
-        return;
-    };
+    for UnresolvedCall { name, arity } in unresolved {
+        let start_from = resume_from
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(0, |(_, pos)| *pos);
 
-    eprintln!("jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:");
-    eprintln!("{line_text}{}", " ".repeat(column));
-    eprintln!("jq: 1 compile error");
+        match locate_identifier_from(filter, name, start_from) {
+            Some((line_no, line_text, column, end)) => {
+                match resume_from.iter_mut().find(|(n, _)| n == name) {
+                    Some(entry) => entry.1 = end,
+                    None => resume_from.push((name, end)),
+                }
+                eprintln!(
+                    "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
+                );
+                eprintln!("{line_text}{}", " ".repeat(column));
+            }
+            None => {
+                eprintln!("jq: error: {name}/{arity} is not defined at <top-level>");
+            }
+        }
+    }
+
+    let count = unresolved.len();
+    let noun = if count == 1 { "error" } else { "errors" };
+    eprintln!("jq: {count} compile {noun}");
 }
 
-/// Find the first occurrence of `name` in `filter` that stands alone as an
-/// identifier, returning its 1-based line, that line's text, and its 0-based
-/// column.
+/// Find the first occurrence of `name` in `filter`, at or after byte offset
+/// `start_from`, that stands alone as an identifier — returning its 1-based
+/// line, that line's text, its 0-based column, and the byte offset just past
+/// the match (so a caller can resume from there to find the *next*
+/// occurrence).
 ///
 /// "Stands alone" means neither neighbour is an identifier character, so a
 /// search for `f` does not match the `f` inside `first` — but `::` is allowed
 /// on the left, since a namespaced call arrives here as `ns::f` while the
 /// source spells the two halves either side of the separator.
-fn locate_identifier(filter: &str, name: &str) -> Option<(usize, String, usize)> {
+fn locate_identifier_from(
+    filter: &str,
+    name: &str,
+    start_from: usize,
+) -> Option<(usize, String, usize, usize)> {
     fn is_ident_byte(b: u8) -> bool {
         b.is_ascii_alphanumeric() || b == b'_'
     }
 
     let bytes = filter.as_bytes();
-    let mut search_from = 0;
+    let mut search_from = start_from;
     let start = loop {
         let hit = search_from + filter[search_from..].find(name)?;
         let before_ok = hit == 0 || !is_ident_byte(bytes[hit - 1]);
@@ -1036,6 +1063,7 @@ fn locate_identifier(filter: &str, name: &str) -> Option<(usize, String, usize)>
         line_no,
         filter[line_start..line_end].to_string(),
         start - line_start,
+        start + name.len(),
     ))
 }
 
@@ -1166,8 +1194,9 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // module function as undefined. `substitute_vars` above substitutes
     // `OwnedValue`s, never sub-expressions, so it cannot introduce a call and
     // running after it rather than before is equivalent.
-    if let Err(unresolved) = jq::resolve_func_calls(&expr) {
-        report_unresolved_call(&unresolved, &filter_str);
+    let unresolved = jq::resolve_func_calls_all(&expr);
+    if !unresolved.is_empty() {
+        report_unresolved_calls(&unresolved, &filter_str);
         return Ok(exit_codes::COMPILE_ERROR);
     }
 

@@ -340,11 +340,9 @@ type Scope = Vec<(String, usize)>;
 /// Check every function call in `expr` against the `def`s, parameters and
 /// builtins in scope at its position, the way real jq's compiler does.
 ///
-/// Returns the first unresolvable call in traversal order. jq reports every
-/// compile error and then `jq: N compile errors`; this stops at the first, so
-/// the runner always prints `jq: 1 compile error`. Reporting the rest would
-/// need per-call source positions, which the AST does not carry (#1473's
-/// follow-up).
+/// Returns the first unresolvable call in traversal order, if any. See
+/// [`resolve_func_calls_all`] to collect every one, matching jq's own
+/// `jq: N compile errors` behaviour.
 ///
 /// Must run *after* `ModuleLoader::process_program`: that is what inlines
 /// `include`/`import`/`~/.jq` definitions as `Expr::FuncDef` wrappers around
@@ -352,8 +350,25 @@ type Scope = Vec<(String, usize)>;
 /// the wrapper it also creates. Running earlier would report every module
 /// function as undefined.
 pub fn resolve_func_calls(expr: &Expr) -> Result<(), UnresolvedCall> {
+    match resolve_func_calls_all(expr).into_iter().next() {
+        Some(first) => Err(first),
+        None => Ok(()),
+    }
+}
+
+/// Like [`resolve_func_calls`], but keeps traversing past an unresolvable
+/// call instead of stopping at the first.
+///
+/// Returns every unresolvable call it finds, in traversal order (which
+/// follows source order for every existing `Expr` variant). Real jq reports
+/// every unresolvable call in one compile pass (`jq: N compile errors`);
+/// this is what lets the jq runner match that instead of always reporting
+/// `jq: 1 compile error` (#2037).
+pub fn resolve_func_calls_all(expr: &Expr) -> Vec<UnresolvedCall> {
     let mut scope = Scope::new();
-    check(expr, &mut scope)
+    let mut errors = Vec::new();
+    check(expr, &mut scope, &mut errors);
+    errors
 }
 
 /// Whether `(name, arity)` is one of the pinned jq's own builtins.
@@ -369,8 +384,11 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
 }
 
 /// Recurse into `expr` under `scope`, restoring `scope` before returning so a
-/// sibling never sees a binding introduced by its neighbour.
-fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
+/// sibling never sees a binding introduced by its neighbour. Appends every
+/// unresolvable call to `errors` rather than stopping at the first, matching
+/// how real jq's own compiler keeps going to report every compile error in
+/// one pass (#2037).
+fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
     match expr {
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
         // own grouping so the two stay comparable arm for arm.
@@ -389,7 +407,7 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
         | Expr::TrackedVar(_)
         | Expr::Loc { .. }
         | Expr::Env
-        | Expr::Break(_) => Ok(()),
+        | Expr::Break(_) => {}
 
         Expr::Optional(inner)
         | Expr::Array(inner)
@@ -398,12 +416,13 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
         | Expr::FirstExpr(inner)
         | Expr::LastExpr(inner)
         | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => check(inner, scope),
+        | Expr::Label { body: inner, .. } => check(inner, scope, errors),
 
-        Expr::Error(inner) => match inner.as_deref() {
-            Some(e) => check(e, scope),
-            None => Ok(()),
-        },
+        Expr::Error(inner) => {
+            if let Some(e) = inner.as_deref() {
+                check(e, scope, errors);
+            }
+        }
 
         Expr::Arithmetic { left, right, .. }
         | Expr::Compare { left, right, .. }
@@ -463,8 +482,8 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
             path: left,
             value: right,
         } => {
-            check(left, scope)?;
-            check(right, scope)
+            check(left, scope, errors);
+            check(right, scope, errors);
         }
 
         // The one arm that changes scope. `body` sees the function itself
@@ -490,20 +509,17 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
             for p in params {
                 scope.push((p.clone(), 0));
             }
-            let body_result = check(body, scope);
+            check(body, scope, errors);
             scope.truncate(with_self);
-            body_result?;
 
-            let then_result = check(then, scope);
+            check(then, scope, errors);
             scope.truncate(outer);
-            then_result
         }
 
         Expr::Try { expr, catch } => {
-            check(expr, scope)?;
-            match catch.as_deref() {
-                Some(c) => check(c, scope),
-                None => Ok(()),
+            check(expr, scope, errors);
+            if let Some(c) = catch.as_deref() {
+                check(c, scope, errors);
             }
         }
 
@@ -512,21 +528,21 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
             then_branch,
             else_branch,
         } => {
-            check(cond, scope)?;
-            check(then_branch, scope)?;
-            check(else_branch, scope)
+            check(cond, scope, errors);
+            check(then_branch, scope, errors);
+            check(else_branch, scope, errors);
         }
 
         Expr::SliceExpr { target, start, end } => {
-            check(target, scope)?;
-            check_opt(start.as_deref(), scope)?;
-            check_opt(end.as_deref(), scope)
+            check(target, scope, errors);
+            check_opt(start.as_deref(), scope, errors);
+            check_opt(end.as_deref(), scope, errors);
         }
 
         Expr::Range { from, to, step } => {
-            check(from, scope)?;
-            check_opt(to.as_deref(), scope)?;
-            check_opt(step.as_deref(), scope)
+            check(from, scope, errors);
+            check_opt(to.as_deref(), scope, errors);
+            check_opt(step.as_deref(), scope, errors);
         }
 
         Expr::Reduce {
@@ -535,9 +551,9 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
             update,
             ..
         } => {
-            check(input, scope)?;
-            check(init, scope)?;
-            check(update, scope)
+            check(input, scope, errors);
+            check(init, scope, errors);
+            check(update, scope, errors);
         }
 
         Expr::Foreach {
@@ -547,32 +563,29 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
             extract,
             ..
         } => {
-            check(input, scope)?;
-            check(init, scope)?;
-            check(update, scope)?;
-            check_opt(extract.as_deref(), scope)
+            check(input, scope, errors);
+            check(init, scope, errors);
+            check(update, scope, errors);
+            check_opt(extract.as_deref(), scope, errors);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             for e in exprs {
-                check(e, scope)?;
+                check(e, scope, errors);
             }
-            Ok(())
         }
 
         // The check itself. Arguments are checked in the *caller's* scope, not
         // the callee's — an argument is an expression written at the call site.
         Expr::FuncCall { name, args } => {
             for a in args {
-                check(a, scope)?;
+                check(a, scope, errors);
             }
-            if in_scope(scope, name, args.len()) || is_jq_builtin(name, args.len()) {
-                Ok(())
-            } else {
-                Err(UnresolvedCall {
+            if !(in_scope(scope, name, args.len()) || is_jq_builtin(name, args.len())) {
+                errors.push(UnresolvedCall {
                     name: name.clone(),
                     arity: args.len(),
-                })
+                });
             }
         }
 
@@ -583,28 +596,25 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
             for a in args {
-                check(a, scope)?;
+                check(a, scope, errors);
             }
-            Ok(())
         }
 
         Expr::Object(entries) => {
             for entry in entries {
                 if let ObjectKey::Expr(k) = &entry.key {
-                    check(k, scope)?;
+                    check(k, scope, errors);
                 }
-                check(&entry.value, scope)?;
+                check(&entry.value, scope, errors);
             }
-            Ok(())
         }
 
         Expr::StringInterpolation(parts) => {
             for part in parts {
                 if let StringPart::Expr(e) = part {
-                    check(e, scope)?;
+                    check(e, scope, errors);
                 }
             }
-            Ok(())
         }
 
         // No builtin introduces a function binding, so its sub-expressions
@@ -613,26 +623,25 @@ fn check(expr: &Expr, scope: &mut Scope) -> Result<(), UnresolvedCall> {
         // a new sub-expression-carrying variant is a compile error there and
         // this pass picks the fix up for free.
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
-            BuiltinKids::None => Ok(()),
-            BuiltinKids::One(a) => check(a, scope),
+            BuiltinKids::None => {}
+            BuiltinKids::One(a) => check(a, scope, errors),
             BuiltinKids::Two(a, b) => {
-                check(a, scope)?;
-                check(b, scope)
+                check(a, scope, errors);
+                check(b, scope, errors);
             }
             BuiltinKids::Three(a, b, c) => {
-                check(a, scope)?;
-                check(b, scope)?;
-                check(c, scope)
+                check(a, scope, errors);
+                check(b, scope, errors);
+                check(c, scope, errors);
             }
         },
     }
 }
 
 /// [`check`] over an optional sub-expression.
-fn check_opt(expr: Option<&Expr>, scope: &mut Scope) -> Result<(), UnresolvedCall> {
-    match expr {
-        Some(e) => check(e, scope),
-        None => Ok(()),
+fn check_opt(expr: Option<&Expr>, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
+    if let Some(e) = expr {
+        check(e, scope, errors);
     }
 }
 
