@@ -17770,6 +17770,55 @@ fn test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371() -> Res
     Ok(())
 }
 
+/// #2093 (code review of #1371/#2090): the sibling test above pins that
+/// exceeding `MAX_EVAL_FRAMES` stays catchable, but its own wrapping shape
+/// (array constructors) also grows the *output value*'s nesting past
+/// `MAX_VALUE_TREE_DEPTH` (384) at the same query -- so it can't tell
+/// whether a regression to a plain per-call counter (unsafe for exactly the
+/// structural-nesting shape `MAX_EVAL_FRAMES`'s own doc comment describes)
+/// would go uncaught, since either guard alone already explains the error.
+///
+/// `if true then <body> end` nesting charges the same cumulative structural
+/// frame cost per level (confirmed: this shape hits the guard at a
+/// depth×width product in the tens of thousands, matching the array-wrapped
+/// shape's own order of magnitude) while the *value* never grows at all --
+/// an always-true condition just threads `.` straight through every level
+/// unchanged, so the returned value is `null` whether the call succeeds or
+/// the guard fires. That isolates the frame guard: a flat per-call counter
+/// would let this succeed at any depth (nothing about call *count* alone
+/// exceeds a few thousand here), where the real structural-frame guard
+/// correctly refuses it.
+#[test]
+fn test_deeply_nested_conditional_wrapping_hits_frame_guard_without_growing_value_2093(
+) -> Result<()> {
+    let wrap_open = "if true then ".repeat(100);
+    let wrap_close = " end".repeat(100);
+
+    // 100 levels × 300 recursive steps ≈ 30,000 frames -- safely under
+    // MAX_EVAL_FRAMES (40,000) and nowhere near MAX_VALUE_TREE_DEPTH, since
+    // the value never nests. Matches jq 1.7.1 byte for byte (confirmed live).
+    let query = format!(
+        "def deep(m): if m == 0 then . else ({wrap_open}deep(m-1){wrap_close}) end; deep(300)"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "null");
+
+    // 100 levels × 1,500 recursive steps ≈ 150,000 frames -- well past
+    // MAX_EVAL_FRAMES, refused as a catchable error rather than a stack
+    // overflow (#1016/#1098) -- the invariant this whole guard exists for.
+    let query = format!(
+        "def deep(m): if m == 0 then . else ({wrap_open}deep(m-1){wrap_close}) end; deep(1500)"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1371: the depth guard has to be reachable from every evaluator, not just
 /// the plain one, and each reports it differently. A runaway recursion under a
 /// *truncating* consumer goes through `eval_each`'s own `DefCall` arm, and one
