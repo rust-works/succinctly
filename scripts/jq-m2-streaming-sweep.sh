@@ -14,8 +14,15 @@
 # that reason.
 #
 # This sweep separates the two variables. It runs each (document, filter)
-# case three ways -- the eager route, the streaming route, and the pinned jq
-# oracle -- and reports:
+# case three ways -- the eager route, the route the build actually ships, and
+# the pinned jq oracle -- and reports:
+#
+# By default the second leg is the **shipped** route, so `0 unexpected` means
+# "the `expr_is_cursor_transparent` gate admits nothing that changes an
+# answer". Pass `--forced-stream` to make it stream *every* filter regardless
+# of the gate: that is the diagnostic view, and what it reports is the set of
+# divergences the gate exists to avoid -- i.e. #2103's worklist. Shrinking
+# that set is what lets the gate widen.
 #
 #   * PARITY divergences: eager vs streaming disagree on stdout/stderr/exit.
 #     **These are the gate.** Every one is a check the streaming route lost
@@ -36,13 +43,24 @@
 #
 # Usage:
 #   cargo build --release --features cli
-#   ./scripts/jq-m2-streaming-sweep.sh [path-to-succinctly-binary]
+#   ./scripts/jq-m2-streaming-sweep.sh [--forced-stream] [path-to-succinctly-binary]
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIN="$(cat "$REPO_ROOT/tests/data/jq-golden/JQ_VERSION")"
-SUCC="${1:-$REPO_ROOT/target/release/succinctly}"
+
+# Empty = let the build's own gate decide (the shipped route); "stream" =
+# force every filter through the demand-driven evaluator.
+STREAM_LEG=""
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --forced-stream) STREAM_LEG=stream ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+SUCC="${ARGS[0]:-$REPO_ROOT/target/release/succinctly}"
 
 if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli" >&2
@@ -60,7 +78,7 @@ else
   echo "error: no jq matching pin $PIN found at /usr/bin/jq or on PATH" >&2
   exit 1
 fi
-echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
+echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC, second leg: ${STREAM_LEG:-shipped gate}" >&2
 
 WORK="$(mktemp -d -t jq-m2-sweep)"
 trap 'rm -rf "$WORK"' EXIT
@@ -129,6 +147,23 @@ FILTERS=(
   'keys_unsorted, length'
   'debug'
   '(., debug)'
+  # descended shapes: after a first stage that descends, the ambient value is
+  # a proper descendant, so a branch forwarding it is not forwarding the root.
+  # These decide how far past the root the streaming gate can safely reach.
+  '.[]|debug'
+  '.[] | (., debug)'
+  '.[] | .,.'
+  '.[] | if . then . else . end'
+  '.[] | try (1+1) catch "x"'
+  '.[] | 1+1'
+  '.[] | label $x | .'
+  '.[] | def f: .; f'
+  '.[] | . as $x | $x'
+  '.a | (., debug)'
+  '.a | if . then . else . end'
+  '.a | 1+1'
+  '.[] | select(. != null)'
+  '.[] | tostring'
 )
 
 # Attribute a parity divergence to an already-tracked, deliberately-accepted
@@ -173,7 +208,7 @@ run_case() {
     && eager_code=0 || eager_code=$?
   eager_err="$(cat "$WORK/e.err")"
 
-  stream_out="$(SUCCINCTLY_JQ_M2_EVAL=stream "$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$WORK/s.err")" \
+  stream_out="$(SUCCINCTLY_JQ_M2_EVAL="$STREAM_LEG" "$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$WORK/s.err")" \
     && stream_code=0 || stream_code=$?
   stream_err="$(cat "$WORK/s.err")"
 
