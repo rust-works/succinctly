@@ -193,9 +193,12 @@ jobs:
         if: needs.gate.outputs.code == 'true'
         run: cargo test --verbose --features simd,scalar-yaml
 
-      - name: Check no_std compatibility
+      # #2114: `cargo check` doesn't build test targets at all, so it never
+      # caught #2083 (a std-only symbol reachable from test code with no
+      # matching cfg gate) -- `cargo test` both builds and runs them.
+      - name: Check no_std compatibility (build + run tests)
         if: needs.gate.outputs.code == 'true'
-        run: cargo check --no-default-features
+        run: cargo test --no-default-features --verbose
 
   test-arm:
     name: Test (ARM64)
@@ -437,8 +440,11 @@ jobs:
       - name: Run tests (portable-popcount feature)
         run: cargo test --verbose --features portable-popcount
 
-      - name: Check no_std compatibility
-        run: cargo check --no-default-features
+      # #2114: `cargo check` doesn't build test targets at all, so it never
+      # caught #2083 (a std-only symbol reachable from test code with no
+      # matching cfg gate) -- `cargo test` both builds and runs them.
+      - name: Check no_std compatibility (build + run tests)
+        run: cargo test --no-default-features --verbose
 
   # Skipped on `merge_group` (#310): a 3-arch `cargo bench` fan-out is far too
   # slow to run per queue entry, and it gates nothing.
