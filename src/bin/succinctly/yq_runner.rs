@@ -4025,6 +4025,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // constraint is that `--jq-extensions` gating already happened, which it
     // did — a gated jq-only builtin is a *parse* error above, never a residual
     // `FuncCall` reaching this pass.
+    //
+    // Deliberately still the singular `resolve_func_calls` (first error only),
+    // not `resolve_func_calls_all` (#2037): that split exists to match jq's
+    // own `jq: N compile errors` count and per-call line numbers, and yq's
+    // uniform `Error: …` wording has no count or per-call position to match
+    // in the first place — real yq has no `def` at all (see above), so there
+    // is no reference behaviour for "more than one unresolved call" to be
+    // unfaithful to here. Reporting only the first is simply what this
+    // extension has always done, not a shortcut #2037 introduced or one that
+    // needs revisiting alongside it.
     if let Err(unresolved) = jq::resolve_func_calls(&program.expr) {
         anyhow::bail!("{unresolved}");
     }

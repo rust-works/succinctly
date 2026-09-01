@@ -972,11 +972,22 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// search right after the previous one's match — matching jq's own output
 /// whenever `resolve_func_calls_all`'s traversal order (which follows source
 /// order for every existing `Expr` variant) agrees with a left-to-right
-/// textual scan, which is the common case but not a guarantee for every
-/// conceivable AST shape (there is no *positional* proof, only a textual
-/// heuristic). A filter whose failing call came from an `include`d module or
-/// `~/.jq` has no occurrence in `filter` at all, and drops the line marker and
-/// source echo rather than inventing a position.
+/// textual scan.
+///
+/// **This is a textual heuristic, not a positional proof, and it can misfire
+/// even when traversal order agrees with text order**: `locate_identifier_from`
+/// matches any occurrence of the name's spelling, not specifically a call
+/// site, so an unrelated same-spelling occurrence earlier in the source (an
+/// object key, a variable) is indistinguishable from the real one to a pure
+/// text scan. `{nosuch: 1} | nosuch` cites the harmless object key on line 1
+/// instead of the actual failing call on line 2 — a pre-existing gap from
+/// #1473, not something this resumed-search scheme introduces or fixes.
+/// Tracked separately as #2085. Closing it for real needs the same source position on `Expr::FuncCall`
+/// this whole approach exists to avoid adding.
+///
+/// A filter whose failing call came from an `include`d module or `~/.jq` has
+/// no occurrence in `filter` at all, and drops the line marker and source
+/// echo rather than inventing a position.
 ///
 /// jq pads the echoed line with trailing spaces (a `%*s` in its own
 /// `locfile_locate`); the padding width follows the failing node's start
@@ -987,20 +998,14 @@ fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
     // first one's.
-    let mut resume_from: Vec<(&str, usize)> = Vec::new();
+    let mut resume_from: HashMap<&str, usize> = HashMap::new();
 
     for UnresolvedCall { name, arity } in unresolved {
-        let start_from = resume_from
-            .iter()
-            .find(|(n, _)| n == name)
-            .map_or(0, |(_, pos)| *pos);
+        let start_from = resume_from.get(name.as_str()).copied().unwrap_or(0);
 
         match locate_identifier_from(filter, name, start_from) {
             Some((line_no, line_text, column, end)) => {
-                match resume_from.iter_mut().find(|(n, _)| n == name) {
-                    Some(entry) => entry.1 = end,
-                    None => resume_from.push((name, end)),
-                }
+                resume_from.insert(name.as_str(), end);
                 eprintln!(
                     "jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:"
                 );

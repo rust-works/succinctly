@@ -17444,7 +17444,7 @@ cover(1)"#,
 /// and the wording is jq's own. Captured from the pinned oracle
 /// (`/usr/bin/jq`, jq-1.7.1), which emits exactly these three lines --
 /// modulo trailing padding on the echoed source line, see
-/// `report_unresolved_call` (`src/bin/succinctly/jq_runner.rs`).
+/// `report_unresolved_calls` (`src/bin/succinctly/jq_runner.rs`).
 #[test]
 fn test_func_call_arity_mismatch_reports_clean_error_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def f(x): x; f(1;2)"], Some("null"))?;
@@ -28524,7 +28524,7 @@ fn test_module_error_exits_with_the_compile_error_code_1473() -> Result<()> {
 }
 
 /// The reported line is the one the offending identifier is written on, not
-/// always line 1 -- `report_unresolved_call` locates it in the filter source.
+/// always line 1 -- `report_unresolved_calls` locates it in the filter source.
 #[test]
 fn test_unresolved_call_reports_its_own_source_line_1473() -> Result<()> {
     let (_stdout, stderr, code) = run_jq_full(&["-c", "def f: 1;\nf\n| nosuch"], Some("null"))?;
@@ -28557,9 +28557,9 @@ fn test_unresolved_call_line_search_is_word_bounded_1473() -> Result<()> {
 }
 
 /// #1473: an unresolvable call reached through an `include`d module has no
-/// occurrence in the filter source, so `locate_identifier` finds nothing and
-/// the diagnostic drops the line marker and source echo rather than inventing
-/// a position.
+/// occurrence in the filter source, so `locate_identifier_from` finds nothing
+/// and the diagnostic drops the line marker and source echo rather than
+/// inventing a position.
 ///
 /// jq names the module file and line here
 /// (`... is not defined at /path/mymod.jq, line 1:` plus the module's own
@@ -28629,9 +28629,10 @@ fn test_all_unresolved_calls_are_reported_not_just_the_first_2037() -> Result<()
 /// #2037: a repeated undefined name no longer always cites the first
 /// occurrence's line -- each successive report resumes the source search
 /// right after the previous match, so the second and third `nosuch1` in
-/// `nosuch1 | nosuch2 | nosuch1` are told apart even though `locate_identifier`
-/// still has no real AST position to work from. Captured live against the
-/// pinned oracle, which reports the same three errors in the same order.
+/// `nosuch1 | nosuch2 | nosuch1` are told apart even though
+/// `locate_identifier_from` still has no real AST position to work from.
+/// Captured live against the pinned oracle, which reports the same three
+/// errors in the same order.
 #[test]
 fn test_repeated_unresolved_name_cites_its_own_occurrence_2037() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-n", "nosuch1 | nosuch2 | nosuch1"], None)?;
@@ -28670,6 +28671,49 @@ fn test_original_2037_repro_reports_both_lines() -> Result<()> {
     assert!(
         stderr.contains("jq: 2 compile errors"),
         "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2037: an unresolved call's *arguments* are only checked once the call
+/// itself resolves. Real jq's compiler binds argument closures to the
+/// callee's parameter slots, which requires the callee to already be found;
+/// an unresolved callee means there is nothing to bind the arguments to, so
+/// jq never compiles them and reports only the callee. Verified live: this
+/// filter is `nosucha/2 is not defined`, one error, in jq 1.7.1 -- not three.
+///
+/// Collecting every unresolvable call (rather than stopping at the first, as
+/// this same PR does) made this easy to get wrong in the other direction: a
+/// naive "keep checking everything" still descends into an unresolved call's
+/// own arguments and reports errors real jq's compiler never reaches at all.
+#[test]
+fn test_unresolved_callee_args_are_not_independently_checked_2037() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "nosucha(nosuchb; nosuchc)"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: nosucha/2 is not defined at <top-level>, line 1:\n\
+         nosucha(nosuchb; nosuchc)\n\
+         jq: 1 compile error\n"
+    );
+    Ok(())
+}
+
+/// #2037, the flip side of the test above: once the callee itself *does*
+/// resolve, its arguments are checked exactly as before -- an unresolved call
+/// inside a resolved call's argument is still reported. Verified live against
+/// jq 1.7.1 (`nosuch/0 is not defined`, one error).
+#[test]
+fn test_resolved_callee_still_checks_its_own_arguments_2037() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-n", "def f(x): x; f(nosuch)"], None)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert_eq!(stdout, "", "a compile error produces no output");
+    assert_eq!(
+        stderr,
+        "jq: error: nosuch/0 is not defined at <top-level>, line 1:\n\
+         def f(x): x; f(nosuch)               \n\
+         jq: 1 compile error\n"
     );
     Ok(())
 }
