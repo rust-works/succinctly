@@ -1349,7 +1349,22 @@ fn try_multicall() -> Result<Option<i32>> {
 /// Applied here, at the single point every subcommand passes through, rather
 /// than around `run_jq` alone -- `yq` shares the same evaluator, and the
 /// alternative is one wrapper per command that each has to remember.
-const EVAL_STACK_SIZE: usize = 256 * 1024 * 1024;
+///
+/// **Bigger in a debug build, deliberately.** An unoptimized frame for the
+/// same evaluator is ~9x the size of an optimized one -- measured at the same
+/// stack, a recursion that survives ~57,500 levels in release dies at ~6,250
+/// in debug. A single stack size would therefore mean `MAX_EVAL_FRAMES` had
+/// to be calibrated for debug and would then cap release far below what its
+/// stack could carry, or be calibrated for release and abort the debug
+/// binary -- which is what `cargo test` and CI actually run. Scaling the
+/// stack with the profile instead keeps *one* frame ceiling correct for both,
+/// so the tests exercise the same limit the shipped binary enforces. Reserved
+/// address space either way: pages are faulted in only as used.
+const EVAL_STACK_SIZE: usize = if cfg!(debug_assertions) {
+    2 * 1024 * 1024 * 1024
+} else {
+    256 * 1024 * 1024
+};
 
 fn main() -> Result<()> {
     // Run everything on a thread with an explicitly sized stack, then

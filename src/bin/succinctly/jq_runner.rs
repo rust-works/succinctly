@@ -4260,6 +4260,30 @@ fn evaluate_bytes_lazy<'a>(
 ///
 /// This is similar to query_result_to_jq_values but works with the
 /// cursor-aware GenericResult type from eval_generic.
+/// Convert one materialized value for output, reporting an over-deep one as
+/// an ordinary error rather than letting it panic (#1371).
+///
+/// `JqValue::from_owned` asserts past `MAX_VALUE_TREE_DEPTH` (384), which is
+/// a reasonable contract for a library caller that owns its input and a very
+/// unreasonable one here: with `def` now recursing by evaluation rather than
+/// by pre-substituted body, an ordinary recursive filter can build a value
+/// deeper than that ceiling, and a filter a user typed must not be able to
+/// abort the process (#1098). Returns no values on failure, having reported
+/// the error, exactly as every other erroring arm around it does.
+fn to_jq_values<'a, W: Clone + AsRef<[u64]>>(
+    value: OwnedValue,
+    at: &InputLocation,
+    sink: &mut ErrorSink,
+) -> Vec<JqValue<'a, W>> {
+    match JqValue::try_from_owned(value) {
+        Ok(v) => vec![v],
+        Err(e) => {
+            sink.report(DiagStyle::Jq, &e, at);
+            Vec::new()
+        }
+    }
+}
+
 fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
     result: GenericResult<StandardJson<'a, W>>,
     cursor: JsonCursor<'a, W>,
@@ -4324,9 +4348,11 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         } => match effective_keys(&fields, collapse) {
             Ok(mut keys) => {
                 keys.sort();
-                vec![JqValue::from_owned(OwnedValue::Array(
-                    keys.into_iter().map(OwnedValue::String).collect(),
-                ))]
+                to_jq_values(
+                    OwnedValue::Array(keys.into_iter().map(OwnedValue::String).collect()),
+                    at,
+                    sink,
+                )
             }
             Err(e) => {
                 sink.report(DiagStyle::Jq, &e, at);
@@ -4343,7 +4369,7 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         // wrapping via `from_owned` reuses the existing `write_json` path
         // entirely.
         GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
-            Ok(v) => vec![JqValue::from_owned(v)],
+            Ok(v) => to_jq_values(v, at, sink),
             Err(jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Jq, &e, at);
                 vec![]
@@ -4362,8 +4388,11 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             sink.report(DiagStyle::Jq, &e, at);
             vec![]
         }
-        GenericResult::Owned(v) => vec![JqValue::from_owned(v)],
-        GenericResult::ManyOwned(vs) => vs.into_iter().map(JqValue::from_owned).collect(),
+        GenericResult::Owned(v) => to_jq_values(v, at, sink),
+        GenericResult::ManyOwned(vs) => vs
+            .into_iter()
+            .flat_map(|v| to_jq_values(v, at, sink))
+            .collect(),
         GenericResult::Break(label) => {
             sink.report_break(DiagStyle::Jq, &label, at);
             vec![]

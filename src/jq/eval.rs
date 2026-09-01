@@ -3407,8 +3407,34 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(bound) => eval_each::<W, S>(&bound, value, optional, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        // Transparent, so the wrapped argument's own laziness survives.
-        Expr::Shared(inner) => eval_each::<W, S>(inner, value, optional, sink),
+        // Lazy only for an argument the *user* wrote, not for a link in a
+        // recursion's own argument chain (#1371).
+        //
+        // Laziness here is observable and has to be kept: `isempty(def f(g):
+        // g; f(1, ("B"|stderr)))` must not run the second branch after the
+        // answer is known, which the eager `drain_result` fallback would.
+        //
+        // But a recursive call's argument is `Shared(previous) - 1`, a chain
+        // one link deep per level, and walking it through this sink-based
+        // evaluator costs roughly 70x the native stack that `eval_single`'s
+        // own path does -- measured: `sum_to` reached ~20,000 levels before
+        // this arm existed and crashed at ~300 with it applied
+        // unconditionally. Nothing is gained there either: an arithmetic
+        // chain is single-valued, so there is no demand to forward.
+        //
+        // A link is exactly an argument that already contains a `Shared`,
+        // which `any_subexpr` reports without walking the chain (its
+        // predicate fires on the first one, at depth 1). An enclosing
+        // definition's parameter threaded into an inner call looks the same
+        // and is treated the same -- conservative, and still correct: an
+        // un-lazified arm is a missed optimization, never a behaviour change.
+        Expr::Shared(inner) => {
+            if any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
+                drain_result(eval_single::<W, S>(inner, value, optional), sink)
+            } else {
+                eval_each::<W, S>(inner, value, optional, sink)
+            }
+        }
 
         // #1462 (Stage 5): demand-forwarding through a nested consumer.
         // `each_take_n` (Stage 2) already stops asking `expr` for more once
@@ -39963,35 +39989,47 @@ pub(crate) fn bind_def(name: &str, params: &[String], body: &Expr, then: &Expr) 
     install_def_calls(then, &def, 0)
 }
 
-/// How deep a user-defined function may recurse before evaluation gives up
-/// (#1371).
+/// How much live native evaluation a user-defined function may accumulate
+/// before the call is refused (#1371).
 ///
-/// This is a genuine recursion-depth limit — one unit per *live* call, the
-/// thing jq itself bounds only by memory — not the substitution budget it
-/// replaces. The distinction is the point of #1371: the old ceiling was
-/// charged during expansion, so it was consumed by branches a real run would
-/// never take (`fib(0)` failed exactly like `fib(1000)`, since expansion
-/// unrolled the `else` arm it could not know was dead), and a `def` with more
-/// than one self-call exhausted it at every depth including zero. Nothing is
-/// charged here until a call actually runs.
+/// Counts **frames, not calls.** `install_def_calls` charges one unit per
+/// structural level it descends, and each call carries its parent's total
+/// forward, so a `DefCall`'s `frames` is the nesting the evaluator is
+/// actually holding live when it reaches that node. A plain call count would
+/// not do: it is not how many calls are outstanding that exhausts the stack
+/// but how much structure each one holds live across its own recursive call.
+/// Measured at 256 MB, release: a body whose call sits directly in a pipe
+/// survives ~57,500 levels, while one wrapping the same call in 40 array
+/// constructors dies between 4,000 and 8,000 -- a 10x spread that one count
+/// cannot straddle, and that this charge tracks (both crash at ~172,000-258,000
+/// frames by this measure, within a factor of 1.5 of each other).
 ///
-/// **Calibrated against measured native stack use, not guessed** (#2080): one
-/// live call level costs ~4.4 KB of native stack, measured by bisecting the
-/// deepest working recursion at two stack sizes an 8x multiple apart (4406
-/// B/level at 8 MB, 4381 B/level at 64 MB — 0.6% apart, so consumption is
-/// linear in depth, not quadratic as it was while arguments were substituted
-/// textually). At that rate this ceiling needs ~44 MB of stack, which is why
-/// the CLI runs evaluation on a thread with an explicitly sized one
-/// (`jq_runner.rs`) rather than the default 8 MB main thread, and why
-/// exceeding it must stay a clean, catchable error: the alternative is the
-/// `SIGABRT` stack overflow #1016 exists to prevent.
+/// This replaces three substitution budgets (`MAX_FUNC_EXPANSION_DEPTH`,
+/// `..._CHAIN_DEPTH`, `..._WEIGHTED_COST`) that bounded *expansion* work
+/// rather than evaluation. The difference is not just where the cost is
+/// charged: nothing is charged here until a call actually runs, so a branch a
+/// given input never takes costs nothing. That is what makes an ordinary
+/// branching `def` work at all -- `fib(0)` used to exhaust the old ceiling
+/// exactly like `fib(1000)`, because expansion unrolled the `else` arm it
+/// could not know was dead.
 ///
-/// Matches the depth jq itself was confirmed to handle for this issue's own
-/// repro (`sum_to(10000)`), rather than being set to whatever happened not to
-/// crash — a library embedder with a smaller stack is the case this does not
-/// cover, and is why the limit is a constant here rather than derived from
-/// whatever stack the caller happens to have.
-const MAX_EVAL_FRAMES: u32 = 100_000;
+/// **Calibrated in both profiles, against the tightest shape of each**
+/// (release at 256 MB, debug at 2 GB -- see `EVAL_STACK_SIZE` in
+/// `main.rs` for why the two stacks differ). Crash floors, bisected: thin
+/// body ~57,500 levels release / ~50,000 debug; 40-deep wrapping body
+/// 4,000-8,000 release / 4,000-6,000 debug. At 40,000 frames the guard fires
+/// first in every one of those, by 4x or better, while still clearing the
+/// depth this issue's own repro needs: `sum_to(10000)` returns 50005000,
+/// matching jq 1.7.1 (~3 frames per level for that body, so ~13,000 levels
+/// available).
+///
+/// Exceeding it must stay a *catchable error*, never a stack overflow: an
+/// abort is the failure mode #1016 exists to prevent, and #1098 established
+/// that a filter a user typed must not be able to take the process down.
+/// Real jq does not manage this on the same input -- `def deep: [deep]; deep`
+/// dies there with `cannot allocate memory`, exit 134 (confirmed live) -- so
+/// erroring instead is a divergence in the only direction ADR-0018 permits.
+const MAX_EVAL_FRAMES: u32 = 40_000;
 
 /// Evaluate one call to a user-defined function (#1371).
 ///

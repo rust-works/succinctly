@@ -239,6 +239,51 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
         }
     }
 
+    /// [`from_owned`](Self::from_owned)'s checked twin: reports a value
+    /// nested past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
+    /// as an ordinary [`EvalError`] instead of panicking (#1371).
+    ///
+    /// The panicking form stays for library callers that own their input and
+    /// treat over-deep nesting as a bug. The CLI is the opposite case: since
+    /// a `def` recurses by evaluation rather than by pre-substituted body
+    /// (#1371), an ordinary recursive filter can now build a value deeper
+    /// than the ceiling -- `def deep(n): if n == 0 then . else [[deep(n-1)]]
+    /// end;` at a few hundred levels -- and taking the whole process down
+    /// with a panic for a filter a user simply typed is the failure mode
+    /// #1098 established this codebase does not ship.
+    ///
+    /// Costs nothing extra: the depth is already being carried down the
+    /// conversion that has to happen anyway, so this is the same walk with
+    /// its assertion turned into a returned error.
+    pub fn try_from_owned(owned: OwnedValue) -> Result<Self, EvalError> {
+        Self::try_from_owned_at_depth(owned, 0)
+    }
+
+    fn try_from_owned_at_depth(owned: OwnedValue, depth: usize) -> Result<Self, EvalError> {
+        if depth >= super::value::MAX_VALUE_TREE_DEPTH {
+            return Err(EvalError::new(
+                super::value::nesting_depth_exceeded_message(super::value::MAX_VALUE_TREE_DEPTH),
+            ));
+        }
+        Ok(match owned {
+            OwnedValue::Array(arr) => JqValue::Array(
+                arr.into_iter()
+                    .map(|v| Self::try_from_owned_at_depth(v, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            OwnedValue::Object(obj) => JqValue::Object(
+                obj.into_iter()
+                    .map(|(k, v)| Self::try_from_owned_at_depth(v, depth + 1).map(|v| (k, v)))
+                    .collect::<Result<IndexMap<_, _>, _>>()?,
+            ),
+            // Every scalar arm is exactly `from_owned_at_depth`'s, reached
+            // only after the depth check above; kept as one delegation
+            // rather than six duplicated arms so the two constructors cannot
+            // drift on how a scalar is represented.
+            scalar => Self::from_owned_at_depth(scalar, depth),
+        })
+    }
+
     // =========================================================================
     // Type checking
     // =========================================================================
