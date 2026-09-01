@@ -2011,7 +2011,7 @@ mod tests {
     /// shared index leaked its `Cell` into the formatted output.
     #[test]
     fn test_bound_body_is_invisible_to_eq_and_debug_1371() {
-        let call = || Expr::DefCall {
+        let call = |bound| Expr::DefCall {
             def: Rc::new(FuncDefData {
                 name: "f".into(),
                 params: alloc_vec(["n"]),
@@ -2019,15 +2019,16 @@ mod tests {
             }),
             args: vec![Expr::Literal(Literal::Int(1))],
             frames: 3,
-            bound: BoundBody::default(),
+            bound,
         };
-        let cold = call();
-        let warm = call();
-        let Expr::DefCall { bound, .. } = &warm else {
-            unreachable!("just built a DefCall")
-        };
-        // Populate one side's cache; the two must stay indistinguishable.
-        let _ = bound.get_or_try_init(|| Ok::<_, ()>(Rc::new(Expr::Identity)));
+        let cold = call(BoundBody::default());
+
+        // Populate the warm side's cache before it's ever wrapped in an
+        // `Expr::DefCall`, so the two stay indistinguishable without needing
+        // to destructure `bound` back out of `warm` afterwards.
+        let warm_bound = BoundBody::default();
+        let _ = warm_bound.get_or_try_init(|| Ok::<_, ()>(Rc::new(Expr::Identity)));
+        let warm = call(warm_bound);
 
         assert_eq!(cold, warm, "the cache must not affect equality");
         assert_eq!(

@@ -17352,4 +17352,57 @@ mod tests {
         let result = eval_with_cursor(&expr, index.root(json));
         assert_eq!(result.into_owned().unwrap().unwrap(), OwnedValue::Int(3));
     }
+
+    /// #1371: `eval_each_generic`'s own `Expr::DefCall` arm (mirroring
+    /// `eval.rs`'s eager `eval_def_call`) has to turn a `bind_def_call`
+    /// failure into `Flow::Escaped(Control::Error(_))` rather than, say,
+    /// unwrapping or silently stopping -- a consumer stacked on top of the
+    /// generic/lazy sink (`limit`, `first`, `[...]`) must see the same
+    /// recursion-depth error the eager path raises, not a truncated or empty
+    /// result.
+    ///
+    /// Reaches `MAX_EVAL_FRAMES` via the ambient-depth guard directly, the
+    /// same white-box shortcut `eval.rs`'s own
+    /// `test_ambient_frame_depth_composes_with_defcall_guard_1371` uses,
+    /// rather than actually recursing 40,000 levels deep. `eval_each_generic`
+    /// is reached (rather than `eval_single`'s "fall back to the full
+    /// evaluator" wildcard arm) by driving the constructed `Expr::DefCall`
+    /// straight through [`eval_each_with_cursor_using`], which calls
+    /// `eval_each_generic` as its own entry point.
+    #[test]
+    fn eval_each_generic_reports_defcall_binding_failure_1371() {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+        } = parse("def f: f; f").unwrap()
+        else {
+            panic!("expected a top-level FuncDef");
+        };
+
+        let _guard = enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
+        let defcall = bind_def(&name, &params, &body, &then);
+        assert!(
+            matches!(&defcall, Expr::DefCall { frames, .. } if *frames == crate::jq::eval::MAX_EVAL_FRAMES),
+            "expected bind_def to seed frames from the ambient depth"
+        );
+
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+
+        let mut on_value = |_item: GenericResult<_>| true;
+        let control =
+            eval_each_with_cursor_using::<JqSemantics, _>(&defcall, cursor, &mut on_value);
+
+        match control {
+            Some(Control::Error(err)) => assert!(
+                err.message.contains("exceeded maximum recursion depth"),
+                "message: {}",
+                err.message
+            ),
+            other => panic!("expected Control::Error, got {other:?}"),
+        }
+    }
 }
