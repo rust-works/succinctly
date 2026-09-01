@@ -24567,12 +24567,9 @@ struct StepRegisterFacts {
 /// All four confirmed live against jq 1.7.1, along with the rest of the
 /// matrix on #1573.
 ///
-/// The five preconditions are each load-bearing (the first four ride
+/// The four preconditions are each load-bearing (all but the last ride
 /// [`StepRegisterFacts`]):
 ///
-/// - `!branch_trackable` — a trackable branch needs no re-establishing, and
-///   its `Expr::TrackedVar` arm already certifies against the ambient value
-///   directly (which *is* the register while trackable).
 /// - `!navigated` — the step contributed no path components. A step that
 ///   navigated reached a genuinely new position, and `trackable` already
 ///   answers for it; re-pointing it at `prefix` would report the wrong path.
@@ -24584,6 +24581,21 @@ struct StepRegisterFacts {
 /// - [`register_identical`] — the whole rule, shared with the fold register
 ///   so the two cannot drift.
 ///
+/// `branch_trackable` is **not** a precondition here (#2044): a trackable
+/// branch that this stage drops out of trackability (a computed, non-
+/// navigating value — the caller's own `step_trackable` already went
+/// `false`) can still land back on the register by this exact rule, the
+/// same as an already-untracked branch can. jq's `INDEX`/`PATH_END` run
+/// `jv_identical` against the register on *every* step regardless of
+/// whether the resolver here still considers the branch trackable —
+/// confirmed live: `path(null | .a)` on `null` input is `["a"]`, because a
+/// freshly computed `null` is `jv_identical` to a `null` register exactly
+/// like an already-untracked one would be. The caller sources `register`
+/// from `step_register` (not `carried_register`) for this case, since
+/// `carried_register` is only ever populated once already-untracked
+/// (`resolve_leaf` records the ambient value as `step_register` on the
+/// very transition that drops trackability — see [`carry_register`]).
+///
 /// This only ever turns a refusal into an answer, so getting it *wrong*
 /// costs an accepted path jq refuses — the dangerous direction, and why
 /// every clause above is a conjunct rather than a heuristic.
@@ -24592,8 +24604,7 @@ fn reestablishes_register(
     register: Option<&OwnedValue>,
     resulting: &OwnedValue,
 ) -> bool {
-    !facts.branch_trackable
-        && !facts.navigated
+    !facts.navigated
         && facts.stage_preserves_register
         && register.is_some_and(|reg| register_identical(reg, resulting, facts.step_snapshot))
 }
@@ -24836,8 +24847,19 @@ fn resolve_seq<'a, S: EvalSemantics>(
                     stage_preserves_register,
                     step_snapshot,
                 };
-                let reestablished =
-                    reestablishes_register(facts, carried_register.as_deref(), &resulting);
+                // The register entering this step (#2044): while the branch
+                // was still trackable, the register was `current` itself,
+                // and `resolve_leaf` records that value as `step_register`
+                // on exactly the transition that drops trackability --
+                // `carried_register` is only ever populated once already
+                // untracked (see `reestablishes_register`'s own doc
+                // comment).
+                let register_entering = if branch_trackable {
+                    step_register.as_deref()
+                } else {
+                    carried_register.as_deref()
+                };
+                let reestablished = reestablishes_register(facts, register_entering, &resulting);
                 let path = if reestablished {
                     Rc::clone(&prefix)
                 } else {
@@ -70285,6 +70307,46 @@ mod tests {
         query!(br#"{"a":{"b":1}}"#, r"path(.a as $y | .a | $y)",
             QueryResult::Error(e) => {
                 assert!(e.is_invalid_path_expression());
+            }
+        );
+    }
+
+    /// #2044: `reestablishes_register`'s `!branch_trackable` conjunct
+    /// excluded the *plain-pipe* case (no variable at all) from the same
+    /// `jv_identical` default-arm rule `register_identical` already applies
+    /// once already-untracked -- a *freshly computed* `null`/`true`/`false`
+    /// reached from a still-trackable position (the document root here) is
+    /// `jv_identical` to a matching register too, exactly like jq's own
+    /// `INDEX`/`PATH_END` opcodes see it. Live-verified against jq 1.7.1:
+    /// `path(null | .a)` on `null` input is `["a"]`.
+    #[test]
+    fn test_path_reestablishes_register_from_trackable_branch_2044() {
+        query!(b"null", r"path(null | .a)",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::String("a".to_string())]);
+            }
+        );
+
+        // A non-null/bool value reached the same way is *not* covered by
+        // `register_identical`'s default arm (jq's own `jv_identical` only
+        // takes that unconditional path for null/true/false) -- still
+        // refuses, same as the pre-#2044 behavior. `Field`/`Index` against
+        // an untracked value raises the "near attempt to access element"
+        // wording (`ErrorKind::UntrackedNavigation`), not the "with result"
+        // one `is_invalid_path_expression` checks -- see
+        // `invalid_path_expression_near_access`'s own doc comment.
+        query!(b"null", r"path(true | .a)",
+            QueryResult::Error(e) => {
+                assert!(e.is_untracked_navigation_error());
+            }
+        );
+
+        // The issue's own second repro: a `$var` snapshot combined with the
+        // same trackable-branch null re-establishment, live-verified
+        // against jq 1.7.1 as `[0]`.
+        query!(b"null", r"path((try . catch 1) as $v | null | .[0] | $v)",
+            QueryResult::Owned(OwnedValue::Array(path)) => {
+                assert_eq!(path, vec![OwnedValue::Int(0)]);
             }
         );
     }
