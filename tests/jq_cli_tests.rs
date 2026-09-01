@@ -30597,3 +30597,26 @@ fn test_index_expr_eval_rs_dispatch_target_reevaluated_per_key_2032() -> Result<
     assert_eq!(stdout, "[1,4]\n");
     Ok(())
 }
+
+/// #2032 review: `eval_generic.rs`'s per-key `KeyTargets::Native` arm
+/// reserves capacity once, up front, on whichever of `cursors`/`owned` is
+/// live *at that moment* -- but `index_one_generic` can still return
+/// `GenericResult::Owned` for an ordinary target in the middle of that same
+/// `ts` list (a missing object field or out-of-bounds index, both decode to
+/// an owned `Null`), flipping liveness from `cursors` to `owned` partway
+/// through, past the point the upfront reservation could see it. Each
+/// element of `.[]` here is one key's whole `ts` list for the `[("a")]`
+/// index that follows: `{"a":1}` -> `GenericResult::OneCursor` (native),
+/// `{}` -> `GenericResult::Owned(Null)` (missing field) -- the second
+/// element is exactly the flip. Without a guard on every push made *after*
+/// such a flip (not just the upfront batch), this reopens a narrow form of
+/// the #1017/#1612/#1634/#1669 abort-on-allocation-failure class in
+/// production traffic, not just a synthetic fallback path. Verified against
+/// jq 1.7.1: both emit `1` then `null`.
+#[test]
+fn test_index_expr_native_to_owned_flip_mid_key_reserves_2032() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[][(\"a\")]"], Some(r#"[{"a":1},{}]"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\nnull\n");
+    Ok(())
+}
