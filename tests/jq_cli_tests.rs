@@ -17087,19 +17087,16 @@ fn nested_arrays(depth: usize) -> String {
     format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
 }
 
-/// #1016: a self-recursive `def` has no base case at expansion time --
-/// `expand_func_calls` statically substitutes `deep`'s body in place of
-/// each call *before* any evaluation happens, so it can't observe that
-/// `n == 0` will eventually hold and unrolls unconditionally. Confirmed
-/// live before this fix: `deep(1)` crashed with SIGABRT (stack overflow)
-/// even at the shallowest possible depth, since expansion never terminates
-/// on its own regardless of `n`'s actual value.
+/// #1016/#1371: `deep(60)` used to be refused -- static expansion could not
+/// observe that `n == 0` would eventually hold, so it unrolled until
+/// `MAX_FUNC_EXPANSION_DEPTH` (50) stopped it and reported "recursion depth
+/// exceeds limit of 50" for a filter real jq evaluates without difficulty.
 ///
-/// `n = 60` safely exceeds `MAX_FUNC_EXPANSION_DEPTH` (50), so this must
-/// still fail -- but cleanly, as a catchable `EvalError`, not a SIGABRT
-/// that takes the whole process down.
+/// Now that a call is bound and substituted at evaluation time (#1371), the
+/// base case simply terminates the recursion, and the output is byte-for-byte
+/// jq 1.7.1's own (confirmed live).
 #[test]
-fn test_self_recursive_def_rejects_past_expansion_depth_1016() -> Result<()> {
+fn test_self_recursive_def_past_old_expansion_depth_now_matches_jq_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -17107,10 +17104,10 @@ fn test_self_recursive_def_rejects_past_expansion_depth_1016() -> Result<()> {
         ],
         Some("null"),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("recursion depth exceeds limit of 50"),
-        "stderr: {stderr:?}"
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!("{}null{}", "[".repeat(60), "]".repeat(60))
     );
     Ok(())
 }
@@ -17136,56 +17133,41 @@ fn test_self_recursive_def_accepts_depth_under_limit_1016() -> Result<()> {
     Ok(())
 }
 
-/// Pins the exact boundary rather than just "well under"/"well over": for
-/// this single-argument shape, `deep(49)` is the largest `n` that succeeds
-/// and `deep(50)` is the first that fails -- confirmed live. A future
-/// change to the budget check (e.g. `>` instead of `>=`, or a shifted
-/// increment) would silently move this boundary by one with nothing to
-/// catch it if only the "well within"/"well past" tests above existed.
+/// #1371: there is no longer a substitution boundary to pin. `deep(49)` and
+/// `deep(50)` used to be the last success and the first failure -- an
+/// artefact of `MAX_FUNC_EXPANSION_DEPTH` counting substitutions, not of
+/// anything jq does. Both now evaluate, and this pins that the old cliff is
+/// gone rather than merely moved: the two outputs differ only by one level of
+/// nesting, as they should.
 #[test]
-fn test_self_recursive_def_boundary_is_exactly_49_1016() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "-c",
-            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(49)",
-        ],
-        Some("null"),
-    )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(
-        stdout.trim_end(),
-        format!("{}null{}", "[".repeat(49), "]".repeat(49))
-    );
-
-    let (stdout, stderr, code) = run_jq_full(
-        &[
-            "-c",
-            "def deep(n): if n == 0 then . else [deep(n-1)] end; deep(50)",
-        ],
-        Some("null"),
-    )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("recursion depth exceeds limit of 50"),
-        "stderr: {stderr:?}"
-    );
+fn test_old_expansion_depth_boundary_is_gone_1371() -> Result<()> {
+    for n in [49usize, 50] {
+        let (stdout, stderr, code) = run_jq_full(
+            &[
+                "-c",
+                &format!("def deep(n): if n == 0 then . else [deep(n-1)] end; deep({n})"),
+            ],
+            Some("null"),
+        )?;
+        assert_eq!(code, 0, "n={n} stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            format!("{}null{}", "[".repeat(n), "]".repeat(n)),
+            "n={n}"
+        );
+    }
     Ok(())
 }
 
-/// #1381: chaining several small recursive `def`s, each calling the
-/// previous one as its base case, used to multiply size ~50x per chained
-/// level (`r0`'s occurrence inside `r1`'s own body gets fully expanded
-/// *before* `r1`'s own self-reference loop runs, so every one of `r1`'s
-/// own budget-bounded hits clones a `body` that already embeds `r0`'s
-/// entire expansion) -- confirmed live pre-fix at 4+ GB peak RSS for the
-/// 3-def repro below. The weighted-cost guard now throttles `r1`'s (and
-/// `r2`'s) own hit count down to a small handful once their `body` has
-/// absorbed a prior chained `def`'s expansion, so this now fails cleanly
-/// and fast instead of exhausting memory -- see
-/// `MAX_FUNC_EXPANSION_WEIGHTED_COST`'s own doc comment (`src/jq/eval.rs`)
-/// for the full mechanism.
+/// #1381/#1371: three chained recursive `def`s, each calling the previous one
+/// as its base case. Under static expansion this multiplied body size ~50x
+/// per chained level -- 4+ GB peak RSS before #1381 bounded it, and a clean
+/// "substitution cost exceeds limit of 250000" refusal after. The
+/// multiplication was inherent to expanding one `def`'s body *into* the next
+/// one's before either ran; binding calls at evaluation time removes it
+/// outright, and this now returns jq 1.7.1's own answer (confirmed live).
 #[test]
-fn test_chained_self_recursive_defs_bounded_by_weighted_cost_1381() -> Result<()> {
+fn test_chained_self_recursive_defs_now_match_jq_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -17196,10 +17178,10 @@ fn test_chained_self_recursive_defs_bounded_by_weighted_cost_1381() -> Result<()
         ],
         Some("null"),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("substitution cost exceeds limit of 250000"),
-        "stderr: {stderr:?}"
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        format!("{}null{}", "[".repeat(45), "]".repeat(45))
     );
     Ok(())
 }
@@ -17254,19 +17236,21 @@ fn test_weighted_cost_guard_does_not_regress_moderately_complex_body_1381() -> R
     Ok(())
 }
 
-/// A zero-argument self-recursive `def` (no growing argument expression to
-/// substitute) is the *cheapest possible* case for `expand_func_calls`'s own
-/// recursion, yet still crashed at only ~383 levels in a debug build before
-/// this fix (measured while calibrating `MAX_FUNC_EXPANSION_DEPTH`) -- it
-/// has no base case at all, so it must hit the depth guard on every build,
-/// not just adversarially deep ones. Confirms the guard covers this shape
-/// too, not just the parameterized one above.
+/// A `def` with no base case at all must still fail, and must fail *cleanly*
+/// -- the one thing #1016 established is non-negotiable, and the thing
+/// #1371's change could most easily have broken by trading a guard for
+/// unbounded native recursion.
+///
+/// Real jq does not survive this: `def deep: [deep]; deep` dies with
+/// `cannot allocate memory` and signal-level exit 134 (confirmed live against
+/// jq 1.7.1). Erroring instead of aborting is a deliberate divergence in the
+/// only direction ADR-0018 permits -- matching would take the process down.
 #[test]
 fn test_unconditional_self_recursive_def_rejects_cleanly_1016() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "def deep: [deep]; deep"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of 50"),
+        stderr.contains("deep/0 exceeded maximum recursion depth"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -17289,31 +17273,35 @@ fn test_non_self_recursive_constructs_unaffected_by_expansion_guard_1016() -> Re
     Ok(())
 }
 
-/// #1016 code review: a `def` body with *more than one* syntactic self-call
-/// (branching self-recursion, e.g. naive `fib`) defeats a plain per-chain
-/// depth counter -- every structural arm visiting multiple children (`+`'s
-/// two operands here) passes the same depth to each, so `k` self-calls per
-/// level compound to `O(k^depth)` total substitutions even though no single
-/// chain exceeds the cap. Confirmed live before this fix: `def f: [f, f];
-/// f` consumed tens of GB and never terminated. `MAX_FUNC_EXPANSION_DEPTH`
-/// must bound *total* expansion work (a shared budget, not a per-chain
-/// value) to stay safe for this shape too -- this must return quickly with
-/// a clean error, not hang or exhaust memory. Real jq resolves `fib(3)`
-/// instantly (`2`); this guard's shared-budget design means even this
-/// shallow, everyday case can't succeed under static expansion (see
-/// `MAX_FUNC_EXPANSION_DEPTH`'s doc comment) -- but it must fail cleanly.
+/// #1016/#1371: a `def` body with more than one syntactic self-call -- naive
+/// `fib`, the most ordinary recursive filter there is -- could not succeed at
+/// *any* depth under static expansion, `fib(0)` included, because expansion
+/// unrolled the `else` branch it could not know a given input would never
+/// take. `k` self-calls per level compounded as `O(k^depth)`, so a shared
+/// budget was the only thing keeping `def f: [f, f]; f` from consuming tens of
+/// GB.
+///
+/// Binding calls at evaluation time removes the branching problem with the
+/// depth problem: only the branch actually taken is ever substituted. Pinned
+/// against jq 1.7.1's own values (confirmed live).
 #[test]
-fn test_branching_self_recursive_def_bounded_not_exponential_1016() -> Result<()> {
+fn test_branching_self_recursive_def_now_matches_jq_1371() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
-            "def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; fib(3)",
+            "def fib(n): if n < 2 then n else fib(n-1) + fib(n-2) end; [range(12)] | map(fib(.))",
         ],
         Some("null"),
     )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0,1,1,2,3,5,8,13,21,34,55,89]");
+
+    // The unbounded branching shape must still fail cleanly, as above: real
+    // jq 1.7.1 aborts on it with `cannot allocate memory`, exit 134.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "def f: [f, f]; f"], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("recursion depth exceeds limit of 50"),
+        stderr.contains("f/0 exceeded maximum recursion depth"),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -17341,17 +17329,20 @@ fn test_independent_sibling_calls_do_not_share_budget_1016() -> Result<()> {
     Ok(())
 }
 
-/// #1016 code review: `MAX_FUNC_EXPANSION_DEPTH` only bounds how many
-/// times the `FuncCall` self-reference arm fires, not the native stack
-/// depth needed to walk from one self-reference to the next -- a `def`
-/// body that wraps its recursive call in substantial structure (here, 20
-/// levels of array nesting) overflows the native stack (SIGABRT) well
-/// before that budget is anywhere near exhausted, confirmed live before
-/// this fix. `MAX_FUNC_EXPANSION_CHAIN_DEPTH` bounds raw recursion depth
-/// directly and must catch this case too, cleanly, not just the thin-body
-/// shape the other tests in this group use.
+/// #1016/#1371: a body that wraps its recursive call in substantial structure
+/// (20 levels of array nesting here) is the shape that made a *call-count*
+/// ceiling unsafe -- it is not the number of calls that exhausts the native
+/// stack but the frames each one holds live, which is why the guard now
+/// accumulates structural nesting per call site (`MAX_EVAL_FRAMES`) instead
+/// of counting calls.
+///
+/// At 60 levels this builds a value 1,200 deep, past `MAX_VALUE_TREE_DEPTH`
+/// (384). Real jq prints it; succinctly refuses it -- but as a catchable
+/// error, which is the part this pins. Before the output path was routed
+/// through `JqValue::try_from_owned` (#1371) the same query took the process
+/// down with a panic, exit 101, which is precisely what #1098 forbids.
 #[test]
-fn test_thickly_wrapped_self_recursive_def_bounded_by_chain_depth_1016() -> Result<()> {
+fn test_thickly_wrapped_self_recursive_def_errors_without_aborting_1371() -> Result<()> {
     let wrap_open = "[".repeat(20);
     let wrap_close = "]".repeat(20);
     let query = format!(
@@ -17360,9 +17351,18 @@ fn test_thickly_wrapped_self_recursive_def_bounded_by_chain_depth_1016() -> Resu
     let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting exceeds depth limit of 300"),
+        stderr.contains("nesting depth exceeds limit of 384"),
         "stderr: {stderr:?}"
     );
+
+    // Shallow enough to stay inside the value-depth ceiling: the same shape
+    // evaluates, and matches jq 1.7.1 byte for byte (confirmed live).
+    let query = format!(
+        "def deep(m): if m == 0 then . else {wrap_open}deep(m-1){wrap_close} end; deep(3) | flatten | length"
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
     Ok(())
 }
 

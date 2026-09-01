@@ -5698,7 +5698,18 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(bound) => eval_each_generic::<S, V>(&bound, value, optional, cursor, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        Expr::Shared(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
+        // Same split as `eval.rs`'s own `Shared` arm, for the same measured
+        // reason -- see there. A link in a recursion's own argument chain
+        // takes the cheaper eager path (it is single-valued, so no demand is
+        // lost); an argument the user wrote stays lazy, because *its*
+        // laziness is observable.
+        Expr::Shared(inner) => {
+            if crate::jq::walk::any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
+                drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
+            } else {
+                eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+            }
+        }
 
         // See `each_limit_generic`'s own doc comment.
         Expr::Limit { n, expr } => {
