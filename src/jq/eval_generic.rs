@@ -5707,7 +5707,14 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // reason -- see there. A link in a recursion's own argument chain
         // takes the cheaper eager path (it is single-valued, so no demand is
         // lost); an argument the user wrote stays lazy, because *its*
-        // laziness is observable.
+        // laziness is observable. A bare pass-through (`inner` is itself a
+        // `Shared` -- a parameter threaded unchanged through another level,
+        // not a computed chain link) can be arbitrary user code underneath,
+        // so it is peeled by re-entering this same arm rather than taken as
+        // settled -- see `eval.rs`'s identical split for the full reasoning.
+        Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
+            eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+        }
         Expr::Shared(inner) => {
             if crate::jq::walk::any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
                 drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
