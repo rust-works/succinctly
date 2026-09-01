@@ -33691,6 +33691,7 @@ fn delete_trie_apply(
     mut value: OwnedValue,
     trie: &DeleteTrie,
     id: u32,
+    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     let node = trie.node(id);
     // The pre-#1690 `delete_expr_paths_at`'s `paths.is_empty()` guard. Only the root can
@@ -33711,12 +33712,13 @@ fn delete_trie_apply(
     // computed key that skips `resolve_node`'s validation (#2049) can
     // populate both maps against a non-null scalar root too -- the fields
     // arm no-ops through it (below), and the indices arm raises its own
-    // type-mismatch error.
+    // type-mismatch error (a genuine yq-mode gap for a scalar root, #2106 --
+    // `yq_mode` threaded through both trie walks for exactly that arm).
     if !node.fields.is_empty() {
-        value = delete_trie_object(value, trie, id)?;
+        value = delete_trie_object(value, trie, id, yq_mode)?;
     }
     if !node.indices.is_empty() {
-        value = delete_trie_array(value, trie, id)?;
+        value = delete_trie_array(value, trie, id, yq_mode)?;
     }
     Ok(value)
 }
@@ -33731,7 +33733,12 @@ fn delete_trie_apply(
 /// `DeleteStep` shape that is not `null`-tolerant (the way `.[]` is not,
 /// #527) would otherwise silently skip validation here instead of raising.
 fn delete_trie_through_absent(trie: &DeleteTrie, id: u32) -> Result<(), EvalError> {
-    let deleted = delete_trie_apply(OwnedValue::Null, trie, id)?;
+    // `yq_mode` doesn't matter here: the value is always a synthetic `Null`,
+    // and this function's own doc comment already establishes every arm it
+    // can reach is `null`-tolerant regardless of mode -- `false` never
+    // reaches `delete_trie_array`'s new yq-mode gate (#2106), which only
+    // fires for a genuine scalar, never `Null`.
+    let deleted = delete_trie_apply(OwnedValue::Null, trie, id, false)?;
     debug_assert!(
         matches!(deleted, OwnedValue::Null),
         "deleting through a synthetic null produced a value to write back"
@@ -33744,6 +33751,7 @@ fn delete_trie_object(
     mut value: OwnedValue,
     trie: &DeleteTrie,
     id: u32,
+    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     let node = trie.node(id);
     // `null` tolerates any field key unconditionally — `null | del(.a)` is
@@ -33787,7 +33795,7 @@ fn delete_trie_object(
         match entries.get_mut(name.as_str()) {
             Some(target) => {
                 let old = core::mem::replace(target, OwnedValue::Null);
-                *target = delete_trie_apply(old, trie, child)?;
+                *target = delete_trie_apply(old, trie, child, yq_mode)?;
             }
             // A field the object doesn't have is a dead end, not an error
             // (#527) — and the tail decides whether it stays one.
@@ -33814,6 +33822,7 @@ fn delete_trie_array(
     mut value: OwnedValue,
     trie: &DeleteTrie,
     id: u32,
+    yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     let node = trie.node(id);
     // Same per-step `null` exemption as `delete_trie_object` — applies to a
@@ -33857,6 +33866,18 @@ fn delete_trie_array(
             .indices
             .get_index(0)
             .expect("caller checked indices is non-empty");
+        // #2106: real yq no-ops an index key against a genuine scalar root
+        // (`2.5 | del(.[(0,1)])` stays `2.5`), matching the same
+        // `is_yq_field_index_noop_scalar` rule `delete_at_path`'s `Index`
+        // arm already applies for a non-comma path -- confirmed live that
+        // real jq still errors on this exact input (`Cannot index number
+        // with number`), so this is gated to yq mode only, unlike
+        // `delete_trie_object`'s sibling no-op above (which real jq's own
+        // earlier `resolve_node` validation already keeps this function
+        // from ever seeing in a way that would need to differ).
+        if yq_mode && is_yq_field_index_noop_scalar(&value) {
+            return Ok(value);
+        }
         return Err(match step {
             ArrayStep::Slice(..) if matches!(value, OwnedValue::String(_)) => {
                 EvalError::cannot_delete_fields_from("string")
@@ -33882,7 +33903,7 @@ fn delete_trie_array(
                         Some(actual) => {
                             let target = &mut arr[actual];
                             let old = core::mem::replace(target, OwnedValue::Null);
-                            *target = delete_trie_apply(old, trie, child)?;
+                            *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
                         // An out-of-range index names nothing to delete
                         // through, so `delpaths` silently skips the step
@@ -33897,7 +33918,8 @@ fn delete_trie_array(
                 ArrayStep::Slice(s, e) => {
                     let range = SliceBounds::from_literals(*s, *e).resolve(arr.len());
                     let sub = OwnedValue::Array(arr[range.clone()].to_vec());
-                    let OwnedValue::Array(items) = delete_trie_apply(sub, trie, child)? else {
+                    let OwnedValue::Array(items) = delete_trie_apply(sub, trie, child, yq_mode)?
+                    else {
                         unreachable!("deleting from an array yields an array")
                     };
                     arr.splice(range, items);
@@ -34144,7 +34166,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Releases the borrow the branches hold on `result`, so the apply
         // walk below can take it by value.
         drop(resolved);
-        return match delete_trie_apply(result, &trie, DELETE_TRIE_ROOT) {
+        return match delete_trie_apply(result, &trie, DELETE_TRIE_ROOT, S::TAG == EvalTag::Yq) {
             Ok(result) => QueryResult::Owned(result),
             Err(_) if optional => QueryResult::None,
             Err(e) => e.into(),
@@ -34284,6 +34306,11 @@ fn delete_at_path(
             // `null` (#476).
             OwnedValue::Null => Ok(()),
             _ if optional => Ok(()),
+            // #2106: real yq no-ops a field key against a genuine scalar
+            // root (`2.5 | del(.k0)` stays `2.5`) — an array root still
+            // errors (`is_yq_field_index_noop_scalar` excludes it),
+            // matching real yq's own `cannot index array with 'k0'`.
+            _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
             _ => Err(EvalError::cannot_index_with_field(
                 owned_type_name(root),
                 name,
@@ -34302,6 +34329,9 @@ fn delete_at_path(
             // no-op — `null | del(.[0])` is `null` (#476).
             OwnedValue::Null => Ok(()),
             _ if optional => Ok(()),
+            // #2106: same scalar no-op as the `Field` arm above, for an
+            // index key (`2.5 | del(.[0])` stays `2.5` in real yq).
+            _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
             _ => Err(EvalError::cannot_index_with_type(
                 owned_type_name(root),
                 "number",
@@ -34388,6 +34418,13 @@ fn delete_at_path(
                         // (#527).
                         OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
                         _ if here => Ok(()),
+                        // #2106: a mid-chain field step into a genuine
+                        // scalar no-ops the whole remaining chain in yq
+                        // mode (`2.5 | del(.[("k0","k1")].b)` stays `2.5`)
+                        // — there is nothing left to navigate into, so
+                        // `rest` is moot, same as the terminal `Field` arm
+                        // above.
+                        _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
                         _ => Err(EvalError::cannot_index_with_field(
                             owned_type_name(root),
                             name,
@@ -34415,6 +34452,9 @@ fn delete_at_path(
                         // `null | del(.[0][])` still raises (#527).
                         OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
                         _ if here => Ok(()),
+                        // #2106: same mid-chain scalar no-op as `Field`
+                        // above, for an index step.
+                        _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
                         _ => Err(EvalError::cannot_index_with_type(
                             owned_type_name(root),
                             "number",
@@ -66577,7 +66617,7 @@ mod tests {
             idx: 2,
             key: NumberKey::Literal(2.0, "2.0".into()),
         });
-        let err = delete_trie_array(OwnedValue::Int(5), &trie, DELETE_TRIE_ROOT)
+        let err = delete_trie_array(OwnedValue::Int(5), &trie, DELETE_TRIE_ROOT, false)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot index number with number");
     }
@@ -66599,11 +66639,16 @@ mod tests {
             start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
             end_key: None,
         });
-        let err = delete_trie_array(OwnedValue::String("hi".into()), &trie, DELETE_TRIE_ROOT)
-            .expect_err("not an array");
+        let err = delete_trie_array(
+            OwnedValue::String("hi".into()),
+            &trie,
+            DELETE_TRIE_ROOT,
+            false,
+        )
+        .expect_err("not an array");
         assert_eq!(err.message, "Cannot delete fields from string");
 
-        let err = delete_trie_array(OwnedValue::Bool(true), &trie, DELETE_TRIE_ROOT)
+        let err = delete_trie_array(OwnedValue::Bool(true), &trie, DELETE_TRIE_ROOT, false)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot index boolean with object");
     }
@@ -67684,7 +67729,7 @@ mod tests {
         assert!(trie.root_is_terminal());
         // ... and the empty walk itself is still a clean no-op, not a panic:
         // `terminal` is never consulted by the node it sits on.
-        match delete_trie_apply(OwnedValue::Null, &trie, DELETE_TRIE_ROOT) {
+        match delete_trie_apply(OwnedValue::Null, &trie, DELETE_TRIE_ROOT, false) {
             Ok(OwnedValue::Null) => {}
             other => panic!("expected Ok(Null), got {other:?}"),
         }
