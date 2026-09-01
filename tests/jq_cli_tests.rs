@@ -7428,6 +7428,45 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "[null]");
 
+    // `paired` + `QueryResult::Partial` (the body itself produces some
+    // outputs before a terminating control): `first` can short-circuit
+    // once satisfied, so it answers from the already-taken output's own
+    // path, same as `first(1, error("x"))` = `1` in the non-path-context
+    // case. `last` cannot short-circuit and surfaces the control instead
+    // (verified live: `last(1,2,error("x"))` raises, doesn't answer `2`).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | first((.[], error(\"boom\"))) | key"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | last((.[], error(\"boom\"))) | key"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("boom"));
+
+    // Same shape with `halt` instead of `error` -- exercises
+    // `accumulate_path_context_step`'s `Halt` arm specifically (a
+    // different `Control` variant than the `Error` case above, taking a
+    // separate branch through `control_to_result`/`partial`).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | first((.[], halt)) | key"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | last((.[], halt)) | key"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty(), "halt should suppress all output");
+
     // The common case (no path-context builtin in the body) is unaffected.
     let (stdout, _, code) = run_jq_full(&["-c", "[first(.[])]"], Some(r"[1,2,3]"))?;
     assert_eq!(code, 0);

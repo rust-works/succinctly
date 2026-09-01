@@ -31341,9 +31341,7 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 QueryResult::Error(e) => QueryResult::Error(e),
                 QueryResult::Break(label) => QueryResult::Break(label),
                 QueryResult::Halt(code) => QueryResult::Halt(code),
-                QueryResult::Partial(_, Control::Error(e)) => QueryResult::Error(e),
-                QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
-                QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+                QueryResult::Partial(_, control) => control_to_result(control),
                 QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
                     unreachable!(
                         "eval_pipe_with_path_context_internal only ever produces \
