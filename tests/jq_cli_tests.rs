@@ -17186,6 +17186,98 @@ fn test_chained_self_recursive_defs_now_match_jq_1371() -> Result<()> {
     Ok(())
 }
 
+/// #1371 code-review regression: a self-call to the `def` currently being
+/// installed can sit nested inside an *already-installed* sibling call's
+/// own arguments (`g(f(n-1))`, installing `f` while `g`'s own call is
+/// already a bound `DefCall`). `install_def_calls`'s `DefCall` arm used to
+/// treat `args` as fully opaque -- correct only with respect to the `def`
+/// that created the node, not one installed afterward -- so the nested
+/// `f(n-1)` was left a bare, never-installed `FuncCall` forever, and
+/// `eval_func_call` rejected it as undefined. Matches jq 1.7.1 live (`3`).
+#[test]
+fn test_self_call_nested_in_sibling_calls_args_is_installed_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def g(m): m + 1; \
+             def f(n): if n == 0 then 0 else g(f(n-1)) end; \
+             f(3)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "3");
+    Ok(())
+}
+
+/// #1371 code-review regression: composed recursion across two different
+/// `def`s must be charged for the real depth it runs at, not the shallow
+/// structural depth the call was first written at. A `DefCall`'s `frames`
+/// field used to be fixed once, when its owning `def` was installed, and
+/// never refreshed -- so an unrelated `def` embedding that call deep inside
+/// its own recursion (in its base case) could let both `def`s' guards pass
+/// individually while their real native stacks summed past what either
+/// alone was calibrated safe for. `frames` is now refreshed to the larger
+/// of its stale value and the ambient depth each later install pass finds
+/// it at. This pins the *safety* property, not a specific jq-matching
+/// output: composed enough recursion must still end in a catchable
+/// "exceeded maximum recursion depth" error (exit 5), never a native
+/// stack-overflow abort -- confirmed this exact shape aborts without the
+/// fix (`d1` and `d2` each individually complete at n=11000, only the
+/// composed call errors).
+#[test]
+fn test_composed_recursion_across_two_defs_errors_not_aborts_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def d2(n): if n == 0 then 0 else 1 + d2(n-1) end; \
+             def d1(n): if n == 0 then d2(11000) else 1 + d1(n-1) end; \
+             d1(11000)",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #1371 code-review regression: `generic_result_to_jq_values`'s three
+/// `GenericResult::Partial` arms (the already-produced outputs of a
+/// generator that later failed, #400/#494) used to convert via the
+/// panicking `JqValue::from_owned` instead of the checked `to_jq_values`
+/// every other arm in that function uses. A value built by an ordinary
+/// recursive `def` can now exceed `MAX_VALUE_TREE_DEPTH` (384, #1371's
+/// whole point), so an already-produced `Partial` output deeper than that
+/// used to panic the process instead of reporting a clean error -- exactly
+/// the class of bug #1098 closed everywhere else. `deep(500)` builds a
+/// value past the ceiling as the first, successful half of a comma whose
+/// second half then genuinely errors; both must surface as ordinary
+/// diagnostics, never a panic.
+#[test]
+fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "def deep(n): if n==0 then . else [deep(n-1)] end; \
+             (deep(500), error(\"boom\"))",
+        ],
+        Some("null"),
+    )?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1381 regression guard: the weighted-cost check must not fire before an
 /// *ordinary, non-chained* recursive `def` reaches its own
 /// `MAX_FUNC_EXPANSION_DEPTH` budget -- `deep(49)` (a thin single-argument
@@ -23851,6 +23943,24 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             &["-cn", r#"isempty(def f: (1,("B"|stderr)); f)"#],
             None,
             "false\n",
+            "",
+            0,
+        ),
+        // #1371 code-review: `Expr::Shared`'s eager/lazy split used to treat
+        // "the argument contains a nested `Shared`" as proof of a computed,
+        // single-valued chain link (safe to evaluate eagerly, e.g.
+        // `Shared(prev) - 1`) -- but a threaded parameter passed unchanged
+        // through another level of recursion is *also* a nested `Shared`
+        // (`inner` is itself directly a `Shared`, not a chain link at all),
+        // and can be arbitrary user code underneath. The eager fallback ran
+        // the side effect this demand-driven `first` never asked for.
+        (
+            &[
+                "-cn",
+                r#"first(def f(n; x): if n <= 0 then x else f(n-1; x) end; f(3; (1, ("B"|stderr))))"#,
+            ],
+            None,
+            "1\n",
             "",
             0,
         ),

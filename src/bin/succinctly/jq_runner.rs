@@ -4405,18 +4405,28 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
             vec![]
         }
         // The outputs already produced no longer vanish behind the failure
-        // (#400, #494).
+        // (#400, #494). Each one still goes through the checked
+        // `to_jq_values`, not `JqValue::from_owned` directly -- these can be
+        // built by an ordinary recursive `def` now (#1371), so an
+        // over-deep one must report cleanly rather than panic, same as
+        // every other arm in this function (see `to_jq_values`'s own doc).
         GenericResult::Partial(vs, jq::Control::Error(e)) => {
             sink.report(DiagStyle::Jq, &e, at);
-            vs.into_iter().map(JqValue::from_owned).collect()
+            vs.into_iter()
+                .flat_map(|v| to_jq_values(v, at, sink))
+                .collect()
         }
         GenericResult::Partial(vs, jq::Control::Break(label)) => {
             sink.report_break(DiagStyle::Jq, &label, at);
-            vs.into_iter().map(JqValue::from_owned).collect()
+            vs.into_iter()
+                .flat_map(|v| to_jq_values(v, at, sink))
+                .collect()
         }
         GenericResult::Partial(vs, jq::Control::Halt(code)) => {
             sink.request_halt(code);
-            vs.into_iter().map(JqValue::from_owned).collect()
+            vs.into_iter()
+                .flat_map(|v| to_jq_values(v, at, sink))
+                .collect()
         }
     }
 }

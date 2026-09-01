@@ -3432,10 +3432,24 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         //
         // A link is exactly an argument that already contains a `Shared`,
         // which `any_subexpr` reports without walking the chain (its
-        // predicate fires on the first one, at depth 1). An enclosing
-        // definition's parameter threaded into an inner call looks the same
-        // and is treated the same -- conservative, and still correct: an
-        // un-lazified arm is a missed optimization, never a behaviour change.
+        // predicate fires on the first one, at depth 1). But that predicate
+        // cannot tell a computed chain link (`Shared(prev) - 1`: an operator
+        // applied *around* a `Shared`, always single-valued if `prev` is)
+        // from a bare pass-through (`inner` *is itself* a `Shared`: an
+        // ordinary parameter threaded unchanged into a nested call, one more
+        // wrapper deep than the level below). A pass-through can be anything
+        // the user wrote inside it -- multi-valued, infinite, side-effecting
+        // -- so treating it as a settled single value ran a branch first()/
+        // limit() would never have asked for, and re-ran it once per level
+        // the value was threaded through un-memoized.
+        //
+        // Peel a bare pass-through first, by re-entering this same arm on
+        // what it wraps -- `eval_each` dispatches straight back here for
+        // another `Shared`, or into whatever real expression or chain-link
+        // operator was underneath once the pass-through chain runs out.
+        Expr::Shared(inner) if matches!(&**inner, Expr::Shared(_)) => {
+            eval_each::<W, S>(inner, value, optional, sink)
+        }
         Expr::Shared(inner) => {
             if any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
                 drain_result(eval_single::<W, S>(inner, value, optional), sink)
@@ -40472,23 +40486,50 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // chain of arguments from every level below, restoring exactly the
         // O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        // Likewise opaque: a `DefCall`'s own definition was captured with all
-        // outer definitions already installed in it, and its arguments were
-        // installed when it was created. Descending would also re-install
-        // *this* definition inside a call that is deliberately deferred,
-        // which is the unrolling this fix exists to stop.
+        // The definition itself is opaque for the same reason `Shared` is --
+        // it was captured with every outer definition already installed, and
+        // re-installing it here would re-walk work this same pass already
+        // did when the node was created. `args`, though, are not: they are
+        // ordinary caller-scope code, and "installed when it was created"
+        // only holds with respect to *that* creating pass's own `def` --
+        // a sibling `def` being installed afterward (e.g. this call sits
+        // nested inside an already-installed call's arguments, as in
+        // `g(f(n-1))` while installing `f`) has never had its own
+        // occurrences installed inside `args` at all. Not descending left
+        // such a nested self-call as a bare `FuncCall` forever, which
+        // `eval_func_call` then rejected as "undefined function" (#1371).
+        //
+        // `frames` is refreshed to the larger of its own stale count and the
+        // ambient depth this pass is walking at, for the same reason: `n`
+        // was fixed once, when this call's owning `def` was originally
+        // installed at whatever (usually shallow) structural depth it sat
+        // at textually. A different `def` whose own recursion embeds this
+        // call deeper on the *real* call stack -- e.g. this `DefCall` sits
+        // in the base case of an unrelated, independently-recursing `def`
+        // -- walks over it again here with a much larger ambient `frames`.
+        // Leaving `n` untouched would let this call's own guard fire based
+        // on a native depth that no longer describes where it actually
+        // runs, permitting its own budget to stack on top of the ambient
+        // one already spent and blow past the real native stack -- exactly
+        // the composed-recursion overflow `MAX_EVAL_FRAMES` exists to
+        // prevent, just spread across two different `def`s instead of one.
         Expr::DefCall {
             def: d,
             args,
             frames: n,
-            bound,
+            bound: _,
         } => Expr::DefCall {
             def: Rc::clone(d),
-            args: args.clone(),
-            frames: *n,
-            // `args` come through unchanged, so whatever this node has
-            // already bound is still exactly what it would bind again.
-            bound: bound.clone(),
+            args: args
+                .iter()
+                .map(|a| install_def_calls(a, def, frames + 1))
+                .collect(),
+            frames: frames.max(*n),
+            // `args` (and possibly `frames`) may have changed, so a stale
+            // cached binding cannot be reused (though in practice `bound`
+            // is always still empty here -- install only ever runs on a
+            // node before it has been evaluated).
+            bound: BoundBody::default(),
         },
         Expr::Break(name) => Expr::Break(name.clone()),
     }
@@ -40909,7 +40950,12 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
 
 /// Expand function calls in a builtin expression.
 fn install_def_calls_in_builtin(builtin: &Builtin, def: &Rc<FuncDefData>, depth: u32) -> Builtin {
-    map_builtin_subexprs(builtin, &mut |e| install_def_calls(e, def, depth))
+    // Every other structural arm in `install_def_calls` charges `frames + 1`
+    // at each descent step (once at the call site into this function, again
+    // here for the step into each subexpression) -- matching that keeps a
+    // `DefCall` reached through a builtin argument (`map(recurse_def)`,
+    // `select(...)`) charged the same as an equivalent plain-expression path.
+    map_builtin_subexprs(builtin, &mut |e| install_def_calls(e, def, depth + 1))
 }
 
 /// Substitute function parameter in a builtin expression.

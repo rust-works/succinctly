@@ -1339,8 +1339,9 @@ fn try_multicall() -> Result<Option<i32>> {
 /// B/level at 64 MB, agreeing to within 0.6%, so the cost is linear in depth
 /// and this size converts directly into a depth.
 ///
-/// 256 MB carries `MAX_CALL_DEPTH`'s 10,000 levels (~44 MB for the shape
-/// measured) with room for bodies far heavier than that one, on a platform
+/// 256 MB carries `MAX_EVAL_FRAMES`'s ~13,000 levels for a `sum_to`-shaped
+/// body (~57 MB at this per-level cost) with room for bodies far heavier
+/// than that one, on a platform
 /// whose *default* main-thread stack is 8 MB and would cap the same
 /// recursion below 1,000. It is reserved address space, not committed
 /// memory: pages are faulted in only as the stack is actually used, so a
