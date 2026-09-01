@@ -28939,7 +28939,10 @@ fn test_isolated_subexpr_threads_per_output_path_1409() -> Result<()> {
         // `As` reaches its own path-context arm only when `expr` or `body`
         // needs path context on its own; `select(key >= 0)` is what routes
         // this shape there. The bare `. as $x | .[]` form is a separate,
-        // still-open routing gap, not this fix's subject.
+        // still-open routing gap (#2072): widening the guard to consult
+        // `rest` reaches it, but regresses `.x as $v | $v | file_index`,
+        // because `substitute_bound_var` re-materialises the bound value as
+        // a literal and erases the node identity real yq keeps.
         ".a | (. as $x | (.[] | select(key >= 0))) | key",
         ".a | (. as [$x] | (.[] | select(key >= 0))) | key",
     ] {
