@@ -37607,9 +37607,9 @@ fn builtin_builtins<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
         "trunc/0",
         // Type conversion (arity 0)
         "toboolean/0",
-        // Meta (arity 0-1)
+        // Meta (arity 0)
         "builtins/0",
-        "modulemeta/1",
+        "modulemeta/0",
         // Error handling (arity 0-1)
         "error/0",
         "error/1",
@@ -39190,8 +39190,11 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
 
 // Object functions
 
-/// Builtin: modulemeta - get module metadata for the input module name
-/// (stub for compatibility). Arity 0, matching real jq (#2035).
+/// Builtin: modulemeta - get module metadata for the input module name.
+/// Arity 0, matching real jq (#2035) -- but the stub below always returns
+/// `null` rather than erroring the way real jq's `modulemeta` always does;
+/// that runtime-behavior gap is pre-existing, recorded in
+/// docs/compliance/jq/limitations.md, and tracked in #2111.
 fn builtin_modulemeta<W: Clone + AsRef<[u64]>>(
     _value: StandardJson<'_, W>,
     _optional: bool,
@@ -64234,6 +64237,20 @@ mod tests {
         query!(b"null", r#"builtins | map(select(startswith("now"))) | length"#,
             QueryResult::Owned(OwnedValue::Int(n)) => {
                 assert!(n >= 1, "should have now builtin");
+            }
+        );
+        // #2035: modulemeta is arity 0 (matching real jq's modulemeta/0),
+        // not the arity-1 entry this list carried before the parser fix --
+        // pinned here since builtin_builtins's hand-maintained list has no
+        // other guard tying it to the parser's actual accepted grammar.
+        query!(b"null", r#"builtins | any(. == "modulemeta/0")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(b, "builtins should list modulemeta/0");
+            }
+        );
+        query!(b"null", r#"builtins | any(. == "modulemeta/1")"#,
+            QueryResult::Owned(OwnedValue::Bool(b)) => {
+                assert!(!b, "builtins should not list modulemeta/1");
             }
         );
     }
