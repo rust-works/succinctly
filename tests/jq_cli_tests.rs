@@ -9224,11 +9224,11 @@ fn test_result_to_owned_many_empty_arm_via_ltrimstr_argument() -> Result<()> {
 fn test_result_to_owned_manyowned_empty_arm_via_ltrimstr_argument() -> Result<()> {
     // #1043 fixed the bug this test originally probed: the `Owned`-target
     // sibling of the `Many`-empty case above, reached through a different
-    // producer -- `eval_index_expr`'s `Targets::Owned` branch used to end
+    // producer -- `eval_index_expr`'s `KeyTargets::Owned` branch used to end
     // its match on `out.len()` with only `1 => Owned(...)`, so the
     // `_ => ManyOwned(out)` wildcard also covered `out.len() == 0`. `(2+3)`
     // is computed (arithmetic is always `Owned`/`ManyOwned`, never
-    // document-borrowed, so its target is `Targets::Owned`), and both
+    // document-borrowed, so its target is `KeyTargets::Owned`), and both
     // `"x"`/`"y"` keys against the number `5` -- with the trailing `?`
     // making `optional` true -- each resolve via `index_one_owned`'s `_ if
     // optional => Ok(None)` refusal-suppression arm, leaving `out` empty.
@@ -9869,8 +9869,8 @@ fn test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn() ->
 #[test]
 fn test_eval_index_expr_owned_targets_pending_key_halt_reached_through_group_by_key_fn(
 ) -> Result<()> {
-    // `eval_index_expr`'s `Targets::Owned` branch, `pending_halt` arm --
-    // the *owned* twin of the already-covered `Targets::Borrowed` arm right
+    // `eval_index_expr`'s `KeyTargets::Owned` branch, `pending_halt` arm --
+    // the *owned* twin of the already-covered `KeyTargets::Borrowed` arm right
     // above it. The target (`[9,8,7],[6,5,4]`, two array literals) is
     // *computed* rather than borrowed from the input, taking the `Owned`
     // branch; the key (`0, halt`) yields one real key (`0`) before halting.
@@ -10958,10 +10958,10 @@ fn test_eval_index_expr_target_partial_halt_discards_prefix() -> Result<()> {
 
 #[test]
 fn test_eval_index_expr_owned_target_flushes_prior_keys_before_halting() -> Result<()> {
-    // `eval_index_expr`'s `Targets::Owned` arm (an owned/computed target --
+    // `eval_index_expr`'s `KeyTargets::Owned` arm (an owned/computed target --
     // here, an inline array literal, rather than a value borrowed straight
     // from the input document) carries its own copy of the `pending_halt`
-    // flush the `Targets::Borrowed` arm has: a key stream that yields some
+    // flush the `KeyTargets::Borrowed` arm has: a key stream that yields some
     // keys before halting (`(0,1,halt_error(9))`) must still index the
     // target with every key already produced before the halt propagates
     // (#791). Verified against jq 1.7.1:
@@ -30506,5 +30506,94 @@ fn test_range_demand_driven_consumer_past_cap_still_raises_2089() -> Result<()> 
     let (stdout, stderr, code) = run_jq_full(&["-nc", "nth(150000; range(1000000))"], None)?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(stderr.contains("range: maximum iterations exceeded"));
+    Ok(())
+}
+
+/// #2032: `E[K]` compiles as `K as $k | E | .[$k]`, so `E` is re-evaluated
+/// once per output of the key generator `K`, not once total -- a side
+/// effect in `E` must fire once per key. `succinctly` used to cache `E`'s
+/// result and loop the keys over it, firing the side effect once overall
+/// instead. Counted by occurrence, not by line (`stderr` writes no trailing
+/// newline). All rows verified against jq 1.7.1.
+///
+/// This is `eval_generic::eval_index_expr`'s own fix -- the function an
+/// ordinary CLI `.[$keys]` read actually reaches (confirmed empirically:
+/// `eval::eval_index_expr`'s identical sibling fix, verified separately via
+/// `jq -n '[(input)[("a","b")]]'`, is reached only through certain fallback
+/// shapes, not this file's own stdin-fed queries).
+#[test]
+fn test_index_expr_target_reevaluated_once_per_key_2032() -> Result<()> {
+    for (input, filter, want_stderr, why) in [
+        (
+            "[1,2]",
+            "[(.[] | stderr)[(\"a\",\"b\")]?]",
+            "1212",
+            "the issue's own repro: two keys, both fail to index (suppressed \
+             by `?`), target still re-runs once per key",
+        ),
+        (
+            r#"[{"a":1,"b":2},{"a":3,"b":4}]"#,
+            "[(.[] | stderr)[(\"a\",\"b\")]]",
+            r#"{"a":1,"b":2}{"a":3,"b":4}{"a":1,"b":2}{"a":3,"b":4}"#,
+            "an indexable multi-output target: values AND side effects both \
+             re-run per key",
+        ),
+        (
+            r#"{"a":{"x":1},"b":{"x":2}}"#,
+            "[(. | stderr)[(\"a\",\"b\")]]",
+            r#"{"a":{"x":1},"b":{"x":2}}{"a":{"x":1},"b":{"x":2}}"#,
+            "a single-output target re-runs once per key too, not just \
+             multi-output ones",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stderr, want_stderr, "{why}");
+    }
+    Ok(())
+}
+
+/// #2032 sibling: a key whose target evaluation is genuinely empty must not
+/// short-circuit the *remaining* keys -- each key's target is now
+/// independent, unlike the old once-for-all-keys evaluation, where an empty
+/// target for any one key made every key look empty. `inputs` (an impure,
+/// stateful generator) is what makes the target's result vary per
+/// re-evaluation here: for key `0` it drains the one remaining stdin line
+/// (`[10,20]`) and yields it, so `.[0]` produces `10`; re-evaluating
+/// `inputs` for key `1` finds the stream already exhausted and yields
+/// nothing at all (not an error -- a target that legitimately produces zero
+/// values for that key), so key `1` contributes nothing to the output.
+/// Verified against jq 1.7.1 (`jq -n 'inputs[(0,1)]'` also emits only `10`).
+#[test]
+fn test_index_expr_one_empty_key_does_not_short_circuit_others_2032() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "-n", "inputs[(0,1)]"], Some("[10,20]\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "10\n");
+    Ok(())
+}
+
+/// #2032 sibling: a second impure-target regression alongside the `stderr`
+/// cases above, this time via `input` (a stateful generator that consumes
+/// from the CLI's document stream) rather than a side-channel write --
+/// `.[$keys]`'s target must be *re-read* from the stream once per key, not
+/// read once and reused. `run_jq_full` execs the real CLI subprocess, which
+/// always dispatches through `eval_generic::eval_index_expr`
+/// (`eval::eval_index_expr` has no CLI-reachable path at all -- it's a
+/// separate, pure-in-process library entry point with no `input`/`inputs`
+/// builtin and no observable side-effect mechanism in its own unit tests,
+/// so its sibling fix is covered there only by reachability/regression
+/// tests on pure targets, e.g.
+/// `test_computed_index_ordinary_cross_product_unaffected_1634`).
+/// Verified against jq 1.7.1: both emit `[1,4]` (key `"a"` re-reads `input`
+/// to get `{"a":1,"b":2}` -> `.a` = 1; key `"b"` re-reads `input` again to
+/// get `{"a":3,"b":4}` -> `.b` = 4).
+#[test]
+fn test_index_expr_eval_rs_dispatch_target_reevaluated_per_key_2032() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-n", "[(input)[(\"a\",\"b\")]]"],
+        Some("{\"a\":1,\"b\":2}\n{\"a\":3,\"b\":4}\n"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,4]\n");
     Ok(())
 }

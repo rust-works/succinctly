@@ -34,16 +34,17 @@ use super::document::{
     DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call, classify_limit_n,
-    classify_nth_n, collapse_vec, collect_pattern_var_names, compare_values, enter_def_call_frame,
-    eval as full_eval, eval_each_owned, eval_foreach_with_values, eval_reduce_with_values,
-    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_component_value,
-    index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
-    literal_to_owned, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    owned_bound_to_i64, owned_to_string, slice_object_as_yq_children, slice_owned_value_read,
-    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, try_reserve_product,
-    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, QueryResult, YqSemantics,
+    apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
+    cannot_reserve_cross_product, classify_limit_n, classify_nth_n, collapse_vec,
+    collect_pattern_var_names, compare_values, enter_def_call_frame, eval as full_eval,
+    eval_each_owned, eval_foreach_with_values, eval_reduce_with_values, extract_pattern_bindings,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_pure_chain_link, literal_to_owned,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
+    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
+    substitute_vars, suppresses, tonumber_from_str, try_reserve_product, vec_with_capacity,
+    Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult,
+    YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -7673,131 +7674,201 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::None;
     }
 
-    let targets = match eval_single::<S, V>(target, value, false, cursor) {
-        GenericResult::Error(e) => return GenericResult::Error(e),
-        GenericResult::Break(label) => return GenericResult::Break(label),
-        // Same reasoning as the `keys` match above: kept out of the
-        // `owned @ (...)` group below, whose `collect_owned()` call would
-        // otherwise quietly turn a halted target stream into an empty `Vec`.
-        GenericResult::Halt(code) => return GenericResult::Halt(code),
-        // A target with zero outputs indexes to zero results for every key
-        // — not an error, break, or halt of its own — so it has nothing
-        // that "happens first" to preempt a pending halt from the key side
-        // (unlike the other arms here, each itself a terminating event
-        // during target evaluation for the first already-known key, and so
-        // legitimately preempting a key halt not yet reached). The key
-        // generator's own halt is still the only terminating event here and
-        // must still fire (#791) — mirrors `eval::eval_index_expr`.
-        GenericResult::None => {
-            return match pending_halt {
-                Some(code) => GenericResult::Halt(code),
-                None => GenericResult::None,
-            };
-        }
-        // Computed indexing's key/target forking isn't part of #400/#494's
-        // verified semantics — conservatively matching the Error/Break arms
-        // above rather than inventing new partial-target behavior, same as
-        // `eval::eval_index_expr`.
-        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
-        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
-        GenericResult::Partial(_, Control::Halt(code)) => return GenericResult::Halt(code),
-        GenericResult::One(v) => vec![v],
-        GenericResult::Many(vs) => vs,
-        GenericResult::OneCursor(c) => vec![c.value()],
-        GenericResult::ManyCursor(cs) => cs.iter().map(DocumentCursor::value).collect(),
-        // An owned target (a computed, non-navigational left side) has no
-        // borrowed representation here; round-trip it through the shared
-        // owned-value path by re-entering with the materialized document.
-        // `LazySeq` shares this arm too: `collect_owned()` materializes it
-        // (via `materialize_lazy()`) the same as the other lazy variants.
-        // Known, narrow, pre-existing gap, not a new regression:
-        // `collect_owned()` already silently swallows any error into an
-        // empty `Vec` for every variant that can error (`Partial`, and now
-        // a failing `LazySeq`) -- `(keys_unsorted|map(error("x")))[$k]`
-        // swallows the error into "no results" rather than propagating it,
-        // same as it already did for other error-producing shapes here.
-        owned @ (GenericResult::Owned(_)
-        | GenericResult::ManyOwned(_)
-        | GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_)) => {
-            let targets = owned_or_err!(owned.collect_owned());
-            // #1634: `keys.len() * targets.len()` is a product of two
-            // independent, generator-controlled lengths -- an unguarded
-            // `Vec::with_capacity` here can panic/abort the process on
-            // overflow or a genuine allocation failure. This is the actual
-            // dispatch path for an ordinary `.[$keys]` CLI read (see the
-            // comment on `Expr::IndexExpr`'s own match arm above), so this
-            // site -- not `eval::eval_index_expr`'s sibling -- is what a
-            // real `succinctly jq`/`succinctly yq` invocation hits.
-            let mut out = owned_or_err!(try_reserve_product(&[keys.len(), targets.len()]));
-            for k in &keys {
-                for t in &targets {
-                    match index_owned_by_key(t, k, optional) {
-                        Ok(Some(v)) => out.push(v),
-                        Ok(None) => {}
-                        // A later key's index error outranks an earlier key's
-                        // still-pending halt (verified against jq 1.7.1/1.8.2:
-                        // `{"a":1} | .[("a", 5, halt)]` prints `1`, then the
-                        // "Cannot index object with number" error, and never
-                        // reaches `halt`) — the already-indexed prefix must
-                        // still survive as `Partial`, not vanish with it.
-                        Err(e) => return partial_generic(out, Control::Error(e)),
-                    }
-                }
-            }
-            return match pending_halt {
-                Some(code) => partial_generic(out, Control::Halt(code)),
-                // #1048: a zero-result collapse here (every key/target pair
-                // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
-                None => owned_vec_to_generic_result(out),
-            };
-        }
-    };
-
-    // Key outer, target inner.
+    // Key outer, target inner -- and, since #2032, `target` (`E`) is
+    // re-evaluated fresh for *every* key rather than once for all of them,
+    // matching jq's own `K as $k | E | .[$k]` compilation: a side effect
+    // inside `E` fires once per key, not once total, and each key's own
+    // output count is independent. See `eval::eval_index_expr`'s identical
+    // fix for the fuller rationale and the `jq -n '[(input)[("a","b")]]'`
+    // live-verified repro; this is the sibling that actually handles an
+    // ordinary CLI `.[$keys]` read (see the old comment this replaced, on
+    // the now-removed `owned @ (...)` arm, for why this file -- not
+    // `eval::eval_index_expr` -- is what a real invocation hits).
     let mut cursors: Vec<V::Cursor> = Vec::new();
     let mut owned: Vec<OwnedValue> = Vec::new();
     let mut any_owned = false;
+
+    // Folds the running `cursors`/`owned` accumulator into a `Partial`'s
+    // prefix -- the shared exit every escape arm below funnels through, so
+    // "what already indexed successfully across earlier keys" can't be
+    // dropped by one arm and kept by another. Unlike the promotion step
+    // below (`ensure_owned!`), a *secondary* failure converting `cursors`
+    // here can't be allowed to silently discard the original `$control`:
+    // `resolve_terminal_prefix` (`src/jq/eval.rs`) already establishes the
+    // rule this mirrors -- a `Halt` must survive a promotion failure (jq
+    // never turns a halt into a loud decode error just because rendering
+    // its own already-abandoned prefix hit an unrelated problem; confirmed
+    // live: `jq -n '(input | if . == "STOP" then halt else . end)
+    // [("x","y")]'` on a bad-then-STOP input stream exits 0 silently in
+    // real jq), while `Error`/`Break` downgrade to the promotion's own
+    // error, same as `resolve_terminal_prefix`'s matching arm.
+    macro_rules! escape_generic {
+        ($control:expr) => {{
+            let control = $control;
+            let out = if any_owned {
+                owned
+            } else {
+                match to_owned_all_cursors(&cursors) {
+                    Ok(vs) => vs,
+                    Err(e) => {
+                        let control = match control {
+                            Control::Halt(code) => Control::Halt(code),
+                            Control::Error(_) | Control::Break(_) => Control::Error(e),
+                        };
+                        return partial_generic(Vec::new(), control);
+                    }
+                }
+            };
+            return partial_generic(out, control);
+        }};
+    }
+
+    // Promotes `cursors` into `owned` on the first Owned-kind result seen,
+    // shared by both `KeyTargets` arms below (#2032 review: this exact
+    // 4-line sequence used to be written out twice). `owned_or_err!`'s bare
+    // return on a promotion failure here is pre-existing, unchanged by
+    // #2032 -- unlike `escape_generic!` above, this path was already
+    // reachable before this fix (any ordinary indexing result could be the
+    // first `Owned` one), so its error-only-ever handling isn't new
+    // territory this fix needs to harden.
+    macro_rules! ensure_owned {
+        () => {
+            if !any_owned {
+                any_owned = true;
+                owned = owned_or_err!(to_owned_all_cursors(&cursors));
+                cursors.clear();
+            }
+        };
+    }
+
     for k in &keys {
-        for t in &targets {
-            match index_one_generic::<V>(t.clone(), k, optional) {
-                GenericResult::OneCursor(c) => {
-                    if any_owned {
-                        // Not `owned_or_err!`: that bare-returns and would
-                        // discard every key/target pair already resolved
-                        // into `owned` ahead of this one. The already-indexed
-                        // prefix must survive as `Partial`, same as the
-                        // `GenericResult::Error` arm below.
-                        match to_owned_cursor(&c) {
-                            Ok(v) => owned.push(v),
-                            Err(e) => return partial_generic(owned, Control::Error(e)),
+        // Normalized the same way the old once-for-all-keys `targets` match
+        // did, minus the arms that used to return early: those now escape
+        // through `escape_generic!` so the running accumulator survives.
+        enum KeyTargets<V> {
+            Native(Vec<V>),
+            Owned(Vec<OwnedValue>),
+        }
+        let key_targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
+            GenericResult::Error(e) => escape_generic!(Control::Error(e)),
+            GenericResult::Break(label) => escape_generic!(Control::Break(label)),
+            GenericResult::Halt(code) => escape_generic!(Control::Halt(code)),
+            // Zero outputs for *this* key indexes to zero results for it —
+            // not an error, break, or halt — so this key simply contributes
+            // nothing and the loop moves on to the next one (#2032: unlike
+            // the old once-for-all-keys evaluation, this no longer implies
+            // every other key is empty too).
+            GenericResult::None => continue,
+            // Same conservative treatment the old once-for-all-keys
+            // evaluation already gave a target's own mid-stream escape:
+            // discard this key's own target prefix (never part of the
+            // indexed output either way), but now fold the *running*
+            // prefix from every earlier key in, instead of assuming it was
+            // empty.
+            GenericResult::Partial(_, control) => escape_generic!(control),
+            GenericResult::One(v) => KeyTargets::Native(vec![v]),
+            GenericResult::Many(vs) => KeyTargets::Native(vs),
+            GenericResult::OneCursor(c) => KeyTargets::Native(vec![c.value()]),
+            GenericResult::ManyCursor(cs) => {
+                KeyTargets::Native(cs.iter().map(DocumentCursor::value).collect())
+            }
+            // An owned target (a computed, non-navigational left side) has
+            // no borrowed representation here; round-trip it through the
+            // shared owned-value path. `LazySeq` shares this arm too:
+            // `collect_owned()` materializes it (via `materialize_lazy()`)
+            // the same as the other lazy variants. Known, narrow,
+            // pre-existing gap, not a new regression (unchanged by #2032):
+            // `collect_owned()` already silently swallows any error into an
+            // empty `Vec` for every variant that can error (`Partial`, and
+            // a failing `LazySeq`).
+            owned_kind @ (GenericResult::Owned(_)
+            | GenericResult::ManyOwned(_)
+            | GenericResult::LazyKeys { .. }
+            | GenericResult::LazyIndexRange(_)
+            | GenericResult::LazySeq(_)) => match owned_kind.collect_owned() {
+                Ok(vs) => KeyTargets::Owned(vs),
+                Err(e) => escape_generic!(Control::Error(e)),
+            },
+        };
+        match key_targets {
+            KeyTargets::Native(ts) => {
+                // Reserved once per key, ahead of that key's own indexing
+                // loop, mirroring `eval::eval_index_expr`'s identical fix
+                // (#2032 review: the old upfront `try_reserve_product(&[
+                // keys.len(), targets.len()])`, visible as deleted in this
+                // diff, is no longer computable now that a key's own
+                // target length varies per key -- but this file is the
+                // one an ordinary CLI `.[$keys]` read actually reaches, so
+                // dropping the guard entirely here (as an earlier revision
+                // of this fix did) reopens the #1017/#1612/#1634/#1669
+                // abort-on-allocation-failure class of bug for real
+                // traffic, not just a narrower fallback path). Reserved on
+                // whichever accumulator is *currently* live, matching
+                // where the loop below will actually push.
+                let reserved = if any_owned {
+                    owned.try_reserve(ts.len())
+                } else {
+                    cursors.try_reserve(ts.len())
+                };
+                if reserved.is_err() {
+                    escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
+                }
+                for t in &ts {
+                    match index_one_generic::<V>(t.clone(), k, optional) {
+                        GenericResult::OneCursor(c) => {
+                            if any_owned {
+                                // Not `owned_or_err!`: that bare-returns and
+                                // would discard every key/target pair
+                                // already resolved into `owned` ahead of
+                                // this one. The already-indexed prefix must
+                                // survive as `Partial`, same as the
+                                // `GenericResult::Error` arm below.
+                                match to_owned_cursor(&c) {
+                                    Ok(v) => owned.push(v),
+                                    Err(e) => escape_generic!(Control::Error(e)),
+                                }
+                            } else {
+                                cursors.push(c);
+                            }
                         }
-                    } else {
-                        cursors.push(c);
+                        GenericResult::Owned(v) => {
+                            ensure_owned!();
+                            owned.push(v);
+                        }
+                        GenericResult::None => {}
+                        // A later key's index error outranks an earlier
+                        // key's still-pending halt (verified against jq
+                        // 1.7.1/1.8.2: `{"a":1} | .[("a", 5, halt)]` prints
+                        // `1`, then the "Cannot index object with number"
+                        // error, and never reaches `halt`) — the
+                        // already-indexed prefix must still survive as
+                        // `Partial`, not vanish with it.
+                        GenericResult::Error(e) => escape_generic!(Control::Error(e)),
+                        _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
                     }
                 }
-                GenericResult::Owned(v) => {
-                    if !any_owned {
-                        any_owned = true;
-                        owned = owned_or_err!(to_owned_all_cursors(&cursors));
-                        cursors.clear();
+            }
+            KeyTargets::Owned(ts) => {
+                // Ensures `owned` exists *before* reserving onto it, so the
+                // reservation lands on the vec that will actually receive
+                // this batch -- `ensure_owned!`'s own promotion (via
+                // `to_owned_all_cursors`) has no knowledge of `ts.len()`'s
+                // pending pushes, only of `cursors`'s existing length.
+                ensure_owned!();
+                if owned.try_reserve(ts.len()).is_err() {
+                    escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
+                }
+                for t in &ts {
+                    match index_owned_by_key(t, k, optional) {
+                        Ok(Some(v)) => owned.push(v),
+                        Ok(None) => {}
+                        // Same reasoning as the `Native` arm above: a later
+                        // key's index error outranks an earlier key's
+                        // pending halt, and the already-indexed prefix
+                        // survives it.
+                        Err(e) => escape_generic!(Control::Error(e)),
                     }
-                    owned.push(v);
                 }
-                GenericResult::None => {}
-                // Same reasoning as the `owned @ (...)` arm above: a later
-                // key's index error outranks an earlier key's pending halt,
-                // and the already-indexed prefix survives it as `Partial`.
-                GenericResult::Error(e) => {
-                    let out = if any_owned {
-                        owned
-                    } else {
-                        owned_or_err!(to_owned_all_cursors(&cursors))
-                    };
-                    return partial_generic(out, Control::Error(e));
-                }
-                _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
             }
         }
     }
@@ -10265,12 +10336,16 @@ mod tests {
     /// ordinary `.[$keys]` read -- `Expr::IndexExpr` is handled natively
     /// here, in this module's own `eval_index_expr` (see the comment on
     /// its match arm above), so that other test never touched this
-    /// module's independently-guarded `try_reserve_product` call site at
-    /// all. This test exercises this module's real dispatch path
-    /// directly, targeting the specific arm the guard was added to (an
-    /// *owned* target -- `({"x":1,"y":2})`, a constructed value rather than
-    /// a document navigation, takes `eval_index_expr`'s `owned @ (...)`
-    /// arm rather than the unguarded cursor-based loop below it).
+    /// module's own guard at all. This test exercises this module's real
+    /// dispatch path directly, targeting the specific arm the guard was
+    /// added to (an *owned* target -- `({"x":1,"y":2})`, a constructed
+    /// value rather than a document navigation, takes `eval_index_expr`'s
+    /// `KeyTargets::Owned` arm). Since #2032, both arms carry their own
+    /// per-key `try_reserve` guard (target length can vary per key now, so
+    /// the single upfront `try_reserve_product` this comment used to name
+    /// no longer applies to either arm) -- see the current per-key
+    /// reservation logic on each arm for the mechanism this test actually
+    /// exercises.
     #[test]
     fn test_generic_computed_index_ordinary_cross_product_unaffected_1634() {
         let json = br"null";
