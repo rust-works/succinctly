@@ -20153,16 +20153,69 @@ fn test_1690_del_multi_branch_computed_key_over_scalar_root_2049() -> Result<()>
     }
 
     // Mixed key kinds (string + number): the field-group half of the trie
-    // walk still no-ops per the fix above, but the numeric key also
-    // populates the trie's *index* group, which then reaches
-    // `delete_trie_array`'s own pre-existing, deliberate non-array gate —
-    // a different, out-of-scope-for-#2049 typed-error path (real yq no-ops
-    // here too, but matching that is a broader change than removing this
-    // issue's `unreachable!()`). The fix's actual contract for this shape is
-    // narrower: no longer a process abort, exit 101 -> a catchable error.
+    // walk no-ops per the fix above, and the numeric key also populates the
+    // trie's *index* group, which used to reach `delete_trie_array`'s own
+    // non-array gate and raise a catchable error instead of the crash this
+    // test originally pinned -- #2106 closed that remaining gap too
+    // (`delete_trie_array` now threads `yq_mode` and no-ops there the same
+    // way, matching real yq's own no-op for this exact input, confirmed
+    // live).
     let (out, code) = run_yq_stdin(r#"del(.[("k0",0)])"#, "2.5", &["-o=json", "-I=0"])?;
-    assert_ne!(code, 101, "must not crash the process: {out}");
-    assert_eq!(code, 1, "expected a catchable error, got: {out}");
+    assert_eq!(code, 0, "must not crash or error: {out}");
+    assert_eq!(out.trim(), "2.5");
+
+    Ok(())
+}
+
+/// #2106: real yq no-ops `del()`'s field/index key against a genuine scalar
+/// root (number/string/bool) -- static, single-branch-computed, and
+/// multi-branch-computed alike -- while an *array* root still errors, same
+/// as a plain read. Live-verified against yq v4.53.3 for every shape below;
+/// `#2049` fixed the crash for the multi-branch-computed-field-key case but
+/// left the far more common static/single-computed/index shapes (and the
+/// multi-branch case's own *index* half) still raising a catchable error
+/// instead of no-oping.
+#[test]
+fn test_del_field_and_index_key_noop_on_scalar_root_2106() -> Result<()> {
+    for scalar in ["2.5", "0", r#""a""#, "true", "false"] {
+        // Static field key.
+        let (out, code) = run_yq_stdin("del(.k0)", scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "static field key, scalar root {scalar}: {out}");
+        assert_eq!(out.trim(), scalar, "static field key, scalar root {scalar}");
+
+        // Single computed field key.
+        let (out, code) = run_yq_stdin(r#"del(.["k0"])"#, scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "computed field key, scalar root {scalar}: {out}");
+        assert_eq!(
+            out.trim(),
+            scalar,
+            "computed field key, scalar root {scalar}"
+        );
+
+        // Index key.
+        let (out, code) = run_yq_stdin("del(.[0])", scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "index key, scalar root {scalar}: {out}");
+        assert_eq!(out.trim(), scalar, "index key, scalar root {scalar}");
+
+        // Multi-branch computed index key.
+        let (out, code) = run_yq_stdin("del(.[(0,1)])", scalar, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            code, 0,
+            "multi-branch index key, scalar root {scalar}: {out}"
+        );
+        assert_eq!(
+            out.trim(),
+            scalar,
+            "multi-branch index key, scalar root {scalar}"
+        );
+    }
+
+    // An array root still errors for a field key (matching real yq's
+    // "cannot index array with 'k0'", confirmed live) -- this predicate
+    // (`is_yq_field_index_noop_scalar`) deliberately excludes arrays, unlike
+    // every genuine scalar above.
+    let (_out, code) = run_yq_stdin("del(.k0)", "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "array root must still error for a field key");
 
     Ok(())
 }
