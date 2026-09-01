@@ -34,8 +34,6 @@ use alloc::rc::Rc;
 #[cfg(test)]
 use std::rc::Rc;
 
-use core::cell::Cell;
-
 use indexmap::IndexMap;
 
 use super::document::{
@@ -300,8 +298,8 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Literal, MergeFlags, NumberKey,
-    ObjectEntry, ObjectKey, Pattern, PatternEntry, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, MergeFlags,
+    NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, StringPart,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -867,6 +865,20 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // as a known gap rather than paying for a full
         // `expand_func_calls` just to answer this routing question.
         Expr::FuncDef { body, then, .. } => needs_path_context(body) || needs_path_context(then),
+        // #1371: same reasoning as `FuncDef` above, one step further along.
+        // By the time a call has been bound, the definition is reachable from
+        // the node itself, so the "does `then` ever call `name`" guess that
+        // arm has to make is not needed here -- the body genuinely runs, and
+        // its arguments genuinely run in the caller's own position. This also
+        // closes that arm's documented gap for bound calls: a path-context
+        // builtin passed *as an argument* (`def f(x): x; .a | f(key)`) is
+        // visible here, because `args` are right there.
+        Expr::DefCall { def, args, .. } => {
+            needs_path_context(&def.body) || args.iter().any(needs_path_context)
+        }
+        // Transparent: a `Shared` is its inner expression as far as
+        // evaluation -- and therefore routing -- is concerned.
+        Expr::Shared(inner) => needs_path_context(inner),
         // `EXPR as $v | body` (#1663): neither `expr` nor `body` navigate
         // away from the caller's own position -- `eval_as` evaluates both
         // against the same `value` -- so a `key`/`parent`/`file_index`
@@ -1284,6 +1296,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             then,
         } => eval_func_def::<W, S>(name, params, body, then, value, optional),
         Expr::FuncCall { name, args } => eval_func_call::<W>(name, args, value, optional),
+
+        // #1371: a call already bound to its definition. Unlike `FuncCall`
+        // above (which only ever errors, since an unbound call is a compile
+        // error `resolve.rs` rejects earlier), this is where a user-defined
+        // function actually runs.
+        Expr::DefCall { def, args, frames } => {
+            eval_def_call::<W, S>(def, args, *frames, value, optional)
+        }
+
+        // #1371: an argument captured at call time. Transparent to
+        // evaluation -- it is the substitution passes, not this one, that
+        // must treat it as opaque.
+        Expr::Shared(inner) => eval_single::<W, S>(inner, value, optional),
         Expr::NamespacedCall {
             namespace,
             name,
@@ -3367,9 +3392,23 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             body,
             then,
         } => {
-            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
-            eval_each::<W, S>(&expanded_then, value, optional, sink)
+            let bound_then = bind_def(name, params, body, then);
+            eval_each::<W, S>(&bound_then, value, optional, sink)
         }
+
+        // #1371: a bound call needs its own arm here for the same reason the
+        // `FuncDef` arm above exists -- without one it falls to the generic
+        // `drain_result` fallback, which materializes the whole body before a
+        // wrapping consumer can say it has seen enough. That is observable,
+        // not just slower: `isempty(def f: (1, ("B"|stderr)); f)` printed `B`
+        // where jq prints nothing, because the second branch ran after the
+        // answer was already known.
+        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
+            Ok(bound) => eval_each::<W, S>(&bound, value, optional, sink),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        // Transparent, so the wrapped argument's own laziness survives.
+        Expr::Shared(inner) => eval_each::<W, S>(inner, value, optional, sink),
 
         // #1462 (Stage 5): demand-forwarding through a nested consumer.
         // `each_take_n` (Stage 2) already stops asking `expr` for more once
@@ -20471,6 +20510,26 @@ fn resolve_node<'a, S: EvalSemantics>(
         Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable, snapshot),
         Expr::Paren(inner) => resolve_node::<S>(inner, value, trackable, snapshot),
 
+        // #1371: `path(f)` has to see *through* a call to whatever its body
+        // navigates, exactly as it did when the body was substituted in
+        // before evaluation began. Binding the call here and resolving the
+        // result keeps that: `def f: .[1.5:3.5]; path(f)` reports the slice,
+        // not "invalid path expression" for an opaque call node.
+        //
+        // The depth guard's error is surfaced as a path-resolution failure
+        // with no branches, the same shape every other erroring arm here
+        // uses -- a runaway recursion inside `path()` must not be able to
+        // exhaust the stack just because it is being resolved rather than
+        // evaluated.
+        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
+            Ok(bound) => resolve_node::<S>(&bound, value, trackable, snapshot),
+            Err(e) => Err((Vec::new(), e.into())),
+        },
+        // Transparent, like `Paren`: the wrapped argument is ordinary code
+        // whose own navigation is exactly as trackable here as it would be
+        // written out in place.
+        Expr::Shared(inner) => resolve_node::<S>(inner, value, trackable, snapshot),
+
         Expr::Comma(exprs) => {
             let mut out = Vec::new();
             for e in exprs {
@@ -25289,6 +25348,28 @@ fn substitute_var_impl(
     mark_trackable: bool,
 ) -> Expr {
     match expr {
+        // #1371: opaque, in both directions. A `Shared` holds an argument the
+        // caller had already fully substituted before the call ran, so there
+        // is nothing here to substitute -- and reaching inside it is exactly
+        // the capture #2077 fixed: a binder in the callee (`3 as $x`) must
+        // not rewrite a `$x` the *caller* wrote in an argument. Descending
+        // would also re-walk every argument from every level below on each
+        // binding, which is the O(depth^2) traversal this design removes.
+        Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
+        // A `DefCall`'s arguments are ordinary caller-scope code and must
+        // stay reachable: the call site can sit inside an `as` that has not
+        // been evaluated yet, so this is the pass that binds `$x` in
+        // `1 as $x | f($x)`. The definition itself is not descended into --
+        // it was captured with every variable in scope at its own definition
+        // site already substituted, and its body is a fresh scope per call.
+        Expr::DefCall { def, args, frames } => Expr::DefCall {
+            def: Rc::clone(def),
+            args: args
+                .iter()
+                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
+                .collect(),
+            frames: *frames,
+        },
         Expr::Var(name) if name == var_name => {
             if mark_trackable {
                 Expr::TrackedVar(Rc::new(replacement.clone()))
@@ -30613,6 +30694,43 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // result *is* this arm's result, with nothing wrapping it) -- it's
         // a simple delegation, the same shape as the `Paren` arm above,
         // which also threads `optional` straight through unchanged.
+        // #1371: a bound call, in the evaluator that keeps `key`/`parent`/
+        // `file_index` and `path()` working. The generic `_` fallback below
+        // would evaluate it correctly but *without* path context, so
+        // `path(f)` over a `def` whose body navigates would report the call
+        // as an untrackable leaf rather than seeing through to the
+        // navigation. Binding here and continuing in this same evaluator is
+        // what the `FuncDef` arm just below already does one step earlier.
+        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
+            Err(e) => QueryResult::Error(e),
+            Ok(bound) => {
+                let mut stages = vec![bound];
+                stages.extend(rest.iter().cloned());
+                eval_pipe_with_path_context_internal::<W, S>(
+                    &stages,
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                )
+            }
+        },
+        // Transparent, for the same reason it is transparent to evaluation:
+        // the argument this wraps is ordinary code, and it must keep the
+        // caller's own path context when it runs.
+        Expr::Shared(inner) => {
+            let mut stages = vec![(**inner).clone()];
+            stages.extend(rest.iter().cloned());
+            eval_pipe_with_path_context_internal::<W, S>(
+                &stages,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
+        }
         Expr::FuncDef {
             name,
             params,
@@ -30622,8 +30740,8 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
-            let mut then_stages = vec![expanded_then];
+            let bound_then = bind_def(name, params, body, then);
+            let mut then_stages = vec![bound_then];
             if paired {
                 then_stages.push(path_probe_stage());
             }
@@ -39801,10 +39919,22 @@ fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, 
         .collect()
 }
 
-/// Evaluate function definition: `def name(params): body; then`.
+/// Evaluate `def name(params): body; then` (#1371).
 ///
-/// In jq, function definitions are scoped - the function is available in `then`.
-/// We implement this by substituting function calls with the body (with args substituted).
+/// Binds every call to this definition inside `then` — replacing each
+/// `Expr::FuncCall` with an `Expr::DefCall` that carries the definition —
+/// and then evaluates `then`. It does **not** substitute the body anywhere;
+/// that happens per call, in [`eval_def_call`], when evaluation reaches the
+/// call site.
+///
+/// The previous model substituted here instead, before any evaluation, which
+/// could not terminate for a self-recursive `def`: the substituted body
+/// always contains another syntactic call to the same name, and expansion
+/// cannot observe that a runtime condition (`n == 0`) will eventually hold.
+/// Three guards (`MAX_FUNC_EXPANSION_DEPTH`, `..._CHAIN_DEPTH`,
+/// `..._WEIGHTED_COST`) existed only to bound that non-termination, and are
+/// gone: recursion now stops where jq stops it, at the base case the program
+/// itself evaluates.
 fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
     params: &[String],
@@ -39813,247 +39943,109 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Substitute all calls to this function in `then` with the body
-    let expanded_then = expand_func_calls(then, name, params, body, None, 0);
-    eval_single::<W, S>(&expanded_then, value, optional)
+    let bound_then = bind_def(name, params, body, then);
+    eval_single::<W, S>(&bound_then, value, optional)
 }
 
-/// Caps how many times [`expand_func_calls`] will re-enter its own
-/// `FuncCall` self-reference arm while inlining one `def` (#1016).
+/// Install `def name(params): body` over `then`, the shared first half of
+/// every `Expr::FuncDef` evaluation arm (#1371).
 ///
-/// `succinctly jq` evaluates `def name(params): body; then` by statically
-/// substituting each call to `name` with `body` (with `params` replaced by
-/// the call's arguments) -- entirely before any evaluation happens. For a
-/// self-recursive `def` (e.g. `def deep(n): if n == 0 then . else
-/// [deep(n-1)] end;`), the substituted `body` always contains another
-/// syntactic call to `name`, since expansion can't observe that a runtime
-/// condition like `n == 0` will eventually hold -- only real evaluation
-/// (which hasn't happened yet) could. Left unguarded, this unrolls forever
-/// and overflows the native stack; confirmed live (`def deep(n): if n == 0
-/// then . else [deep(n-1)] end; deep(1)` crashes with SIGABRT even at the
-/// shallowest possible depth, since expansion never terminates on its own).
-///
-/// **This does not, and cannot, match real jq's usable recursion depth.**
-/// jq evaluates function calls at runtime rather than expanding them
-/// statically, so a self-recursive `def` there costs one interpreter frame
-/// per call and works up to jq's own memory limits (confirmed live against
-/// jq 1.7.1: this issue's own `deep(n)` repro returns cleanly through at
-/// least `n = 10_000`). `expand_func_calls`'s substitution has a much
-/// steeper native-stack cost per level -- confirmed empirically (debug
-/// build, default thread stack, this crate's usual methodology for `MAX_*`
-/// ceilings) across several `def` shapes (1, 2, and 4 parameters; plain
-/// arithmetic and string/array/object bodies): even the *cheapest possible*
-/// case (a zero-argument `def deep: [deep]; deep`) crashes at only ~383
-/// levels, and every parameterized shape tested crashed between ~189 and
-/// ~192 -- each unrolling re-substitutes the *entire* argument expression
-/// from the level before into a fresh clone of `body`, so the tree being
-/// walked keeps growing with depth, unlike jq's own runtime call. Genuinely
-/// matching jq's depth needs a different evaluation strategy for self-
-/// recursive `def`s (real runtime calls, not static substitution) -- a
-/// real architectural change, filed separately as #1371, not this guard.
-///
-/// Picked with a wide safety margin below every crash observed above (the
-/// lowest was ~189) precisely because that margin has to absorb `def`
-/// bodies more expensive than anything tested here, not because legitimate
-/// use is expected to need this many levels. A `def` recursing deeper than
-/// this now gets a clean, catchable error -- worse than jq's own result
-/// (which would still succeed) but strictly better than a SIGABRT that
-/// takes the whole process down; see #1016 and #1371 for that gap.
-///
-/// **This counts total substitutions within one occurrence's own
-/// resolution, not nesting depth along one chain -- and not globally
-/// across the whole expansion either.** Two earlier versions of this guard
-/// each had a real bug code review caught:
-///
-/// - A plain per-call-chain `depth: usize`, incremented only along the
-///   single path from one self-call to the next, is defeated entirely by a
-///   `def` body with more than one syntactic self-call (e.g. `def f: [f,
-///   f]; f`, or an everyday naive `def fib(n): if n < 2 then n else
-///   fib(n-1) + fib(n-2) end;`): every structural arm visiting more than
-///   one child (`Comma`, arithmetic's `left`/`right`, an `if`'s
-///   `then`/`else`, etc.) passes the *same* depth to each child, so `k`
-///   self-calls per body level compound to `O(k^depth)` total
-///   substitutions even though no single chain exceeds the cap. Confirmed
-///   live: `def f: [f, f]; f` consumed tens of GB and never terminated.
-/// - Fixing that by sharing *one* counter across the *entire* expansion
-///   (one `Cell` per call to [`expand_func_calls`] from
-///   [`eval_func_def`]) stops the blowup above, but starves every later,
-///   syntactically-independent call to the same function once an earlier
-///   one has consumed the budget -- confirmed live, `[fact(3), fact(4),
-///   fact(5)]` failed even though each call alone succeeds trivially, and
-///   real jq returns `[6,24,120]`.
-///
-/// The counter this guard actually uses is scoped per *occurrence*: a
-/// `FuncCall` reached by ordinary structural descent through code that is
-/// *not* itself generated by resolving some earlier occurrence (an
-/// independent, originally-distinct call the user wrote) gets its own
-/// fresh counter (`budget: Option<&Cell<(usize, Option<usize>)>>` is `None` on the way in).
-/// A `FuncCall` found *while already resolving* an earlier occurrence's own
-/// substituted body or arguments -- a genuine self-reference within that
-/// resolution, e.g. the two `f`s inside `def f: [f, f]; f`'s own body --
-/// keeps sharing that occurrence's counter (`budget` is `Some(cell)`).
-/// This bounds total work for branching self-recursion (the first bug
-/// above) without cross-contaminating unrelated sibling calls (the second).
-///
-/// One consequence of counting total work instead of path depth: for a
-/// `def` whose body has more than one self-call, expansion exhausts the
-/// budget regardless of how shallow the real runtime recursion needed for
-/// a given input actually is -- `fib(0)` hits this ceiling exactly the same
-/// as `fib(1000)`, since expansion never evaluates `n < 2` and so can't
-/// stop unrolling the `else` branch just because a real run would take the
-/// `then` branch instead. Only a `def` with exactly one self-call per body
-/// (the shape #1016's own repro uses) gets the "shallow succeeds, only
-/// truly deep recursion errors" behavior the rest of this doc comment
-/// describes; a branching `def` always errors, at any depth. Making
-/// branching self-recursive `def`s work at all is exactly the runtime-call
-/// architecture #1371 tracks -- this guard's job is only to make the
-/// failure clean and bounded, for every shape, not to make any shape work.
-///
-/// **Also known to not close**: chaining several small recursive `def`s,
-/// each calling the previous one as its base case (e.g. `def r0(n): ...;
-/// def r1(n): if n==0 then r0(n) else [r1(n-1)] end; def r2(n): if n==0
-/// then r1(n) else [r2(n-1)] end; r2(45)`), still causes unbounded memory
-/// blowup (multiple GB, confirmed live) -- `r1`'s own expansion clones a
-/// `body` that already embeds `r0`'s full ~50-node expansion, so `r1`'s own
-/// budget-bounded substitutions multiply that size rather than bounding it,
-/// and each further chained `def` repeats the multiplication. Neither
-/// `budget` (bounds hit *count*) nor `chain_depth` (bounds live *stack*
-/// depth, which stays modest for this breadth-wise, not depth-wise, blowup)
-/// catches it. Pre-existing on `main` (crashes there too, via SIGABRT
-/// instead), not introduced by this guard; tracked separately as #1381.
-const MAX_FUNC_EXPANSION_DEPTH: usize = 50;
+/// Four evaluators have their own `FuncDef` arm — the plain one, the
+/// demand-driven `eval_each`, the path-context one, and `eval_generic`'s —
+/// and all four need exactly this before continuing into their own
+/// evaluation of `then`.
+pub(crate) fn bind_def(name: &str, params: &[String], body: &Expr, then: &Expr) -> Expr {
+    let def = Rc::new(FuncDefData {
+        name: name.to_string(),
+        params: params.to_vec(),
+        body: body.clone(),
+    });
+    install_def_calls(then, &def, 0)
+}
 
-/// Caps `chain_depth` in [`expand_func_calls`]/[`expand_func_calls_in_builtin`]
-/// -- a plain, per-call-chain `usize` incremented on *every* recursive call
-/// in either function, not just `FuncCall` self-reference hits, bounding
-/// native stack usage directly rather than counting substitutions.
+/// How deep a user-defined function may recurse before evaluation gives up
+/// (#1371).
 ///
-/// `MAX_FUNC_EXPANSION_DEPTH`'s `budget` bounds *how many self-references*
-/// one occurrence's resolution performs, which is the right guard against
-/// runaway *work* (memory, time) -- but it says nothing about how much
-/// *native stack* each one of those self-references costs to reach, which
-/// depends on how much structure (`if`/`else`, array/object literals,
-/// pipes) a `def` body wraps around its recursive call. Code review
-/// confirmed live: a `def` whose body wraps its self-call in only ~20
-/// levels of array nesting overflows the native stack (SIGABRT) well
-/// before `budget` is anywhere near exhausted -- the exact failure mode
-/// this PR exists to eliminate, surviving through a gap `budget` alone
-/// cannot close, since `budget` only increments at self-reference hits
-/// while the *structural* descent between one hit and the next (walking
-/// through that 20-level wrapper) is exactly what overflows the stack.
+/// This is a genuine recursion-depth limit — one unit per *live* call, the
+/// thing jq itself bounds only by memory — not the substitution budget it
+/// replaces. The distinction is the point of #1371: the old ceiling was
+/// charged during expansion, so it was consumed by branches a real run would
+/// never take (`fib(0)` failed exactly like `fib(1000)`, since expansion
+/// unrolled the `else` arm it could not know was dead), and a `def` with more
+/// than one self-call exhausted it at every depth including zero. Nothing is
+/// charged here until a call actually runs.
 ///
-/// `chain_depth` closes this by bounding the live call-stack depth at any
-/// moment, independent of how many self-references have fired. This
-/// required its own, separate calibration (debug build, default thread
-/// stack, temporarily raising both ceilings far past any real crash to let
-/// `chain_depth` run to actual failure): the *raw* recursion-depth crash
-/// floor turned out to be essentially shape-independent -- ~549 for the
-/// single-argument shape `MAX_FUNC_EXPANSION_DEPTH`'s own doc comment
-/// tested, ~682-704 for the same shape with its recursive call wrapped in
-/// 20 levels of array nesting, ~612-714 wrapped in 100 levels. That makes
-/// sense: `chain_depth` counts total live stack frames directly, and each
-/// frame here costs roughly the same regardless of which `Expr`/`Builtin`
-/// variant it's processing, so the crash floor in *this* metric doesn't
-/// move the way `MAX_FUNC_EXPANSION_DEPTH`'s self-reference-hit count does
-/// (that one crashed at wildly different hit counts across body shapes,
-/// exactly *because* raw frames-per-hit varies with how much structure
-/// separates one hit from the next -- see its own doc comment).
+/// **Calibrated against measured native stack use, not guessed** (#2080): one
+/// live call level costs ~4.4 KB of native stack, measured by bisecting the
+/// deepest working recursion at two stack sizes an 8x multiple apart (4406
+/// B/level at 8 MB, 4381 B/level at 64 MB — 0.6% apart, so consumption is
+/// linear in depth, not quadratic as it was while arguments were substituted
+/// textually). At that rate this ceiling needs ~44 MB of stack, which is why
+/// the CLI runs evaluation on a thread with an explicitly sized one
+/// (`jq_runner.rs`) rather than the default 8 MB main thread, and why
+/// exceeding it must stay a clean, catchable error: the alternative is the
+/// `SIGABRT` stack overflow #1016 exists to prevent.
 ///
-/// Picked with a wide margin below the lowest of those (~549) for the same
-/// reason `MAX_FUNC_EXPANSION_DEPTH` was: real `def` bodies will be more
-/// expensive per frame than anything tested here. Also picked comfortably
-/// above the ~150 frames a `MAX_FUNC_EXPANSION_DEPTH`-worth of self-
-/// reference hits costs for the *thin*-body shape (roughly 3 frames per
-/// hit there) -- low enough to catch a thick-bodied `def` before its stack
-/// overflows, high enough that it doesn't itself become the limiting
-/// factor for the thin-bodied shape `MAX_FUNC_EXPANSION_DEPTH` already
-/// covers.
-const MAX_FUNC_EXPANSION_CHAIN_DEPTH: usize = 300;
+/// Matches the depth jq itself was confirmed to handle for this issue's own
+/// repro (`sum_to(10000)`), rather than being set to whatever happened not to
+/// crash — a library embedder with a smaller stack is the case this does not
+/// cover, and is why the limit is a constant here rather than derived from
+/// whatever stack the caller happens to have.
+const MAX_EVAL_FRAMES: u32 = 100_000;
 
-/// Caps *total substitution cost, weighted by `body`'s own size* -- the
-/// narrower stopgap #1381 (see `MAX_FUNC_EXPANSION_DEPTH`'s own doc
-/// comment, "Also known to not close") describes for the gap neither
-/// `MAX_FUNC_EXPANSION_DEPTH` nor `MAX_FUNC_EXPANSION_CHAIN_DEPTH` closes:
-/// chaining several small recursive `def`s, each calling the previous as
-/// its base case.
+/// Evaluate one call to a user-defined function (#1371).
 ///
-/// `MAX_FUNC_EXPANSION_DEPTH` bounds *hit count* -- a flat "1 per
-/// self-reference" charge, regardless of how large `body` actually is at
-/// that hit. That's fine standing alone: for an ordinary, un-chained
-/// recursive `def`, `body` is a fixed, small size throughout its own
-/// resolution. But for `def r1(n): if n==0 then r0(n) else [r1(n-1)] end;`
-/// coming right after `def r0(n): ...;`, `r0`'s own occurrence *inside*
-/// `r1`'s body gets fully expanded (up to `MAX_FUNC_EXPANSION_DEPTH`
-/// clones of `r0`'s body) *before* `r1`'s own self-reference loop ever
-/// runs -- so by the time that loop starts, the `body` it clones on every
-/// one of its own (still flat-"1 per hit") 50 allowed hits is no longer
-/// `r1`'s small original body, but `r1`'s body *with `r0`'s entire
-/// expansion embedded in it*. Each further chained `def` repeats this,
-/// compounding roughly 50x per level -- confirmed live, 3 chained `def`s
-/// (`r0`..`r2`) hit 4+ GB peak RSS.
+/// Substitutes the arguments into a fresh copy of the body, re-installs the
+/// definition over that copy so its own self-calls become `DefCall`s one
+/// level deeper, and evaluates the result.
 ///
-/// This charges each hit `body`'s own `{:?}`-formatted length instead of a
-/// flat `1`, and caps the *cumulative* weighted total -- so a hit against
-/// an already-inflated `body` costs proportionally more, and naturally
-/// throttles down to far fewer than `MAX_FUNC_EXPANSION_DEPTH` hits once
-/// `body` has absorbed a prior chained `def`'s own expansion. A `Debug`-
-/// string length is a deliberately weak, approximate size proxy rather
-/// than an exact AST node count: `Expr`'s `Debug` impl is a plain
-/// `#[derive]`, which -- unlike a hand-matched node-counter needing an arm
-/// per one of `Expr`'s 55 variants -- cannot silently undercount when the
-/// AST gains a new variant, at the cost of being only roughly proportional
-/// to the tree's real memory footprint rather than exact. Computed once
-/// per occurrence and cached alongside `hits_so_far` in the same shared
-/// `Cell` (see the `FuncCall` arm below), not recomputed on every hit --
-/// an earlier version of this guard recomputed it every hit; code review
-/// measured a real ~30-40% slowdown on ordinary (non-recursive-triggering)
-/// `def` usage from that, since `body` never changes within one
-/// occurrence's own resolution.
+/// Each argument is wrapped in [`Expr::Shared`] rather than cloned in. Two
+/// things follow, and both are load-bearing:
 ///
-/// Calibrated so an ordinary, non-chained `def`'s `MAX_FUNC_EXPANSION_DEPTH`
-/// budget is unaffected -- **this needed two calibration passes.** The
-/// first (`50 * 600 = 30_000`) used only two thin, minimal example bodies
-/// (299-301 and 515 chars) and regressed real usage: code review measured
-/// live that a moderately-complex-but-entirely-ordinary single-argument
-/// recursive `def` (an `if`/`else` building a small object literal with a
-/// handful of fields, one nested array, one string) has a `Debug` length
-/// of 1372-1561 chars, well past that budget's real headroom -- `deep(20)`
-/// failed with "recursion depth exceeds limit of 50" where pre-#1381 `main`
-/// succeeded through `deep(45)`+. Recalibrated with a much wider margin:
-/// `50 * 5_000 = 250_000` gives every measured real body (up to 1561 chars)
-/// more than **8x** headroom above what `MAX_FUNC_EXPANSION_DEPTH`'s own
-/// 50-hit budget would need, so `hits_so_far * body_debug_len` cannot reach
-/// this cap before `hits_so_far` itself reaches `MAX_FUNC_EXPANSION_DEPTH`
-/// for any realistic single (non-chained) `def` body -- while still
-/// throttling a chained `def`'s inflated `body` (tens of thousands of
-/// chars after just one prior expansion already exceeds this cap outright)
-/// down to a small handful of further hits, keeping total blowup additive
-/// across a chain rather than multiplicative. Re-verified live after the
-/// recalibration: the moderately-complex body above now succeeds through
-/// its own natural depth (matching pre-#1381 `main`), and the original
-/// 3-chained-`def` repro (`r0`..`r2`, 4+ GB pre-fix) still fails cleanly
-/// and fast rather than exhausting memory.
-const MAX_FUNC_EXPANSION_WEIGHTED_COST: usize = 250_000;
+/// - **The recursion is linear, not quadratic.** Substituting the argument
+///   *expression* inlined the caller's own argument tree at every level, so
+///   the tree being walked grew with depth — `O(d^2)` work and native stack,
+///   measured at ~40 usable levels for a one-parameter `def`. A shared
+///   pointer adds `O(1)` per level over the level before.
+/// - **The callee cannot capture the caller's variables.** A substitution
+///   pass stops at a `Shared`, so a binder inside the body (`3 as $x`, a
+///   `reduce` pattern) cannot reach into an argument that mentions `$x`
+///   (#2077).
+pub(crate) fn bind_def_call(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+) -> Result<Expr, EvalError> {
+    if frames >= MAX_EVAL_FRAMES {
+        return Err(EvalError::new(format!(
+            "{}/{} exceeded maximum recursion depth",
+            def.name,
+            def.params.len()
+        )));
+    }
+    let mut bound = def.body.clone();
+    for (param, arg) in def.params.iter().zip(args.iter()) {
+        bound = substitute_func_param(&bound, param, &Expr::Shared(Rc::new(arg.clone())));
+    }
+    Ok(install_def_calls(&bound, def, frames + 1))
+}
 
-/// Builds an `Expr::Error` node carrying a plain string message, evaluated
-/// via [`eval_error`]'s `Expr::Error` arm the same way a real `error("...")`
-/// call would be -- the mechanism `expand_func_calls` uses to report a
-/// problem discovered during expansion (which happens before any real
-/// evaluation, so it has no `QueryResult`/`EvalError` to return directly)
-/// without panicking.
-fn expansion_error(msg: String) -> Expr {
-    Expr::Error(Some(Box::new(Expr::Literal(Literal::String(msg)))))
+/// Evaluate an `Expr::DefCall` in the plain evaluator (#1371).
+fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    def: &Rc<FuncDefData>,
+    args: &[Expr],
+    frames: u32,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match bind_def_call(def, args, frames) {
+        Ok(bound) => eval_single::<W, S>(&bound, value, optional),
+        Err(e) => QueryResult::Error(e),
+    }
 }
 
 /// Expand function calls to a defined function by inlining the body.
-pub(crate) fn expand_func_calls(
-    expr: &Expr,
-    func_name: &str,
-    params: &[String],
-    body: &Expr,
-    budget: Option<&Cell<(usize, Option<usize>)>>,
-    chain_depth: usize,
-) -> Expr {
+pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32) -> Expr {
     match expr {
         // #1376: the arity check used to live *inside* this arm, matching
         // on name alone and erroring on any arity mismatch -- which broke
@@ -40088,108 +40080,33 @@ pub(crate) fn expand_func_calls(
         // -- so expansion is never handed one. Do not read the fallthrough
         // below as *permitting* a forward reference: it is unreachable for
         // one, and would still mis-resolve it if that pass were bypassed.
-        Expr::FuncCall { name, args } if name == func_name && args.len() == params.len() => {
-            // #1016: a self-recursive `def` (e.g. `def deep(n): if n == 0
-            // then . else [deep(n-1)] end;`) has no base case at expansion
-            // time -- expansion is static AST substitution, run before any
-            // evaluation, so it can never observe that a runtime condition
-            // like `n == 0` will eventually hold. Each hop back into this
-            // arm re-substitutes the body, which (for a genuinely recursive
-            // `def`) always contains another syntactic call to `func_name`,
-            // so this would otherwise unroll forever and overflow the
-            // native stack -- see `MAX_FUNC_EXPANSION_DEPTH`'s and
-            // `MAX_FUNC_EXPANSION_CHAIN_DEPTH`'s doc comments. Same
-            // non-panicking `Expr::Error` shape as the arity check above,
-            // not a panic (#1098 established that panicking here is
-            // live-reachable through ordinary CLI usage, not just a
-            // theoretical safety net).
+        Expr::FuncCall { name, args } if *name == def.name && args.len() == def.params.len() => {
+            // #1371: bind the call to its definition, but do **not**
+            // substitute yet. Substitution happens in `eval_def_call`, when
+            // evaluation actually reaches this node.
             //
-            // `chain_depth` bounds *native stack usage* directly: it
-            // increments on every recursive call in this function, not just
-            // self-reference hits, so it catches a def body that wraps its
-            // recursive call in substantial structure (nested arrays,
-            // objects, pipes) between one self-reference and the next --
-            // see that constant's own doc comment for why `budget` alone
-            // (below) cannot catch this. It is intentionally a single
-            // running total over the whole expression being expanded, not
-            // scoped to `func_name`'s own self-reference chain (code review
-            // asked about this): live stack depth at any moment includes
-            // *all* nesting the traversal is currently inside, including
-            // structure with nothing to do with this recursion, and that
-            // depth is real regardless of its source -- so the message
-            // below doesn't claim the nesting is `func_name`'s own doing.
-            if chain_depth >= MAX_FUNC_EXPANSION_CHAIN_DEPTH {
-                return expansion_error(format!(
-                    "expression nesting exceeds depth limit of {MAX_FUNC_EXPANSION_CHAIN_DEPTH} while expanding function {func_name}"
-                ));
-            }
-            // `budget` bounds *total substitution work*, shared by
-            // reference across every self-reference reached while
-            // resolving one originally-independent occurrence -- see
-            // `MAX_FUNC_EXPANSION_DEPTH`'s doc comment for why a per-chain
-            // value alone isn't enough (a def body with more than one
-            // self-call compounds exponentially otherwise).
+            // Doing it here instead -- which is what this function used to do
+            // -- cannot terminate for a self-recursive `def`: the substituted
+            // body contains another syntactic call to the same name, and
+            // static expansion can never observe that a runtime condition
+            // (`n == 0`) will eventually hold, so it unrolled until a guard
+            // stopped it. Every one of those guards (`MAX_FUNC_EXPANSION_*`)
+            // is gone with this arm; the depth ceiling is now a genuine
+            // recursion-depth limit checked per call, not a substitution
+            // budget that a branching body exhausts at depth zero.
             //
-            // `budget` is `None` when this occurrence was reached by
-            // ordinary structural descent through code that is *not*
-            // itself generated by resolving some earlier occurrence --
-            // e.g. two independent top-level calls the user wrote side by
-            // side (`[fact(3), fact(4)]`). Such an occurrence gets a fresh
-            // counter of its own here, rather than sharing one with
-            // unrelated sibling calls (code review found sharing one
-            // global counter for the whole `then` starves later,
-            // independent calls once an earlier one has consumed the
-            // budget -- confirmed live, `[fact(3), fact(4), fact(5)]`
-            // failed even though each call alone succeeds trivially).
-            // `budget` is `Some(cell)` when this occurrence was itself
-            // found *while* resolving an earlier occurrence's own
-            // substituted body/arguments (a genuine self-reference within
-            // that resolution, e.g. the two `f`s inside `def f: [f, f];
-            // f`'s own body) -- that case must keep sharing the same
-            // counter, or the branching-explosion bug above comes back.
-            let fresh_cell = Cell::new((0, None));
-            let cell = budget.unwrap_or(&fresh_cell);
-            let (hits_so_far, cached_body_debug_len) = cell.get();
-            if hits_so_far >= MAX_FUNC_EXPANSION_DEPTH {
-                return expansion_error(format!(
-                    "function {func_name} recursion depth exceeds limit of {MAX_FUNC_EXPANSION_DEPTH} while expanding"
-                ));
+            // `args` are installed but left otherwise untouched, so a call to
+            // this same definition *inside* an argument is bound too, while
+            // the argument itself stays ordinary caller-scope code that an
+            // enclosing, not-yet-evaluated `as` can still substitute into.
+            Expr::DefCall {
+                def: Rc::clone(def),
+                args: args
+                    .iter()
+                    .map(|a| install_def_calls(a, def, frames + 1))
+                    .collect(),
+                frames,
             }
-            // #1381: `hits_so_far` alone doesn't catch a chained `def`
-            // whose `body` has already absorbed a prior chained `def`'s
-            // own full expansion -- see `MAX_FUNC_EXPANSION_WEIGHTED_COST`'s
-            // own doc comment for the full mechanism and calibration.
-            // `body` never changes across every hit sharing this `cell`
-            // (it's the same parameter threaded through unchanged), so its
-            // `Debug` length is computed once per occurrence and cached
-            // here rather than reformatted on every hit.
-            let body_debug_len = cached_body_debug_len.unwrap_or_else(|| format!("{body:?}").len());
-            if hits_so_far.saturating_mul(body_debug_len) >= MAX_FUNC_EXPANSION_WEIGHTED_COST {
-                return expansion_error(format!(
-                    "function {func_name} substitution cost exceeds limit of {MAX_FUNC_EXPANSION_WEIGHTED_COST} while expanding"
-                ));
-            }
-            cell.set((hits_so_far + 1, Some(body_debug_len)));
-            // Substitute parameters with arguments in the body
-            let mut result = body.clone();
-            // First, expand any nested function calls in the arguments
-            let expanded_args: Vec<Expr> = args
-                .iter()
-                .map(|a| expand_func_calls(a, func_name, params, body, Some(cell), chain_depth + 1))
-                .collect();
-            // Then substitute each parameter
-            for (param, arg) in params.iter().zip(expanded_args.iter()) {
-                result = substitute_func_param(&result, param, arg);
-            }
-            // Also expand any recursive calls in the result
-            expand_func_calls(
-                &result,
-                func_name,
-                params,
-                body,
-                Some(cell),
-                chain_depth + 1,
-            )
         }
         // Recursively expand in all subexpressions
         Expr::Identity => Expr::Identity,
@@ -40216,293 +40133,103 @@ pub(crate) fn expand_func_calls(
         },
         Expr::Iterate => Expr::Iterate,
         Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(expand_func_calls(
-                target,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            key: Box::new(expand_func_calls(
-                key,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            target: Box::new(install_def_calls(target, def, frames + 1)),
+            key: Box::new(install_def_calls(key, def, frames + 1)),
         },
         Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(expand_func_calls(
-                target,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            start: start.as_deref().map(|e| {
-                Box::new(expand_func_calls(
-                    e,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
-            end: end.as_deref().map(|e| {
-                Box::new(expand_func_calls(
-                    e,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
+            target: Box::new(install_def_calls(target, def, frames + 1)),
+            start: start
+                .as_deref()
+                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
+            end: end
+                .as_deref()
+                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
         },
         Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => Expr::Optional(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::Optional(e) => Expr::Optional(Box::new(install_def_calls(e, def, frames + 1))),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| expand_func_calls(e, func_name, params, body, budget, chain_depth + 1))
+                .map(|e| install_def_calls(e, def, frames + 1))
                 .collect(),
         ),
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| expand_func_calls(e, func_name, params, body, budget, chain_depth + 1))
+                .map(|e| install_def_calls(e, def, frames + 1))
                 .collect(),
         ),
-        Expr::Array(e) => Expr::Array(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::Array(e) => Expr::Array(Box::new(install_def_calls(e, def, frames + 1))),
         Expr::Object(entries) => Expr::Object(
             entries
                 .iter()
                 .map(|entry| {
                     let new_key = match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(expand_func_calls(
-                            e,
-                            func_name,
-                            params,
-                            body,
-                            budget,
-                            chain_depth + 1,
-                        ))),
+                        ObjectKey::Expr(e) => {
+                            ObjectKey::Expr(Box::new(install_def_calls(e, def, frames + 1)))
+                        }
                     };
                     ObjectEntry {
                         key: new_key,
-                        value: expand_func_calls(
-                            &entry.value,
-                            func_name,
-                            params,
-                            body,
-                            budget,
-                            chain_depth + 1,
-                        ),
+                        value: install_def_calls(&entry.value, def, frames + 1),
                     }
                 })
                 .collect(),
         ),
         Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::Paren(e) => Expr::Paren(Box::new(install_def_calls(e, def, frames + 1))),
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op: *op,
-            left: Box::new(expand_func_calls(
-                left,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            right: Box::new(expand_func_calls(
-                right,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            left: Box::new(install_def_calls(left, def, frames + 1)),
+            right: Box::new(install_def_calls(right, def, frames + 1)),
         },
-        Expr::Negate(operand) => Expr::Negate(Box::new(expand_func_calls(
-            operand,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::Negate(operand) => {
+            Expr::Negate(Box::new(install_def_calls(operand, def, frames + 1)))
+        }
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
-            left: Box::new(expand_func_calls(
-                left,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            right: Box::new(expand_func_calls(
-                right,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            left: Box::new(install_def_calls(left, def, frames + 1)),
+            right: Box::new(install_def_calls(right, def, frames + 1)),
         },
         Expr::And(l, r) => Expr::And(
-            Box::new(expand_func_calls(
-                l,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            Box::new(expand_func_calls(
-                r,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            Box::new(install_def_calls(l, def, frames + 1)),
+            Box::new(install_def_calls(r, def, frames + 1)),
         ),
         Expr::Or(l, r) => Expr::Or(
-            Box::new(expand_func_calls(
-                l,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            Box::new(expand_func_calls(
-                r,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            Box::new(install_def_calls(l, def, frames + 1)),
+            Box::new(install_def_calls(r, def, frames + 1)),
         ),
         Expr::Not => Expr::Not,
         Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(expand_func_calls(
-                l,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            Box::new(expand_func_calls(
-                r,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            Box::new(install_def_calls(l, def, frames + 1)),
+            Box::new(install_def_calls(r, def, frames + 1)),
         ),
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => Expr::If {
-            cond: Box::new(expand_func_calls(
-                cond,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            then_branch: Box::new(expand_func_calls(
-                then_branch,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            else_branch: Box::new(expand_func_calls(
-                else_branch,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            cond: Box::new(install_def_calls(cond, def, frames + 1)),
+            then_branch: Box::new(install_def_calls(then_branch, def, frames + 1)),
+            else_branch: Box::new(install_def_calls(else_branch, def, frames + 1)),
         },
         Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(expand_func_calls(
-                expr,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            catch: catch.as_ref().map(|c| {
-                Box::new(expand_func_calls(
-                    c,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
+            expr: Box::new(install_def_calls(expr, def, frames + 1)),
+            catch: catch
+                .as_ref()
+                .map(|c| Box::new(install_def_calls(c, def, frames + 1))),
         },
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(expand_func_calls_in_builtin(
-            b,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        )),
+        Expr::Builtin(b) => Expr::Builtin(install_def_calls_in_builtin(b, def, frames + 1)),
         Expr::StringInterpolation(parts) => Expr::StringInterpolation(
             parts
                 .iter()
                 .map(|p| match p {
                     StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => StringPart::Expr(Box::new(expand_func_calls(
-                        e,
-                        func_name,
-                        params,
-                        body,
-                        budget,
-                        chain_depth + 1,
-                    ))),
+                    StringPart::Expr(e) => {
+                        StringPart::Expr(Box::new(install_def_calls(e, def, frames + 1)))
+                    }
                 })
                 .collect(),
         ),
@@ -40525,23 +40252,9 @@ pub(crate) fn expand_func_calls(
             var,
             body: as_body,
         } => Expr::As {
-            expr: Box::new(expand_func_calls(
-                expr,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            expr: Box::new(install_def_calls(expr, def, frames + 1)),
             var: var.clone(),
-            body: Box::new(expand_func_calls(
-                as_body,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            body: Box::new(install_def_calls(as_body, def, frames + 1)),
         },
         Expr::Reduce {
             input,
@@ -40549,31 +40262,10 @@ pub(crate) fn expand_func_calls(
             init,
             update,
         } => Expr::Reduce {
-            input: Box::new(expand_func_calls(
-                input,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            input: Box::new(install_def_calls(input, def, frames + 1)),
             patterns: patterns.clone(),
-            init: Box::new(expand_func_calls(
-                init,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            update: Box::new(expand_func_calls(
-                update,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            init: Box::new(install_def_calls(init, def, frames + 1)),
+            update: Box::new(install_def_calls(update, def, frames + 1)),
         },
         Expr::Foreach {
             input,
@@ -40582,190 +40274,50 @@ pub(crate) fn expand_func_calls(
             update,
             extract,
         } => Expr::Foreach {
-            input: Box::new(expand_func_calls(
-                input,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            input: Box::new(install_def_calls(input, def, frames + 1)),
             patterns: patterns.clone(),
-            init: Box::new(expand_func_calls(
-                init,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            update: Box::new(expand_func_calls(
-                update,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            extract: extract.as_ref().map(|e| {
-                Box::new(expand_func_calls(
-                    e,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
+            init: Box::new(install_def_calls(init, def, frames + 1)),
+            update: Box::new(install_def_calls(update, def, frames + 1)),
+            extract: extract
+                .as_ref()
+                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
         },
         Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(expand_func_calls(
-                n,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            expr: Box::new(expand_func_calls(
-                expr,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            n: Box::new(install_def_calls(n, def, frames + 1)),
+            expr: Box::new(install_def_calls(expr, def, frames + 1)),
         },
-        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
-        Expr::LastExpr(e) => Expr::LastExpr(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(install_def_calls(e, def, frames + 1))),
+        Expr::LastExpr(e) => Expr::LastExpr(Box::new(install_def_calls(e, def, frames + 1))),
         Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(expand_func_calls(
-                n,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            expr: Box::new(expand_func_calls(
-                expr,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            n: Box::new(install_def_calls(n, def, frames + 1)),
+            expr: Box::new(install_def_calls(expr, def, frames + 1)),
         },
         Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(expand_func_calls(
-                cond,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            update: Box::new(expand_func_calls(
-                update,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            cond: Box::new(install_def_calls(cond, def, frames + 1)),
+            update: Box::new(install_def_calls(update, def, frames + 1)),
         },
         Expr::While { cond, update } => Expr::While {
-            cond: Box::new(expand_func_calls(
-                cond,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            update: Box::new(expand_func_calls(
-                update,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            cond: Box::new(install_def_calls(cond, def, frames + 1)),
+            update: Box::new(install_def_calls(update, def, frames + 1)),
         },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(expand_func_calls(
-            e,
-            func_name,
-            params,
-            body,
-            budget,
-            chain_depth + 1,
-        ))),
+        Expr::Repeat(e) => Expr::Repeat(Box::new(install_def_calls(e, def, frames + 1))),
         Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(expand_func_calls(
-                from,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            to: to.as_ref().map(|e| {
-                Box::new(expand_func_calls(
-                    e,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
-            step: step.as_ref().map(|e| {
-                Box::new(expand_func_calls(
-                    e,
-                    func_name,
-                    params,
-                    body,
-                    budget,
-                    chain_depth + 1,
-                ))
-            }),
+            from: Box::new(install_def_calls(from, def, frames + 1)),
+            to: to
+                .as_ref()
+                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
+            step: step
+                .as_ref()
+                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
         },
         Expr::AsPattern {
             expr,
             patterns,
             body: pattern_body,
         } => Expr::AsPattern {
-            expr: Box::new(expand_func_calls(
-                expr,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            expr: Box::new(install_def_calls(expr, def, frames + 1)),
             patterns: patterns.clone(),
-            body: Box::new(expand_func_calls(
-                pattern_body,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            body: Box::new(install_def_calls(pattern_body, def, frames + 1)),
         },
         Expr::FuncDef {
             name: inner_name,
@@ -40787,29 +40339,15 @@ pub(crate) fn expand_func_calls(
             // case below already does -- only a genuine same-arity
             // redefinition (which really does make the earlier definition
             // permanently unreachable from this point on) stops expansion.
-            if inner_name == func_name && inner_params.len() == params.len() {
+            if *inner_name == def.name && inner_params.len() == def.params.len() {
                 // Don't expand in the body or then - this is a new definition
                 expr.clone()
             } else {
                 Expr::FuncDef {
                     name: inner_name.clone(),
                     params: inner_params.clone(),
-                    body: Box::new(expand_func_calls(
-                        inner_body,
-                        func_name,
-                        params,
-                        body,
-                        budget,
-                        chain_depth + 1,
-                    )),
-                    then: Box::new(expand_func_calls(
-                        then,
-                        func_name,
-                        params,
-                        body,
-                        budget,
-                        chain_depth + 1,
-                    )),
+                    body: Box::new(install_def_calls(inner_body, def, frames + 1)),
+                    then: Box::new(install_def_calls(then, def, frames + 1)),
                 }
             }
         }
@@ -40822,7 +40360,7 @@ pub(crate) fn expand_func_calls(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|a| expand_func_calls(a, func_name, params, body, budget, chain_depth + 1))
+                    .map(|a| install_def_calls(a, def, frames + 1))
                     .collect(),
             }
         }
@@ -40835,94 +40373,52 @@ pub(crate) fn expand_func_calls(
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| expand_func_calls(a, func_name, params, body, budget, chain_depth + 1))
+                .map(|a| install_def_calls(a, def, frames + 1))
                 .collect(),
         },
         Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(expand_func_calls(
-                path,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            value: Box::new(expand_func_calls(
-                value,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            path: Box::new(install_def_calls(path, def, frames + 1)),
+            value: Box::new(install_def_calls(value, def, frames + 1)),
         },
         Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(expand_func_calls(
-                path,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            filter: Box::new(expand_func_calls(
-                filter,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            path: Box::new(install_def_calls(path, def, frames + 1)),
+            filter: Box::new(install_def_calls(filter, def, frames + 1)),
         },
         Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
             op: *op,
-            path: Box::new(expand_func_calls(
-                path,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            value: Box::new(expand_func_calls(
-                value,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            path: Box::new(install_def_calls(path, def, frames + 1)),
+            value: Box::new(install_def_calls(value, def, frames + 1)),
         },
         Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(expand_func_calls(
-                path,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
-            value: Box::new(expand_func_calls(
-                value,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            path: Box::new(install_def_calls(path, def, frames + 1)),
+            value: Box::new(install_def_calls(value, def, frames + 1)),
         },
 
         // Label-break
         Expr::Label { name, body: lbody } => Expr::Label {
             name: name.clone(),
-            body: Box::new(expand_func_calls(
-                lbody,
-                func_name,
-                params,
-                body,
-                budget,
-                chain_depth + 1,
-            )),
+            body: Box::new(install_def_calls(lbody, def, frames + 1)),
+        },
+        // #1371: opaque. A `Shared` holds an argument that was captured at
+        // call time, after every enclosing substitution had run and after
+        // this same installer had already visited it -- so there is nothing
+        // left to install inside, and descending would re-walk the whole
+        // chain of arguments from every level below, restoring exactly the
+        // O(depth^2) traversal this design removes.
+        Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
+        // Likewise opaque: a `DefCall`'s own definition was captured with all
+        // outer definitions already installed in it, and its arguments were
+        // installed when it was created. Descending would also re-install
+        // *this* definition inside a call that is deliberately deferred,
+        // which is the unrolling this fix exists to stop.
+        Expr::DefCall {
+            def: d,
+            args,
+            frames: n,
+        } => Expr::DefCall {
+            def: Rc::clone(d),
+            args: args.clone(),
+            frames: *n,
         },
         Expr::Break(name) => Expr::Break(name.clone()),
     }
@@ -40931,6 +40427,26 @@ pub(crate) fn expand_func_calls(
 /// Substitute a function parameter with an argument expression.
 fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
     match expr {
+        // #1371: opaque, for the same reasons `substitute_var_impl` gives --
+        // and for one more that is specific to parameters. Binding a
+        // multi-parameter call substitutes each parameter in turn over the
+        // result of the last, so this arm is what stops the second parameter
+        // from being substituted *into the first argument*: arguments live in
+        // the caller's scope and cannot mention the callee's own parameters.
+        Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
+        // A nested call's arguments, by contrast, are code in *this* body's
+        // scope and can mention this parameter -- `def outer(n): inner(n);`
+        // binds `n` here, through the inner call. Reached whenever an outer
+        // definition was installed over a body before this one's parameters
+        // were bound, which is the ordinary case for two sibling `def`s.
+        Expr::DefCall { def, args, frames } => Expr::DefCall {
+            def: Rc::clone(def),
+            args: args
+                .iter()
+                .map(|a| substitute_func_param(a, param, arg))
+                .collect(),
+            frames: *frames,
+        },
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),
         Expr::Var(_) => expr.clone(),
@@ -41318,17 +40834,8 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
 }
 
 /// Expand function calls in a builtin expression.
-fn expand_func_calls_in_builtin(
-    builtin: &Builtin,
-    func_name: &str,
-    params: &[String],
-    body: &Expr,
-    budget: Option<&Cell<(usize, Option<usize>)>>,
-    chain_depth: usize,
-) -> Builtin {
-    map_builtin_subexprs(builtin, &mut |e| {
-        expand_func_calls(e, func_name, params, body, budget, chain_depth + 1)
-    })
+fn install_def_calls_in_builtin(builtin: &Builtin, def: &Rc<FuncDefData>, depth: u32) -> Builtin {
+    map_builtin_subexprs(builtin, &mut |e| install_def_calls(e, def, depth))
 }
 
 /// Substitute function parameter in a builtin expression.
@@ -66015,7 +65522,15 @@ mod tests {
             slice_number
         );
         assert_eq!(
-            expand_func_calls(&slice_number, "f", &[], &Expr::Identity, None, 0),
+            install_def_calls(
+                &slice_number,
+                &Rc::new(FuncDefData {
+                    name: "f".into(),
+                    params: Vec::new(),
+                    body: Expr::Identity,
+                }),
+                0,
+            ),
             slice_number
         );
         assert_eq!(

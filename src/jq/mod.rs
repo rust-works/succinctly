@@ -102,8 +102,9 @@ pub use eval::{
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;
 pub use expr::{
-    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal, MetaValue,
-    ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefData, Import, Include, Literal,
+    MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry, Program,
+    StringPart,
 };
 pub use lazy::JqValue;
 pub use parser::{

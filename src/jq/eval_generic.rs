@@ -34,9 +34,9 @@ use super::document::{
     DocumentValue, IndentSpec,
 };
 use super::eval::{
-    apply_compare_op, arith_combine, as_var_refs, classify_limit_n, classify_nth_n, collapse_vec,
-    collect_pattern_var_names, compare_values, eval as full_eval, eval_each_owned,
-    eval_foreach_with_values, eval_reduce_with_values, expand_func_calls, extract_pattern_bindings,
+    apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call, classify_limit_n,
+    classify_nth_n, collapse_vec, collect_pattern_var_names, compare_values, eval as full_eval,
+    eval_each_owned, eval_foreach_with_values, eval_reduce_with_values, extract_pattern_bindings,
     format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
     numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
@@ -5687,9 +5687,18 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             body,
             then,
         } => {
-            let expanded_then = expand_func_calls(then, name, params, body, None, 0);
-            eval_each_generic::<S, V>(&expanded_then, value, optional, cursor, sink)
+            let bound_then = bind_def(name, params, body, then);
+            eval_each_generic::<S, V>(&bound_then, value, optional, cursor, sink)
         }
+
+        // #1371: mirrors `eval.rs`'s own `DefCall`/`Shared` pair -- see there
+        // for why the generic fallback is not good enough (a consumer that
+        // stops early must not have already run the rest of the body).
+        Expr::DefCall { def, args, frames } => match bind_def_call(def, args, *frames) {
+            Ok(bound) => eval_each_generic::<S, V>(&bound, value, optional, cursor, sink),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        Expr::Shared(inner) => eval_each_generic::<S, V>(inner, value, optional, cursor, sink),
 
         // See `each_limit_generic`'s own doc comment.
         Expr::Limit { n, expr } => {
