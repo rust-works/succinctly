@@ -421,6 +421,74 @@ pub enum Expr {
         args: Vec<Self>,
     },
 
+    /// A sub-expression that has already had every enclosing substitution
+    /// applied to it, and must therefore be treated as **opaque** by every
+    /// later substitution pass (#1371).
+    ///
+    /// Created when a user-defined function call binds its arguments: the
+    /// argument expression is captured as-is, behind an [`Rc`], instead of
+    /// being cloned into the callee's body. Two properties follow, and both
+    /// are load-bearing:
+    ///
+    /// - **No growth with recursion depth.** `def sum_to(n): … sum_to(n-1) …`
+    ///   used to inline the caller's own argument tree at every level, so the
+    ///   argument at depth `d` had `O(d)` nodes and the tree being walked kept
+    ///   growing — `O(d²)` work and native stack. Sharing makes each level add
+    ///   `O(1)` nodes over a pointer to the level before, so the same
+    ///   recursion is linear.
+    /// - **Hygiene.** A substitution that skips this node cannot reach inside
+    ///   an argument, so a binder in the callee (`3 as $x`, a `reduce`
+    ///   pattern) can never capture a caller variable the argument mentions
+    ///   (#2077).
+    ///
+    /// The contents are always fully substituted at construction time: the
+    /// node is built while *evaluating* a call, and everything that could
+    /// substitute into it lexically encloses that call and has therefore
+    /// already run. Evaluation is transparent — a `Shared` evaluates exactly
+    /// as its inner expression does.
+    Shared(Rc<Self>),
+
+    /// A call to a user-defined function, bound to its definition but **not
+    /// yet substituted** (#1371).
+    ///
+    /// Installed in place of an [`Expr::FuncCall`] when the enclosing
+    /// [`Expr::FuncDef`] is evaluated; the substitution of `args` into
+    /// `def.body` happens later, when evaluation actually reaches this node.
+    /// That split is the whole fix:
+    ///
+    /// - **Recursion terminates on its own.** Static substitution cannot see
+    ///   that a runtime condition (`n == 0`) will eventually hold, so it
+    ///   unrolls a self-recursive body forever and has to be cut off by a
+    ///   guard. Substituting one level per evaluation instead lets the base
+    ///   case simply not be evaluated — which is also why a branching body
+    ///   (`fib`) works at all now, rather than exhausting a budget at every
+    ///   depth including zero.
+    /// - **`args` stay ordinary caller-scope code until the call runs.** They
+    ///   are still reachable by an enclosing `as`-substitution, which an
+    ///   argument captured at install time would not be — the call site can
+    ///   sit inside a binder that has not been evaluated yet.
+    DefCall {
+        /// The definition this call resolves to, shared so that binding one
+        /// more level of recursion costs a pointer clone, not a body clone.
+        def: Rc<FuncDefData>,
+        /// Argument expressions, in the caller's scope and unsubstituted.
+        args: Vec<Self>,
+        /// How many native evaluation frames are already live above this
+        /// node, accumulated as the installer walks: one per structural level
+        /// it descends, carried across each call so it sums over the whole
+        /// live recursion. Carried in the node so the guard needs no ambient
+        /// state and stays deterministic under `no_std`.
+        ///
+        /// A plain call *count* would not do. It is not the number of calls
+        /// that exhausts the native stack but the frames each one holds live:
+        /// measured at 256 MB, a body whose recursive call sits directly in a
+        /// pipe survives ~57,500 levels, while one that wraps the same call in
+        /// 40 array constructors — which stay live across it — dies between
+        /// 4,000 and 8,000. Charging the structural nesting at each call site
+        /// tracks that difference; a count cannot.
+        frames: u32,
+    },
+
     /// Namespaced function call: `module::func` or `module::func(args)`
     NamespacedCall {
         /// Module namespace
@@ -469,6 +537,23 @@ pub enum Expr {
         /// Default value expression (right side)
         value: Box<Self>,
     },
+}
+
+/// The three parts of a `def` that [`Expr::PendingDef`] carries between
+/// recursion levels (#1371).
+///
+/// Split out of [`Expr::FuncDef`]'s inline fields so one `Rc` can hold all
+/// three: re-declaring the definition around each newly substituted body is
+/// the innermost step of every recursive call, and cloning a `body` there
+/// would reintroduce the per-level copy this design exists to remove.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncDefData {
+    /// Function name.
+    pub name: String,
+    /// Parameter names (empty for a no-argument definition).
+    pub params: Vec<String>,
+    /// Function body.
+    pub body: Expr,
 }
 
 /// A complete jq program including module directives and the main expression.

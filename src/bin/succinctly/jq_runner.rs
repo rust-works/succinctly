@@ -204,6 +204,11 @@ impl ModuleLoader {
 /// by transforming `namespace::func(args)` to `namespace::func(args)` as a regular call
 fn rewrite_namespaced_calls(expr: Expr) -> Expr {
     match expr {
+        // #1371: parse-time only, so neither can occur -- both are built by
+        // evaluation, which happens after this rewrite. Named rather than
+        // wildcarded so a future evaluation-time caller gets a compile error
+        // here instead of silently keeping a `NamespacedCall` inside one.
+        Expr::Shared(_) | Expr::DefCall { .. } => expr,
         Expr::NamespacedCall {
             namespace,
             name,

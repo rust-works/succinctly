@@ -390,6 +390,23 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
 /// one pass (#2037).
 fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
     match expr {
+        // #1371: neither variant can occur here. This pass runs once, on the
+        // freshly parsed program, before evaluation begins; both are built
+        // *by* evaluation. They are still given real arms rather than being
+        // folded into a leaf group, so that if a future caller ever runs this
+        // check over an evaluation-time tree it reports honestly instead of
+        // silently treating a whole subtree as having no calls in it.
+        //
+        // A `DefCall` is by construction already resolved -- it holds the
+        // definition it resolved to -- so only its arguments can carry an
+        // unresolved call, and they are checked in the scope this node sits
+        // in. The definition's own body was checked at its `FuncDef`.
+        Expr::Shared(inner) => check(inner, scope, errors),
+        Expr::DefCall { args, .. } => {
+            for arg in args {
+                check(arg, scope, errors);
+            }
+        }
         // Leaves: nothing nested to descend into. Mirrors `walk::any_subexpr`'s
         // own grouping so the two stay comparable arm for arm.
         Expr::Identity

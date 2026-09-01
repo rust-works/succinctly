@@ -1328,7 +1328,45 @@ fn try_multicall() -> Result<Option<i32>> {
     }
 }
 
+/// Native stack given to the thread every command actually runs on
+/// (#1371).
+///
+/// A user-defined `def` now recurses by real evaluation rather than by
+/// pre-substituting its own body, so recursion depth is bounded by native
+/// stack instead of by a substitution budget. One live call level costs
+/// ~4.4 KB, measured (#2080) by bisecting the deepest working recursion at
+/// two stack sizes an 8x multiple apart -- 4406 B/level at 8 MB and 4381
+/// B/level at 64 MB, agreeing to within 0.6%, so the cost is linear in depth
+/// and this size converts directly into a depth.
+///
+/// 256 MB carries `MAX_CALL_DEPTH`'s 10,000 levels (~44 MB for the shape
+/// measured) with room for bodies far heavier than that one, on a platform
+/// whose *default* main-thread stack is 8 MB and would cap the same
+/// recursion below 1,000. It is reserved address space, not committed
+/// memory: pages are faulted in only as the stack is actually used, so a
+/// filter that never recurses pays nothing for it.
+///
+/// Applied here, at the single point every subcommand passes through, rather
+/// than around `run_jq` alone -- `yq` shares the same evaluator, and the
+/// alternative is one wrapper per command that each has to remember.
+const EVAL_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    // Run everything on a thread with an explicitly sized stack, then
+    // propagate its result. A panic in the child is resumed here rather than
+    // swallowed, so panic behaviour (and the abort/backtrace a panic produces)
+    // is exactly what it was when this ran on the main thread.
+    let child = std::thread::Builder::new()
+        .stack_size(EVAL_STACK_SIZE)
+        .spawn(run_main)
+        .expect("failed to spawn the evaluation thread");
+    match child.join() {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run_main() -> Result<()> {
     // Multi-call binary: check if invoked via a known alias name (e.g., sjq, syq)
     if let Some(exit_code) = try_multicall()? {
         std::process::exit(exit_code);

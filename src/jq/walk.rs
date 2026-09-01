@@ -589,6 +589,18 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
     }
 
     match expr {
+        // #1371: both variants only ever exist mid-evaluation, never in a
+        // freshly parsed program -- but this function answers "does this tree
+        // mention X anywhere" for callers that do run against evaluation-time
+        // trees, so both descend. A `Shared` holds a real argument
+        // expression, and a `DefCall` holds both the definition it resolved
+        // to and that call's arguments; treating either as a leaf would
+        // reintroduce exactly the "silently reported no match" bug this
+        // module exists to prevent.
+        Expr::Shared(inner) => any_subexpr(inner, pred),
+        Expr::DefCall { def, args, .. } => {
+            any_subexpr(&def.body, pred) || args.iter().any(|a| any_subexpr(a, pred))
+        }
         // Leaves: nothing nested to descend into.
         Expr::Identity
         | Expr::Field(_)
