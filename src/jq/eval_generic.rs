@@ -9410,7 +9410,14 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
     // A fan-out that materializes a node per branch loses to the bridge on
     // YAML, and that has to be decided here -- before the gate below -- not
     // mid-walk. A fan-out of `key`/`path` is free: they materialize nothing.
-    if walked.iter().any(path_context_fans_out) && !walked.iter().all(path_context_emits_paths_only)
+    // Only a pipe's *last* stage emits; the earlier ones just move the
+    // position. Testing every stage instead rejected `(.a, .b) | key`,
+    // because stage 0's own branches are `Field`s -- a lost optimization the
+    // suite could not see, because falling back produces identical output.
+    // Patch coverage caught it: the arms that shape reaches stayed at zero
+    // hits after a test was added for it.
+    if walked.iter().any(path_context_fans_out)
+        && !walked.last().is_some_and(path_context_emits_paths_only)
     {
         return None;
     }
