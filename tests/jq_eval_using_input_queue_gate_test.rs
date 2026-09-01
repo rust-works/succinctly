@@ -12,6 +12,8 @@
 //! separate process) so it can't leak into any other test file's shared
 //! process or test-thread pool.
 
+#![cfg(feature = "std")]
+
 use succinctly::jq::eval_generic::eval_using;
 use succinctly::jq::{parse, seed_remaining_inputs, JqSemantics, OwnedValue};
 use succinctly::json::JsonIndex;
