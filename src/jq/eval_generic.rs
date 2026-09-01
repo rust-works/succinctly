@@ -9092,6 +9092,7 @@ enum PathContextAbort {
 /// with `OwnedValue::Null`.
 fn path_context_emit_value<V: DocumentValue>(
     pos: &PathContextPos<V>,
+    materialized: &mut usize,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), PathContextAbort> {
     // Emitting the *root* means materializing the whole document, which is
@@ -9101,6 +9102,21 @@ fn path_context_emit_value<V: DocumentValue>(
     // So a `parent` that lands back at the root stays on the bridge; one
     // that lands on a proper subtree still skips the whole-document tree.
     if pos.path.is_empty() {
+        return Err(PathContextAbort::Unsupported);
+    }
+    // At most one materialization per walk. Decoding an ancestor is a
+    // *backward* jump against the document-wide `Cell<SequentialCursor>` in
+    // `AdvancePositions`/`CompactEndPositions`, which falls into
+    // `get_random` and resets the incremental scan to position zero -- so a
+    // fan-out that materializes once per element pays it once per element.
+    // Measured on YAML: `[.[] | .k.x | parent] | length` was +22.6%/+27.4%
+    // (1 MB/6 MB, M4 Pro) before this cap, while the single-emission
+    // `.[0].k.x | parent` is -39%/-41%. The bridge has no such cliff -- it
+    // decodes the document once, forwards -- so a fan-out is handed back to
+    // it and only the bounded case is walked. `key`/`path` are unaffected:
+    // they emit path components and materialize nothing.
+    *materialized += 1;
+    if *materialized > 1 {
         return Err(PathContextAbort::Unsupported);
     }
     out.push(to_owned_cursor(&pos.node).map_err(PathContextAbort::Error)?);
@@ -9258,14 +9274,15 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
 fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
+    materialized: &mut usize,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), PathContextAbort> {
     match expr {
-        Expr::Paren(inner) => path_context_walk_generic::<S, V>(inner, pos, out),
-        Expr::Pipe(exprs) => path_context_walk_pipe::<S, V>(exprs, pos, out),
+        Expr::Paren(inner) => path_context_walk_generic::<S, V>(inner, pos, materialized, out),
+        Expr::Pipe(exprs) => path_context_walk_pipe::<S, V>(exprs, pos, materialized, out),
         Expr::Comma(exprs) => {
             for e in exprs {
-                path_context_walk_generic::<S, V>(e, pos, out)?;
+                path_context_walk_generic::<S, V>(e, pos, materialized, out)?;
             }
             Ok(())
         }
@@ -9275,7 +9292,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // where the same body outside brackets emits its resolved prefix
             // first (jq 1.7.1).
             let mut items = Vec::new();
-            path_context_walk_generic::<S, V>(inner, pos, &mut items)?;
+            path_context_walk_generic::<S, V>(inner, pos, materialized, &mut items)?;
             out.push(OwnedValue::Array(items));
             Ok(())
         }
@@ -9297,7 +9314,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
             let mut heads = Vec::new();
             let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
             for head in heads {
-                path_context_emit_value(&head, out)?;
+                path_context_emit_value(&head, materialized, out)?;
             }
             stepped
         }
@@ -9309,11 +9326,12 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
 fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     pos: &PathContextPos<V>,
+    materialized: &mut usize,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), PathContextAbort> {
     match exprs.split_first() {
-        None => path_context_emit_value(pos, out),
-        Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, out),
+        None => path_context_emit_value(pos, materialized, out),
+        Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, materialized, out),
         Some((first, rest)) => {
             // `key` and `path` replace the position with a *computed* value,
             // so no document node is left for a later stage to navigate
@@ -9327,7 +9345,7 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
             // Positions reached before a failing sibling are earlier in jq's
             // generator order than the failure, so they are walked first.
             for head in heads {
-                path_context_walk_pipe::<S, V>(rest, &head, out)?;
+                path_context_walk_pipe::<S, V>(rest, &head, materialized, out)?;
             }
             stepped
         }
@@ -9386,7 +9404,9 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
         ancestors: Vec::new(),
     };
     let mut out = Vec::new();
-    let walked_result = path_context_walk_pipe::<S, V>(walked, &root_pos, &mut out);
+    let mut materialized = 0usize;
+    let walked_result =
+        path_context_walk_pipe::<S, V>(walked, &root_pos, &mut materialized, &mut out);
 
     // #953/#1909's hazard, and the second constraint #2061's own body names.
     // When the materialized document is *not* a reindex-bridge identity, the
