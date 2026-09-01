@@ -41015,7 +41015,47 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
 /// downstream call's own argument is ever `Shared`-wrapped. See #2088 for
 /// the same conclusion reached independently for the bare (non-`$`)
 /// parameter-capture shape.
+///
+/// The `Expr::Shared` premise above is a convention, not something the type
+/// system enforces -- debug-only, since every real (release) call already
+/// goes through [`bind_def_call`], which constructs the wrapper itself.
+///
+/// Substitute into `e` unless `shadowed`, in which case leave it untouched
+/// (`shadowed` means some binder between here and `e` already rebinds
+/// `param`, so nothing further down can still be `param`'s substituted
+/// argument -- see each call site's own shadow condition). Collapses the
+/// "binder shadows `param` -> clone; otherwise recurse" idiom shared by
+/// `substitute_func_param`'s `As`/`Reduce`/`Foreach`/`AsPattern`/`FuncDef`
+/// arms below (#2096 review).
+fn subst_unless_shadowed(shadowed: bool, e: &Expr, param: &str, arg: &Expr) -> Expr {
+    if shadowed {
+        e.clone()
+    } else {
+        substitute_func_param(e, param, arg)
+    }
+}
+
+/// Like [`subst_unless_shadowed`], for `Foreach`'s optional `extract` slot.
+fn subst_unless_shadowed_opt(
+    shadowed: bool,
+    e: &Option<Box<Expr>>,
+    param: &str,
+    arg: &Expr,
+) -> Option<Expr> {
+    if shadowed {
+        e.as_deref().cloned()
+    } else {
+        e.as_deref().map(|e| substitute_func_param(e, param, arg))
+    }
+}
+
 fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
+    debug_assert!(
+        matches!(arg, Expr::Shared(_)),
+        "substitute_func_param's capture-hygiene argument (#2096) requires `arg` to be \
+         Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named binder \
+         in `expr` (#2077)"
+    );
     match expr {
         // #1371: opaque, for the same reasons `substitute_var_impl` gives --
         // and for one more that is specific to parameters. Binding a
@@ -41177,40 +41217,23 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                 .collect(),
         ),
         Expr::Format(f) => Expr::Format(f.clone()),
-        Expr::As { expr, var, body } => {
-            // If var shadows param, don't substitute in body. Otherwise no
-            // rename is needed either -- see this function's own doc comment
-            // (#2096).
-            let new_body = if var == param {
-                body.clone()
-            } else {
-                Box::new(substitute_func_param(body, param, arg))
-            };
-            Expr::As {
-                expr: Box::new(substitute_func_param(expr, param, arg)),
-                var: var.clone(),
-                body: new_body,
-            }
-        }
+        Expr::As { expr, var, body } => Expr::As {
+            expr: Box::new(substitute_func_param(expr, param, arg)),
+            var: var.clone(),
+            body: Box::new(subst_unless_shadowed(var == param, body, param, arg)),
+        },
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
         } => {
-            // If patterns shadow param, don't substitute in update.
-            // Otherwise no rename is needed either -- see
-            // `substitute_func_param`'s own doc comment (#2096).
-            let new_update = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
-                update.clone()
-            } else {
-                Box::new(substitute_func_param(update, param, arg))
-            };
+            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
             Expr::Reduce {
                 input: Box::new(substitute_func_param(input, param, arg)),
                 patterns: patterns.clone(),
                 init: Box::new(substitute_func_param(init, param, arg)),
-                update: new_update,
+                update: Box::new(subst_unless_shadowed(shadowed, update, param, arg)),
             }
         }
         Expr::Foreach {
@@ -41220,26 +41243,13 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             update,
             extract,
         } => {
-            // If patterns shadow param, don't substitute in update/extract.
-            // Otherwise no rename is needed either -- see
-            // `substitute_func_param`'s own doc comment (#2096).
-            let (new_update, new_extract) = if patterns.iter().any(|p| pattern_binds_var(p, param))
-            {
-                (update.clone(), extract.clone())
-            } else {
-                (
-                    Box::new(substitute_func_param(update, param, arg)),
-                    extract
-                        .as_ref()
-                        .map(|e| Box::new(substitute_func_param(e, param, arg))),
-                )
-            };
+            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
             Expr::Foreach {
                 input: Box::new(substitute_func_param(input, param, arg)),
                 patterns: patterns.clone(),
                 init: Box::new(substitute_func_param(init, param, arg)),
-                update: new_update,
-                extract: new_extract,
+                update: Box::new(subst_unless_shadowed(shadowed, update, param, arg)),
+                extract: subst_unless_shadowed_opt(shadowed, extract, param, arg).map(Box::new),
             }
         }
         Expr::Limit { n, expr } => Expr::Limit {
@@ -41275,19 +41285,11 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             patterns,
             body,
         } => {
-            // If patterns shadow param, don't substitute in body. Otherwise
-            // no rename is needed either -- see `substitute_func_param`'s
-            // own doc comment (#2096).
             let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
-            let new_body = if shadowed {
-                body.clone()
-            } else {
-                Box::new(substitute_func_param(body, param, arg))
-            };
             Expr::AsPattern {
                 expr: Box::new(substitute_func_param(expr, param, arg)),
                 patterns: patterns.clone(),
-                body: new_body,
+                body: Box::new(subst_unless_shadowed(shadowed, body, param, arg)),
             }
         }
         Expr::FuncDef {
@@ -41305,25 +41307,13 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             // not to `param`'s substituted argument.
             let then_shadowed = name == param && params.is_empty();
             // A nested def's own parameter list shadows `param` within its
-            // own body the same way an outer `as $param` would. Otherwise no
-            // rename is needed either -- see `substitute_func_param`'s own
-            // doc comment (#2096).
+            // own body the same way an outer `as $param` would.
             let body_shadowed = params.contains(&param.to_string());
-            let new_body = if body_shadowed {
-                body.clone()
-            } else {
-                Box::new(substitute_func_param(body, param, arg))
-            };
-
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
-                body: new_body,
-                then: if then_shadowed {
-                    then.clone()
-                } else {
-                    Box::new(substitute_func_param(then, param, arg))
-                },
+                body: Box::new(subst_unless_shadowed(body_shadowed, body, param, arg)),
+                then: Box::new(subst_unless_shadowed(then_shadowed, then, param, arg)),
             }
         }
         Expr::FuncCall { name, args } => {
@@ -55809,6 +55799,38 @@ mod tests {
     }
 
     #[test]
+    fn test_func_arg_label_break_does_not_capture_caller_var_2096() {
+        // #2096: a `label`/`break` wrapped around the capturing `as` binder
+        // doesn't change the Shared-opacity argument -- confirmed against
+        // jq 1.7.1: `2`, not `5`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): label $out | (1,2,3) as $x | \
+                 (if $x == 2 then g, break $out else empty end); \
+                 5 as $x | 2 as $x | f($x)"
+            ),
+            ["2"]
+        );
+    }
+
+    #[test]
+    fn test_func_arg_nested_def_dollar_param_under_generator_does_not_capture_caller_var_2096() {
+        // #2096: the capturing binder (`h`'s own `$x` parameter) sits inside
+        // a generator (`(1,2,3) as $x`) that forks the body three times, so
+        // the substituted-in caller `$x` must survive all three forks
+        // unrenamed and uncaptured -- confirmed against jq 1.7.1: `[99,2]`
+        // three times, not `[99,1]`/`[99,2]`/`[99,3]`.
+        assert_eq!(
+            outputs(
+                b"null",
+                "def f(g): (1,2,3) as $x | def h($x): [x, g]; h(99); 2 as $x | f($x)"
+            ),
+            ["[99,2]", "[99,2]", "[99,2]"]
+        );
+    }
+
+    #[test]
     fn test_until_budget_exceeded_errors() {
         // `cond` is always falsy, so `until_step`'s single-output fast path
         // never emits anything before the `WHILE_UNTIL_MAX_STEPS` cap trips.
@@ -66575,7 +66597,7 @@ mod tests {
             slice_number
         );
         assert_eq!(
-            substitute_func_param(&slice_number, "x", &Expr::Identity),
+            substitute_func_param(&slice_number, "x", &Expr::Shared(Rc::new(Expr::Identity))),
             slice_number
         );
     }
