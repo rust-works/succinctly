@@ -33815,20 +33815,21 @@ fn delete_trie_object(
     // the same `Cannot index … with …` error itself — before the trie was
     // ever built.
     //
-    // **Not for all of them, though: this `unreachable!()` is live-reachable
-    // and aborts the process.** `[] | del(.[0], .[1:2].b?[2:3])` reaches it
-    // in jq mode (where jq 1.7.1 prints `[]`), and `2.5 | del(.[("k0","k1")])`
-    // reaches it in yq mode (where real yq prints `2.5`) -- both confirmed
-    // live, both identically reachable before #1690 through this function's
-    // predecessor, whose own comment made the same false claim. Tracked as
-    // [#2049](https://github.com/rust-works/succinctly/issues/2049) rather
-    // than fixed here: turning it into an `EvalError` (which is what the
-    // array arm below already does for its own equivalent gate, and what
-    // #1098 established as this crate's rule) is a behaviour change needing
-    // its own oracle capture of *which* error -- or, per both references
-    // above, of no error at all -- and #1690 is gated on changing nothing.
+    // Not for all of them, though: `[] | del(.[0], .[1:2].b?[2:3])` (jq
+    // mode -- the `?` on `.b?` suppresses resolve_node's field-indexable
+    // check for that branch) and `2.5 | del(.[("k0","k1")])` (yq mode -- a
+    // multi-branch computed key isn't validated by resolve_node the way a
+    // static or single-branch one is) both reach here with a non-object,
+    // non-null root and no prior validation. Both are confirmed live against
+    // the oracle -- jq 1.7.1 prints `[]`, real yq prints `2.5` -- so this is
+    // a no-op through the unvalidated root rather than the `unreachable!()`
+    // that used to sit here and abort the process on this exact input
+    // (#2049).
+    if !matches!(value, OwnedValue::Object(_)) {
+        return Ok(value);
+    }
     let OwnedValue::Object(entries) = &mut value else {
-        unreachable!("delete_trie_object reached a non-object, non-null root")
+        unreachable!("checked above")
     };
     for &slot in &node.field_groups {
         let (name, &child) = node

@@ -20138,6 +20138,35 @@ fn test_1690_yq_del_slice_rules_over_a_merged_match_set() -> Result<()> {
     Ok(())
 }
 
+/// #2049: a multi-branch computed key (`.[("k0","k1")]`) against a scalar
+/// root isn't validated by `resolve_node` the way a static or single-branch
+/// computed key is, so it used to reach `delete_trie_object`'s field-group
+/// arm with a non-object, non-null root and hit a live `unreachable!()` —
+/// aborting the process with exit 101 on ordinary CLI input. Real yq v4.53.3
+/// no-ops through every scalar kind here; verified live.
+#[test]
+fn test_1690_del_multi_branch_computed_key_over_scalar_root_2049() -> Result<()> {
+    for input in ["2.5", "0", r#""a""#, "true", "false"] {
+        let (out, code) = run_yq_stdin(r#"del(.[("k0","k1")])"#, input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "scalar root {input}");
+        assert_eq!(out.trim(), input, "scalar root {input}");
+    }
+
+    // Mixed key kinds (string + number): the field-group half of the trie
+    // walk still no-ops per the fix above, but the numeric key also
+    // populates the trie's *index* group, which then reaches
+    // `delete_trie_array`'s own pre-existing, deliberate non-array gate —
+    // a different, out-of-scope-for-#2049 typed-error path (real yq no-ops
+    // here too, but matching that is a broader change than removing this
+    // issue's `unreachable!()`). The fix's actual contract for this shape is
+    // narrower: no longer a process abort, exit 101 -> a catchable error.
+    let (out, code) = run_yq_stdin(r#"del(.[("k0",0)])"#, "2.5", &["-o=json", "-I=0"])?;
+    assert_ne!(code, 101, "must not crash the process: {out}");
+    assert_eq!(code, 1, "expected a catchable error, got: {out}");
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
 /// multiple values) — the multi-path delete walk never sees the original

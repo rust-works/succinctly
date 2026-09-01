@@ -2204,6 +2204,17 @@ fn test_del_filtered_recursive_descent_1690() {
     );
 }
 
+/// #2049: an array root reaches `delete_trie_object`'s field-group arm
+/// unvalidated when the second comma branch's `?` (`.b?`) suppresses
+/// `resolve_node`'s usual field-indexable check. This used to hit a live
+/// `unreachable!()` and abort the process; real jq 1.7.1 treats it as a
+/// no-op (the array has no `.[0]` to delete, and `.b?` swallows the type
+/// error), so the whole filter is the identity here.
+#[test]
+fn test_del_multi_branch_optional_field_step_over_array_root_2049() {
+    check("[]", "del(.[0], .[1:2].b?[2:3])", Outcome::values(&["[]"]));
+}
+
 /// #1322: `delete_expr_array_paths`'s multi-path type-mismatch check used to
 /// be gated behind `paths.iter().all(|p| p[start].optional)`, but every
 /// sibling here reaching this function already had its own `Expr::Optional`
