@@ -35,14 +35,15 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call, classify_limit_n,
-    classify_nth_n, collapse_vec, collect_pattern_var_names, compare_values, eval as full_eval,
-    eval_each_owned, eval_foreach_with_values, eval_reduce_with_values, extract_pattern_bindings,
-    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, literal_to_owned, needs_path_context,
-    numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
-    slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var, substitute_vars,
-    suppresses, tonumber_from_str, try_reserve_product, vec_with_capacity, Control, Demand,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
+    classify_nth_n, collapse_vec, collect_pattern_var_names, compare_values, enter_def_call_frame,
+    eval as full_eval, eval_each_owned, eval_foreach_with_values, eval_reduce_with_values,
+    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_component_value,
+    index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
+    literal_to_owned, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    owned_bound_to_i64, owned_to_string, slice_object_as_yq_children, slice_owned_value_read,
+    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, try_reserve_product,
+    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, QueryResult, YqSemantics,
 };
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
@@ -5700,7 +5701,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => eval_each_generic::<S, V>(bound, value, optional, cursor, sink),
+            Ok(bound) => {
+                let _guard = enter_def_call_frame(*frames);
+                eval_each_generic::<S, V>(bound, value, optional, cursor, sink)
+            }
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Same split as `eval.rs`'s own `Shared` arm, for the same measured
@@ -5716,7 +5720,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
         }
         Expr::Shared(inner) => {
-            if crate::jq::walk::any_subexpr(inner, &mut |e| matches!(e, Expr::Shared(_))) {
+            if is_pure_chain_link(inner) {
                 drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
             } else {
                 eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
