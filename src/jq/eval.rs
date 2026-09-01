@@ -17898,6 +17898,39 @@ fn reaches_iterate(expr: &Expr) -> bool {
     }
 }
 
+/// Apply `edit` to every element of an array / every value of an object, or
+/// return `None` when `root` is neither (#1429).
+///
+/// The one definition behind the `.[]` fan-out the write walkers all need.
+/// There were four hand-maintained copies of this loop pair before: `=`'s
+/// terminal and mid-chain arms, and `|=`'s. Nothing made them agree, and
+/// they had already drifted once -- `update_path`'s mid-chain arm was
+/// missing #1181's `null`-to-`[]` autovivify that its own terminal twin
+/// had, closed separately as #1919.
+///
+/// Deliberately does *not* fold in the surrounding decisions each caller
+/// makes on either side of the loop -- the yq-only autovivify before it, and
+/// the `optional`/scalar-no-op/`cannot_iterate_with` disposition after it --
+/// which is why `None` is returned rather than an error: those differ per
+/// caller (operator-gated in one, `S::TAG`-gated in another) and folding
+/// them in would replace four visible copies with one hidden set of flags.
+///
+/// `update_path`'s *terminal* `Expr::Iterate` arm is the one fan-out left
+/// out. Its jq-mode #1916 branch rebuilds the container to drop the slots an
+/// empty update filter left behind, rather than mutating each in place, so
+/// it has to split on `Array`/`Object` before it splits on mode -- there is
+/// no in-place loop there to share.
+fn for_each_container_slot<E>(
+    root: &mut OwnedValue,
+    mut edit: impl FnMut(&mut OwnedValue) -> Result<(), E>,
+) -> Option<Result<(), E>> {
+    match root {
+        OwnedValue::Array(arr) => Some(arr.iter_mut().try_for_each(&mut edit)),
+        OwnedValue::Object(map) => Some(map.values_mut().try_for_each(&mut edit)),
+        _ => None,
+    }
+}
+
 /// Set a value at a path in an owned value.
 fn set_path<S: EvalSemantics>(
     root: &mut OwnedValue,
@@ -18012,21 +18045,14 @@ fn set_path<S: EvalSemantics>(
             if scalar_noop {
                 autovivify_array(root);
             }
-            match root {
-                OwnedValue::Array(arr) => {
-                    for elem in arr.iter_mut() {
-                        *elem = new_value.clone();
-                    }
-                    Ok(())
-                }
-                OwnedValue::Object(map) => {
-                    for (_, elem) in map.iter_mut() {
-                        *elem = new_value.clone();
-                    }
-                    Ok(())
-                }
-                _ if scalar_noop && is_yq_field_index_noop_scalar(root) => Ok(()),
-                _ => Err(EvalError::cannot_iterate_with(S::TAG, root)),
+            let fanned = for_each_container_slot(root, |slot| {
+                *slot = new_value.clone();
+                Ok(())
+            });
+            match fanned {
+                Some(result) => result,
+                None if scalar_noop && is_yq_field_index_noop_scalar(root) => Ok(()),
+                None => Err(EvalError::cannot_iterate_with(S::TAG, root)),
             }
         }
         // `.[a:b] = v` splices `v`'s elements over the range, so `v` has to be
@@ -18279,33 +18305,13 @@ fn set_path_steps<S: EvalSemantics>(
             if scalar_noop {
                 autovivify_array(root);
             }
-            match root {
-                OwnedValue::Array(arr) => {
-                    for elem in arr.iter_mut() {
-                        set_path_steps::<S>(
-                            elem,
-                            rest,
-                            new_value.clone(),
-                            scalar_noop,
-                            container_noop,
-                        )?;
-                    }
-                    Ok(())
-                }
-                OwnedValue::Object(map) => {
-                    for (_, elem) in map.iter_mut() {
-                        set_path_steps::<S>(
-                            elem,
-                            rest,
-                            new_value.clone(),
-                            scalar_noop,
-                            container_noop,
-                        )?;
-                    }
-                    Ok(())
-                }
-                _ if optional || noop_here => Ok(()),
-                _ => Err(EvalError::cannot_iterate_with(S::TAG, root)),
+            let fanned = for_each_container_slot(root, |slot| {
+                set_path_steps::<S>(slot, rest, new_value.clone(), scalar_noop, container_noop)
+            });
+            match fanned {
+                Some(result) => result,
+                None if optional || noop_here => Ok(()),
+                None => Err(EvalError::cannot_iterate_with(S::TAG, root)),
             }
         }
         // The chain continues *inside* the slice, so the rest of the walk
@@ -19225,33 +19231,19 @@ fn update_path<S: EvalSemantics>(
                         if S::TAG == EvalTag::Yq {
                             autovivify_array(root);
                         }
-                        match root {
-                            OwnedValue::Array(arr) => {
-                                for elem in arr.iter_mut() {
-                                    update_path::<S>(
-                                        elem,
-                                        &rest,
-                                        filter_expr,
-                                        optional,
-                                        scalar_noop,
-                                    )?;
-                                }
-                                Ok(true)
-                            }
-                            OwnedValue::Object(map) => {
-                                for value in map.values_mut() {
-                                    update_path::<S>(
-                                        value,
-                                        &rest,
-                                        filter_expr,
-                                        optional,
-                                        scalar_noop,
-                                    )?;
-                                }
-                                Ok(true)
-                            }
-                            _ if here || noop_scalar => Ok(false),
-                            _ => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
+                        // `Ok(true)` however many slots were actually
+                        // touched, including none -- see the `Field` arm's
+                        // "neither clause subsumes the other" note above for
+                        // why the stranded check needs `reaches_iterate`
+                        // rather than this answer.
+                        let fanned = for_each_container_slot(root, |slot| {
+                            update_path::<S>(slot, &rest, filter_expr, optional, scalar_noop)
+                                .map(|_| ())
+                        });
+                        match fanned {
+                            Some(result) => result.map(|()| true),
+                            None if here || noop_scalar => Ok(false),
+                            None => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
                         }
                     }
                     // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
@@ -60888,6 +60880,131 @@ mod tests {
                 "((.a.b[0:1])? | .[0]) = 9",
                 Ok(r#"{"a":{"b":[9,2,3]}}"#),
             ),
+        ]);
+    }
+
+    /// #1429: whichever multi-slot construct comes *first* claims the walk.
+    ///
+    /// Before `set_path_steps`, this was an invariant maintained by hand:
+    /// `split_at_iterate` bailed whenever a `Slice` appeared earlier in the
+    /// chain, so that `split_at_slice` -- called *after* it -- got first
+    /// crack, while `split_at_slice` carried no reciprocal bail of its own.
+    /// Correctness therefore rested on the call-site ordering plus a doc
+    /// comment; nothing failed if either drifted. Peeling one component at a
+    /// time makes it structural instead: the first construct in the chain is
+    /// simply the first arm the walk reaches. Both orderings pinned here, and
+    /// both confirmed against real jq 1.7.1.
+    #[test]
+    fn test_assign_leftmost_multi_slot_construct_claims_the_walk_1429() {
+        assert_outcomes(&[
+            // Slice first: the iterate runs *inside* each sliced element.
+            (
+                br#"{"a":[[1,2],[3,4],[5,6]]}"#,
+                ".a[0:2][] = 9",
+                Ok(r#"{"a":[9,9,[5,6]]}"#),
+            ),
+            // Iterate first: the slice runs independently inside each
+            // fanned-out element. Same two constructs, opposite order,
+            // genuinely different answer -- which is why the ordering had to
+            // be right rather than merely consistent.
+            (
+                br#"{"a":[[1,2,3],[4,5,6]]}"#,
+                ".a[][0:2] = [9]",
+                Ok(r#"{"a":[[9,3],[9,6]]}"#),
+            ),
+            // Three constructs deep, alternating, so no two-way precedence
+            // rule could cover it.
+            (
+                br#"{"a":[[[1,2],[3,4]],[[5,6],[7,8]]]}"#,
+                ".a[][0:1][] = 9",
+                Ok(r#"{"a":[[9,[3,4]],[9,[7,8]]]}"#),
+            ),
+        ]);
+    }
+
+    /// #1429: a nested `Paren`/`Pipe` group with neither an iterate nor a
+    /// slice in it is walked once, not scanned twice.
+    ///
+    /// Behaviourally this is #1287's case and is pinned above; what this adds
+    /// is the shape that used to pay *both* `split_at_iterate`'s and
+    /// `split_at_slice`'s full allocate-and-clone flatten before either
+    /// concluded it had nothing to do. A regression here would most likely
+    /// show as a wrong answer rather than a slow one, since re-introducing a
+    /// pre-scan is what would make the group opaque again.
+    #[test]
+    fn test_assign_through_nested_group_without_iterate_or_slice_1429() {
+        assert_outcomes(&[
+            (
+                br#"{"a":{"c":[1,2,3]}}"#,
+                "(.a|.c)[0] = 9",
+                Ok(r#"{"a":{"c":[9,2,3]}}"#),
+            ),
+            (
+                br#"{"a":{"c":{}}}"#,
+                "(.a|.c).d = 9",
+                Ok(r#"{"a":{"c":{"d":9}}}"#),
+            ),
+            // A group nested inside another group -- the shape that
+            // reaches `push_path_components`' own recursion, not just its
+            // top-level splice. Parenthesised as a whole: a bare
+            // `(.a|.b)|(.c) = 9` binds as a *pipe* of two expressions
+            // (`|` is lower-precedence than `=`) and is `{"c":9}` in jq,
+            // not a path at all.
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "((.a|.b)|.c) = 9",
+                Ok(r#"{"a":{"b":{"c":9}}}"#),
+            ),
+        ]);
+    }
+
+    /// #1429: `=` walks a long chain by recursion now, where it used to loop
+    /// inside `get_path_mut`.
+    ///
+    /// `|=` and `del()` have always recursed per component, so this is not a
+    /// new class of depth limit -- but it is new for `=`, and a chain long
+    /// enough to matter has to actually be exercised rather than assumed.
+    ///
+    /// The depths are measured, not guessed. In a *debug* build (larger
+    /// frames, 2 MiB test-thread stack) `set_path_steps` clears 256
+    /// components comfortably while `update_path` -- unchanged by #1429 --
+    /// already aborts with `fatal runtime error: stack overflow` somewhere
+    /// between 128 and 192, so pinning the two at a shared depth would
+    /// mean pinning `=` at `|=`'s pre-existing ceiling. They are pinned
+    /// separately instead: 256 for the walker this issue rewrote, 128 for
+    /// the `|=` twin, which is where they can still be compared directly.
+    ///
+    /// The release CLI is bounded well before any of this: `=`, `|=` and
+    /// `del()` were each run at 256 / 1,000 / 5,000 / 20,000 / 50,000 and
+    /// 200,000 components against the binaries either side of #1429, and
+    /// every one of the thirty-six results is identical -- a clean
+    /// `nesting depth exceeds limit of 384` error (the pre-existing
+    /// *value*-nesting guard, which the rebuilt document trips long before
+    /// the walk itself runs out of stack), never a crash.
+    #[test]
+    fn test_assign_deep_chain_recurses_without_blowing_the_stack_1429() {
+        fn chain(depth: usize) -> (String, String) {
+            let path: String = (0..depth).map(|i| format!(".k{i}")).collect();
+            let mut expected = String::from("9");
+            for i in (0..depth).rev() {
+                expected = format!("{{\"k{i}\":{expected}}}");
+            }
+            (path, expected)
+        }
+
+        let (path, expected) = chain(256);
+        let set = format!("{path} = 9");
+        assert_outcomes(&[(b"null", set.as_str(), Ok(expected.as_str()))]);
+
+        // Shallower, so `|=`'s own deeper recursion still fits: the point
+        // here is that both operators build the identical document, not how
+        // far each can go.
+        let (path, expected) = chain(128);
+        let set = format!("{path} = 9");
+        let update = format!("{path} |= 9");
+        assert_outcomes(&[
+            (b"null", set.as_str(), Ok(expected.as_str())),
+            (b"null", update.as_str(), Ok(expected.as_str())),
         ]);
     }
 
