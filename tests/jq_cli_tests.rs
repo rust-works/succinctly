@@ -20209,6 +20209,60 @@ fn test_jq_string_repetition_accepts_float_count_1230() -> Result<()> {
 /// ARG_MAX in CI ("Argument list too long", os error 7) well before the
 /// query is ever parsed, which is an unrelated process-spawn limit, not
 /// this fix's own behavior.
+/// A very long flat `=` chain exits cleanly rather than crashing, and does so
+/// in linear time -- the two regressions #1429's review caught in the
+/// `set_path_steps` refactor, both measured against the pre-#1429 binary.
+///
+/// `=` used to navigate its prefix in `get_path_mut`'s loop. Peeling one
+/// component per *recursive call* instead put one stack frame on every path
+/// component, and at 500,000 components a release build aborted (SIGABRT)
+/// where it had returned this same clean error (exit 5). The walker now
+/// consumes any step that provably cannot strand -- no `Iterate` left ahead
+/// of it, so there is no slot to undo on the way out -- without leaving a
+/// frame behind, which bounds the frame count by the stranding-capable steps
+/// rather than by path length.
+///
+/// The same shape also caught an O(N^2): the stranded-write test used to
+/// rescan the remaining chain at every frame, costing 0.15 s / 0.58 s /
+/// 2.40 s at N = 16,000 / 32,000 / 64,000 against a flat 0.02 s for the old
+/// walker. `iterate_suffix_len` now answers it in O(1). This test does not
+/// assert a wall-clock bound -- that would be flaky -- but a return of the
+/// quadratic makes it take minutes instead of well under a second, which is
+/// hard to miss; `iterate_suffix_len`'s own unit tests pin the mechanism.
+///
+/// Passed via `-f`, not argv: 200,000 components is a ~2 MB filter, well past
+/// `ARG_MAX` on Linux CI even though macOS would take it.
+#[test]
+fn test_deep_flat_assign_chain_exits_cleanly_not_stack_overflow_1429() -> Result<()> {
+    let n = 200_000;
+    let path: String = (0..n).map(|i| format!(".k{i}")).collect();
+
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, "{path} = 9")?;
+    let filter_path = filter_file.path().to_owned();
+
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "null")?;
+    let input_path = input_file.path().to_owned();
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-f",
+            filter_path.to_str().expect("temp path is utf-8"),
+            input_path.to_str().expect("temp path is utf-8"),
+        ],
+        None,
+    )?;
+    // A refusal, not a crash: the pre-existing value-nesting guard, which the
+    // rebuilt 200,000-deep document trips once the walk itself has completed.
+    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    assert!(
+        err.contains("nesting depth exceeds limit"),
+        "expected the clean depth refusal, got err={err:?} code={code}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_as_pattern_deep_nesting_exits_cleanly_not_stack_overflow_1240() -> Result<()> {
     let n = 300;

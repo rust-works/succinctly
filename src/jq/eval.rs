@@ -18000,14 +18000,24 @@ fn set_path<S: EvalSemantics>(
                 // `get_path_mut` used to clone the component list
                 // (`path_parts.to_vec()`) plus a parallel `vec![false; len]`
                 // for this same case.
-                set_path_steps::<S>(root, exprs, new_value, scalar_noop, container_noop)
-            } else {
                 set_path_steps::<S>(
                     root,
-                    &flatten_path_components(exprs),
+                    exprs,
                     new_value,
                     scalar_noop,
                     container_noop,
+                    iterate_suffix_len(exprs),
+                )
+            } else {
+                let flat = flatten_path_components(exprs);
+                let iterate_suffix = iterate_suffix_len(&flat);
+                set_path_steps::<S>(
+                    root,
+                    &flat,
+                    new_value,
+                    scalar_noop,
+                    container_noop,
+                    iterate_suffix,
                 )
             }
         }
@@ -18119,6 +18129,72 @@ fn is_atomic_path_component(expr: &Expr) -> bool {
     )
 }
 
+/// #1428's stranded-write test, shared by `=`'s and `|=`'s chain walkers.
+///
+/// Walking toward a write target creates every missing step on the way. A
+/// tail that then turns out to write nothing -- an `Iterate` over the `Null`
+/// autovivification just produced has no elements -- must leave the document
+/// alone, so the frame that created the slot undoes it on the way out. The
+/// four call sites (two walkers x `Field`/`Index`) differ only in the
+/// container mechanics that follow: `map.shift_remove` against
+/// `arr.truncate`. The *decision* is one rule and lives here.
+///
+/// Factored out on review of #1429, for the reason that PR's own
+/// `for_each_container_slot` gives: the rule has already been amended more
+/// than once, four hand-maintained copies have no compiler-enforced link,
+/// and this file has watched that exact shape drift before.
+///
+/// `created` is whether this frame is responsible for the slot at all -- `=`'s
+/// `Index` arm and `|=`'s pass `true` and gate on the array having actually
+/// grown instead, since `write_index` pads rather than inserting one slot.
+/// `nothing_written` is the caller's own evidence that the tail declined to
+/// write: an `Iterate` still ahead in the chain, or (`|=` only, #1877/#1894)
+/// an update filter that produced no output at all. Neither subsumes the
+/// other -- the `Iterate` arms report `Ok(true)` for a container however many
+/// elements they touch, including none.
+///
+/// `still_null` is read last on purpose: a write whose value happens to be
+/// `null` is indistinguishable from no write at all by looking at the slot,
+/// which is why `nothing_written` has to be established independently
+/// (`null | (.a|.) = null` must keep `{"a": null}`).
+fn slot_was_stranded<T, E>(
+    created: bool,
+    undo_enabled: bool,
+    nothing_written: bool,
+    result: &Result<T, E>,
+    current: &OwnedValue,
+) -> bool {
+    created
+        && undo_enabled
+        && nothing_written
+        && result.is_ok()
+        && matches!(current, OwnedValue::Null)
+}
+
+/// Length of the shortest suffix of `steps` that still contains an `Iterate`,
+/// or `usize::MAX` when there is none.
+///
+/// [`set_path_steps`]'s stranded-write undo needs to know, at each frame,
+/// whether an `Iterate` remains anywhere in the chain ahead of it. Asking
+/// `rest.iter().any(reaches_iterate)` per frame is the obvious spelling and
+/// is quadratic: `rest` shrinks by one per frame and the scan never
+/// short-circuits when there is no `Iterate` to find, so a flat `.k0.k1…kN =
+/// 9` pays `N(N-1)/2` comparisons. Measured before this was hoisted: 0.15 s
+/// at N=16,000, 0.58 s at 32,000, 2.40 s at 64,000 -- a clean 4x per
+/// doubling, against a flat 0.02 s for the pre-#1429 walker, which asked the
+/// equivalent question once.
+///
+/// Because every recursive call receives a *suffix* of the same list, one
+/// number computed up front answers all of them: `rest` contains an
+/// `Iterate` exactly when `rest.len() >= iterate_suffix`. O(N) once, O(1)
+/// per frame.
+fn iterate_suffix_len(steps: &[Expr]) -> usize {
+    steps
+        .iter()
+        .rposition(reaches_iterate)
+        .map_or(usize::MAX, |at| steps.len() - at)
+}
+
 /// Walk a *flat* list of atomic path components, peeling one per call, and
 /// write `new_value` at the end (#1429).
 ///
@@ -18149,61 +18225,131 @@ fn set_path_steps<S: EvalSemantics>(
     new_value: OwnedValue,
     scalar_noop: bool,
     container_noop: bool,
+    iterate_suffix: usize,
 ) -> Result<(), EvalError> {
-    let (first, rest) = match steps {
-        // Nothing left to navigate, so this *is* the write. Reached only via
-        // the flattener, when every step it produces is an `Identity` it then
-        // drops -- which needs a nested group sitting *alongside* another
-        // component, `((.|.) | .) = 9` or `(.|(.|.)) = 9`, since that is what
-        // makes the list non-atomic in the first place. Neither `((.|.)) = 9`
-        // nor `(.|.) = 9` gets here: `set_path`'s own `Paren` arm unwraps the
-        // outer parens, leaving a list that is already atomic (`Identity`
-        // counts, see `is_atomic_path_component`), so both stay on the
-        // borrowed path with the trailing `Identity` as the terminal
-        // component. Confirmed by instrumenting this arm and running all
-        // four spellings.
-        [] => {
-            *root = new_value;
-            return Ok(());
-        }
-        [last] => {
-            // A `?`-marked *terminal slice* reached through a chain
-            // (`.a[0:1]? = 9`) is the one component that must not go through
-            // `set_path`'s `Expr::Optional` catch-and-swallow arm: the split
-            // this replaced threaded the `?` into `through_slice`'s own
-            // bounds gate instead (#1303), which suppresses an out-of-range
-            // slice while still leaving `slice_assign_non_array`/
-            // `cannot_update_string_slices` to raise. Catch-and-swallow
-            // would abandon the whole write instead. Every other terminal
-            // component -- including a `?`-marked `Field`/`Index`/`Iterate`,
-            // which the split-based walker also routed through
-            // catch-and-swallow -- delegates unchanged.
-            let (component, optional) = unwrap_path_component(last);
-            if let Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } = component {
-                return through_slice(
-                    root,
-                    *start,
-                    *end,
-                    SliceEditFlags {
-                        optional,
-                        scalar_noop,
-                        container_noop,
-                        // The slice genuinely is the last path component, so
-                        // this call's own `edit` is the write (#1321).
-                        terminal_write: true,
-                    },
-                    // Always `true` -- `=`'s RHS is an already-materialized
-                    // value, it has no `|= empty` concept (#1877/#1894).
-                    |sub| {
-                        *sub = new_value;
-                        Ok(true)
-                    },
-                )
-                .map(|_| ());
+    // A frame exists here for exactly one reason: so that the slot it created
+    // is still reachable when the recursion returns and may have to be undone
+    // (#1428). A step whose remaining chain holds no `Iterate` can never
+    // strand -- `rest_reaches_iterate` below is the whole undo condition --
+    // so that frame has nothing to come back to, and consuming the step in
+    // place is not an optimization of the recursion but the absence of a
+    // reason for it.
+    //
+    // Load-bearing, not a nicety. `=` navigated its prefix in
+    // `get_path_mut`'s loop before #1429; recursing unconditionally instead
+    // made a long flat chain abort on a blown stack in *release* where it had
+    // returned a clean `nesting depth exceeds limit of 384` -- measured at
+    // 500,000 components, SIGABRT against the pre-#1429 binary's exit 5.
+    // Bounding the frame count by the number of steps that can actually
+    // strand restores that, and leaves the recursion for the shapes that
+    // genuinely need it.
+    let mut root = root;
+    let mut steps = steps;
+    let (first, rest) = loop {
+        let (first, rest) = match steps {
+            // Nothing left to navigate, so this *is* the write. Reached only via
+            // the flattener, when every step it produces is an `Identity` it then
+            // drops -- which needs a nested group sitting *alongside* another
+            // component, `((.|.) | .) = 9` or `(.|(.|.)) = 9`, since that is what
+            // makes the list non-atomic in the first place. Neither `((.|.)) = 9`
+            // nor `(.|.) = 9` gets here: `set_path`'s own `Paren` arm unwraps the
+            // outer parens, leaving a list that is already atomic (`Identity`
+            // counts, see `is_atomic_path_component`), so both stay on the
+            // borrowed path with the trailing `Identity` as the terminal
+            // component. Confirmed by instrumenting this arm and running all
+            // four spellings.
+            [] => {
+                *root = new_value;
+                return Ok(());
             }
-            return set_path::<S>(root, last, new_value, scalar_noop, container_noop);
+            [last] => {
+                // A `?`-marked *terminal slice* reached through a chain
+                // (`.a[0:1]? = 9`) is the one component that must not go through
+                // `set_path`'s `Expr::Optional` catch-and-swallow arm: the split
+                // this replaced threaded the `?` into `through_slice`'s own
+                // bounds gate instead (#1303), which suppresses an out-of-range
+                // slice while still leaving `slice_assign_non_array`/
+                // `cannot_update_string_slices` to raise. Catch-and-swallow
+                // would abandon the whole write instead. Every other terminal
+                // component -- including a `?`-marked `Field`/`Index`/`Iterate`,
+                // which the split-based walker also routed through
+                // catch-and-swallow -- delegates unchanged.
+                let (component, optional) = unwrap_path_component(last);
+                if let Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } = component
+                {
+                    return through_slice(
+                        root,
+                        *start,
+                        *end,
+                        SliceEditFlags {
+                            optional,
+                            scalar_noop,
+                            container_noop,
+                            // The slice genuinely is the last path component, so
+                            // this call's own `edit` is the write (#1321).
+                            terminal_write: true,
+                        },
+                        // Always `true` -- `=`'s RHS is an already-materialized
+                        // value, it has no `|= empty` concept (#1877/#1894).
+                        |sub| {
+                            *sub = new_value;
+                            Ok(true)
+                        },
+                    )
+                    .map(|_| ());
+                }
+                return set_path::<S>(root, last, new_value, scalar_noop, container_noop);
+            }
+            [first, rest @ ..] => (first, rest),
+        };
+
+        // Same reading as below, hoisted so the in-place arms can use it: an
+        // `Iterate` still ahead means this step's slot may have to be undone,
+        // which needs the frame.
+        if rest.len() >= iterate_suffix {
+            break (first, rest);
         }
-        [first, rest @ ..] => (first, rest),
+        let (component, optional) = unwrap_path_component(first);
+        let noop_here = scalar_noop && is_yq_field_index_noop_scalar(root);
+        root = match component {
+            Expr::Identity => root,
+            Expr::Field(name) => {
+                autovivify_object(root);
+                if let OwnedValue::Object(map) = root {
+                    map.entry(name.clone()).or_insert(OwnedValue::Null)
+                } else if optional || noop_here {
+                    return Ok(());
+                } else {
+                    return Err(EvalError::cannot_index_with_field(
+                        owned_type_name(root),
+                        name,
+                    ));
+                }
+            }
+            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+                autovivify_array(root);
+                if let OwnedValue::Array(arr) = root {
+                    // A still-negative index after counting back from the end
+                    // is jq's write-time bounds check, which `?` never covers
+                    // -- so this propagates rather than folding into the
+                    // `optional` branch, exactly as `get_path_mut` had it.
+                    write_index(arr, *idx)?
+                } else if optional || noop_here {
+                    return Ok(());
+                } else {
+                    return Err(EvalError::cannot_index_with_type(
+                        owned_type_name(root),
+                        "number",
+                    ));
+                }
+            }
+            // A `Slice` hands its tail to `through_slice`'s closure and the
+            // guard arms report their own errors; neither is a plain step to
+            // walk past. (`Iterate` cannot reach here at all -- one still
+            // ahead is what the `break` above tests for.)
+            _ => break (first, rest),
+        };
+        steps = rest;
     };
 
     let (component, optional) = unwrap_path_component(first);
@@ -18231,14 +18377,25 @@ fn set_path_steps<S: EvalSemantics>(
     // slot, and the inner frame restores *its* parent to `Null` on the way
     // out, so the outer frame's reading is accurate again by the time it
     // looks.
-    let rest_reaches_iterate = rest.iter().any(reaches_iterate);
+    // O(1) against [`iterate_suffix_len`], computed once for the whole walk:
+    // every recursive call gets a suffix of the same list, so "an `Iterate`
+    // remains in `rest`" is just a length comparison. Scanning `rest` here
+    // instead is quadratic over a long chain -- see that function.
+    let rest_reaches_iterate = rest.len() >= iterate_suffix;
 
     match component {
         // Only ever reached on the borrowed fast path: `.a | . | .b = 9` keeps
         // its `Identity` because `is_atomic_path_component` accepts one, where
         // `flatten_path_components` would have dropped it. Nothing to
         // navigate either way.
-        Expr::Identity => set_path_steps::<S>(root, rest, new_value, scalar_noop, container_noop),
+        Expr::Identity => set_path_steps::<S>(
+            root,
+            rest,
+            new_value,
+            scalar_noop,
+            container_noop,
+            iterate_suffix,
+        ),
         Expr::Field(name) => {
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_object(root);
@@ -18246,13 +18403,21 @@ fn set_path_steps<S: EvalSemantics>(
                 let created = !map.contains_key(name);
                 let (result, stranded) = {
                     let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                    let result =
-                        set_path_steps::<S>(current, rest, new_value, scalar_noop, container_noop);
-                    let stranded = created
-                        && undo_stranded
-                        && rest_reaches_iterate
-                        && result.is_ok()
-                        && matches!(*current, OwnedValue::Null);
+                    let result = set_path_steps::<S>(
+                        current,
+                        rest,
+                        new_value,
+                        scalar_noop,
+                        container_noop,
+                        iterate_suffix,
+                    );
+                    let stranded = slot_was_stranded(
+                        created,
+                        undo_stranded,
+                        rest_reaches_iterate,
+                        &result,
+                        current,
+                    );
                     (result, stranded)
                 };
                 if stranded {
@@ -18283,12 +18448,21 @@ fn set_path_steps<S: EvalSemantics>(
                     // rather than being folded into the `optional` branch
                     // below, exactly as `get_path_mut` had it.
                     let current = write_index(arr, *idx)?;
-                    let result =
-                        set_path_steps::<S>(current, rest, new_value, scalar_noop, container_noop);
-                    let stranded = undo_stranded
-                        && rest_reaches_iterate
-                        && result.is_ok()
-                        && matches!(*current, OwnedValue::Null);
+                    let result = set_path_steps::<S>(
+                        current,
+                        rest,
+                        new_value,
+                        scalar_noop,
+                        container_noop,
+                        iterate_suffix,
+                    );
+                    let stranded = slot_was_stranded(
+                        true,
+                        undo_stranded,
+                        rest_reaches_iterate,
+                        &result,
+                        current,
+                    );
                     (result, stranded)
                 };
                 // `write_index` pads with `Null`s to reach a positive
@@ -18325,7 +18499,14 @@ fn set_path_steps<S: EvalSemantics>(
                 autovivify_array(root);
             }
             let fanned = for_each_container_slot(root, |slot| {
-                set_path_steps::<S>(slot, rest, new_value.clone(), scalar_noop, container_noop)
+                set_path_steps::<S>(
+                    slot,
+                    rest,
+                    new_value.clone(),
+                    scalar_noop,
+                    container_noop,
+                    iterate_suffix,
+                )
             });
             match fanned {
                 Some(result) => result,
@@ -18356,6 +18537,7 @@ fn set_path_steps<S: EvalSemantics>(
                     new_value,
                     scalar_noop,
                     container_noop,
+                    iterate_suffix,
                 ))
             },
         )
@@ -19167,11 +19349,13 @@ fn update_path<S: EvalSemantics>(
                                 // registers as `Ok(false)`, and
                                 // `reaches_iterate` stays the only signal
                                 // that catches it.
-                                let stranded = created
-                                    && undo_stranded
-                                    && (reaches_iterate(&rest) || matches!(result, Ok(false)))
-                                    && result.is_ok()
-                                    && matches!(*current, OwnedValue::Null);
+                                let stranded = slot_was_stranded(
+                                    created,
+                                    undo_stranded,
+                                    reaches_iterate(&rest) || matches!(result, Ok(false)),
+                                    &result,
+                                    current,
+                                );
                                 (result, stranded)
                             };
                             if stranded {
@@ -19218,10 +19402,13 @@ fn update_path<S: EvalSemantics>(
                                 );
                                 // See the `Field` arm above, including the
                                 // `Ok(false)` OR-clause (#1877/#1894).
-                                let stranded = undo_stranded
-                                    && (reaches_iterate(&rest) || matches!(result, Ok(false)))
-                                    && result.is_ok()
-                                    && matches!(*current, OwnedValue::Null);
+                                let stranded = slot_was_stranded(
+                                    true,
+                                    undo_stranded,
+                                    reaches_iterate(&rest) || matches!(result, Ok(false)),
+                                    &result,
+                                    current,
+                                );
                                 (result, stranded)
                             };
                             if stranded && arr.len() > original_len {
@@ -61222,31 +61409,68 @@ mod tests {
         ]);
     }
 
-    /// #1429: `=` walks a long chain by recursion now, where it used to loop
-    /// inside `get_path_mut`.
+    /// #1429: [`iterate_suffix_len`]'s O(1) answer agrees with the O(N) scan
+    /// it replaced.
     ///
-    /// `|=` and `del()` have always recursed per component, so this is not a
-    /// new class of depth limit -- but it is new for `=`, and a chain long
-    /// enough to matter has to actually be exercised rather than assumed.
-    ///
-    /// The depths are measured, not guessed. In a *debug* build (larger
-    /// frames, 2 MiB test-thread stack) `set_path_steps` clears 256
-    /// components comfortably while `update_path` -- unchanged by #1429 --
-    /// already aborts with `fatal runtime error: stack overflow` somewhere
-    /// between 128 and 192, so pinning the two at a shared depth would
-    /// mean pinning `=` at `|=`'s pre-existing ceiling. They are pinned
-    /// separately instead: 256 for the walker this issue rewrote, 128 for
-    /// the `|=` twin, which is where they can still be compared directly.
-    ///
-    /// The release CLI is bounded well before any of this: `=`, `|=` and
-    /// `del()` were each run at 256 / 1,000 / 5,000 / 20,000 / 50,000 and
-    /// 200,000 components against the binaries either side of #1429, and
-    /// every one of the thirty-six results is identical -- a clean
-    /// `nesting depth exceeds limit of 384` error (the pre-existing
-    /// *value*-nesting guard, which the rebuilt document trips long before
-    /// the walk itself runs out of stack), never a crash.
+    /// This is the whole mechanism behind the stranded-write undo now, so it
+    /// is pinned against the definition it has to match --
+    /// `rest.iter().any(reaches_iterate)` -- rather than against hand-written
+    /// expectations, over every suffix of a chain that mixes both kinds of
+    /// component and both `Iterate` spellings.
     #[test]
-    fn test_assign_deep_chain_recurses_without_blowing_the_stack_1429() {
+    fn test_iterate_suffix_len_matches_a_direct_scan_1429() {
+        let steps = [
+            Expr::Field("a".to_string()),
+            Expr::Iterate,
+            Expr::Index(0),
+            Expr::Optional(Box::new(Expr::Iterate)),
+            Expr::Field("b".to_string()),
+            Expr::Slice {
+                start: None,
+                end: None,
+            },
+        ];
+        let suffix = iterate_suffix_len(&steps);
+        for cut in 0..=steps.len() {
+            let rest = &steps[cut..];
+            assert_eq!(
+                rest.len() >= suffix,
+                rest.iter().any(reaches_iterate),
+                "disagreement on suffix starting at {cut}"
+            );
+        }
+
+        // No `Iterate` anywhere: every suffix must answer `false`, which is
+        // what `usize::MAX` buys -- a sentinel no `rest.len()` can reach.
+        let none = [
+            Expr::Field("a".to_string()),
+            Expr::Index(0),
+            Expr::Field("b".to_string()),
+        ];
+        assert_eq!(iterate_suffix_len(&none), usize::MAX);
+        for cut in 0..=none.len() {
+            assert!(none[cut..].len() < iterate_suffix_len(&none));
+        }
+    }
+
+    /// #1429: a long chain writes the same document under `=` as under `|=`.
+    ///
+    /// `=` briefly recursed per path component during this refactor, which
+    /// review caught as a release-build stack-overflow regression; it now
+    /// consumes any step that cannot strand without leaving a frame, so its
+    /// stack use is bounded by the stranding-capable steps rather than by
+    /// path length. The end-to-end proof of that is
+    /// `test_deep_flat_assign_chain_exits_cleanly_not_stack_overflow_1429`
+    /// in tests/jq_cli_tests.rs, at 200,000 components.
+    ///
+    /// What is left here is the agreement check, and the depths are still
+    /// measured rather than guessed: `|=` -- untouched by #1429, and
+    /// recursive per component -- already aborts in a *debug* build (larger
+    /// frames, 2 MiB test-thread stack) somewhere between 128 and 192, so the
+    /// two operators are pinned at 256 and 128 rather than at a shared depth
+    /// that would silently be `|=`'s pre-existing ceiling.
+    #[test]
+    fn test_assign_deep_chain_agrees_with_the_update_walker_1429() {
         fn chain(depth: usize) -> (String, String) {
             let path: String = (0..depth).map(|i| format!(".k{i}")).collect();
             let mut expected = String::from("9");
@@ -61825,16 +62049,18 @@ mod tests {
         // multi-part chain, not just the first step (#1429: this used to be
         // `get_path_mut`'s job, and its own direct-call coverage).
         let mut root = OwnedValue::Object(IndexMap::new());
+        let steps = [
+            Expr::Field("a".to_string()),
+            Expr::Field("b".to_string()),
+            Expr::Field("c".to_string()),
+        ];
         set_path_steps::<JqSemantics>(
             &mut root,
-            &[
-                Expr::Field("a".to_string()),
-                Expr::Field("b".to_string()),
-                Expr::Field("c".to_string()),
-            ],
+            &steps,
             OwnedValue::Int(7),
             false,
             false,
+            iterate_suffix_len(&steps),
         )
         .unwrap();
         assert_eq!(
@@ -61886,15 +62112,27 @@ mod tests {
         // not the terminal one above that raises.
         let steps = [Expr::Iterate, Expr::Field("b".to_string())];
         let mut target = OwnedValue::Float(3.0);
-        let err =
-            set_path_steps::<YqSemantics>(&mut target, &steps, OwnedValue::Int(9), false, false)
-                .unwrap_err();
+        let err = set_path_steps::<YqSemantics>(
+            &mut target,
+            &steps,
+            OwnedValue::Int(9),
+            false,
+            false,
+            iterate_suffix_len(&steps),
+        )
+        .unwrap_err();
         assert_eq!(err.message, "Cannot iterate over number (3.0)");
 
         let mut target = OwnedValue::Float(3.0);
-        let err =
-            set_path_steps::<JqSemantics>(&mut target, &steps, OwnedValue::Int(9), false, false)
-                .unwrap_err();
+        let err = set_path_steps::<JqSemantics>(
+            &mut target,
+            &steps,
+            OwnedValue::Int(9),
+            false,
+            false,
+            iterate_suffix_len(&steps),
+        )
+        .unwrap_err();
         assert_eq!(err.message, "Cannot iterate over number (3)");
     }
 
@@ -65774,6 +66012,7 @@ mod tests {
                 OwnedValue::Int(1),
                 false,
                 false,
+                iterate_suffix_len(&[Expr::Var("k".to_string()), Expr::Field("a".to_string())]),
             )
             .unwrap_err();
             assert_eq!(err.message, "invalid path component");
@@ -65793,6 +66032,7 @@ mod tests {
                 OwnedValue::Int(1),
                 false,
                 false,
+                iterate_suffix_len(&[unresolved(), Expr::Field("a".to_string())]),
             )
             .unwrap_err();
             assert_eq!(
@@ -65903,6 +66143,7 @@ mod tests {
                 OwnedValue::Int(1),
                 false,
                 false,
+                iterate_suffix_len(&[unresolved(), Expr::Field("a".to_string())]),
             )
             .unwrap_err();
             assert_eq!(
