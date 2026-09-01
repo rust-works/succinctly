@@ -1004,7 +1004,9 @@ fix relies on).
 
 [#1232](https://github.com/rust-works/succinctly/issues/1232) widened #1181's scalar-target
 no-op to a scalar hit *before* the last path component (`.a.b = 99` on a scalar `.a`
-no-ops), but only for the *static*-path walkers (`get_path_mut`/`set_path`/`update_path`).
+no-ops), but only for the *static*-path walkers (`set_path`/`update_path` — at the time
+`=`'s own share of that lived in `get_path_mut`, folded into `set_path_steps` by
+[#1429](https://github.com/rust-works/succinctly/issues/1429)).
 A path that needs the full `resolve_dynamic_indexes` pre-pass — a computed key, or a
 `Comma`-grouped LHS — resolves each component through a plain read evaluator with no yq
 scalar-noop awareness at all, so the boundary this section's *previous* entry describes
@@ -1032,7 +1034,10 @@ silently, even though the write itself — `.[$k] = 99` — already correctly no
 under plain `=` (`.a[].b = 99`) always errored "invalid path component" — in both jq and yq
 mode, and predating #1232 entirely (`|=`/`+=`/`-=`/`*=`/`del()` were unaffected, their own
 recursive-descent walkers already supported fan-out). #1298 added `split_at_iterate`/
-`set_path_through_iterate` so `=` fans out per element like every other operator, and gave
+`set_path_through_iterate` so `=` fans out per element like every other operator (both since
+folded into `set_path_steps`' own mid-chain `Iterate` arm by
+[#1429](https://github.com/rust-works/succinctly/issues/1429), which replaced the whole
+pre-scan with one peel-and-recurse walk — same behaviour, verified byte-identical), and gave
 `navigate_read_only`'s prefix walk (`yq_assign_is_total_noop`'s own eager-RHS-discard
 pre-check, #1232's `PrefixNavOutcome`) an `Expr::Iterate` arm too — but only for the
 narrowest case, `.a` itself being a genuine scalar (`.a[].b = error("boom")` on `a: 5` now
@@ -1043,7 +1048,8 @@ RHS-discard rule for a mid-chain `Iterate` is broader than #1298's own narrowest
 container whose own elements *all* individually no-op also discards the RHS, and so does an
 empty container (vacuously). New `assign_path_all_noop` recurses into
 `.iter().all(...)`/`.values().all(...)` at such an `Iterate` instead of unconditionally
-deferring, a read-only dry run of `set_path_through_iterate`'s own per-element recursion:
+deferring, a read-only dry run of the `=` walker's own per-element recursion (then
+`set_path_through_iterate`, now `set_path_steps`' `Iterate` arm):
 
 ```bash
 $ printf 'a: [1, 2]\n' | yq            -o=json '.a[].b = error("boom")'   # {"a":[1,2]}, no-op

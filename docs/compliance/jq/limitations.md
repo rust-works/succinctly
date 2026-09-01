@@ -412,7 +412,9 @@ whatever container the path names. Four non-slice rows used to sit above these �
 on `null`, `.a.b = 1` on `{}`, `.[5] = 9` and `.[5] |= 9` on `[1,2]`, all reported as
 `Cannot index …`/`index N out of bounds (length M)` where jq builds or pads the container —
 closed together by [#486](https://github.com/rust-works/succinctly/issues/486)
-(`set_path`/`get_path_mut`/`update_path` now vivify `null` and pad past the array end, the
+(`set_path`/`update_path`, and `=`'s own chain walker — then `get_path_mut`, now
+`set_path_steps` since [#1429](https://github.com/rust-works/succinctly/issues/1429) —
+now vivify `null` and pad past the array end, the
 way `set_value_at_path` already did for `setpath()`) and
 [#498](https://github.com/rust-works/succinctly/issues/498) (the write-time negative-index
 bounds check now survives `?`, since padding is what makes the positive case succeed rather
@@ -485,7 +487,8 @@ the mechanism.
 `setpath` is the same operation without the syntax, and after #359 it does follow jq —
 `[1,2] | setpath([5]; 9)` is `[1,2,null,null,null,9]`, and `null | setpath(["a"]; 1)` is
 `{"a":1}`. The two used to disagree with each other in-tree; [#486](https://github.com/rust-works/succinctly/issues/486)
-closed that by teaching `set_path`/`get_path_mut`/`update_path` to vivify the way
+closed that by teaching `set_path`/`update_path` and `=`'s chain walker (then
+`get_path_mut`, now `set_path_steps`) to vivify the way
 `set_value_at_path` already did, so `=`/`|=`/the compound operators/`//=` now agree with
 `setpath` on every one of the four shapes removed from the table earlier in this section.
 `delete_at_path` deliberately keeps its own,
