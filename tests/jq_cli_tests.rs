@@ -29227,3 +29227,62 @@ fn test_path_still_raises_on_an_undecodable_sibling_2061() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2061: the walk's remaining arms — navigating *through* an absent node, and
+/// the multi-stage pipe forms.
+///
+/// These are the shapes the first round of tests missed: `Iterate` and the
+/// index/field steps each have a distinct `PathNode::Absent` arm, reached only
+/// when an earlier component did not exist in the document, and a pipe of more
+/// than two stages takes a different branch from a two-stage one. Every row is
+/// jq 1.7.1's own output.
+#[test]
+fn test_path_cursor_native_absent_nodes_and_pipes_2061() -> Result<()> {
+    for (filter, input, want) in [
+        // Navigating on through an absent node: jq keeps yielding the path.
+        ("path(.a.b.c)", "{}", "[\"a\",\"b\",\"c\"]\n"),
+        ("path(.a[0])", "{}", "[\"a\",0]\n"),
+        // Identity and a parenthesised stage inside a pipe.
+        ("path(.|.a)", "{}", "[\"a\"]\n"),
+        ("path((.a)|.b)", "{}", "[\"a\",\"b\"]\n"),
+        // Three stages: the `rest.len() > 1` branch, distinct from two.
+        ("path(.a|.|.b)", "{}", "[\"a\",\"b\"]\n"),
+        (
+            "path(.a.b.c)",
+            "{\"a\":{\"b\":{\"c\":1}}}",
+            "[\"a\",\"b\",\"c\"]\n",
+        ),
+        // Iterate as a later pipe stage, over both container kinds.
+        ("path(.[]|.[])", "{\"a\":{\"b\":1}}", "[\"a\",\"b\"]\n"),
+        ("path(.[]|.[])", "{\"a\":[1,2]}", "[\"a\",0]\n[\"a\",1]\n"),
+        ("path(.a[])", "{\"a\":[1,2]}", "[\"a\",0]\n[\"a\",1]\n"),
+        ("path(.a[])", "{\"a\":{\"b\":1}}", "[\"a\",\"b\"]\n"),
+        // An empty container iterates to nothing rather than erroring.
+        ("[path(.[]|.[])]", "{}", "[]\n"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on `{input}`");
+        assert_eq!(stdout, want, "`{filter}` on `{input}`");
+    }
+
+    // Iterating an absent node raises, exactly as iterating an explicit null
+    // does -- the `PathNode::Absent` arm of the `Iterate` step.
+    for (filter, input) in [("path(.a[])", "{}"), ("path(.a|.[])", "{}")] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}` on `{input}`: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Cannot iterate over null"),
+            "`{filter}` on `{input}`: {stderr}"
+        );
+    }
+
+    // A type error reached *after* an absent step still names the right type.
+    let (_, stderr, code) = run_jq_stdin_streams("path(.a.b.c)", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Cannot index array with string \"b\""),
+        "{stderr}"
+    );
+
+    Ok(())
+}
