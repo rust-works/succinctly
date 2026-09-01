@@ -7467,6 +7467,73 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     assert_eq!(code, 0);
     assert!(stdout.trim().is_empty(), "halt should suppress all output");
 
+    // The body producing a *bare* Error/Break/Halt/None -- not wrapped in
+    // a `Partial` -- is a structurally distinct case from the
+    // Comma-accumulation shapes above: the very first (only) body stage
+    // itself terminates before any output is ever collected, so
+    // `eval_pipe_with_path_context_internal` never reaches
+    // `accumulate_path_context_step` at all for this pipe.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | first(empty) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | first(error(\"x\")) | key"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains('x'));
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | first(halt) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | (.a | first(break $out) | key)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    // `Partial` with an *empty* prefix (the very first comma branch is
+    // what terminates, before any output was ever collected) -- `first`
+    // has nothing satisfying to fall back on here, so it surfaces the
+    // control just like `last` always does.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | first((error(\"x\"), 1)) | key"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains('x'));
+
+    // Same bare-terminator cases for `last`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | last(empty) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    // Empty body -> `null` (#1521), continuing `rest` from the fallback
+    // (ambient) path since no real navigation happened -- `key` there
+    // answers the *enclosing* container's own key, `"a"`, not a fabricated
+    // one.
+    assert_eq!(stdout.trim(), "\"a\"");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".a | last(error(\"x\")) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains('x'));
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | last(halt) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | (.a | last(break $out) | key)"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
     // The common case (no path-context builtin in the body) is unaffected.
     let (stdout, _, code) = run_jq_full(&["-c", "[first(.[])]"], Some(r"[1,2,3]"))?;
     assert_eq!(code, 0);
