@@ -1394,11 +1394,19 @@ are now rejected before it runs.
 Two deliberate remainders:
 
 - **The reported line is located by searching the filter source for the offending
-  identifier**, since `Expr::FuncCall` carries no source position. A filter mentioning the
-  same undefined name more than once cites the first occurrence's line, and only the first
-  unresolvable call is reported (`jq: 1 compile error`) where jq reports all of them. Adding
-  a position to the AST would perturb `format!("{body:?}").len()`, which #1381's
-  `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against.
+  identifier**, since `Expr::FuncCall` carries no source position. Adding a position to
+  the AST would perturb `format!("{body:?}").len()`, which #1381's
+  `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against, so this stays a textual search
+  rather than a real position lookup. [#2037](https://github.com/rust-works/succinctly/issues/2037)
+  closed the two sharpest edges of that: every unresolvable call is now reported, not just
+  the first (`jq: N compile errors`, matching jq's own count), and a name mentioned more
+  than once has each of its occurrences located independently — the search for the *k*-th
+  reported call of a given name resumes right after the (*k*-1)-th one's match, rather than
+  re-finding the first occurrence every time. This matches jq byte-for-byte whenever
+  `resolve_func_calls_all`'s traversal order agrees with a left-to-right textual scan,
+  which holds for every existing `Expr` variant, but it is still a heuristic over source
+  text, not a proof from real positions — a construct that visits the same name's call
+  sites in an order the text scan wouldn't predict could still cite the wrong occurrence.
 - **A call reached through an `include`d module or `~/.jq` reports no location at all.** It
   has no occurrence in the filter source to locate, so the line marker and source echo are
   dropped rather than a position invented: `nosuchfn/0 is not defined at <top-level>` where
