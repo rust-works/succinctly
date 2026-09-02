@@ -20642,6 +20642,21 @@ pub(crate) enum PathTrail {
     Node {
         parent: Rc<Self>,
         component: OwnedValue,
+        /// Components from `Root` to here, inclusive. `Root` = 0. Keeps
+        /// [`Self::depth`] O(1) without walking the chain — the same reason
+        /// `PathPrefix` carries this field, and load-bearing for the exact
+        /// same reason (#2058 code review): a naive Rust recursive walk over
+        /// a `Pipe`/`Comma` chain has no depth cap of its own, so a
+        /// pathologically deep static chain (`path(.a.a.a...)`, a million
+        /// `.a` segments) would recurse the native call stack until it
+        /// overflows and aborts the process — silent and unrecoverable,
+        /// unlike a panic. `assert_value_tree_depth(depth)` at the top of
+        /// every function that recurses once per chain step converts that
+        /// crash into a clean, `catch_unwind`-caught CLI error, the same
+        /// guarantee `collect_paths`/`collect_tostream_events`/
+        /// `collect_leaf_paths` already give recursive value-tree walks
+        /// elsewhere in this file (#1005/#1021/#1025).
+        depth: usize,
     },
 }
 
@@ -20654,11 +20669,21 @@ impl PathTrail {
         Rc::new(Self::Root)
     }
 
+    /// O(1): the depth `extend` already computed and cached, not a walk up
+    /// the chain -- mirrors [`PathPrefix::depth`] exactly.
+    pub(crate) fn depth(&self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Node { depth, .. } => *depth,
+        }
+    }
+
     /// O(1): one `Rc::clone` (refcount bump) plus one new allocation.
     pub(crate) fn extend(parent: &Rc<Self>, component: OwnedValue) -> Rc<Self> {
         Rc::new(Self::Node {
             parent: Rc::clone(parent),
             component,
+            depth: parent.depth() + 1,
         })
     }
 
@@ -20667,8 +20692,13 @@ impl PathTrail {
     /// (`eval_generic.rs`'s `PathContextPos`, whose `key`/`parent`/
     /// `file_index` machinery is out of scope for #2058 and left unchanged),
     /// so it can still call into the shared, `PathTrail`-based step helpers.
-    /// Same cost as that caller's own pre-existing per-call flatten -- not an
-    /// improvement there, but not a regression either.
+    /// This is a *second* O(depth) traversal on top of that caller's own
+    /// pre-existing per-call flatten (paired with an equal-cost `to_vec()`
+    /// on the way back out) -- not a regression in asymptotic order (that
+    /// call site was already O(d^2) end to end and stays so), but a real,
+    /// roughly 2x constant-factor increase this bridge introduces, not
+    /// eliminated here because restructuring `PathContextPos` itself to
+    /// carry a `PathTrail` natively is out of scope for #2058.
     pub(crate) fn from_slice(components: &[OwnedValue]) -> Rc<Self> {
         components.iter().fold(Self::root(), |acc, component| {
             Self::extend(&acc, component.clone())
@@ -20680,9 +20710,12 @@ impl PathTrail {
     /// where a flat path is actually required (i.e. when it becomes one
     /// `path()` output).
     pub(crate) fn to_vec(&self) -> Vec<OwnedValue> {
-        let mut out = Vec::new();
+        let mut out = vec_with_capacity(self.depth());
         let mut cur = self;
-        while let Self::Node { parent, component } = cur {
+        while let Self::Node {
+            parent, component, ..
+        } = cur
+        {
             out.push(component.clone());
             cur = parent;
         }
@@ -32973,6 +33006,21 @@ fn walk_path<S: EvalSemantics>(
     out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
+    // Panics past `MAX_VALUE_TREE_DEPTH` levels (code review on #2058): a
+    // static chain (`path(.a.a.a...)`) reaches this function once per
+    // component via `walk_pipe`'s own per-stage recursion, which -- unlike
+    // `value_after_components`'s plain iterative `for` loop over `=`/`del()`'s
+    // resolved components -- grows the native call stack by one frame per
+    // step with no cap of its own. A million-component chain overflowed the
+    // stack and aborted the process outright (confirmed live) once this fix
+    // made `path()` fast enough to reach that depth in practice; before,
+    // the pre-fix O(d^2) cost made the same input time out long before ever
+    // getting there. `walk_pipe` always calls this function once per stage
+    // before recursing any deeper, so checking here bounds it too -- the
+    // same "check at the one function that recurses once per node" shape
+    // `collect_paths`/`collect_tostream_events`/`collect_leaf_paths` already
+    // use for value-tree recursion elsewhere in this file.
+    assert_value_tree_depth(current_path.depth());
     match expr {
         // The path already reaching here, named as it stands. `value` moves
         // straight into `out`, and `current_path` is a cheap `Rc::clone`
@@ -47435,6 +47483,74 @@ mod tests {
                 fast, reference,
                 "eval_owned_fast_path disagrees with index_object_by_name/index_array_by_position \
                  for {expr:?} on {input:?} (optional={optional})"
+            );
+        }
+    }
+
+    /// [`navigate_static_component`]'s `Field`/`Index` arms are a *third*
+    /// independent copy of the missing-key/out-of-bounds/error-type indexing
+    /// rules, alongside [`eval_owned_fast_path`]'s own arms (kept aligned only
+    /// by a doc comment cross-reference, #2058 code review) and the general
+    /// evaluator's `eval_single` arms. This is
+    /// `eval_owned_fast_path_agrees_with_index_object_by_name_and_index_array_by_position`'s
+    /// own reasoning one hop over: pin the two together so a future edit to
+    /// either one's missing-key/out-of-bounds/error-type rule cannot drift
+    /// silently out of sync with the other, matching this repo's own
+    /// documented lesson ("duplicated predicates diverge silently -- one
+    /// definition, plus a test that the call sites agree").
+    ///
+    /// `navigate_static_component` has no `optional` parameter of its own --
+    /// every one of its callers reaches it only for a bare (non-`Optional`-
+    /// wrapped) `Field`/`Index` component, so it always behaves as
+    /// `eval_owned_fast_path::<S>(expr, input, false)` does. The comparison
+    /// below fixes `optional` at `false` for exactly that reason, reusing
+    /// the other test's own case matrix (its `optional: true` rows dropped,
+    /// since those exercise a parameter this function doesn't have).
+    #[test]
+    fn navigate_static_component_agrees_with_eval_owned_fast_path() {
+        let obj = || {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("a".to_string(), OwnedValue::Int(1));
+            m.insert("b".to_string(), OwnedValue::Int(2));
+            OwnedValue::Object(m)
+        };
+        let arr = || {
+            OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20),
+                OwnedValue::Int(30),
+            ])
+        };
+
+        let cases: Vec<(Expr, OwnedValue)> = vec![
+            // Field: present key, missing key, on null, on a type that
+            // cannot be field-indexed at all.
+            (Expr::Field("a".to_string()), obj()),
+            (Expr::Field("missing".to_string()), obj()),
+            (Expr::Field("a".to_string()), OwnedValue::Null),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5)),
+            (Expr::Field("a".to_string()), arr()),
+            // Index: in bounds, negative-from-end, out of bounds (positive
+            // and negative), on null, on a type that cannot be
+            // position-indexed at all.
+            (Expr::index(1), arr()),
+            (Expr::index(-1), arr()),
+            (Expr::index(10), arr()),
+            (Expr::index(-10), arr()),
+            (Expr::index(0), OwnedValue::Null),
+            (Expr::index(0), OwnedValue::String("x".to_string())),
+            (Expr::index(0), obj()),
+        ];
+
+        for (expr, input) in cases {
+            let fast = eval_owned_fast_path::<JqSemantics>(&expr, &input, false)
+                .expect("Field/Index are always Some from eval_owned_fast_path")
+                .map_err(EvalEscape::from);
+            let destructive = navigate_static_component::<JqSemantics>(&expr, input.clone());
+            assert_eq!(
+                fast, destructive,
+                "navigate_static_component disagrees with eval_owned_fast_path \
+                 for {expr:?} on {input:?}"
             );
         }
     }
