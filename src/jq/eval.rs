@@ -16541,20 +16541,6 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Some(control) => partial(Vec::new(), control),
         };
     }
-    let (ends, ends_escape) = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
-        Ok(v) => v,
-        Err(control) => return partial(Vec::new(), control),
-    };
-    let ends_escaped = ends_escape.is_some();
-    let bounds_escape = ends_escape.or(starts_escape);
-    if ends.is_empty() {
-        return match bounds_escape {
-            None => QueryResult::None,
-            Some(control) => partial(Vec::new(), control),
-        };
-    }
-    let starts_len = if ends_escaped { 1 } else { starts.len() };
-    let starts = &starts[..starts_len];
 
     // Borrowed and owned targets are kept apart so the common (borrowed) case
     // never materializes the document — mirrors `eval_index_expr`.
@@ -16563,31 +16549,20 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Owned(Vec<OwnedValue>),
     }
 
-    // S outer, T middle, E inner (point 2 above), with E now genuinely
-    // re-evaluated once per (s, e) pair rather than once overall (#2143).
-    // The result is always owned: slicing constructs a new array/string
-    // (see `eval_single`'s `Expr::Slice` arm), so there is nothing to
-    // borrow except its rare whole-value fast paths, which `to_owned_lossy`
-    // below just copies out of.
+    // S outer, T middle, E inner (point 2 above), with E re-evaluated once
+    // per (s, e) pair (#2143) and T (`end`) now genuinely re-evaluated once
+    // per `s` rather than once overall (#2225) -- T sits inside S's own
+    // binding scope in jq's desugaring, so a fresh `s` gets a fresh `T`
+    // evaluation, the same nesting #2143 already established one level
+    // deeper for E relative to `(s, e)`.
     //
-    // `starts.len() * ends.len()` is still fully known before the loop --
-    // only the per-pair target count varies -- so `try_reserve_product`
-    // reserves that much upfront as a baseline (the common case is exactly
-    // one output per pair), recovering the single upfront allocation the
-    // pre-#2143 code made for that case instead of paying amortized-
-    // doubling reallocation/copy costs on every slice query; both `starts`
-    // and `ends` are already known non-empty here (the `is_empty` checks
-    // above), so this never takes the zero-factor fast-return arm. Reusing
-    // the existing helper -- rather than a bespoke `checked_mul` inline --
-    // keeps this refusal path covered by that function's own existing unit
-    // tests instead of adding new, practically-untestable ones of its own:
-    // constructing real `starts`/`ends` generator output long enough to
-    // organically overflow this product would first exhaust memory
-    // building the *inputs*, long before this reservation could ever run.
-    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
-        Ok(out) => out,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // No upfront `starts.len() * ends.len()` reservation baseline anymore:
+    // `ends.len()` is no longer known until each `s` iteration evaluates T,
+    // so there is nothing fixed to reserve before the loop starts. The
+    // per-target `try_reserve` calls inside the loop still protect every
+    // real allocation; only the pre-#2225 upfront-baseline optimization is
+    // gone, not the overflow protection itself.
+    let mut out: Vec<OwnedValue> = Vec::new();
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms
@@ -16601,7 +16576,21 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     }
 
-    for s in starts {
+    for s in &starts {
+        // #2225: T (`end`) evaluated fresh for this `s`, not once overall.
+        // An empty T for this `s` contributes nothing and moves on to the
+        // next `s` (verified live: a `T` that's empty only for `s == 0`
+        // still lets `s == 1` run and contribute its own output -- not a
+        // whole-function short-circuit the way an entirely-empty `S` is).
+        // A `T` that produces some values before escaping processes those
+        // values first, then folds the running `out` in as the escape's
+        // prefix, same as every other per-iteration escape in this
+        // function (verified live: `.[0:(1,2,error("boom"))]` prints the
+        // slices for `1` and `2` before raising).
+        let (ends, ends_escape) = match eval_slice_bound::<W, S>(end, value.clone(), f64::ceil) {
+            Ok(v) => v,
+            Err(control) => escape!(control),
+        };
         for e in &ends {
             let targets = eval_single::<W, S>(target, value.clone(), false).materialize_cursor();
             let targets = match targets {
@@ -16706,11 +16695,23 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         }
+        // #2225: this `s`'s own T evaluation may have produced some values
+        // before escaping (a break/halt/error partway through T's own
+        // stream) -- fold the running `out` in as that escape's prefix,
+        // same as every other per-iteration escape above, rather than
+        // discarding it or deferring it past values a *later* `s` might
+        // still contribute (verified live: T escaping for a non-last `s`
+        // still reaches this point only after that `s`'s own successful
+        // `e` values have already been pushed).
+        if let Some(control) = ends_escape {
+            escape!(control);
+        }
     }
-    // #1528: the bound-escape info threaded through above still has to
-    // reach the final result -- a successful loop doesn't mean `start`/`end`
-    // themselves didn't escape after producing `out`'s own values.
-    match bounds_escape {
+    // #1528: `start`'s own trailing escape info still has to reach the
+    // final result -- a successful loop doesn't mean `start` itself didn't
+    // escape after producing `out`'s own values. `end`'s own escape is now
+    // handled per-`s` above (#2225), not here.
+    match starts_escape {
         None => owned_vec_to_result(out),
         Some(control) => partial(out, control),
     }
