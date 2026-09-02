@@ -5034,6 +5034,23 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
                     // pairing, the outputs already pushed stand either way,
                     // and `optional` decides whether the failure itself
                     // survives.
+                    //
+                    // #2212: this `optional` can currently only be `true` via
+                    // a path-context `?` that used to leak into an operand's
+                    // own evaluation through #2073's now-removed
+                    // combined-with-`rest` fallback (`.a | (.[])? | (key,
+                    // (1 + "x"))` -- needs an arithmetic op to reach this
+                    // `combine`-failure arm at all; `==`'s own `combine`
+                    // (`apply_compare_op`) is infallible, so an error from a
+                    // `==`-wrapped operand like `error("x")` never lands
+                    // here, it propagates through a different path entirely)
+                    // -- the plain (non-path-context) evaluator's own
+                    // `Expr::Optional` forwards the *ambient* `optional`
+                    // rather than forcing `true` (#693), so nothing else
+                    // ever delivers one here. Currently dead by the same
+                    // evidence as `catch_error_under_optional`'s own doc
+                    // comment, despite living outside the path-context
+                    // evaluator itself.
                     abort = Some(if optional {
                         Flow::Exhausted
                     } else {
@@ -30107,6 +30124,29 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// time a caller's loop breaks, its own `results` binding is already empty
 /// -- reusing it here instead of the pattern's own `prefix` would silently
 /// keep nothing.
+/// #2212: every caller of this function lives inside the path-context
+/// evaluator's own call graph, and `optional` reaches every one of them
+/// through a chain that bottoms out at `eval_stage_with_path_context`'s own
+/// `optional` parameter. #2073 removed `Expr::Optional`'s combined-with-
+/// `rest` fallback there -- the only route that ever forced a `true` into
+/// that parameter -- so `optional` is `false` at every one of this
+/// function's call sites today, making the `optional == true` cells below
+/// (`(true, true)` and `(false, true)`, plus the bare `Error(e)` arm above)
+/// currently unreachable. Confirmed two independent ways (#2212): an
+/// `assert!(!optional, ...)` probe at `eval_stage_with_path_context`'s own
+/// entry point fires zero times across the full suite (it fires 5 times on
+/// pre-#2073 `main`), and `llvm-cov`'s patch-coverage diff on the #2073 PR
+/// itself reported these lines losing coverage on otherwise-unchanged code.
+/// Left in place rather than removed -- deleting `optional` from this
+/// function's signature (and from every caller's own signature in turn)
+/// would ripple well beyond this one function, and a future path-context
+/// arm could legitimately reintroduce a real producer of `true` the same
+/// way #2073's fallback used to be one. `test_catch_error_under_optional_full_truth_table_1888`
+/// is the sole test exercising these cells now that #1826/#1869/#1964's own
+/// end-to-end tests reach the `optional == false` branch either through
+/// #2073's new hard-error behavior or through `Expr::Optional`'s own
+/// structural catch instead -- treat it as this function's spec for the
+/// `optional == true` column, not just a regression pin.
 fn catch_error_under_optional<W>(
     stopped: QueryResult<'_, W>,
     optional: bool,
@@ -31718,7 +31758,8 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(Some(ref v)) => match classify_parent_n::<S>(v, current_path.len()) {
                 Ok(n) => n,
                 // `?` swallows only a genuine error; a halt always escapes
-                // (#791).
+                // (#791). #2212: currently unreachable with `optional ==
+                // true` -- see `catch_error_under_optional`'s doc comment.
                 Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e),
             },
@@ -31981,6 +32022,10 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                 }
+                // #2212: `optional` is this arm's own ambient parameter, not
+                // `iterate_element_step`'s per-element `false` above --
+                // currently unreachable with `optional == true`, same
+                // evidence as `catch_error_under_optional`'s doc comment.
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
@@ -31992,7 +32037,8 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // means a caught `Error` keeps the already-produced prefix
                 // rather than discarding it, and `Break`/`Halt` are left
                 // completely untouched (`catch_error_under_optional`,
-                // #1888).
+                // #1888; #2212: the `optional == true` half of that dispatch
+                // is currently unreachable here too).
                 Some(stop) => catch_error_under_optional::<W>(stop, optional, false),
             }
         }
@@ -32473,6 +32519,8 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                 }
+                // #2212: currently unreachable with `optional == true`, same
+                // evidence as `catch_error_under_optional`'s doc comment.
                 _ if optional => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
@@ -32483,7 +32531,9 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // far rather than letting them leak out as this arm's
                 // result (#791), which is what `atomic: true` means to
                 // `catch_error_under_optional` (#1888) -- only `Error` is
-                // gated on this arm's own ambient `optional`.
+                // gated on this arm's own ambient `optional`. #2212: the
+                // `optional == true` half of that dispatch is currently
+                // unreachable here too.
                 Some(stop) => catch_error_under_optional::<W>(stop, optional, true),
                 None => QueryResult::Owned(OwnedValue::Array(results)),
             };
@@ -43673,15 +43723,11 @@ mod tests {
     /// Every `(atomic, optional)` cell of [`catch_error_under_optional`],
     /// plus the bare-`Error` and `Break`/`Halt` shapes around them.
     ///
-    /// Since #2073 this is the *only* test that reaches the helper's
-    /// `optional == true` cells at all: that fix removed
-    /// `Expr::Optional`'s combined-with-`rest` fallback, and with it the
-    /// last producer of an ambient `optional == true` anywhere inside the
-    /// path-context evaluator, so #1826's and #1869's own end-to-end tests
-    /// now exercise the `false` column instead (#2212 tracks whether the
-    /// parameter should survive at all). Deleting or weakening a row here
-    /// therefore removes the last check on that behaviour rather than a
-    /// duplicate of an integration test's.
+    /// #2212: the sole test exercising `catch_error_under_optional`'s
+    /// `optional == true` cells now that every production call site's own
+    /// `optional` is provably always `false` (see the function's own doc
+    /// comment) -- treat this as the spec for that column, not just a
+    /// regression pin against a shape no live query can trigger today.
     #[test]
     fn test_catch_error_under_optional_full_truth_table_1888() {
         type W = Vec<u64>;
