@@ -30758,3 +30758,116 @@ fn test_index_expr_native_to_owned_flip_mid_key_reserves_2032() -> Result<()> {
     assert_eq!(stdout, "1\nnull\n");
     Ok(())
 }
+
+/// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
+/// expression, so real jq's single shared path register moves onto `.a`'s
+/// own position as a side effect of evaluating it -- and UPDATE's own
+/// output (`.`, unaffected by SOURCE's own navigation since it is never
+/// assigned into the accumulator) is then checked against *that* clobbered
+/// register, not the fold's persistent, INIT-seeded one. `main` before this
+/// fix silently discarded SOURCE's own trackability whenever any branch of
+/// it was itself trackable, so this printed `[]` instead of raising.
+/// Verified against jq 1.7.1: `jq -c 'path(foreach (.a) as $k (.; .))'` on
+/// `{"a":1}` raises the identical message, exit 5.
+#[test]
+fn test_foreach_source_navigation_clobbers_register_2031() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (.a) as $k (.; .))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(stdout, "", "must not emit a path: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2031's mixed-source variant: a source with *some* trackable branches
+/// and some untracked ones must still stream every branch before the
+/// trackable one, exactly as an all-untracked source already did (#1872) --
+/// the per-element check is not an all-or-nothing gate on the source as a
+/// whole. `1` (untracked, register untouched) succeeds and streams `[]`
+/// first; `.[]` (trackable, register clobbered onto its own navigated
+/// position) then raises on its own step. Verified against jq 1.7.1:
+/// `jq -c 'path(foreach (1, .[]) as $k (.; .))'` on `{"a":1}` prints `[]`
+/// then raises the identical message, exit 5.
+#[test]
+fn test_foreach_mixed_source_streams_untracked_prefix_then_raises_on_trackable_element_2031(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1, .[]) as $k (.; .))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(stdout, "[]\n", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2031's write-side repro: `main` before this fix let a fold whose source
+/// navigates silently succeed as a `path()` target, which meant `=`/`|=`
+/// wrote through it too -- `(foreach (.a) as $k (.; .)) = 9` used to
+/// overwrite the whole document with `9`, a write real jq never performs.
+/// Verified against jq 1.7.1: the identical filter raises the identical
+/// message and leaves the document untouched, exit 5.
+#[test]
+fn test_foreach_source_navigation_clobber_blocks_a_write_2031() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "(foreach (.a) as $k (.; .)) = 9"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(stdout, "", "must not write: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2031 positive companion to the primary repro: a trackable source
+/// element's own per-element binding (`$k`, bound from `.a`'s own navigated
+/// value) *does* carry the register through when UPDATE references it
+/// directly -- confirmed live against jq 1.7.1, `["a"]`, exit 0. Guards
+/// against an overreaching fix that always raises whenever the source
+/// navigates, regardless of what UPDATE actually does with it (the
+/// "eleven of four thousand" regression the fold-source doc comment warns
+/// about was exactly an earlier, cruder attempt at this).
+#[test]
+fn test_foreach_trackable_source_element_binding_still_tracks_through_2031() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (.a) as $k (0; $k))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(stdout, "[\"a\"]\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2031 review: `reduce` does *not* share `foreach`'s per-emission
+/// register clobber, even though both share the exact same SOURCE
+/// register-establishing logic -- `reduce`'s own final re-entry boundary
+/// (already in place before #2031, `resolve_reduce`'s own doc comment)
+/// re-checks the accumulator against the fold's *persistent* register one
+/// last time, and a bare `.` UPDATE that never itself navigates leaves that
+/// accumulator's trackability untouched by whatever SOURCE did along the
+/// way. An earlier draft of this fix applied the same per-step register
+/// override to `reduce` as to `foreach`, which wrongly made this raise --
+/// caught by the differential fuzzer (`.ai/scratch/sweep-path-fold-differential.py`)
+/// comparing against jq 1.7.1, where `jq -c 'path(reduce (.[]) as $k (.; .))'`
+/// on `{"a":[1,2]}` is `[]`, exit 0.
+#[test]
+fn test_reduce_source_navigation_does_not_clobber_persistent_register_2031() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (.[]) as $k (.; .))"],
+        Some(r#"{"a":[1,2]}"#),
+    )?;
+    assert_eq!(stdout, "[]\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
