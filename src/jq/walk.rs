@@ -20,10 +20,14 @@
 //! its sub-expressions are declared, and every caller picks the fix up at once.
 
 use alloc::boxed::Box;
+#[cfg(not(test))]
+use alloc::rc::Rc;
+#[cfg(test)]
+use std::rc::Rc;
 
 #[cfg(test)]
-use super::FuncDefBound;
-use super::{Builtin, Expr, ObjectKey, StringPart};
+use super::FuncDefData;
+use super::{BoundBody, Builtin, Expr, FuncDefBound, ObjectEntry, ObjectKey, StringPart};
 
 /// The sub-expressions a [`Builtin`] owns, in source order.
 ///
@@ -567,6 +571,373 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         Builtin::GsubFlags(a, b, c) => {
             Builtin::GsubFlags(Box::new(f(a)), Box::new(f(b)), Box::new(f(c)))
         }
+    }
+}
+
+/// The mapping twin of [`any_subexpr`].
+///
+/// Generalizes [`map_builtin_subexprs`] one level up the tree (#2095):
+/// rebuilds `expr` with each of its direct `Expr`-typed children replaced by
+/// `f`'s answer for it.
+///
+/// Before this existed, `eval.rs` had three separate ~40-arm matches over
+/// every `Expr` variant -- `install_def_calls`, `substitute_func_param` and
+/// `substitute_var_impl` -- structurally identical except at a handful of
+/// binder/leaf/opaque arms, so adding a new `Expr` variant meant three
+/// synchronized hand-edits. Missing one next to a wildcard would compile
+/// cleanly and silently drop that variant from whichever pass forgot it --
+/// the same failure mode [`builtin_kids`]'s own doc comment describes, one
+/// level up.
+///
+/// **Not every variant below is a shared, unconditional shape.** Several
+/// carry per-caller logic -- a shadow check that must skip recursing into a
+/// bound-scope child, opacity, frame-accounting specific to one caller --
+/// that this function does not and cannot reproduce generically. Every
+/// `eval.rs` caller that needs one matches that variant explicitly, with its
+/// own condition, *before* ever falling through to this function for
+/// whatever remains uniform -- mirroring how each already special-cases
+/// `Expr::Builtin` ahead of its own `_in_builtin` sibling rather than
+/// somehow folding builtin dispatch in here too. Concretely, verified by
+/// reading all three functions' arms side by side (#2095 review):
+///
+/// - `Expr::As`/`Reduce`/`Foreach`/`AsPattern`/`Label`: `install_def_calls`
+///   has no shadow concept for these (a `def`-name substitution is never
+///   shadowed by a `$var`/pattern binder) and recurses into every child
+///   unconditionally -- exactly this function's own arm below. Both
+///   `substitute_var_impl` and `substitute_func_param` must *not* recurse
+///   into the bound-scope child when their own binder shadows the name being
+///   substituted, so both intercept these variants with their own guarded
+///   arm first and never reach this function for them.
+/// - `Expr::Var`/`Expr::FuncCall`: `install_def_calls` (for `Var`) and
+///   `substitute_var_impl` (for `FuncCall`) have no special case at all --
+///   exactly this function's leaf-clone / clone-name-and-map-args arms.
+///   `substitute_var_impl`/`substitute_func_param` (for `Var`) and
+///   `install_def_calls`/`substitute_func_param` (for `FuncCall`) intercept
+///   the name/arity match explicitly and fall through to this function only
+///   for the non-matching case.
+/// - `Expr::DefCall`: shared verbatim by `substitute_var_impl` and
+///   `substitute_func_param` (`def` opaque, `frames` unchanged, `args`
+///   walked, `bound` reset -- see the arm below). `install_def_calls` needs a
+///   *different* `frames` policy (the larger of its own stale count and the
+///   ambient depth this pass is walking at) and keeps its own explicit arm.
+/// - `Expr::Shared`: opaque (no recursion at all) in all three, for the
+///   architectural reasons #1371/#2077/#2096 give -- descending would redo
+///   already-finished substitution and could recapture a caller's variable.
+///   Kept explicit in all three rather than folded here, despite being
+///   identical across them, because each function's own comment on this arm
+///   documents a different concrete hazard worth reading in place.
+/// - `Expr::Error`: also identical across all three (`msg.clone()`, no
+///   recursion into the message) -- and also kept explicit in all three
+///   rather than folded, but for the opposite reason from `Shared`: unlike
+///   `Shared`'s opacity, this one is not obviously a deliberate invariant.
+///   `error($x)` referencing a variable, parameter, or def-call the
+///   enclosing pass is substituting would not get substituted by any of the
+///   three today. Preserved as-is (behavior-preserving refactor, not a
+///   bugfix) but flagged here for follow-up.
+/// - `Expr::Builtin`: always delegates to [`map_builtin_subexprs`], but
+///   `install_def_calls_in_builtin` charges its own sub-expressions an extra
+///   frame relative to every other structural descent (see its own doc
+///   comment) -- so all three callers keep their existing explicit
+///   `Expr::Builtin(b) => Expr::Builtin(..._in_builtin(b, ...))` arm rather
+///   than reaching this function's own arm for it.
+/// - `Expr::FuncDef`: genuinely different in all three, not just in
+///   *whether* something is shadowed but in what "shadowed" even means
+///   (`install_def_calls`: same name and arity, and the fully-shadowed
+///   branch clones the whole node, preserving its cache; `substitute_func_param`:
+///   two independent conditions, one for `body` and one for `then`;
+///   `substitute_var_impl`: one condition, for `body` only, with `then`
+///   always recursed) -- no shared unconditional shape exists to fall back
+///   to, so all three keep their own complete arm and never reach this
+///   function's own arm for it.
+///
+/// The five arms named above (`Shared`, `Error`, `Builtin`, `FuncDef`, and
+/// `install_def_calls`'s own `DefCall` policy) are therefore never actually
+/// exercised by any of today's three callers -- but this function still
+/// implements them, with a reasoned default, rather than reaching for a
+/// wildcard: the whole point of matching exhaustively is that a *future*
+/// `Expr` variant is a compile error here until it is categorized, and a
+/// wildcard on these five would quietly extend to that future variant too,
+/// recreating exactly the silent-drop risk this function exists to close.
+///
+/// **Deliberately has no wildcard arm**, for the same reason
+/// [`map_builtin_subexprs`] doesn't.
+///
+/// `&mut dyn FnMut`, not a generic `F`, for the same reason
+/// [`map_builtin_subexprs`] and [`any_subexpr`] both give: this recurses, so
+/// a generic parameter would monomorphise the whole traversal per call site.
+pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
+    match expr {
+        // --- Leaves: no `Expr` child, nothing for `f` to see -----------------
+        Expr::Identity => Expr::Identity,
+        Expr::Field(name) => Expr::Field(name.clone()),
+        Expr::Index { idx, key } => Expr::Index {
+            idx: *idx,
+            key: key.clone(),
+        },
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => Expr::Slice {
+            start: *start,
+            end: *end,
+            start_key: start_key.clone(),
+            end_key: end_key.clone(),
+        },
+        Expr::Iterate => Expr::Iterate,
+        Expr::Literal(lit) => Expr::Literal(lit.clone()),
+        Expr::RecursiveDescent => Expr::RecursiveDescent,
+        Expr::Not => Expr::Not,
+        Expr::Format(fmt) => Expr::Format(fmt.clone()),
+        Expr::Var(name) => Expr::Var(name.clone()),
+        // Genuinely reachable, not just a totality formality: `install_def_calls`
+        // re-runs on every `Expr::FuncDef` *evaluation* (its own call site
+        // inlines `def`s at the point they execute, not once at parse time),
+        // and a `def`'s own body can already contain a `TrackedVar` from an
+        // enclosing `as`-binding -- confirmed live, `. as $x | def f: $x |
+        // .b; path(f)` reaches this arm. `substitute_func_param` reaches it
+        // for the same underlying reason: it binds a `def`'s own
+        // `$`-parameters at every call site, and the `def`'s body can
+        // already contain a `TrackedVar` unrelated to the parameter being
+        // bound. `v.clone()` is an O(1) `Rc` refcount bump, not a deep copy
+        // of the frozen snapshot, so re-inlining a `def` that closes over a
+        // large passthrough-bound value on every call stays cheap (#844).
+        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
+        Expr::Loc { line } => Expr::Loc { line: *line },
+        Expr::Env => Expr::Env,
+        Expr::Break(name) => Expr::Break(name.clone()),
+
+        // --- One `Expr` child -----------------------------------------------
+        Expr::Optional(e) => Expr::Optional(Box::new(f(e))),
+        Expr::Array(e) => Expr::Array(Box::new(f(e))),
+        Expr::Paren(e) => Expr::Paren(Box::new(f(e))),
+        Expr::Negate(e) => Expr::Negate(Box::new(f(e))),
+        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(f(e))),
+        Expr::LastExpr(e) => Expr::LastExpr(Box::new(f(e))),
+        Expr::Repeat(e) => Expr::Repeat(Box::new(f(e))),
+
+        // --- `Vec<Expr>` children ---------------------------------------------
+        Expr::Pipe(exprs) => Expr::Pipe(exprs.iter().map(&mut f).collect()),
+        Expr::Comma(exprs) => Expr::Comma(exprs.iter().map(&mut f).collect()),
+
+        // --- Two unconditional `Expr` children --------------------------------
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: Box::new(f(target)),
+            key: Box::new(f(key)),
+        },
+        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+            op: *op,
+            left: Box::new(f(left)),
+            right: Box::new(f(right)),
+        },
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: Box::new(f(left)),
+            right: Box::new(f(right)),
+        },
+        Expr::And(l, r) => Expr::And(Box::new(f(l)), Box::new(f(r))),
+        Expr::Or(l, r) => Expr::Or(Box::new(f(l)), Box::new(f(r))),
+        Expr::Alternative(l, r) => Expr::Alternative(Box::new(f(l)), Box::new(f(r))),
+        Expr::Limit { n, expr } => Expr::Limit {
+            n: Box::new(f(n)),
+            expr: Box::new(f(expr)),
+        },
+        Expr::NthExpr { n, expr } => Expr::NthExpr {
+            n: Box::new(f(n)),
+            expr: Box::new(f(expr)),
+        },
+        Expr::Until { cond, update } => Expr::Until {
+            cond: Box::new(f(cond)),
+            update: Box::new(f(update)),
+        },
+        Expr::While { cond, update } => Expr::While {
+            cond: Box::new(f(cond)),
+            update: Box::new(f(update)),
+        },
+        Expr::Assign { path, value } => Expr::Assign {
+            path: Box::new(f(path)),
+            value: Box::new(f(value)),
+        },
+        Expr::Update { path, filter } => Expr::Update {
+            path: Box::new(f(path)),
+            filter: Box::new(f(filter)),
+        },
+        Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
+            op: *op,
+            path: Box::new(f(path)),
+            value: Box::new(f(value)),
+        },
+        Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
+            path: Box::new(f(path)),
+            value: Box::new(f(value)),
+        },
+
+        // --- One required child plus optional siblings ------------------------
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: Box::new(f(target)),
+            start: start.as_deref().map(|e| Box::new(f(e))),
+            end: end.as_deref().map(|e| Box::new(f(e))),
+        },
+        Expr::Range { from, to, step } => Expr::Range {
+            from: Box::new(f(from)),
+            to: to.as_deref().map(|e| Box::new(f(e))),
+            step: step.as_deref().map(|e| Box::new(f(e))),
+        },
+        Expr::Try { expr, catch } => Expr::Try {
+            expr: Box::new(f(expr)),
+            catch: catch.as_deref().map(|c| Box::new(f(c))),
+        },
+
+        // --- Three unconditional `Expr` children -------------------------------
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: Box::new(f(cond)),
+            then_branch: Box::new(f(then_branch)),
+            else_branch: Box::new(f(else_branch)),
+        },
+
+        // --- Structured collections --------------------------------------------
+        Expr::Object(entries) => Expr::Object(
+            entries
+                .iter()
+                .map(|entry| {
+                    let key = match &entry.key {
+                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(f(e))),
+                    };
+                    ObjectEntry {
+                        key,
+                        value: f(&entry.value),
+                    }
+                })
+                .collect(),
+        ),
+        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
+            parts
+                .iter()
+                .map(|part| match part {
+                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
+                    StringPart::Expr(e) => StringPart::Expr(Box::new(f(e))),
+                })
+                .collect(),
+        ),
+
+        // --- Calls: clone the name, map every argument through `f` -------------
+        // The shape a non-matching call already falls back to in every one of
+        // the three `eval.rs` callers below -- each that needs to intercept a
+        // *particular* name/arity (installing a `DefCall`, binding a
+        // `$`-parameter reference) does so with its own guarded arm first and
+        // reaches this one only once that guard has already failed.
+        Expr::FuncCall { name, args } => Expr::FuncCall {
+            name: name.clone(),
+            args: args.iter().map(&mut f).collect(),
+        },
+        Expr::NamespacedCall {
+            namespace,
+            name,
+            args,
+        } => Expr::NamespacedCall {
+            namespace: namespace.clone(),
+            name: name.clone(),
+            args: args.iter().map(&mut f).collect(),
+        },
+
+        // --- Binders: unconditional recursion into every child, including the
+        // bound-scope one -- see this function's own doc comment for which
+        // callers rely on this arm and which intercept the variant themselves
+        // instead.
+        Expr::As { expr, var, body } => Expr::As {
+            expr: Box::new(f(expr)),
+            var: var.clone(),
+            body: Box::new(f(body)),
+        },
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => Expr::Reduce {
+            input: Box::new(f(input)),
+            patterns: patterns.clone(),
+            init: Box::new(f(init)),
+            update: Box::new(f(update)),
+        },
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            input: Box::new(f(input)),
+            patterns: patterns.clone(),
+            init: Box::new(f(init)),
+            update: Box::new(f(update)),
+            extract: extract.as_deref().map(|e| Box::new(f(e))),
+        },
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => Expr::AsPattern {
+            expr: Box::new(f(expr)),
+            patterns: patterns.clone(),
+            body: Box::new(f(body)),
+        },
+        Expr::Label { name, body } => Expr::Label {
+            name: name.clone(),
+            body: Box::new(f(body)),
+        },
+
+        // --- `DefCall`: the shape shared by `substitute_var_impl` and
+        // `substitute_func_param` -- see this function's own doc comment.
+        // `install_def_calls` needs a different `frames` policy and keeps its
+        // own explicit arm instead of reaching this one.
+        //
+        // `args` are code in the *caller's* scope, not the resolved `def`'s
+        // own, and can still mention a variable or parameter this pass is
+        // substituting -- `def outer(n): inner(n);` binds `n` here, through
+        // the inner call, whenever an outer definition was installed over a
+        // body before this one's own binder had run (the ordinary case for
+        // two sibling `def`s). `def` itself is not descended into: it was
+        // captured with everything in its own scope already substituted.
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound: _,
+        } => Expr::DefCall {
+            def: Rc::clone(def),
+            args: args.iter().map(&mut f).collect(),
+            frames: *frames,
+            bound: BoundBody::default(),
+        },
+
+        // --- Never reached by any of today's three `eval.rs` callers -- see
+        // this function's own doc comment for why each keeps its own
+        // explicit arm instead. Implemented anyway, exhaustively, so a
+        // hypothetical new caller gets a reasoned default instead of a
+        // temptation to add a wildcard.
+        Expr::Shared(inner) => Expr::Shared(Rc::new(f(inner))),
+        Expr::Error(msg) => Expr::Error(msg.as_deref().map(|m| Box::new(f(m)))),
+        Expr::Builtin(b) => Expr::Builtin(map_builtin_subexprs(b, f)),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound: _,
+        } => Expr::FuncDef {
+            name: name.clone(),
+            params: params.clone(),
+            body: Box::new(f(body)),
+            then: Box::new(f(then)),
+            bound: FuncDefBound::default(),
+        },
     }
 }
 
@@ -1123,5 +1494,282 @@ mod tests {
                 "field order/identity not preserved for {filter:?}"
             );
         }
+    }
+
+    /// #2095: exercises [`map_subexprs`]'s two-child arms with the same
+    /// "identity closure, distinct field values, full equality against the
+    /// original" technique [`map_builtin_subexprs_preserves_field_order`]
+    /// uses -- a reconstruction that transposed two fields would still pass
+    /// a same-value or "count only" check, but fails `assert_eq!` here
+    /// because each case's two fields hold genuinely different values.
+    #[test]
+    fn map_subexprs_preserves_field_order_two_children() {
+        let cases = [
+            "1 + 2",       // Arithmetic(Add, 1, 2)
+            "1 == 2",      // Compare(Eq, 1, 2)
+            "1 and 2",     // And(1, 2)
+            "1 or 2",      // Or(1, 2)
+            "1 // 2",      // Alternative(1, 2)
+            "limit(1; 2)", // Limit(n, expr)
+            "nth(1; 2)",   // NthExpr(n, expr)
+            "until(1; 2)", // Until(cond, update)
+            "while(1; 2)", // While(cond, update)
+            ".a[.b]",      // IndexExpr(target, key)
+        ];
+        for filter in cases {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, 2, "expected exactly 2 sub-expressions in {filter:?}");
+            assert_eq!(
+                result, expr,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
+    }
+
+    /// Three-and-more-child arms, plus the optional-sibling ones
+    /// (`SliceExpr`/`Range`/`Try`) in both their fully-populated and
+    /// partially-`None` shapes.
+    #[test]
+    fn map_subexprs_preserves_field_order_three_or_more_children() {
+        let cases = [
+            "if .a then .b else .c end", // If(cond, then, else)
+            "range(.a; .b; .c)",         // Range(from, to, step) -- both present
+            ".[.a:.b]",                  // SliceExpr(target, start, end) -- both present
+        ];
+        for filter in cases {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, 3, "expected exactly 3 sub-expressions in {filter:?}");
+            assert_eq!(
+                result, expr,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
+
+        // `SliceExpr`/`Range` with only one optional sibling present -- the
+        // `None` slot must round-trip as `None`, not be skipped or coerced.
+        for (filter, expected_calls) in [
+            (".[.a:]", 2),          // SliceExpr(target, Some(start), None)
+            (".[:.a]", 2),          // SliceExpr(target, None, Some(end))
+            ("range(.a)", 2), // Range(from=0 literal, Some(to), None) -- `range(n)` desugars to `range(0; n)`
+            ("range(.a; .b)", 2), // Range(from, Some(to), None)
+            ("try .a", 1),    // Try(expr, None)
+            ("try .a catch .b", 2), // Try(expr, Some(catch))
+        ] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, expected_calls, "call count mismatch for {filter:?}");
+            assert_eq!(
+                result, expr,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
+    }
+
+    /// `Vec<Expr>` and structured-collection arms (`Pipe`/`Comma`/`Object`/
+    /// `StringInterpolation`/`FuncCall`/`NamespacedCall`), confirming every
+    /// element is visited (not just the first/last) and non-`Expr` payload
+    /// (literal object keys, string literal parts) is left alone.
+    #[test]
+    fn map_subexprs_visits_every_element_of_a_collection() {
+        for (filter, expected_calls) in [
+            ("1,2,3", 3),             // Comma
+            ("1|2|3", 3),             // Pipe
+            ("{a: .b, (.c): .d}", 3), // Object: literal key (0) + expr key (1) + value (1)
+            (r#""x\(.a)y""#, 1),      // StringInterpolation: one Expr part
+            ("module::f(.a; .b)", 2), // NamespacedCall args
+        ] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, expected_calls, "call count mismatch for {filter:?}");
+            assert_eq!(result, expr, "identity round-trip failed for {filter:?}");
+        }
+    }
+
+    /// The generic (unconditional-recursion) binder arms -- `As`/`Reduce`/
+    /// `Foreach`/`AsPattern`/`Label` -- as reached directly through
+    /// `map_subexprs` itself (no shadow check, since that lives in the three
+    /// `eval.rs` callers, not here). `patterns.clone()`/`var.clone()`/
+    /// `name.clone()` fields must also survive the round trip untouched.
+    #[test]
+    fn map_subexprs_binders_recurse_unconditionally() {
+        for (filter, expected_calls) in [
+            (".a as $x | .b", 2),                 // As
+            ("reduce .a as $x (.b; .c)", 3),      // Reduce
+            ("foreach .a as $x (.b; .c; .d)", 4), // Foreach
+            (". as [$a] ?// {b:$b} | .c", 2),     // AsPattern
+            ("label $out | .a", 1),               // Label
+        ] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, expected_calls, "call count mismatch for {filter:?}");
+            assert_eq!(result, expr, "identity round-trip failed for {filter:?}");
+        }
+    }
+
+    /// Assignment-family arms (`Assign`/`Update`/`CompoundAssign`/
+    /// `AlternativeAssign`), which all share the same "path + value/filter"
+    /// two-child shape.
+    #[test]
+    fn map_subexprs_assignment_family() {
+        for filter in [".a = .b", ".a |= .b", ".a += .b", ".a //= .b"] {
+            let expr = parse(filter).expect("filter should parse");
+            let mut calls = 0usize;
+            let result = map_subexprs(&expr, &mut |e| {
+                calls += 1;
+                e.clone()
+            });
+            assert_eq!(calls, 2, "expected exactly 2 sub-expressions in {filter:?}");
+            assert_eq!(
+                result, expr,
+                "field order/identity not preserved for {filter:?}"
+            );
+        }
+    }
+
+    /// `Expr::Builtin` still delegates to [`map_builtin_subexprs`] when
+    /// reached through `map_subexprs` directly (dead code from the three
+    /// `eval.rs` callers today, which all special-case `Builtin` themselves
+    /// -- see `map_subexprs`'s own doc comment -- but this function must
+    /// still behave sensibly if something else ever does reach it here).
+    #[test]
+    fn map_subexprs_builtin_delegates_to_map_builtin_subexprs() {
+        let expr = parse("map(.a)").expect("filter should parse");
+        let mut calls = 0usize;
+        let result = map_subexprs(&expr, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result, expr);
+    }
+
+    /// `Expr::Error`'s default arm recurses into the message (unlike any of
+    /// today's three `eval.rs` callers, which all keep their own
+    /// non-recursing `Expr::Error(msg) => Expr::Error(msg.clone())` arm
+    /// instead of reaching this one -- see this function's own doc comment
+    /// for why). Confirms both the `Some` and `None` message shapes.
+    #[test]
+    fn map_subexprs_error_default_recurses_into_message() {
+        let with_msg = parse("error(.a)").expect("filter should parse");
+        let mut calls = 0usize;
+        let result = map_subexprs(&with_msg, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result, with_msg);
+
+        let bare = Expr::Error(None);
+        let mut calls = 0usize;
+        let result = map_subexprs(&bare, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 0);
+        assert_eq!(result, bare);
+    }
+
+    /// `Expr::Shared`'s default arm recurses into the wrapped expression
+    /// (dead code from the three `eval.rs` callers today, which all keep
+    /// `Shared` opaque -- see this function's own doc comment).
+    #[test]
+    fn map_subexprs_shared_default_recurses() {
+        let inner = Expr::Builtin(Builtin::Length);
+        let shared = Expr::Shared(Rc::new(inner.clone()));
+        let mut calls = 0usize;
+        let result = map_subexprs(&shared, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result, shared);
+    }
+
+    /// `Expr::DefCall`'s default arm -- the shape shared by
+    /// `substitute_var_impl` and `substitute_func_param` (`def` opaque via
+    /// `Rc::clone`, `args` mapped through `f`, `frames` unchanged, `bound`
+    /// reset). `install_def_calls` never reaches this arm (it keeps its own
+    /// explicit one with a different `frames` policy), so this test
+    /// exercises the arm directly.
+    #[test]
+    fn map_subexprs_defcall_default_maps_args_and_resets_bound() {
+        let def = Rc::new(FuncDefData {
+            name: "f".into(),
+            params: vec!["x".into()],
+            body: Expr::Identity,
+        });
+        let original = Expr::DefCall {
+            def: Rc::clone(&def),
+            args: vec![Expr::Field("a".into()), Expr::Field("b".into())],
+            frames: 7,
+            bound: BoundBody::default(),
+        };
+        let mut calls = 0usize;
+        let result = map_subexprs(&original, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 2, "expected exactly one call per arg");
+        match result {
+            Expr::DefCall {
+                def: result_def,
+                args,
+                frames,
+                bound: _,
+            } => {
+                assert!(
+                    Rc::ptr_eq(&result_def, &def),
+                    "`def` must stay opaque (Rc::clone)"
+                );
+                assert_eq!(
+                    args,
+                    vec![Expr::Field("a".into()), Expr::Field("b".into())],
+                    "args must be mapped in order"
+                );
+                assert_eq!(
+                    frames, 7,
+                    "frames must be unchanged (install_def_calls-only policy)"
+                );
+            }
+            other => panic!("expected DefCall, got {other:?}"),
+        }
+    }
+
+    /// `Expr::FuncDef`'s default arm (unconditional recursion into both
+    /// `body` and `then`, bound reset) -- dead code from all three
+    /// `eval.rs` callers today, each of which keeps its own complete,
+    /// genuinely different arm (see this function's own doc comment).
+    #[test]
+    fn map_subexprs_funcdef_default_recurses_body_and_then() {
+        let expr = parse("def f: .a; .b").expect("filter should parse");
+        let mut calls = 0usize;
+        let result = map_subexprs(&expr, &mut |e| {
+            calls += 1;
+            e.clone()
+        });
+        assert_eq!(calls, 2, "expected exactly one call each for body and then");
+        assert_eq!(result, expr);
     }
 }
