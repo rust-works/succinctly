@@ -1885,38 +1885,71 @@ is `limit`'s own scope. Tracked in
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md)
 (item 9).
 
-## A `?//`-alternatives bind under a short-circuiting consumer runs once, not once per alternative
+## A `?//`-alternatives bind sees a short-circuiting consumer's stop only when nothing materializes it first
 
-Real jq's short-circuiting builtins (`first`, `isempty`, `limit`, `any`, `all`, ...) are defined
-in `builtin.jq` as `label $out | ... break $out`. When the generator argument is a
+Real jq's short-circuiting builtins (`first`, `isempty`, `limit`, `nth`, `any`, `all`, `IN`) are
+defined in `builtin.jq` as `label $out | ... break $out`. When the generator argument is a
 `?//`-alternatives bind and that `break` unwinds through it, jq's `?//` treats *any* escaping
 break as "this alternative failed, try the next" — it does not distinguish a label declared
 outside the whole `?//` from one declared inside it. The consumer's whole computation therefore
-runs once per alternative, even though only the first alternative's output is ever kept. Every
-row confirmed live against jq 1.7.1:
+runs once per alternative.
 
-| filter                              | jq 1.7.1             | succinctly jq |
-|-------------------------------------|----------------------|---------------|
-| `isempty(1 as $x ?// $y \| 5)`      | `false` then `false` | `false`       |
-| `[first(1 as $x ?// $y \| 5, 6)]`   | `[5,5]`              | `[5]`         |
-| `[limit(1; 1 as $x ?// $y \| 5)]`   | `[5,5]`              | `[5]`         |
-| `1 as $x ?// $y \| 5` (no consumer) | `5`                  | `5`           |
+[#1519](https://github.com/rust-works/succinctly/issues/1519) implemented that rule.
+succinctly's builtins are native Rust rather than macro expansions, so they signal satisfaction
+as `Demand::Stop`/`Flow::Stopped` instead of raising a break — the *same event*, so
+`each_pattern_alternatives` (`src/jq/eval.rs`) and `each_pattern_alternatives_generic`
+(`src/jq/eval_generic.rs`) now fall through to the next alternative on it, under the same
+`is_last` rule they already applied to `Control::Break` since
+[#1457](https://github.com/rust-works/succinctly/issues/1457) (see `eval::is_retryable_stop`).
+The terminal sinks were reshaped to jq's own macro shape at the same time — emit, *then* stop —
+so a retried alternative emits again. All of the following now match, confirmed live against
+jq 1.7.1 and pinned as golden fixtures (`tests/data/jq-golden/cases/alt_pattern_*`):
 
-`succinctly jq` resolves `?//` via static Rust-side pattern-alternative resolution
-(`try_pattern_alternatives`/`each_pattern_alternatives`, `src/jq/eval.rs`) with no concept of an
-outer `label`/`break` at all — its builtins are native Rust, not user-space `builtin.jq` macro
-expansions — so it always produces exactly one output regardless of alternative count. This is
-the *non-duplicating* direction: succinctly's own output is the smaller, arguably more intuitive
-one, but it is a real divergence from jq's own defined semantics.
+| filter                                                     | jq 1.7.1 and `succinctly jq` |
+|------------------------------------------------------------|------------------------------|
+| `isempty(1 as $x ?// $y \| 5)`                             | `false` then `false`         |
+| `[first(1 as $x ?// $y \| 5, 6)]`                          | `[5,5]`                      |
+| `[limit(2; 1 as $x ?// $y \| 5,6)]`                        | `[5,6,5]`                    |
+| `[nth(1; 1 as $x ?// $y \| 5, 6)]`                         | `[6,5]`                      |
+| `[any(1 as $x ?// $y \| true; .)]`                         | `[true,true]`                |
+| `1 as $x ?// $y \| 5` (no consumer)                        | `5`                          |
 
-Not fixed here — whether to reproduce jq's per-alternative re-run behaviour is an open
-implementation question tracked in
-[#1519](https://github.com/rust-works/succinctly/issues/1519), which this entry was split from
-([#1831](https://github.com/rust-works/succinctly/issues/1831)) to record the divergence
-unconditionally regardless of how that question is resolved. Piggybacks on the `?//` retry rule
-from [#1457](https://github.com/rust-works/succinctly/issues/1457); unrelated to the other `?//`
-divergence already recorded above ([#1365](https://github.com/rust-works/succinctly/issues/1365),
-`?//`-alternatives folds not being path-tracked).
+**What still diverges.** The stop only reaches the `?//` if every construct between the consumer
+and the bind *forwards demand* into it rather than materializing it. Three do not, so these still
+answer once where jq answers twice:
+
+| filter                                                         | jq 1.7.1        | succinctly jq |
+|-----------------------------------------------------------------|-----------------|---------------|
+| `[first((1 as $x ?// $y \| 5)//9)]`                             | `[5,5]`         | `[5]`         |
+| `[label $o \| (1 as $x ?// $y \| 5) \| (., break $o)]`          | `[5,5]`         | `[5]`         |
+| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`              | `[1,2]`         | `[1]`         |
+| `1 \| [first(first(1 as $x ?// $y \| 1))]`                      | `[1,1]`         | `[1]`         |
+| `1 \| [first(isempty(1 as $x ?// $y \| 1))]`                    | `[false,false]` | `[false]`     |
+| `1 \| [first(IN(1 as $x ?// $y \| 1))]`                         | `[true,true]`   | `[true]`      |
+
+The cause is uniform and is not about `?//` at all: each of `//`, `foreach`, a parenthesised bind
+whose break arrives from a *downstream* pipe stage, and a **nested short-circuiting consumer**
+lacks a demand-forwarding `eval_each` arm, so it evaluates the bind eagerly and absorbs the stop
+before it can reach `each_pattern_alternatives`.
+
+`limit` is the one consumer that already has such an arm (`each_limit`, #1462/#1596), and it is
+exactly the one that works when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` is `[1,1]` in
+both, while substituting any other consumer for the inner `limit` diverges. That contrast is the
+direct evidence for the mechanism, and it means each construct closes its own row by gaining an
+arm, with no further `?//` work. Demand-forwarding and unparenthesised spellings likewise all
+already match (`[first((1 as $x ?// $y | 5)|.)]`, `[first(if true then 1 as $x ?// $y | 5 else 9
+end)]`, `[first(limit(5; 1 as $x ?// $y | 5))]`, `[label $o | 1 as $x ?// $y | (5, break $o)]`).
+This is the same missing-lazy-arm class as items 9 and 10 of
+[`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
+in [#2180](https://github.com/rust-works/succinctly/issues/2180).
+
+Unrelated to the other `?//` divergence recorded above
+([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being
+path-tracked), and to the path-context refusal
+([#1663](https://github.com/rust-works/succinctly/issues/1663)), which independently makes
+`{a:1} | [path(first(1 as $x ?// $y | .a))]` raise where jq answers `[["a"],["a"]]`. This entry
+was originally split out as [#1831](https://github.com/rust-works/succinctly/issues/1831) to
+record the divergence unconditionally, before it was known to be fixable this cheaply.
 
 ## `--seq`'s malformed-record warning covers one of jq's several message shapes
 

@@ -3923,11 +3923,15 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// alternative's": those pushes already happened by the time an alternative
 /// fails, `sink` having seen them is what "kept" means here.
 ///
-/// If `sink` itself is satisfied partway through an alternative,
-/// `eval_each` returns `Flow::Stopped` rather than `Escaped`, which this
-/// function propagates immediately rather than falling through to the next
-/// alternative -- once the consumer has what it wants, no further
-/// alternative is ever tried, matching `each_try`'s identical reasoning.
+/// If `sink` itself is satisfied partway through an alternative, `eval_each`
+/// returns `Flow::Stopped` rather than `Escaped`. #1519: that is the *same
+/// event* as jq's escaping `break` -- succinctly's short-circuiting builtins
+/// are native Rust, so they signal satisfaction as `Demand::Stop` where real
+/// jq's `builtin.jq` macros raise `break $out` -- so it falls through to the
+/// next alternative on exactly the same `is_last` rule, via
+/// [`is_retryable_stop`]. This function used to propagate it immediately,
+/// which is what made `isempty(1 as $x ?// $y | 5)` answer `false` once where
+/// jq answers it twice.
 fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     patterns: &[Pattern],
     all_var_names: &[String],
@@ -3969,7 +3973,19 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
             Flow::Exhausted => return Flow::Exhausted,
-            Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1519: a satisfied consumer is jq's escaping `break`, so it
+            // retries the next alternative just like `Control::Break` below.
+            // `pending` is dropped on the retry rather than carried: it is
+            // only ever `Some` when an eager fallback had already raised a
+            // trailing control before the stop, and real jq -- which would
+            // never have evaluated that far -- ignores it, the same reasoning
+            // `builtin_isempty` records at its own `Flow::Stopped` arm.
+            Flow::Stopped { pending } => {
+                if is_retryable_stop(is_last) {
+                    continue;
+                }
+                return Flow::Stopped { pending };
+            }
             // #1620/#1660: same decode-failure exclusion as
             // `try_pattern_alternatives` -- always propagates, `is_last` or
             // not.
@@ -4568,33 +4584,64 @@ fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
     owned_vec_to_result(out)
 }
 
-/// Pull at most one output, then stop the generator — jq's
+/// Pull at most one output *per delivery*, then stop the generator — jq's
 /// `def first(f): label $out | (f, break $out);`.
 ///
-/// `Err` is returned only for a *bare* escape (the generator's very first
-/// "output" was itself an error/break/halt). Once an output exists the
-/// consumer is satisfied, and jq — whose `break $out` has already fired —
-/// never reaches whatever came after, so any trailing control is dropped.
-/// Oracle-confirmed: `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0.
+/// Returns the items alongside the terminating [`Flow`], for the same reason
+/// [`each_take_n`] does: whether a trailing control is dropped depends on
+/// *why* the pull ended. A `Flow::Stopped` means jq's `break $out` fired and
+/// it never reached what came after, so the control is dropped
+/// (oracle-confirmed: `first(1, ("BOOM"|halt_error(3)))` is `1`, exit 0). A
+/// `Flow::Escaped` *with* items already taken can only come from a `?//`
+/// retry (#1519) -- the sink stops on every item, so nothing else can hand
+/// over an item and then escape -- and there jq genuinely does reach the
+/// failing alternative, so it must raise:
+/// `first([1] as [$x] ?// $x | if ($x|type)=="number" then 5 else
+/// error("boom") end)` prints `5` and then fails, exactly as the same shape
+/// under `limit` already did.
+///
+/// **Why a `Vec` and not an `Option` (#1519).** jq's definition emits `f`'s
+/// output *before* it breaks, so anything that catches that break and re-runs
+/// the generator makes `first` emit again. Exactly one construct does:
+/// `?//`, whose alternative retry treats an escaping break as "this
+/// alternative failed, try the next" — so `[first(1 as $x ?// $y | 5, 6)]` is
+/// `[5,5]` in real jq, one output per alternative. Latching into an `Option`
+/// silently collapsed that to `[5]`. Under a single alternative — every other
+/// caller — the sink is still entered exactly once and this returns exactly
+/// one item, so the change is inert outside a `?//` chain.
 fn each_take_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
-) -> Result<Option<Item<'a, W>>, Control> {
-    let mut first: Option<Item<'a, W>> = None;
+) -> (Vec<Item<'a, W>>, Flow) {
+    let mut taken: Vec<Item<'a, W>> = Vec::new();
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
-        first = Some(item);
+        taken.push(item);
         Demand::Stop
     });
+    (taken, flow)
+}
+
+/// Shared resolution of [`each_take_first`]'s and [`each_take_nth`]'s two
+/// outputs into a [`QueryResult`], so their call sites cannot drift on the
+/// dropped-versus-raised trailing-control rule (#1519). Both sinks stop on
+/// every item they keep, so both have the identical rule.
+fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
+    items: Vec<Item<'_, W>>,
+    flow: Flow,
+) -> QueryResult<'_, W> {
     match flow {
-        Flow::Stopped { .. } | Flow::Exhausted => Ok(first),
-        // The sink always stops on its first item, so an escape can only mean
-        // nothing was ever produced. The `Some` guard keeps that reasoning
-        // local rather than relying on it from a distance.
-        Flow::Escaped(control) => match first {
-            Some(item) => Ok(Some(item)),
-            None => Err(control),
-        },
+        Flow::Escaped(control) if items.is_empty() => control_to_result(control),
+        // #1519: items *and* an escape means a later `?//` alternative failed
+        // after an earlier one had already answered. jq reaches that failure,
+        // so the prefix is kept and the control still raises.
+        Flow::Escaped(control) => {
+            QueryResult::Partial(items.into_iter().map(Item::into_owned).collect(), control)
+        }
+        // `_checked`, not the unchecked twin it replaced upstream: an
+        // undecodable item must raise rather than silently become "", and a
+        // `?//` retry must not be able to launder that (#1820, #1660).
+        Flow::Stopped { .. } | Flow::Exhausted => items_to_result_checked(items),
     }
 }
 
@@ -4623,34 +4670,43 @@ fn each_take_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     (taken, flow)
 }
 
-/// Pull outputs until index `n`, keeping only that one — jq's `nth`, which it
-/// defines as `last(limit($n + 1; f))`, so it stops there exactly as `limit`
-/// would.
+/// Pull outputs until index `n`, keeping the ones at or past it — jq's `nth`,
+/// which stops there exactly as `limit` would.
+///
+/// **The index test is `>=`, not `==` (#1519).** jq 1.7.1's `nth` is a
+/// `label`/`break` macro that emits the current output and breaks once its
+/// running counter has passed `$n`; the counter is *not* reset by anything
+/// that catches that break. Normally the break is caught by `nth`'s own label
+/// and no further output is ever offered, so `>=` and `==` are
+/// indistinguishable. Under a `?//` chain they are not: the retry re-runs the
+/// generator with the counter already past `n`, and jq emits again --
+/// `[nth(1; 1 as $x ?// $y | 5, 6)]` is `[6,5]`, index 1 from the first
+/// alternative then the very next output from the second. `==` yielded only
+/// `[6]`.
+///
+/// Note this is also why `nth($n; f)` cannot be modelled here as jq's
+/// documented `last(limit($n + 1; f))` desugaring: under a `?//` chain the two
+/// genuinely differ (`[last(limit(2; 1 as $x ?// $y | 5, 6))]` is `[5]`, not
+/// `[6,5]`), both confirmed live against jq 1.7.1.
 fn each_take_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
     n: usize,
-) -> Result<Option<Item<'a, W>>, Control> {
+) -> (Vec<Item<'a, W>>, Flow) {
     let mut seen = 0usize;
-    let mut wanted: Option<Item<'a, W>> = None;
+    let mut wanted: Vec<Item<'a, W>> = Vec::new();
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
-        if seen == n {
-            wanted = Some(item);
-            seen += 1;
+        let at_or_past = seen >= n;
+        seen += 1;
+        if at_or_past {
+            wanted.push(item);
             Demand::Stop
         } else {
-            seen += 1;
             Demand::Continue
         }
     });
-    match flow {
-        Flow::Stopped { .. } | Flow::Exhausted => Ok(wanted),
-        Flow::Escaped(control) => match wanted {
-            Some(item) => Ok(Some(item)),
-            None => Err(control),
-        },
-    }
+    (wanted, flow)
 }
 
 /// Owned-input twin of [`eval_each`], mirroring `eval_owned_input`.
@@ -7287,25 +7343,38 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // behavior (contrast `builtin_recurse_f`'s own doc comment, which does
     // give one for *its* unused `optional`).
     let current = to_owned_or_suppress!(&value, optional);
-    let mut found = false;
+    // #1519: a count, not a latch -- `IN(s)` is jq's `any(s == .; .)`, so it
+    // answers once per `?//` alternative that matched, exactly as
+    // `any_all_gen_cond` does. `5 | [IN(1 as $x ?// $y | 5)]` is `[true,true]`.
+    let mut found = 0usize;
     // #2015: `optional`, not hardcoded `false` -- `s`'s own generator
     // errors are `any_all_gen_cond`'s `gen` in `IN(s)`'s own `any(s ==
     // .; .)` terms, and that sibling already threads the real ambient
     // `optional` into its own `gen` evaluation for exactly this reason.
     let flow = eval_each_owned::<S>(s, &current, optional, &mut |candidate| {
         if owned_value_eq::<S>(&candidate, &current) {
-            found = true;
+            found += 1;
             Demand::Stop
         } else {
             Demand::Continue
         }
     });
-    if found {
-        return QueryResult::Owned(OwnedValue::Bool(true));
-    }
+    let mut out = vec![OwnedValue::Bool(true); found];
     match flow {
-        Flow::Exhausted | Flow::Stopped { .. } => QueryResult::Owned(OwnedValue::Bool(false)),
-        Flow::Escaped(control) => control_to_result(control),
+        Flow::Exhausted => {
+            out.push(OwnedValue::Bool(false));
+            owned_vec_to_result(out)
+        }
+        // Non-empty by construction: this sink only stops on a match. See
+        // `any_all_gen_cond`'s equivalent arm.
+        Flow::Stopped { .. } => owned_vec_to_result(out),
+        Flow::Escaped(control) => {
+            if out.is_empty() {
+                control_to_result(control)
+            } else {
+                QueryResult::Partial(out, control)
+            }
+        }
     }
 }
 
@@ -7944,7 +8013,14 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // deliberate split.
     let owned = to_owned_or_suppress!(&value, optional);
 
-    let mut matched = false;
+    // #1519: a *count* of decisive elements, not a latch. jq's `any`/`all`
+    // emit their answer from inside the generator pipeline and then break, so
+    // a `?//` chain -- which catches that break and retries the next
+    // alternative -- makes them answer once per alternative that decided:
+    // `[any(1 as $x ?// $y | true; .)]` is `[true,true]`. Outside a `?//`
+    // chain this is always 0 or 1 and answers exactly as the previous bool
+    // did.
+    let mut matches = 0usize;
     // `cond`'s own escape is not `gen`'s, so it travels out-of-band rather
     // than as `Flow::Escaped`; this preserves the existing precedence, where
     // a `cond` escape wins over `gen`'s trailing control.
@@ -7956,7 +8032,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         &mut |elem| match any_all_probe_element::<S>(cond, &elem, target_truthy) {
             Ok(true) => {
-                matched = true;
+                matches += 1;
                 Demand::Stop
             }
             Ok(false) => Demand::Continue,
@@ -7970,24 +8046,41 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if let Some(control) = probe_escape {
         return control_to_result(control);
     }
-    if matched {
-        return QueryResult::Owned(OwnedValue::Bool(target_truthy));
-    }
+    let mut out = vec![OwnedValue::Bool(target_truthy); matches];
     match flow {
-        // `gen` exhausted with no match: the answer is the identity element
-        // (`false` for `any`, `true` for `all`).
+        // `gen` exhausted: the identity element (`false` for `any`, `true` for
+        // `all`) is appended to however many decisive answers already fired.
+        // Normally `matches` is 0 here and this is the sole answer; a `?//`
+        // chain whose last alternative runs dry after an earlier one decided
+        // yields both (`[any([1] as [$x] ?// $x | ($x == 1); .)]` is
+        // `[true,false]`, confirmed live against jq 1.7.1).
         //
         // `Stopped` is folded in here rather than given an `unreachable!()`:
-        // every `Stop` this sink issues sets `matched` or `probe_escape`, both
-        // returned above, so reaching this arm as `Stopped` is impossible
-        // today -- but a defensible identity answer is a better failure mode
-        // than a panic if a future sink grows a third stop reason.
-        Flow::Exhausted | Flow::Stopped { .. } => {
-            QueryResult::Owned(OwnedValue::Bool(!target_truthy))
+        // every `Stop` this sink issues bumps `matches` or sets
+        // `probe_escape`, so reaching this arm as `Stopped` with no decisive
+        // answer is impossible today -- but a defensible identity answer is a
+        // better failure mode than a panic if a future sink grows a third stop
+        // reason. A `Stopped` that *did* decide must not append the identity
+        // element, which is why the two are no longer folded into one arm.
+        Flow::Exhausted => {
+            out.push(OwnedValue::Bool(!target_truthy));
+            owned_vec_to_result(out)
         }
+        // Stopped means at least one element was decisive, so `out` is
+        // non-empty here by construction -- every `Stop` this sink issues
+        // either bumps `matches` or sets `probe_escape` (returned above). jq's
+        // trailing identity element belongs only to the exhausted case, since
+        // its `break` is exactly what skips it.
+        Flow::Stopped { .. } => owned_vec_to_result(out),
         // No earlier output matched, so `gen`'s own terminator is the only
         // verdict left -- oracle-verified: `IN(3, error("boom"))` on `2` raises.
-        Flow::Escaped(control) => control_to_result(control),
+        Flow::Escaped(control) => {
+            if out.is_empty() {
+                control_to_result(control)
+            } else {
+                QueryResult::Partial(out, control)
+            }
+        }
     }
 }
 
@@ -27650,6 +27743,41 @@ fn is_retryable_control(control: &Control, is_last: bool) -> bool {
     }
 }
 
+/// Whether a [`Flow::Stopped`] escaping a `?//` alternative's attempt should
+/// retry the next alternative rather than propagate -- the lazy-path twin of
+/// [`is_retryable_control`], and the whole of #1519's fix.
+///
+/// Real jq's short-circuiting builtins are `builtin.jq` macros shaped
+/// `label $out | ... break $out`, and its `?//` catches *any* escaping break
+/// -- including one addressed to a label declared entirely outside the `?//`
+/// -- reading it as "this alternative failed, try the next". So a consumer's
+/// short-circuit makes the whole bind run once per alternative:
+/// `isempty(1 as $x ?// $y | 5)` is `false` *twice*, and
+/// `[first(1 as $x ?// $y | 5, 6)]` is `[5,5]` (both live-verified against
+/// the pinned oracle, jq 1.7.1).
+///
+/// succinctly's builtins are native Rust rather than macro expansions, so
+/// they never emit a `break` for [`is_retryable_control`] to classify: they
+/// signal satisfaction as `Demand::Stop`, surfacing here as
+/// [`Flow::Stopped`]. That is the *same event* as jq's escaping break, so it
+/// gets the same answer -- retry unless this was the last alternative. #1519
+/// was originally filed believing succinctly had "no concept of an outer
+/// `label`/`break` at all" and would need one built; in fact `Control::Break`
+/// retry has worked since #1457 (every user-written `label`/`break` shape
+/// through a `?//` already matched jq), and only this stop-shaped sibling
+/// signal was missing.
+///
+/// Taking `is_last` alone rather than a `&Control` is deliberate: a stop
+/// carries no control to classify, and the decode-failure and `Halt`
+/// exclusions that make [`is_retryable_control`] a `match` cannot arise from
+/// a stop -- both are `Flow::Escaped`, never `Flow::Stopped`. The rule still
+/// lives in a named function next to its sibling rather than open-coded at
+/// the two call sites, because duplicated `?//` classifiers in this file have
+/// drifted twice already (#1313, #1457).
+pub(crate) fn is_retryable_stop(is_last: bool) -> bool {
+    !is_last
+}
+
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
 /// step, in order, against a single `input_val`.
 ///
@@ -28146,12 +28274,10 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Was: evaluate `expr` to completion, then take `.next()` off the result.
     // That answered correctly but had already run every later branch, firing
     // any `stderr`/`halt_error` and consuming any `input` in them (#820).
-    match each_take_first::<W, S>(expr, value, optional) {
-        Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
-        Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
-        Ok(None) => QueryResult::None,
-        Err(control) => control_to_result(control),
-    }
+    // #1519: normally a one-element `Vec`; a `?//` chain under this consumer
+    // legitimately yields one item per alternative.
+    let (items, flow) = each_take_first::<W, S>(expr, value, optional);
+    take_stopping_items_to_result(items, flow)
 }
 
 /// Evaluate `last(expr)` - take last output.
@@ -28248,12 +28374,11 @@ fn eval_nth_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // Pull only as far as index `n`, then stop -- jq defines `nth` as
             // `last(limit($n + 1; f))`, so it stops there too (#820).
-            match each_take_nth::<W, S>(expr, value.clone(), optional, n) {
-                Ok(Some(Item::Borrowed(v))) => QueryResult::One(v),
-                Ok(Some(Item::Owned(v))) => QueryResult::Owned(v),
-                Ok(None) => QueryResult::None,
-                Err(control) => control_to_result(control),
-            }
+            // #1519: normally a one-element `Vec`; a `?//` chain under this
+            // consumer legitimately yields one item per alternative, and a
+            // later alternative's own error still raises after it.
+            let (items, flow) = each_take_nth::<W, S>(expr, value.clone(), optional, n);
+            take_stopping_items_to_result(items, flow)
         },
     )
 }
@@ -38450,16 +38575,14 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    match each_take_first::<W, S>(expr, value, optional) {
-        // #1989: `into_owned_checked` -- this value is the query's own
-        // output, so an undecodable string must raise rather than be
-        // emitted as `""` (see `builtin_limit`'s identical conversion).
-        Ok(Some(item)) => match item.into_owned_checked() {
-            Ok(v) => QueryResult::Owned(v),
-            Err(e) => suppress_or_raise(e, optional),
-        },
-        Ok(None) => QueryResult::None,
-        Err(control) => control_to_result(control),
+    let (items, flow) = each_take_first::<W, S>(expr, value, optional);
+    match take_stopping_items_to_result(items, flow) {
+        // This builtin has always materialized, unlike `eval_first_expr`.
+        // #1989: checked conversion -- this value is the query's own output,
+        // so an undecodable string must raise rather than be emitted as `""`
+        // (see `builtin_limit`'s identical conversion).
+        QueryResult::One(v) => QueryResult::Owned(to_owned_or_suppress!(&v, optional)),
+        other => other,
     }
 }
 
@@ -38556,13 +38679,20 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // deferring the decode entirely, so it was never at risk the same
             // way -- this "always materializing" spelling is the one that
             // forces the conversion and so is the one that must check it).
-            match each_take_nth::<W, S>(expr, value.clone(), optional, n) {
-                Ok(Some(item)) => match item.into_owned_checked() {
-                    Ok(v) => QueryResult::Owned(v),
-                    Err(e) => QueryResult::Error(e),
-                },
-                Ok(None) => QueryResult::None,
-                Err(control) => control_to_result(control),
+            let (items, flow) = each_take_nth::<W, S>(expr, value.clone(), optional, n);
+            // This spelling always materializes (see the note above), so the
+            // decode is checked here rather than deferred.
+            let mut owned = vec_with_capacity(items.len());
+            for item in items {
+                match item.into_owned_checked() {
+                    Ok(v) => owned.push(v),
+                    Err(e) => return QueryResult::Error(e),
+                }
+            }
+            match flow {
+                Flow::Escaped(control) if owned.is_empty() => control_to_result(control),
+                Flow::Escaped(control) => QueryResult::Partial(owned, control),
+                _ => owned_vec_to_result(owned),
             }
         },
     )
@@ -38586,7 +38716,22 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The three arms below replace an eight-arm case analysis (#882, #791,
     // #867) whose every oracle fact now falls out of `Flow`'s shape instead of
     // being re-derived per `QueryResult` variant.
-    match eval_each::<W, S>(expr, value, optional, &mut |_item| Demand::Stop) {
+    // #1519: `delivered` counts sink entries rather than latching a bool.
+    // jq's `g|false` emits a `false` for *every* output `g` hands over, and
+    // the `break $out` that follows fires on the first one -- so normally
+    // that is exactly one `false`. A `?//` chain catches the break and retries
+    // the next alternative, handing over another output and emitting another
+    // `false`: `isempty(1 as $x ?// $y | 5)` is `false` *twice* in real jq,
+    // `false` three times for a three-alternative chain. Counting reproduces
+    // that without special-casing `?//`, because it is a direct transcription
+    // of the macro; outside a `?//` chain the count is always 0 or 1 and this
+    // answers exactly as the previous bool did.
+    let mut delivered = 0usize;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |_item| {
+        delivered += 1;
+        Demand::Stop
+    });
+    match flow {
         // `g` produced an output and we stopped it right there.
         //
         // `pending` is deliberately dropped: it is only ever `Some` when an
@@ -38595,10 +38740,20 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // answers `false` regardless. Oracle-confirmed for all three shapes:
         // `isempty(1, error("x"))`, `isempty(1, ("m"|halt_error(3)))` and
         // `label $o | isempty(1, break $o)` all answer `false`, exit 0.
-        Flow::Stopped { .. } => QueryResult::Owned(OwnedValue::Bool(false)),
+        Flow::Stopped { .. } => owned_vec_to_result(vec![OwnedValue::Bool(false); delivered]),
 
-        // `g` ran to exhaustion without ever calling the sink.
-        Flow::Exhausted => QueryResult::Owned(OwnedValue::Bool(true)),
+        // `g` ran to exhaustion. The trailing `, true` in jq's definition is
+        // reached exactly when no `break` is left unwinding, so it is appended
+        // to however many `false`s were already emitted -- normally none, but
+        // a `?//` chain whose *last* alternative runs dry after an earlier one
+        // short-circuited answers `false` then `true`
+        // (`isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else
+        // empty end)`, confirmed live against jq 1.7.1).
+        Flow::Exhausted => {
+            let mut out = vec![OwnedValue::Bool(false); delivered];
+            out.push(OwnedValue::Bool(true));
+            owned_vec_to_result(out)
+        }
 
         // A *bare* escape: `g`'s very first "output" was itself an
         // error/break/halt, so there is nothing to answer with and all three
@@ -39520,7 +39675,16 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // so converting the other 19 call sites would be wrong. It is
             // sound here only because this body terminates the process, so
             // control can never return to the generator.
-            let first = each_take_first::<W, S>(expr, value.clone(), optional);
+            let (items, flow) = each_take_first::<W, S>(expr, value.clone(), optional);
+            // #1519: `each_take_first` now reports every delivered item so
+            // `first(...)` itself can re-emit under a `?//` retry. This call
+            // site wants a single exit code, not a stream, so it keeps taking
+            // the leading one -- unchanged behaviour, since the process
+            // terminates before a second could matter.
+            let first: Result<Option<Item<'_, W>>, Control> = match flow {
+                Flow::Escaped(control) if items.is_empty() => Err(control),
+                _ => Ok(items.into_iter().next()),
+            };
             let n_result: Result<OwnedValue, EvalEscape> = match first {
                 Ok(Some(item)) => Ok(item.into_owned()),
                 // #1408: a zero-output code expression (`halt_error(empty)`)
@@ -46300,6 +46464,213 @@ mod tests {
                 assert_eq!(n, 2);
             }
         );
+    }
+
+    /// #1519: a short-circuiting consumer's satisfaction (`Flow::Stopped`)
+    /// retries the next `?//` alternative exactly as an escaping `break`
+    /// already did (#1457), because in real jq they are the *same event* --
+    /// jq's builtins short-circuit by raising `break $out`, and its `?//`
+    /// catches any escaping break as "this alternative failed, try the next".
+    ///
+    /// Every expectation is real jq 1.7.1's, captured live. See
+    /// `is_retryable_stop`.
+    #[test]
+    fn test_pattern_alternatives_retry_on_consumer_stop_1519() {
+        for (filter, want) in [
+            // One answer per alternative, per short-circuiting builtin.
+            ("[isempty(1 as $x ?// $y | 5)]", "[false,false]"),
+            (
+                "[isempty(1 as $x ?// $y ?// $z | 5)]",
+                "[false,false,false]",
+            ),
+            ("[first(1 as $x ?// $y | 5, 6)]", "[5,5]"),
+            ("[limit(1; 1 as $x ?// $y | 5)]", "[5,5]"),
+            ("[nth(1; 1 as $x ?// $y | 5, 6)]", "[6,5]"),
+            ("[any(1 as $x ?// $y | true; .)]", "[true,true]"),
+            ("[all(1 as $x ?// $y | false; .)]", "[false,false]"),
+            // `limit`'s and `nth`'s counters keep rising across the retry
+            // rather than restarting -- the reason `each_take_nth` tests
+            // `seen >= n` and not `seen == n`.
+            ("[limit(2; 1 as $x ?// $y | 5,6)]", "[5,6,5]"),
+            ("[nth(0; 1 as $x ?// $y | 5, 6)]", "[5,5]"),
+            // The retry advances to the *next* pattern, re-binding the *same*
+            // source value (not the generator's next one).
+            (
+                "[first([1] as [$x] ?// $x | ($x|tostring), \"z\")]",
+                "[\"1\",\"[1]\"]",
+            ),
+            ("[first((1,2) as $x ?// $y | $x, \"z\")]", "[1,null]"),
+            // Nested chains compose into a cross product.
+            (
+                "[first(1 as $a ?// $b | (2 as $c ?// $d | 9), \"z\")]",
+                "[9,9,9,9]",
+            ),
+            // A retried alternative that runs dry still reaches the builtin's
+            // own exhaustion answer, so the two answers can differ.
+            (
+                "[isempty([1] as [$x] ?// $x | if ($x|type)==\"number\" then 9 else empty end)]",
+                "[false,true]",
+            ),
+            ("[any([1] as [$x] ?// $x | ($x == 1); .)]", "[true,false]"),
+            ("[all([1] as [$x] ?// $x | ($x != 1); .)]", "[false,true]"),
+            // Negative controls: an empty body is success, never a retry;
+            // `limit(0; ...)` never starts the generator; and with no
+            // consumer at all there is no stop to retry on.
+            ("[isempty(1 as $x ?// $y | empty)]", "[true]"),
+            ("[first(1 as $x ?// $y | empty)]", "[]"),
+            ("[limit(0; 1 as $x ?// $y | 5)]", "[]"),
+            ("[1 as $x ?// $y | 5]", "[5]"),
+            // A single (non-`?//`) pattern is always `is_last`, so it can
+            // never retry -- the property that makes this change inert
+            // outside a `?//` chain.
+            ("[first([1] as [$x] | $x, 9)]", "[1]"),
+            ("[isempty([1] as [$x] | $x)]", "[false]"),
+        ] {
+            assert_eq!(outputs(b"null", filter), vec![want.to_string()], "{filter}");
+        }
+    }
+
+    /// #1519: `IN` is jq's `any(s == .; .)`, so it answers once per matching
+    /// alternative too -- both its 1-arg form (`builtin_upper_in`, which keeps
+    /// its own candidate loop) and its 2-arg form (`builtin_upper_in_src`,
+    /// which delegates to `any_all_gen_cond`). Live-verified against jq 1.7.1.
+    #[test]
+    fn test_in_builtins_retry_on_consumer_stop_1519() {
+        for (json, filter, want) in [
+            (&b"5"[..], "[IN(1 as $x ?// $y | 5)]", "[true,true]"),
+            (&b"3"[..], "[IN(1 as $x ?// $y | 5)]", "[false]"),
+            (&b"5"[..], "[IN(1 as $x ?// $y | 5; .)]", "[true,true]"),
+            (&b"3"[..], "[IN(1 as $x ?// $y | 5; .)]", "[false]"),
+            // A matching alternative followed by a non-matching one yields
+            // both the decisive answer and the exhaustion answer.
+            (&b"1"[..], "[IN([1] as [$x] ?// $x | $x)]", "[true,false]"),
+        ] {
+            assert_eq!(outputs(json, filter), vec![want.to_string()], "{filter}");
+        }
+    }
+
+    /// #1519: the trailing-control rule differs by *why* the pull ended, which
+    /// is why `each_take_first` reports its `Flow` rather than collapsing to
+    /// `Result`. A control the consumer's break jumped over stays dropped; one
+    /// raised by a *retried* alternative is genuinely reached by jq and still
+    /// raises, after the earlier alternative's output. Before #1519 `first`
+    /// silently swallowed the second kind -- `limit` and `isempty` already got
+    /// it right, which is what made the inconsistency visible.
+    #[test]
+    fn test_pattern_alternative_retry_trailing_control_1519() {
+        // Dropped: the break fires before the halt is ever evaluated.
+        assert_eq!(
+            outputs(
+                b"null",
+                "[first(1 as $x ?// $y | 5, (\"m\"|halt_error(3)))]"
+            ),
+            vec!["[5,5]".to_string()]
+        );
+        // Raised: a later alternative's own error is genuinely reached, and
+        // the earlier alternative's output survives as a `Partial` prefix.
+        // Every consumer that keeps an item and then meets a failing
+        // alternative behaves the same way.
+        // `nth` had the identical swallowing bug `first` did, found only by
+        // chasing this arm's coverage.
+        for (filter, want_prefix) in [
+            (
+                "first([1] as [$x] ?// $x | if ($x|type)==\"number\" then 5 else error(\"boom\") end)",
+                vec!["5".to_string()],
+            ),
+            (
+                "nth(0; [1] as [$x] ?// $x | if ($x|type)==\"number\" then 5 else error(\"boom\") end)",
+                vec!["5".to_string()],
+            ),
+            (
+                "nth(1; [1] as [$x] ?// $x | if ($x|type)==\"number\" then (5,6) else error(\"boom\") end)",
+                vec!["6".to_string()],
+            ),
+            (
+                "any([1] as [$x] ?// $x | if ($x|type)==\"number\" then true else error(\"boom\") end; .)",
+                vec!["true".to_string()],
+            ),
+            (
+                "all([1] as [$x] ?// $x | if ($x|type)==\"number\" then false else error(\"boom\") end; .)",
+                vec!["false".to_string()],
+            ),
+        ] {
+            let index = JsonIndex::build(b"null");
+            let cursor = index.root(b"null");
+            let expr = parse(filter).unwrap();
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                QueryResult::Partial(prefix, Control::Error(e)) => {
+                    assert_eq!(
+                        prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                        want_prefix,
+                        "{filter}"
+                    );
+                    assert!(e.to_string().contains("boom"), "{filter}: {e}");
+                }
+                other => panic!("{filter}: expected Partial(_, Error(boom)), got {other:?}"),
+            }
+        }
+
+        // `IN(s)` keeps its own candidate loop rather than delegating to
+        // `any_all_gen_cond`, so it needs its own row.
+        let json: &[u8] = b"1";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(
+            "IN([1] as [$x] ?// $x | if ($x|type)==\"number\" then $x else error(\"boom\") end)",
+        )
+        .unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec!["true".to_string()]
+                );
+                assert!(e.to_string().contains("boom"), "{e}");
+            }
+            other => panic!("expected Partial([true], Error(boom)), got {other:?}"),
+        }
+    }
+
+    /// #1519: `Builtin::FirstStream` is never constructed by the parser (a CLI
+    /// `first(expr)` always reaches `Expr::FirstExpr`, see
+    /// `builtin_first_stream_propagates_bare_halt`), so its own `?//` retry
+    /// path is exercised directly here to keep it from drifting away from
+    /// `eval_first_expr`'s.
+    #[test]
+    fn builtin_first_stream_retries_pattern_alternatives_1519() {
+        let json_bytes: &[u8] = b"null";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse("1 as $x ?// $y | 5, 6").unwrap();
+        let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec!["5".to_string(), "5".to_string()]);
+
+        // The single-alternative case still answers exactly once.
+        let expr = parse("1 as $x | 5, 6").unwrap();
+        let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec!["5".to_string()]);
+
+        // A borrowed document value, so the lone item comes back as
+        // `QueryResult::One` and this builtin's own materializing arm runs
+        // (unlike `eval_first_expr`, it has always owned its answer).
+        let doc: &[u8] = br#"{"a": [7, 8]}"#;
+        let index = JsonIndex::build(doc);
+        let cursor = index.root(doc);
+        let expr = parse(".a").unwrap();
+        let got = builtin_first_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect::<Vec<_>>();
+        assert_eq!(got, vec!["[7,8]".to_string()]);
     }
 
     /// #1660 code review: `is_decode_failure()` used to classify purely by

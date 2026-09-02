@@ -25329,40 +25329,246 @@ fn test_array_iterate_lazy_limit_streams_confirmed_prefix_before_reaching_malfor
 /// expression (`1 as $x ?// $y | 5`, no consumer at all) is an ordinary
 /// single `5`.
 ///
-/// succinctly's `?//` resolution (`each_pattern_alternatives`/
-/// `try_pattern_alternatives`) has no concept of an enclosing `label`/
-/// `break` at all -- its short-circuiting builtins are native Rust
-/// functions, not user-space macro expansions -- so it always produces
-/// exactly one answer regardless of alternative count. Orthogonal to
-/// #1462's own scope (whether a wrapping consumer's demand reaches a nested
-/// generator; here demand reaches it correctly, and stops it after exactly
-/// the number of outputs succinctly itself produces) and confirmed
-/// pre-existing on `main` before that work landed, so pinned here rather
-/// than attempted there.
+/// This test used to pin succinctly's own diverging single-answer output as
+/// a characterization, on the premise -- taken from #1519's own text -- that
+/// succinctly "has no concept of an enclosing `label`/`break` at all" and
+/// would need one built. That premise was wrong in a way worth recording,
+/// because it is what kept the issue unscheduled: `?//` has retried on
+/// `Control::Break` since #1457, and every *user-written* `label`/`break`
+/// shape through a `?//` already matched jq exactly (pinned by
+/// `test_as_pattern_alt_break_falls_through_like_error_1457` and its
+/// siblings, and by the last four rows here). The only thing missing was
+/// that succinctly's native-Rust builtins signal satisfaction as
+/// `Demand::Stop`/`Flow::Stopped` rather than by raising a break, and
+/// `each_pattern_alternatives` returned that immediately instead of falling
+/// through on the same `is_last` rule. See `eval::is_retryable_stop`.
 ///
-/// The table below records succinctly's own current (single-answer,
-/// jq-diverging) output directly, in the same style as
-/// `test_short_circuit_side_effect_leaks_820_932_987` above -- jq's answer
-/// for each row is given in a comment rather than asserted, since matching
-/// it is #1519's own future fix, not this test's job.
+/// Every row is the real jq 1.7.1 answer, captured live.
 #[test]
-fn test_as_pattern_alternatives_do_not_retry_under_a_wrapping_label_1519() -> Result<()> {
+fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // No wrapping consumer: jq and succinctly already agree (`5`, once).
+        // No wrapping consumer at all: a single, ordinary evaluation. The
+        // retry is driven entirely by a consumer's short-circuit, so nothing
+        // here changed.
         (&["-cn", "1 as $x ?// $y | 5"], None, "5\n", "", 0),
-        // Wrapped in `isempty`: jq is `false` twice; succinctly, once.
+        // One answer per alternative, for each short-circuiting builtin.
         (
             &["-cn", "isempty(1 as $x ?// $y | 5)"],
+            None,
+            "false\nfalse\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "isempty(1 as $x ?// $y ?// $z | 5)"],
+            None,
+            "false\nfalse\nfalse\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[first(1 as $x ?// $y | 5, 6)]"],
+            None,
+            "[5,5]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[limit(1; 1 as $x ?// $y | 5)]"],
+            None,
+            "[5,5]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[any(1 as $x ?// $y | true; .)]"],
+            None,
+            "[true,true]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[all(1 as $x ?// $y | false; .)]"],
+            None,
+            "[false,false]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "5 | [IN(1 as $x ?// $y | 5)]"],
+            None,
+            "[true,true]\n",
+            "",
+            0,
+        ),
+        // `limit`'s counter is *not* reset by the retry: it keeps rising, so
+        // the second alternative contributes only until `n` is reached again.
+        (
+            &["-cn", "[limit(2; 1 as $x ?// $y | 5,6)]"],
+            None,
+            "[5,6,5]\n",
+            "",
+            0,
+        ),
+        // Same for `nth`, which is why its index test is `>=` and not `==`.
+        // Note this is also where jq's own documented `nth($n; f) ==
+        // last(limit($n + 1; f))` desugaring stops holding:
+        // `[last(limit(2; 1 as $x ?// $y | 5, 6))]` is `[5]`, not `[6,5]`.
+        (
+            &["-cn", "[nth(1; 1 as $x ?// $y | 5, 6)]"],
+            None,
+            "[6,5]\n",
+            "",
+            0,
+        ),
+        // The retry uses the *next* pattern, not a re-run of the first one.
+        (
+            &["-cn", r#"[first([1] as [$x] ?// $x | ($x|tostring), "z")]"#],
+            None,
+            "[\"1\",\"[1]\"]\n",
+            "",
+            0,
+        ),
+        // ...and re-binds the *same* source value, not the generator's next
+        // one. `$x` is unbound in the second alternative, hence `null`.
+        (
+            &["-cn", r#"[first((1,2) as $x ?// $y | $x, "z")]"#],
+            None,
+            "[1,null]\n",
+            "",
+            0,
+        ),
+        // Nested `?//` chains compose into a cross product: 2 x 2 = 4.
+        (
+            &[
+                "-cn",
+                r#"[first(1 as $a ?// $b | (2 as $c ?// $d | 9), "z")]"#,
+            ],
+            None,
+            "[9,9,9,9]\n",
+            "",
+            0,
+        ),
+        // A retried alternative that runs dry rather than short-circuiting
+        // still reaches the builtin's own exhaustion answer -- jq's trailing
+        // `, true` in `def isempty(g): label $out | (g|false, break $out),
+        // true;`. So the two answers differ from each other.
+        (
+            &[
+                "-cn",
+                r#"[isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else empty end)]"#,
+            ],
+            None,
+            "[false,true]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[any([1] as [$x] ?// $x | ($x == 1); .)]"],
+            None,
+            "[true,false]\n",
+            "",
+            0,
+        ),
+        // An empty body is *success*, never a retry -- unchanged by #1519,
+        // and the case that would break first if "stopped" and "produced
+        // nothing" were ever conflated.
+        (
+            &["-cn", "[isempty(1 as $x ?// $y | empty)]"],
+            None,
+            "[true]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[first(1 as $x ?// $y | empty)]"],
+            None,
+            "[]\n",
+            "",
+            0,
+        ),
+        // `limit(0; ...)` never runs the generator, so there is no stop to
+        // retry on.
+        (
+            &["-cn", "[limit(0; 1 as $x ?// $y | 5)]"],
+            None,
+            "[]\n",
+            "",
+            0,
+        ),
+        // A trailing control the consumer's break already jumped over stays
+        // dropped: the halt is never reached, in either alternative.
+        (
+            &["-cn", r#"[first(1 as $x ?// $y | 5, ("m"|halt_error(3)))]"#],
+            None,
+            "[5,5]\n",
+            "",
+            0,
+        ),
+        // But a control raised *by a retried alternative* is genuinely
+        // reached, so it must still raise -- succinctly answered `[5]` here
+        // before #1519, silently dropping the error.
+        (
+            &[
+                "-cn",
+                r#"first([1] as [$x] ?// $x | if ($x|type)=="number" then 5 else error("boom") end)"#,
+            ],
+            None,
+            "5\n",
+            "jq: error (at <unknown>): boom",
+            5,
+        ),
+        // `nth` had the identical swallowing bug and is fixed with it -- the
+        // trailing-control rule is shared (`take_stopping_items_to_result`).
+        (
+            &[
+                "-cn",
+                r#"nth(0; [1] as [$x] ?// $x | if ($x|type)=="number" then 5 else error("boom") end)"#,
+            ],
+            None,
+            "5\n",
+            "jq: error (at <unknown>): boom",
+            5,
+        ),
+        // `reduce` does not short-circuit, so it never triggers a retry.
+        (
+            &["-cn", "isempty(reduce (1) as $x ?// $y (0; .))"],
             None,
             "false\n",
             "",
             0,
         ),
-        // Three alternatives: jq is `false` three times; succinctly, once.
+        // User-written `label`/`break` through a `?//`: already correct
+        // before #1519 (#1457), and must stay so. A break raised *outside*
+        // the `?//` never reaches it, so no retry...
         (
-            &["-cn", "isempty(1 as $x ?// $y ?// $z | 5)"],
+            &["-cn", "[label $out | (1 as $x ?// $y | 5), break $out]"],
             None,
-            "false\n",
+            "[5]\n",
+            "",
+            0,
+        ),
+        // ...one raised inside its body unwinds through it, so it retries...
+        (
+            &["-cn", "[label $out | (1 as $x ?// $y | 5, break $out)]"],
+            None,
+            "[5,5]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", "[label $out | 1 as $x ?// $y | (5, break $out)]"],
+            None,
+            "[5,5]\n",
+            "",
+            0,
+        ),
+        // ...and one caught by a label *inside* the body never escapes the
+        // `?//` at all, so again no retry.
+        (
+            &["-cn", "[1 as $x ?// $y | label $in | (5, break $in)]"],
+            None,
+            "[5]\n",
             "",
             0,
         ),
@@ -25373,8 +25579,71 @@ fn test_as_pattern_alternatives_do_not_retry_under_a_wrapping_label_1519() -> Re
         assert_eq!(
             (stdout.as_str(), stderr.trim_end_matches('\n'), code),
             (*want_out, *want_err, *want_code),
-            "`{}` changed -- if #1519 is fixed, update this test's expectations",
+            "`{}` diverged from jq 1.7.1",
             args.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// #2180, the residual left by #1519: the consumer's stop only reaches the
+/// `?//` bind if every construct in between *forwards demand* into it. A
+/// nested short-circuiting consumer does not -- it materializes its result, so
+/// the outer consumer's `Demand::Stop` lands on `drain_result` and never
+/// reaches `each_pattern_alternatives`.
+///
+/// `limit` is the control: it is the only consumer with a demand-forwarding
+/// `eval_each` arm (`each_limit`, #1462/#1596), and it is the only one that
+/// works when nested. That contrast is the evidence the cause is the missing
+/// arm and not `?//` itself, so it is pinned here rather than only described.
+///
+/// This is a characterization test of a *known divergence*: the `want` column
+/// is succinctly's current answer, with jq 1.7.1's given per row. When #2180
+/// gives a construct its lazy arm, that row starts matching jq and this test
+/// must be updated -- which is the point.
+#[test]
+fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
+    // `G` is the generator under test in every row below.
+    const G: &str = "1 as $x ?// $y | 1";
+
+    let cases: &[(String, &str, &str)] = &[
+        // The control: `limit` forwards demand, so the retry still happens and
+        // succinctly already matches jq here.
+        (format!("[first(limit(1; {G}))]"), "[1,1]", "matches jq"),
+        // Every other consumer materializes, so the outer stop is absorbed.
+        (format!("[first(first({G}))]"), "[1]", "jq: [1,1]"),
+        (format!("[first(nth(0; {G}))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[first(isempty({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(any({G}; .))]"), "[true]", "jq: [true,true]"),
+        (format!("[first(IN({G}))]"), "[true]", "jq: [true,true]"),
+        (
+            format!("[isempty(isempty({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[limit(1; IN({G}))]"), "[true]", "jq: [true,true]"),
+        // Single-level is correct throughout -- it is the nesting that breaks
+        // it, not the bind.
+        (format!("[first({G})]"), "[1,1]", "matches jq"),
+        (format!("[IN({G})]"), "[true,true]", "matches jq"),
+        (format!("[isempty({G})]"), "[false,false]", "matches jq"),
+    ];
+
+    for (filter, want, note) in cases {
+        // `-c` with a real `1` on stdin, not `-cn`: `IN(s)` compares against
+        // the *input*, so a `null` input would make every row answer `false`
+        // for a reason that has nothing to do with #2180.
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("1"))?;
+        assert_eq!(code, 0, "`{filter}` stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            *want,
+            "`{filter}` ({note}) changed -- if #2180 gave this construct a \
+             demand-forwarding lazy arm, update this row to jq's answer"
         );
     }
     Ok(())

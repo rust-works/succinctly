@@ -40,11 +40,11 @@ use super::eval::{
     eval as full_eval, eval_each_owned, eval_foreach_with_values, eval_reduce_with_values,
     extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_component_value,
     index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
-    literal_to_owned, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    owned_bound_to_i64, owned_to_string, slice_object_as_yq_children, slice_owned_value_read,
-    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, try_reserve_product,
-    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, QueryResult, YqSemantics,
+    is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
+    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
+    slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
+    try_reserve_product, vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag,
+    Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -6310,11 +6310,13 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
 /// collected.
 ///
 /// If `sink` itself is satisfied partway through an alternative,
-/// `eval_each_generic` returns `Flow::Stopped` rather than `Escaped`, which
-/// this function propagates immediately rather than falling through to the
-/// next alternative -- once the consumer has what it wants, no further
-/// alternative is ever tried, matching [`each_try_generic`]'s identical
-/// reasoning.
+/// `eval_each_generic` returns `Flow::Stopped` rather than `Escaped`. #1519:
+/// that is the *same event* as jq's escaping `break` -- succinctly's
+/// short-circuiting builtins are native Rust, so they signal satisfaction as
+/// `Demand::Stop` where real jq's `builtin.jq` macros raise `break $out` --
+/// so it falls through to the next alternative on exactly the same `is_last`
+/// rule, via `eval::is_retryable_stop`. See
+/// `eval::each_pattern_alternatives`, whose arm this mirrors.
 ///
 /// **Wraps `sink` the same way `each_try_generic` does (#1948 review):**
 /// `eval_each_generic`'s wildcard fallback forwards a still-lazy
@@ -6395,7 +6397,16 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
 
         match flow {
             Flow::Exhausted => return Flow::Exhausted,
-            Flow::Stopped { pending } => return Flow::Stopped { pending },
+            // #1519: a satisfied consumer is jq's escaping `break`, so it
+            // retries the next alternative just like `Control::Break` below.
+            // `pending` is dropped on the retry, matching
+            // `eval::each_pattern_alternatives`'s own arm.
+            Flow::Stopped { pending } => {
+                if is_retryable_stop(is_last) {
+                    continue;
+                }
+                return Flow::Stopped { pending };
+            }
             // #1620/#1660: same decode-failure exclusion as
             // `eval::each_pattern_alternatives` -- always propagates,
             // `is_last` or not. Live and load-bearing, not merely
@@ -6629,21 +6640,19 @@ fn each_take_first_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-) -> Result<Option<GenericItem<V>>, Control> {
-    let mut first: Option<GenericItem<V>> = None;
+) -> (Vec<GenericItem<V>>, Flow) {
+    // #1519: a `Vec`, not an `Option`, for the same reason `eval`'s
+    // `each_take_first` takes one -- jq's `def first(f): label $out | (f,
+    // break $out);` emits *before* it breaks, and a `?//` chain catches that
+    // break and re-runs the generator, so `first` legitimately emits once per
+    // alternative. Under a single alternative this is still entered exactly
+    // once and returns exactly one item.
+    let mut taken: Vec<GenericItem<V>> = Vec::new();
     let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
-        first = Some(item);
+        taken.push(item);
         Demand::Stop
     });
-    match flow {
-        Flow::Stopped { .. } | Flow::Exhausted => Ok(first),
-        // The sink always stops on its first item, so an escape can only
-        // mean nothing was ever produced.
-        Flow::Escaped(control) => match first {
-            Some(item) => Ok(Some(item)),
-            None => Err(control),
-        },
-    }
+    (taken, flow)
 }
 
 /// Convert a captured [`GenericItem`] back to the [`GenericResult`] shape it
@@ -6937,12 +6946,45 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     // is the last until the stream is exhausted -- so it keeps the eager
     // path below.
     if !want_last {
-        return match each_take_first_generic::<S, V>(inner, value, optional, cursor) {
-            Ok(Some(item)) => generic_item_to_result(item),
-            Ok(None) => GenericResult::None,
-            Err(Control::Error(e)) => GenericResult::Error(e),
-            Err(Control::Break(label)) => GenericResult::Break(label),
-            Err(Control::Halt(code)) => GenericResult::Halt(code),
+        let (mut items, flow) = each_take_first_generic::<S, V>(inner, value, optional, cursor);
+        // #1519: normally one item; a `?//` chain under this consumer
+        // legitimately yields one per alternative. Items *plus* an escape
+        // means a later alternative failed after an earlier one answered --
+        // jq reaches that failure, so the prefix is kept and it still raises;
+        // see `eval::take_first_to_result`, whose rule this mirrors.
+        if let Flow::Escaped(control) = flow {
+            if items.is_empty() {
+                return match control {
+                    Control::Error(e) => GenericResult::Error(e),
+                    Control::Break(label) => GenericResult::Break(label),
+                    Control::Halt(code) => GenericResult::Halt(code),
+                };
+            }
+            let mut owned = vec_with_capacity(items.len());
+            for item in items {
+                match generic_item_into_owned(item) {
+                    Ok(v) => owned.push(v),
+                    // Not reachable through a `?//` retry today: a
+                    // cursor-backed batch defers its decode (see
+                    // `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`),
+                    // so the failure surfaces at materialization instead. Handled
+                    // because the conversion's signature requires it, and as
+                    // parity with `limit_with_n_generic`'s equivalent guard.
+                    Err(c) => return partial_generic(owned, c),
+                }
+            }
+            return partial_generic(owned, control);
+        }
+        return match items.len() {
+            0 => GenericResult::None,
+            // The lone-item case keeps `generic_item_to_result`'s
+            // cursor-backed conversion so a duplicate key inside it survives.
+            1 => generic_item_to_result(items.remove(0)),
+            _ => match items_to_generic_result(items) {
+                Ok(result) => result,
+                // Same deferred-decode note as the escaping path above.
+                Err((prefix, control)) => partial_generic(prefix, control),
+            },
         };
     }
 
@@ -7455,15 +7497,21 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     };
 
     let mut seen = 0usize;
-    let mut wanted: Option<GenericItem<V>> = None;
+    let mut wanted: Vec<GenericItem<V>> = Vec::new();
     let mut skipped_err: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        if seen == n {
-            wanted = Some(item);
-            seen += 1;
+        // #1519: `>=`, not `==`, and a `Vec` rather than a latch -- see
+        // `eval::each_take_nth`'s doc comment for why jq's own counter keeps
+        // rising across a `?//` retry and emits again
+        // (`[nth(1; 1 as $x ?// $y | 5, 6)]` is `[6,5]`). Outside a `?//`
+        // chain the sink is never re-entered after its stop, so this is
+        // exactly the previous behaviour.
+        let at_or_past = seen >= n;
+        seen += 1;
+        if at_or_past {
+            wanted.push(item);
             return Demand::Stop;
         }
-        seen += 1;
         // jq defines `nth($n; f)` as `last(limit($n + 1; f))`: every output
         // of `f` up to index `n` is genuinely produced, not just the one
         // ultimately kept -- a *skipped* item's own lazy computation (a
@@ -7493,9 +7541,42 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     // kept cursor-backed ([`generic_item_to_result`], #607's own
     // conversion) rather than forced through `OwnedValue`, so a duplicate
     // key *inside* it survives too, not just across the walk to reach it.
-    if let Some(item) = wanted {
-        generic_item_to_result(item)
-    } else if let Some(control) = skipped_err {
+    if !wanted.is_empty() {
+        // #1519: a later `?//` alternative's own error is genuinely reached by
+        // jq after an earlier one answered, so it raises rather than being
+        // dropped -- the same rule `eval::take_stopping_items_to_result`
+        // applies, and the one `first` and `nth` share.
+        if let Flow::Escaped(control) = flow {
+            let mut owned = vec_with_capacity(wanted.len());
+            for item in wanted {
+                match generic_item_into_owned(item) {
+                    Ok(v) => owned.push(v),
+                    // Not reachable through a `?//` retry today: a
+                    // cursor-backed batch defers its decode (see
+                    // `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`),
+                    // so the failure surfaces at materialization instead. Handled
+                    // because the conversion's signature requires it, and as
+                    // parity with `limit_with_n_generic`'s equivalent guard.
+                    Err(c) => return partial_generic(owned, c),
+                }
+            }
+            return partial_generic(owned, control);
+        }
+        return if wanted.len() == 1 {
+            // The lone-item case keeps `generic_item_to_result`'s
+            // cursor-backed conversion so a duplicate key inside it survives
+            // (#607).
+            generic_item_to_result(wanted.remove(0))
+        } else {
+            // #1519: one item per `?//` alternative.
+            match items_to_generic_result(wanted) {
+                Ok(result) => result,
+                // Same deferred-decode note as the escaping path above.
+                Err((prefix, control)) => partial_generic(prefix, control),
+            }
+        };
+    }
+    if let Some(control) = skipped_err {
         partial_generic(Vec::new(), control)
     } else {
         match flow {
@@ -10978,6 +11059,122 @@ mod tests {
                 e.message
             ),
             other => panic!("expected an uncaught decode-failure error, got {other:?}"),
+        }
+    }
+
+    /// #1519: the generic evaluator's own `?//` retry loop
+    /// (`each_pattern_alternatives_generic`) and its own reshaped terminal
+    /// sinks (`each_take_first_generic`, `nth_with_n_generic`) are separate
+    /// code from `eval.rs`'s, and `first`/`last` additionally route through
+    /// this module *before* `eval.rs`'s `eval_each` ever sees them (#1461) --
+    /// so this exercises them directly rather than relying on the shared arms.
+    /// Companion to
+    /// `eval::tests::test_pattern_alternatives_retry_on_consumer_stop_1519`;
+    /// expectations are real jq 1.7.1's.
+    #[test]
+    fn test_generic_pattern_alternatives_retry_on_consumer_stop_1519() {
+        use crate::json::JsonIndex;
+
+        fn got(json: &[u8], filter: &str) -> Vec<String> {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            eval(&parse(filter).unwrap(), cursor.value())
+                .collect_owned()
+                .expect("materializes")
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
+        }
+
+        for (json, filter, want) in [
+            (&b"null"[..], "[first(1 as $x ?// $y | 5, 6)]", "[5,5]"),
+            (
+                &b"null"[..],
+                "[isempty(1 as $x ?// $y | 5)]",
+                "[false,false]",
+            ),
+            (&b"null"[..], "[limit(1; 1 as $x ?// $y | 5)]", "[5,5]"),
+            (&b"null"[..], "[nth(1; 1 as $x ?// $y | 5, 6)]", "[6,5]"),
+            (&b"null"[..], "[limit(2; 1 as $x ?// $y | 5,6)]", "[5,6,5]"),
+            // Cursor-backed source values, so the multi-item retry goes
+            // through `items_to_generic_result` rather than the lone-item
+            // `generic_item_to_result` shortcut.
+            (
+                &br#"{"a": [1, 2]}"#[..],
+                "[first(.a as [$p] ?// $p | $p, 9)]",
+                "[1,[1,2]]",
+            ),
+            (
+                &br#"{"a": [1, 2]}"#[..],
+                "[nth(1; .a as [$p] ?// $p | $p, 7)]",
+                "[7,[1,2]]",
+            ),
+            // Negative controls: no consumer, and a single (non-`?//`)
+            // pattern, must both stay single-answer.
+            (&b"null"[..], "[1 as $x ?// $y | 5]", "[5]"),
+            (&br#"{"a": [1]}"#[..], "[first(.a as [$p] | $p, 9)]", "[1]"),
+        ] {
+            assert_eq!(got(json, filter), vec![want.to_string()], "{filter}");
+        }
+    }
+
+    /// #1519: a control raised by a *retried* alternative is genuinely reached
+    /// by jq, so `each_take_first_generic`'s caller keeps the earlier
+    /// alternative's output and still raises -- the generic twin of
+    /// `eval::tests::test_pattern_alternative_retry_trailing_control_1519`.
+    #[test]
+    fn test_generic_first_retried_alternative_error_raises_1519() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(
+            "first([1] as [$x] ?// $x | if ($x|type)==\"number\" then 5 else error(\"boom\") end)",
+        )
+        .unwrap();
+        match eval(&expr, cursor.value()) {
+            GenericResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec!["5".to_string()]
+                );
+                assert!(e.message.contains("boom"), "message: {}", e.message);
+            }
+            other => panic!("expected Partial([5], Error(boom)), got {other:?}"),
+        }
+    }
+
+    /// #1519 + #1620/#1660: a `?//` retry hands `first`/`nth` a *batch* of
+    /// items, and when the source values are cursor-backed that batch stays
+    /// lazy (`GenericResult::ManyCursor`) rather than being decoded on the
+    /// spot -- so the decode failure surfaces later, at materialization.
+    ///
+    /// The rule that matters is that it still surfaces at all: a decode
+    /// failure is never retryable, and the retry must not be able to turn a
+    /// raise into a silent success. Pinned for both the single-alternative and
+    /// the `?//` spelling, so the two cannot diverge.
+    #[test]
+    fn test_generic_first_nth_retry_batch_still_raises_decode_failure_1519() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = b"{\"a\": \"\xff\xfe\", \"p\": 1}";
+
+        for filter in [
+            // Single-alternative control: already raised before #1519.
+            "first([.p] as [$y] | .a, 9)",
+            // The batch spellings a `?//` retry produces.
+            "first([.p] as [$y] ?// $y | .a, 9)",
+            "nth(0; [.p] as [$y] ?// $y | .a, 9)",
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = eval(&parse(filter).unwrap(), cursor.value())
+                .collect_owned()
+                .expect_err(filter);
+            assert!(
+                err.is_decode_failure(),
+                "{filter}: expected a decode failure, got {}",
+                err.message
+            );
         }
     }
 

@@ -1,0 +1,1 @@
+[isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else empty end)]
