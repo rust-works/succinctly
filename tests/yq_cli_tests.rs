@@ -12100,6 +12100,41 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 }
 
 /// yq-mode counterpart to `jq_cli_tests.rs`'s
+/// `test_literal_slice_path_context_resolves_2215` -- the new
+/// `eval_stage_with_path_context` `Expr::Slice` arm lives on the shared
+/// `<S: EvalSemantics>` evaluator, so this file needs its own dedicated
+/// check rather than relying on the jq-mode coverage alone (a jq-scoped fix
+/// to shared evaluator code can silently regress yq without one).
+#[test]
+fn test_literal_slice_path_context_resolves_yq_2215() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".a | .[0:3] | path",
+        "a: [1, 2, 3, 4]\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a",{"start":0,"end":3}]"#);
+
+    let (output, code) = run_yq_stdin(
+        ".a | .[0:3] | key",
+        "a: [1, 2, 3, 4]\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"start":0,"end":3}"#);
+
+    let (output, code) = run_yq_stdin(
+        ".a | .[0:3] | .[0]",
+        "a: [1, 2, 3, 4]\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1");
+
+    Ok(())
+}
+
+/// yq-mode counterpart to `jq_cli_tests.rs`'s
 /// `test_string_interpolation_path_context_builtins_1334`/
 /// `test_func_def_path_context_builtins_1306` -- both new
 /// `needs_path_context`/`eval_pipe_with_path_context_internal` arms
