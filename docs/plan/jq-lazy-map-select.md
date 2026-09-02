@@ -538,7 +538,8 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     noise floor (control range roughly ±2-3%) — the new per-value buffering (needed for the
     atomicity fix above) costs a memory copy on a large single-result value that the old path
     didn't pay, with no rendering-throughput win to offset it since there's only one such
-    value, not many. The buffering itself isn't optional -- real jq parses the whole document
+    value, not many. Filed as [#2206](https://github.com/rust-works/succinctly/issues/2206).
+    The buffering itself isn't optional -- real jq parses the whole document
     before printing anything, so even a single-result query like `.data` needs the same
     zero-partial-output guarantee if a later structural error exists deeper in that value, the
     same reasoning as the `LazySeq` case, just for one value instead of many. Not fixed in this
