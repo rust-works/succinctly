@@ -2509,6 +2509,19 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 None => QueryResult::Error(inner_e),
             };
         }
+        // #1989: inner's own trailing control still has to be checked even
+        // when `apply_arg_fanout` succeeds on `probe_inners` -- which it
+        // always does on an empty vec, since `RejectMany`'s own guard is
+        // `len() > 1`. A decode failure captured by `stream_outputs_checked`
+        // (empty vec, `Some(Control::Error(_))`) is exactly this shape, and
+        // without this check it was silently discarded in favor of outer's
+        // own plain, `?`-suppressible violation message -- the same "inner
+        // always wins" rule as above, just for the trailing-control case
+        // rather than the violation case, and the same check the main loop
+        // below already makes after its own `apply_arg_fanout` call.
+        if let Some(inner_control) = probe_inner_trailing {
+            return partial(Vec::new(), inner_control);
+        }
         return match outer_trailing {
             Some(outer_control) => partial(Vec::new(), outer_control),
             None => QueryResult::Error(e),
@@ -12192,16 +12205,21 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                         // Not a strict integer: either a fractional literal (jq
                         // truncates it) or the NaN sentinel (jq errors on it,
                         // matched below since `as_f64` fails for it too).
+                        // #1989 review: `scalar_fallback`, not a bare
+                        // `if optional {...} else {...}` -- this arm can
+                        // never actually see a decode failure (a `Number`
+                        // has no string content to fail decoding), but
+                        // writing it the same way as the `_` arm below
+                        // means this function states its decode-failure
+                        // discipline once instead of twice, so a later
+                        // change to either the error or the ordering rule
+                        // can't land on one copy and miss the other.
                         Err(_) => match n.as_f64() {
                             Ok(f) => f.trunc() as i64,
                             Err(_) => {
-                                return if optional {
-                                    QueryResult::None
-                                } else {
-                                    QueryResult::Error(EvalError::cannot_be_imploded(
-                                        &to_owned_lossy(&elem),
-                                    ))
-                                };
+                                return scalar_fallback(&elem, optional, || {
+                                    EvalError::cannot_be_imploded(&to_owned_lossy(&elem))
+                                });
                             }
                         },
                     },
@@ -38090,14 +38108,24 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // doc comment already flags that gap). Parser-unreachable today
             // (#981) but library/`query!`-reachable, which #1972 already
             // established is worth fixing rather than deferring.
-            let values: Vec<OwnedValue> = match taken
-                .into_iter()
-                .map(Item::into_owned_checked)
-                .collect::<Result<Vec<OwnedValue>, EvalError>>()
-            {
-                Ok(values) => values,
-                Err(e) => return suppress_or_raise(e, optional),
-            };
+            //
+            // #1989 review: built up one item at a time, not
+            // `.collect::<Result<Vec<_>, _>>()` -- that all-or-nothing
+            // `FromIterator` impl discards every already-converted prefix
+            // item the moment a later one fails, which is exactly the
+            // "outputs already produced don't vanish" contract #400/#494
+            // exist to prevent (`limit(2; "good","\xff\xfe")` silently lost
+            // `"good"` instead of reporting it as a `Partial` prefix ahead
+            // of the decode failure, matching how `flow`'s own
+            // `Flow::Escaped` arm just below already treats a trailing
+            // control against this same `values` accumulator).
+            let mut values: Vec<OwnedValue> = vec_with_capacity(taken.len());
+            for item in taken {
+                match item.into_owned_checked() {
+                    Ok(v) => values.push(v),
+                    Err(e) => return partial(values, Control::Error(e)),
+                }
+            }
             match flow {
                 Flow::Stopped { .. } | Flow::Exhausted => owned_vec_to_result(values),
                 Flow::Escaped(control) => {
@@ -38155,7 +38183,13 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // arms used bare `to_owned_lossy`, so an undecodable string in a navigated
     // `expr` output silently became `""` instead of raising. "Keeping the
     // two implementations in sync" (above) is exactly what this restores:
-    // `eval_last_expr` already materializes through the checked path.
+    // `eval_last_expr` itself returns its `One`/`Many` results
+    // unmaterialized, leaving the conversion to whichever caller
+    // eventually consumes them (the same reason `builtin_nth_stream`'s own
+    // doc comment gives for why *it* must check the conversion: "always
+    // materializing its answer" is what forces it). This function is that
+    // "always materializing" spelling for `last`, so it is the one that
+    // has to check.
     let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => QueryResult::Owned(to_owned_or_suppress!(&v, optional)),
@@ -72203,6 +72237,20 @@ mod tests {
             "(setpath(.a; 1))?",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
+        // The "probe" branch: the outer slot (the value) has its own
+        // `RejectMany` violation (two outputs), which used to make this
+        // function report that plain, `?`-suppressible violation instead of
+        // checking whether the inner slot (the path) it had to probe along
+        // the way carried a decode failure of its own -- `RejectMany`'s own
+        // guard is `len() > 1`, so the probe's now-empty `Vec` (the decode
+        // failure took its one slot's place in the trailing control instead)
+        // passed `apply_arg_fanout` silently, and the decode failure it
+        // carried was discarded.
+        yq_query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "setpath(.a; (1,2))",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
         // Positive control: decodable arguments still work.
         yq_query!(
             br#"{"a":"x"}"#,
@@ -72349,15 +72397,25 @@ mod tests {
         let iterate = parse(".[]").unwrap();
         let two = parse("2").unwrap();
 
-        // `builtin_limit`: the second taken item is undecodable.
+        // `builtin_limit`: the second taken item is undecodable. The first
+        // (`"good"`) was already successfully converted before the second
+        // one failed, so #400/#494's "outputs already produced don't
+        // vanish" contract means this must come back as a `Partial`
+        // prefix, not a bare `Error` that silently drops `"good"`.
         match builtin_limit::<Vec<u64>, JqSemantics>(&two, &iterate, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
-            other => panic!("expected a decode failure, got {other:?}"),
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix, vec![OwnedValue::String("good".to_string())]);
+                assert!(e.is_decode_failure(), "{}", e.message);
+            }
+            other => panic!("expected a Partial prefix + decode failure, got {other:?}"),
         }
-        // Never suppressed by `optional` (#1620).
+        // Never suppressed by `optional` (#1620) -- same Partial shape.
         match builtin_limit::<Vec<u64>, JqSemantics>(&two, &iterate, cursor.value(), true) {
-            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
-            other => panic!("expected a decode failure, got {other:?}"),
+            QueryResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(prefix, vec![OwnedValue::String("good".to_string())]);
+                assert!(e.is_decode_failure(), "{}", e.message);
+            }
+            other => panic!("expected a Partial prefix + decode failure, got {other:?}"),
         }
         // `builtin_first_stream`: the *first* output is the undecodable one.
         let first_bytes: &[u8] = &b"[\"\xff\xfe\",\"good\"]"[..];

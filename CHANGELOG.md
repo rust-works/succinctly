@@ -134,13 +134,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     per-element fix in the sort family: an undecodable array element was
     reported as `"" can't be imploded, ...` and suppressed by `?`.
 
-  Four smaller, still-benign-today shapes surfaced during the same audit
+  Five smaller, still-benign-today shapes surfaced during the same audit
   are split out to #2196 rather than bundled here: `Item::into_owned`'s
   own naming (not renamed by this issue), `builtin_implode`'s top-level
   (non-element) `_ if optional` arm, `builtin_combinations_n`'s remaining
-  unchecked `stream_outputs` use, and the now-backwards-reading `_checked`
+  unchecked `stream_outputs` use, the now-backwards-reading `_checked`
   suffix on `stream_outputs_checked`/`push_owned_values_checked`/
-  `promote_borrowed_checked`.
+  `promote_borrowed_checked`, and `builtin_nth_stream`'s pre-existing
+  (predating both this issue and #1972) gap where `Item::into_owned_checked`'s
+  non-decode-failure errors aren't run through `suppress_or_raise` the way
+  its two `each_take_first`/`each_take_n` siblings now are.
+
+  A dedicated adversarial code review (8 independent finder passes) then
+  caught two further issues in this PR's own fixes before they landed:
+
+  - `fanout_two_args`'s probe branch (entered when the outer slot's own
+    `RejectMany` violation has to be reported, but inner has to be
+    evaluated once first to check whether *it* takes priority) discarded a
+    decode failure it had just captured. `stream_outputs_checked` on a
+    single undecodable inner value returns an *empty* vec plus the failure
+    in its trailing control — and `apply_arg_fanout(RejectMany, ...)`'s own
+    guard is `len() > 1`, so it reports `Ok(())` on that empty vec, and the
+    code only checked the trailing control inside the `Err` arm of that
+    call. Fixed by adding the same unconditional trailing-control check the
+    function's main loop already makes right after its own (structurally
+    identical) `apply_arg_fanout` call.
+  - `builtin_limit`'s `into_owned_checked` conversion (this issue's own
+    fix) used `.collect::<Result<Vec<_>, _>>()`, whose all-or-nothing
+    `FromIterator` impl discards every already-converted prefix item the
+    moment a later one fails — silently losing legitimate output
+    (`limit(2; "good", <bad>)` reported a bare decode failure instead of a
+    `Partial` prefix carrying `"good"`), violating #400/#494's own "outputs
+    already produced don't vanish" contract that this same function's
+    `Flow::Escaped` arm, two lines below, was already honoring correctly.
+    Fixed by converting items one at a time into an explicit `Vec`.
 
 ### Fixed
 
