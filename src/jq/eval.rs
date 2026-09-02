@@ -42,7 +42,7 @@ use super::document::{
     DocumentFields,
 };
 use super::slice::{self, SliceBounds};
-use super::walk::{any_subexpr, map_builtin_subexprs};
+use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
 
 /// Which `EvalSemantics` implementor a value carries, as a runtime tag.
 ///
@@ -26188,25 +26188,6 @@ fn substitute_var_impl(
         // would also re-walk every argument from every level below on each
         // binding, which is the O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        // A `DefCall`'s arguments are ordinary caller-scope code and must
-        // stay reachable: the call site can sit inside an `as` that has not
-        // been evaluated yet, so this is the pass that binds `$x` in
-        // `1 as $x | f($x)`. The definition itself is not descended into --
-        // it was captured with every variable in scope at its own definition
-        // site already substituted, and its body is a fresh scope per call.
-        Expr::DefCall {
-            def, args, frames, ..
-        } => Expr::DefCall {
-            def: Rc::clone(def),
-            args: args
-                .iter()
-                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
-                .collect(),
-            frames: *frames,
-            // Fresh: `args` just changed, so anything cached against the old
-            // ones would be stale.
-            bound: BoundBody::default(),
-        },
         Expr::Var(name) if name == var_name => {
             if mark_trackable {
                 Expr::TrackedVar(Rc::new(replacement.clone()))
@@ -26214,245 +26195,9 @@ fn substitute_var_impl(
                 owned_to_expr(replacement)
             }
         }
-        Expr::Var(_) => expr.clone(),
-        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
-        Expr::Loc { line } => Expr::Loc { line: *line },
-        Expr::Env => Expr::Env,
-        Expr::Identity => Expr::Identity,
-        Expr::Field(name) => Expr::Field(name.clone()),
-        Expr::Index { idx, key } => Expr::Index {
-            idx: *idx,
-            key: key.clone(),
-        },
-        Expr::Slice {
-            start,
-            end,
-            start_key,
-            end_key,
-        } => Expr::Slice {
-            start: *start,
-            end: *end,
-            start_key: start_key.clone(),
-            end_key: end_key.clone(),
-        },
-        Expr::Iterate => Expr::Iterate,
-        // Must recurse into `key`: variables are resolved by substitution, so
-        // skipping it would leave `$k` in `.[$k]` unbound at eval time.
-        Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(substitute_var_impl(
-                target,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            key: Box::new(substitute_var_impl(
-                key,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        // Same reasoning as `IndexExpr`: `$a`/`$b` in `.[$a:$b]` must resolve.
-        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(substitute_var_impl(
-                target,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            start: start.as_deref().map(|e| {
-                Box::new(substitute_var_impl(
-                    e,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                ))
-            }),
-            end: end.as_deref().map(|e| {
-                Box::new(substitute_var_impl(
-                    e,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                ))
-            }),
-        },
-        Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => Expr::Optional(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::Pipe(exprs) => Expr::Pipe(
-            exprs
-                .iter()
-                .map(|e| substitute_var_impl(e, var_name, replacement, mark_trackable))
-                .collect(),
-        ),
-        Expr::Comma(exprs) => Expr::Comma(
-            exprs
-                .iter()
-                .map(|e| substitute_var_impl(e, var_name, replacement, mark_trackable))
-                .collect(),
-        ),
-        Expr::Array(e) => Expr::Array(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::Object(entries) => {
-            Expr::Object(
-                entries
-                    .iter()
-                    .map(|entry| {
-                        let new_key =
-                            match &entry.key {
-                                ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                                ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(
-                                    substitute_var_impl(e, var_name, replacement, mark_trackable),
-                                )),
-                            };
-                        ObjectEntry {
-                            key: new_key,
-                            value: substitute_var_impl(
-                                &entry.value,
-                                var_name,
-                                replacement,
-                                mark_trackable,
-                            ),
-                        }
-                    })
-                    .collect(),
-            )
-        }
-        Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
-            op: *op,
-            left: Box::new(substitute_var_impl(
-                left,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            right: Box::new(substitute_var_impl(
-                right,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::Negate(operand) => Expr::Negate(Box::new(substitute_var_impl(
-            operand,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::Compare { op, left, right } => Expr::Compare {
-            op: *op,
-            left: Box::new(substitute_var_impl(
-                left,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            right: Box::new(substitute_var_impl(
-                right,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::And(l, r) => Expr::And(
-            Box::new(substitute_var_impl(
-                l,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            Box::new(substitute_var_impl(
-                r,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        ),
-        Expr::Or(l, r) => Expr::Or(
-            Box::new(substitute_var_impl(
-                l,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            Box::new(substitute_var_impl(
-                r,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        ),
-        Expr::Not => Expr::Not,
-        Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(substitute_var_impl(
-                l,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            Box::new(substitute_var_impl(
-                r,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        ),
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => Expr::If {
-            cond: Box::new(substitute_var_impl(
-                cond,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            then_branch: Box::new(substitute_var_impl(
-                then_branch,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            else_branch: Box::new(substitute_var_impl(
-                else_branch,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(substitute_var_impl(
-                expr,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            catch: catch.as_ref().map(|e| {
-                Box::new(substitute_var_impl(
-                    e,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                ))
-            }),
-        },
+        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
+        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
+        // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
         Expr::Builtin(b) => Expr::Builtin(substitute_var_in_builtin(
             b,
@@ -26460,290 +26205,85 @@ fn substitute_var_impl(
             replacement,
             mark_trackable,
         )),
-        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
-            parts
-                .iter()
-                .map(|p| match p {
-                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => StringPart::Expr(Box::new(substitute_var_impl(
-                        e,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    ))),
-                })
-                .collect(),
-        ),
-        Expr::Format(f) => Expr::Format(f.clone()),
         // Phase 8 expressions
-        Expr::As { expr, var, body } => {
-            // Don't substitute if this `as` binds the same variable (shadowing)
-            if var == var_name {
-                Expr::As {
-                    expr: Box::new(substitute_var_impl(
-                        expr,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    var: var.clone(),
-                    body: body.clone(), // Don't substitute in body - shadowed
-                }
-            } else {
-                Expr::As {
-                    expr: Box::new(substitute_var_impl(
-                        expr,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    var: var.clone(),
-                    body: Box::new(substitute_var_impl(
-                        body,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                }
-            }
-        }
+        // Don't substitute if this `as` binds the same variable (shadowing)
+        Expr::As { expr, var, body } if var == var_name => Expr::As {
+            expr: Box::new(substitute_var_impl(
+                expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            var: var.clone(),
+            body: body.clone(), // Don't substitute in body - shadowed
+        },
+        // Shadowed if *any* alternative pattern binds var_name (#1201,
+        // #1365; mirrors `Expr::AsPattern`'s own `pattern_binds_var`
+        // shadow check just above, since a bare `$var` binding is just
+        // the single-variable, single-alternative case of this same
+        // question).
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
-        } => {
-            // Shadowed if *any* alternative pattern binds var_name (#1201,
-            // #1365; mirrors `Expr::AsPattern`'s own `pattern_binds_var`
-            // shadow check just above, since a bare `$var` binding is just
-            // the single-variable, single-alternative case of this same
-            // question).
-            if patterns.iter().any(|p| pattern_binds_var(p, var_name)) {
-                Expr::Reduce {
-                    input: Box::new(substitute_var_impl(
-                        input,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    patterns: patterns.clone(),
-                    init: Box::new(substitute_var_impl(
-                        init,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    update: update.clone(), // shadowed
-                }
-            } else {
-                Expr::Reduce {
-                    input: Box::new(substitute_var_impl(
-                        input,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    patterns: patterns.clone(),
-                    init: Box::new(substitute_var_impl(
-                        init,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    update: Box::new(substitute_var_impl(
-                        update,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                }
-            }
-        }
+        } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Reduce {
+            input: Box::new(substitute_var_impl(
+                input,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            patterns: patterns.clone(),
+            init: Box::new(substitute_var_impl(
+                init,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            update: update.clone(), // shadowed
+        },
         Expr::Foreach {
             input,
             patterns,
             init,
             update,
             extract,
-        } => {
-            if patterns.iter().any(|p| pattern_binds_var(p, var_name)) {
-                Expr::Foreach {
-                    input: Box::new(substitute_var_impl(
-                        input,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    patterns: patterns.clone(),
-                    init: Box::new(substitute_var_impl(
-                        init,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    update: update.clone(),
-                    extract: extract.clone(),
-                }
-            } else {
-                Expr::Foreach {
-                    input: Box::new(substitute_var_impl(
-                        input,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    patterns: patterns.clone(),
-                    init: Box::new(substitute_var_impl(
-                        init,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    update: Box::new(substitute_var_impl(
-                        update,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                    extract: extract.as_ref().map(|e| {
-                        Box::new(substitute_var_impl(
-                            e,
-                            var_name,
-                            replacement,
-                            mark_trackable,
-                        ))
-                    }),
-                }
-            }
-        }
-        Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(substitute_var_impl(
-                n,
+        } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Foreach {
+            input: Box::new(substitute_var_impl(
+                input,
                 var_name,
                 replacement,
                 mark_trackable,
             )),
-            expr: Box::new(substitute_var_impl(
-                expr,
+            patterns: patterns.clone(),
+            init: Box::new(substitute_var_impl(
+                init,
                 var_name,
                 replacement,
                 mark_trackable,
             )),
-        },
-        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::LastExpr(e) => Expr::LastExpr(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(substitute_var_impl(
-                n,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            expr: Box::new(substitute_var_impl(
-                expr,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(substitute_var_impl(
-                cond,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            update: Box::new(substitute_var_impl(
-                update,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::While { cond, update } => Expr::While {
-            cond: Box::new(substitute_var_impl(
-                cond,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            update: Box::new(substitute_var_impl(
-                update,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(substitute_var_impl(
-            e,
-            var_name,
-            replacement,
-            mark_trackable,
-        ))),
-        Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(substitute_var_impl(
-                from,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            to: to.as_ref().map(|e| {
-                Box::new(substitute_var_impl(
-                    e,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                ))
-            }),
-            step: step.as_ref().map(|e| {
-                Box::new(substitute_var_impl(
-                    e,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                ))
-            }),
+            update: update.clone(),
+            extract: extract.clone(),
         },
         // Phase 9: Variables & Definitions
+        // Shadowed if *any* alternative binds var_name -- the body's scope
+        // has to treat the name consistently across every alternative it
+        // might actually run under (#720).
         Expr::AsPattern {
             expr,
             patterns,
             body,
-        } => {
-            // Shadowed if *any* alternative binds var_name -- the body's
-            // scope has to treat the name consistently across every
-            // alternative it might actually run under (#720).
-            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, var_name));
-            Expr::AsPattern {
-                expr: Box::new(substitute_var_impl(
-                    expr,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                )),
-                patterns: patterns.clone(),
-                body: if shadowed {
-                    body.clone()
-                } else {
-                    Box::new(substitute_var_impl(
-                        body,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    ))
-                },
-            }
-        }
+        } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::AsPattern {
+            expr: Box::new(substitute_var_impl(
+                expr,
+                var_name,
+                replacement,
+                mark_trackable,
+            )),
+            patterns: patterns.clone(),
+            body: body.clone(),
+        },
         Expr::FuncDef {
             name,
             params,
@@ -26777,102 +26317,23 @@ fn substitute_var_impl(
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args } => Expr::FuncCall {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
-                .collect(),
-        },
-        Expr::NamespacedCall {
-            namespace,
-            name,
-            args,
-        } => Expr::NamespacedCall {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| substitute_var_impl(a, var_name, replacement, mark_trackable))
-                .collect(),
-        },
-        // Assignment operators
-        Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(substitute_var_impl(
-                path,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            value: Box::new(substitute_var_impl(
-                value,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(substitute_var_impl(
-                path,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            filter: Box::new(substitute_var_impl(
-                filter,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
-            op: *op,
-            path: Box::new(substitute_var_impl(
-                path,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            value: Box::new(substitute_var_impl(
-                value,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-        Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(substitute_var_impl(
-                path,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-            value: Box::new(substitute_var_impl(
-                value,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
-        },
-
         // Label-break
-        Expr::Label { name, body } => {
-            // Don't substitute if the label shadows our variable
-            if name == var_name {
-                expr.clone()
-            } else {
-                Expr::Label {
-                    name: name.clone(),
-                    body: Box::new(substitute_var_impl(
-                        body,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    )),
-                }
-            }
-        }
-        Expr::Break(name) => Expr::Break(name.clone()),
+        // Don't substitute if the label shadows our variable
+        Expr::Label { name, .. } if name == var_name => expr.clone(),
+
+        // #2095: every remaining variant's recursive-structural-child
+        // handling here is identical to `install_def_calls`'s and
+        // `substitute_func_param`'s own -- apply this substitution to each
+        // `Expr`-typed child and rebuild the node, nothing else -- so it
+        // lives once in `map_subexprs` (`src/jq/walk.rs`) instead of being
+        // hand-repeated in all three. See that function's own doc comment
+        // for the full variant-by-variant justification, including the five
+        // arms (`Shared`, `Error`, `Builtin`, `FuncDef`, and
+        // `install_def_calls`'s own `DefCall` policy) that stay explicit
+        // above/in each caller instead of ever reaching it.
+        _ => map_subexprs(expr, &mut |sub| {
+            substitute_var_impl(sub, var_name, replacement, mark_trackable)
+        }),
     }
 }
 
@@ -41389,212 +40850,11 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                 bound: BoundBody::default(),
             }
         }
-        // Recursively expand in all subexpressions
-        Expr::Identity => Expr::Identity,
-        Expr::Field(s) => Expr::Field(s.clone()),
-        Expr::Index { idx, key } => Expr::Index {
-            idx: *idx,
-            key: key.clone(),
-        },
-        Expr::Slice {
-            start,
-            end,
-            start_key,
-            end_key,
-        } => Expr::Slice {
-            start: *start,
-            end: *end,
-            start_key: start_key.clone(),
-            end_key: end_key.clone(),
-        },
-        Expr::Iterate => Expr::Iterate,
-        Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(install_def_calls(target, def, frames + 1)),
-            key: Box::new(install_def_calls(key, def, frames + 1)),
-        },
-        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(install_def_calls(target, def, frames + 1)),
-            start: start
-                .as_deref()
-                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
-            end: end
-                .as_deref()
-                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
-        },
-        Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => Expr::Optional(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::Pipe(exprs) => Expr::Pipe(
-            exprs
-                .iter()
-                .map(|e| install_def_calls(e, def, frames + 1))
-                .collect(),
-        ),
-        Expr::Comma(exprs) => Expr::Comma(
-            exprs
-                .iter()
-                .map(|e| install_def_calls(e, def, frames + 1))
-                .collect(),
-        ),
-        Expr::Array(e) => Expr::Array(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .iter()
-                .map(|entry| {
-                    let new_key = match &entry.key {
-                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => {
-                            ObjectKey::Expr(Box::new(install_def_calls(e, def, frames + 1)))
-                        }
-                    };
-                    ObjectEntry {
-                        key: new_key,
-                        value: install_def_calls(&entry.value, def, frames + 1),
-                    }
-                })
-                .collect(),
-        ),
-        Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
-            op: *op,
-            left: Box::new(install_def_calls(left, def, frames + 1)),
-            right: Box::new(install_def_calls(right, def, frames + 1)),
-        },
-        Expr::Negate(operand) => {
-            Expr::Negate(Box::new(install_def_calls(operand, def, frames + 1)))
-        }
-        Expr::Compare { op, left, right } => Expr::Compare {
-            op: *op,
-            left: Box::new(install_def_calls(left, def, frames + 1)),
-            right: Box::new(install_def_calls(right, def, frames + 1)),
-        },
-        Expr::And(l, r) => Expr::And(
-            Box::new(install_def_calls(l, def, frames + 1)),
-            Box::new(install_def_calls(r, def, frames + 1)),
-        ),
-        Expr::Or(l, r) => Expr::Or(
-            Box::new(install_def_calls(l, def, frames + 1)),
-            Box::new(install_def_calls(r, def, frames + 1)),
-        ),
-        Expr::Not => Expr::Not,
-        Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(install_def_calls(l, def, frames + 1)),
-            Box::new(install_def_calls(r, def, frames + 1)),
-        ),
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => Expr::If {
-            cond: Box::new(install_def_calls(cond, def, frames + 1)),
-            then_branch: Box::new(install_def_calls(then_branch, def, frames + 1)),
-            else_branch: Box::new(install_def_calls(else_branch, def, frames + 1)),
-        },
-        Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(install_def_calls(expr, def, frames + 1)),
-            catch: catch
-                .as_ref()
-                .map(|c| Box::new(install_def_calls(c, def, frames + 1))),
-        },
+        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
+        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
+        // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
         Expr::Builtin(b) => Expr::Builtin(install_def_calls_in_builtin(b, def, frames + 1)),
-        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
-            parts
-                .iter()
-                .map(|p| match p {
-                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => {
-                        StringPart::Expr(Box::new(install_def_calls(e, def, frames + 1)))
-                    }
-                })
-                .collect(),
-        ),
-        Expr::Format(f) => Expr::Format(f.clone()),
-        Expr::Var(v) => Expr::Var(v.clone()),
-        // Genuinely reachable, not just a totality formality: this
-        // function re-runs on every `Expr::FuncDef` *evaluation* (its own
-        // call site inlines `def`s at the point they execute, not once at
-        // parse time), and a `def`'s own body can already contain a
-        // `TrackedVar` from an enclosing `as`-binding -- confirmed live,
-        // `. as $x | def f: $x | .b; path(f)` reaches this arm. `v.clone()`
-        // is an O(1) `Rc` refcount bump, not a deep copy of the frozen
-        // snapshot, so re-inlining a `def` that closes over a large
-        // passthrough-bound value on every call stays cheap (#844).
-        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
-        Expr::Loc { line } => Expr::Loc { line: *line },
-        Expr::Env => Expr::Env,
-        Expr::As {
-            expr,
-            var,
-            body: as_body,
-        } => Expr::As {
-            expr: Box::new(install_def_calls(expr, def, frames + 1)),
-            var: var.clone(),
-            body: Box::new(install_def_calls(as_body, def, frames + 1)),
-        },
-        Expr::Reduce {
-            input,
-            patterns,
-            init,
-            update,
-        } => Expr::Reduce {
-            input: Box::new(install_def_calls(input, def, frames + 1)),
-            patterns: patterns.clone(),
-            init: Box::new(install_def_calls(init, def, frames + 1)),
-            update: Box::new(install_def_calls(update, def, frames + 1)),
-        },
-        Expr::Foreach {
-            input,
-            patterns,
-            init,
-            update,
-            extract,
-        } => Expr::Foreach {
-            input: Box::new(install_def_calls(input, def, frames + 1)),
-            patterns: patterns.clone(),
-            init: Box::new(install_def_calls(init, def, frames + 1)),
-            update: Box::new(install_def_calls(update, def, frames + 1)),
-            extract: extract
-                .as_ref()
-                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
-        },
-        Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(install_def_calls(n, def, frames + 1)),
-            expr: Box::new(install_def_calls(expr, def, frames + 1)),
-        },
-        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::LastExpr(e) => Expr::LastExpr(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(install_def_calls(n, def, frames + 1)),
-            expr: Box::new(install_def_calls(expr, def, frames + 1)),
-        },
-        Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(install_def_calls(cond, def, frames + 1)),
-            update: Box::new(install_def_calls(update, def, frames + 1)),
-        },
-        Expr::While { cond, update } => Expr::While {
-            cond: Box::new(install_def_calls(cond, def, frames + 1)),
-            update: Box::new(install_def_calls(update, def, frames + 1)),
-        },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(install_def_calls(e, def, frames + 1))),
-        Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(install_def_calls(from, def, frames + 1)),
-            to: to
-                .as_ref()
-                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
-            step: step
-                .as_ref()
-                .map(|e| Box::new(install_def_calls(e, def, frames + 1))),
-        },
-        Expr::AsPattern {
-            expr,
-            patterns,
-            body: pattern_body,
-        } => Expr::AsPattern {
-            expr: Box::new(install_def_calls(expr, def, frames + 1)),
-            patterns: patterns.clone(),
-            body: Box::new(install_def_calls(pattern_body, def, frames + 1)),
-        },
         Expr::FuncDef {
             name: inner_name,
             params: inner_params,
@@ -41633,54 +40893,6 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                 }
             }
         }
-        Expr::FuncCall { name, args } => {
-            // Reached for a different function name entirely, or (#1376)
-            // a same-name call whose arity doesn't match this occurrence
-            // -- either way, not this pass's call to resolve, so just
-            // expand in arguments and leave the call itself untouched.
-            Expr::FuncCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| install_def_calls(a, def, frames + 1))
-                    .collect(),
-            }
-        }
-        Expr::NamespacedCall {
-            namespace,
-            name,
-            args,
-        } => Expr::NamespacedCall {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| install_def_calls(a, def, frames + 1))
-                .collect(),
-        },
-        Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(install_def_calls(path, def, frames + 1)),
-            value: Box::new(install_def_calls(value, def, frames + 1)),
-        },
-        Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(install_def_calls(path, def, frames + 1)),
-            filter: Box::new(install_def_calls(filter, def, frames + 1)),
-        },
-        Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
-            op: *op,
-            path: Box::new(install_def_calls(path, def, frames + 1)),
-            value: Box::new(install_def_calls(value, def, frames + 1)),
-        },
-        Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(install_def_calls(path, def, frames + 1)),
-            value: Box::new(install_def_calls(value, def, frames + 1)),
-        },
-
-        // Label-break
-        Expr::Label { name, body: lbody } => Expr::Label {
-            name: name.clone(),
-            body: Box::new(install_def_calls(lbody, def, frames + 1)),
-        },
         // #1371: opaque. A `Shared` holds an argument that was captured at
         // call time, after every enclosing substitution had run and after
         // this same installer had already visited it -- so there is nothing
@@ -41733,7 +40945,16 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
             // node before it has been evaluated).
             bound: BoundBody::default(),
         },
-        Expr::Break(name) => Expr::Break(name.clone()),
+        // Reached for a different function name entirely, or (#1376)
+        // a same-name call whose arity doesn't match this occurrence
+        // -- either way, not this pass's call to resolve, so just
+        // expand in arguments and leave the call itself untouched. Shared
+        // with every other uniform structural variant below (#2095) via
+        // `map_subexprs` (`src/jq/walk.rs`) -- see that function's own doc
+        // comment for the full variant-by-variant justification, including
+        // the arms above that stay explicit here instead of ever reaching
+        // it.
+        _ => map_subexprs(expr, &mut |sub| install_def_calls(sub, def, frames + 1)),
     }
 }
 
@@ -41768,28 +40989,18 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
 /// (`shadowed` means some binder between here and `e` already rebinds
 /// `param`, so nothing further down can still be `param`'s substituted
 /// argument -- see each call site's own shadow condition). Collapses the
-/// "binder shadows `param` -> clone; otherwise recurse" idiom shared by
-/// `substitute_func_param`'s `As`/`Reduce`/`Foreach`/`AsPattern`/`FuncDef`
-/// arms below (#2096 review).
+/// "binder shadows `param` -> clone; otherwise recurse" idiom `FuncDef`'s
+/// own arm below needs for its two *independent* `body`/`then` shadow
+/// conditions (#2096 review). `As`/`Reduce`/`Foreach`/`AsPattern` used to
+/// share this too, before #2095 hoisted each of their single shadow
+/// conditions to a match guard instead, so their own non-shadowed case could
+/// fall through to [`map_subexprs`]'s (`src/jq/walk.rs`) shared,
+/// unconditional-recursion arm rather than calling back in here.
 fn subst_unless_shadowed(shadowed: bool, e: &Expr, param: &str, arg: &Expr) -> Expr {
     if shadowed {
         e.clone()
     } else {
         substitute_func_param(e, param, arg)
-    }
-}
-
-/// Like [`subst_unless_shadowed`], for `Foreach`'s optional `extract` slot.
-fn subst_unless_shadowed_opt(
-    shadowed: bool,
-    e: &Option<Box<Expr>>,
-    param: &str,
-    arg: &Expr,
-) -> Option<Expr> {
-    if shadowed {
-        e.as_deref().cloned()
-    } else {
-        e.as_deref().map(|e| substitute_func_param(e, param, arg))
     }
 }
 
@@ -41808,229 +41019,51 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         // from being substituted *into the first argument*: arguments live in
         // the caller's scope and cannot mention the callee's own parameters.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        // A nested call's arguments, by contrast, are code in *this* body's
-        // scope and can mention this parameter -- `def outer(n): inner(n);`
-        // binds `n` here, through the inner call. Reached whenever an outer
-        // definition was installed over a body before this one's parameters
-        // were bound, which is the ordinary case for two sibling `def`s.
-        Expr::DefCall {
-            def, args, frames, ..
-        } => Expr::DefCall {
-            def: Rc::clone(def),
-            args: args
-                .iter()
-                .map(|a| substitute_func_param(a, param, arg))
-                .collect(),
-            frames: *frames,
-            // Fresh, for the reason `substitute_var_impl`'s own arm gives.
-            bound: BoundBody::default(),
-        },
         // A variable reference to the parameter becomes the argument expression
         Expr::Var(name) if name == param => arg.clone(),
-        Expr::Var(_) => expr.clone(),
-        // Genuinely reachable, not just a totality formality: called from
-        // `expand_func_calls` to bind a `def`'s own `$`-parameters at every
-        // call site, and the `def`'s body can already contain a
-        // `TrackedVar` from an enclosing `as`-binding unrelated to `param`
-        // -- see `expand_func_calls`'s own `Expr::TrackedVar` arm for the
-        // confirmed repro. `v.clone()` is an `Rc` refcount bump, not a
-        // deep copy (#844).
-        Expr::TrackedVar(v) => Expr::TrackedVar(v.clone()),
-        Expr::Loc { line } => Expr::Loc { line: *line },
-        Expr::Env => Expr::Env,
-        Expr::Identity => Expr::Identity,
-        Expr::Field(name) => Expr::Field(name.clone()),
-        Expr::Index { idx, key } => Expr::Index {
-            idx: *idx,
-            key: key.clone(),
-        },
-        Expr::Slice {
-            start,
-            end,
-            start_key,
-            end_key,
-        } => Expr::Slice {
-            start: *start,
-            end: *end,
-            start_key: start_key.clone(),
-            end_key: end_key.clone(),
-        },
-        Expr::Iterate => Expr::Iterate,
-        Expr::IndexExpr { target, key } => Expr::IndexExpr {
-            target: Box::new(substitute_func_param(target, param, arg)),
-            key: Box::new(substitute_func_param(key, param, arg)),
-        },
-        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
-            target: Box::new(substitute_func_param(target, param, arg)),
-            start: start
-                .as_deref()
-                .map(|e| Box::new(substitute_func_param(e, param, arg))),
-            end: end
-                .as_deref()
-                .map(|e| Box::new(substitute_func_param(e, param, arg))),
-        },
-        Expr::RecursiveDescent => Expr::RecursiveDescent,
-        Expr::Optional(e) => Expr::Optional(Box::new(substitute_func_param(e, param, arg))),
-        Expr::Pipe(exprs) => Expr::Pipe(
-            exprs
-                .iter()
-                .map(|e| substitute_func_param(e, param, arg))
-                .collect(),
-        ),
-        Expr::Comma(exprs) => Expr::Comma(
-            exprs
-                .iter()
-                .map(|e| substitute_func_param(e, param, arg))
-                .collect(),
-        ),
-        Expr::Array(e) => Expr::Array(Box::new(substitute_func_param(e, param, arg))),
-        Expr::Object(entries) => Expr::Object(
-            entries
-                .iter()
-                .map(|entry| {
-                    let new_key = match &entry.key {
-                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => {
-                            ObjectKey::Expr(Box::new(substitute_func_param(e, param, arg)))
-                        }
-                    };
-                    ObjectEntry {
-                        key: new_key,
-                        value: substitute_func_param(&entry.value, param, arg),
-                    }
-                })
-                .collect(),
-        ),
-        Expr::Literal(lit) => Expr::Literal(lit.clone()),
-        Expr::Paren(e) => Expr::Paren(Box::new(substitute_func_param(e, param, arg))),
-        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
-            op: *op,
-            left: Box::new(substitute_func_param(left, param, arg)),
-            right: Box::new(substitute_func_param(right, param, arg)),
-        },
-        Expr::Negate(operand) => Expr::Negate(Box::new(substitute_func_param(operand, param, arg))),
-        Expr::Compare { op, left, right } => Expr::Compare {
-            op: *op,
-            left: Box::new(substitute_func_param(left, param, arg)),
-            right: Box::new(substitute_func_param(right, param, arg)),
-        },
-        Expr::And(l, r) => Expr::And(
-            Box::new(substitute_func_param(l, param, arg)),
-            Box::new(substitute_func_param(r, param, arg)),
-        ),
-        Expr::Or(l, r) => Expr::Or(
-            Box::new(substitute_func_param(l, param, arg)),
-            Box::new(substitute_func_param(r, param, arg)),
-        ),
-        Expr::Not => Expr::Not,
-        Expr::Alternative(l, r) => Expr::Alternative(
-            Box::new(substitute_func_param(l, param, arg)),
-            Box::new(substitute_func_param(r, param, arg)),
-        ),
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => Expr::If {
-            cond: Box::new(substitute_func_param(cond, param, arg)),
-            then_branch: Box::new(substitute_func_param(then_branch, param, arg)),
-            else_branch: Box::new(substitute_func_param(else_branch, param, arg)),
-        },
-        Expr::Try { expr, catch } => Expr::Try {
-            expr: Box::new(substitute_func_param(expr, param, arg)),
-            catch: catch
-                .as_ref()
-                .map(|c| Box::new(substitute_func_param(c, param, arg))),
-        },
+        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
+        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
+        // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
         Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg)),
-        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
-            parts
-                .iter()
-                .map(|p| match p {
-                    StringPart::Literal(s) => StringPart::Literal(s.clone()),
-                    StringPart::Expr(e) => {
-                        StringPart::Expr(Box::new(substitute_func_param(e, param, arg)))
-                    }
-                })
-                .collect(),
-        ),
-        Expr::Format(f) => Expr::Format(f.clone()),
-        Expr::As { expr, var, body } => Expr::As {
+        Expr::As { expr, var, body } if var == param => Expr::As {
             expr: Box::new(substitute_func_param(expr, param, arg)),
             var: var.clone(),
-            body: Box::new(subst_unless_shadowed(var == param, body, param, arg)),
+            body: body.clone(),
         },
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
-        } => {
-            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
-            Expr::Reduce {
-                input: Box::new(substitute_func_param(input, param, arg)),
-                patterns: patterns.clone(),
-                init: Box::new(substitute_func_param(init, param, arg)),
-                update: Box::new(subst_unless_shadowed(shadowed, update, param, arg)),
-            }
-        }
+        } if patterns.iter().any(|p| pattern_binds_var(p, param)) => Expr::Reduce {
+            input: Box::new(substitute_func_param(input, param, arg)),
+            patterns: patterns.clone(),
+            init: Box::new(substitute_func_param(init, param, arg)),
+            update: update.clone(),
+        },
         Expr::Foreach {
             input,
             patterns,
             init,
             update,
             extract,
-        } => {
-            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
-            Expr::Foreach {
-                input: Box::new(substitute_func_param(input, param, arg)),
-                patterns: patterns.clone(),
-                init: Box::new(substitute_func_param(init, param, arg)),
-                update: Box::new(subst_unless_shadowed(shadowed, update, param, arg)),
-                extract: subst_unless_shadowed_opt(shadowed, extract, param, arg).map(Box::new),
-            }
-        }
-        Expr::Limit { n, expr } => Expr::Limit {
-            n: Box::new(substitute_func_param(n, param, arg)),
-            expr: Box::new(substitute_func_param(expr, param, arg)),
-        },
-        Expr::FirstExpr(e) => Expr::FirstExpr(Box::new(substitute_func_param(e, param, arg))),
-        Expr::LastExpr(e) => Expr::LastExpr(Box::new(substitute_func_param(e, param, arg))),
-        Expr::NthExpr { n, expr } => Expr::NthExpr {
-            n: Box::new(substitute_func_param(n, param, arg)),
-            expr: Box::new(substitute_func_param(expr, param, arg)),
-        },
-        Expr::Until { cond, update } => Expr::Until {
-            cond: Box::new(substitute_func_param(cond, param, arg)),
-            update: Box::new(substitute_func_param(update, param, arg)),
-        },
-        Expr::While { cond, update } => Expr::While {
-            cond: Box::new(substitute_func_param(cond, param, arg)),
-            update: Box::new(substitute_func_param(update, param, arg)),
-        },
-        Expr::Repeat(e) => Expr::Repeat(Box::new(substitute_func_param(e, param, arg))),
-        Expr::Range { from, to, step } => Expr::Range {
-            from: Box::new(substitute_func_param(from, param, arg)),
-            to: to
-                .as_ref()
-                .map(|e| Box::new(substitute_func_param(e, param, arg))),
-            step: step
-                .as_ref()
-                .map(|e| Box::new(substitute_func_param(e, param, arg))),
+        } if patterns.iter().any(|p| pattern_binds_var(p, param)) => Expr::Foreach {
+            input: Box::new(substitute_func_param(input, param, arg)),
+            patterns: patterns.clone(),
+            init: Box::new(substitute_func_param(init, param, arg)),
+            update: update.clone(),
+            extract: extract.clone(),
         },
         Expr::AsPattern {
             expr,
             patterns,
             body,
-        } => {
-            let shadowed = patterns.iter().any(|p| pattern_binds_var(p, param));
-            Expr::AsPattern {
-                expr: Box::new(substitute_func_param(expr, param, arg)),
-                patterns: patterns.clone(),
-                body: Box::new(subst_unless_shadowed(shadowed, body, param, arg)),
-            }
-        }
+        } if patterns.iter().any(|p| pattern_binds_var(p, param)) => Expr::AsPattern {
+            expr: Box::new(substitute_func_param(expr, param, arg)),
+            patterns: patterns.clone(),
+            body: body.clone(),
+        },
         Expr::FuncDef {
             name,
             params,
@@ -42058,57 +41091,21 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args } => {
-            // In jq, function parameters are bare identifiers that parse as zero-arg FuncCalls
-            // Check if this is a reference to the parameter
-            if name == param && args.is_empty() {
-                arg.clone()
-            } else {
-                Expr::FuncCall {
-                    name: name.clone(),
-                    args: args
-                        .iter()
-                        .map(|a| substitute_func_param(a, param, arg))
-                        .collect(),
-                }
-            }
+        Expr::FuncCall { name, args } if name == param && args.is_empty() => {
+            // In jq, function parameters are bare identifiers that parse as
+            // zero-arg FuncCalls. This is a reference to the parameter.
+            arg.clone()
         }
-        Expr::NamespacedCall {
-            namespace,
-            name,
-            args,
-        } => Expr::NamespacedCall {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| substitute_func_param(a, param, arg))
-                .collect(),
-        },
-        Expr::Assign { path, value } => Expr::Assign {
-            path: Box::new(substitute_func_param(path, param, arg)),
-            value: Box::new(substitute_func_param(value, param, arg)),
-        },
-        Expr::Update { path, filter } => Expr::Update {
-            path: Box::new(substitute_func_param(path, param, arg)),
-            filter: Box::new(substitute_func_param(filter, param, arg)),
-        },
-        Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
-            op: *op,
-            path: Box::new(substitute_func_param(path, param, arg)),
-            value: Box::new(substitute_func_param(value, param, arg)),
-        },
-        Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
-            path: Box::new(substitute_func_param(path, param, arg)),
-            value: Box::new(substitute_func_param(value, param, arg)),
-        },
 
-        // Label-break
-        Expr::Label { name, body } => Expr::Label {
-            name: name.clone(),
-            body: Box::new(substitute_func_param(body, param, arg)),
-        },
-        Expr::Break(name) => Expr::Break(name.clone()),
+        // #2095: every remaining variant's recursive-structural-child
+        // handling here is identical to `install_def_calls`'s and
+        // `substitute_var_impl`'s own -- apply this substitution to each
+        // `Expr`-typed child and rebuild the node, nothing else -- so it
+        // lives once in `map_subexprs` (`src/jq/walk.rs`) instead of being
+        // hand-repeated in all three. See that function's own doc comment
+        // for the full variant-by-variant justification, including the arms
+        // above that stay explicit here instead of ever reaching it.
+        _ => map_subexprs(expr, &mut |sub| substitute_func_param(sub, param, arg)),
     }
 }
 

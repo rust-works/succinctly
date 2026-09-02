@@ -26,6 +26,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Expr`-scrutinee `unreachable!()` fallbacks along with it. `size_of::<Expr>()` is
   unchanged at 96 bytes and is now pinned by a test.
 
+- **`eval.rs`'s three `Expr`-substitution passes now share one generic tree
+  walk** (#2095): `install_def_calls`, `substitute_func_param` and
+  `substitute_var_impl` each used to hand-write a full ~40-arm match over
+  every `Expr` variant, identical except at a handful of binder/leaf/opaque
+  arms, so adding a new `Expr` variant meant three synchronized edits — and
+  missing one next to a wildcard would compile cleanly while silently
+  dropping that variant from whichever pass forgot it. `map_subexprs`
+  (`src/jq/walk.rs`) generalizes `map_builtin_subexprs` one level up the
+  tree: it owns every variant whose recursive-structural-child handling is
+  identical across all three callers, and each caller now matches only its
+  own special-cased arms (shadow checks, opaque `Shared`/`DefCall`
+  handling, `FuncDef`, `Builtin`) before falling through to it. Both
+  `map_subexprs` and `map_builtin_subexprs` deliberately have no wildcard
+  arm, so a future `Expr`/`Builtin` variant is a compile error in one place
+  rather than a silent gap in three.
+
+  Behavior-preserving refactor, not a fix: verified by reading all three
+  functions' arms side by side before folding any of them, and every
+  existing `jq`/`yq` test still passes unchanged. `Expr::Shared` and
+  `Expr::Error` turned out to be handled identically across all three
+  callers too, but are kept as explicit per-function arms rather than
+  folded — `Shared`'s opacity is architecturally load-bearing (#1371,
+  #2077, #2096) and each caller's own comment documents a different
+  concrete hazard, and `Expr::Error`'s non-recursion into its message looks
+  like a pre-existing latent gap (`error($x)` referencing a variable a pass
+  is substituting doesn't get substituted) rather than a deliberate
+  invariant, flagged in `map_subexprs`'s own doc comment for follow-up
+  rather than silently changed here.
+
 ### Fixed
 
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
