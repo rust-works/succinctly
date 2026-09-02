@@ -169,6 +169,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `Flow::Escaped` arm, two lines below, was already honoring correctly.
     Fixed by converting items one at a time into an explicit `Vec`.
 
+- **`resolve_node`/`resolve_seq` no longer serialize-and-reparse a branch's
+  whole subtree to evaluate a pure `select`/comparison condition** (#2048).
+  A filtered recursive descent (`del(.. | select(type == "number"))`)
+  evaluates its filter once per resolved branch, and branch *i* of a
+  depth-*d* chain holds an O(*d* - *i*)-sized subtree — routing that
+  evaluation through `eval_owned_multi_keep_partial` → `eval_owned_input`'s
+  `to_json_for_reindex` + `JsonIndex::build` bridge (built for filters that
+  need real navigation) summed those serializations to O(*d*²), independent
+  of and larger than the per-branch path-flatten term #1690/#2047 already
+  fixed in this exact code region. A new pre-check in
+  `eval_owned_fast_path` (`eval_owned_pure`, gated by `is_owned_pure_expr` +
+  the representation-preserving `produces_fresh_value`, #2048) answers a
+  closed grammar of pure, always-single-output shapes — comparisons,
+  `and`/`or`, `type`, literals, and navigation used only as an operand —
+  directly against the already-owned branch, with no text round-trip.
+
+  Measured on the issue's own D=240 repro (interleaved A/B, real hardware,
+  both `nodes.yaml` targets): 2.06–2.69x faster, landing on the floor a
+  condition that never reindexed at all already costs — the reindex term is
+  gone, not merely cheaper. The scaling *exponent* does not drop toward
+  O(*d*) (1.93→1.84 on ARM, 1.93→1.91 on x86): a second, independent O(*d*²)
+  term in the descent/delete machinery (the #1690/#1651/#1301/#1213 chain)
+  still dominates what's left, and is out of scope here. Realistic
+  wide/shallow shapes (200k-record arrays) still see a real 1.16–1.25x win.
+  yq mode shares `resolve_node` and benefits identically (up to 1.84x at
+  D=240); `eval_generic.rs` has no `resolve_node` of its own, so this
+  specific term has no twin there — though that evaluator's own reindex
+  bridge (`eval_on_owned`) lacks even the pre-#2048 `Identity`/`Field`/
+  `Index` fast path #491 gave this one, which may be worth its own
+  follow-up.
+
+  Correctness: 728 CLI cases (26 inputs × 28 queries spanning `del`/`path`/
+  `|=`/`map_values`/`with_entries`/`recurse`) verified byte-identical
+  against the pinned oracle (`/usr/bin/jq` 1.7.1) and against the
+  pre-#2048 binary; 546 yq-mode cases likewise byte-identical
+  stdout/stderr/exit-code against the pre-#2048 binary. The fast path is a
+  closed allow-list (`is_owned_pure_expr`'s catch-all is `_ => false`, so a
+  future `Expr` variant is never silently fast-pathed) and delegates every
+  arm to the same helper the slow evaluator itself uses
+  (`apply_compare_op`, `literal_to_owned`, `owned_type_name`, `is_truthy`)
+  rather than restating any rule. `produces_fresh_value` is a second,
+  independent gate catching a real representation bug an earlier version
+  of this fix had: fast-pathing `.a.b` in *result* position would return
+  `Int(2)` where the reindex bridge returns `NumberLiteral(Int(2), "2")`
+  — the exact swap #1008's literal-preservation rule reads and #1054 is a
+  live bug over, in the opposite direction. Navigation is therefore
+  admitted only as an *operand* consumed by a comparison or truthiness
+  test (which read all three numeric representations identically), never
+  as an expression's own escaping result.
+
 ### Fixed
 
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of

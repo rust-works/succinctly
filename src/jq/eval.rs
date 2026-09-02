@@ -26994,6 +26994,15 @@ fn eval_owned_fast_path<S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> Option<Result<Option<OwnedValue>, EvalError>> {
+    // #2048: the *composite* pure shapes (`type == "number"`, `.a and .b`,
+    // `.a.b > 3`, ...). Gated on `!optional` so the `?`-suppression rules
+    // `binary_fanout_core`/`boolean_fanout_core` apply to an erroring operand
+    // stay the slow path's business alone -- see [`eval_owned_pure`].
+    if !optional && is_owned_pure_composite(expr) {
+        if let Some(result) = eval_owned_pure::<S>(expr, input) {
+            return Some(result.map(Some));
+        }
+    }
     match expr {
         Expr::Identity => Some(Ok(Some(input.clone()))),
         Expr::Builtin(Builtin::ToString) => {
@@ -27056,6 +27065,236 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         }),
         _ => None,
     }
+}
+
+/// Whether `expr` is one of the pure, always-single-output shapes
+/// [`eval_owned_pure`] can answer directly against an `OwnedValue` (#2048).
+///
+/// **Syntactic, and deliberately closed.** Every accepted shape is (a) pure —
+/// no variable binding, no `error`/`stderr`/`input`/`halt`, no assignment, no
+/// generator, nothing that can observe or mutate anything outside `input`;
+/// (b) exactly-single-output, so there is no fan-out, `Partial` prefix, or
+/// `Control` for the single-value contract below to lose; and (c) free of
+/// path context (`key`/`parent`/`file_index`), which the slow path routes
+/// through a different evaluator entirely (`eval_pipe`'s own
+/// [`needs_path_context`] pre-check). Anything else — including shapes that
+/// *look* pure but are not exactly-single-output (`Comma`, `Iterate`,
+/// `RecursiveDescent`, `Optional`, `Alternative`, `If`) — falls through to the
+/// reindex bridge unchanged. `Expr::Arithmetic` is deliberately absent too:
+/// its own literal-operand case already has a narrower arm in
+/// [`eval_owned_fast_path`] (#2086) whose divergences are pinned there.
+///
+/// The `_ => false` catch-all is what makes adding a variant to [`Expr`] safe
+/// by default: a new variant is not fast-pathed until someone opts it in here
+/// *and* gives [`eval_owned_pure`] an arm for it.
+fn is_owned_pure_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Not
+        | Expr::Literal(_)
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Builtin(Builtin::Type) => true,
+        Expr::Paren(inner) => is_owned_pure_expr(inner),
+        Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+            is_owned_pure_expr(left) && is_owned_pure_expr(right)
+        }
+        // A pipe of pure single-output stages is itself pure and
+        // single-output; `.a.b` and `.a | type` both take this shape.
+        Expr::Pipe(stages) => stages.iter().all(is_owned_pure_expr),
+        _ => false,
+    }
+}
+
+/// Whether `expr`'s own result is a value it *constructs* — a `Bool` from a
+/// comparison or a boolean operator, a `String` from `type`, a literal —
+/// rather than a subvalue it read back out of its input.
+///
+/// **This is the gate that makes the #2048 fast path representation-neutral,
+/// and it is load-bearing.** The reindex bridge is a *formatter*: a number
+/// travelling through `to_json_for_reindex` + reparse comes back as a
+/// `NumberLiteral` carrying source text, where the owned tree may have held a
+/// plain `Int`/`Float`. That difference is not academic — `NumberLiteral` is
+/// what #1008's literal-preservation rule echoes verbatim on output, and
+/// #1054 is a live bug caused by the *opposite* direction of the same swap.
+/// A fast path that answered `.a.b` directly would hand back `Int(2)` where
+/// the bridge hands back `NumberLiteral(Int(2), "2")` — caught by
+/// `eval_owned_pure_agrees_with_the_reindex_bridge` on exactly that case.
+///
+/// So navigation is admitted only *inside* an accepted expression, where its
+/// result is consumed by [`apply_compare_op`] / a truthiness test (both of
+/// which read `Int`/`Float`/`NumberLiteral` identically — see
+/// `owned_value_eq_at_depth`'s cross-representation arms) and never escapes.
+/// `Expr::Field`/`Expr::Index`/`Expr::Identity` in *result* position keep
+/// their pre-#2048 arms in [`eval_owned_fast_path`], whose own equivalent
+/// widening is pinned separately by
+/// `eval_owned_fast_path_agrees_with_index_object_by_name_and_index_array_by_position`.
+fn produces_fresh_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Not
+        | Expr::Literal(_)
+        | Expr::Builtin(Builtin::Type)
+        | Expr::Compare { .. }
+        | Expr::And(_, _)
+        | Expr::Or(_, _) => true,
+        Expr::Paren(inner) => produces_fresh_value(inner),
+        // Only the last stage's result leaves the pipe.
+        Expr::Pipe(stages) => stages.last().is_some_and(produces_fresh_value),
+        _ => false,
+    }
+}
+
+/// Whether the #2048 pre-check in [`eval_owned_fast_path`] should consult
+/// [`eval_owned_pure`] for `expr`: it has to be pure and single-output
+/// ([`is_owned_pure_expr`]) *and* return a freshly-constructed value
+/// ([`produces_fresh_value`]).
+///
+/// The second half is the correctness gate (see its doc comment). The first
+/// half is also what keeps the pre-#2048 arms
+/// (`Identity`/`Field`/`Index`/`ToString`/`Arithmetic`) answering from their
+/// own arms byte for byte — none of them is `produces_fresh_value`, except
+/// `Arithmetic`, which `is_owned_pure_expr` rejects.
+fn is_owned_pure_composite(expr: &Expr) -> bool {
+    produces_fresh_value(expr) && is_owned_pure_expr(expr)
+}
+
+/// Evaluate a pure, single-output expression ([`is_owned_pure_expr`])
+/// directly against an `OwnedValue`, with no `to_json_for_reindex` +
+/// `JsonIndex::build` round trip (#2048).
+///
+/// **Why this exists.** `resolve_node`'s `select(f)`/`if` arms evaluate their
+/// condition once per resolved branch through
+/// `eval_owned_multi_keep_partial` -> `eval_owned_input`, which serializes the
+/// *whole* branch subtree and reparses it just to obtain something
+/// `eval_single` can index. On a filtered recursive descent
+/// (`del(.. | select(type == "number"))`) branch *i* of a depth-*d* chain
+/// holds an O(*d* - *i*)-sized subtree, so those serializations alone sum to
+/// O(*d*²) — for a condition that reads nothing but the branch's own top-level
+/// shape. Measured on the issue's own repro (D=240, 100 documents per
+/// process, interleaved A/B on an idle Apple M4 Pro on AC): 1499ms before,
+/// 556ms after -- which lands on the 561ms the same descent costs with a
+/// condition that never reindexed at all (`del(.. | numbers)`), so the
+/// reindex term is gone rather than merely reduced. The shape stays O(*d*²):
+/// what remains is the descent/delete term the #1690/#1651 chain tracks, not
+/// this one.
+///
+/// This is the same "answer it against the owned tree instead" move #491 made
+/// for bare `.`/`.foo`/`.[n]`, widened to the composite shapes a `select`
+/// condition actually takes. It is likewise **unobservable except in speed**:
+/// each arm delegates to the *same* helper `eval_single` uses for that
+/// operator ([`apply_compare_op`], [`literal_to_owned`], [`owned_type_name`]'s
+/// mapping, `is_truthy`), rather than restating the rule. The pinning test is
+/// `eval_owned_pure_agrees_with_the_reindex_bridge`, which runs both this and
+/// the reindex bridge (via [`eval_owned_input_reindexed`]) over a matrix of
+/// expressions x values and asserts they agree.
+///
+/// Returns `None` for anything outside [`is_owned_pure_expr`] — the caller
+/// then falls back to the bridge unchanged. Because every accepted shape is
+/// pure, a partially-completed evaluation that ends in `None` has cost only
+/// wasted work, never a duplicated side effect.
+///
+/// This function's grammar is *wider* than what
+/// [`is_owned_pure_composite`] actually gates in: navigation arms
+/// (`Identity`/`Field`/`Index`, and a `Pipe` ending in one) are evaluable
+/// here but only ever reached as an operand of something that consumes
+/// their value, never as an expression's own result — see
+/// [`produces_fresh_value`] for the representation reason that separation
+/// exists.
+fn eval_owned_pure<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+) -> Option<Result<OwnedValue, EvalError>> {
+    match expr {
+        Expr::Paren(inner) => eval_owned_pure::<S>(inner, input),
+        // `eval_single`'s own `Expr::Literal` arm, verbatim.
+        Expr::Literal(lit) => Some(Ok(literal_to_owned(lit))),
+        // `eval_not`'s rule: truthiness excludes exactly `null`/`false`, and
+        // `OwnedValue::is_truthy` is the same predicate `json_is_truthy`
+        // implements over a cursor.
+        Expr::Not => Some(Ok(OwnedValue::Bool(!input.is_truthy()))),
+        // `eval_builtin`'s `Builtin::Type` arm maps the cursor's own kind to
+        // the same six names `owned_type_name` maps an `OwnedValue` to (its
+        // seventh, `StandardJson::Error`, has no `OwnedValue` counterpart and
+        // cannot arise from a reindexed document).
+        Expr::Builtin(Builtin::Type) => Some(Ok(OwnedValue::String(owned_type_name(input).into()))),
+        // Delegated rather than restated, so the navigation rules stay
+        // single-sourced with the arms `eval_owned_fast_path_agrees_with_
+        // index_object_by_name_and_index_array_by_position` already pins.
+        // `optional: false` is this function's whole contract (see the
+        // `!optional` gate at its call site), under which those arms answer
+        // `Ok(Some(_))` or `Err(_)` and never `Ok(None)`; the `Ok(None)` arm
+        // below is a non-panicking fallback to the bridge rather than an
+        // `unreachable!()`.
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
+            match eval_owned_fast_path::<S>(expr, input, false)? {
+                Ok(Some(v)) => Some(Ok(v)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        }
+        // `eval_compare` -> `eval_binary_fanout` with two single-output
+        // operands is exactly one (left, right) pairing, and its `combine` is
+        // `apply_compare_op` — the shared operator semantics this reuses
+        // directly. Left is the outer generator there, so a left-side error
+        // wins over a right-side one; short-circuiting on it here matches.
+        Expr::Compare { op, left, right } => {
+            let l = match eval_owned_pure::<S>(left, input)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            let r = match eval_owned_pure::<S>(right, input)? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(Ok(OwnedValue::Bool(apply_compare_op::<S>(*op, &l, &r))))
+        }
+        // `boolean_fanout_core` with a single-output left operand: a left
+        // output equal to the short-circuiting value contributes that value
+        // *without evaluating the right operand at all* (which is what makes
+        // `false and error("x")` answer `false` rather than raising), and
+        // otherwise the answer is the right operand's own truthiness.
+        Expr::And(left, right) => eval_owned_pure_boolean::<S>(left, right, input, false),
+        Expr::Or(left, right) => eval_owned_pure_boolean::<S>(left, right, input, true),
+        // A pure pipe threads one value stage to stage — `eval_pipe`'s own
+        // shape once every stage is single-output (and, per
+        // [`is_owned_pure_expr`], once no stage needs path context, which is
+        // the branch `eval_pipe` takes *before* threading anything).
+        Expr::Pipe(stages) => {
+            let mut current = input.clone();
+            for stage in stages {
+                current = match eval_owned_pure::<S>(stage, &current)? {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+            Some(Ok(current))
+        }
+        _ => None,
+    }
+}
+
+/// Shared body of [`eval_owned_pure`]'s `and`/`or` arms, which differ only in
+/// which truth value short-circuits — the same split
+/// [`boolean_fanout_core`] makes for the cursor evaluator, kept here so the
+/// two arms cannot drift from each other.
+fn eval_owned_pure_boolean<S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    input: &OwnedValue,
+    short_circuit: bool,
+) -> Option<Result<OwnedValue, EvalError>> {
+    let l = match eval_owned_pure::<S>(left, input)? {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    if l.is_truthy() == short_circuit {
+        return Some(Ok(OwnedValue::Bool(short_circuit)));
+    }
+    let r = match eval_owned_pure::<S>(right, input)? {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(OwnedValue::Bool(r.is_truthy())))
 }
 
 /// Same evaluator as `eval_owned_expr`, but keeps a `break` distinguishable
@@ -27292,6 +27531,24 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     }
 
+    eval_owned_input_reindexed::<W, S>(expr, input, optional)
+}
+
+/// [`eval_owned_input`]'s reindex bridge, with no fast-path pre-check: build a
+/// throwaway JSON document out of `input` and run the ordinary cursor
+/// evaluator against it.
+///
+/// Split out of [`eval_owned_input`] (#2048) so a test can force the bridge
+/// for a shape [`eval_owned_fast_path`] now answers directly, and assert the
+/// two agree — the same pinning `eval_owned_fast_path_agrees_with_index_
+/// object_by_name_and_index_array_by_position` does for #491's arms via its
+/// own `via_cursor`, but for arbitrary expressions rather than three hardcoded
+/// ones. Behaviour is unchanged: this is the identical body, relocated.
+fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -46340,6 +46597,409 @@ mod tests {
                 "eval_owned_fast_path disagrees with index_object_by_name/index_array_by_position \
                  for {expr:?} on {input:?} (optional={optional})"
             );
+        }
+    }
+
+    /// The value matrix `eval_owned_pure`'s pinning tests run every
+    /// expression against: one of every `OwnedValue` variant, both numeric
+    /// spellings (`Int`/`Float`/`NumberLiteral`), the non-finite floats the
+    /// reindex bridge has to smuggle through a sentinel (#561), and the
+    /// containers the `select`-condition shapes actually navigate into.
+    ///
+    /// Each scalar also appears *wrapped* as `{"a": {"b": v}}` and `[v]`, so
+    /// the arms that hand a navigated subvalue straight back (`Field`,
+    /// `Index`, and the `Pipe` threading built on them) are diffed on every
+    /// numeric spelling too — the round trip those arms skip is a *formatter*
+    /// (`to_json_for_reindex` writes a bare `Float` decimally and the reparse
+    /// hands back a `NumberLiteral`), so an un-round-tripped `Float`/`Int`
+    /// reaching a caller is exactly where a divergence would hide.
+    fn pure_value_matrix() -> Vec<OwnedValue> {
+        let scalars = pure_scalar_matrix();
+        let mut out = scalars.clone();
+        for v in scalars {
+            let mut inner = indexmap::IndexMap::new();
+            inner.insert("b".to_string(), v.clone());
+            let mut wrapper = indexmap::IndexMap::new();
+            wrapper.insert("a".to_string(), OwnedValue::Object(inner));
+            out.push(OwnedValue::Object(wrapper));
+            out.push(OwnedValue::Array(vec![v]));
+        }
+        out
+    }
+
+    /// The unwrapped half of [`pure_value_matrix`].
+    fn pure_scalar_matrix() -> Vec<OwnedValue> {
+        let mut inner = indexmap::IndexMap::new();
+        inner.insert("b".to_string(), OwnedValue::Int(2));
+        let mut nested = indexmap::IndexMap::new();
+        nested.insert("a".to_string(), OwnedValue::Object(inner));
+        let mut flat = indexmap::IndexMap::new();
+        flat.insert("a".to_string(), OwnedValue::Int(1));
+        flat.insert("b".to_string(), OwnedValue::Bool(false));
+        let mut nulled = indexmap::IndexMap::new();
+        nulled.insert("a".to_string(), OwnedValue::Null);
+
+        vec![
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(1),
+            OwnedValue::Int(2),
+            OwnedValue::Int(9007199254740993),
+            OwnedValue::Float(1.0),
+            OwnedValue::Float(1.5),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::from_number_literal("1"),
+            OwnedValue::from_number_literal("1.0"),
+            OwnedValue::from_number_literal("1e10"),
+            OwnedValue::String(String::new()),
+            OwnedValue::String("number".to_string()),
+            OwnedValue::String("x".to_string()),
+            OwnedValue::Array(Vec::new()),
+            OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            OwnedValue::Object(indexmap::IndexMap::new()),
+            OwnedValue::Object(flat),
+            OwnedValue::Object(nested),
+            OwnedValue::Object(nulled),
+        ]
+    }
+
+    /// Every expression `is_owned_pure_expr` admits that the tests below
+    /// diff against the reindex bridge. Deliberately includes shapes whose
+    /// *result* is an error (`.a` on a scalar), so the error text is pinned
+    /// too, not just the success values.
+    fn pure_expr_matrix() -> Vec<&'static str> {
+        vec![
+            // The issue's own repro condition, plus the rest of the `type`
+            // family a `select` typically spells.
+            r#"type == "number""#,
+            r#"type == "object""#,
+            r#"type != "null""#,
+            r#"type == "number" or type == "string""#,
+            // Bare pure leaves, reached through the composite arms.
+            "1 == 1",
+            r#""a" < "b""#,
+            ". == 1",
+            ". == 1.0",
+            ". == null",
+            ". != false",
+            ". < 2",
+            ". <= 2",
+            ". > 2",
+            ". >= 2",
+            // Navigation inside a condition: field, nested field, index.
+            ".a == 1",
+            ".a.b == 2",
+            ".a == null",
+            ".[0] == 1",
+            ".[-1] == 2",
+            // Boolean combinators, including the short-circuiting shapes.
+            ".a and .b",
+            ".a or .b",
+            ".a and .b or . == null",
+            "(.a == 1) and (.b == false)",
+            "false and .a",
+            "true or .a",
+            // `not`, alone and as a pipe stage.
+            "not",
+            ". | not",
+            ".a | not",
+            // Pure pipes, all of which *end* in a freshly-constructed value
+            // (`produces_fresh_value`) -- a pipe ending in navigation
+            // (`.a | .b`) is deliberately not here; see
+            // `pipes_ending_in_navigation_are_evaluable_but_not_gated_2048`.
+            ".a | type",
+            ".a | .b == 2",
+            "(.a) == (1)",
+        ]
+    }
+
+    /// #2048: `eval_owned_fast_path`'s composite pure arms
+    /// ([`eval_owned_pure`]) answer `select`-condition shapes directly
+    /// against the `OwnedValue`, where before they round-tripped the whole
+    /// branch subtree through `to_json_for_reindex` + `JsonIndex::build`. That
+    /// makes them a second implementation of rules the cursor evaluator
+    /// already has -- the exact drift risk #106 named ("duplicated predicates
+    /// diverge silently") and that #491's own
+    /// `eval_owned_fast_path_agrees_with_...` test above already guards for
+    /// the `Field`/`Index` arms.
+    ///
+    /// This pins the two together for the new arms: run every expression in
+    /// [`pure_expr_matrix`] against every value in [`pure_value_matrix`]
+    /// through both `eval_owned_input` (now fast-pathed) and
+    /// [`eval_owned_input_reindexed`] (the bridge, forced), and assert the
+    /// values *and* the terminating control/error text agree exactly. Both
+    /// semantics are covered: `S` reaches these arms through `apply_compare_op`
+    /// (`STRICT_NUMERIC_EQUALITY`) and through the bridge's own float
+    /// spelling (`to_json_for_reindex`), so jq and yq can diverge here
+    /// independently.
+    /// Compared as `Debug` text, not with `==`: `OwnedValue`'s own `PartialEq`
+    /// is jq's, under which `nan != nan` (see `cmp_f64`'s truth table), so
+    /// `assert_eq!` on two *identical* `Float(NaN)` results fails. `Debug` is
+    /// also strictly the sharper check for what this test is guarding, since
+    /// it distinguishes the representations `==` deliberately widens across
+    /// (`Float(1.0)` vs `NumberLiteral(Float(1.0), "1.0")`) -- exactly the
+    /// spelling the bridge's serialize-and-reparse can change and the fast
+    /// path does not.
+    fn debug_normalize<W: Clone + AsRef<[u64]>>(r: QueryResult<'_, W>) -> String {
+        format!("{:?}", normalize(r))
+    }
+
+    #[test]
+    fn eval_owned_pure_agrees_with_the_reindex_bridge() {
+        let values = pure_value_matrix();
+        for src in pure_expr_matrix() {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                is_owned_pure_expr(&expr),
+                "{src:?} is expected to be fast-pathable, but is_owned_pure_expr said no: {expr:?}"
+            );
+            for value in &values {
+                let fast = debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                let bridge = debug_normalize(eval_owned_input_reindexed::<Vec<u64>, JqSemantics>(
+                    &expr, value, false,
+                ));
+                assert_eq!(
+                    fast, bridge,
+                    "jq mode: {src:?} on {value:?} disagrees with the reindex bridge"
+                );
+
+                let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
+                    &expr, value, false,
+                ));
+                let bridge = debug_normalize(eval_owned_input_reindexed::<Vec<u64>, YqSemantics>(
+                    &expr, value, false,
+                ));
+                assert_eq!(
+                    fast, bridge,
+                    "yq mode: {src:?} on {value:?} disagrees with the reindex bridge"
+                );
+            }
+        }
+    }
+
+    /// #2048: the fast path must stay *closed*. Anything that can fan out,
+    /// bind, raise, halt, break, read outside its input, or need path context
+    /// has to keep going through the reindex bridge -- `eval_owned_pure` has
+    /// no way to express a multi-output stream, a `Control`, or a
+    /// `current_path`, so admitting one of these would silently drop outputs
+    /// or answer the wrong thing rather than merely being slower.
+    ///
+    /// Guards the over-eager direction the agreement test above cannot: that
+    /// test only ever runs expressions `is_owned_pure_expr` already accepts.
+    #[test]
+    fn is_owned_pure_expr_rejects_everything_impure_or_multi_output() {
+        let rejected = [
+            // Fan-out: more than one output, which the single-value contract
+            // cannot carry.
+            ".a, .b",
+            ".[]",
+            "..",
+            "recurse",
+            "range(3)",
+            "1, 2",
+            "(.a, .b) == 1",
+            "type == (\"a\", \"b\")",
+            // Container *construction* is `Expr::Array`/`Expr::Object` over a
+            // generator, not a literal -- even when empty (`[]` parses as
+            // `Array(Comma([]))`), so it stays off the fast path.
+            ". == []",
+            ". == {}",
+            ". == [1]",
+            ". == {a: 1}",
+            // Zero-output / error-suppressing shapes.
+            ".a?",
+            "empty",
+            ".a // 1",
+            "try .a catch 1",
+            "if . then 1 else 2 end",
+            // Escapes: an error, a halt, a break -- none of which
+            // `eval_owned_pure`'s `Result<OwnedValue, EvalError>` can carry
+            // as anything but an error.
+            r#"error("x")"#,
+            "halt",
+            "halt_error",
+            "false and error(\"x\")",
+            "true or halt",
+            // Variable binding and definition.
+            ". as $x | $x == 1",
+            "def f: 1; f == 1",
+            "$__loc__ == 1",
+            // Path context (`eval_pipe` routes these through a different
+            // evaluator entirely, before any threading happens).
+            "path(.a)",
+            "getpath([\"a\"])",
+            // Anything that reads outside its input, or is impure in time.
+            "input",
+            "now",
+            "env",
+            "stderr",
+            // Assignment and deletion: writes, not reads.
+            ".a = 1",
+            ".a |= . + 1",
+            "del(.a)",
+            // Ordinary builtins that are pure but not opted in -- these are
+            // correct to reject, and the assertion documents that the gate is
+            // an allow-list, not a deny-list.
+            "length == 0",
+            "keys == []",
+            "tostring == \"1\"",
+            "-.a == 1",
+            ".a + 1 == 2",
+        ];
+        for src in rejected {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                !is_owned_pure_expr(&expr),
+                "{src:?} must NOT be fast-pathed, but is_owned_pure_expr accepted it: {expr:?}"
+            );
+        }
+    }
+
+    /// #2048: `is_owned_pure_expr` accepts navigation, but
+    /// `is_owned_pure_composite` does not *gate* on it when the navigated
+    /// value is the expression's own result -- the representation gate
+    /// [`produces_fresh_value`] documents.
+    ///
+    /// This is the concrete case that gate was added for, and it is a real
+    /// divergence, not a hypothetical one: on `{"a":{"b":2}}` the fast path's
+    /// `.a | .b` answers `Int(2)` while the reindex bridge answers
+    /// `NumberLiteral(Int(2), "2")` -- the same `NumberLiteral`-vs-plain swap
+    /// #1008's literal preservation reads and #1054 was filed over. The
+    /// assertions below pin *both* halves: that the two representations
+    /// genuinely differ here, and that the gate therefore routes this shape to
+    /// the bridge.
+    #[test]
+    fn pipes_ending_in_navigation_are_evaluable_but_not_gated_2048() {
+        let expr = parse(".a | .b").unwrap();
+        let mut inner = indexmap::IndexMap::new();
+        inner.insert("b".to_string(), OwnedValue::Int(2));
+        let mut outer = indexmap::IndexMap::new();
+        outer.insert("a".to_string(), OwnedValue::Object(inner));
+        let value = OwnedValue::Object(outer);
+
+        // Pure and single-output ...
+        assert!(is_owned_pure_expr(&expr));
+        assert!(eval_owned_pure::<JqSemantics>(&expr, &value).is_some());
+        // ... but not freshly constructed, so not gated in.
+        assert!(!produces_fresh_value(&expr));
+        assert!(!is_owned_pure_composite(&expr));
+
+        // And this is why: the two disagree on representation.
+        let direct = eval_owned_pure::<JqSemantics>(&expr, &value)
+            .unwrap()
+            .unwrap();
+        let bridge = debug_normalize(eval_owned_input_reindexed::<Vec<u64>, JqSemantics>(
+            &expr, &value, false,
+        ));
+        assert_eq!(format!("{direct:?}"), "Int(2)");
+        assert_eq!(bridge, "([NumberLiteral(Int(2), \"2\")], \"ok\")");
+        // The gate holds: what actually runs is the bridge's answer.
+        assert_eq!(
+            debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                &expr, &value, false
+            )),
+            bridge
+        );
+    }
+
+    /// #2048: the fast path has to actually *fire* for the issue's own repro
+    /// condition, or the benchmark measured something else entirely (the
+    /// "prove the benchmark reaches the changed code" rule). `select`'s
+    /// condition is what `resolve_node` hands to
+    /// `eval_owned_multi_keep_partial` -> `eval_owned_input`, so this asserts
+    /// on that inner expression, not on the `select(...)` wrapper.
+    #[test]
+    fn select_condition_from_the_2048_repro_is_fast_pathed() {
+        let Expr::Builtin(Builtin::Select(cond)) = parse(r#"select(type == "number")"#).unwrap()
+        else {
+            panic!("select(...) is expected to parse to Builtin::Select");
+        };
+        assert!(is_owned_pure_composite(&cond));
+        assert!(
+            eval_owned_pure::<JqSemantics>(&cond, &OwnedValue::Int(1)).is_some(),
+            "the repro's own condition must not fall back to the reindex bridge"
+        );
+        // And it still answers what the bridge answers, on both sides of the
+        // predicate.
+        for (value, expected) in [
+            (OwnedValue::Int(1), true),
+            (OwnedValue::String("1".to_string()), false),
+        ] {
+            assert_eq!(
+                eval_owned_pure::<JqSemantics>(&cond, &value)
+                    .unwrap()
+                    .unwrap(),
+                OwnedValue::Bool(expected)
+            );
+        }
+    }
+
+    /// #2048, behavioural half of the over-eager guard: a `select` condition
+    /// that the fast path must *not* claim still behaves exactly as it did.
+    /// `is_owned_pure_expr_rejects_everything_impure_or_multi_output` above
+    /// pins the gate; this pins what the gate is protecting, through the
+    /// `resolve_node` arm the issue is actually about (path position, not
+    /// value position -- the existing `select((true,true))` tests cover the
+    /// latter).
+    ///
+    /// Each expectation is the one `resolve_node`'s `Builtin::Select` arm
+    /// already documents as live-verified against jq 1.7.1.
+    #[test]
+    fn path_position_select_conditions_the_fast_path_must_not_claim_2048() {
+        // Multi-output condition: forks into one branch per truthy output.
+        // A fast path that answered "one value" here would silently drop the
+        // second branch.
+        assert_eq!(outputs(b"1", "[path(select((true,true)))]"), ["[[],[]]"]);
+        assert_eq!(outputs(b"1", "[path(select((false,false)))]"), ["[]"]);
+        // A condition that errors after producing a truthy output keeps the
+        // branch it already produced, then raises.
+        assert_eq!(
+            outputs(b"{\"a\":1}", "[path(select((true, error(\"x\"))))]?"),
+            Vec::<String>::new()
+        );
+        // ... and the fast-pathed condition still resolves the same branch it
+        // did through the bridge.
+        assert_eq!(
+            outputs(b"{\"a\":1}", "[path(.a | select(type == \"number\"))]"),
+            ["[[\"a\"]]"]
+        );
+        assert_eq!(
+            outputs(b"{\"a\":1}", "[path(.a | select(type == \"string\"))]"),
+            ["[]"]
+        );
+        // The issue's own repro, end to end, on a small chain.
+        assert_eq!(
+            outputs(
+                b"{\"n\":1,\"c\":{\"n\":1,\"c\":{}}}",
+                "del(.. | select(type == \"number\"))"
+            ),
+            ["{\"c\":{\"c\":{}}}"]
+        );
+    }
+
+    /// #2048: `is_owned_pure_expr` (the syntactic gate) and `eval_owned_pure`
+    /// (the evaluator) must agree about what is fast-pathable -- a gate that
+    /// admits a shape the evaluator answers `None` for silently costs a
+    /// wasted evaluation, and one that rejects a shape the evaluator handles
+    /// leaves the speedup on the floor. Two definitions of one predicate is
+    /// the #106 shape; this is the test that they agree.
+    #[test]
+    fn is_owned_pure_expr_agrees_with_eval_owned_pure() {
+        for src in pure_expr_matrix() {
+            let expr = parse(src).unwrap();
+            for value in pure_value_matrix() {
+                assert_eq!(
+                    is_owned_pure_expr(&expr),
+                    eval_owned_pure::<JqSemantics>(&expr, &value).is_some(),
+                    "gate and evaluator disagree for {src:?} on {value:?}"
+                );
+            }
         }
     }
 
