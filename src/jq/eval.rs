@@ -31664,44 +31664,39 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `query_result_to_owned_values` convention (the Array arm discards
         // it instead, since a halted array never finished constructing).
         //
-        // Isolating `inner` this way only works when nothing downstream
-        // needs the per-output `current_path` `inner` would have produced
-        // had it continued straight into `rest` -- `Field`/`Index`/`Iterate`
-        // (and friends) only compute+thread an updated path when they have
-        // a non-empty `rest` to recurse into; evaluated with an empty
-        // `rest` for isolation, they just return bare values, so
-        // `continue_rest_with_context` below would fan them into `rest`
-        // using the *stale*, pre-`inner` `current_path` instead of each
-        // output's real one (`.a | (.[])? | key` would wrongly report every
-        // element's key as `"a"` instead of its index). This is a
-        // pre-existing limitation of the isolate-then-continue shape shared
-        // by the `Try`/`Label`/`If`/`FuncDef`/`Limit` arms elsewhere in this
-        // function. `Comma` escaped it by combining each branch with `rest`
-        // instead (#1509) -- a trick that doesn't carry over to constructs
-        // that scope something `rest` must stay outside of, since it would
-        // let `rest`'s own errors be caught by `try`'s handler or `label`'s
-        // break scope. Those arms instead keep isolating and append
-        // `path_probe_stage`'s `[path, .]` inside the isolated pipe
-        // (#1409), which would work here too -- but adopting it for
-        // `Optional` also stops `rest` inheriting this arm's suppression,
-        // an evaluator-wide model change #1826/#1869 both build on, so it
-        // is deliberately left for its own change -- #2073, which also
-        // records what that suppression currently costs: `.a | (.[])? |
-        // (key, error("boom"))` swallows an error real jq raises. This arm
-        // must not regress the path threading meanwhile, so it only takes
-        // the fast, isolated path when `rest` doesn't consult path context
-        // in the first place, and otherwise falls back to evaluating
-        // `[inner, ...rest]` combined under a forced `optional=true` (this
-        // arm's pre-#1335 behavior), which still threads `current_path`
-        // correctly because it never leaves the same recursive call `Field`/
-        // `Index`/`Iterate` build `new_path` inside of. That fallback still
-        // carries the narrower, pre-existing "rest inherits suppression"
-        // gap #1335 fixes in the common case (also tracked in #1409), but
-        // that's strictly no worse than `main`'s current behavior for this
-        // rarer combination.
-        Expr::Optional(inner) if rest.is_empty() || !rest.iter().any(needs_path_context) => {
-            let inner_result = eval_pipe_with_path_context_internal::<W, S>(
-                core::slice::from_ref(inner),
+        // Each output continues `rest` from its own path, not this arm's
+        // ambient one -- see `path_probe_stage` (#1409), the same technique
+        // `Try`/`Label`/`If`/`Limit`/`FirstExpr` use: appending `[path, .]`
+        // *inside* the isolated pipe (only when `rest` needs it, `paired`
+        // below) recovers each output's true `current_path` without ever
+        // leaving `inner`'s isolation, so `.a | (.[])? | key` still reports
+        // each element's own index (`0`, `1`, `2`) instead of one stale
+        // pre-`inner` path.
+        //
+        // `rest` always continues with the *ambient* `optional` this arm
+        // itself received, never a forced `true` (#2073). The arm used to
+        // fall back to evaluating `[inner, ...rest]` combined under a
+        // forced `optional=true` whenever `rest` needed path context (#1335's
+        // fix for the common, non-path-context case, extended no further)
+        // -- correct for path threading, since it never left the one
+        // recursive call `Field`/`Index`/`Iterate` build `new_path` inside
+        // of, but it also meant `optional=true` rode downstream as an
+        // ordinary parameter into the whole of `rest`'s evaluation tree, so
+        // any of that construct's own `if optional` leaf checks could
+        // swallow an error with nothing to do with this `?`: `.a | (.[])? |
+        // (key, error("boom"))` swallowed an error real jq raises. `Comma`
+        // could not have taken this isolating shape instead (combining each
+        // branch with `rest` is its own #1509 fix, since `,` genuinely
+        // distributes `rest` over every branch in real jq) but `?` is not
+        // `,` -- nothing about real jq's semantics has `rest` inherit a `?`
+        // several stages back. Isolating unconditionally, like `Try`/`Label`
+        // already do, removes the leak at its source instead of gating each
+        // leaf's self-check on where `optional` came from.
+        Expr::Optional(inner) => {
+            let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+            let inner_result = eval_stage_with_path_context::<W, S>(
+                inner,
+                &probe_stages(paired),
                 value,
                 root,
                 file_origin,
@@ -31716,27 +31711,27 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 other => other,
             };
             if rest.is_empty() {
-                caught
-            } else {
-                continue_rest_with_context::<W, S>(
+                return caught;
+            }
+            if paired {
+                return continue_rest_with_paths::<W, S>(
                     caught,
                     rest,
                     root,
                     file_origin,
                     current_path,
                     optional,
-                )
+                );
             }
+            continue_rest_with_context::<W, S>(
+                caught,
+                rest,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
-        Expr::Optional(inner) => eval_stage_with_path_context::<W, S>(
-            inner,
-            rest,
-            value,
-            root,
-            file_origin,
-            current_path,
-            true,
-        ),
         // Flatten a nested pipe into this one. A `Pipe` prepends its whole
         // stage list rather than a single stage, so it is the one arm the
         // #1510 borrow cannot serve in general: `[i0..in] ++ rest` is two

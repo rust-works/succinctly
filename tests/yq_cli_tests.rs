@@ -1542,17 +1542,22 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
 /// lives in `eval_pipe_with_path_context_internal`, generic over
 /// `EvalSemantics` and shared verbatim by both modes -- `key` (a jq-mode
 /// path-context builtin) reaches it in yq mode too, once gated open via
-/// `--jq-extensions`. Confirms the same fixed behavior here: the erroring
-/// element (1) stops the traversal and keeps the pre-error prefix, rather
-/// than the pre-fix bug's silent skip-and-continue.
+/// `--jq-extensions`. #2073 then closed the wider gap #1869's own fix was
+/// built on top of (see the jq-mode test's own updated doc comment): an
+/// ambient `?` from an earlier stage no longer threads into `rest`'s
+/// evaluation at all, so the erroring element's error now escapes as an
+/// ordinary hard error instead of being swallowed. The prefix-keeping half
+/// of #1869's fix is unaffected and still holds here: the erroring element
+/// (1) still stops the traversal and keeps the pre-error prefix.
 #[test]
 fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<()> {
-    let (stdout, code) = run_yq_stdin(
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
         "(.a)? | .[] | if key==1 then error(\"boom\") else key end",
         "a:\n  - 1\n  - 2\n  - 3\n",
         &["--jq-extensions", "-o", "json"],
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
     assert_eq!(stdout, "0\n");
     Ok(())
 }
@@ -1582,6 +1587,26 @@ fn test_yq_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "\"a\"");
+
+    Ok(())
+}
+
+/// #2073's own repro, yq-mode twin of jq_cli_tests.rs's own
+/// `test_optional_ambient_no_longer_suppresses_rest_error_2073` -- the fixed
+/// arm lives in `eval_pipe_with_path_context_internal`, generic over
+/// `EvalSemantics` and shared verbatim by both modes. Before the fix this
+/// printed `0` and exited 0, silently suppressing `error("boom")` even
+/// though it is several stages downstream of the `?`, not inside it.
+#[test]
+fn test_yq_optional_ambient_no_longer_suppresses_rest_error_2073() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#".a | (.[])? | (key, error("boom"))"#,
+        "a:\n  - 1\n  - 2\n  - 3\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert_eq!(stdout, "0\n");
 
     Ok(())
 }
@@ -24438,17 +24463,23 @@ fn test_yq_string_interpolation_path_context_control_flow_is_atomic_1403() -> Re
 }
 
 /// `?` wraps only the interpolation, with a downstream `| key` still
-/// needing path context -- flattens through the general `Expr::Optional`
-/// arm's rest-non-empty branch, threading `optional=true` straight into
-/// this yq-only match, exercising its own `if optional` arm directly.
-/// Unlike the jq-mode counterpart
+/// needing path context. Before #2073, this routed through the general
+/// `Expr::Optional` arm's old combined-with-`rest` fallback, threading
+/// `optional=true` straight into this yq-only match's own `if optional`
+/// arm, which returns `QueryResult::None` as the whole match arm's result --
+/// `rest` (the flattened-in `key`) never ran at all, since there is no
+/// separate rest-continuation step here the way `continue_rest_with_fresh_root`
+/// gives the jq-mode path. #2073 removed that fallback: `Expr::Optional` now
+/// isolates the interpolation unconditionally with `optional` forced
+/// `false`, so this yq-only match's second slot (`error("boom")`) now
+/// propagates a genuine `QueryResult::Error` instead of self-swallowing, and
+/// `Expr::Optional`'s own arm catches it structurally one level up -- with
+/// nothing produced to feed into `rest`, `key` still never runs against a
+/// real value. Same empty output either way (confirmed live that the query
+/// below is empty, not `null`, unlike the jq-mode counterpart
 /// (`test_string_interpolation_path_context_fanout_continues_rest_1403`'s
-/// final case, which still runs `| key` against the fanned-out result),
-/// this arm's `if optional` catch returns `QueryResult::None` as the whole
-/// match arm's result -- `rest` (the flattened-in `key`) never runs at
-/// all, since there is no separate rest-continuation step here the way
-/// `continue_rest_with_fresh_root` gives the jq-mode path: confirmed live
-/// that the query below is empty, not `null`.
+/// final case), since yq mode's `StringInterpolation` arm has no
+/// `continue_rest_with_fresh_root`-style path to fall back to.
 #[test]
 fn test_yq_string_interpolation_path_context_optional_threaded_through_rest_1403() -> Result<()> {
     let (output, code) = run_yq_stdin(
