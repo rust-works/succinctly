@@ -22174,6 +22174,54 @@ fn resolve_node<'a, S: EvalSemantics>(
             resolve_leaf::<S>(expr, value, trackable, snapshot, keep)
         }
 
+        // #2234: `stderr`/`debug`/`debug(msg)` are true identity passthroughs
+        // in jq -- their value-mode implementations (`builtin_stderr`/
+        // `builtin_debug`/`builtin_debug_msg` below) all decode-then-return
+        // `value` completely unchanged, side effect aside. Before this arm,
+        // none of the three were recognised here, so they fell through to
+        // `resolve_leaf`'s generic "not one of the four primitives" rejection
+        // and raised jq's own `#530` "Invalid path expression" unconditionally
+        // -- even on a bare `path(. | stderr)`, which real jq answers `[]`
+        // (confirmed live against jq 1.7.1). Perform each builtin's own side
+        // effect here, matching its value-mode counterpart exactly, then
+        // delegate the actual path-tracking to bare `Expr::Identity` -- this
+        // inherits every one of Identity's existing rules (the untracked
+        // bare-`.` passthrough, the four-primitives `is_primitive` branch)
+        // instead of re-deriving them for a fifth and sixth call site.
+        Expr::Builtin(Builtin::Stderr) => {
+            match value {
+                OwnedValue::String(s) => write_stderr(s),
+                other => write_stderr(&owned_value_to_json::<S>(other)),
+            }
+            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+        }
+        Expr::Builtin(Builtin::Debug) => {
+            write_debug_line::<S>(value);
+            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+        }
+        // `debug(msg)`'s own definition is `(msg|debug|empty), .` -- `msg`'s
+        // generator runs for its side effects only, in true per-item order
+        // (mirrors `builtin_debug_msg`'s own doc comment on why an eager
+        // collect would get ordering and partial-output-before-escape both
+        // wrong); the trailing `.` is only reached once `msg` is fully
+        // exhausted without escaping, which is exactly what an `Ok` `Flow`
+        // means here. An escape from `msg` propagates with an empty prefix --
+        // `debug(msg)` itself never produces a real value in that case, so
+        // there is nothing about `expr`'s own passthrough to have resolved
+        // yet (mirrors the identical "nothing built yet, so no prefix to
+        // keep" reasoning `resolve_index_expr`'s own key/target evaluation
+        // escapes already document).
+        Expr::Builtin(Builtin::DebugMsg(msg)) => {
+            let flow = eval_each_owned::<S>(msg, value, false, &mut |msg_value| {
+                write_debug_line::<S>(&msg_value);
+                Demand::Continue
+            });
+            if let Flow::Escaped(control) = flow {
+                return Err((Vec::new(), EvalEscape::from(control)));
+            }
+            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+        }
+
         other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
     }
 }

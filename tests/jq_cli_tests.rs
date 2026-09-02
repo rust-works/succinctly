@@ -31400,16 +31400,50 @@ fn fold_source_side_effect_fires_once_per_output_1872() -> Result<()> {
             "123",
             "one write per output, in order",
         ),
-        (
-            "[1,2,3]",
-            ". as $x | path(foreach (.[] | stderr) as $i (0; $x))",
-            "123",
-            "foreach pulls the same single evaluation",
-        ),
     ] {
         let (_stdout, stderr, _code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(stderr, want, "{why}");
     }
+    Ok(())
+}
+
+/// #1872 sibling, `foreach` rather than `reduce`: real jq's own disposition
+/// for this exact shape genuinely differs between the two -- `reduce` (above)
+/// answers `[]` (its UPDATE, `$x`, stays trackable), but `foreach` raises
+/// `Invalid path expression` on its *first* step instead (jq 1.7.1: `. as $x
+/// | path(foreach (.[] | stderr) as $i (0; $x))` on `[1,2,3]` writes `1` to
+/// stderr, once, then raises -- #2031's "source navigation clobbers the
+/// shared path register" rule makes `$x` untrackable inside a `foreach` step
+/// where it stays trackable inside `reduce`'s single terminal step).
+///
+/// succinctly matches that disposition (raises, no stdout) since #2234 fixed
+/// `stderr`'s own path-trackability -- before that fix, this raised nowhere
+/// at all and instead answered wrongly with `[]` three times, exit 0.
+///
+/// The one remaining divergence from jq is `stderr`'s own write *count*:
+/// `resolve_fold_source`'s `Keep::AtMost(usize::MAX)` (#1467) pulls the whole
+/// navigating source upfront, so all three writes happen before the fold
+/// loop ever inspects the first step's own UPDATE result -- jq's true
+/// demand-driven generator stops pulling the source the moment that first
+/// step fails to track, writing only once. Tracked separately (not #2234's
+/// own scope, which is specifically about stderr/debug's trackability, not
+/// fold-source pull laziness) -- filed as a follow-up.
+#[test]
+fn fold_source_foreach_diverges_from_reduce_on_this_shape_1872() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ". as $x | path(foreach (.[] | stderr) as $i (0; $x))"],
+        Some("[1,2,3]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("123"),
+        "known divergence from jq's own single write -- see this test's doc comment; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression with result"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -32522,5 +32556,72 @@ fn test_range_cap_hit_lookahead_overflow_keeps_exact_i64_answer_2131() -> Result
     let (stdout, code) = run_jq_null("nth(250; range(0;9223372036854775807;92234642714974))", &[])?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim(), (250i64 * 92234642714974).to_string());
+    Ok(())
+}
+
+/// #2234: `stderr`/`debug`/`debug(msg)` are true identity passthroughs in
+/// jq -- `path()` should treat `EXPR | stderr` (etc.) exactly like `EXPR`
+/// itself. Before this fix, all three fell through to `resolve_leaf`'s
+/// generic "not one of the four primitives" rejection and raised jq's own
+/// `Invalid path expression`, even on a bare `path(. | stderr)` where real
+/// jq answers `[]`. Verified against jq 1.7.1.
+#[test]
+fn test_path_stderr_debug_are_identity_passthroughs_2234() -> Result<()> {
+    for (filter, want_stdout, why) in [
+        (
+            "path(. | stderr)",
+            "[]\n",
+            "bare stderr passthrough on the root",
+        ),
+        (
+            "path(. | debug)",
+            "[]\n",
+            "bare debug passthrough on the root",
+        ),
+        (
+            r#"path(. | debug("msg"))"#,
+            "[]\n",
+            "debug(msg) passthrough on the root",
+        ),
+        (
+            "path(.a | stderr)",
+            "[\"a\"]\n",
+            "stderr passthrough after real navigation",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 0, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_stdout, "{why}");
+    }
+    Ok(())
+}
+
+/// #2234 sibling: `debug(msg)`'s own definition is `(msg|debug|empty), .`
+/// -- when `msg` itself errors, the whole `debug(msg)` expression never
+/// reaches its trailing `.`, so `path()` sees no branch at all (an empty
+/// prefix, matching every other bare-escape site in this file). Verified
+/// against jq 1.7.1: both raise the same error, no path output.
+#[test]
+fn test_path_debug_msg_propagates_msg_escape_2234() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(. | debug(error("boom")))"#], Some("[1,2]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2234 sibling: the fix has to work through the write side too
+/// (`resolve_node` backs `path()`/`=`/`|=`/`del()` alike), not just
+/// `path()` itself -- `stderr` inside an update-assignment target used to
+/// raise the same spurious "Invalid path expression" this issue fixes.
+/// Verified against jq 1.7.1.
+#[test]
+fn test_stderr_in_update_assignment_target_2234() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(.a | stderr) |= . + 1"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"a\":2}\n");
+    assert_eq!(stderr, "1");
     Ok(())
 }
