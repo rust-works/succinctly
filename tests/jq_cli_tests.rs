@@ -7621,6 +7621,53 @@ fn test_literal_slice_path_context_resolves_2215() -> Result<()> {
     Ok(())
 }
 
+/// #2215 (found in review of the fix above): `get_value_at_path` -- what
+/// `parent`/`parent(n)` re-derives an ancestor value through -- only
+/// pattern-matched a plain field/index path component, so once the new
+/// `Expr::Slice` arm above started making a slice's `{"start":s,"end":e}`
+/// descriptor a genuinely reachable path component, landing `parent` on one
+/// fell through `get_value_at_path`'s catch-all and fabricated an empty
+/// object instead of re-deriving the real ancestor. `getpath` (which
+/// already understood this descriptor shape before this fix) is the
+/// reference every assertion below cross-checks against.
+#[test]
+fn test_literal_slice_parent_ancestor_resolves_2215() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[0:3] | .[0] | parent"],
+        Some(r#"{"a":["FIRST","SECOND","THIRD","FOURTH"]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["FIRST","SECOND","THIRD"]"#);
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[0:3] | .[0] | parent(1)"],
+        Some(r#"{"a":["FIRST","SECOND","THIRD","FOURTH"]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["FIRST","SECOND","THIRD"]"#);
+
+    // Cross-checked directly against `getpath` on the identical path `path`
+    // already reports for this exact query (the two must never drift, per
+    // CLAUDE.md's "duplicated predicates diverge silently").
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "getpath([\"a\",{\"start\":0,\"end\":3}])"],
+        Some(r#"{"a":["FIRST","SECOND","THIRD","FOURTH"]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["FIRST","SECOND","THIRD"]"#);
+
+    // String targets slice by character, same as the plain (non-ancestor)
+    // read.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[1:5] | .[0:1] | parent"],
+        Some(r#"{"a":"hello world"}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""ello""#);
+
+    Ok(())
+}
+
 /// #1964 (found in review of the `Expr::Limit` path-context fix above, then
 /// fixed by #1964 itself): `eval_pipe_with_path_context_internal`'s
 /// `Expr::Comma` arm routes every branch through this same evaluator,

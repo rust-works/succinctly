@@ -12135,6 +12135,27 @@ fn test_literal_slice_path_context_resolves_yq_2215() -> Result<()> {
 }
 
 /// yq-mode counterpart to `jq_cli_tests.rs`'s
+/// `test_literal_slice_parent_ancestor_resolves_2215` -- `get_value_at_path`
+/// (what `parent` re-derives an ancestor through) lives on the shared,
+/// mode-blind evaluator, so this covers yq's own object-slicing rule
+/// (#1102) specifically: slicing a mapping produces a descriptor over the
+/// object's AST child-node layout, a shape `get_value_at_path` has no
+/// `S: EvalSemantics` parameter to gate on -- see the fix's own comment for
+/// why that's still sound.
+#[test]
+fn test_literal_slice_parent_ancestor_resolves_yq_2215() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".a | .[0:2] | .[0] | parent",
+        "a:\n  x: 1\n  y: 2\n  z: 3\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["x",1]"#);
+
+    Ok(())
+}
+
+/// yq-mode counterpart to `jq_cli_tests.rs`'s
 /// `test_string_interpolation_path_context_builtins_1334`/
 /// `test_func_def_path_context_builtins_1306` -- both new
 /// `needs_path_context`/`eval_pipe_with_path_context_internal` arms
