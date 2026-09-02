@@ -1412,6 +1412,31 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
     Ok(())
 }
 
+/// #2110's jq-mode fix (a zero-arity builtin/literal called with the wrong
+/// arity reports jq's own "X/N is not defined" instead of a raw parser
+/// rejection) must not leak into yq mode: real yq (v4.53.3) has no
+/// name/arity resolution vocabulary at all -- `null(1)` and `length(1)`
+/// both give the identical generic "bad expression, please check
+/// expression syntax" there, verified live. `zero_arity_or_wrong_arity_call`
+/// (`src/jq/parser.rs`) only rewinds in jq mode for exactly this reason, so
+/// yq mode keeps its own pre-#2110 generic parse-error rejection unchanged
+/// -- pinned here against succinctly's own wording (a pre-existing,
+/// separate divergence from real yq's wording, out of scope for #2110).
+#[test]
+fn test_yq_mode_zero_arity_wrong_arity_call_unaffected_by_2110() -> Result<()> {
+    for (filter, position) in [("null(1)", 4), ("length(1)", 6), ("not(1)", 3)] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert!(
+            stderr.contains(&format!(
+                "parse error: parse error at position {position}: unexpected character '('"
+            )),
+            "filter {filter:?} stderr: {stderr}"
+        );
+        assert_eq!(code, 1, "filter {filter:?} stderr: {stderr}");
+    }
+    Ok(())
+}
+
 /// #1512/#1650/#1714: the CLI flag actually reaches the parser --
 /// `--jq-extensions` makes the same filters succeed end to end through the
 /// real `succinctly yq` binary, not just through the parser's own unit

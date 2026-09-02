@@ -18450,6 +18450,73 @@ fn test_if_called_with_args_stays_a_syntax_error_not_arity_error_2110() -> Resul
     Ok(())
 }
 
+/// Round-2 review finding: `null`/`true`/`false`/`not`'s own call sites
+/// initially didn't apply postfix parsing to `zero_arity_or_wrong_arity_call`'s
+/// result the way the sibling builtin call site did, so a wrong-arity call
+/// to one of these four followed by `.field`/`[idx]` regressed to the same
+/// raw "unexpected character" parse error #2110 exists to replace. Verified
+/// against the pinned oracle (`/usr/bin/jq`, jq-1.7.1).
+#[test]
+fn test_zero_arity_wrong_arity_call_still_reports_not_defined_with_postfix_2110() -> Result<()> {
+    for (filter, name) in [
+        ("null(1).foo", "null/1"),
+        ("not(1)[0]", "not/1"),
+        ("true(1).foo", "true/1"),
+        ("false(1)[0]", "false/1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// The same missing-postfix gap the test above pins was not just a wrong
+/// error message but a genuine correctness regression: once `null` is
+/// legitimately redefined at arity 1, `null(1).foo` is a valid call, not a
+/// wrong-arity one -- real jq accepts it and returns the field. Before
+/// `zero_arity_or_wrong_arity_call` applied postfix uniformly, succinctly
+/// failed to parse this at all. Verified against the pinned oracle.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_shadowed_zero_arity_keyword_with_postfix_still_parses_2110() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def null(x): {foo:x}; null(1).foo"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// Round-2 review finding: an explicit, *empty* `()` on a zero-arity
+/// builtin real jq itself already implements (`length`, `not`, `keys`,
+/// ...) must not rewind into a `FuncCall` -- `resolve.rs`'s builtin roster
+/// lists these names at arity 0 for the unrelated `#1473` "builtins jq has
+/// that succinctly doesn't implement" purpose, so a rewound `length()`
+/// would pass compile-time resolution and only fail later with a confusing
+/// runtime "undefined function" error (exit 5) instead of staying the
+/// exit-3 compile-time rejection every other malformed-arity shape in this
+/// file gets. Real jq's own grammar has no zero-argument parenthesized
+/// call shape at all (`def f: 1; f()` is *also* a syntax error there, not
+/// `f/0 is not defined` -- verified live), so this specific shape is left
+/// exactly as the pre-#2110 parser already treated it: a raw parse
+/// rejection, not a name/arity resolution error.
+#[test]
+fn test_zero_arity_builtin_empty_parens_stays_compile_error_2110() -> Result<()> {
+    for filter in ["length()", "not()", "keys()", "null()"] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            !stderr.contains("undefined function"),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.

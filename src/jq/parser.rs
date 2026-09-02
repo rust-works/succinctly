@@ -1450,14 +1450,14 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("break") {
                     self.parse_break_expr()
                 } else if let Some(builtin) = self.try_parse_builtin()? {
-                    // #2110: a following `(` means this was actually a
-                    // wrong-arity call, not a bare builtin reference --
+                    // #2110: a following `(<args>)` means this was actually
+                    // a wrong-arity call, not a bare builtin reference --
                     // `zero_arity_or_wrong_arity_call` rewinds and re-parses
-                    // it as one instead of falling into `parse_postfix`,
-                    // which would just reject the `(` as a stray token.
+                    // it as one instead of falling into postfix parsing,
+                    // which would just reject the `(` as a stray token; it
+                    // also applies postfix itself (e.g. `env.PATH`,
+                    // `keys[0]`) on whichever `Expr` it ends up returning.
                     self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Builtin(builtin))
-                        // Allow postfix operations after builtins (e.g., env.PATH, keys[0])
-                        .and_then(|expr| self.parse_postfix(expr))
                 } else {
                     // Phase 9: Try to parse as function call
                     self.parse_func_call_or_error()
@@ -2277,13 +2277,39 @@ impl<'a> Parser<'a> {
     }
 
     /// A zero-arity keyword (`null`/`true`/`false`/`not`, or anything
-    /// [`try_parse_builtin`] recognizes) immediately followed by `(` is a
-    /// wrong-arity call, not a stray token -- real jq resolves it at compile
-    /// time via name/arity resolution ("`length/1 is not defined`", the same
-    /// class #1473/#2037 already give a genuinely-undefined name), not as a
-    /// raw parser rejection of the `(` (#2110). Whitespace before `(` is
-    /// allowed too, matching real jq (`length (1)` errors identically to
-    /// `length(1)`).
+    /// [`try_parse_builtin`] recognizes) immediately followed by `(<args>)`
+    /// (at least one argument), **in jq mode**, is a wrong-arity call, not a
+    /// stray token -- real jq resolves it at compile time via name/arity
+    /// resolution ("`length/1 is not defined`", the same class #1473/#2037
+    /// already give a genuinely-undefined name), not as a raw parser
+    /// rejection of the `(` (#2110). Whitespace before `(` is allowed too,
+    /// matching real jq (`length (1)` errors identically to `length(1)`).
+    ///
+    /// yq mode never rewinds, regardless of argument count: real yq (v4.53.3)
+    /// has no name/arity resolution vocabulary at all -- confirmed live,
+    /// `null(1)` and `length(1)` both give the identical generic "bad
+    /// expression, please check expression syntax" -- so jq's "X/N is not
+    /// defined" wording would be a *new*, jq-flavored divergence in yq mode,
+    /// not a fix. yq mode keeps the pre-#2110 generic parse-error rejection
+    /// unchanged.
+    ///
+    /// An *empty* `()` is deliberately excluded from the rewind: real jq's
+    /// grammar has no zero-argument parenthesized call shape at all, for
+    /// any name -- confirmed live, `def f: 1; f()` is a syntax error
+    /// ("unexpected ')'") in real jq exactly like `length()`/
+    /// `undefinedname()` are, not a name/arity resolution error. Rewinding
+    /// `length()` the same way as `length(1)` would ask
+    /// [`Self::parse_func_call_or_error`] to answer a question it isn't --
+    /// that function's own empty-arg-list leniency (`FuncCall { args: [] }`)
+    /// exists for the ordinary "just call `foo`" case, not this one, and for
+    /// any name [`resolve.rs`]'s builtin roster tracks at arity 0 for an
+    /// unrelated reason (a real jq builtin succinctly doesn't implement,
+    /// e.g. `cbrt`) it would let compile-time resolution wrongly accept the
+    /// call, deferring the failure to a confusing runtime "undefined
+    /// function" error instead. Leaving `()` alone here restores exactly
+    /// the pre-#2110 behavior (a raw parser rejection of the stray `(`) --
+    /// not a match for jq's own wording, but not a new divergence either,
+    /// and never worse than what `main` already did.
     ///
     /// `start_pos` must be the position *before* the keyword was consumed:
     /// on a hit, this rewinds there and re-parses the same text through
@@ -2297,18 +2323,48 @@ impl<'a> Parser<'a> {
     /// [`try_parse_builtin`] recognizes) -- never from `if`/`try`/`reduce`/
     /// `def`/etc.
     ///
+    /// Postfix (`.field`, `[idx]`) is applied uniformly to whichever `Expr`
+    /// this returns, matching the sibling call site inside
+    /// [`Self::parse_primary_inner`] that already needed it for a bare
+    /// builtin (`env.PATH`) -- earlier revisions of this fix only wrapped
+    /// that one site, which left a wrong-arity `null`/`true`/`false`/`not`
+    /// call followed by postfix syntax (`null(1).foo`) with the *same* raw
+    /// parser rejection this whole function exists to replace, and, worse,
+    /// broke postfix chaining after a legitimately name/arity-*resolved*
+    /// call too (`def null(x): {foo:x}; null(1).foo` must parse -- real jq
+    /// accepts it and returns `1` -- not just fail cleanly).
+    ///
     /// [`try_parse_builtin`]: Self::try_parse_builtin
+    /// [`resolve.rs`]: super::resolve
     fn zero_arity_or_wrong_arity_call(
         &mut self,
         start_pos: usize,
         parsed: Expr,
     ) -> Result<Expr, ParseError> {
+        let after_keyword = self.pos;
         self.skip_ws();
         if self.peek() == Some('(') {
-            self.pos = start_pos;
-            return self.parse_func_call_or_error();
+            let paren_pos = self.pos;
+            self.next();
+            self.skip_ws();
+            let has_arg = self.peek() != Some(')');
+            self.pos = paren_pos;
+            // yq mode: real yq has no name/arity resolution vocabulary at
+            // all -- confirmed live (yq v4.53.3), `null(1)` and `length(1)`
+            // both give the identical generic "bad expression, please
+            // check expression syntax" regardless of name or arity. Real
+            // jq's own "X/N is not defined" wording this rewind produces
+            // would be a *new*, jq-flavored divergence in yq mode, not a
+            // fix -- so only jq mode rewinds; yq mode falls through to the
+            // pre-#2110 generic parse-error rejection below, unchanged.
+            if has_arg && self.mode == ParserMode::Jq {
+                self.pos = start_pos;
+                let call = self.parse_func_call_or_error()?;
+                return self.parse_postfix(call);
+            }
         }
-        Ok(parsed)
+        self.pos = after_keyword;
+        self.parse_postfix(parsed)
     }
 
     /// Try to parse a builtin function.
