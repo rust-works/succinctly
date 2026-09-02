@@ -31447,6 +31447,60 @@ fn test_slice_expr_eval_rs_dispatch_target_reevaluated_per_pair_2143() -> Result
     Ok(())
 }
 
+/// #2143 (review finding, confirmed live against jq 1.7.1): a per-target
+/// slice-application error one level inside the `(s, e)` loop must not
+/// discard values already produced by earlier pairs/targets, the same
+/// "later step's error outranks an earlier already-produced prefix, which
+/// still survives as `Partial`" rule the target-evaluation escape just
+/// above it already follows. Pre-existing gap (present on `main` before
+/// #2143 too, in the sense that a *single* pair's own multi-target list
+/// could already lose an earlier target's output to a later one's error --
+/// #2143's fix to re-evaluate the target per pair is what newly makes an
+/// earlier *pair's* output reachable at this point too), closed as part of
+/// this fix since the new per-pair escape sits directly above it making the
+/// identical claim.
+///
+/// Covers both `Targets` arms: the generator here (`[10,20,30,40,50], 99`)
+/// resolves to `GenericResult::ManyOwned` (a computed, non-navigational
+/// left side), reaching the `Owned` arm; `Borrowed` is covered by
+/// `test_slice_expr_eval_rs_dispatch_target_reevaluated_per_pair_2143`
+/// above, whose `(input)` target reaches it via a document-borrowed value.
+#[test]
+fn test_slice_expr_later_target_error_preserves_earlier_output_2143() -> Result<()> {
+    for (filter, why) in [
+        (
+            "(.[])[(0,1):(2,3)]",
+            "single pair, two targets from `.[]` -- second target (a bare \
+             number) fails to slice after the first (an array) already \
+             succeeded",
+        ),
+        (
+            "0 as $z | ([10,20,30,40,50], 99)[$z:2]",
+            "literal comma-generator target, same shape via a different \
+             AST path",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(
+            &["-c", filter],
+            Some(if filter.starts_with("(.[])") {
+                "[[9,9,9,9],1]"
+            } else {
+                "null"
+            }),
+        )?;
+        assert_eq!(code, 5, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("Cannot index"),
+            "{why} -- stderr: {stderr:?}"
+        );
+        assert!(
+            !stdout.is_empty(),
+            "{why} -- lost the already-produced prefix, stdout: {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
 /// expression, so real jq's single shared path register moves onto `.a`'s
 /// own position as a side effect of evaluating it -- and UPDATE's own

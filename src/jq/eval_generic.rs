@@ -8057,11 +8057,24 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 /// `(s, e)` pair, not once total (verified against jq 1.7.1: `[10,20,30] |
 /// [(stderr)[(0,1):(2,3)]]` writes `[10,20,30]` to stderr four times, once
 /// per pair). `target`'s own escape (`Error`/`Break`/`Halt`/`Partial`) can
-/// now fire after earlier pairs already contributed real output, so it
-/// folds the running `out` in as a `Partial` prefix instead of discarding
-/// it — the "target's own `Partial` arm discards its prefix, unreachable in
-/// practice" note this comment used to carry no longer applies now that the
-/// arm runs inside the loop.
+/// now fire after *earlier pairs* already contributed real output to `out`,
+/// so it folds `out` in as a `Partial` prefix instead of discarding it —
+/// this cross-pair prefix was provably always empty before this fix (`E`
+/// used to be evaluated once, before the loop could produce anything), so
+/// there was nothing to lose by discarding it there; now there can be. The
+/// per-target slice-application escape one level in got the identical
+/// cross-pair fix for the identical reason (review). Left deliberately
+/// unaddressed, matching `eval_index_expr`'s own identical, pre-existing
+/// gap (confirmed live on `main`, not introduced or worsened by this fix):
+/// a `Partial(prefix, control)` result still discards `prefix` itself —
+/// the values `E`'s *own* generator produced before erroring *within* one
+/// (s, e) pair (as opposed to the cross-pair `out` this fix does thread
+/// through) — e.g. `E = ([1,2],[3,4],error("x"))` loses the `[1]`/`[3]`
+/// slices it should still emit before raising `x`. Real fix needs applying
+/// the pair's own slice/index operation to each of `prefix`'s values before
+/// folding them into `out`, not just discarding `prefix`; tracked
+/// separately (issue filed alongside this fix) since it's a pre-existing
+/// gap shared with `eval_index_expr`, not something #2143 introduces.
 fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -8126,24 +8139,47 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // re-evaluated once per (s, e) pair, so it is genuinely the innermost
     // stage, not just looped as if it were). The result is always owned:
     // slicing constructs a fresh array/string, same invariant as
-    // `eval::eval_slice_expr`. Reserved per-pair below rather than as one
-    // upfront `starts.len() * ends.len() * targets.len()` product (#1634's
-    // original concern still applies -- an unguarded product of
-    // generator-controlled lengths can panic/abort on overflow -- but the
-    // target's own length can now vary per pair, so a single upfront
-    // product is no longer computable). This is the actual dispatch path
-    // for an ordinary `.[$s:$e]` CLI read (see the comment on
-    // `Expr::SliceExpr`'s own match arm above), so this site -- not
-    // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
-    // jq`/`succinctly yq` invocation hits.
+    // `eval::eval_slice_expr`. This is the actual dispatch path for an
+    // ordinary `.[$s:$e]` CLI read (see the comment on `Expr::SliceExpr`'s
+    // own match arm above), so this site -- not `eval::eval_slice_expr`'s
+    // sibling -- is what a real `succinctly jq`/`succinctly yq` invocation
+    // hits.
     let mut out: Vec<OwnedValue> = Vec::new();
+
+    // `starts.len() * ends.len()` is still fully known before the loop --
+    // only the per-pair target count varies -- so reserve that much upfront
+    // as a baseline (the common case is exactly one output per pair),
+    // recovering the single upfront allocation the pre-#2143 code made for
+    // that case instead of paying amortized-doubling reallocation/copy
+    // costs on every slice query. An overflowing product just skips the
+    // hint and falls through to the per-pair `try_reserve` calls below,
+    // which still refuse cleanly on their own once actually unallocatable
+    // -- `out` is empty at this point regardless, so there's nothing this
+    // hint could lose by skipping it.
+    if let Some(pairs) = starts.len().checked_mul(ends.len()) {
+        if out.try_reserve(pairs).is_err() {
+            return GenericResult::Error(cannot_reserve_cross_product(&[starts.len(), ends.len()]));
+        }
+    }
+
+    // The shared exit every escape arm below funnels through, so folding
+    // the running `out` in as a `Partial` prefix can't drift between arms
+    // -- the single-accumulator counterpart of `eval_index_expr`'s
+    // `escape_generic!` above (that macro's own cursor/owned promotion has
+    // nothing to do here: `out` is always `Vec<OwnedValue>`, never a
+    // separate cursor accumulator).
+    macro_rules! escape {
+        ($control:expr) => {
+            return partial_generic(out, $control)
+        };
+    }
 
     for s in starts {
         for e in &ends {
             let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
-                GenericResult::Error(e) => return partial_generic(out, Control::Error(e)),
-                GenericResult::Break(label) => return partial_generic(out, Control::Break(label)),
-                GenericResult::Halt(code) => return partial_generic(out, Control::Halt(code)),
+                GenericResult::Error(e) => escape!(Control::Error(e)),
+                GenericResult::Break(label) => escape!(Control::Break(label)),
+                GenericResult::Halt(code) => escape!(Control::Halt(code)),
                 // Zero outputs for *this* (s, e) pair contributes nothing to
                 // it -- not a whole-function short-circuit, now that E's own
                 // output count can vary across pairs (mirrors
@@ -8152,7 +8188,7 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 // Same conservative Error/Break/Halt-only handling as
                 // `eval_index_expr`'s target `Partial` arm, now folding the
                 // running `out` in as the prefix instead of discarding it.
-                GenericResult::Partial(_, control) => return partial_generic(out, control),
+                GenericResult::Partial(_, control) => escape!(control),
                 GenericResult::One(v) => Targets::Borrowed(vec![v]),
                 GenericResult::Many(vs) => Targets::Borrowed(vs),
                 GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
@@ -8168,38 +8204,51 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 | GenericResult::LazyIndexRange(_)
                 | GenericResult::LazySeq(_)) => match owned.collect_owned() {
                     Ok(vs) => Targets::Owned(vs),
-                    Err(err) => return partial_generic(out, Control::Error(err)),
+                    Err(err) => escape!(Control::Error(err)),
                 },
             };
             match &targets {
                 Targets::Borrowed(ts) => {
                     if out.try_reserve(ts.len()).is_err() {
-                        return partial_generic(
-                            out,
-                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
-                        );
+                        escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                     }
                     for t in ts {
                         match slice_one_generic::<S, V>(t.clone(), *s, *e, optional) {
                             GenericResult::Owned(v) => out.push(v),
                             GenericResult::None => {}
-                            GenericResult::Error(e) => return GenericResult::Error(e),
+                            // #2143 (review): a later (s, e) pair's/target's
+                            // slice-application error must not discard the
+                            // values already produced by earlier ones --
+                            // same "later step's error outranks an earlier
+                            // already-produced prefix, which still survives
+                            // as Partial" rule this function's own
+                            // target-evaluation escape above follows,
+                            // mirroring `eval_index_expr`'s identical
+                            // treatment of a later key's index error.
+                            // Pre-existing gap (predates #2143, confirmed
+                            // live against jq 1.7.1: `[1,2,3,4] |
+                            // (.,5)[(1-1):(1+1)]` prints `[1,2]` before
+                            // raising "Cannot index number with object";
+                            // this arm used to discard it), fixed here now
+                            // that it sits directly beneath the
+                            // target-evaluation fix above making the same
+                            // claim.
+                            GenericResult::Error(e) => escape!(Control::Error(e)),
                             _ => unreachable!("slice_one_generic yields Owned/None/Error"),
                         }
                     }
                 }
                 Targets::Owned(ts) => {
                     if out.try_reserve(ts.len()).is_err() {
-                        return partial_generic(
-                            out,
-                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
-                        );
+                        escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                     }
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
-                            Err(e) => return GenericResult::Error(e),
+                            // #2143 (review): same fix as the Borrowed arm
+                            // above.
+                            Err(e) => escape!(Control::Error(e)),
                         }
                     }
                 }

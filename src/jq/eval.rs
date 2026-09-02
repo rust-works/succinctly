@@ -16515,7 +16515,11 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// rather than once overall, mirroring #2032/#2142's identical fix for
 /// `eval_index_expr` one nesting level deeper — see
 /// `eval_generic::eval_slice_expr`'s own copy of this comment for the full
-/// rationale and live-verified repro; not repeated here.
+/// rationale, live-verified repro, and the "cross-pair `out` vs. `target`'s
+/// own within-pair `Partial` prefix" distinction (not repeated here) that
+/// this file's copy folds `out` in for but deliberately still doesn't
+/// address the latter — same pre-existing, unaddressed gap
+/// `eval_index_expr` already carries.
 fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -16564,13 +16568,38 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // The result is always owned: slicing constructs a new array/string
     // (see `eval_single`'s `Expr::Slice` arm), so there is nothing to
     // borrow except its rare whole-value fast paths, which `to_owned_lossy`
-    // below just copies out of. Reserved per-pair below rather than as one
-    // upfront `starts.len() * ends.len() * targets.len()` product (#1634's
-    // original concern still applies -- an unguarded product of
-    // generator-controlled lengths can panic/abort on overflow -- but the
-    // target's own length can now vary per pair, so a single upfront
-    // product is no longer computable).
+    // below just copies out of.
     let mut out: Vec<OwnedValue> = Vec::new();
+
+    // `starts.len() * ends.len()` is still fully known before the loop --
+    // only the per-pair target count varies -- so reserve that much upfront
+    // as a baseline (the common case is exactly one output per pair),
+    // recovering the single upfront allocation the pre-#2143 code made for
+    // that case instead of paying amortized-doubling reallocation/copy
+    // costs on every slice query. `checked_mul` rather than
+    // `try_reserve_product` (which would also fold in a `targets.len()`
+    // this point doesn't have yet): an overflowing product here just skips
+    // the hint and falls through to the per-pair `try_reserve` calls below,
+    // which still refuse cleanly on their own once actually unallocatable
+    // -- `out` is empty at this point regardless, so there's nothing this
+    // hint could lose by skipping it.
+    if let Some(pairs) = starts.len().checked_mul(ends.len()) {
+        if out.try_reserve(pairs).is_err() {
+            return QueryResult::Error(cannot_reserve_cross_product(&[starts.len(), ends.len()]));
+        }
+    }
+
+    // The shared exit every escape arm below funnels through, so folding
+    // the running `out` in as a `Partial` prefix can't drift between arms
+    // -- the single-accumulator counterpart of `eval_index_expr`'s
+    // `escape_with_prefix!` one function above (that macro's own
+    // borrowed/owned promotion has nothing to do here: `out` is always
+    // `Vec<OwnedValue>`, never a separate borrowed accumulator).
+    macro_rules! escape {
+        ($control:expr) => {
+            return partial(out, $control)
+        };
+    }
 
     for s in starts {
         for e in &ends {
@@ -16585,9 +16614,9 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // output count can vary across pairs (mirrors
                 // `eval_index_expr`'s identical per-key treatment).
                 QueryResult::None => continue,
-                QueryResult::Error(err) => return partial(out, Control::Error(err)),
-                QueryResult::Break(label) => return partial(out, Control::Break(label)),
-                QueryResult::Halt(code) => return partial(out, Control::Halt(code)),
+                QueryResult::Error(err) => escape!(Control::Error(err)),
+                QueryResult::Break(label) => escape!(Control::Break(label)),
+                QueryResult::Halt(code) => escape!(Control::Halt(code)),
                 QueryResult::OneCursor(_) => {
                     unreachable!("materialize_cursor should have converted this")
                 }
@@ -16596,15 +16625,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // instead of discarding it (unreachable before this fix,
                 // since `out` was always empty at this point -- E was
                 // evaluated before the loop could produce anything).
-                QueryResult::Partial(_, control) => return partial(out, control),
+                QueryResult::Partial(_, control) => escape!(control),
             };
             match &targets {
                 Targets::Borrowed(ts) => {
                     if out.try_reserve(ts.len()).is_err() {
-                        return partial(
-                            out,
-                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
-                        );
+                        escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                     }
                     let slice_expr = Expr::Slice {
                         start: *s,
@@ -16622,33 +16648,59 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // own finding for `eval_single`'s array arm),
                             // so an undecodable string here used to
                             // silently become `""` instead of raising.
-                            // #2001 (code review): ...or_suppress -- this
-                            // is the computed-bounds sibling of
-                            // `eval_single`'s own literal-bounds `Expr::
-                            // Slice` array arm, which had the identical
-                            // unconditional-raise gap this same PR fixes.
-                            QueryResult::One(v) => {
-                                out.push(to_owned_or_suppress!(&v, optional));
-                            }
+                            // #2001 (code review): suppress-or-raise, not
+                            // an unconditional raise -- this is the
+                            // computed-bounds sibling of `eval_single`'s
+                            // own literal-bounds `Expr::Slice` array arm,
+                            // which had the identical unconditional-raise
+                            // gap this same PR fixed. Not the
+                            // `to_owned_or_suppress!` macro (#2143,
+                            // review): its bare `return` would discard
+                            // `out`'s already-accumulated prefix from
+                            // earlier (s, e) pairs/targets -- inlined here
+                            // so the raise arm can fold `out` in via
+                            // `escape!` instead, same as
+                            // `suppress_or_raise`'s own logic.
+                            QueryResult::One(v) => match to_owned(&v) {
+                                Ok(v) => out.push(v),
+                                Err(err) if suppresses(&err, optional) => {}
+                                Err(err) => escape!(Control::Error(err)),
+                            },
                             QueryResult::Owned(v) => out.push(v),
                             QueryResult::None => {}
-                            QueryResult::Error(e) => return QueryResult::Error(e),
+                            // #2143 (review): a later (s, e) pair's/target's
+                            // slice-application error must not discard the
+                            // values already produced by earlier ones --
+                            // same "later step's error outranks an earlier
+                            // already-produced prefix, which still survives
+                            // as Partial" rule this function's own
+                            // target-evaluation escape above follows,
+                            // mirroring `eval_index_expr`'s identical
+                            // treatment of a later key's index error.
+                            // Pre-existing gap (predates #2143, confirmed
+                            // live against jq 1.7.1: `[1,2,3,4] |
+                            // (.,5)[(1-1):(1+1)]` prints `[1,2]` before
+                            // raising "Cannot index number with object";
+                            // this arm used to discard it), fixed here now
+                            // that it sits directly beneath the
+                            // target-evaluation fix above making the same
+                            // claim.
+                            QueryResult::Error(e) => escape!(Control::Error(e)),
                             _ => unreachable!("Expr::Slice yields only One/Owned/None/Error"),
                         }
                     }
                 }
                 Targets::Owned(ts) => {
                     if out.try_reserve(ts.len()).is_err() {
-                        return partial(
-                            out,
-                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
-                        );
+                        escape!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                     }
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
                             Ok(None) => {}
-                            Err(e) => return e.into(),
+                            // #2143 (review): same fix as the Borrowed arm
+                            // above.
+                            Err(e) => escape!(Control::Error(e)),
                         }
                     }
                 }
