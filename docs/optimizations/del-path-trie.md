@@ -161,6 +161,13 @@ Until it is fixed, the depth-scaled fixture cannot read near-linear however good
 path handling gets — `jq_write_path_del_shared_prefix_width` is the group that answers for
 this change.
 
+**Update: fixed by #2058** — see
+[path-resolution-clone.md](path-resolution-clone.md) for the full write-up. The single
+per-step clone this section describes turned out to be two independent ones (`eval.rs`'s
+`value_after_components`, plus a second, `path()`-only pair in both evaluators' own
+path-array construction), and fixing both drops every exponent in the table above from
+~1.8-1.95 to ~1.0 on both `nodes.yaml` targets.
+
 ## Lessons
 
 - **Three superlinear-in-depth terms on one path all fit "hold the count fixed, vary the

@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`path()`/`=`/`del()` no longer re-clone an owned subtree at every step of a static
+  `Field`/`Index` chain** (#2058), fixing the O(d²) that #1690's own depth-scaled acceptance
+  benchmark (`jq_write_path_del_shared_prefix_depth`) flagged as still binding its exponent to
+  ~1.6. Holding branch count fixed at two and scaling only depth `D`, `path()`/`=`/`del()` all
+  read an exponent of ~1.8-1.95 — two independent per-step clone sites, found and fixed
+  together:
+
+  - `src/jq/eval.rs`'s `value_after_components` (`resolve_seq`'s shared static-tail
+    resolver, reached by all three builtins once a top-level `Comma` routes through
+    `resolve_node`) cloned the *entire remaining value* at every navigation step
+    (`eval_owned_fast_path`'s `Field`/`Index` arms already skip the JSON reindex round trip
+    for these two shapes, but still `.cloned()` the matched child's whole subtree — O(d−i) at
+    step `i`, summing to O(d²)). It now takes its value by move and navigates *destructively*
+    via a new `navigate_static_component`: `IndexMap::swap_remove`/`Vec::swap_remove` pull the
+    one matched child out by move instead of cloning it, since the parent container is never
+    read again once this function has stepped past it — the caller pays exactly one `.clone()`
+    at the boundary (unavoidable; it never owns the document it's handed), everything after
+    that is a move. `Expr::Slice`/`Expr::Optional`-wrapped components are unaffected — neither
+    was on the fast path to begin with.
+  - `path()` alone kept a growing exponent even with the above fixed, traced to a *second*
+    site present independently in **both** of this crate's evaluators: `src/jq/eval.rs`'s
+    `walk_path`/`walk_pipe`/`step_into` and `src/jq/eval_generic.rs`'s `path_walk_generic`/
+    `path_step_generic` (the #2061 cursor-native fast path the CLI's own `path()` dispatch
+    actually uses for this shape) both rebuilt the *reported* path (`["c","c",...,0]`) with a
+    `path.to_vec()`-then-push per step — another O(d²). `eval_generic.rs`'s copy compounded
+    this with a second, independent clone: its `Expr::Pipe` handling split one component off
+    at a time and rewrapped the remainder in a fresh, owned `Expr::Pipe(rest.to_vec())` just to
+    recurse, the identical AST-clone-per-stage shape #1510 already fixed in `eval.rs`'s own
+    path-context evaluator, but not (until now) in `eval_generic.rs`'s independent copy. Fixed
+    by a new `PathTrail` (`eval.rs`, shared by both evaluators) — `PathPrefix`'s twin for
+    `path()`'s own value-typed components, an `Rc`-linked cons-list with O(1) `extend` and one
+    O(depth) `to_vec` paid once per branch — plus two new slice-based helpers
+    (`path_walk_pipe_generic`, `path_step_pipe_generic`) that recurse on a borrowed `&[Expr]`
+    instead of rebuilding an owned `Expr::Pipe`.
+
+  Measured via interleaved CLI A/B (`succinctly jq`, 200-document stream per invocation, 5
+  reps alternating before/after order, both `nodes.yaml` targets idle): every exponent over
+  the last depth-doubling (D=120→240) drops from ~1.88-1.98 to ~0.95-1.02 on both an Apple M4
+  Pro and an AMD Ryzen 9 7950X, for `path()`, `=` and `del()` alike. Speedups at D=240 range
+  5.8x (`del()`, x86) to 19.9x (`path()`, x86). No behavior change: 2320 systematic
+  before/after CLI cases (varying depth, container type, missing keys, out-of-range indices,
+  slices, `?`-optional siblings, both jq and yq mode) plus the pinned-oracle differential
+  suite (`/usr/bin/jq` 1.7.1, Homebrew `yq` v4.53.3) are byte-for-byte identical to the
+  pre-fix binary. New regression fixture:
+  `jq_write_path_two_branch_{path,assign,del}_depth` in `benches/jq_write_path_bench.rs`
+  (fixed two-branch comma, depth-only scaling, unlike the existing
+  `jq_write_path_del_shared_prefix_depth` group which scales branch count and depth together
+  and so cannot isolate this term). See
+  [docs/optimizations/path-resolution-clone.md](docs/optimizations/path-resolution-clone.md)
+  for the full write-up.
+
 - **`Expr::Index` and `Expr::Slice` now carry their own float-spelling keys** (#1401),
   replacing the separate `Expr::IndexNumber`/`Expr::SliceNumber` variants that #1088 and
   #1326 added beside them. `Expr::Index(i64)` is now

@@ -20618,6 +20618,79 @@ impl PathPrefix {
     }
 }
 
+/// [`PathPrefix`]'s twin for `path()`'s own *value*-typed trail — the
+/// resolved key components a `path()` call actually reports (`OwnedValue`:
+/// `"c"`, `0`, `{"start":1,"end":2}`, ...), as opposed to `PathPrefix`'s
+/// `Expr` components (the still-to-be-applied filter). Same mechanism, same
+/// reason (#2058): `walk_path`/`walk_pipe`/`step_into` used to carry
+/// `current_path: &[OwnedValue]` and rebuild it with `current_path.to_vec()`
+/// then `.push(component)` at every single navigation step, an O(depth)
+/// clone of the whole trail so far, summed over a `d`-deep chain's `d`
+/// steps, for O(d^2) overall. Threading an `Rc`-linked chain instead makes
+/// every step an O(1) `extend` (one allocation, one refcount bump);
+/// [`Self::to_vec`] is the one O(depth) flatten, paid exactly once per
+/// branch when it is finally pushed as a completed `path()` output, never
+/// once per step along the way.
+///
+/// `pub(crate)`: `eval_generic.rs`'s own `path_walk_generic`/`path_step_
+/// generic` (the CLI's actual `path()` dispatch for the common
+/// cursor-navigable shapes, #2061) had the identical `path.to_vec()`-and-push
+/// pattern and shares this same type rather than duplicating it.
+pub(crate) enum PathTrail {
+    /// The empty trail — `path(.)`, or the start of a fresh walk.
+    Root,
+    Node {
+        parent: Rc<Self>,
+        component: OwnedValue,
+    },
+}
+
+impl PathTrail {
+    /// A fresh, empty trail. Like [`PathPrefix::root`], not a shared
+    /// singleton — re-allocating one `Root` per walk is O(1) regardless, and
+    /// this crate stays `no_std`-compatible with no `thread_local`-style
+    /// sharing available.
+    pub(crate) fn root() -> Rc<Self> {
+        Rc::new(Self::Root)
+    }
+
+    /// O(1): one `Rc::clone` (refcount bump) plus one new allocation.
+    pub(crate) fn extend(parent: &Rc<Self>, component: OwnedValue) -> Rc<Self> {
+        Rc::new(Self::Node {
+            parent: Rc::clone(parent),
+            component,
+        })
+    }
+
+    /// Build a fresh trail from an already-flat `&[OwnedValue]` -- an O(depth)
+    /// bridge for a caller that still carries its own path as a plain `Vec`
+    /// (`eval_generic.rs`'s `PathContextPos`, whose `key`/`parent`/
+    /// `file_index` machinery is out of scope for #2058 and left unchanged),
+    /// so it can still call into the shared, `PathTrail`-based step helpers.
+    /// Same cost as that caller's own pre-existing per-call flatten -- not an
+    /// improvement there, but not a regression either.
+    pub(crate) fn from_slice(components: &[OwnedValue]) -> Rc<Self> {
+        components.iter().fold(Self::root(), |acc, component| {
+            Self::extend(&acc, component.clone())
+        })
+    }
+
+    /// The one O(depth) operation: flatten the chain into an owned
+    /// `Vec<OwnedValue>`, root-to-leaf order. Paid once per branch, only
+    /// where a flat path is actually required (i.e. when it becomes one
+    /// `path()` output).
+    pub(crate) fn to_vec(&self) -> Vec<OwnedValue> {
+        let mut out = Vec::new();
+        let mut cur = self;
+        while let Self::Node { parent, component } = cur {
+            out.push(component.clone());
+            cur = parent;
+        }
+        out.reverse();
+        out
+    }
+}
+
 /// One resolved branch: the static path components reaching it, and the value
 /// found there (needed to resolve any computed key further along the chain).
 ///
@@ -25104,29 +25177,31 @@ fn resolve_slice_bound<S: EvalSemantics>(
 /// A component with no single output stops the walk at null: null accepts every
 /// key kind that can index anything at all, so a later key still resolves
 /// instead of erroring against a container it never actually saw.
+///
+/// **Takes `value` by value, and that is load-bearing (#2058).** Each step
+/// below navigates *destructively* -- swapping the matched child out of its
+/// parent container and letting the untouched remainder drop -- rather than
+/// cloning the parent's whole remaining subtree just to read one field out of
+/// it. `OwnedValue`'s derived `Clone` is a deep clone, so the old
+/// `value.clone()`-per-step version cost, for a `d`-deep chain, O(d) at step
+/// 1, O(d-1) at step 2, ... summing to O(d^2) -- exactly the shape #1690's own
+/// depth-scaled acceptance benchmark kept reading an exponent near 2 under,
+/// even after #1690 itself removed a *different* O(d^2) one level up (see
+/// docs/optimizations/del-path-trie.md and this function's issue, #2058).
+/// Every container `current` holds at each step is exclusively owned by this
+/// call -- `resolve_static_tail`, the only caller, always hands in a fresh
+/// `.clone()` of its own borrowed input (see its call site) -- so nothing
+/// else can observe a container after this function has navigated past it,
+/// and consuming it here is safe. See [`navigate_static_component`] for the
+/// per-step logic.
 fn value_after_components<S: EvalSemantics>(
     components: &[Expr],
-    value: &OwnedValue,
+    value: OwnedValue,
 ) -> Result<Option<OwnedValue>, EvalEscape> {
-    let mut current = value.clone();
+    let mut current = value;
     for component in components {
-        let mut values = eval_owned_multi::<S>(component, &current)?;
-        // Every caller hands this a tail already proven single-valued by
-        // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
-        // `> 1` output count here is a genuine invariant violation, not the
-        // ordinary "component matched nothing" case handled below (a
-        // missing key still yields exactly one output, `null`). #682 was
-        // exactly this: `Expr::Iterate` produced more than one output
-        // through this function, which silently discarded every branch but
-        // one instead of the fan-out its caller actually needed.
-        debug_assert!(
-            values.len() <= 1,
-            "value_after_components: {component:?} produced {} outputs, but every \
-             caller requires a single-valued tail (see needs_fanout_pass)",
-            values.len()
-        );
-        match values.len() {
-            1 => current = values.pop().expect("len checked"),
+        current = match navigate_static_component::<S>(component, current)? {
+            Some(next) => next,
             // Zero outputs here can only come from a `?`-suppressed step
             // that failed to navigate (#2124): every component reaching
             // this loop is a bare `Field`/`Index`/`Slice`-family step
@@ -25144,10 +25219,98 @@ fn value_after_components<S: EvalSemantics>(
             // with a failing navigation as a no-write once it has a
             // surviving sibling (`path()`/`del()` were already correct
             // here via other means -- #2049/#2108).
-            _ => return Ok(None),
-        }
+            None => return Ok(None),
+        };
     }
     Ok(Some(current))
+}
+
+/// One step of [`value_after_components`]'s walk (#2058).
+///
+/// A bare [`Expr::Field`]/[`Expr::Index`] -- the overwhelmingly common shape
+/// in a static tail (`.c.c.c...c[0]`) -- is handled here directly and
+/// destructively, mirroring [`eval_owned_fast_path`]'s own arms for those two
+/// (kept in sync deliberately: same missing-key/out-of-bounds ->
+/// `OwnedValue::Null` rule, same error types/messages for a non-indexable
+/// container) but consuming `current` instead of borrowing it.
+/// [`IndexMap::swap_remove`]/[`Vec::swap_remove`] -- not the order-preserving
+/// `shift_remove`/`Vec::remove` -- are what make this O(1) instead of O(n),
+/// and are safe here specifically because the container being consumed is
+/// *never read again*: every sibling still inside it is simply dropped, in
+/// whatever order swap-removal leaves them, the moment this function
+/// returns. (A container whose remaining order or contents an *other* live
+/// reference could still observe would need the order-preserving removal
+/// instead -- this one has no such reference; see `value_after_components`'s
+/// own doc comment for why.)
+///
+/// Anything else -- [`Expr::Slice`] (jq's own array slice keeps the sliced
+/// sub-range regardless, so there is no equivalent "don't clone the sibling"
+/// move available, and it was never on [`eval_owned_fast_path`]'s fast path to
+/// begin with -- every static-tail `Slice` step already paid a full
+/// `to_json_for_reindex` + reparse round trip before this change and still
+/// does, a separate, pre-existing cost this fix does not touch),
+/// [`Expr::Optional`] (ditto: [`eval_owned_multi_keep_partial`], the only
+/// caller feeding this loop, always evaluates with `optional: false`
+/// regardless of whether `component` is `Optional`-wrapped, so a wrapped
+/// component was already falling through [`eval_owned_fast_path`]'s `_ =>
+/// None` arm to the reindex bridge before this change too), or anything
+/// unforeseen -- falls back to the pre-#2058 clone-and-reevaluate path
+/// unchanged, at the cost of one clone for that single step only.
+fn navigate_static_component<S: EvalSemantics>(
+    component: &Expr,
+    current: OwnedValue,
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    match component {
+        Expr::Field(name) => Ok(Some(match current {
+            OwnedValue::Object(mut map) => map.swap_remove(name).unwrap_or(OwnedValue::Null),
+            OwnedValue::Null => OwnedValue::Null,
+            other => {
+                return Err(
+                    EvalError::cannot_index_with_field(owned_type_name(&other), name).into(),
+                );
+            }
+        })),
+        Expr::Index { idx, .. } => Ok(Some(match current {
+            OwnedValue::Array(mut items) => {
+                let resolved = if *idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                usize::try_from(resolved)
+                    .ok()
+                    .filter(|&i| i < items.len())
+                    .map_or(OwnedValue::Null, |i| items.swap_remove(i))
+            }
+            OwnedValue::Null => OwnedValue::Null,
+            other => {
+                return Err(
+                    EvalError::cannot_index_with_type(owned_type_name(&other), "number").into(),
+                );
+            }
+        })),
+        _ => {
+            let mut values = eval_owned_multi::<S>(component, &current)?;
+            // Every caller hands this a tail already proven single-valued by
+            // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
+            // `> 1` output count here is a genuine invariant violation, not
+            // the ordinary "component matched nothing" case (a missing key
+            // still yields exactly one output, `null`). #682 was exactly
+            // this: `Expr::Iterate` produced more than one output through
+            // this function, which silently discarded every branch but one
+            // instead of the fan-out its caller actually needed.
+            debug_assert!(
+                values.len() <= 1,
+                "value_after_components: {component:?} produced {} outputs, but every \
+                 caller requires a single-valued tail (see needs_fanout_pass)",
+                values.len()
+            );
+            Ok(match values.len() {
+                1 => Some(values.pop().expect("len checked")),
+                _ => None,
+            })
+        }
+    }
 }
 
 /// [`value_after_components`], except when `trackable` is false (#843): then
@@ -25181,7 +25344,13 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
         };
         return Err((Vec::new(), error.into()));
     }
-    value_after_components::<S>(components, value).map_err(|e| (Vec::new(), e))
+    // The one clone `value_after_components` needs -- its own body now
+    // navigates the clone destructively instead of re-cloning at every step
+    // (#2058) -- so this keeps the pre-#2058 total cost at this boundary
+    // identical (`value` is always borrowed here, from a caller that cannot
+    // hand ownership over) while removing the O(d^2) that used to live
+    // inside the loop.
+    value_after_components::<S>(components, value.clone()).map_err(|e| (Vec::new(), e))
 }
 
 /// Apply a purely-static path tail to every branch, extending each branch's
@@ -32723,20 +32892,29 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
 
     let mut reached = Vec::new();
     let mut walk_error = None;
+    let root = PathTrail::root();
     for expr in &exprs {
         // A later walk-time failure (an unindexable step reached only once
         // the expression is concretely walked) needs the same treatment:
         // whatever earlier resolved expressions already streamed into
         // `reached` survives, and only this one stops the walk.
-        if let Err(e) = walk_path::<S>(expr, owned, &[], &mut reached, optional) {
+        // One clone of the whole document per resolved branch (#2058) --
+        // `walk_path`/`walk_pipe`/`step_into` below take their value by move
+        // and navigate destructively, so this is the only clone this branch
+        // pays, however deep it walks. `owned` is shared across every branch
+        // in `exprs` (each needs its own independent walk from the document
+        // root), so it cannot be moved in directly here.
+        if let Err(e) = walk_path::<S>(expr, owned.clone(), &root, &mut reached, optional) {
             walk_error = Some(e);
             break;
         }
     }
 
+    // `PathTrail::to_vec` is the one O(depth) flatten, paid exactly once per
+    // reached branch here -- never per navigation step (#2058).
     let paths: Vec<OwnedValue> = reached
         .into_iter()
-        .map(|(path, _)| OwnedValue::Array(path))
+        .map(|(path, _)| OwnedValue::Array(path.to_vec()))
         .collect();
 
     if let Some(e) = walk_error.or(resolve_error) {
@@ -32774,16 +32952,33 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
 /// One walker, not one per position: the last step of a path and the steps
 /// before it obey the same rules, and keeping two copies of them is what let
 /// `path(.b.c)` lose the path that `path(.b)` kept (#489).
+///
+/// **Takes `value` by value, and consumes it destructively, for the same
+/// reason [`value_after_components`] does (#2058).** `builtin_path_on_owned`
+/// clones the document once per resolved branch at this function's one call
+/// site -- everything below navigates that clone by move, so a `d`-deep
+/// chain costs O(d) per branch instead of the O(d^2) a `.clone()` at every
+/// step used to cost (step `i` used to clone the whole remaining O(d-i)-sized
+/// subtree just to read one field out of it). This mirrors
+/// `value_after_components`'s own fix one level up: that one flattened
+/// `resolve_seq`'s pre-pass (which every one of `path()`/`=`/`del()` runs to
+/// turn a computed key into a resolved component list), while this one
+/// flattens `path()`'s *own* second walk over that resolved list -- the
+/// reason `path()` alone still read the full O(d^2) exponent even after the
+/// pre-pass was fixed, since `=`/`del()` never reach this function at all.
 fn walk_path<S: EvalSemantics>(
     expr: &Expr,
-    value: &OwnedValue,
-    current_path: &[OwnedValue],
-    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
+    value: OwnedValue,
+    current_path: &Rc<PathTrail>,
+    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
     match expr {
-        // The path already reaching here, named as it stands.
-        Expr::Identity => out.push((current_path.to_vec(), value.clone())),
+        // The path already reaching here, named as it stands. `value` moves
+        // straight into `out`, and `current_path` is a cheap `Rc::clone`
+        // (refcount bump) -- the terminal case pays no O(depth) clone at all
+        // (#2058; see `PathTrail`'s own doc comment).
+        Expr::Identity => out.push((Rc::clone(current_path), value)),
 
         // One component each, written as the step was written rather than as
         // it resolves: jq keeps `path(.[-1])` as `[-1]` and `path(.[1:2])` as
@@ -32828,22 +33023,27 @@ fn walk_path<S: EvalSemantics>(
         // The one step whose components come from the *value* rather than the
         // expression, so it reads them off the container directly. Anything
         // that is not a container still takes the evaluator's verdict, which
-        // is jq's `Cannot iterate over <t> (<v>)`.
+        // is jq's `Cannot iterate over <t> (<v>)`. `value` is owned, so each
+        // element/entry moves into `out` directly rather than being cloned,
+        // and each element's own trail extension is O(1) (`PathTrail::extend`).
         Expr::Iterate => match value {
             OwnedValue::Array(arr) => {
-                for (i, val) in arr.iter().enumerate() {
-                    out.push((extend(current_path, OwnedValue::Int(i as i64)), val.clone()));
+                for (i, val) in arr.into_iter().enumerate() {
+                    out.push((
+                        PathTrail::extend(current_path, OwnedValue::Int(i as i64)),
+                        val,
+                    ));
                 }
             }
             OwnedValue::Object(entries) => {
                 for (key, val) in entries {
                     out.push((
-                        extend(current_path, OwnedValue::String(key.clone())),
-                        val.clone(),
+                        PathTrail::extend(current_path, OwnedValue::String(key)),
+                        val,
                     ));
                 }
             }
-            other => match eval_owned_multi::<S>(expr, other) {
+            other => match eval_owned_multi::<S>(expr, &other) {
                 Ok(_) => {}
                 // `?` silences only the genuine indexing error; a halt
                 // raised while producing the verdict still escapes (#791).
@@ -32869,24 +33069,35 @@ fn walk_path<S: EvalSemantics>(
         // Expressions with no path-tracking arm — `..`, `recurse`, `select`,
         // arithmetic — name no path (#483). `builtin_path` renders that as no
         // output, which is still the wrong answer but no longer a path that
-        // resolves.
+        // resolves. `value` is simply dropped here, same as it was before
+        // this function took it by value instead of by reference.
         _ => {}
     }
     Ok(())
 }
 
 /// Walk a pipe of path steps, threading each value reached into the next step.
+///
+/// `value` moves stage to stage -- see [`walk_path`]'s own doc comment for why
+/// that is the point of this whole rewrite (#2058): a straight-line chain of
+/// `Field`/`Index` stages now passes exactly one value along by move, never
+/// cloning the remaining document at any intermediate stage. `current_path`
+/// is an `Rc<PathTrail>` for the identical reason one level up: `rest` is
+/// already a borrowed `&[Expr]` slice here (no AST clone needed to recurse,
+/// unlike `eval_generic.rs`'s twin of this function, which has to rebuild an
+/// owned `Expr::Pipe` at each stage because its own per-step helper only
+/// takes a single `&Expr` -- see that function's own doc comment).
 fn walk_pipe<S: EvalSemantics>(
     exprs: &[Expr],
-    value: &OwnedValue,
-    current_path: &[OwnedValue],
-    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
+    value: OwnedValue,
+    current_path: &Rc<PathTrail>,
+    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
     let Some((first, rest)) = exprs.split_first() else {
         // An empty pipe reaches nothing new, so it names the path handed to
         // it — `path(())` is `[]`, as `path(.)` is.
-        out.push((current_path.to_vec(), value.clone()));
+        out.push((Rc::clone(current_path), value));
         return Ok(());
     };
     if rest.is_empty() {
@@ -32896,7 +33107,7 @@ fn walk_pipe<S: EvalSemantics>(
     let mut reached = Vec::new();
     walk_path::<S>(first, value, current_path, &mut reached, optional)?;
     for (path, val) in reached {
-        walk_pipe::<S>(rest, &val, &path, out, optional)?;
+        walk_pipe::<S>(rest, val, &path, out, optional)?;
     }
     Ok(())
 }
@@ -32904,37 +33115,31 @@ fn walk_pipe<S: EvalSemantics>(
 /// Take one path step: `component` names it, and the value evaluator decides
 /// both what it reaches and whether it may be taken at all.
 ///
-/// Asking the evaluator rather than re-deciding here is the point — see
-/// [`walk_path`]. `Err` is suppressed into no output under `?`, which is all
-/// `?` means on a path step.
+/// Delegates the actual navigation to [`navigate_static_component`] -- the
+/// same destructive, move-based step [`value_after_components`] uses (#2058)
+/// -- rather than a second copy of jq's indexing rules here. `Err` is
+/// suppressed into no output under `?`, which is all `?` means on a path
+/// step.
 fn step_into<S: EvalSemantics>(
     step: &Expr,
     component: OwnedValue,
-    value: &OwnedValue,
-    current_path: &[OwnedValue],
-    out: &mut Vec<(Vec<OwnedValue>, OwnedValue)>,
+    value: OwnedValue,
+    current_path: &Rc<PathTrail>,
+    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
-    let values = match eval_owned_multi::<S>(step, value) {
-        Ok(values) => values,
+    let reached = match navigate_static_component::<S>(step, value) {
+        Ok(reached) => reached,
         // `?` turns only a genuine step error into no output; a halt raised
         // by the step still escapes (#791).
         Err(EvalEscape::Error(_)) if optional => return Ok(()),
         Err(escape) => return Err(escape),
     };
-    debug_assert!(values.len() <= 1, "one path step reaches at most one value");
-    let Some(reached) = values.into_iter().next() else {
+    let Some(reached) = reached else {
         return Ok(());
     };
-    out.push((extend(current_path, component), reached));
+    out.push((PathTrail::extend(current_path, component), reached));
     Ok(())
-}
-
-/// `current_path` with one more component on the end.
-fn extend(current_path: &[OwnedValue], component: OwnedValue) -> Vec<OwnedValue> {
-    let mut path = current_path.to_vec();
-    path.push(component);
-    path
 }
 
 /// Helper to collect all paths recursively.
@@ -68432,8 +68637,8 @@ mod tests {
             let mut reached = Vec::new();
             let _ = walk_path::<JqSemantics>(
                 &unresolved(),
-                &OwnedValue::Null,
-                &[],
+                OwnedValue::Null,
+                &PathTrail::root(),
                 &mut reached,
                 false,
             );
@@ -68447,7 +68652,13 @@ mod tests {
         fn test_path_tracking_refuses_an_unresolved_key_mid_pipe() {
             let mut reached = Vec::new();
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
-            let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
+            let _ = walk_path::<JqSemantics>(
+                &pipe,
+                OwnedValue::Null,
+                &PathTrail::root(),
+                &mut reached,
+                false,
+            );
         }
     }
 
@@ -68538,8 +68749,8 @@ mod tests {
             let mut reached = Vec::new();
             let _ = walk_path::<JqSemantics>(
                 &unresolved(),
-                &OwnedValue::Null,
-                &[],
+                OwnedValue::Null,
+                &PathTrail::root(),
                 &mut reached,
                 false,
             );
@@ -68552,7 +68763,13 @@ mod tests {
         fn test_path_tracking_refuses_an_unresolved_slice_mid_pipe() {
             let mut reached = Vec::new();
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
-            let _ = walk_path::<JqSemantics>(&pipe, &OwnedValue::Null, &[], &mut reached, false);
+            let _ = walk_path::<JqSemantics>(
+                &pipe,
+                OwnedValue::Null,
+                &PathTrail::root(),
+                &mut reached,
+                false,
+            );
         }
     }
 
