@@ -2120,6 +2120,40 @@ mod tests {
         );
     }
 
+    /// Same invariant as [`test_bound_body_is_invisible_to_eq_and_debug_1371`],
+    /// for [`FuncDefBound`] (#2094) -- and additionally covers that a
+    /// *depth-mismatched* cache entry is just as invisible as an empty one,
+    /// since `FuncDefBound` (unlike `BoundBody`) can hold a populated-but-
+    /// stale entry rather than only empty-or-fresh.
+    #[test]
+    fn test_func_def_bound_is_invisible_to_eq_and_debug_2094() {
+        let def = |bound| Expr::FuncDef {
+            name: "f".into(),
+            params: Vec::new(),
+            body: Box::new(Expr::Identity),
+            then: Box::new(Expr::Identity),
+            bound,
+        };
+        let cold = def(FuncDefBound::default());
+
+        let warm_bound = FuncDefBound::default();
+        let _ = warm_bound.get_or_init_at(0, || Rc::new(Expr::Identity));
+        let warm = def(warm_bound);
+
+        let stale_bound = FuncDefBound::default();
+        let _ = stale_bound.get_or_init_at(99, || Rc::new(Expr::Identity));
+        let stale = def(stale_bound);
+
+        for (label, other) in [("warm", &warm), ("stale", &stale)] {
+            assert_eq!(cold, *other, "the cache must not affect equality ({label})");
+            assert_eq!(
+                format!("{cold:?}"),
+                format!("{other:?}"),
+                "the cache must not affect Debug output ({label})"
+            );
+        }
+    }
+
     /// Helper: `Vec<String>` from string literals, without repeating the
     /// `to_string` dance at each call site.
     fn alloc_vec<const N: usize>(names: [&str; N]) -> Vec<String> {
