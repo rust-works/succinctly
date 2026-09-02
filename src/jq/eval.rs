@@ -43796,6 +43796,38 @@ mod tests {
         }
     }
 
+    /// #2015 code review: `test_builtin_upper_in_respects_optional_for_malformed_member_error_2015`
+    /// above exercises only the *first* of `builtin_upper_in`'s two
+    /// `optional`-wiring points -- its malformed root `value` makes
+    /// `to_owned_checked_or_suppress!` return before `s` (the identity
+    /// expression there) is ever evaluated by `eval_each_owned`, so a
+    /// revert of that second call's `optional` argument back to hardcoded
+    /// `false` still passes every `_2015` test above (verified by hand:
+    /// reverting it and rerunning `cargo test --lib
+    /// jq::eval::tests::test_builtin_upper_in` leaves all of them green).
+    /// This test instead gives `s` itself a reason to error independent of
+    /// `value`'s own decodability -- a decodable root (`5`, a number) fed
+    /// through `s = .foo` (`Expr::Field`), which unconditionally errors
+    /// ("Cannot index number with string \"foo\"") on a non-object/null
+    /// target -- so it can only be suppressed if `eval_each_owned`'s own
+    /// `optional` argument is the real ambient one, not a hardcoded
+    /// `false`.
+    #[test]
+    fn test_builtin_upper_in_respects_optional_for_type_mismatch_inside_s_2015() {
+        let json_bytes: &[u8] = b"5";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let s_expr = Expr::field("foo");
+        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), true) {
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+            other => panic!("expected Bool(false) (suppressed), got {other:?}"),
+        }
+        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     /// #2015: a genuine decode failure must still survive `optional` here
     /// too -- `IN(s)`'s fix routes through `to_owned_checked_or_suppress!`,
     /// which (like every other site sharing that macro) never suppresses
