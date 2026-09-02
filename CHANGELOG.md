@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rejecting `select(...)` after a generator builtin (`paths`, `range`, ...)
+  no longer swallows a surviving branch's own path-validity check** (#2050).
+  Inside a path expression, when `select(...)` rejected at least one branch a
+  *generator builtin* produced, the branches that survived stopped having
+  their path-validity checked at all:
+
+  ```console
+  $ echo '{"a":{"b":1}}' | jq -c '[path(paths | select(length == 2) | .["a"])]'
+  jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of ["a","b"]
+
+  $ echo '{"a":{"b":1}}' | succinctly jq -c '[path(paths | select(length == 2) | .["a"])]'
+  [] # before this fix
+  ```
+
+  and, the shape a randomised differential fuzzer actually found while
+  working #1690 (PR #2047):
+
+  ```console
+  $ echo '{"a":{"b":1}}' | jq -c 'del(paths | select(length == 2) as $p | getpath($p))'
+  jq: error (at <stdin>:1): Cannot index array with string "a"
+
+  $ echo '{"a":{"b":1}}' | succinctly jq -c 'del(paths | select(length == 2) as $p | getpath($p))'
+  {"a":{"b":1}} # silent no-op, before this fix
+  ```
+
+  Root cause: `resolve_seq`'s multi-stage fan-out loop threaded the whole
+  call's own terminal `keep` (`Keep::First`, #987's "stop a generator after
+  its first output" rule) into **every** stage of the pipe, not just the
+  genuinely terminal one. A bare generator builtin like `paths` has no
+  dedicated `resolve_node` arm, so it falls to `resolve_leaf`'s general,
+  `keep`-obeying case — and got truncated to its *first* output (`["a"]`)
+  before `select(length == 2)` ever ran, discarding the second output
+  (`["a","b"]`) that `select` would have let through. `resolve_fold_source`
+  had already established the fix for its own "needs every output" case
+  (`Keep::AtMost(usize::MAX)` in place of `Keep::First`, #1872); `resolve_seq`
+  now applies that same widened `keep` to every stage except the pipe's own
+  final one (only reached when a later stage or a non-empty static tail
+  isn't still waiting to run), which is the one position the caller's actual
+  demand still applies to.
+
+  Confirmed live against jq 1.7.1 that this generalizes beyond `paths`:
+  `path(range(3) | select(.==2))` raises "Invalid path expression with result
+  2" (the candidate `select` actually lets through), never "...result 0" (the
+  generator's own first output) — succinctly now matches. The two rows in
+  the issue that were already correct (a non-rejecting `select(true)`, and a
+  rejecting `select` over a literal `Expr::Comma` rather than a generator
+  builtin) are unaffected and pinned by regression tests alongside the fix.
+
+  `src/jq/eval_generic.rs` (the CLI's own bridge for both `jq` and `yq`
+  modes) needed no matching change: it has no separate path-tracking
+  implementation of its own for `path()`/`del()`/`=`/`|=` — every one bridges
+  to `src/jq/eval.rs`'s `resolve_node`/`resolve_seq` via
+  `bridge_to_full_evaluator`, so this fix in the one shared implementation
+  covers the CLI in both modes.
+
 - **`succinctly::jq::eval`'s object-construction key/value slots and jq-mode
   string interpolation no longer silently substitute `""` for an undecodable
   string** (#2022): all three fed their generator's output through
