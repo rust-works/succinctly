@@ -30090,6 +30090,17 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// hand, makes that gap structurally impossible to reintroduce at a future
 /// call site.
 ///
+/// **`optional` is currently always `false` at every call site reachable from
+/// the path-context evaluator (#2212).** #2073 removed `Expr::Optional`'s
+/// combined-with-`rest` fallback, which was the last thing that produced an
+/// `optional == true` in there, so the three cells below that consult it are
+/// live only through this function's own unit test
+/// (`test_catch_error_under_optional_full_truth_table_1888`) -- which is
+/// therefore the sole load-bearing test for the truth table, not a
+/// belt-and-braces duplicate of an end-to-end one. Whether to delete the
+/// parameter or keep it as defence in depth is #2212's call; until then, do
+/// not cite these cells as evidence of live behaviour.
+///
 /// The prefix lives *inside* the matched `Partial` pattern, not in a
 /// separately-passed accumulator: `accumulate_path_context_step` already
 /// moved the caller's own `results` `Vec` into that `Partial` via
@@ -30138,9 +30149,10 @@ fn catch_error_under_optional<W>(
 /// result back out over `rest` the same way `Iterate` does above. Shared by
 /// `If`/`Try`/`Label` below to avoid re-deriving this fan-out loop at each
 /// call site (`Comma` used to as well, until #1409 moved it onto the
-/// combine-with-`rest` idiom `Optional`/`Pipe` already use, since threading
-/// one ambient `current_path` through every comma branch lost each
-/// branch's own per-output path).
+/// combine-with-`rest` idiom `Pipe` uses, since threading one ambient
+/// `current_path` through every comma branch lost each branch's own
+/// per-output path. `Optional` shared that idiom too until #2073 moved it
+/// onto the isolate-and-probe shape `Try`/`Label` use).
 fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     intermediate: QueryResult<'a, W>,
     rest: &[Expr],
@@ -31448,33 +31460,35 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // arm's existing (#1302/#1826) response to this exact ambient
             // shape.
             //
-            // That still isn't full jq parity for this exact query, and
-            // isn't meant to be: real jq's equivalent (`.a | .[] | if
-            // .==2 then error("boom") else . end` on `[1,2,3]`, confirmed
-            // live against jq 1.7.1) emits `1` then *errors*, whether or
-            // not an unrelated `?` sits earlier in the pipe, because `?`
-            // only catches an error raised *inside* what it directly
-            // wraps. Here, `(.a)?` only wraps `.a`; `.[] | ...` is a
-            // separate downstream stage `?` was never meant to reach. It
-            // reaches this arm's `optional=true` only because `key` makes
-            // `needs_path_context(rest)` true, routing through the
-            // `Expr::Optional` arm's slower "combine `[inner, ...rest]`,
-            // evaluate under a forced ambient `optional=true`" fallback a
-            // few arms below (rather than its faster, correct, isolated
-            // path) -- the same pre-existing #1335 "rest inherits
-            // suppression" gap already present, unchanged, in `Array`'s
-            // and `Map`'s own #1302/#1826 fixes (confirmed live: both
-            // `(.a)? | [.[] | if key==1 then error("boom") end]` and
-            // `(.a)? | map(if key==1 then error("boom") else key end)`
-            // also silently exit 0 with no error, on the same input).
-            // Closing that gap needs #1335's own architecture fix (a way
-            // to tell "there's a literal `?` right here" apart from
-            // "`optional` merely bled in from an unrelated earlier
-            // stage"), not another per-construct patch here -- this fix's
-            // job is only to make `Iterate`'s *response* to `optional`
-            // (however it arrived) consistent with every sibling arm's,
-            // not to independently re-litigate whether it should have
-            // arrived at all.
+            // #2073 has since closed the wider gap that repro depended on.
+            // The ambient `optional=true` only ever reached this arm
+            // because `key` made `needs_path_context(rest)` true, routing
+            // through the `Expr::Optional` arm's old "combine
+            // `[inner, ...rest]`, evaluate under a forced ambient
+            // `optional=true`" fallback a few arms below. That fallback is
+            // gone: `Expr::Optional` now isolates `inner` unconditionally,
+            // so `rest` continues with the ambient `optional` it entered
+            // with and never inherits a `?` several stages back. The same
+            // query now emits `0` and then *errors* (exit 5), which is full
+            // jq parity -- real jq's equivalent (`.a | .[] | if .==2 then
+            // error("boom") else . end` on `[1,2,3]`, confirmed live
+            // against jq 1.7.1) emits `1` then errors too, because `?` only
+            // catches an error raised *inside* what it directly wraps, and
+            // `(.a)?` only wraps `.a`. `Array`'s and `Map`'s own
+            // #1302/#1826 repros converged the same way (confirmed live
+            // post-#2073: both `(.a)? | [.[] | if key==1 then
+            // error("boom") end]` and `(.a)? | map(if key==1 then
+            // error("boom") else key end)` now exit 5 on the same input,
+            // where they used to exit 0 with no error).
+            //
+            // Consequence, tracked in #2212: with that fallback gone,
+            // nothing left in this evaluator produces `optional == true`,
+            // so this arm's force-`false` is a no-op and the catch below
+            // never takes its `optional` branch. The forcing is kept as
+            // defence in depth -- it is what makes the arm's response
+            // depend on its own structure rather than on an ambient flag --
+            // but do not read the `optional == true` cells below as live
+            // behaviour without re-checking #2212 first.
             //
             // Unlike `Array`/`Map`, `Iterate` is not a constructor -- there
             // is no atomic "discard the whole in-progress collection"
@@ -31486,11 +31500,13 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `Halt` are never caught by this arm's ambient `optional` at
             // all, even when it's `true` -- unlike `Optional`'s own arm
             // (which only ever runs when there's a literal `?` right here,
-            // so unconditional catching is correct there), an ambient
-            // `optional` reaching `Iterate` can come from an *unrelated*
-            // enclosing `?` bleeding through `rest` (the same #1335 gap
-            // above), and a `break`'s label target is lexically scoped,
-            // never something an unrelated ancestor's `?` may intercept.
+            // so unconditional catching is correct there), this arm cannot
+            // tell a `?` that genuinely wraps it from one that merely sits
+            // somewhere above it, and a `break`'s label target is lexically
+            // scoped, never something an unrelated ancestor's `?` may
+            // intercept. #1335 was the route that made that distinction
+            // matter in practice; #2073 removed it, but the conservative
+            // rule stands on its own.
             // Both fall through `Some(other) => other` unchanged,
             // preserving whatever prefix `accumulate_path_context_step`
             // already attached (#400/#494).
@@ -43122,6 +43138,18 @@ mod tests {
         );
     }
 
+    /// Every `(atomic, optional)` cell of [`catch_error_under_optional`],
+    /// plus the bare-`Error` and `Break`/`Halt` shapes around them.
+    ///
+    /// Since #2073 this is the *only* test that reaches the helper's
+    /// `optional == true` cells at all: that fix removed
+    /// `Expr::Optional`'s combined-with-`rest` fallback, and with it the
+    /// last producer of an ambient `optional == true` anywhere inside the
+    /// path-context evaluator, so #1826's and #1869's own end-to-end tests
+    /// now exercise the `false` column instead (#2212 tracks whether the
+    /// parameter should survive at all). Deleting or weakening a row here
+    /// therefore removes the last check on that behaviour rather than a
+    /// duplicate of an integration test's.
     #[test]
     fn test_catch_error_under_optional_full_truth_table_1888() {
         type W = Vec<u64>;

@@ -2784,6 +2784,14 @@ helper (the same one `Expr::Iterate`/`Builtin::Map` already use for this
 exact "keep the prefix, gate only the error" policy) instead of a bare
 `partial(...)` call.
 
+**The output above is unchanged since #2073, but the mechanism behind it
+moved.** That fix stopped `Expr::Optional` handing `rest` a forced
+`optional = true`, so `continue_rest_with_context`'s own `optional` gate no
+longer fires for this query -- the suppression now happens one level up, in
+`Expr::Optional`'s own structural catch of the isolated `recurse(...)`'s
+`Partial`. Nothing left in the path-context evaluator produces
+`optional == true` at all; see #2212.
+
 **One site remains unfixed**: `ParentN`'s own `n` argument (`parent((1,2))`
 still array-collapses `n` to `[1,2]`, then errors on the wrong type -- a
 narrower, lower-traffic case than the three arms fixed above, not attempted
