@@ -177,6 +177,29 @@ $ echo '"abcdefghijklm"' | sjq -c 'try .[] catch .'
 String *keys* in indexing messages are not truncated; `.["aaaaaaaaaaaaaaaaaaaa"]` on a
 number reports the whole twenty-character key.
 
+### `path()`'s own "Invalid path expression..." family truncates wider (#2179)
+
+The three `path()`-triggered messages — `Invalid path expression with result <v>`,
+`... near attempt to access element <k> of <v>`, `... near attempt to iterate through <v>`
+— do **not** share the 11-byte truncation above. Confirmed by reading jq 1.7.1's C source
+(`execute.c`): the `PATH_END`/`EACH`/`EACH_OPT` cases, and `INDEX`/`INDEX_OPT`'s own
+*container* argument, call `jv_dump_string_trunc` with `char errbuf[30]`/`objbuf[30]` —
+keeping 26 bytes before the `...`, not 11. `INDEX`/`INDEX_OPT`'s *key* argument is the one
+exception within this family: it uses `char keybuf[15]`, the same narrow 11-byte width as
+every other message above. Reproduced exactly:
+
+```bash
+$ jq -n -c 'path({"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":1})'
+jq: error (at <unknown>): Invalid path expression with result {"aaaaaaaaaaaaaaaaaaaaaaaa...
+                                                              # 26 bytes kept, not 11
+$ jq -n -c 'path(try (.a, error({"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":1})) catch .b?)'
+jq: error (at <unknown>): Invalid path expression near attempt to access element "b" of {"aaaaaaaaaaaaaaaaaaaaaaaa...
+                                                                                        # container: 26 bytes
+$ jq -n -c 'path(try (.a, error({"z":1})) catch .aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?)'
+jq: error (at <unknown>): Invalid path expression near attempt to access element "aaaaaaaaaa... of {"z":1}
+                                                                             # key: still 11 bytes
+```
+
 ## Truncation that splits a multi-byte character
 
 jq cuts the dump at a byte offset and will happily split a UTF-8 sequence, emitting
