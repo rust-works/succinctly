@@ -20696,11 +20696,9 @@ pub(crate) fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedV
 
 /// The `OwnedValue` a static slice component's `{"start":s,"end":e}` path
 /// descriptor is reported as, one bound at a time -- the slice-bound sibling
-/// of [`index_component_value`] (#1326), shared by [`walk_path`] and
-/// [`navigation_element`]. `eval_pipe_with_path_context_internal` has no
-/// `Expr::Slice` arm at all -- a slice there falls
-/// through to that function's generic, path-context-losing fallback, a
-/// pre-existing gap #1326 doesn't touch.
+/// of [`index_component_value`] (#1326), shared by [`walk_path`],
+/// [`navigation_element`], and `eval_stage_with_path_context`'s own
+/// `Expr::Slice` arm (#2215).
 ///
 /// Each bound converts independently via [`index_component_value`] itself
 /// (an absent/integer-spelled bound and a float-spelled one are exactly the
@@ -31412,6 +31410,44 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     owned_type_name(value),
                     "number",
                 ))
+            }
+        }
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => {
+            // Extend path with the slice's own `{start,end}` descriptor, as
+            // written rather than as resolved (#1326) -- see
+            // `slice_component_value`, the shared per-bound rule this and
+            // `walk_path`'s own `Expr::Slice` arm both call rather than
+            // hand-deriving a third copy (CLAUDE.md's "duplicated
+            // predicates diverge silently", #106).
+            let mut new_path = current_path.to_vec();
+            new_path.push(slice_component_value(
+                *start,
+                start_key.as_ref(),
+                *end,
+                end_key.as_ref(),
+            ));
+
+            // Read via the same owned-value helper `eval_slice_expr`'s
+            // `Targets::Owned` loop uses, so bound/type/optional semantics
+            // (open bounds, negatives, strings, yq's object-slicing rule)
+            // can't drift from the ordinary (non-path-context) evaluator's
+            // own answer for the identical slice.
+            match slice_owned_value_read::<S>(value, *start, *end, optional) {
+                Ok(Some(sliced)) => continue_rest_with_borrowed_value::<W, S>(
+                    &sliced,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                ),
+                Ok(None) => QueryResult::None,
+                Err(err) => QueryResult::Error(err),
             }
         }
         Expr::Iterate => {

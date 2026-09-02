@@ -7545,6 +7545,82 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     Ok(())
 }
 
+/// #2215: a literal `Expr::Slice` (`.[0:3]`, both bounds constant) had no
+/// arm in `eval_stage_with_path_context`, so it fell to the generic
+/// catch-all and left `current_path` unextended -- `key`/`path` named the
+/// *container*, not the slice. `path(.a[0:3])` (routed through `walk_path`
+/// instead) already got this right, so that's the reference matched here,
+/// same as every assertion below cross-checks against it directly.
+#[test]
+fn test_literal_slice_path_context_resolves_2215() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3] | path"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":0,"end":3}]"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", "path(.a[0:3])"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":0,"end":3}]"#);
+
+    // `key` is the last path component, same as `path` less the wrapping
+    // array -- exercises the same arm through a different downstream
+    // consumer.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3] | key"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"start":0,"end":3}"#);
+
+    // Open bounds: `start`/`end` each independently `null` in the
+    // descriptor when omitted, matching `slice_component_value`'s own
+    // `Null`-for-absent rule.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[1:] | path"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":1,"end":null}]"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[:2] | path"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":null,"end":2}]"#);
+
+    // `rest` continues from the sliced value itself, not the container --
+    // `continue_rest_with_borrowed_value` threading the freshly-sliced
+    // owned value through, same as the `Expr::Field`/`Expr::Index` arms.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3] | .[0]"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | .[0:3] | length"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "3");
+
+    // String targets slice by character, not byte -- same
+    // `slice_owned_value_read` the plain (non-path-context) evaluator uses,
+    // so this can't drift from `.a | .[1:3]`'s own already-correct answer.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[1:3] | path"], Some(r#"{"a":"hello"}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":1,"end":3}]"#);
+
+    // `null` slices to `null` (jq's own rule) -- still names the slice
+    // component, not just the container.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3] | path"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a",{"start":0,"end":3}]"#);
+
+    // A non-sliceable type errors exactly like the plain evaluator and the
+    // `path(...)` reference both already do -- the new arm's error path
+    // isn't a divergence of its own.
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".a | .[0:3] | path"], Some(r#"{"a":5}"#))?;
+    assert_eq!(code, 5);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Cannot index number with object"));
+
+    // `?` on the slice itself suppresses that error into no output, not a
+    // stubbed path.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[0:3]? | path"], Some(r#"{"a":5}"#))?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    Ok(())
+}
+
 /// #1964 (found in review of the `Expr::Limit` path-context fix above, then
 /// fixed by #1964 itself): `eval_pipe_with_path_context_internal`'s
 /// `Expr::Comma` arm routes every branch through this same evaluator,
