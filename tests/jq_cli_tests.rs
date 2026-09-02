@@ -25572,6 +25572,76 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
             "",
             0,
         ),
+        // `any`/`all(gen; cond)` had a second, independent swallowing bug
+        // beyond the one fixed above: `cond`'s own error (not `gen`'s) is
+        // tracked out-of-band because it arrives through the same
+        // `Demand::Stop` channel a genuine match does, and that tracking
+        // used to survive past the retry it triggered. So a *later*
+        // alternative's genuine match was masked by an *earlier*
+        // alternative's already-retried-past `cond` error -- confirmed live
+        // against jq 1.7.1, which reaches alt2's `true` after retrying past
+        // alt1's error.
+        (
+            &[
+                "-cn",
+                r#"any(["err"] as [$x] ?// $y | if $x != null then $x else "clean" end; if . == "err" then error("boom") else true end)"#,
+            ],
+            None,
+            "true\n",
+            "",
+            0,
+        ),
+        // Same class, the other terminal shape: the *last* alternative,
+        // reached after an earlier one's `cond` error is retried past, runs
+        // clean to exhaustion with no match at all. The stale error must not
+        // resurface here either -- `any` correctly falls through to its own
+        // identity answer, `false`.
+        (
+            &[
+                "-cn",
+                r#"any(1 as $x ?// $y | if $x == 1 then "err" else "clean" end; if . == "err" then error("boom") else empty end)"#,
+            ],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `isempty` had the identical prefix-discard bug as `first`/`nth`
+        // above (same #1519 class, different function): a later
+        // alternative's own error is genuinely reached by jq after an
+        // earlier one already answered `false`, so it raises rather than
+        // discarding that answer.
+        (
+            &[
+                "-cn",
+                r#"isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else error("boom") end)"#,
+            ],
+            None,
+            "false\n",
+            "jq: error (at <unknown>): boom",
+            5,
+        ),
+        // `nth(n; f)`'s own `Builtin::NthStream` spelling (always
+        // materializing, #820) had the same prefix-discard bug as
+        // `each_take_nth`'s `Expr::NthExpr` twin above -- fixed
+        // separately since this always-materializing path checks the
+        // decode itself instead of deferring it. Two kept items here
+        // (index 0 from each `?//` alternative, `nth(0; ...)`): the first
+        // decodes fine, the second is an undecodable string sourced from
+        // `.bad` (`\x` is not a valid JSON escape but a lazily-accepted
+        // span, matching `test_select_raises_on_decode_failure_instead_of_silently_truthy_1645`'s
+        // shape) -- the already-decoded first item must survive as a
+        // `Partial`, not be discarded by the second's bare error.
+        (
+            &[
+                "-c",
+                r#"nth(0; 1 as $x ?// $y | (if $x == 1 then "ok" else .bad end))"#,
+            ],
+            Some(r#"{"bad": "\x"}"#),
+            "\"ok\"\n",
+            "jq: error (at <stdin>:0): invalid escape sequence in string",
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {

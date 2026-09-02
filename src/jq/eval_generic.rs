@@ -6877,6 +6877,52 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
     finish_fork_generic(out, control.or(stray), optional)
 }
 
+/// Shared resolution of [`each_take_first_generic`]'s and
+/// [`nth_with_n_generic`]'s two outputs into a [`GenericResult`], mirroring
+/// [`super::eval::take_stopping_items_to_result`] -- so their call sites
+/// cannot drift on the dropped-versus-raised trailing-control rule (#1519).
+/// Both sinks stop on every item they keep, so both have the identical rule.
+fn take_stopping_items_to_generic_result<V: DocumentValue>(
+    mut items: Vec<GenericItem<V>>,
+    flow: Flow,
+) -> GenericResult<V> {
+    // #1519: items *and* an escape means a later `?//` alternative failed
+    // after an earlier one had already answered. jq reaches that failure, so
+    // the prefix is kept and the control still raises.
+    if let Flow::Escaped(control) = flow {
+        if items.is_empty() {
+            return partial_generic(Vec::new(), control);
+        }
+        let mut owned = vec_with_capacity(items.len());
+        for item in items {
+            match generic_item_into_owned(item) {
+                Ok(v) => owned.push(v),
+                // Not reachable through a `?//` retry today: a cursor-backed
+                // batch defers its decode (see
+                // `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`),
+                // so the failure surfaces at materialization instead. Handled
+                // because the conversion's signature requires it.
+                Err(c) => return partial_generic(owned, c),
+            }
+        }
+        return partial_generic(owned, control);
+    }
+    // `Flow::Stopped`/`Flow::Exhausted`: an undecodable kept item must raise
+    // rather than silently being dropped, and a `?//` retry must not be able
+    // to launder that away -- the same rule `eval::items_to_result_checked`
+    // enforces for the borrowed evaluator's twin.
+    match items.len() {
+        0 => GenericResult::None,
+        // The lone-item case keeps `generic_item_to_result`'s cursor-backed
+        // conversion so a duplicate key inside it survives (#607).
+        1 => generic_item_to_result(items.remove(0)),
+        _ => match items_to_generic_result(items) {
+            Ok(result) => result,
+            Err((prefix, control)) => partial_generic(prefix, control),
+        },
+    }
+}
+
 /// Evaluate `first(inner)`/`last(inner)`. `Expr::FirstExpr`/`Expr::LastExpr`
 /// are the only spellings any parseable query produces -- `Builtin::
 /// FirstStream`/`LastStream` are never constructed by the parser (#1986;
@@ -6946,46 +6992,13 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     // is the last until the stream is exhausted -- so it keeps the eager
     // path below.
     if !want_last {
-        let (mut items, flow) = each_take_first_generic::<S, V>(inner, value, optional, cursor);
         // #1519: normally one item; a `?//` chain under this consumer
-        // legitimately yields one per alternative. Items *plus* an escape
-        // means a later alternative failed after an earlier one answered --
-        // jq reaches that failure, so the prefix is kept and it still raises;
-        // see `eval::take_first_to_result`, whose rule this mirrors.
-        if let Flow::Escaped(control) = flow {
-            if items.is_empty() {
-                return match control {
-                    Control::Error(e) => GenericResult::Error(e),
-                    Control::Break(label) => GenericResult::Break(label),
-                    Control::Halt(code) => GenericResult::Halt(code),
-                };
-            }
-            let mut owned = vec_with_capacity(items.len());
-            for item in items {
-                match generic_item_into_owned(item) {
-                    Ok(v) => owned.push(v),
-                    // Not reachable through a `?//` retry today: a
-                    // cursor-backed batch defers its decode (see
-                    // `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`),
-                    // so the failure surfaces at materialization instead. Handled
-                    // because the conversion's signature requires it, and as
-                    // parity with `limit_with_n_generic`'s equivalent guard.
-                    Err(c) => return partial_generic(owned, c),
-                }
-            }
-            return partial_generic(owned, control);
-        }
-        return match items.len() {
-            0 => GenericResult::None,
-            // The lone-item case keeps `generic_item_to_result`'s
-            // cursor-backed conversion so a duplicate key inside it survives.
-            1 => generic_item_to_result(items.remove(0)),
-            _ => match items_to_generic_result(items) {
-                Ok(result) => result,
-                // Same deferred-decode note as the escaping path above.
-                Err((prefix, control)) => partial_generic(prefix, control),
-            },
-        };
+        // legitimately yields one per alternative. See
+        // `take_stopping_items_to_generic_result`, whose rule this uses
+        // directly -- `each_take_first_generic` stops on every item it
+        // keeps, exactly like `nth_with_n_generic`'s own sink.
+        let (items, flow) = each_take_first_generic::<S, V>(inner, value, optional, cursor);
+        return take_stopping_items_to_generic_result(items, flow);
     }
 
     // No local `optional` handling is needed for `last(f)?` here: post-#693,
@@ -7544,37 +7557,9 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     if !wanted.is_empty() {
         // #1519: a later `?//` alternative's own error is genuinely reached by
         // jq after an earlier one answered, so it raises rather than being
-        // dropped -- the same rule `eval::take_stopping_items_to_result`
-        // applies, and the one `first` and `nth` share.
-        if let Flow::Escaped(control) = flow {
-            let mut owned = vec_with_capacity(wanted.len());
-            for item in wanted {
-                match generic_item_into_owned(item) {
-                    Ok(v) => owned.push(v),
-                    // Not reachable through a `?//` retry today: a
-                    // cursor-backed batch defers its decode (see
-                    // `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`),
-                    // so the failure surfaces at materialization instead. Handled
-                    // because the conversion's signature requires it, and as
-                    // parity with `limit_with_n_generic`'s equivalent guard.
-                    Err(c) => return partial_generic(owned, c),
-                }
-            }
-            return partial_generic(owned, control);
-        }
-        return if wanted.len() == 1 {
-            // The lone-item case keeps `generic_item_to_result`'s
-            // cursor-backed conversion so a duplicate key inside it survives
-            // (#607).
-            generic_item_to_result(wanted.remove(0))
-        } else {
-            // #1519: one item per `?//` alternative.
-            match items_to_generic_result(wanted) {
-                Ok(result) => result,
-                // Same deferred-decode note as the escaping path above.
-                Err((prefix, control)) => partial_generic(prefix, control),
-            }
-        };
+        // dropped -- see `take_stopping_items_to_generic_result`, the rule
+        // `first` and `nth` share.
+        return take_stopping_items_to_generic_result(wanted, flow);
     }
     if let Some(control) = skipped_err {
         partial_generic(Vec::new(), control)

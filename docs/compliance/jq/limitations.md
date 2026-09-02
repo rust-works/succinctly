@@ -1951,6 +1951,20 @@ path-tracked), and to the path-context refusal
 was originally split out as [#1831](https://github.com/rust-works/succinctly/issues/1831) to
 record the divergence unconditionally, before it was known to be fixable this cheaply.
 
+**`nth(n; f)`'s generic-evaluator twin has a narrower, separate residual**, tracked in
+[#2199](https://github.com/rust-works/succinctly/issues/2199): `nth_with_n_generic`
+(`src/jq/eval_generic.rs`) has to force the decode of a *skipped* (index `< n`) item for its
+side effects, exactly as jq's own `nth($n; f) == last(limit($n + 1; f))` desugaring requires. A
+decode failure there is recorded out-of-band and signalled as an ordinary `Demand::Stop`, which
+`?//` retry (correctly) cannot tell apart from a genuine consumer-satisfied stop — so a skipped
+item's decode failure on a non-last alternative gets silently retried into the next one instead
+of propagating, unlike the equivalent `Flow::Escaped(Control::Error(e))` case, which
+`is_retryable_control` already excludes via `is_decode_failure()`. `eval::each_take_nth` (the
+borrowed evaluator's twin) is not at risk — its `Item` is never lazy, so it never needs to force a
+skipped item's decode in the first place. Fixing this needs `Demand` (or an equivalent channel) to
+let a sink mark its own stop as unretryable, which is a real design change rather than a local
+one, so it is tracked separately instead of folded into this fix.
+
 ## `--seq`'s malformed-record warning covers one of jq's several message shapes
 
 Real jq warns on stderr ("`jq: ignoring parse error: ...`") whenever it silently drops a
