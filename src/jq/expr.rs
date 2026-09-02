@@ -412,13 +412,14 @@ pub enum Expr {
         /// Expression where this function is in scope
         then: Box<Self>,
         /// `then`, with this def's own calls installed -- computed on first
-        /// evaluation of this node and reused afterwards (#2094), the same
-        /// way `DefCall`'s own `bound` field works. Every substitution pass
-        /// that rebuilds this node's `body`/`then`/`params` must reset this
-        /// to `BoundBody::default()`; a pass that merely clones the node
-        /// through unchanged (nothing here was substituted into) may carry
-        /// the cached value along.
-        bound: BoundBody,
+        /// evaluation of this node and reused afterwards (#2094). See
+        /// [`FuncDefBound`]'s own doc comment for why this needs a different
+        /// cache shape than `DefCall`'s own `bound` field. Every
+        /// substitution pass that rebuilds this node's `body`/`then`/`params`
+        /// must reset this to `FuncDefBound::default()`; a pass that merely
+        /// clones the node through unchanged (nothing here was substituted
+        /// into) may carry the cached value along.
+        bound: FuncDefBound,
     },
 
     /// Function call: `name` or `name(args)`
@@ -568,6 +569,13 @@ pub enum Expr {
 /// must reset this** — they construct a fresh `BoundBody` rather than
 /// carrying the old node's, since a cache keyed on arguments that just
 /// changed is exactly a stale one.
+///
+/// Write-once by design (see [`Self::get_or_try_init`]/[`Self::get_or_init`]
+/// below) — safe *only* because `DefCall.frames` is a plain field, frozen
+/// once by whichever `install_def_calls` pass built this specific node, and
+/// never re-read from ambient state at call time. [`Expr::FuncDef`]'s own
+/// cache (#2094) needs a different shape for exactly that reason: see
+/// [`FuncDefBound`]'s own doc comment.
 #[derive(Clone, Default)]
 pub struct BoundBody(core::cell::OnceCell<Rc<Expr>>);
 
@@ -588,15 +596,6 @@ impl BoundBody {
         let bound = bind()?;
         Ok(self.0.get_or_init(|| bound))
     }
-
-    /// The bound body, computing it with an infallible `bind` on first call.
-    ///
-    /// For a cache site whose `bind` can never fail (#2094's `FuncDef`
-    /// installation, unlike `DefCall`'s own recursion-depth-guarded bind) --
-    /// see [`Self::get_or_try_init`] for the fallible counterpart.
-    pub fn get_or_init(&self, bind: impl FnOnce() -> Rc<Expr>) -> &Rc<Expr> {
-        self.0.get_or_init(bind)
-    }
 }
 
 /// Two `DefCall`s are equal when their definition, arguments and frame count
@@ -613,6 +612,71 @@ impl PartialEq for BoundBody {
 impl core::fmt::Debug for BoundBody {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("BoundBody")
+    }
+}
+
+/// An [`Expr::FuncDef`]'s "`then`, with this def's own calls installed" cache
+/// (#2094).
+///
+/// Computed on first evaluation and reused afterwards -- unlike
+/// [`BoundBody`], keyed additionally by the ambient frame depth
+/// ([`super::eval::ambient_frame_depth`]) it was computed at, and
+/// recomputed (not just left stale) whenever that depth differs from what
+/// produced the cached answer.
+///
+/// The naive `OnceCell`-style write-once cache `BoundBody` uses is unsound
+/// here: installing a `def` bakes the *current* ambient depth into every
+/// nested `DefCall`'s own `frames` field (`bind_def`'s doc comment covers
+/// why that's normally safe to treat as constant across repeat evaluations
+/// of one node). But `Expr::Shared` sharing an `Rc<Expr>` unchanged across
+/// substitution passes (by design, for #1371/#2077/#2096 hygiene) means the
+/// *same* `FuncDef` node -- same `Rc`, same cache cell -- can genuinely be
+/// reached at two different real depths without ever being rebuilt: pass a
+/// self-recursive `def` as a function-valued argument, evaluate it once
+/// directly (shallow) and once inside a deeper recursive call (e.g. `def
+/// each(n; f): if n <= 0 then empty else (f, each(n - 1; f)) end`). A
+/// write-once cache would freeze the shallow reach's `frames` baseline and
+/// silently reuse it for the deep reach too, undercounting how close that
+/// deep call actually is to `MAX_EVAL_FRAMES` -- exactly the unbounded
+/// native-recursion gap #1098/#1016 exist to close.
+///
+/// Falling back to recomputing whenever the depth moves keeps the *common*
+/// case (a `def` inline in a loop body, reached repeatedly at one constant
+/// depth) fully cached, and only pays install cost again in the rarer
+/// cross-depth-reuse shape above -- trading a little of that shape's own
+/// performance for keeping the recursion guard sound in all cases.
+#[derive(Clone, Default)]
+pub struct FuncDefBound(core::cell::RefCell<Option<(u32, Rc<Expr>)>>);
+
+impl FuncDefBound {
+    /// The installed body for the given ambient `depth`, computing it fresh
+    /// via `bind` if nothing is cached yet or the cached answer was computed
+    /// at a different depth.
+    pub fn get_or_init_at(&self, depth: u32, bind: impl FnOnce() -> Rc<Expr>) -> Rc<Expr> {
+        if let Some((cached_depth, tree)) = self.0.borrow().as_ref() {
+            if *cached_depth == depth {
+                return Rc::clone(tree);
+            }
+        }
+        let tree = bind();
+        *self.0.borrow_mut() = Some((depth, Rc::clone(&tree)));
+        tree
+    }
+}
+
+/// Two `FuncDef`s are equal when their name/params/body/then are — whether
+/// either has been evaluated yet, or at what depth, is derived state, not
+/// identity (mirrors [`BoundBody`]'s own `PartialEq`).
+impl PartialEq for FuncDefBound {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+/// Deliberately opaque, for the same reason as [`BoundBody`]'s own `Debug`.
+impl core::fmt::Debug for FuncDefBound {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FuncDefBound")
     }
 }
 
