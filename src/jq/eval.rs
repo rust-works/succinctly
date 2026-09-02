@@ -25174,30 +25174,30 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     if starts.is_empty() {
         return path_result(Vec::new(), starts_escape);
     }
-    let (ends, ends_escape) =
-        resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
-    // `end` (`T`) is nested inside `start` (`S`)'s own iteration -- jq's `S
-    // as $s | T as $t | ...` re-runs `T` fresh for `$s`'s very first value,
-    // so a `T` escape (if any) fires before `S` ever gets a chance to
-    // expose its own. `ends_escape` therefore wins over `starts_escape` --
-    // computed once as `bounds_escape` and reused both by the
-    // `ends.is_empty()` early return just below and by the full
-    // `target`/`end`/`start` priority chain further down, so the two sites
-    // that need this rule can't silently drift apart (#1526 review).
-    // `ends_escaped` is split off first since `.or()` moves its operand and
-    // the truncation logic below still needs to ask "did `end` specifically
-    // escape" on its own. Confirmed against jq 1.7.1:
-    // `path(.[(0,1):error("b")])` on `[10,20,30]` prints nothing before
-    // raising `b` -- `end`'s own escape, with *zero* prior values, still
-    // wins over `start`'s later one.
-    let ends_escaped = ends_escape.is_some();
-    let bounds_escape = ends_escape.or(starts_escape);
-    if ends.is_empty() {
-        return path_result(Vec::new(), bounds_escape);
-    }
     // #843: same rule as `resolve_index_expr` above, for a slice's bounds
-    // instead of an index's key.
+    // instead of an index's key. This guard is a static property of
+    // `target`'s own AST plus the ambient `trackable` flag -- independent
+    // of any S/T value -- so whether it fires is already known here,
+    // before `end` (`T`) has been touched at all.
+    //
+    // `end` is still only evaluated (lazily, right here, not upfront) when
+    // this guard is actually going to fire, mirroring #2225's own "T can
+    // have side effects, don't force it before it's needed" reasoning:
+    // `T`'s own emptiness/escape wins over this check exactly the way it
+    // wins over the cross-product below. Confirmed against jq 1.7.1: an
+    // untrackable target paired with a completely empty `T`
+    // (`(1,2)[(0,1):(empty)]`) produces empty output with **no error at
+    // all** -- this branch's own `EvalError::invalid_path_expression_near_
+    // access` never fires unless `T` actually yields a value to name in
+    // it. Confirmed the same for `T` erroring before any value
+    // (`(1,2)[(0,1):(error("boom"))]` raises `boom`, not the path-
+    // expression error).
     if !trackable && is_passthrough_target(target) {
+        let (ends, ends_escape) =
+            resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
+        if ends.is_empty() {
+            return path_result(Vec::new(), ends_escape.or(starts_escape));
+        }
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
@@ -25230,6 +25230,13 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // downstream read of `target_branches` below inspects only
     // `.value`/`.trackable`, and this function's own output is always
     // `snapshot: false` regardless (slicing is genuine navigation).
+    //
+    // `target` (`E`) doesn't depend on `start`/`end`'s own values, so this
+    // stays a single call outside every loop below regardless of `end`
+    // now being re-evaluated per `s` (#2245) -- the issue's own analysis
+    // confirmed this site is not a #2143-class bug: a trackable expression
+    // has no observable side effects, so re-evaluating it once vs. per
+    // pair would be unobservable even if it were moved.
     let (target_branches, target_escape) =
         match resolve_node::<S>(target, value, trackable, false, keep) {
             Ok(branches) => (branches, None),
@@ -25246,10 +25253,23 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // pipe's literal deferred here instead of raising. Kept as one condition
     // with `!trackable` so the two can't drift: this file's own "duplicated
     // predicates diverge silently" lesson (#106).
+    //
+    // `end` is lazily evaluated here too (#2245), for the identical reason
+    // as the guard above: this check's *firing* depends only on
+    // `target_branches` (already computed, S/T-independent), but its error
+    // message needs a representative `(s, e)` pair, and jq's own nesting
+    // means that pair's `T` value is only ever forced once a genuine
+    // `(s, t)` binding is reached -- so `T`'s own emptiness/escape still
+    // has to win first, exactly as above.
     if let Some(PathBranch {
         value: first_value, ..
     }) = target_branches.iter().find(|b| !trackable || !b.trackable)
     {
+        let (ends, ends_escape) =
+            resolve_slice_bound::<S>(end, value, f64::ceil).map_err(|e| (Vec::new(), e))?;
+        if ends.is_empty() {
+            return path_result(Vec::new(), ends_escape.or(starts_escape));
+        }
         return Err((
             Vec::new(),
             EvalError::invalid_path_expression_near_access(
@@ -25266,79 +25286,72 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     }
 
     // jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]` — `S`
-    // outer, `T` middle (re-run fresh for every `$s`), `E` innermost. Three
-    // generators can each independently escape after producing some
-    // values, and whichever is *innermost* is the one that actually fires
-    // first in jq's real depth-first walk — the others never get a chance
-    // to advance far enough to reach their own escape at all (#1517;
-    // `starts`/`ends` here are each already truncated to their own
-    // pre-escape partial prefix by `resolve_slice_bound`, so only the
-    // *cross-product* needs restricting, not the lists themselves). Two
-    // independent lengths, not a three-way branch on *which* escape fired
-    // (#1526 review — the old three-arm form repeated `&starts[..1]`
-    // identically in two branches, obscuring that `start` truncates
-    // whenever anything *more inner* escaped, while `end` only truncates
-    // when `target` itself did):
+    // outer, `T` middle, `E` innermost. `T` is now genuinely re-evaluated
+    // once per `s` (#2245, mirroring #2225's identical fix for the two
+    // value-mode siblings, `eval_slice_expr` in this file and
+    // `eval_generic.rs`) rather than once overall for the whole function --
+    // `T` sits inside `S`'s own binding scope in jq's desugaring, so a
+    // fresh `s` gets a fresh `T` evaluation, observable whenever `T` has
+    // side effects (`input`, confirmed live in the issue's own repro).
     //
-    // - `starts_len` is `1` whenever `target` *or* `end` escaped — either
-    //   one means `start` never got to try a second value (`end`, nested
-    //   inside `start`'s own iteration, escaping during `start`'s first
-    //   value has the identical effect on `start` as `target` escaping
-    //   does) — otherwise `starts`'s own pre-escape prefix is already the
-    //   right length. Confirmed against jq 1.7.1:
-    //   `path(.[(0,1):(2,error("b"))])` on `[10,20,30]` prints only
-    //   `[{"start":0,"end":2}]` before raising `b` -- `$s=1` is never
-    //   tried; `path(.[(0,error("b")):(2,3)])` prints *both*
-    //   `[{"start":0,"end":2}]` and `[{"start":0,"end":3}]` before raising
-    //   `b` (`T` fully iterated for `$s=0` before `S` ever tries to
-    //   advance, so no truncation here).
-    // - `ends_len` is `1` only when `target` itself escaped -- `target`
-    //   escapes inside the very first `(s, t)` pair, so neither bound
-    //   generator is ever resumed for a second pair. `target_branches` was
-    //   computed once, outside this loop, so this keeps this function's
-    //   `Err` prefix equal to jq's own pre-escape stream, mirroring
-    //   `resolve_index_expr`'s identical fix (#972, pre-existing).
-    //   Confirmed against jq 1.7.1:
-    //   `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
-    //   prints only `[{"start":0,"end":2}]` before raising `t`.
-    let starts_len = if target_escape.is_some() || ends_escaped {
+    // `target`'s own escape still wins over both `end` and `start` (#1517)
+    // -- it's known upfront, unaffected by `end`'s new per-`s` timing, so
+    // `starts` is truncated to just its first value whenever `target`
+    // escaped, exactly as before this fix: `target` escaping inside the
+    // very first `(s, t)` pair means neither bound generator is ever
+    // resumed for a second pair. Confirmed against jq 1.7.1:
+    // `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
+    // prints only `[{"start":0,"end":2}]` before raising `t`.
+    let starts_limit = if target_escape.is_some() {
         1
     } else {
         starts.len()
     };
-    let ends_len = if target_escape.is_some() {
-        1
-    } else {
-        ends.len()
-    };
-    let (starts, ends): (&[ResolvedSliceBound], &[ResolvedSliceBound]) =
-        (&starts[..starts_len], &ends[..ends_len]);
-    // Innermost escape wins, same reasoning as the restriction above and
-    // the `ends.is_empty()` early return: `target` > `end` > `start` --
-    // `bounds_escape` already carries the `end` > `start` half.
-    let escape = target_escape.or(bounds_escape);
-    // A capacity failure here bypasses `escape` -- same reasoning as
-    // `resolve_index_expr`'s identical arm: `out` is always empty at this
-    // point, and a fresh error at this point takes the same priority a
-    // mid-loop failure already does further down in this function (its own
-    // `return Err((out, ...))` arms likewise don't fold `escape` in).
-    //
-    // Unlike `resolve_index_expr`, `optional` is *not* extended to a
-    // capacity failure here: this function's own doc comment deliberately
-    // narrows `?` to "only the final application of the resolved bounds to
-    // the target", explicitly excluding bound resolution and any check
-    // that isn't that final per-element application -- the same narrower
-    // convention `eval_slice_expr` (value position) already follows, unlike
-    // `eval_index_expr`'s broader "covers the indexing" scope. A capacity
-    // check is neither S/T's evaluation nor the final application; treating
-    // it as covered here would be extending `?` past what this function's
-    // own documented contract already draws the line at.
-    let mut out = match try_reserve_product(&[starts.len(), ends.len(), target_branches.len()]) {
-        Ok(out) => out,
-        Err(e) => return Err((Vec::new(), e.into())),
-    };
-    for (s, s_key) in starts {
-        for (e, e_key) in ends {
+
+    // No upfront `starts.len() * ends.len() * target_branches.len()`
+    // reservation baseline anymore (#2245, mirroring #2225): `ends.len()`
+    // is no longer known until each `s` iteration evaluates `T`, so there
+    // is nothing fixed to reserve before the loop starts. The per-pair
+    // `try_reserve` call inside the loop still protects every real
+    // allocation; only the upfront-baseline optimization is gone, not the
+    // overflow protection itself.
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+
+    // The shared exit every escape arm below funnels through, so folding
+    // the running `out` in as a `Partial`-equivalent prefix can't drift
+    // between arms -- mirrors #2225's identical `escape!` macro in
+    // `eval_slice_expr`.
+    macro_rules! escape {
+        ($control:expr) => {
+            return Err((out, $control))
+        };
+    }
+
+    'outer: for (s, s_key) in &starts[..starts_limit] {
+        // #2245: `T` (`end`) evaluated fresh for this `s`, not once
+        // overall. An empty `T` for this `s` contributes nothing and moves
+        // on to the next `s` (verified live: a `T` that's empty only for
+        // `s == 0` still lets `s == 1` run and contribute its own output —
+        // not a whole-function short-circuit the way an entirely-empty `S`
+        // is). A `T` that produces some values before escaping processes
+        // those values first, then folds the running `out` in as the
+        // escape's prefix, same as every other per-iteration escape in
+        // this function.
+        let (ends, ends_escape) = match resolve_slice_bound::<S>(end, value, f64::ceil) {
+            Ok(v) => v,
+            Err(e) => escape!(e),
+        };
+        // `target` escaping still caps this `s`'s own `T` stream to a
+        // single pair too, same reasoning as `starts_limit` above.
+        let ends_limit = if target_escape.is_some() {
+            1
+        } else {
+            ends.len()
+        };
+        for (e, e_key) in &ends[..ends_limit] {
+            if out.try_reserve(target_branches.len()).is_err() {
+                escape!(cannot_reserve_cross_product(&[target_branches.len()]).into());
+            }
             // #1326: a genuinely dynamic bound (unlike a literal one, which
             // the parser's own `fold_slice_bound` handles at parse time)
             // keeps its float spelling the same way -- each bound's key is
@@ -25385,7 +25398,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 let next_value = match slice_owned_value_read::<S>(target_value, *s, *e, false) {
                     Ok(v) => v.expect("non-optional slice yields a value or errors"),
                     Err(_) if optional => continue,
-                    Err(e) => return Err((out, e.into())),
+                    Err(e) => escape!(e.into()),
                 };
                 let path = PathPrefix::extend(
                     components,
@@ -25399,8 +25412,36 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 out.push(PathBranch::new(path, Cow::Owned(next_value), true));
             }
         }
+        // #2245: this `s`'s own `T` evaluation may have produced some
+        // values before escaping (a break/halt/error partway through `T`'s
+        // own stream) -- fold the running `out` in as that escape's
+        // prefix, same as every other per-iteration escape above.
+        if let Some(control) = ends_escape {
+            escape!(control);
+        }
+        // `target` escaped: only `starts[0]`'s own pair was ever tried
+        // (`starts_limit` above already caps the loop to one iteration in
+        // this case, so this is reached at most once and only as the
+        // natural end of that one iteration -- not a second truncation).
+        if target_escape.is_some() {
+            break 'outer;
+        }
     }
-    path_result(out, escape)
+    // #1528: `start`'s own trailing escape info still has to reach the
+    // final result -- a successful loop doesn't mean `start` itself didn't
+    // escape after producing `out`'s own values. `end`'s own trailing
+    // escape is handled per-`s` above (#2245), via `escape!`, not here.
+    // `target`'s escape, by contrast, only *breaks* the loop above rather
+    // than returning through `escape!` (its own `out` contribution, if
+    // any, is already the accumulated `out` at that point) -- so it still
+    // has to be folded in here, taking priority over `starts_escape`
+    // exactly as the three-way priority (`target` > `end` > `start`)
+    // requires. Missing this dropped `target`'s escape entirely (found in
+    // this fix's own live-oracle verification): `path((select((true,
+    // error("t"))))[(0,1):(2,3)])` on `[10,20,30]` produced the correct
+    // `[{"start":0,"end":2}]` prefix but silently exited 0 instead of
+    // raising `t`.
+    path_result(out, target_escape.or(starts_escape))
 }
 
 /// One resolved slice bound, paired with the [`NumberKey`] it should
