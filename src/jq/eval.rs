@@ -11624,14 +11624,17 @@ fn yaml_quote_string(s: &str) -> String {
 /// Builtin: tostring - convert any value to string
 fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable value must
-    // raise, not silently stringify as "".
-    match to_owned(&value) {
-        Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned))),
-        Err(e) => QueryResult::Error(e),
-    }
+    // raise, not silently stringify as "". #2184: `..._or_suppress`, not
+    // unconditional `to_owned` -- no doc comment anywhere claims this
+    // builtin has a principled reason to ignore `optional` (contrast
+    // `builtin_recurse_f`'s own doc comment, which gives one for its unused
+    // `optional`), so hardcoding a raise here was the same accidental miss
+    // #2015 fixed for `IN(s)`/`IN(src;s)`.
+    let owned = to_owned_or_suppress!(&value, optional);
+    QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
 }
 
 /// Builtin: tonumber - convert string to number
@@ -11879,14 +11882,14 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: tojson - convert any value to JSON string
 fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable value must
-    // raise, not silently serialize with "" in its place.
-    match to_owned(&value) {
-        Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned))),
-        Err(e) => QueryResult::Error(e),
-    }
+    // raise, not silently serialize with "" in its place. #2184: see
+    // `builtin_tostring`'s identical reasoning -- no principled exemption
+    // documented anywhere for this sibling either.
+    let owned = to_owned_or_suppress!(&value, optional);
+    QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned)))
 }
 
 /// Builtin: fromjson - parse JSON string to value
@@ -12801,14 +12804,13 @@ fn index_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     idx_expr: &Expr,
     value: StandardJson<'a, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'a, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable input must
-    // raise, not silently seed the fold with "" in its place.
-    let current = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // raise, not silently seed the fold with "" in its place. #2184: see
+    // `builtin_tostring`'s identical reasoning -- no principled exemption
+    // documented anywhere for this sibling either.
+    let current = to_owned_or_suppress!(&value, optional);
     match eval_owned_multi::<S>(&Expr::Iterate, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
         Err(e) => e.into(),
@@ -12822,13 +12824,12 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     stream: &Expr,
     idx_expr: &Expr,
     value: StandardJson<'a, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: see `builtin_upper_index`'s identical reasoning.
-    let current = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // #1755: see `builtin_upper_index`'s identical reasoning. #2184: same
+    // `..._or_suppress` fix, same reasoning -- no principled exemption
+    // documented anywhere for this sibling either.
+    let current = to_owned_or_suppress!(&value, optional);
     match eval_owned_multi::<S>(stream, &current) {
         Ok(rows) => build_upper_index::<W, S>(rows, idx_expr),
         Err(e) => e.into(),
@@ -12888,17 +12889,16 @@ fn rindex_with_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: tojsonstream - convert to JSON text stream format (simplified)
 fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     // Simplified: just return the value as JSON lines format
     //
     // #1820: to_owned, not to_owned_lossy -- an undecodable string
     // anywhere in `value` used to silently become `""` in the *actual
-    // streamed output* below, not just an error message.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // streamed output* below, not just an error message. #2184:
+    // `..._or_suppress`, not unconditional `to_owned` -- no principled
+    // exemption documented anywhere for this sibling either.
+    let owned = to_owned_or_suppress!(&value, optional);
     fn collect_stream(
         value: &OwnedValue,
         path: &mut Vec<OwnedValue>,
@@ -33410,14 +33410,13 @@ fn collect_tostream_events(
 /// Builtin: tostream - jq-compatible stream of `[path,value]` / `[path]` events
 fn builtin_tostream<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable value must
-    // raise, not silently stream events for "" in its place.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // raise, not silently stream events for "" in its place. #2184:
+    // `..._or_suppress`, not unconditional `to_owned` -- no principled
+    // exemption documented anywhere for this sibling either.
+    let owned = to_owned_or_suppress!(&value, optional);
     let mut events = Vec::new();
     collect_tostream_events(&owned, &mut Vec::new(), &mut events);
     // Always non-empty: every value (including an empty container or a
@@ -44457,6 +44456,218 @@ mod tests {
             cursor.value(),
             true,
         ) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_tostring` had the identical shape as `IN(s)`
+    /// (#2015) -- an unused `_optional` and an unconditional `to_owned`.
+    /// See `test_builtin_upper_in_respects_optional_for_malformed_member_error_2015`'s
+    /// doc comment for the full reasoning; no principled exemption is
+    /// documented anywhere for this sibling either.
+    #[test]
+    fn test_builtin_tostring_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too -- the fix routes through `to_owned_or_suppress!`, which never
+    /// suppresses `is_decode_failure()`.
+    #[test]
+    fn test_builtin_tostring_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_tojson` had the identical shape. See
+    /// `test_builtin_tostring_respects_optional_for_malformed_member_error_2184`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_tojson_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too, same reasoning as `builtin_tostring`'s matching test.
+    #[test]
+    fn test_builtin_tojson_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_upper_index` (`INDEX(idx_expr)`) had the identical
+    /// shape. See
+    /// `test_builtin_tostring_respects_optional_for_malformed_member_error_2184`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_upper_index_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let idx_expr = Expr::field("a");
+        match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too, same reasoning as `builtin_tostring`'s matching test.
+    #[test]
+    fn test_builtin_upper_index_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let idx_expr = Expr::field("a");
+        match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_upper_index_stream` (`INDEX(stream; idx_expr)`) had
+    /// the identical shape. See
+    /// `test_builtin_tostring_respects_optional_for_malformed_member_error_2184`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_upper_index_stream_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let stream_expr = Expr::Identity;
+        let idx_expr = Expr::field("a");
+        match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
+            &stream_expr,
+            &idx_expr,
+            cursor.value(),
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
+            &stream_expr,
+            &idx_expr,
+            cursor.value(),
+            false,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too, same reasoning as `builtin_tostring`'s matching test.
+    #[test]
+    fn test_builtin_upper_index_stream_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let stream_expr = Expr::Identity;
+        let idx_expr = Expr::field("a");
+        match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
+            &stream_expr,
+            &idx_expr,
+            cursor.value(),
+            true,
+        ) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_tojsonstream` had the identical shape. See
+    /// `test_builtin_tostring_respects_optional_for_malformed_member_error_2184`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_tojsonstream_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too, same reasoning as `builtin_tostring`'s matching test.
+    #[test]
+    fn test_builtin_tojsonstream_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2184: `builtin_tostream` had the identical shape. See
+    /// `test_builtin_tostring_respects_optional_for_malformed_member_error_2184`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_tostream_respects_optional_for_malformed_member_error_2184() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        match builtin_tostream::<Vec<u64>>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_tostream::<Vec<u64>>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2184: a genuine decode failure must still survive `optional` here
+    /// too, same reasoning as `builtin_tostring`'s matching test.
+    #[test]
+    fn test_builtin_tostream_decode_failure_survives_optional_2184() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        match builtin_tostream::<Vec<u64>>(cursor.value(), true) {
             QueryResult::Error(e) => assert!(e.is_decode_failure()),
             other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
         }
