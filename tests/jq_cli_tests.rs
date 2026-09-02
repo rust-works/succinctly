@@ -18431,6 +18431,77 @@ fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result
     Ok(())
 }
 
+/// #2058 code review (Finding 1): `path()`'s new `PathTrail`-based
+/// value/path tracking (`path_walk_generic`/`path_walk_pipe_generic`/
+/// `path_step_generic`/`path_step_pipe_generic`, `eval_generic.rs`) recurses
+/// once per component of a static chain with no depth cap of its own --
+/// before this fix, `path(.a.a.a...)` with enough repeated `.a` segments
+/// crashed with a raw stack overflow (`fatal runtime error: stack overflow,
+/// aborting`, SIGABRT, no diagnostic at all) rather than any clean error,
+/// confirmed live with 1,000,000 segments at review. This test uses a much
+/// smaller, CI-friendly depth that still clears `MAX_NESTING_DEPTH` (256,
+/// #2061's cursor-native fast path this shape reaches) -- the crash
+/// reproduces at any depth past that limit, not only at a million.
+/// `path(.a.a.a...)` alone is fully cursor-navigable
+/// (`path_expr_is_cursor_navigable`), so this reaches the same #1793
+/// `catch_unwind` this file's other adversarial-nesting tests above already
+/// pin -- matching their exact assertion shape.
+#[test]
+fn test_path_cursor_native_deep_static_chain_reports_cleanly_not_stack_overflow_2058() -> Result<()>
+{
+    let filter = format!("path({})", ".a".repeat(300));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2058 code review (Finding 1) sibling: the *non*-cursor-navigable route
+/// (a trailing `Expr::Slice` routes `path()` to `eval.rs`'s
+/// `builtin_path_on_owned`/`walk_path`/`walk_pipe`/`step_into` instead of
+/// `eval_generic.rs`'s cursor-native walk, since `path_expr_is_cursor_
+/// navigable` rejects a `Slice` component, #2061) shares the identical
+/// unbounded-recursion shape, guarded there by the file-appropriate
+/// `MAX_VALUE_TREE_DEPTH` (384) instead of `MAX_NESTING_DEPTH`.
+///
+/// Unlike the sibling test above, this route is *not* wrapped by the CLI's
+/// `catch_unwind`: `nesting_depth_panic_message`'s own doc comment records
+/// that a `MAX_VALUE_TREE_DEPTH` panic is a deliberately different failure
+/// class (filter-driven value growth, e.g. `reduce`, rather than document
+/// nesting) that this CLI leaves uncaught here on purpose, matching every
+/// other pre-existing caller of `assert_value_tree_depth` -- confirmed live
+/// and identical on unmodified `main` via
+/// `reduce range(400) as $i (null; [.])`, which panics uncaught (exit 101,
+/// no `catch_unwind` reformatting) today. So this test asserts only that
+/// the failure is an ordinary, bounded Rust panic -- a clean depth-limit
+/// message, deterministic, no corrupted process state -- rather than a
+/// stack overflow (unrecoverable, no message, `SIGABRT`); it does not (and,
+/// per the above, should not) assert a specific caught-and-reformatted exit
+/// code the way the cursor-native sibling above does.
+#[test]
+fn test_path_non_cursor_native_deep_static_chain_panics_cleanly_not_stack_overflow_2058(
+) -> Result<()> {
+    let filter = format!("path({}[0:1])", ".a".repeat(500));
+    let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("{}"))?;
+    assert_ne!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 384"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2066 review: a `LazySeq`-backed builtin (`map`/`reverse`/`sort_by`/
 /// `unique_by`/...) must stay atomic on malformed content the same way it
 /// already was on adversarial nesting depth (the test above) -- nothing on

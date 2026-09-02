@@ -8819,6 +8819,18 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
+    // Panics past `MAX_NESTING_DEPTH` levels (code review on #2058), the
+    // same guard `collect_paths_generic` already carries for its own
+    // recursive path-array walk in this file. `PathTrail` has no depth cap
+    // of its own -- a static chain (`path(.a.a.a...)`) recurses this
+    // function's own call graph (`path_walk_pipe_generic`/`path_step_
+    // generic`/`path_step_pipe_generic` below all funnel back through it)
+    // once per component with no limit, and a million-component chain
+    // overflowed the native stack and aborted the process outright
+    // (confirmed live) once this PR's fix made `path()` fast enough to
+    // reach that depth in practice -- pre-fix, the O(d^2) cost made the
+    // same input time out long before ever getting there.
+    assert_nesting_depth(path.depth());
     match expr {
         Expr::Identity => {
             out.push(OwnedValue::Array(path.to_vec()));
@@ -8880,6 +8892,10 @@ fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
+    // See `path_walk_generic`'s own doc comment -- this function recurses
+    // into itself once per pipe stage without ever passing back through
+    // that entry check, so it needs its own (#2058 code review).
+    assert_nesting_depth(path.depth());
     let Some((first, rest)) = exprs.split_first() else {
         out.push(OwnedValue::Array(path.to_vec()));
         return Ok(());
@@ -8912,6 +8928,8 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
     collapse_duplicate_keys: bool,
     out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
 ) -> Result<(), EvalError> {
+    // See `path_walk_generic`'s own doc comment (#2058 code review).
+    assert_nesting_depth(path.depth());
     match expr {
         Expr::Identity => {
             out.push((Rc::clone(path), node.clone()));
@@ -9080,6 +9098,10 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     collapse_duplicate_keys: bool,
     out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
 ) -> Result<(), EvalError> {
+    // See `path_walk_generic`'s own doc comment -- like `path_walk_pipe_
+    // generic`, this recurses into itself once per pipe stage (#2058 code
+    // review).
+    assert_nesting_depth(path.depth());
     let Some((first, rest)) = exprs.split_first() else {
         out.push((Rc::clone(path), node.clone()));
         return Ok(());
