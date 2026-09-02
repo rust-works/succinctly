@@ -31629,3 +31629,119 @@ fn test_foreach_advance_does_not_carry_register_past_a_caught_navigation_2046() 
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     Ok(())
 }
+
+/// #1576 moved every shape `can_use_m2_streaming` admits onto the cursor
+/// streamer, which quietly took the *existing* suite's only coverage of
+/// `print_json`'s own pretty-container, empty-container, `null`/`true`,
+/// escaped-string and duplicate-key-collapse branches with it -- those
+/// branches are still live (any run the gate declines reaches them: `-S`,
+/// `--arg`, `-r`, `--unbuffered`, `--ascii-output`, a computing filter),
+/// they simply stopped being *reached* by the identity queries that used to
+/// cover them.
+///
+/// Rather than re-pin each branch's output in isolation, this pins the
+/// property that makes two printers safe to keep: for every shape below the
+/// M2 path and the DOM path must agree with each other *and* with real jq.
+/// `--unbuffered` is the cheapest way to force the DOM path for an
+/// otherwise-streamable filter (it is one of `can_json_fast_path`'s own
+/// exclusions, for reasons unrelated to output shape), so each case runs
+/// twice over one input.
+///
+/// Every `expected` below is jq 1.7.1's own output for that input and flag
+/// set, captured from the pinned oracle binary.
+#[test]
+fn test_m2_and_dom_printers_agree_on_every_container_shape_1576() -> Result<()> {
+    let wide_object = {
+        let mut s = String::from("{");
+        // > `PAIRWISE_SPAN_SCAN_LIMIT` (16) fields, so the duplicate-key
+        // probe takes its hashing path rather than the pairwise scan.
+        for i in 0..20 {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"k{i}\":{i}"));
+        }
+        s.push('}');
+        s
+    };
+
+    let cases: &[(&str, &[&str], &str)] = &[
+        // Pretty containers: nested array, nested empty object.
+        (
+            r#"[1,[2,3],{"a":{}}]"#,
+            &["--indent", "2"],
+            "[\n  1,\n  [\n    2,\n    3\n  ],\n  {\n    \"a\": {}\n  }\n]\n",
+        ),
+        // Pretty scalars and both empty containers in one array.
+        (
+            r#"[null,true,[],{},"s"]"#,
+            &["--indent", "2"],
+            "[\n  null,\n  true,\n  [],\n  {},\n  \"s\"\n]\n",
+        ),
+        // Two distinct plain keys: the duplicate-key probe's early "nothing
+        // repeats, nothing escaped" answer.
+        (r#"{"a":1,"b":2}"#, &["-c"], "{\"a\":1,\"b\":2}\n"),
+        // Wide object: same answer, hashing path.
+        (&wide_object, &["-c"], "{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8,\"k9\":9,\"k10\":10,\"k11\":11,\"k12\":12,\"k13\":13,\"k14\":14,\"k15\":15,\"k16\":16,\"k17\":17,\"k18\":18,\"k19\":19}\n"),
+        // An escaped *key* forces the decode-and-re-encode key writer.
+        (r#"{"a\tb":1,"c":2}"#, &["-c"], "{\"a\\tb\":1,\"c\":2}\n"),
+        // An escaped *value* forces the same for the value writer.
+        (
+            "{\"a\":\"x\\ty\",\"b\":\"\u{e9}\"}",
+            &["-c"],
+            "{\"a\":\"x\\ty\",\"b\":\"\u{e9}\"}\n",
+        ),
+        // `--ascii-output` re-encodes an unescaped span it would otherwise
+        // echo verbatim -- once for a value, once for a key.
+        (
+            "{\"a\":\"\u{e9}\"}",
+            &["-c", "--ascii-output"],
+            "{\"a\":\"\\u00e9\"}\n",
+        ),
+        (
+            "{\"k\u{e9}\":1}",
+            &["-c", "--ascii-output"],
+            "{\"k\\u00e9\":1}\n",
+        ),
+    ];
+
+    for (input, flags, expected) in cases {
+        let mut m2_args: Vec<&str> = flags.to_vec();
+        m2_args.push(".");
+        let (m2_out, m2_err, m2_code) = run_jq_full(&m2_args, Some(input))?;
+        assert_eq!(m2_code, 0, "input {input:?}: stderr {m2_err:?}");
+        assert_eq!(&m2_out, expected, "M2 path, input {input:?}");
+
+        let mut dom_args: Vec<&str> = vec!["--unbuffered"];
+        dom_args.extend_from_slice(flags);
+        dom_args.push(".");
+        let (dom_out, dom_err, dom_code) = run_jq_full(&dom_args, Some(input))?;
+        assert_eq!(dom_code, 0, "input {input:?}: stderr {dom_err:?}");
+        assert_eq!(
+            dom_out, m2_out,
+            "DOM path must render {input:?} exactly as the M2 path does"
+        );
+    }
+
+    Ok(())
+}
+
+/// #1576's `LazySeq` arm buffers its whole render before touching `out`, so
+/// a `halt` raised while draining has to unwind through that buffer rather
+/// than through a partially-written stdout: the buffer is dropped, the halt
+/// code is handed to the `ErrorSink`, and nothing is printed.
+///
+/// `halt` has to ride in on a sub-expression the M2 gate still admits --
+/// `select`'s condition and `sort_by`'s key expression are both passed over
+/// without recursion, so they can carry one where an `if` body cannot.
+/// Verified against jq 1.7.1: both print nothing and exit 0.
+#[test]
+fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
+    for filter in ["map(select(halt))", "sort_by(halt)", "unique_by(halt)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert_eq!(stderr, "", "{filter}");
+        assert_eq!(code, 0, "{filter}");
+    }
+    Ok(())
+}

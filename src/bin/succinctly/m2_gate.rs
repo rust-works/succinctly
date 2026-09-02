@@ -161,3 +161,67 @@ pub fn can_use_m2_streaming(expr: &Expr) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Expr::NthExpr` shares its gate arm with `Expr::Limit` and
+    /// `Builtin::NthStream`, but is never constructed by the parser -- a CLI
+    /// `nth(n; expr)` always parses through `Builtin::NthStream` (see
+    /// `install_def_calls_descends_into_nth_expr_1371` in `src/jq/eval.rs`
+    /// for the same constraint on the evaluator side). Sharing one arm is
+    /// only correct while all three answer the same way, so the arm is
+    /// exercised directly here rather than left to whichever alternative the
+    /// CLI happens to reach: the gate must recurse into `expr` (streamable
+    /// body streams, computing body doesn't) and must ignore `n` entirely,
+    /// which is always evaluated as a single control value and never
+    /// streamed.
+    #[test]
+    fn nth_expr_gate_arm_recurses_into_expr_only_1576() {
+        let streamable = || Expr::NthExpr {
+            n: Box::new(Expr::Identity),
+            expr: Box::new(Expr::Iterate),
+        };
+        assert!(
+            can_use_m2_streaming(&streamable()),
+            "a streamable body must stream through NthExpr"
+        );
+
+        assert!(
+            !can_use_m2_streaming(&Expr::NthExpr {
+                n: Box::new(Expr::Identity),
+                expr: Box::new(Expr::Builtin(Builtin::Length)),
+            }),
+            "a computing body must keep the DOM path"
+        );
+
+        // `n` is never recursed into: a non-streamable `n` alongside a
+        // streamable `expr` still streams.
+        assert!(
+            can_use_m2_streaming(&Expr::NthExpr {
+                n: Box::new(Expr::Builtin(Builtin::Length)),
+                expr: Box::new(Expr::Iterate),
+            }),
+            "n is a control value, not part of the streamed shape"
+        );
+
+        // The two alternatives sharing this arm must agree with it.
+        assert_eq!(
+            can_use_m2_streaming(&streamable()),
+            can_use_m2_streaming(&Expr::Limit {
+                n: Box::new(Expr::Identity),
+                expr: Box::new(Expr::Iterate),
+            }),
+            "Expr::Limit shares NthExpr's arm and must answer the same"
+        );
+        assert_eq!(
+            can_use_m2_streaming(&streamable()),
+            can_use_m2_streaming(&Expr::Builtin(Builtin::NthStream(
+                Box::new(Expr::Identity),
+                Box::new(Expr::Iterate),
+            ))),
+            "Builtin::NthStream shares NthExpr's arm and must answer the same"
+        );
+    }
+}

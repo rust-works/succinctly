@@ -3611,6 +3611,167 @@ mod tests {
         assert_eq!(out, r#"{"a":[],"b":{},"c":[1,{},[]]}"#);
     }
 
+    // #1576 coverage: `scalar_end_pos`'s `false`/`null` arms are the two
+    // fixed-width literals whose byte length differs from `true`'s, and the
+    // trailing-comma check (`[1, false,]`) is wrong by one byte if either
+    // width is. The streaming array arm is the only caller, so the widths
+    // are pinned through it: a container whose *last* element is the
+    // literal under test, once well-formed and once with a stray trailing
+    // comma that only lands on `]` if the width was right.
+    #[test]
+    fn test_stream_json_pretty_scalar_end_pos_false_and_null_1576() {
+        for (json, expected) in [
+            (&b"[1, false]"[..], "[1,false]"),
+            (&b"[1, null]"[..], "[1,null]"),
+            (&b"[1, true]"[..], "[1,true]"),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let mut out = String::new();
+            root.stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::JqCompat,
+            )
+            .unwrap();
+            assert_eq!(out, expected, "input {}", String::from_utf8_lossy(json));
+        }
+
+        for json in [&b"[1, false,]"[..], &b"[1, null,]"[..], &b"[1, true,]"[..]] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let mut out = String::new();
+            let err = root
+                .stream_json(
+                    &mut out,
+                    IndentSpec::COMPACT,
+                    false,
+                    JsonConvention::JqCompat,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, StreamFailure::Decode(_)),
+                "input {}: {err:?}",
+                String::from_utf8_lossy(json)
+            );
+        }
+    }
+
+    // #1576 coverage: `trailing_gap_ok`'s loop can also run off the end of
+    // the text without ever meeting `close_char` -- an unterminated
+    // container. No document input reaches it (the semi-index rejects
+    // `[1` long before any streamer sees it), so the "ran out of text"
+    // answer is pinned directly: it must be `false` (not the `true` a
+    // whitespace-only tail gets), because a missing closer is exactly the
+    // malformation the check exists to catch.
+    #[test]
+    fn test_trailing_gap_ok_unterminated_container_1576() {
+        assert!(trailing_gap_ok(b"[1]", 2, b']'), "closer present");
+        assert!(
+            trailing_gap_ok(b"[1 \n ]", 2, b']'),
+            "whitespace then closer"
+        );
+        assert!(!trailing_gap_ok(b"[1", 2, b']'), "text ends before closer");
+        assert!(
+            !trailing_gap_ok(b"[1  ", 2, b']'),
+            "whitespace then end of text, still no closer"
+        );
+        assert!(!trailing_gap_ok(b"[1,]", 2, b']'), "stray comma");
+    }
+
+    // #1576 coverage: `write_json_number`'s `JqCompat` fallback chain. The
+    // semi-index accepts a number *span* more leniently than RFC 8259, so a
+    // trailing-dot mantissa (`1.`) reaches `from_number_bytes`, which parses
+    // it as a plain `Float` -- no source literal preserved.
+    //
+    // `1.` matches real jq (`[1.]` -> `[1]`, jq 1.7.1). `1.e999` does *not*:
+    // jq keeps the literal spelling (`[1E+999]`) where succinctly's
+    // `from_number_bytes` degrades it to an infinite `Float` and prints the
+    // clamped `JqSemantics` stand-in. That divergence is older than #1576
+    // and shared with the DOM printer (`--unbuffered` gives byte-identical
+    // output); it is pinned here as current behaviour, not endorsed --
+    // filed as #2220, which also notes that fixing it makes this test's
+    // `1.e999` rows read `1E+999` and may leave the non-finite arm below
+    // with no reachable caller at all.
+    #[test]
+    fn test_stream_json_number_invalid_span_float_fallback_1576() {
+        for (json, expected) in [
+            (&b"[1.]"[..], "[1]"),
+            (&b"[-1.]"[..], "[-1]"),
+            (&b"[1.e999]"[..], "[1.7976931348623157e+308]"),
+            (&b"[-1.e999]"[..], "[-1.7976931348623157e+308]"),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let mut out = String::new();
+            root.stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::JqCompat,
+            )
+            .unwrap();
+            assert_eq!(out, expected, "input {}", String::from_utf8_lossy(json));
+        }
+    }
+
+    // #1576 coverage: `write_json_string_pretty`'s escaping arms. The
+    // zero-copy fast path only fires for a span with no `\`, so an escaped
+    // string is what reaches the decode-and-re-encode tail -- and the arm
+    // taken there is `numbers`'s, not the output format's. `Preserve` is
+    // reachable from the CLI as `succinctly jq --preserve-input` with any
+    // non-compact/sorting output style (compact `Preserve` short-circuits
+    // to the raw echo in `stream_json` before this writer is reached).
+    #[test]
+    fn test_stream_json_escaped_string_both_conventions_1576() {
+        let json = br#"{"a": "x\ty"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        root.stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::JqCompat,
+        )
+        .unwrap();
+        assert_eq!(out, r#"{"a":"x\ty"}"#);
+
+        let mut out = String::new();
+        root.stream_json(
+            &mut out,
+            IndentSpec::spaces(2),
+            false,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
+        assert_eq!(out, "{\n  \"a\": \"x\\ty\"\n}");
+    }
+
+    // #1576 coverage: `stream_json_sequence`'s empty case. `map(...)` over
+    // an empty array (or one whose every element a `select` dropped) drains
+    // to zero cursors, and the writer still owes the caller a well-formed
+    // `[]` -- not the bare `[` + `]` the general loop would emit around no
+    // elements at a non-zero indent.
+    #[test]
+    fn test_json_cursor_streams_empty_sequence_json_1576() {
+        let cursors: [JsonCursor<'_, Vec<u64>>; 0] = [];
+        for indent in [IndentSpec::COMPACT, IndentSpec::spaces(2)] {
+            let mut out = String::new();
+            JsonCursor::stream_sequence_json(
+                &cursors,
+                &mut out,
+                indent,
+                false,
+                JsonConvention::Preserve,
+            )
+            .unwrap();
+            assert_eq!(out, "[]");
+        }
+    }
+
     #[test]
     fn test_stream_yaml_rejects_sort_keys() {
         let json = br#"{"b": 1, "a": 2}"#;
