@@ -2275,7 +2275,24 @@ where
     let mut pending_first: Option<QueryResult<'a, W>> = None;
 
     let flow = eval_each::<W, S>(arg_expr, value.clone(), optional, &mut |item| {
-        let owned = item_to_owned(item);
+        // #2023: a decode failure here must raise, not silently substitute
+        // an undecodable argument value with `""` (`item_to_owned`'s own
+        // #1746-shaped bug, in this lazy sink specifically). Same
+        // flush-then-stop shape as `body`'s own escape below -- a buffered
+        // first result must be flushed ahead of this control too.
+        let owned = match item_to_owned_checked(item) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(previous) = pending_first.take() {
+                    if let Some(control) = push_owned_values(previous, &mut out) {
+                        body_control = Some(control);
+                        return Demand::Stop;
+                    }
+                }
+                body_control = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
         if let Some(previous) = pending_first.take() {
             if let Some(control) = push_owned_values(previous, &mut out) {
                 body_control = Some(control);
@@ -2492,6 +2509,22 @@ fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
     }
 }
 
+/// [`to_owned_checked`]-backed twin of [`item_to_owned`] (#2023): raises a
+/// decode failure instead of silently substituting `""` for an undecodable
+/// `Item::Borrowed` string -- the same #1746 bug shape, here in
+/// `fanout_arg`'s lazy generator-argument sink. `Item::Owned` is already
+/// materialized (came from a variable binding or a computed value, not a
+/// fresh document decode), so there's nothing to check there, same as
+/// `item_to_owned`'s own `Owned` arm.
+fn item_to_owned_checked<W: Clone + AsRef<[u64]>>(
+    item: Item<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    match item {
+        Item::Owned(v) => Ok(v),
+        Item::Borrowed(v) => to_owned_checked(&v),
+    }
+}
+
 /// [`fanout_two_args`]'s [`ArgFanout::All`] path, pulling both generators on
 /// demand so neither is evaluated past the point jq would stop (#1531).
 ///
@@ -2513,9 +2546,23 @@ where
     let mut escape: Option<Control> = None;
 
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
-        let o = item_to_owned(outer_item);
+        // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
+        // for both generators here.
+        let o = match item_to_owned_checked(outer_item) {
+            Ok(v) => v,
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
-            let i = item_to_owned(inner_item);
+            let i = match item_to_owned_checked(inner_item) {
+                Ok(v) => v,
+                Err(e) => {
+                    escape = Some(Control::Error(e));
+                    return Demand::Stop;
+                }
+            };
             match push_owned_values(body(o.clone(), i), &mut out) {
                 Some(control) => {
                     escape = Some(control);
@@ -45589,6 +45636,70 @@ mod tests {
         query!(
             b"{\"a\": \"\xff\xfe\"}",
             r#".a | rtrimstr("x")"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2023: `item_to_owned`'s bare `to_owned` -- `fanout_arg`'s lazy sink
+    /// for a generator-argument builtin's ArgFanout::All path (`test`,
+    /// `match`, `capture`, `scan`, `ltrimstr`, `has`, ...) -- silently
+    /// substituted an undecodable *argument* value with `""` instead of
+    /// raising, the same #1746/#1660 bug shape as the tests above but for
+    /// the argument side rather than the ambient/trimmed-string side.
+    ///
+    /// `has(.b)` on `{"a":1,"b":"<bad>"}` isolates this cleanly: `has`'s own
+    /// ambient (the whole object) never needs a string-decode check itself
+    /// (unlike `test`'s ambient, which must already decode as a string to
+    /// match against at all -- confirmed by hand that a `test((., ...))`
+    /// construction is *not* a valid test here, since it hits `test`'s own
+    /// pre-existing ambient-value decode check first regardless of this
+    /// fix), so the only decode failure this repro can hit is the key
+    /// generator's own, via `item_to_owned`. `.b` is a direct sibling-field
+    /// navigation (not a `$var` binding, which instead materializes to
+    /// `Item::Owned` before reaching this sink and so doesn't exercise the
+    /// bug -- confirmed via debug tracing), preserving the borrowed
+    /// document cursor this fix targets. Confirmed pre-fix this gave
+    /// `Owned(Bool(false))` (silent `""` substitution -> `has("")` -> no
+    /// such field) instead of raising.
+    #[test]
+    fn test_fanout_arg_item_to_owned_raises_decode_failure_2023() {
+        query!(
+            b"{\"a\":1,\"b\":\"\xff\xfe\"}",
+            r"has(.b)",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2023 code review: `fanout_two_args_lazy` (used by two-generator
+    /// builtins, e.g. `setpath(path; value)`) has its own, independent pair
+    /// of `item_to_owned` call sites -- outer and inner -- needing the
+    /// identical fix. `setpath`'s ambient is the whole document being
+    /// modified, never itself string-decode-checked (unlike `test`'s
+    /// ambient -- see the test above), isolating each generator's own
+    /// decode failure cleanly. Both generators navigate a direct sibling
+    /// field (`.b`), not a `$var` binding. Confirmed pre-fix: the outer
+    /// (value) case silently succeeded (`{"x":""}` written); the inner
+    /// (path) case silently corrupted the path to `""`, surfacing as the
+    /// unrelated "Path must be specified as an array" instead of a decode
+    /// failure -- neither raised the correct error.
+    #[test]
+    fn test_fanout_two_args_lazy_item_to_owned_raises_decode_failure_2023() {
+        // Outer (value) generator's own decode failure.
+        query!(
+            b"{\"a\":1,\"b\":\"\xff\xfe\"}",
+            r#"setpath(["x"]; .b)"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Inner (path) generator's own decode failure.
+        query!(
+            b"{\"a\":1,\"b\":\"\xff\xfe\"}",
+            r"setpath(.b; 5)",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
