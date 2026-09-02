@@ -240,7 +240,8 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// walk yields no children at all, which is exactly the gap
     /// `crate::json::light`'s own `empty_container_gap_ok`/`trailing_gap_ok`
     /// pair closed for the CLI's cursor-native writers (#1676) and this
-    /// closes for [`crate::jq::eval_generic::to_owned_cursor_at_depth`] (and
+    /// closes for `crate::jq::eval_generic::to_owned_cursor_at_depth` (a
+    /// private function, not linkable here) -- and
     /// therefore every `evaluate_bytes_lazy`-reachable filter that isn't one
     /// of that evaluator's natively-matched shapes, e.g. `if`/arithmetic/
     /// function calls) -- the one materializing conversion that still
