@@ -629,8 +629,9 @@ differs: falling through to `resolve_leaf`'s catch-all names the whole fold's ow
 blames. That is the same catch-all wording every unresolvable filter already gets here, and
 is the general message-fidelity gap covered above, not a fold-specific one.
 
-**Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467) and
-[#1872](https://github.com/rust-works/succinctly/issues/1872):** the fold's **source
+**Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
+[#1872](https://github.com/rust-works/succinctly/issues/1872) and
+[#2031](https://github.com/rust-works/succinctly/issues/2031):** the fold's **source
 expression** is now evaluated the same way jq evaluates it — `resolve_reduce`/
 `resolve_foreach` route the source through `resolve_fold_source`, which resolves it with
 tracking on via `resolve_node`, but only when the source's own AST contains a real
@@ -673,23 +674,43 @@ miss the navigation entirely when it happened on a later output of the same leaf
 reported the untracked `Cannot index number with string "a"` where jq reports the tracked
 `near attempt to access element "a" of 2`; both now agree.
 
-The all-untracked condition is load-bearing. A *trackable* branch means the source is itself
-a path expression in jq's eyes, and jq's fold then behaves in a way succinctly does not model
-at all — see the `foreach`-with-navigating-source divergence below. Such a source falls back
-to #1467's two-pass shape, unchanged. Randomised differential fuzzing against jq 1.7.1
-established that boundary: an unrestricted version regressed eleven of four thousand
-generated folds, every one of them a source with a trackable branch, and none without.
+A *trackable* branch means the source is itself a path expression in jq's eyes, and — since
+[#2031](https://github.com/rust-works/succinctly/issues/2031) — that is no longer treated as
+an all-or-nothing gate on the whole source stream. Every resolved branch becomes a real fold
+value regardless of its own trackability, and a trackable branch's own path rides along
+(`FoldSourceValue::register_path`) so `resolve_reduce`/`resolve_foreach` can seed a
+**per-step register from that element's own navigated position** while resolving *that*
+element's own UPDATE call, standing in for the fold's persistent, INIT-seeded register —
+reproducing jq's own single shared path register, which SOURCE's own navigation moves just as
+INIT's does. `foreach` applies this per UPDATE emission (its own doc comment on
+`resolve_foreach` has the full derivation, several confirmed-live examples included);
+`reduce` does not — its existing final re-entry-boundary re-check against the fold's
+*persistent* register (unrelated to #2031, predates it) already reproduces jq's own behavior
+there, and an earlier draft of this fix that also overrode `reduce`'s per-step register was
+caught regressing exactly that case by the differential fuzzer
+(`path(reduce (.[]) as $k (.; .))` on `{"a":[1,2]}` is `[]` in jq; the over-broad draft made
+it raise). A cruder, still-earlier attempt — streaming the resolved source values without
+threading the per-step register at all — is what originally established the "all-untracked"
+restriction this section used to describe: randomised differential fuzzing against jq 1.7.1
+found it regressed eleven of four thousand generated folds, every one of them a source with a
+trackable branch. #2031's fix keeps the values-streaming behavior that regression required but
+adds the register threading that closes it instead of reopening it; re-run against the same
+600-case seed (`.ai/scratch/sweep-path-fold-differential.py`), the "jq errors, succinctly
+succeeds" count for this whole fold-source area dropped from 67 to 3, with no increase in any
+other divergence category.
 
 Four residual divergences remain in this area:
 
-- **A `foreach` source that successfully navigates is refused outright by jq.**
-  `path(foreach (.a) as $k (.; .))` on `{"a":1}` raises `Invalid path expression with result
-  {"a":1}` and exits 5 in jq; succinctly prints `[]` and exits 0. jq's source evaluation
-  clobbers the same path register the fold's own emit checks, so the emit fails
-  `jv_identical`; succinctly's `FoldRegister` models the accumulator's provenance but not the
-  source's. The write side diverges the same way — `(foreach (.a) as $k (.; .)) = 9` mutates a
-  document jq refuses to touch. Pre-existing, unaffected by #1872, and tracked as
-  [#2031](https://github.com/rust-works/succinctly/issues/2031).
+- **A fold source whose navigation is discarded by a later non-navigating stage still
+  clobbers jq's real path register, undetected.** `path(foreach (.a|tostring) as $k (.; .a))`
+  on `{"a":1,"b":{"c":2}}` raises `Invalid path expression near attempt to access element "a"
+  of {"a":1,"b":{"c":2}}` in jq; succinctly prints `["a"]`. `.a` genuinely navigates (moving
+  jq's real register) before `tostring` — not itself a path primitive — discards that
+  provenance from the *source element's own* final value; `resolve_fold_source` only inspects
+  each element's final `PathBranch.trackable`, so a source like this looks exactly like an
+  ordinary computed value to it. Distinct from — and not closed by — #2031's fix, confirmed via
+  `git stash` A/B against the pre-#2031 build on `main` too. Tracked as
+  [#2159](https://github.com/rust-works/succinctly/issues/2159).
 
 - **An ordinary-error source is still evaluated twice, and now every output rather than just
   the first.** `resolve_fold_source` treats only `Halt` and
