@@ -10374,6 +10374,76 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
 
+        // #2053: mirrors `Builtin::Path`'s #1909 treatment above -- the `_`
+        // fallback below pays a materialize + re-serialize + re-index round
+        // trip of `value` *and* a second whole-document decode inside
+        // `eval::getpath_one_path`'s own `to_owned`, just to answer
+        // a single node lookup. Unlike `Path`, `getpath`'s root
+        // materialization is not waste to begin with (#1755/#1953): it is
+        // the exact same validity gate `to_owned_with_cursor` below already
+        // pays for -- `{"a":"\ud800","d":5} | getpath(["d"])` must still
+        // raise even though the walk never reaches `.a`, where `.d`/`keys`/
+        // `length` on the same document do not. Only the *second* decode
+        // and the reindex round trip go, not the first.
+        //
+        // The bypass-vs-fallback decision below is made purely from
+        // `owned`'s own shape (`reindex_bridge_is_identity`), *before*
+        // `path_expr` is touched at all. A withdrawn earlier attempt at
+        // this fix (PR #2045) instead probed `path_expr`'s output shape and
+        // fell back to a second, full re-evaluation when the probe didn't
+        // fit a recognized pattern, which fired any side effect inside
+        // `path_expr` twice: `getpath(("a"|stderr))` printed `aa` instead
+        // of jq's `a`. `fanout_arg_generic` is the fix for that shape
+        // (#1687, already used by `limit`/`nth`/`has` above): it drives
+        // `path_expr` lazily, exactly once, against the *original* cursor
+        // `value` -- so a `path_expr` that never touches `.` (the
+        // overwhelmingly common `getpath([0])`/`getpath(["a","b"])` shape)
+        // costs nothing extra beyond evaluating a small literal, and one
+        // that does touch `.` reads it through the same cheap cursor
+        // navigation any other builtin's argument already gets, rather than
+        // a second reindex of the whole document.
+        //
+        // Each resolved path then walks `owned` -- already materialized
+        // above -- directly via `getpath_walk_owned`, which is
+        // `eval::getpath_one_path`'s own walk with its `to_owned`
+        // call lifted out (mirrors `builtin_path_on_owned`'s identical
+        // relationship to `builtin_path`). `optional` is threaded through
+        // for real here, unlike `Path`/`Key`/`Parent`/`FileIndex`'s
+        // hardcoded `false` above -- `getpath_walk_owned` uses it to decide
+        // whether an indexing failure partway through a path raises or
+        // suppresses, so hardcoding it would be a real correctness risk if
+        // dispatch ever changed to reach here with `optional = true`.
+        // Review found no such reachable path today (`Expr::Optional`'s
+        // catch-all evaluates its inner expression at the *ambient*
+        // `optional`, same as the already-documented `Map`/`Select`
+        // precedent at `test_generic_plain_map_optional_on_non_container_is_unreachable_via_parser_725`,
+        // so `getpath(P)?` never actually forces `optional = true` into
+        // this arm) -- confirmed by swapping in a hardcoded `false` here
+        // and finding it byte-identical across the full `getpath` test
+        // suite. Threading it for real costs nothing and removes the
+        // dependency on that reachability analysis staying true, so it
+        // stays -- but it is defensive, not currently load-bearing.
+        Builtin::GetPath(path_expr) => {
+            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            if reindex_bridge_is_identity(&owned) {
+                return fanout_arg_generic::<S, V, _>(
+                    path_expr,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    |path_owned| {
+                        query_result_to_generic::<V>(crate::jq::eval::getpath_walk_owned::<
+                            Vec<u64>,
+                            S,
+                        >(
+                            &owned, path_owned, optional
+                        ))
+                    },
+                );
+            }
+            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
+        }
+
         Builtin::Empty => GenericResult::None,
 
         Builtin::ToString => {
