@@ -223,3 +223,5 @@ infinite_preview	scan(infinite)	"x"	number (1.797693134...) is not a string
 neg_infinite_preview	scan(-infinite)	"x"	number (-1.79769313...) is not a string
 nan_preview	scan(nan)	"x"	number (null) is not a string
 arithmetic_overflow_preview	scan(1e300*1e300)	"x"	number (1.797693134...) is not a string
+modulemeta_non_string	modulemeta	null	modulemeta input module name must be a string
+modulemeta_not_found	modulemeta	"foo"	module not found: foo
