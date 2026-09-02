@@ -584,7 +584,16 @@ impl BoundBody {
             return Ok(cached);
         }
         let bound = bind()?;
-        Ok(self.0.get_or_init(|| bound))
+        // `set`, not `get_or_init`: this cache is write-once by design (see
+        // the struct's own doc comment) because `bind` is not reentrant in
+        // this single-threaded evaluator. `set` makes that invariant
+        // self-checking -- a concurrent/reentrant write panics here instead
+        // of `get_or_init` silently discarding `bound` and returning
+        // whatever the other write raced in with.
+        self.0
+            .set(bound)
+            .expect("BoundBody set twice: bind() must not be reentrant");
+        Ok(self.0.get().expect("just set"))
     }
 }
 
@@ -2120,6 +2129,37 @@ mod tests {
             format!("{warm:?}"),
             "the cache must not affect Debug output"
         );
+    }
+
+    /// #2092 (finding #6): a second `get_or_try_init` call on an
+    /// already-populated `BoundBody` must return the cached value without
+    /// re-invoking `bind` -- confirms the early `self.0.get()` return still
+    /// holds after switching the populate path from `get_or_init` to `set`.
+    #[test]
+    fn test_bound_body_second_call_returns_cached_without_rebinding_2092() {
+        let bound = BoundBody::default();
+        let mut bind_calls = 0usize;
+        let first = bound
+            .get_or_try_init(|| {
+                bind_calls += 1;
+                Ok::<_, ()>(Rc::new(Expr::Identity))
+            })
+            .expect("first bind succeeds");
+        assert_eq!(**first, Expr::Identity);
+        assert_eq!(bind_calls, 1);
+
+        let second = bound
+            .get_or_try_init(|| {
+                bind_calls += 1;
+                Ok::<_, ()>(Rc::new(Expr::RecursiveDescent))
+            })
+            .expect("cached read succeeds");
+        assert_eq!(
+            **second,
+            Expr::Identity,
+            "must return the first bind's cached value, not re-bind"
+        );
+        assert_eq!(bind_calls, 1, "bind must not run a second time");
     }
 
     /// Same invariant as [`test_bound_body_is_invisible_to_eq_and_debug_1371`],
