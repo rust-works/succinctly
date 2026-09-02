@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors};
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, GenericResult,
+    check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, GenericResult, LazyElem,
     MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::map_builtin_subexprs;
@@ -4584,11 +4584,62 @@ fn generic_result_to_jq_values<'a, W: Clone + AsRef<[u64]>>(
         GenericResult::LazyIndexRange(len) => vec![JqValue::LazyIndexRange(len)],
         // `JqValue` needs no new variant for a composed `map` chain (#724,
         // #725): `JqValue::Array` already stores per-element cursors (its
-        // own "Phase 1 Lazy Optimization"), so materializing once here and
-        // wrapping via `from_owned` reuses the existing `write_json` path
-        // entirely.
-        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
-            Ok(v) => to_jq_values(v, at, sink),
+        // own "Phase 1 Lazy Optimization"). `drain_atomic`, not
+        // `materialize_atomic` (#2066): the latter round-trips every element
+        // through an `IndexMap`-backed `OwnedValue`, collapsing a duplicate
+        // object key inside a moved element (`sort`/`unique`/`reverse`'s own
+        // `LazySource::Cursors` #1687 case) even though `--preserve-input`'s
+        // whole point is not doing that. `drain_atomic` keeps each element's
+        // own cursor identity (or already-owned value, for a `map`-computed
+        // one), matching `ManyCursor`'s own per-element `JqValue::Cursor`
+        // mapping just above.
+        //
+        // `check_cursor_nesting_depth` per `Cursor` element (#2066 review,
+        // #1793 regression): `materialize_atomic`'s per-element
+        // `lazy_elem_to_owned` used to run `to_owned`'s `MAX_NESTING_DEPTH`
+        // panic-guard eagerly, before this arm ever returned -- satisfying
+        // the invariant the `catch_unwind` wrapper's own comment states
+        // ("`out`'s writer is never mid-record when the stack unwinds").
+        // Wrapping a raw cursor in `JqValue::Cursor` with no check at all
+        // defers depth validation to `write_json_at_depth`'s own *different*
+        // (`MAX_VALUE_TREE_DEPTH`, deeper) panic, fired *while* writing --
+        // confirmed live via `test_map_identity_reports_clean_error_on_adversarial_nesting_1793`
+        // regressing to exit 1 with a garbled partial-array line on stdout
+        // instead of a clean exit 5. This is a cheap structural walk (no
+        // value decoding/allocation), not the full deep copy
+        // `materialize_atomic` did, so it does not reintroduce what #2066
+        // was written to avoid.
+        GenericResult::LazySeq(seq) => match seq.drain_atomic() {
+            // All-or-nothing, matching `materialize_atomic`'s own atomicity
+            // contract ("real jq's array construction is all-or-nothing:
+            // `[1,2,"x"]|map(.+1)` prints nothing to stdout, only the stderr
+            // diagnostic") -- an early `return vec![]` on the first bad
+            // element, not a partial `JqValue::Array` of whatever converted
+            // before it (#2066 review: the naive `break`-and-fall-through
+            // shape printed an empty `[]` for a single-element failing
+            // array instead of suppressing it entirely).
+            Ok(elems) => {
+                let mut out = Vec::with_capacity(elems.len());
+                for elem in elems {
+                    match elem {
+                        LazyElem::Cursor(c) => match check_cursor_nesting_depth(&c, 0) {
+                            Ok(()) => out.push(JqValue::Cursor(c)),
+                            Err(e) => {
+                                sink.report(DiagStyle::Jq, &e, at);
+                                return vec![];
+                            }
+                        },
+                        LazyElem::Owned(v) => match JqValue::try_from_owned(v) {
+                            Ok(jq_value) => out.push(jq_value),
+                            Err(e) => {
+                                sink.report(DiagStyle::Jq, &e, at);
+                                return vec![];
+                            }
+                        },
+                    }
+                }
+                vec![JqValue::Array(out)]
+            }
             Err(jq::Control::Error(e)) => {
                 sink.report(DiagStyle::Jq, &e, at);
                 vec![]
@@ -5220,6 +5271,53 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
 /// like a leading-zero number (#1094) or a genuinely malformed document, so
 /// this walk is cold by construction and doesn't need `print_json`'s
 /// `known_text_pos` reuse trick.
+/// Bound a cursor's own structural nesting before it's wrapped in a
+/// `JqValue::Cursor` and deferred to write time (#2066 code review).
+///
+/// Every other producer of a lazy `JqValue` (`OneCursor`/`ManyCursor` above)
+/// already had this covered for free: a `sort`/`unique`/`reverse`/`map`
+/// `LazySeq` used to run through `materialize_atomic`'s per-element
+/// `to_owned`, whose `MAX_NESTING_DEPTH` panic-guard fired eagerly -- before
+/// `generic_result_to_jq_values` ever returned, let alone before any output
+/// write began, matching the `catch_unwind` wrapper's own documented
+/// invariant a few hundred lines up ("`out`'s writer is never mid-record
+/// when the stack unwinds"). Routing a `LazySeq` element straight into
+/// `JqValue::Cursor` for #2066 skipped that guard entirely, deferring
+/// validation to `write_json_at_depth`'s own later, differently-tuned
+/// `MAX_VALUE_TREE_DEPTH` panic -- which fires mid-write, not before it,
+/// and regressed `test_map_identity_reports_clean_error_on_adversarial_nesting_1793`
+/// to a garbled partial line on stdout and the wrong exit code.
+///
+/// Deliberately a structural walk only -- no scalar decoding, no
+/// allocation, `check_nesting_depth`'s existing fallible form rather than
+/// `assert_nesting_depth`'s panic -- so it stays cheap on the common
+/// (shallow) case and doesn't reintroduce the full per-element deep copy
+/// #2066 was written to avoid. Starts fresh at `depth` 0 per element, not
+/// carrying any ambient depth from the array wrapping it, matching
+/// `lazy_elem_to_owned`'s own per-element `to_owned` call.
+fn check_cursor_nesting_depth<W: AsRef<[u64]>>(
+    cursor: &JsonCursor<'_, W>,
+    depth: usize,
+) -> core::result::Result<(), EvalError> {
+    check_nesting_depth(depth)?;
+    match cursor.value() {
+        StandardJson::Array(elements) => {
+            for child in elements.cursor_iter() {
+                check_cursor_nesting_depth(&child, depth + 1)?;
+            }
+        }
+        StandardJson::Object(fields) => {
+            let mut remaining = fields;
+            while let Some((field, rest)) = remaining.uncons() {
+                check_cursor_nesting_depth(&field.value_cursor(), depth + 1)?;
+                remaining = rest;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn validate_json_delimiters<W: AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,

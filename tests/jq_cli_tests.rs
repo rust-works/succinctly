@@ -29593,27 +29593,26 @@ fn test_resolved_callee_still_checks_its_own_arguments_2037() -> Result<()> {
     Ok(())
 }
 
-/// #1687 on the jq side. Plain `succinctly jq` collapses duplicate keys on
-/// purpose (#1385, matching real jq), so the observable surface here is
-/// `--preserve-input`, the extension whose stated job is keeping the input's
-/// own formatting.
+/// #1687 on the jq side, and #2066's own follow-up fixing the array-valued
+/// half. Plain `succinctly jq` collapses duplicate keys on purpose (#1385,
+/// matching real jq), so the observable surface here is `--preserve-input`,
+/// the extension whose stated job is keeping the input's own formatting.
 ///
-/// The result is deliberately asymmetric, and this pins both halves:
+/// Every one of these now preserves, and this pins the full set:
 ///
 /// - `min`/`max`/`min_by`/`max_by` answer a bare `GenericResult::OneCursor`,
 ///   which `generic_result_to_jq_values` forwards as `JqValue::Cursor`
-///   without decoding -- so they now preserve, joining `first(.[])`, which
+///   without decoding -- so these preserve, joining `first(.[])`, which
 ///   always has.
-/// - `sort`/`unique`/`reverse` and the `_by` forms answer a `LazySeq`, and
-///   `jq_runner.rs` has no lazy-array `JqValue`: its `LazySeq` arm calls
-///   `materialize_atomic()`, producing an `IndexMap`-backed `OwnedValue`.
-///   They therefore still collapse -- a pre-existing property of the jq
-///   output path, not something #1687 changed: `map(.)` has answered a
-///   `LazySeq` since #724/#725 and collapses here identically.
-///
-/// Closing that second half means giving the jq CLI a streaming array value
-/// the way `yq_runner.rs` already has one; filed separately rather than
-/// widened into this change.
+/// - `sort`/`unique`/`reverse` and the `_by` forms answer a `LazySeq`.
+///   `generic_result_to_jq_values`'s `LazySeq` arm used to call
+///   `materialize_atomic()`, producing an `IndexMap`-backed `OwnedValue`
+///   that collapsed a duplicate key inside a moved element -- #2066 routed
+///   it through `drain_atomic()` instead, mapping each element's own cursor
+///   (or already-owned `map`-computed value) to a `JqValue` individually, the
+///   same way `ManyCursor`'s arm already does. `map(.)` is here as the
+///   control proving the shared cause (`LazySeq`'s own output path) rather
+///   than anything specific to #1687's sort/unique/reverse additions.
 #[test]
 fn test_preserve_input_sort_family_cursor_results_keep_duplicate_keys_1687() -> Result<()> {
     let input = r#"[{"a":1,"a":2},{"b":3}]"#;
@@ -29627,22 +29626,28 @@ fn test_preserve_input_sort_family_cursor_results_keep_duplicate_keys_1687() -> 
     assert_eq!(code, 0);
     assert_eq!(stdout, "{\"a\":1,\"a\":2}\n");
 
-    // Single-element results now match it.
+    // OneCursor results.
     for filter in ["min", "max_by(.a)"] {
         let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(stdout, "{\"a\":1,\"a\":2}\n", "{filter}");
     }
 
-    // Array-valued results do not, for the reason above. `map(.)` is here as
-    // the control proving the cause is the output path rather than #1687.
+    // LazySeq results that keep element order.
     for filter in ["map(.)", "sort", "unique"] {
         let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
         assert_eq!(code, 0, "{filter}");
-        assert_eq!(
-            stdout, "[{\"a\":2},{\"b\":3}]\n",
-            "{filter}: jq_runner has no lazy-array JqValue, so a LazySeq materializes"
-        );
+        assert_eq!(stdout, "[{\"a\":1,\"a\":2},{\"b\":3}]\n", "{filter}");
+    }
+
+    // LazySeq results that reorder elements -- the duplicate key must
+    // survive the move, not just be preserved when it stays in place.
+    // `.a` on the duplicate-key object reads its last value (2); `{"b":3}`'s
+    // absent `.a` sorts as null, before any number, so it moves first.
+    for filter in ["sort_by(.a)", "unique_by(.a)", "reverse"] {
+        let (stdout, _, code) = run_jq_full(&["-c", "--preserve-input", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, "[{\"b\":3},{\"a\":1,\"a\":2}]\n", "{filter}");
     }
 
     Ok(())
