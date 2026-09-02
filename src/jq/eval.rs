@@ -2271,7 +2271,7 @@ where
         }
         let mut out: Vec<OwnedValue> = Vec::new();
         for arg in args {
-            if let Some(control) = push_owned_values(body(arg), &mut out) {
+            if let Some(control) = push_owned_values_checked(body(arg), &mut out) {
                 return partial(out, control);
             }
         }
@@ -2303,7 +2303,7 @@ where
             Ok(v) => v,
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
-                    if let Some(control) = push_owned_values(previous, &mut out) {
+                    if let Some(control) = push_owned_values_checked(previous, &mut out) {
                         body_control = Some(control);
                         return Demand::Stop;
                     }
@@ -2313,7 +2313,7 @@ where
             }
         };
         if let Some(previous) = pending_first.take() {
-            if let Some(control) = push_owned_values(previous, &mut out) {
+            if let Some(control) = push_owned_values_checked(previous, &mut out) {
                 body_control = Some(control);
                 return Demand::Stop;
             }
@@ -2324,14 +2324,14 @@ where
         // or an escaping first result would be parked and the sink would ask
         // for another value anyway -- which is the bug this arm exists to fix.
         if result.is_escape() {
-            if let Some(control) = push_owned_values(result, &mut out) {
+            if let Some(control) = push_owned_values_checked(result, &mut out) {
                 body_control = Some(control);
             }
             return Demand::Stop;
         }
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
-        } else if let Some(control) = push_owned_values(result, &mut out) {
+        } else if let Some(control) = push_owned_values_checked(result, &mut out) {
             body_control = Some(control);
             return Demand::Stop;
         }
@@ -2358,7 +2358,7 @@ where
         // of it.
         Flow::Escaped(control) => {
             if let Some(previous) = pending_first.take() {
-                if let Some(body_control) = push_owned_values(previous, &mut out) {
+                if let Some(body_control) = push_owned_values_checked(previous, &mut out) {
                     return partial(out, body_control);
                 }
             }
@@ -2499,7 +2499,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         for i in inners {
-            if let Some(control) = push_owned_values(body(o.clone(), i), &mut out) {
+            if let Some(control) = push_owned_values_checked(body(o.clone(), i), &mut out) {
                 return partial(out, control);
             }
         }
@@ -2587,7 +2587,7 @@ where
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
-            match push_owned_values(body(o.clone(), i), &mut out) {
+            match push_owned_values_checked(body(o.clone(), i), &mut out) {
                 Some(control) => {
                     escape = Some(control);
                     Demand::Stop
@@ -27977,7 +27977,16 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 result
             } else {
                 let mut prefix = Vec::new();
-                push_owned_values(result, &mut prefix);
+                // #2024: a decode failure discovered while materializing the
+                // pre-escape prefix describes a value the generator already
+                // produced *before* its own terminator fired, so it outranks
+                // that terminator's control -- the same precedence
+                // `fanout_arg`'s own flush-then-stop arms give a flushed
+                // `pending_first`'s decode failure over the argument's
+                // trailing control.
+                if let Some(decode_control) = push_owned_values_checked(result, &mut prefix) {
+                    return partial(prefix, decode_control);
+                }
                 partial(prefix, control)
             }
         }
@@ -46223,6 +46232,57 @@ mod tests {
         yq_query!(
             b"{\"a\":1,\"b\":\"\xff\xfe\"}",
             r"has(.b)",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2024: `fanout_arg`'s lazy (`ArgFanout::All`) sink pushed `body`'s own
+    /// *result* through bare `push_owned_values`, not `_checked` -- a
+    /// different gap from #2023's (which fixed the *argument*-decoding side
+    /// of this same function). `[1,"\xff\xfe"] | nth((0,1))` isolates it:
+    /// `nth`'s `body` is `.[n]`, so `n=0` decodes cleanly (`1`, buffered as
+    /// `pending_first`) while `n=1` indexes the undecodable array element --
+    /// flushing the buffered `1` first (line ~2307, the `pending_first`
+    /// flush, itself already safe -- an `Int` never fails `to_owned_checked`)
+    /// then reaching the `else` push at line ~2325, this fix's target.
+    /// Pre-fix this gave `ManyOwned([Int(1), String("")])` (silent `""`
+    /// substitution for the second, undecodable element); post-fix it raises
+    /// instead, keeping the already-flushed `1` as the `Partial` prefix.
+    #[test]
+    fn test_fanout_arg_lazy_sink_body_result_raises_decode_failure_2024() {
+        query!(
+            b"[1,\"\xff\xfe\"]",
+            r"nth((0,1))",
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2024: `limit_with_n`'s `Flow::Escaped` arm (fewer than `n` outputs
+    /// produced before the generator's own terminator fired) converted its
+    /// pre-escape prefix via bare `push_owned_values` too, discarding
+    /// whatever control the conversion itself raised. `limit(3; (.a,
+    /// error("x")))` on `{"a":"<bad>"}` collects the single undecodable `.a`
+    /// into `taken` before `error("x")` fires (`satisfied` is false, since
+    /// `1 < 3`), then converts that one-item prefix to owned values while
+    /// building the result. Pre-fix this silently substituted `""` into the
+    /// prefix and reported the generator's own `"x"` error (`Error(e)` with
+    /// `e.message == "x"`, the empty-prefix collapse in `partial`); post-fix
+    /// the undecodable value's own decode failure is raised instead --
+    /// `.a`'s value was already produced *before* `error("x")` fired, so it
+    /// outranks that later control, the same precedence
+    /// `fanout_arg`'s flush-then-stop arms already give a flushed
+    /// `pending_first`'s decode failure over the argument's own trailing
+    /// control.
+    #[test]
+    fn test_eval_limit_escaped_prefix_no_silent_substitution_2024() {
+        query!(
+            b"{\"a\":\"\xff\xfe\"}",
+            r#"limit(3; (.a, error("x")))"#,
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
