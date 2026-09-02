@@ -312,14 +312,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the child slot and loops unconditionally, including through a chain of `null`s (a `null`
   slot can never gain a key, so there is nothing to detach a scratch value for either). Neither
   walker rebuilds an `Expr::Pipe` per step any more, incidentally also dropping the O(d²)
-  clone cost `set_path_steps`'s own fix already removed on the `=` side. Both are otherwise
-  behavior-preserving: the full existing test suite passes unchanged, confirmed byte-identical
-  against `/usr/bin/jq` 1.7.1 and `yq` v4.53.3 across nested/computed/sliced/comma/`?`-suppressed
-  paths, and a chain of 1,000,000 components no longer crashes in either a release or a debug
-  build (`test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115`,
+  clone cost `set_path_steps`'s own fix already removed on the `=` side. The full existing test
+  suite passes unchanged, and both walkers were verified byte-identical to `/usr/bin/jq` 1.7.1
+  and `yq` v4.53.3 across nested/computed/sliced/comma/`?`-suppressed paths, plus a 9,000-query
+  differential sweep (code review, PR #2238) — a chain of 1,000,000 components no longer crashes
+  in either a release or a debug build
+  (`test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115`,
   `test_deep_flat_delete_chain_exits_cleanly_not_stack_overflow_2115`,
   `test_deep_flat_delete_chain_through_absent_first_key_exits_cleanly_2115`, all in
   `tests/jq_cli_tests.rs`).
+
+  One confirmed behavior change, found by that sweep: `update_path_steps`' fresh-run collapse
+  (see `wrap_fresh`'s own doc comment) never bounds-checks an out-of-range/negative `Index`
+  swept into an earlier fresh step's collection when the update filter it wraps produces no
+  output, where the pre-#2115 recursive walker always checked eagerly, regardless of the
+  eventual write outcome. This is an *improvement*, not a regression — real jq (1.7.1) defers
+  this exact check the same way, so `null | .a[-1][1] |= empty` is `null` in real jq (no error)
+  where this crate used to raise "Out of bounds negative array index" before #2115 —
+  live-verified, and pinned by
+  `test_update_index_bounds_check_deferred_behind_fresh_run_collapse_2115`. yq mode is
+  unaffected (`undo_stranded` is jq-only, so yq mode always takes the eager path, matching real
+  yq's own stricter requirement); the adjacent real-write case (`.a[-1][1] |= 9`) still errors
+  identically either way.
 
 - **A recursive `def` whose body is a wide, flat pipe or object literal could abort the
   process with a real native stack overflow instead of raising `MAX_EVAL_FRAMES`'s catchable
