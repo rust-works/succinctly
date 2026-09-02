@@ -1135,6 +1135,20 @@ ones). Two different checks are in play, and their coverage differs:
   nested undecodable string through is necessarily non-scalar, which always outranks an `Int`
   path length in jq's ordering — so every event is unconditionally dropped before a corrupted
   leaf could reach output.
+- **#1800 changed *when* the check fires for `contains`/`inside`, not whether.** Both
+  materialize the primary input before fanning their argument out, and that conversion used
+  to `return` its `Err` immediately — so an undecodable input preempted the argument
+  expression's own error or side effect even where jq's `. as $x | b as $y | ($x |
+  contains($y))` desugar would have reached the argument first. The `Result` is now consulted
+  inside the fan-out body instead, which makes an argument-side escape win
+  (`contains(error("boom"), 1)` raises `boom`) and, in the zero-candidate case
+  (`contains(empty)`), leaves the decode failure undemanded and the call empty — matching what
+  real jq answers for a decodable input, and pinned by
+  `test_builtin_contains_empty_argument_never_demands_the_input_1800`. No oracle exists for
+  the undecodable variant itself: jq substitutes U+FFFD upstream, so this whole scenario is
+  succinctly's own semi-indexing artifact and is reachable through the library API only, not
+  the CLI. `in`/`IN` have the identical shape but evaluate their argument against the decoded
+  input itself, so they keep the eager early return (tracked as #2202).
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/

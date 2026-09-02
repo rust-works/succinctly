@@ -7220,6 +7220,15 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // raise, not silently compare as "". #2001: a non-decode-failure error
     // (a #1194 malformed-member shape) respects `optional` the same way
     // this function's own `check_escape`/fanout handling below does.
+    //
+    // #2202: this stays an *eager* early return, unlike `builtin_contains`/
+    // `builtin_inside`'s own #1800 deferral. Those two fan `b_expr` out
+    // over the cursor, so the argument can run before the input is ever
+    // decoded; here `obj_expr` is evaluated against `key_owned` itself (the
+    // line below), so there is nothing to defer to -- the decoded value is
+    // the argument's own `.`. Lifting that needs a poisoned-value concept
+    // this evaluator does not have; see #2202 before "completing" #1800
+    // here.
     let key_owned = to_owned_or_suppress!(&value, optional);
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
@@ -7343,6 +7352,12 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // principled reason to differ from `any`/`all`'s own already-fixed
     // behavior (contrast `builtin_recurse_f`'s own doc comment, which does
     // give one for *its* unused `optional`).
+    //
+    // #2202: eager, not deferred into the sink the way `builtin_contains`/
+    // `builtin_inside` defer theirs (#1800) -- `s` is evaluated against
+    // `current` itself (`eval_each_owned` below), so the decoded input is
+    // the argument's own `.` and there is no "argument first" ordering to
+    // give it. Same structural blocker `builtin_in` documents; see #2202.
     let current = to_owned_or_suppress!(&value, optional);
     // #1519: a count, not a latch -- `IN(s)` is jq's `any(s == .; .)`, so it
     // answers once per `?//` alternative that matched, exactly as
@@ -9056,7 +9071,34 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does.
-    let input = to_owned_or_suppress!(&value, optional);
+    //
+    // #1800: `to_owned` itself still runs eagerly here (it has no
+    // observable side effect or ordering of its own), but its `Result` is
+    // only *consulted* inside `body`, below -- not returned from
+    // immediately. This defers the decode failure past `b_expr`'s own
+    // chance to escape first: `fanout_arg`'s "a body failure stops the
+    // pull here, so the argument's remaining outputs are never evaluated"
+    // rule (see its own doc comment) then makes an escape from `b_expr`
+    // itself (e.g. `contains(error("boom"), 1)`) win outright, since it
+    // fires during the pull, before `body`/this closure is ever called for
+    // a first candidate -- mirroring real jq's
+    // `. as $x | b as $y | ($x | contains($y))` desugar, where `$x`'s
+    // content is only needed once `b`'s first candidate already exists. If
+    // `b_expr` instead produces a candidate successfully first (e.g.
+    // `contains(1, error("boom"))`), the decode failure still fires right
+    // there, exactly as before `b_expr`'s later `error("boom")` is ever
+    // reached -- not a regression, the same "earlier step wins" rule,
+    // reached for the right reason instead of an unconditional early
+    // return. The third case is `b_expr` producing *no* candidate at all
+    // (`contains(empty)`): `body` never runs, so the decode failure is
+    // never demanded and the call is simply empty -- the same desugar read
+    // consistently (`b as $y | ...` over zero `$y`s runs nothing), and what
+    // real jq answers for a decodable input too (`printf '"a"' | jq
+    // 'contains(empty)'` prints nothing and exits 0). Pinned by
+    // `test_builtin_contains_empty_argument_never_demands_the_input_1800`
+    // so a later "reconcile the pending decode failure after the fan-out"
+    // change can't quietly resurrect it there.
+    let input = to_owned(&value);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -9070,14 +9112,18 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `ArgFanout::contains_gate`'s doc comment.
         ArgFanout::contains_gate::<S>(),
         |b| {
-            if containment_kind_mismatch_should_error::<S>(&input, &b) {
+            let input = match &input {
+                Ok(v) => v,
+                Err(e) => return suppress_or_raise(e.clone(), optional),
+            };
+            if containment_kind_mismatch_should_error::<S>(input, &b) {
                 return if optional {
                     QueryResult::None
                 } else {
-                    QueryResult::Error(EvalError::containment_check(&input, &b))
+                    QueryResult::Error(EvalError::containment_check(input, &b))
                 };
             }
-            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&input, &b)))
+            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(input, &b)))
         },
     )
 }
@@ -9165,7 +9211,12 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does -- mirrors `builtin_contains`'s matching fix.
-    let input = to_owned_or_suppress!(&value, optional);
+    //
+    // #1800: deferred into `body`, not returned early -- see
+    // `builtin_contains`'s matching comment for the full ordering
+    // rationale, the zero-candidate case (`inside(empty)`) included (this
+    // function mirrors it exactly).
+    let input = to_owned(&value);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -9177,15 +9228,19 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ungated today; see `builtin_ltrimstr` for the sibling case.
         ArgFanout::All,
         |b| {
+            let input = match &input {
+                Ok(v) => v,
+                Err(e) => return suppress_or_raise(e.clone(), optional),
+            };
             // inside is the inverse of contains: b contains input
-            if containment_kind_mismatch_should_error::<S>(&b, &input) {
+            if containment_kind_mismatch_should_error::<S>(&b, input) {
                 return if optional {
                     QueryResult::None
                 } else {
-                    QueryResult::Error(EvalError::containment_check(&b, &input))
+                    QueryResult::Error(EvalError::containment_check(&b, input))
                 };
             }
-            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&b, &input)))
+            QueryResult::Owned(OwnedValue::Bool(owned_contains::<S>(&b, input)))
         },
     )
 }
@@ -43661,6 +43716,154 @@ mod tests {
             QueryResult::Error(e) => assert!(!e.is_decode_failure()),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// #1800: like `test_builtin_upper_in_decode_failure_survives_optional_2015`,
+    /// a genuine decode failure must still survive `optional` even now that
+    /// it's consulted lazily inside `body` rather than returned eagerly --
+    /// `suppress_or_raise` is reused unchanged, so this is mechanical, but
+    /// pinned directly (white-box) since the deferred path is new.
+    #[test]
+    fn test_builtin_contains_decode_failure_survives_optional_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let b_expr = Expr::Literal(Literal::String(String::new()));
+        match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #1800 companion for `inside`, mirroring `builtin_contains`'s test above.
+    #[test]
+    fn test_builtin_inside_decode_failure_survives_optional_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let b_expr = Expr::Literal(Literal::String(String::new()));
+        match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #1800: the primary input's own decode failure must not preempt an
+    /// escape (error/break/halt) that fires from `b_expr` *before* it ever
+    /// produces a candidate -- confirmed by hand against real jq's
+    /// `. as $x | b as $y | ($x | contains($y))` desugar (no real jq/yq
+    /// oracle can reach this scenario at all: both validate UTF-8 upstream,
+    /// before this code is ever reachable). `error("boom")` is `b`'s
+    /// *first* branch here, so it fires during `b_expr`'s own generator
+    /// pull, before the `body` closure that would need `input`'s decoded
+    /// content is ever invoked for a first candidate -- `fanout_arg`'s own
+    /// "a body failure stops the pull here" rule (see its doc comment)
+    /// applies symmetrically to an argument-side escape that happens
+    /// before any pull at all, via its `Flow::Escaped` handling.
+    #[test]
+    fn test_builtin_contains_defers_decode_failure_for_earlier_argument_escape_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, r#"contains(error("boom"), 1)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #1800 companion for `inside`, mirroring `builtin_contains`'s test
+    /// above (`inside` fans `b_expr` out via the same `fanout_arg`).
+    #[test]
+    fn test_builtin_inside_defers_decode_failure_for_earlier_argument_escape_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, r#"inside(error("boom"), 1)"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
+    /// #1800 companion: once `b_expr` *does* produce a candidate
+    /// successfully first, the decode failure still fires right there,
+    /// exactly as before this fix -- `error("boom")` as `b`'s *second*
+    /// branch is never reached, the same "earlier step wins" rule as
+    /// `test_builtin_upper_in_short_circuits_before_later_error_910`
+    /// (further down this module) for `IN`, just reached because `input`'s content is only needed
+    /// once a candidate exists to compare it against. Pinned so a future
+    /// "defer unconditionally" over-fix doesn't regress this back into a
+    /// bug (jq mode only -- yq mode's own `#1553` "clear on any escape"
+    /// rule for `contains` answers this differently, see the yq-mode test
+    /// below).
+    #[test]
+    fn test_builtin_contains_still_raises_decode_failure_before_later_argument_error_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, r#"contains(1, error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+            }
+        );
+    }
+
+    /// #1800 companion for `inside`, mirroring `builtin_contains`'s test
+    /// above (`inside` uses `ArgFanout::All` unconditionally, so this
+    /// jq/yq-mode divergence doesn't apply to it the way it does to
+    /// `contains`'s `contains_gate`).
+    #[test]
+    fn test_builtin_inside_still_raises_decode_failure_before_later_argument_error_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, r#"inside(1, error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
+            }
+        );
+    }
+
+    /// #1800: the zero-candidate case, the third arm of the deferral (see
+    /// `builtin_contains`'s own comment). With `b_expr` producing no
+    /// candidate at all, `body` never runs, so the primary input's decode
+    /// failure is never demanded and the call is simply empty -- the same
+    /// `b as $y | ...` desugar read consistently, and what real jq answers
+    /// on a decodable input too (`printf '"a"' | jq 'contains(empty)'`
+    /// prints nothing and exits 0; jq itself can never reach the
+    /// undecodable variant, since it substitutes U+FFFD upstream). Pinned
+    /// because this is the one arm where the deferral makes a decode
+    /// failure disappear rather than merely fire later: a future
+    /// "reconcile the pending `Err` after the fan-out" change would
+    /// resurrect it here, and that would be a divergence from the desugar,
+    /// not a repair.
+    #[test]
+    fn test_builtin_contains_empty_argument_never_demands_the_input_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, "contains(empty)", QueryResult::None => {});
+    }
+
+    /// #1800 companion for `inside`, mirroring `builtin_contains`'s test
+    /// above.
+    #[test]
+    fn test_builtin_inside_empty_argument_never_demands_the_input_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        query!(decode_failure_bytes, "inside(empty)", QueryResult::None => {});
+    }
+
+    /// #1800 / yq mode: `contains`'s own `#1553` rule ("an escape anywhere
+    /// in the argument clears the whole output, unlike jq's keep-the-prefix
+    /// rule") already resolves `b_expr`'s own escape -- via
+    /// `clear_values_when_yq_argument_escaped`, entirely before `body` (and
+    /// so this fix's deferred decode-failure check) is ever reached -- so
+    /// this deliberately diverges from the jq-mode test just above:
+    /// `error("boom")` as `b`'s *second* branch still wins over the decode
+    /// failure in yq mode, because `#1553` already clears everything (the
+    /// produced `1` included) the moment any escape shows up anywhere in
+    /// `b_expr`, not just a leading one. Confirms the deferred decode
+    /// failure correctly inherits the existing dual-mode gate for free,
+    /// with no additional branching needed in `builtin_contains` itself.
+    #[test]
+    fn test_builtin_contains_yq_mode_clear_on_escape_wins_over_decode_failure_1800() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        yq_query!(decode_failure_bytes, r#"contains(1, error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
     }
 
     /// #2001: `builtin_pick`'s own keys-expression-result conversion (the
