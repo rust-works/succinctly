@@ -41750,7 +41750,12 @@ pub(crate) fn bind_def(
             params: params.to_vec(),
             body: body.clone(),
         });
-        Rc::new(install_def_calls(then, &def, depth))
+        // `false`: `then` is everything textually *after* this `def`
+        // declaration, not `def`'s own body -- a one-shot scope this walk
+        // visits exactly once for this `def`, never a self-recursive
+        // substitution `bind_def_call` re-enters. See `sibling_frame_charge`'s
+        // own doc comment (#2135 code review, Finding 1).
+        Rc::new(install_def_calls(then, &def, depth, false))
     })
 }
 
@@ -41919,9 +41924,13 @@ pub(crate) fn bind_def_call<'e>(
                 for (param, arg) in params_and_args {
                     body = substitute_func_param(&body, param, &Expr::Shared(Rc::new(arg.clone())));
                 }
-                install_def_calls(&body, def, frames + 1)
+                // `true`: this is `def`'s own body, the scope that repeats
+                // once per actual recursive level -- see
+                // `sibling_frame_charge`'s own doc comment (#2135 code
+                // review, Finding 1).
+                install_def_calls(&body, def, frames + 1, true)
             }
-            None => install_def_calls(&def.body, def, frames + 1),
+            None => install_def_calls(&def.body, def, frames + 1, true),
         };
         Ok(Rc::new(installed_body))
     })
@@ -41946,7 +41955,25 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Expand function calls to a defined function by inlining the body.
-pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32) -> Expr {
+///
+/// `in_recursive_body` (#2135 code review, Finding 1): `true` exactly when
+/// this walk is happening *inside* `def`'s own (potentially self-recursive)
+/// body -- i.e. this call, or an ancestor call in the same walk, originated
+/// from [`bind_def_call`]'s own re-entry -- `false` for a one-shot scope
+/// this pass visits exactly once for this `def`, such as [`bind_def`]'s own
+/// `then`. Threaded through unchanged by every arm below: it never toggles
+/// mid-walk, only at those two call sites. See [`sibling_frame_charge`]'s
+/// own doc comment for why this, and not `frames` itself, is the correct
+/// signal for whether sibling width should compound -- `frames` also grows
+/// from ordinary AST nesting within a single one-shot walk (an enclosing
+/// `Expr::Paren`, an `if`, ...), which is not recursion and must not be
+/// mistaken for it.
+pub(crate) fn install_def_calls(
+    expr: &Expr,
+    def: &Rc<FuncDefData>,
+    frames: u32,
+    in_recursive_body: bool,
+) -> Expr {
     match expr {
         // #1376: the arity check used to live *inside* this arm, matching
         // on name alone and erroring on any arity mismatch -- which broke
@@ -42004,7 +42031,7 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                 def: Rc::clone(def),
                 args: args
                     .iter()
-                    .map(|a| install_def_calls(a, def, frames + 1))
+                    .map(|a| install_def_calls(a, def, frames + 1, in_recursive_body))
                     .collect(),
                 frames,
                 bound: BoundBody::default(),
@@ -42014,7 +42041,12 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
         // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(install_def_calls_in_builtin(b, def, frames + 1)),
+        Expr::Builtin(b) => Expr::Builtin(install_def_calls_in_builtin(
+            b,
+            def,
+            frames + 1,
+            in_recursive_body,
+        )),
         Expr::FuncDef {
             name: inner_name,
             params: inner_params,
@@ -42043,8 +42075,13 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                 Expr::FuncDef {
                     name: inner_name.clone(),
                     params: inner_params.clone(),
-                    body: Box::new(install_def_calls(inner_body, def, frames + 1)),
-                    then: Box::new(install_def_calls(then, def, frames + 1)),
+                    body: Box::new(install_def_calls(
+                        inner_body,
+                        def,
+                        frames + 1,
+                        in_recursive_body,
+                    )),
+                    then: Box::new(install_def_calls(then, def, frames + 1, in_recursive_body)),
                     // Rebuilt above, so any cache from the pre-install node
                     // is stale (#2094) -- the shadowed branch above instead
                     // clones `expr` wholesale, correctly carrying its cache
@@ -42096,7 +42133,7 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
             def: Rc::clone(d),
             args: args
                 .iter()
-                .map(|a| install_def_calls(a, def, frames + 1))
+                .map(|a| install_def_calls(a, def, frames + 1, in_recursive_body))
                 .collect(),
             frames: frames.max(*n),
             // `args` (and possibly `frames`) may have changed, so a stale
@@ -42114,30 +42151,17 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // eliminated as a real tail call). That is exactly the mechanism
         // `MAX_EVAL_FRAMES`'s own doc comment already names for *nesting*
         // ("how much structure each one holds live across its own recursive
-        // call") -- just uncounted here for sibling breadth. The flat
-        // `frames + 1` every sibling used to get regardless of width or
-        // position undercounted this: a 200-wide pipe wrapping a recursive
-        // `deep(m-1)` call in its last position charged that call the same
-        // single `+1` a 2-wide pipe would, so `MAX_EVAL_FRAMES` (checked
-        // against the undercounted total) never fired and `deep(1500)`
-        // overflowed the real native stack instead (confirmed live, #2135).
-        //
-        // Charging sibling `i` (0-indexed) `frames + i + 1` instead prices a
-        // sibling near the end of a wide pipe the same as an equally-deep
-        // nested wrapping would be, while a sibling near the front --
-        // genuinely cheap in `eval_pipe`'s own recursion, since reaching it
-        // needs no extra frames at all -- stays cheap here too. An ordinary
-        // long *non-recursive* pipe (`.a | .b | .c | ...`, the common
-        // generated/templated-filter shape) is unaffected either way:
-        // nothing here is ever checked against `MAX_EVAL_FRAMES` until a
-        // `DefCall` is actually reached, and a pipe with no recursive call
-        // inside never creates one, regardless of how wide it is.
+        // call") -- just uncounted here for sibling breadth, and only
+        // *while that structure sits inside an already-recursing `def`'s own
+        // body* -- see [`sibling_frame_charge`]'s own doc comment for why
+        // that qualifier is load-bearing (#2135 code-review Finding 1).
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
                 .enumerate()
                 .map(|(i, e)| {
-                    install_def_calls(e, def, frames.saturating_add(i as u32).saturating_add(1))
+                    let charged = sibling_frame_charge(frames, i as u32, in_recursive_body);
+                    install_def_calls(e, def, charged, in_recursive_body)
                 })
                 .collect(),
         ),
@@ -42177,33 +42201,139 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // #2135: `Expr::Object` is pulled out of that shared fallthrough for
         // the same reason `Pipe` above is -- see the `Comma` doc comment
         // above for why it, alone among the three `Vec`-shaped siblings
-        // here, needed no change. Charged the same way as `Pipe`: entry `i`
-        // (0-indexed)'s key and value both see `frames + i + 1`, so an entry
-        // near the end of a wide object literal is priced like an
-        // equally-deep nested wrapping, while the ordinary case -- a handful
-        // of keys, or a very wide but non-recursive object literal -- is
-        // unaffected, since nothing is checked against `MAX_EVAL_FRAMES`
-        // until a `DefCall` is actually reached inside one of the entries.
+        // here, needed no change. Charged the same way as `Pipe`, gated by
+        // the same [`sibling_frame_charge`] rule: entry `i` (0-indexed)'s
+        // key and value both see the same charge.
         Expr::Object(entries) => Expr::Object(
             entries
                 .iter()
                 .enumerate()
                 .map(|(i, entry)| {
-                    let charged = frames.saturating_add(i as u32).saturating_add(1);
+                    let charged = sibling_frame_charge(frames, i as u32, in_recursive_body);
                     let key = match &entry.key {
                         ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
-                        ObjectKey::Expr(e) => {
-                            ObjectKey::Expr(Box::new(install_def_calls(e, def, charged)))
-                        }
+                        ObjectKey::Expr(e) => ObjectKey::Expr(Box::new(install_def_calls(
+                            e,
+                            def,
+                            charged,
+                            in_recursive_body,
+                        ))),
                     };
                     ObjectEntry {
                         key,
-                        value: install_def_calls(&entry.value, def, charged),
+                        value: install_def_calls(&entry.value, def, charged, in_recursive_body),
                     }
                 })
                 .collect(),
         ),
-        _ => map_subexprs(expr, &mut |sub| install_def_calls(sub, def, frames + 1)),
+        // #2135 code-review Finding 2: `build_string_parts`/`build_string_
+        // parts_with_context` (`src/jq/eval.rs`) have the identical
+        // non-tail per-part recursion `Expr::Object`'s own `build_object_
+        // entries` does (an `acc`/`slots` mutation sits before the
+        // recursive call returns, so it cannot be tail-call-eliminated) --
+        // confirmed live: a real stack overflow, not caught by any guard,
+        // since this variant fell through to the ordinary flat fallthrough
+        // arm below before this fix and so was never charged for width at
+        // all. Gated by the same [`sibling_frame_charge`] rule as `Pipe`/
+        // `Object`.
+        //
+        // The index is *reversed* from `Pipe`/`Object`'s own left-to-right
+        // charge: both `build_string_parts` functions shrink `parts` from
+        // the right via `split_last()` each recursive call (see either
+        // one's own doc comment for why -- it is what gives `"\(1,2)-\(3,4)"`
+        // its jq-verified `1-3,2-3,1-4,2-4` fan-out order, the *opposite* of
+        // object construction's "last entry varies fastest"), so the
+        // *first* (leftmost) part is the one still live the deepest on the
+        // native stack when the *last* part's own slot is finally reached,
+        // not the other way around. A part at 0-indexed position `i` among
+        // `len` total is therefore charged as if it were at structural
+        // position `len - 1 - i`, not `i` itself.
+        Expr::StringInterpolation(parts) => {
+            let len = parts.len();
+            Expr::StringInterpolation(
+                parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| match part {
+                        StringPart::Literal(s) => StringPart::Literal(s.clone()),
+                        StringPart::Expr(e) => {
+                            let position = (len - 1 - i) as u32;
+                            let charged = sibling_frame_charge(frames, position, in_recursive_body);
+                            StringPart::Expr(Box::new(install_def_calls(
+                                e,
+                                def,
+                                charged,
+                                in_recursive_body,
+                            )))
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        _ => map_subexprs(expr, &mut |sub| {
+            install_def_calls(sub, def, frames + 1, in_recursive_body)
+        }),
+    }
+}
+
+/// The per-sibling `frames` charge `install_def_calls` uses for a
+/// structurally-recursive `Vec`-shaped node (`Expr::Pipe`, `Expr::Object`,
+/// `Expr::StringInterpolation`) at 0-indexed structural position `position`
+/// (#2135, corrected by its own code review -- see the two findings this
+/// function's doc comment on `MAX_EVAL_FRAMES` records).
+///
+/// **Width only compounds when `in_recursive_body` is true** -- i.e. this
+/// walk is happening *inside* `def`'s own (potentially self-recursive) body,
+/// via `bind_def_call`'s own re-entry (`install_def_calls(&body, def, frames
+/// + 1, true)`), rather than a one-shot scope like `bind_def`'s own `then`
+/// (`install_def_calls(then, &def, depth, false)` -- *everything textually
+/// after* a `def` declaration, not that `def`'s own body, walked exactly
+/// once for this `def`). A wide-but-non-recursive pipe/object/string-
+/// interpolation sitting in that one-shot `then` is walked exactly once,
+/// ever, for this `def` -- so unlike a wrapping that sits *inside* a self-
+/// recursive body (repeated once per recursive level, where the extra width
+/// genuinely does compound into real accumulated native stack), a wide
+/// sibling list here contributes no compounding risk at all, no matter how
+/// wide it is, and must fall back to the flat, position-independent `frames
+/// + 1` every sibling got before #2135.
+///
+/// **This is `in_recursive_body`, not `frames > 0`, deliberately** -- an
+/// earlier version of this fix tried gating on `frames > 0` instead, on the
+/// theory that `frames` starts at `0` for `bind_def`'s own one-shot walk and
+/// is always `>= 1` inside `bind_def_call`'s re-entry. That is true, but
+/// insufficient: `frames` *also* grows by `+1` per level of ordinary AST
+/// nesting within the very same one-shot walk (an enclosing `Expr::Paren`,
+/// an `if`, ...) via this function's own generic fallthrough arm below --
+/// nesting that never repeats and so must not compound either. Confirmed
+/// live: `def f: . + 1; ({41000-stage pipe} | f)` (no wrapping parens)
+/// worked correctly under the `frames > 0` gate, but reinstating the exact
+/// same filter's own outer parentheses (`(...)`) bumped `frames` to `1`
+/// *before* the pipe was ever reached (the `Expr::Paren` fallthrough's own
+/// `frames + 1`), defeating the gate and reproducing the original bug
+/// despite zero actual recursion anywhere. `in_recursive_body` is threaded
+/// as its own parameter specifically so ordinary AST nesting can never be
+/// mistaken for genuine recursive re-entry, however many non-`Pipe`/
+/// `Object`/`StringInterpolation` layers sit in between.
+///
+/// Getting this wrong the *other* way (no gate at all) was Finding 1 of
+/// #2135's own code review: charging position-based width unconditionally
+/// made an entirely ordinary, non-recursive call to a user-defined function
+/// -- one instance, zero actual recursion anywhere -- spuriously trip
+/// `MAX_EVAL_FRAMES` merely for sitting late in a sufficiently wide one-shot
+/// pipe or object literal (confirmed live: pre-#2135 `main` and real jq both
+/// return the correct answer for the repro above; the position-based charge
+/// with no gate at all raised `f/0 exceeded maximum recursion depth`
+/// instead). The gate above is what keeps that filter -- and the realistic
+/// generated/templated-filter shape it stands in for -- unaffected, while
+/// still charging the width that sits *inside* a genuinely self-recursive
+/// body starting from its very first level (`bind_def_call`'s own re-entry
+/// is always `in_recursive_body: true`), which is what #2135's own original
+/// repro needs caught.
+fn sibling_frame_charge(frames: u32, position: u32, in_recursive_body: bool) -> u32 {
+    if in_recursive_body {
+        frames.saturating_add(position).saturating_add(1)
+    } else {
+        frames.saturating_add(1)
     }
 }
 
@@ -42359,13 +42489,23 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
 }
 
 /// Expand function calls in a builtin expression.
-fn install_def_calls_in_builtin(builtin: &Builtin, def: &Rc<FuncDefData>, depth: u32) -> Builtin {
+fn install_def_calls_in_builtin(
+    builtin: &Builtin,
+    def: &Rc<FuncDefData>,
+    depth: u32,
+    in_recursive_body: bool,
+) -> Builtin {
     // Every other structural arm in `install_def_calls` charges `frames + 1`
     // at each descent step (once at the call site into this function, again
     // here for the step into each subexpression) -- matching that keeps a
     // `DefCall` reached through a builtin argument (`map(recurse_def)`,
     // `select(...)`) charged the same as an equivalent plain-expression path.
-    map_builtin_subexprs(builtin, &mut |e| install_def_calls(e, def, depth + 1))
+    // `in_recursive_body` is threaded through unchanged, same as every other
+    // arm (#2135 code review, Finding 1) -- a builtin argument is ordinary
+    // structural nesting, not a recursive-substitution boundary of its own.
+    map_builtin_subexprs(builtin, &mut |e| {
+        install_def_calls(e, def, depth + 1, in_recursive_body)
+    })
 }
 
 /// Substitute function parameter in a builtin expression.
@@ -69895,6 +70035,7 @@ mod tests {
                     body: Expr::Identity,
                 }),
                 0,
+                false,
             ),
             slice_number
         );
@@ -69928,7 +70069,7 @@ mod tests {
             expr: Box::new(call_f()),
         };
 
-        match install_def_calls(&nth, &def, 0) {
+        match install_def_calls(&nth, &def, 0, false) {
             Expr::NthExpr { n, expr } => {
                 assert!(
                     matches!(*n, Expr::DefCall { .. }),
@@ -69966,7 +70107,7 @@ mod tests {
             }],
         };
 
-        match install_def_calls(&ns_call, &def, 0) {
+        match install_def_calls(&ns_call, &def, 0, false) {
             Expr::NamespacedCall {
                 namespace,
                 name,

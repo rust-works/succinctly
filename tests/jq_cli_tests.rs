@@ -17941,6 +17941,117 @@ fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
     Ok(())
 }
 
+/// #2135 code-review Finding 1: unlike the sibling test above (a wide pipe
+/// with *no* `DefCall` in it at all, so nothing is ever checked against
+/// `MAX_EVAL_FRAMES` regardless of width), this filter has a genuine,
+/// one-time call to a user-defined function -- `f`, called exactly once, no
+/// recursion anywhere -- sitting at the very last position of a 41,000-stage
+/// pipe. `install_def_calls`'s original #2135 fix charged that position-based
+/// width to *every* `DefCall` it reached, recursive or not, which made this
+/// entirely ordinary filter spuriously raise `f/0 exceeded maximum recursion
+/// depth` instead of returning the correct answer -- confirmed live (both
+/// pre-#2135 `main` and real jq 1.7.1 at a width real jq can still compile,
+/// see this test's own width note below, return the correct value; the
+/// unguarded position-based charge did not). Fixed by
+/// `sibling_frame_charge`'s own `in_recursive_body` gate: width only
+/// compounds when this walk is already inside a `def`'s own (potentially
+/// self-recursive) body, never for a one-shot call embedded in ordinary
+/// top-level structure. Both a wide `Pipe` and a wide `Object` sharing the
+/// same one-time, non-recursive call are pinned here.
+///
+/// Deliberately does **not** compare against real jq at this exact width:
+/// real jq's own bytecode compiler exhausts memory somewhere between 1,000
+/// and 5,000 pipe stages regardless of recursion (confirmed live, unrelated
+/// to this fix or to `MAX_EVAL_FRAMES`), so 41,000 has no real-jq reference
+/// answer to match at all -- the width is chosen instead to comfortably
+/// clear this crate's own 40,000-frame ceiling, which is exactly the point
+/// being pinned.
+#[test]
+fn test_wide_non_recursive_pipe_and_object_do_not_false_positive_2135() -> Result<()> {
+    let chain = std::iter::repeat_n(".", 41_000)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let query = format!("def f: . + 1; ({chain} | f)");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+
+    // The identical shape with no wrapping parens at all around `then` --
+    // confirms the fix does not depend on `Expr::Paren` happening to be
+    // absent (an earlier, incorrect attempt at this fix gated on `frames >
+    // 0`, which an enclosing `Paren`'s own ordinary `frames + 1` AST-nesting
+    // charge silently defeated -- see `sibling_frame_charge`'s own doc
+    // comment for the full account).
+    let query = format!("def f: . + 1; {chain} | f");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+
+    let entries = (0..41_000)
+        .map(|i| format!(r#""k{i}":1"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(r#"def f: . + 1; ({{{entries},"r":f}}) | .r"#);
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #2135 code-review Finding 2: `Expr::StringInterpolation` had the identical
+/// non-tail per-part recursion shape `Expr::Object`'s own `build_object_
+/// entries` does (`build_string_parts`/`build_string_parts_with_context`,
+/// `src/jq/eval.rs`, both a `split_last()`-based reverse walk that mutates a
+/// shared `slots` buffer before the recursive call returns, so neither can be
+/// tail-call-eliminated), but was never given a charging arm at all -- it fell
+/// through to the ordinary flat fallthrough, so nothing here was ever charged
+/// for width, and a recursive `def` wrapping its own self-call in enough
+/// interpolation parts crashed with a real, uncaught stack overflow
+/// (confirmed live before this fix). Fixed by giving `Expr::StringInterpolation`
+/// its own arm in `install_def_calls`, gated by the same `sibling_frame_charge`
+/// rule `Pipe`/`Object` use.
+///
+/// The recursive call sits *first* in source order deliberately: both
+/// `build_string_parts` functions shrink `parts` from the right via
+/// `split_last()`, so the first (leftmost) part is the one still live
+/// deepest on the native stack, not the last -- putting the recursive call
+/// last instead (matching `Pipe`/`Object`'s own left-to-right intuition) does
+/// not reproduce this crash at all, since it would then be the *shallowest*
+/// frame instead of the deepest one.
+#[test]
+fn test_wide_recursive_string_interpolation_reports_cleanly_not_stack_overflow_2135() -> Result<()>
+{
+    let trailing_slots = "\\(1)".repeat(200);
+    let query = format!(
+        r#"def deep(m): if m == 0 then "done" else "\(deep(m-1)){trailing_slots}" end; deep(1500) | length"#
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+
+    // A shallow, ordinary case must still return the correct value -- the
+    // new charging arm must not itself become a false positive.
+    let small_slots = "\\(1)".repeat(50);
+    let query = format!(
+        r#"def deep(m): if m == 0 then "done" else "\(deep(m-1)){small_slots}" end; deep(100) | length"#
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "5004",
+        "stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1371: the depth guard has to be reachable from every evaluator, not just
 /// the plain one, and each reports it differently. A runaway recursion under a
 /// *truncating* consumer goes through `eval_each`'s own `DefCall` arm, and one
