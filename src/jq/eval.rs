@@ -4444,33 +4444,26 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_comma`'s borrowed/owned promotion (#353): stay borrowed while every
 /// item is, and the moment one owned item appears promote the whole ordered
 /// batch, so no operand's position is lost.
-fn items_to_result<'a, W: Clone + AsRef<[u64]>>(items: Vec<Item<'a, W>>) -> QueryResult<'a, W> {
-    if items.iter().all(|i| matches!(i, Item::Borrowed(_))) {
-        let borrowed: Vec<StandardJson<'a, W>> = items
-            .into_iter()
-            .map(|i| match i {
-                Item::Borrowed(v) => v,
-                Item::Owned(_) => unreachable!("checked above"),
-            })
-            .collect();
-        return borrowed_vec_to_result(borrowed);
-    }
-    owned_vec_to_result(items.into_iter().map(Item::into_owned).collect())
-}
-
-/// Fallible twin of [`items_to_result`] (#2024 code review): the
-/// all-`Borrowed` fast path is unchanged (it defers decoding rather than
-/// doing any itself, so there's nothing to check yet -- the eventual
-/// consumer, e.g. [`push_owned_values_checked`], is what raises), but the
-/// mixed/owned branch converted every item through bare [`Item::into_owned`]
+///
+/// The all-`Borrowed` fast path defers decoding rather than doing any
+/// itself, so there's nothing to check yet there -- the eventual consumer,
+/// e.g. [`push_owned_values_checked`], is what raises. But the mixed/owned
+/// branch used to convert every item through bare [`Item::into_owned`]
 /// unconditionally, silently substituting `""` for an undecodable item
-/// instead of raising -- the #1746-shaped bug one layer upstream of
-/// [`limit_with_n`]'s own fix just below: `limit(2; 1, .a)` on an
-/// undecodable `.a` mixes an `Owned` literal (`1`) with a `Borrowed` `.a`,
-/// so it never reaches the all-`Borrowed` fast path at all. Stops at the
-/// first undecodable item, keeping whatever prefix already converted
-/// cleanly -- the same partial-prefix contract every other `_checked`
-/// sibling in this file gives.
+/// instead of raising (#2024 code review) -- the #1746-shaped bug one layer
+/// upstream of [`limit_with_n`]'s own fix, its sole production caller:
+/// `limit(2; 1, .a)` on an undecodable `.a` mixes an `Owned` literal (`1`)
+/// with a `Borrowed` `.a`, so it never reaches the all-`Borrowed` fast path
+/// at all. Now stops at the first undecodable item, keeping whatever prefix
+/// already converted cleanly -- the same partial-prefix contract every
+/// other `_checked` sibling in this file gives. Named `_checked` rather
+/// than renaming this function outright since an unchecked, `to_owned`-only
+/// twin was the pre-fix shape reviewers had to compare against; nothing
+/// else in this file still needs that unchecked twin (its only other
+/// caller, the test-only `collect_each` below, was switched to this
+/// function too -- neither the all-`Borrowed` fast path nor the ordinary,
+/// decodable-content test data it exercises change behavior under the
+/// stricter check).
 fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
     items: Vec<Item<'a, W>>,
 ) -> QueryResult<'a, W> {
@@ -4484,7 +4477,7 @@ fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
             .collect();
         return borrowed_vec_to_result(borrowed);
     }
-    let mut out = Vec::with_capacity(items.len());
+    let mut out = vec_with_capacity(items.len());
     for item in items {
         match item.into_owned_checked() {
             Ok(v) => out.push(v),
@@ -27997,11 +27990,12 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // and fired their side effects (#820).
     let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
     let satisfied = taken.len() >= n;
-    // #2024: `items_to_result_checked`, not `items_to_result` -- the mainline
-    // `Stopped`/`Exhausted` arms return `result` straight through, so a
-    // mixed `Owned`/`Borrowed` `taken` batch (e.g. `limit(2; 1, .a)`, a
-    // literal alongside a field navigation) must already be decode-checked
-    // by the time it gets here, not just the `!satisfied` branch below.
+    // #2024: the mainline `Stopped`/`Exhausted` arms below return `result`
+    // straight through, so a mixed `Owned`/`Borrowed` `taken` batch (e.g.
+    // `limit(2; 1, .a)`, a literal alongside a field navigation) must
+    // already be decode-checked by the time it gets here, not just the
+    // `!satisfied` branch below -- see `items_to_result_checked`'s own doc
+    // comment for why its unchecked predecessor didn't cover this.
     let result = items_to_result_checked(taken);
     match flow {
         // Stopped because `n` outputs arrived: jq's own `foreach ... break
@@ -41960,7 +41954,7 @@ mod tests {
             items.push(item);
             Demand::Continue
         });
-        let result = items_to_result(items);
+        let result = items_to_result_checked(items);
         match flow {
             Flow::Exhausted | Flow::Stopped { .. } => result,
             Flow::Escaped(control) => {
