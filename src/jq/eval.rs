@@ -1293,7 +1293,8 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             params,
             body,
             then,
-        } => eval_func_def::<W, S>(name, params, body, then, value, optional),
+            bound,
+        } => eval_func_def::<W, S>(name, params, body, then, bound, value, optional),
         Expr::FuncCall { name, args } => eval_func_call::<W>(name, args, value, optional),
 
         // #1371: a call already bound to its definition. Unlike `FuncCall`
@@ -3393,9 +3394,10 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             params,
             body,
             then,
+            bound,
         } => {
-            let bound_then = bind_def(name, params, body, then);
-            eval_each::<W, S>(&bound_then, value, optional, sink)
+            let bound_then = bind_def(name, params, body, then, bound);
+            eval_each::<W, S>(bound_then, value, optional, sink)
         }
 
         // #1371: a bound call needs its own arm here for the same reason the
@@ -26295,6 +26297,7 @@ fn substitute_var_impl(
             params,
             body,
             then,
+            ..
         } => {
             // Check if any parameter shadows the var_name
             let shadowed = params.contains(&var_name.to_string());
@@ -26317,6 +26320,9 @@ fn substitute_var_impl(
                     replacement,
                     mark_trackable,
                 )),
+                // Rebuilt above (`body`/`then` may have changed), so any
+                // cache computed against the old node is stale (#2094).
+                bound: BoundBody::default(),
             }
         }
         Expr::FuncCall { name, args } => Expr::FuncCall {
@@ -31076,12 +31082,13 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             params,
             body,
             then,
+            bound,
         } => {
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let bound_then = bind_def(name, params, body, then);
-            let mut then_stages = vec![bound_then];
+            let bound_then = bind_def(name, params, body, then, bound);
+            let mut then_stages = vec![(**bound_then).clone()];
             if paired {
                 then_stages.push(path_probe_stage());
             }
@@ -40483,11 +40490,12 @@ fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     params: &[String],
     body: &Expr,
     then: &Expr,
+    bound: &BoundBody,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let bound_then = bind_def(name, params, body, then);
-    eval_single::<W, S>(&bound_then, value, optional)
+    let bound_then = bind_def(name, params, body, then, bound);
+    eval_single::<W, S>(bound_then, value, optional)
 }
 
 /// Ambient "how many frames deep is the recursion the caller is already
@@ -40568,13 +40576,36 @@ mod ambient_frame_depth {
 /// demand-driven `eval_each`, the path-context one, and `eval_generic`'s —
 /// and all four need exactly this before continuing into their own
 /// evaluation of `then`.
-pub(crate) fn bind_def(name: &str, params: &[String], body: &Expr, then: &Expr) -> Expr {
-    let def = Rc::new(FuncDefData {
-        name: name.to_string(),
-        params: params.to_vec(),
-        body: body.clone(),
-    });
-    install_def_calls(then, &def, ambient_frame_depth::get())
+///
+/// Memoized on `bound` (#2094): a `def` declared *inside* a loop body (`.[] |
+/// (def add1: . + 1; add1)`) reaches this same node once per element, and
+/// installation is a pure function of `(name, params, body, then)` -- the
+/// same reasoning [`BoundBody`] itself documents for `DefCall`. Infallible,
+/// unlike [`bind_def_call`], so there is no failure case to leave uncached.
+///
+/// Safe to cache `ambient_frame_depth::get()`'s value (baked into the
+/// installed `DefCall`s' own `frames` fields) along with the rest: nothing
+/// between two evaluations of the *same* `FuncDef` node can change the
+/// ambient depth without also rebuilding that node first. The depth only
+/// moves inside an [`enter_def_call_frame`] guard scoped to one `DefCall`'s
+/// own bound-body evaluation, and every substitution pass that could place
+/// this `FuncDef` node inside a different `DefCall`'s recursion also
+/// rebuilds the node (and resets `bound`) as part of that same substitution.
+pub(crate) fn bind_def<'e>(
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    then: &Expr,
+    bound: &'e BoundBody,
+) -> &'e Rc<Expr> {
+    bound.get_or_init(|| {
+        let def = Rc::new(FuncDefData {
+            name: name.to_string(),
+            params: params.to_vec(),
+            body: body.clone(),
+        });
+        Rc::new(install_def_calls(then, &def, ambient_frame_depth::get()))
+    })
 }
 
 /// Widens the ambient frame-depth floor (see [`ambient_frame_depth`]) to
@@ -40694,11 +40725,28 @@ pub(crate) fn bind_def_call<'e>(
                 def.params.len()
             )));
         }
-        let mut body = def.body.clone();
-        for (param, arg) in def.params.iter().zip(args.iter()) {
-            body = substitute_func_param(&body, param, &Expr::Shared(Rc::new(arg.clone())));
-        }
-        Ok(Rc::new(install_def_calls(&body, def, frames + 1)))
+        // #2094: `def.body` needs to become an owned `Expr` before
+        // `install_def_calls` below only when at least one parameter
+        // substitution actually rebuilds it -- `substitute_func_param`
+        // already deep-clones/rebuilds the whole tree on its own first
+        // call, so seeding the loop with a separate `def.body.clone()`
+        // wasted one O(body size) allocation per bound call (i.e. once per
+        // recursion level, since this whole function is gated by `bound`).
+        // A zero-parameter `def` needs no substitution at all, so it skips
+        // straight to installing over `&def.body` with no clone whatsoever.
+        let mut params_and_args = def.params.iter().zip(args.iter());
+        let installed_body = match params_and_args.next() {
+            Some((param, arg)) => {
+                let mut body =
+                    substitute_func_param(&def.body, param, &Expr::Shared(Rc::new(arg.clone())));
+                for (param, arg) in params_and_args {
+                    body = substitute_func_param(&body, param, &Expr::Shared(Rc::new(arg.clone())));
+                }
+                install_def_calls(&body, def, frames + 1)
+            }
+            None => install_def_calls(&def.body, def, frames + 1),
+        };
+        Ok(Rc::new(installed_body))
     })
 }
 
@@ -41001,6 +41049,7 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
             params: inner_params,
             body: inner_body,
             then,
+            ..
         } => {
             // #1376: shadowing needs the *same arity*, not just the same
             // name -- see the `FuncCall` arm above for why arity
@@ -41025,6 +41074,11 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
                     params: inner_params.clone(),
                     body: Box::new(install_def_calls(inner_body, def, frames + 1)),
                     then: Box::new(install_def_calls(then, def, frames + 1)),
+                    // Rebuilt above, so any cache from the pre-install node
+                    // is stale (#2094) -- the shadowed branch above instead
+                    // clones `expr` wholesale, correctly carrying its cache
+                    // (if any) through untouched.
+                    bound: BoundBody::default(),
                 }
             }
         }
@@ -41436,6 +41490,7 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
             params,
             body,
             then,
+            ..
         } => {
             // #2077 defect B: a nested `def` of the same name *and arity*
             // (zero, matching how a function parameter is referenced --
@@ -41453,6 +41508,8 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
                 params: params.clone(),
                 body: Box::new(subst_unless_shadowed(body_shadowed, body, param, arg)),
                 then: Box::new(subst_unless_shadowed(then_shadowed, then, param, arg)),
+                // Rebuilt above, so any cache is stale (#2094).
+                bound: BoundBody::default(),
             }
         }
         Expr::FuncCall { name, args } => {
@@ -41630,6 +41687,39 @@ mod tests {
     /// under `no_std` (see its own module doc comment) -- there is no
     /// no_std variant of this mechanism to test.
     #[test]
+    fn test_bind_def_memoizes_per_node_2094() {
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } = parse("def f: 1; f").unwrap()
+        else {
+            panic!("expected a top-level FuncDef");
+        };
+
+        let first = bind_def(&name, &params, &body, &then, &bound);
+        let first_ptr = Rc::as_ptr(first);
+        let second = bind_def(&name, &params, &body, &then, &bound);
+        assert!(
+            Rc::ptr_eq(first, second),
+            "a second call sharing the same BoundBody must reuse the first's cached Rc \
+             (same pointer), not recompute install_def_calls from scratch"
+        );
+        assert_eq!(Rc::as_ptr(second), first_ptr);
+
+        // An independent node's own cache cell is untouched by the one
+        // above -- confirms the cache is keyed per-node, not global.
+        let fresh_cache = BoundBody::default();
+        let third = bind_def(&name, &params, &body, &then, &fresh_cache);
+        assert!(
+            !Rc::ptr_eq(first, third),
+            "a different BoundBody must compute its own Rc, not see another node's cache"
+        );
+    }
+
+    #[test]
     #[cfg(feature = "std")]
     fn test_bind_def_seeds_defcall_frames_from_ambient_depth_1371() {
         let Expr::FuncDef {
@@ -41637,15 +41727,25 @@ mod tests {
             params,
             body,
             then,
+            ..
         } = parse("def f: f; f").unwrap()
         else {
             panic!("expected a top-level FuncDef");
         };
 
+        // Each call below gets its own fresh `BoundBody` (#2094): they
+        // simulate three *independent* reaches of a `def name: ...` node at
+        // different ambient depths, which in the real evaluator can only
+        // happen across a rebuild that itself resets the cache (see
+        // `bind_def`'s own doc comment) -- reusing one cache cell across all
+        // three would make the 2nd/3rd calls return the 1st's stale result
+        // and defeat what this test checks.
+
         // No ambient depth entered yet: a fresh top-level `def` still seeds
         // from `0`, matching every evaluator's actual call site.
-        match bind_def(&name, &params, &body, &then) {
-            Expr::DefCall { frames, .. } => assert_eq!(frames, 0),
+        let cache1 = BoundBody::default();
+        match &**bind_def(&name, &params, &body, &then, &cache1) {
+            Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
 
@@ -41656,8 +41756,9 @@ mod tests {
         // FuncDef node.
         {
             let _guard = enter_def_call_frame(MAX_EVAL_FRAMES - 1);
-            match bind_def(&name, &params, &body, &then) {
-                Expr::DefCall { frames, .. } => assert_eq!(frames, MAX_EVAL_FRAMES - 1),
+            let cache2 = BoundBody::default();
+            match &**bind_def(&name, &params, &body, &then, &cache2) {
+                Expr::DefCall { frames, .. } => assert_eq!(*frames, MAX_EVAL_FRAMES - 1),
                 other => panic!("expected DefCall, got {other:?}"),
             }
         }
@@ -41666,8 +41767,9 @@ mod tests {
         // `def` reached *after* the nested call returns -- a sibling, not
         // something nested inside it -- does not inherit a depth that no
         // longer applies to it.
-        match bind_def(&name, &params, &body, &then) {
-            Expr::DefCall { frames, .. } => assert_eq!(frames, 0),
+        let cache3 = BoundBody::default();
+        match &**bind_def(&name, &params, &body, &then, &cache3) {
+            Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
     }
@@ -41690,22 +41792,25 @@ mod tests {
             params,
             body,
             then,
+            ..
         } = parse("def f: f; f").unwrap()
         else {
             panic!("expected a top-level FuncDef");
         };
 
         let _guard = enter_def_call_frame(MAX_EVAL_FRAMES);
+        let cache = BoundBody::default();
+        let bound_then = bind_def(&name, &params, &body, &then, &cache);
         let Expr::DefCall {
             def,
             args,
             frames,
             bound,
-        } = bind_def(&name, &params, &body, &then)
+        } = &**bound_then
         else {
             panic!("expected DefCall");
         };
-        let err = bind_def_call(&def, &args, frames, &bound)
+        let err = bind_def_call(def, args, *frames, bound)
             .expect_err("ambient depth at the ceiling must refuse the call, not run it");
         assert!(
             err.message.contains("exceeded maximum recursion depth"),
