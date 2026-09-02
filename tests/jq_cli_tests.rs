@@ -17020,8 +17020,11 @@ fn test_resolve_node_alternative_falsy_left_no_catch_needed_845() -> Result<()> 
 /// The shipped fix only special-cases a bare literal (whose value needs no
 /// evaluation at all), so a non-literal falsy-*valued* left like `stderr`
 /// still takes the original, single-evaluation code path -- this pins
-/// "exactly one write", not jq-matching output (that query still diverges
-/// from jq for an unrelated, pre-existing reason, tracked as #986).
+/// "exactly one write". Used to also pin a real jq-mismatch here (`stderr`
+/// wasn't path-trackable at all, an unrelated pre-existing gap tracked as
+/// #986) -- #2234 fixed that: `path(stderr // .b)` now matches jq byte for
+/// byte (`{"a":10}[]`, exit 0), so this test's own write-count check is the
+/// only thing left worth pinning.
 #[test]
 fn test_resolve_node_alternative_does_not_double_evaluate_non_literal_left_845() -> Result<()> {
     let (_stdout, stderr, _code) = run_jq_full(&["-c", "path(stderr // .b)"], Some(r#"{"a":10}"#))?;

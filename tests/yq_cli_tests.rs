@@ -28052,3 +28052,23 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
 
     Ok(())
 }
+
+/// #2234: `resolve_node`'s new `Builtin::Stderr` arm is generic over
+/// `S: EvalSemantics` and shared verbatim by jq and yq -- this pins that the
+/// fix reaches yq mode too, not just jq's own CLI dispatch. `stderr` isn't
+/// actually a real yq builtin (`stderr`/`stderr` alone both lex-reject
+/// against real yq v4.53.3: `Error: 1:1: lexer: invalid input text
+/// "stderr"`), so this is confirming succinctly's own dual-mode consistency
+/// -- there is no real yq oracle output to match here, unlike the project's
+/// usual convention. `stderr` parses unconditionally in succinctly's own yq
+/// mode (unlike `debug`, which needs `--jq-extensions`) -- a pre-existing
+/// parser-gating gap, not introduced or addressed by this fix.
+#[test]
+fn test_stderr_path_passthrough_reaches_yq_mode_2234() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("(.a | stderr) |= . + 1", "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(stderr, "1");
+    assert_eq!(out.trim(), "{\n  \"a\": 2\n}");
+    Ok(())
+}
