@@ -5093,13 +5093,41 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Array(elements) => {
             // LAZY: Store cursor references instead of materializing children
-            let items: Vec<JqValue<'a, W>> = elements.cursor_iter().map(JqValue::Cursor).collect();
+            //
+            // #2211 code review: this walk used to validate *nothing* about
+            // the delimiter preceding each element -- not even the older
+            // #1677 missing/doubled-comma-between-two-real-elements check
+            // `print_json`'s own array arm (`check_preceding_delimiter`) and
+            // `eval_generic::to_owned_cursor_at_depth`'s array loop already
+            // perform. Only the top level (`GenericResult::One`/`Many`)
+            // reaches this function at all, and its own container position
+            // is not available here by construction (`GenericResult::One`
+            // is only ever produced when no cursor is being tracked for
+            // *this* node -- see `Expr::Identity`'s own doc comment in
+            // `eval_generic.rs`), so unlike its `to_owned_cursor_at_depth`/
+            // `cursor_to_owned_at_depth` siblings this cannot also check an
+            // apparently-*empty* container's own opening-to-closing gap
+            // (`[,]`) -- there is no cursor for `[,]` itself to check that
+            // against, only for its (zero) children. Each child's *own*
+            // cursor is still valid and positioned regardless, so the
+            // between-real-elements check below is fully safe.
+            let mut items: Vec<JqValue<'a, W>> = Vec::new();
+            for (i, child_cursor) in elements.cursor_iter().enumerate() {
+                if let Some(pos) = child_cursor.text_position() {
+                    let expected = if i == 0 { None } else { Some(b',') };
+                    if !preceding_gap_ok(child_cursor.text(), pos, expected) {
+                        return Err(EvalError::malformed_json_text(child_cursor.text()));
+                    }
+                }
+                items.push(JqValue::Cursor(child_cursor));
+            }
             JqValue::Array(items)
         }
         StandardJson::Object(fields) => {
             // LAZY: Store cursor references instead of materializing values
             let mut map: IndexMap<String, JqValue<'a, W>> = IndexMap::new();
             let mut remaining = fields;
+            let mut is_first = true;
             while let Some((f, rest)) = remaining.uncons() {
                 // A key that isn't `StandardJson::String` at all is a
                 // structurally malformed key, not a decode failure. This used
@@ -5114,9 +5142,29 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
                     },
                     _ => return Err(EvalError::malformed_json_text(parent_cursor.text())),
                 };
+                // #2211 code review: same missing #1677 check as the array
+                // arm above -- neither the key's own preceding `,` nor the
+                // value's own preceding `:` was ever validated here. Same
+                // "no container-level cursor available" limitation as the
+                // array arm for the apparently-*empty* case (`{,}`); each
+                // real field's own key/value cursor is unaffected by that.
+                let key_cursor = f.key_cursor();
+                let value_cursor = f.value_cursor();
+                if let Some(key_pos) = key_cursor.text_position() {
+                    let expected = if is_first { None } else { Some(b',') };
+                    if !preceding_gap_ok(key_cursor.text(), key_pos, expected) {
+                        return Err(EvalError::malformed_json_text(key_cursor.text()));
+                    }
+                }
+                if let Some(value_pos) = value_cursor.text_position() {
+                    if !preceding_gap_ok(value_cursor.text(), value_pos, Some(b':')) {
+                        return Err(EvalError::malformed_json_text(value_cursor.text()));
+                    }
+                }
                 // Use cursor for value instead of materializing
-                map.insert(key, JqValue::Cursor(f.value_cursor()));
+                map.insert(key, JqValue::Cursor(value_cursor));
                 remaining = rest;
+                is_first = false;
             }
             // A child with no sibling to pair as a value: the object is
             // malformed and `uncons` would drop it silently (#1194).
@@ -7377,6 +7425,74 @@ mod tests {
         let err =
             standard_json_to_jq_value(value, &cursor).expect_err("a bareword is not a JSON value");
         assert!(!err.message.is_empty(), "{err:?}");
+    }
+
+    /// #2211 code review: this function's `Array`/`Object` arms never
+    /// validated *any* delimiter at all -- not even the older #1677
+    /// missing/doubled-comma-between-two-real-children check `print_json`'s
+    /// own array/object arms and `eval_generic::to_owned_cursor_at_depth`
+    /// already perform. `[1 2, 3]` is missing the comma between its first
+    /// two elements (three real elements: `1`, `2`, `3`); `{"a" 1, "b": 2}`
+    /// is missing the colon after its first key.
+    ///
+    /// No CLI-level regression test accompanies either half of this, same
+    /// reasoning as this function's other unit-tested-only fixes above
+    /// (see e.g. `test_standard_json_to_jq_value_raises_on_malformed_top_
+    /// level_value_1194`'s own doc comment): whenever this function's
+    /// output is actually printed, `print_json`'s own independent,
+    /// pre-existing #1643/#1676 checks re-validate the same document
+    /// (confirmed live against the pre-fix binary via `git stash`) and mask
+    /// this function's own gap end-to-end -- calling this function
+    /// directly is the only way to exercise its own validation in
+    /// isolation.
+    #[test]
+    fn test_standard_json_to_jq_value_raises_on_missing_delimiter_between_array_elements_2211() {
+        let json: &[u8] = b"[1 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = standard_json_to_jq_value(value, &cursor)
+            .expect_err("a missing comma between two real elements is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_standard_json_to_jq_value_raises_on_missing_delimiter_in_object_2211() {
+        let json: &[u8] = b"{\"a\" 1, \"b\": 2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = standard_json_to_jq_value(value, &cursor)
+            .expect_err("a missing colon after a real key is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #2211: well-formed multi-element arrays/objects are unaffected by
+    /// the new between-elements delimiter check above --
+    /// `test_standard_json_to_jq_value_succeeds_on_valid_input_1192`'s own
+    /// object case only has two well-formed fields; this exercises a
+    /// three-element well-formed array too, so the `is_first`/subsequent-
+    /// element branches of the new check both get a `true` answer pinned.
+    #[test]
+    fn test_standard_json_to_jq_value_wellformed_array_unaffected_2211() {
+        let json: &[u8] = b"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let jq_value =
+            standard_json_to_jq_value(value, &cursor).expect("a well-formed array must not raise");
+        let JqValue::Array(items) = jq_value else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), 3);
     }
 
     /// #1194: `MalformedJsonError` exists to be `downcast_ref`'d out of an

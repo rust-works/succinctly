@@ -29,7 +29,8 @@ use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
     effective_len, effective_len_checked, key_delimiter_ok, key_display_string,
-    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentFields,
+    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor,
+    DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -847,10 +848,34 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         ),
         StandardJson::Array(_) => {
             // Use cursor navigation to iterate children
-            let items: Vec<OwnedValue> = cursor
-                .children()
-                .map(|child| cursor_to_owned_at_depth(&child, depth + 1))
-                .collect::<Result<_, _>>()?;
+            let mut items = Vec::new();
+            let mut is_first = true;
+            for child in cursor.children() {
+                // #2211 code review: this walk (unlike its
+                // `eval_generic::to_owned_cursor_at_depth` sibling it
+                // otherwise mirrors) never called `preceding_delimiter_ok`
+                // at all -- not even the missing/doubled-comma-between-two-
+                // real-elements check (#1677), which the `Object` arm below
+                // already had. `{"a" 1, "b": 2} | -e` used to silently
+                // succeed for the array shape (`[1 2, 3]`) the same way this
+                // object shape used to before #1956.
+                if let Some(pos) = child.text_position() {
+                    let expected = if is_first { None } else { Some(b',') };
+                    if !child.preceding_delimiter_ok(pos, expected) {
+                        return Err(child.malformed_delimiter_error());
+                    }
+                }
+                items.push(cursor_to_owned_at_depth(&child, depth + 1)?);
+                is_first = false;
+            }
+            // #2211: a stray `,` with no real element at all (`[,]`) left
+            // the loop above with nothing to check a delimiter against --
+            // `items.is_empty()` after the walk is exactly that case (a
+            // genuine `[]` also reaches here, and `container_gap_ok`
+            // answers `true` for it).
+            if items.is_empty() && !cursor.container_gap_ok(b']') {
+                return Err(cursor.malformed_delimiter_error());
+            }
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -893,6 +918,14 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             }
             if f.ends_unpaired() {
                 return Err(f.malformed_member_error());
+            }
+            // #2211: same reasoning as the array arm's own check just
+            // above, for a stray `,` with no real field at all (`{,}`) --
+            // `key_delimiter_ok`/`value_delimiter_ok` above only ever run
+            // against a real field, so the walk producing zero fields at
+            // all leaves nothing to check.
+            if map.is_empty() && !cursor.container_gap_ok(b'}') {
+                return Err(cursor.malformed_delimiter_error());
             }
             OwnedValue::Object(map)
         }
@@ -1101,6 +1134,107 @@ mod tests {
         // `into_owned` is a separate walk of the same tree; it must agree.
         let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
         assert!(val.into_owned().is_err());
+    }
+
+    /// #2211 code review: `cursor_to_owned_at_depth`'s `Array` arm never
+    /// validated *any* element delimiter at all -- unlike its `Object` arm
+    /// neighbor, which already had the #1956/#1677 `key_delimiter_ok`/
+    /// `value_delimiter_ok` check. `[1 2, 3]` is missing the comma between
+    /// its first two (real) elements.
+    ///
+    /// No CLI-level test accompanies this: `-e`/`--exit-status` (the flag
+    /// that forces `.materialize()` at all) still always prints its result
+    /// through `write_output_jq_value`/`print_json` afterward regardless of
+    /// what `.materialize()` found, and `print_json`'s own independent
+    /// #1643/#1676 checks catch this document too -- confirmed live against
+    /// the pre-fix binary (`git stash`) that `succinctly jq -e -c '...'`
+    /// already rejected every one of this test's inputs before this fix,
+    /// via that unrelated, redundant check rather than this function's own
+    /// validation. Calling `materialize`/`into_owned` directly is the only
+    /// way to exercise this function's own gap in isolation.
+    #[test]
+    fn materialize_raises_on_missing_delimiter_between_array_elements_2211() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"[1 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let val = JqValue::from_cursor(cursor);
+        let err = val
+            .materialize()
+            .expect_err("a missing comma between two real elements is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+
+        let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
+        assert!(val.into_owned().is_err(), "into_owned must agree");
+    }
+
+    /// #2211: a stray `,` with no real child at all (`[,]`, `{,}`) left
+    /// both the array loop (which now validates a *real* element's own
+    /// preceding delimiter, added by this same fix) and the pre-existing
+    /// object loop (which validates a real field's own key/value
+    /// delimiters) with nothing to check a delimiter against, since neither
+    /// loop body ever ran -- the same "no real child to check against" gap
+    /// #2211's `eval_generic::to_owned_cursor_at_depth` fix closed via
+    /// `DocumentCursor::container_gap_ok`, needed again here for this
+    /// independent materializer.
+    #[test]
+    fn materialize_raises_on_stray_comma_in_empty_containers_2211() {
+        use crate::json::JsonIndex;
+
+        for json in [b"[,]".as_slice(), b"{,}".as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let val = JqValue::from_cursor(cursor);
+            let err = val
+                .materialize()
+                .expect_err("a stray comma in an apparently-empty container is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+
+            let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
+            assert!(val.into_owned().is_err(), "{json:?}: into_owned must agree");
+        }
+    }
+
+    /// #2211: well-formed arrays/objects (including genuinely empty ones,
+    /// which must still materialize as `[]`/`{}` rather than being caught
+    /// by either new check above) are unaffected.
+    #[test]
+    fn materialize_wellformed_containers_unaffected_2211() {
+        use crate::json::JsonIndex;
+
+        for (json, expected) in [
+            (b"[]".as_slice(), OwnedValue::Array(vec![])),
+            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new())),
+            (
+                b"[1,2,3]".as_slice(),
+                OwnedValue::Array(vec![
+                    OwnedValue::from_number_literal("1"),
+                    OwnedValue::from_number_literal("2"),
+                    OwnedValue::from_number_literal("3"),
+                ]),
+            ),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let val = JqValue::from_cursor(cursor);
+            assert_eq!(
+                val.materialize().unwrap(),
+                expected,
+                "{json:?}: materialize"
+            );
+
+            let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
+            assert_eq!(val.into_owned().unwrap(), expected, "{json:?}: into_owned");
+        }
     }
 
     /// #1247 used to raise here; #1642 preserves instead, matching
