@@ -2030,6 +2030,35 @@ fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
     false
 }
 
+/// Whether an *apparently* empty container (`value` decodes to `[]`/`{}`)
+/// at `cursor` is genuinely empty rather than a stray `,` with no real
+/// child (`{,}`, `[,]`) -- #1576 review: `JsonCursor::stream_json`'s own
+/// pre-recursion check only ever ran on the *root* value, because that was
+/// the only place in the call chain that still held the container's own
+/// cursor. `stream_json_pretty`'s array/object arms hit the identical gap
+/// one level down (`JsonFields`/`JsonElements` carry only "the first
+/// child's cursor, or `None`", nothing for the empty case to compare
+/// against), so both now call this with whichever cursor they still have
+/// for the child about to be checked, rather than only checking the root.
+/// Returns `true` (nothing to flag) whenever `value` isn't an empty
+/// container, or when `cursor` lacks a text position/raw span to check
+/// (a synthetic value with no source span never has a stray token either).
+fn empty_container_gap_ok<'a, W: AsRef<[u64]> + Clone>(
+    cursor: &JsonCursor<'a, W>,
+    value: &StandardJson<'a, W>,
+) -> bool {
+    let is_empty_container = matches!(value, StandardJson::Object(fields) if fields.is_empty())
+        || matches!(value, StandardJson::Array(elements) if elements.is_empty());
+    if !is_empty_container {
+        return true;
+    }
+    let (Some(pos), Some(bytes)) = (cursor.text_position(), cursor.raw_bytes()) else {
+        return true;
+    };
+    let close = bytes[bytes.len() - 1];
+    trailing_gap_ok(cursor.text(), pos + 1, close)
+}
+
 /// Cheap end position (one past the last byte) of an already-resolved
 /// scalar `value` known to start at `start` -- `None` for a container,
 /// which [`trailing_gap_ok`]'s callers treat as "can't determine, skip"
@@ -2166,30 +2195,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
             }
             return Err(StreamFailure::Fmt);
         }
-        // #1676 review: a stray `,` in an *apparently* empty container
-        // (`{,}`, `[,]`) has no child cursor at all for `stream_json_pretty`
-        // to find and check a delimiter against -- `JsonFields`/
-        // `JsonElements` carry only "the first child's cursor, or `None`",
-        // nothing for the empty case to compare its own text against. This
-        // cursor is the only place in the call chain that still has the
-        // container's own opening-bracket position for that comparison, so
-        // the check runs here, once, before recursing.
+        // #1676/#1576 review: a stray `,` in an *apparently* empty
+        // container (`{,}`, `[,]`) has no child cursor for
+        // `stream_json_pretty` to check a delimiter against -- see
+        // `empty_container_gap_ok`'s own doc comment. This is the root
+        // value's own check; `stream_json_pretty`'s array/object arms run
+        // the same check for a nested empty container, using whichever
+        // child cursor they still have.
         let value = self.value();
-        if matches!(
-            value,
-            StandardJson::Object(fields) if fields.is_empty()
-        ) || matches!(
-            value,
-            StandardJson::Array(elements) if elements.is_empty()
-        ) {
-            if let (Some(pos), Some(bytes)) = (self.text_position(), self.raw_bytes()) {
-                let close = bytes[bytes.len() - 1];
-                if !trailing_gap_ok(self.text(), pos + 1, close) {
-                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
-                        self.text(),
-                    )));
-                }
-            }
+        if !empty_container_gap_ok(self, &value) {
+            return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                self.text(),
+            )));
         }
         let mut buf = String::new();
         stream_json_pretty(
@@ -2645,7 +2662,11 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     out.write_char(',')?;
                 }
                 last_scalar_end = None;
-                if let Some(pos) = elem_cursor.text_position() {
+                // Resolved once and reused below for both the trailing-gap
+                // bookkeeping and the recursive render, instead of a second
+                // `elem_cursor.value()` re-deriving the same value (#1576
+                // review).
+                let elem_value = if let Some(pos) = elem_cursor.text_position() {
                     let expected = if first { None } else { Some(b',') };
                     if !elem_cursor.preceding_delimiter_ok(pos, expected) {
                         return Err(StreamFailure::Decode(
@@ -2653,9 +2674,23 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                         ));
                     }
                     let elem_value = elem_cursor.value_at(pos);
+                    // #1576 review: `stream_json`'s root-only empty-
+                    // container check (see `empty_container_gap_ok`) never
+                    // reaches a non-root element like this one, so a stray
+                    // `,` inside a *nested* empty container (`[{"a": [,]}]`)
+                    // needs its own check here, against this element's own
+                    // cursor.
+                    if !empty_container_gap_ok(&elem_cursor, &elem_value) {
+                        return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                            elem_cursor.text(),
+                        )));
+                    }
                     last_scalar_end =
                         scalar_end_pos(pos, &elem_value).map(|end| (elem_cursor.text(), end));
-                }
+                    elem_value
+                } else {
+                    elem_cursor.value()
+                };
                 first = false;
                 rest = next;
                 if indent_spaces > 0 {
@@ -2664,7 +2699,7 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                 }
                 stream_json_pretty(
                     out,
-                    elem_cursor.value(),
+                    elem_value,
                     next_indent,
                     indent_spaces,
                     unit,
@@ -2786,6 +2821,16 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                     out.write_str("\"\"")?;
                 }
                 out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                // #1576 review: same nested-empty-container gap as the array
+                // arm above (see `empty_container_gap_ok`'s doc comment) --
+                // `stream_json`'s root-only check never reaches a field's
+                // value here, so `{"a": {"b": {,}}}` needs its own check
+                // against this field's own value cursor.
+                if !empty_container_gap_ok(&field.value_cursor, &field.value) {
+                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                        field.value_cursor.text(),
+                    )));
+                }
                 stream_json_pretty(
                     out,
                     field.value,
@@ -3499,6 +3544,71 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, r#"{"b": 1, "a": 2}"#);
+    }
+
+    // #1576 review: `stream_json`'s own stray-`,`-in-an-empty-container check
+    // (`{,}`, `[,]`) only ever ran on the *root* value, because that was the
+    // only place in the call chain still holding the container's own cursor
+    // -- a nested empty container one level down silently "healed" into a
+    // valid-looking `[]`/`{}` instead of erroring, unlike `-S`'s DOM path and
+    // real jq (both reject `[,]` outright). `empty_container_gap_ok` closes
+    // this by running the same check wherever `stream_json_pretty`'s array/
+    // object arms still hold a child cursor for the container about to be
+    // recursed into.
+    #[test]
+    fn test_stream_json_pretty_nested_empty_array_stray_comma_1576() {
+        let json = br#"{"a": [,]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        let err = root
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::JqCompat,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamFailure::Decode(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_stream_json_pretty_nested_empty_object_stray_comma_1576() {
+        let json = br"[1, {,}]";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        let err = root
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::JqCompat,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StreamFailure::Decode(_)), "{err:?}");
+    }
+
+    // Control: a genuinely empty nested array/object (no stray token) must
+    // keep streaming cleanly -- `empty_container_gap_ok` must not flag every
+    // empty container, only one with unexplained content before its closer.
+    #[test]
+    fn test_stream_json_pretty_genuinely_empty_nested_containers_still_stream_1576() {
+        let json = br#"{"a": [], "b": {}, "c": [1, {}, []]}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let mut out = String::new();
+        root.stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::JqCompat,
+        )
+        .unwrap();
+        assert_eq!(out, r#"{"a":[],"b":{},"c":[1,{},[]]}"#);
     }
 
     #[test]
