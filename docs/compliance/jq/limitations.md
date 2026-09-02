@@ -1120,6 +1120,19 @@ coverage differs:
   `Error`/`Partial` arms across these same three functions' `input`/INIT streams didn't
   exclude a genuine decode failure from `optional`'s suppression the way `finish_fork`
   already does — an internal-consistency fix, not a further widening of this policy).
+- **#2188 fixed `fromstream(f)`'s own event-collecting fallback.** `collect_owned`'s
+  `One`/`Many` arms use unchecked `to_owned`, so `builtin_fromstream`'s
+  `result.collect_owned()` fallback silently substituted `""` for an undecodable event leaf
+  instead of raising — found via a research audit for #1989 that classified every bare
+  `to_owned(` call site in this file. Fixed by routing through the pre-existing
+  `stream_outputs_checked` (already had the exact `(Vec<OwnedValue>, Option<Control>)` shape
+  the call site destructures into) rather than adding a new function.
+  `builtin_truncate_stream` has the identical `collect_owned` call shape but is safe by
+  construction, not just untested: its `stream_expr` is evaluated against the same ambient
+  value that also becomes `depth`, and any value complex enough for `stream_expr` to reach a
+  nested undecodable string through is necessarily non-scalar, which always outranks an `Int`
+  path length in jq's ordering — so every event is unconditionally dropped before a corrupted
+  leaf could reach output.
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
