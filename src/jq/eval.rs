@@ -25133,7 +25133,31 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // live against jq 1.7.1: `path(.a[(0,error("t1"))] | .c[(0,error("t2"))]
     // | .foo)` on `{"a":[{"c":[{"foo":1}]}]}` raises `t2`, not `t1`.
     let mut deferred_escape: Option<EvalEscape> = None;
-    for element in &flat[..=last_dynamic] {
+    for (stage_index, element) in flat[..=last_dynamic].iter().enumerate() {
+        // #2050: `keep` is this whole call's *terminal* demand (typically
+        // `Keep::First`, #987's "stop a generator after its first output"
+        // rule) — correct only for the position nothing else in this
+        // `resolve_seq` call follows. An earlier stage here is not that
+        // position whenever a later stage or a non-empty `tail` still has
+        // to run: a `select`/filter downstream may reject that stage's
+        // first output and only accept a later one (`paths | select(length
+        // == 2) | .foo` needs `paths`'s *second* output, since its first
+        // is rejected), so truncating the generator to one value before
+        // the filter ever runs can turn a genuine "later output survives"
+        // pipe into a wrongly-empty result, or a wrongly-silent one — #1872's
+        // `resolve_fold_source` already established the fix for its own
+        // "needs every output" case (`Keep::AtMost(usize::MAX)`, not
+        // `Keep::First`); this reuses the identical value for the identical
+        // reason. Only `resolve_leaf`'s general non-primitive case actually
+        // reads `keep` at all (its own doc comment), so this widening is a
+        // no-op for every other arm (`Select` included, which ignores
+        // `keep` entirely) and only changes behavior for a bare generator
+        // builtin (`paths`, `range`, `keys`, ...) reached mid-pipe.
+        let stage_keep = if stage_index == last_dynamic && tail.is_empty() {
+            keep
+        } else {
+            Keep::AtMost(usize::MAX)
+        };
         // Whether this stage can carry a live path register across itself
         // at all (#1573). `false` is the answer for every stage this
         // resolver cannot see inside, because jq's register moves on any
@@ -25260,7 +25284,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
                 current,
                 branch_trackable,
                 branch_snapshot,
-                keep,
+                stage_keep,
             ) {
                 Ok(resolved) => {
                     for step in resolved {
@@ -59548,6 +59572,102 @@ mod tests {
                 assert_eq!(prefix_json(&vs), [r#"["a"]"#]);
                 assert_eq!(e.message, "z");
             }
+        );
+    }
+
+    /// #2050: a rejecting `select(...)` after a *generator builtin* used
+    /// mid-pipe (i.e. not as `path()`'s own terminal leaf) used to swallow
+    /// the surviving branch's own path-validity check entirely, rather
+    /// than merely re-ordering it. Root cause: `resolve_seq`'s fan-out loop
+    /// threaded the caller's own terminal `keep` (`Keep::First`, #987's
+    /// "stop a generator after its first output" rule) into *every* stage
+    /// of the pipe, not just the genuinely terminal one -- so bare `paths`
+    /// (which, lacking a dedicated `resolve_node` arm, falls to
+    /// `resolve_leaf`'s `keep`-obeying general case) was truncated to its
+    /// *first* output before `select` ever ran, discarding the very branch
+    /// `select` would have let through (`{"a":{"b":1}}`'s `paths` emits
+    /// `["a"]` then `["a","b"]`; `select(length == 2)` rejects the first
+    /// and accepts only the second). Confirmed live against jq 1.7.1
+    /// (`/usr/bin/jq`): the filter below raises, it does not produce `[]`.
+    #[test]
+    fn test_path_select_after_generator_does_not_swallow_surviving_branch_2050() {
+        query!(br#"{"a":{"b":1}}"#,
+            r#"[path(paths | select(length == 2) | .["a"])]"#,
+            QueryResult::Error(e) => assert_eq!(
+                e.message,
+                r#"Invalid path expression near attempt to access element "a" of ["a","b"]"#,
+            )
+        );
+        // A different generator builtin (`range`, not `paths`) reproduces
+        // the identical shape, confirming this is `resolve_seq`'s own
+        // stage-by-stage `keep` propagation, not something specific to
+        // `paths`'s own resolve_node handling. Confirmed live: jq raises
+        // on `2` here (the first candidate `select` actually lets
+        // through), never on `0` (the generator's own first output).
+        query!(br"null", r"[path(range(3) | select(.==2))]",
+            QueryResult::Error(e) => assert_eq!(
+                e.message, "Invalid path expression with result 2"
+            )
+        );
+        // `select` rejecting more than one candidate before the survivor
+        // still raises on the first one it actually lets through (`1`),
+        // not the generator's own first output (`0`) -- verified live.
+        query!(br"null", r"[path(range(3) | select(.>=1))]",
+            QueryResult::Error(e) => assert_eq!(
+                e.message, "Invalid path expression with result 1"
+            )
+        );
+    }
+
+    /// #2050's `del()` form -- the shape a randomised differential fuzzer
+    /// actually found (working #1690/PR #2047). Same generator/select
+    /// combination as the test above, but binding the surviving branch via
+    /// `as $p` and then genuinely navigating with `getpath($p)`. Before the
+    /// fix this was a silent no-op: `del(...)` returned the input
+    /// completely unchanged, per the issue's own repro. Real jq raises
+    /// "Cannot index array with string \"a\"" instead, since
+    /// `getpath(["a","b"])` -- `$p` bound from `paths`'s surviving second
+    /// output -- tries to index the array `["a","b"]` itself with the
+    /// string key "a" (its own first path component). This must surface as
+    /// a raised error, not a silent success: a no-op here would mean
+    /// `del()` claimed to delete something it never touched.
+    #[test]
+    fn test_del_select_after_generator_does_not_silently_noop_2050() {
+        query!(br#"{"a":{"b":1}}"#,
+            r"del(paths | select(length == 2) as $p | getpath($p))",
+            QueryResult::Error(e) => assert_eq!(
+                e.message, r#"Cannot index array with string "a""#
+            )
+        );
+    }
+
+    /// The two rows from #2050's own divergence table that were already
+    /// correct before this fix -- pinned here so a future change to
+    /// `resolve_seq`'s fan-out loop can't quietly regress them back.
+    #[test]
+    fn test_path_select_after_generator_previously_correct_rows_2050() {
+        // A *non-rejecting* `select` (`select(true)`) never exercises the
+        // truncate-before-filter bug at all: every generator output
+        // already survives regardless of what `select` does, so this
+        // raised correctly even before the fix -- the error itself comes
+        // from `getpath(.)` genuinely indexing the array `["a"]` with its
+        // own first string key, independent of path tracking.
+        query!(br#"{"a":{"b":1}}"#,
+            r"[path(paths | select(true) | getpath(.))]",
+            QueryResult::Error(e) => assert_eq!(
+                e.message, r#"Cannot index array with string "a""#
+            )
+        );
+        // A rejecting `select` over a literal `Expr::Comma`, not a
+        // generator builtin, never reaches `resolve_leaf`'s `keep`-obeying
+        // general case at all -- `Expr::Comma` has its own dedicated
+        // `resolve_node` arm -- so this also already raised correctly.
+        query!(br#"{"a":{"b":1}}"#,
+            r"[path((1,2) | select(. == 2) | .a)]",
+            QueryResult::Error(e) => assert_eq!(
+                e.message,
+                "Invalid path expression near attempt to access element \"a\" of 2"
+            )
         );
     }
 
