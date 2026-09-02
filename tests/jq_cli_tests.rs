@@ -13600,6 +13600,20 @@ fn test_resolve_slice_expr_reevaluates_end_bound_per_start_2245() -> Result<()> 
     Ok(())
 }
 
+/// #2245: a non-numeric `end` bound value hits `resolve_slice_bound`'s own
+/// hard-`Err` path (its `.collect::<Result<Vec<_>, _>>()?` on a resolved
+/// value that isn't a number) inside the per-`s` loop, not just the
+/// `Ok`/escape shapes the other tests here cover.
+#[test]
+fn test_resolve_slice_expr_end_bound_type_error_2245() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"path(.[(0):("x")])"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2245 (found in this fix's own review/live-oracle verification, not the
 /// issue's original scope): the untrackable-target checks in
 /// `resolve_slice_expr` name a representative `(s, e)` pair in their error
