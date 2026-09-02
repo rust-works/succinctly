@@ -6275,9 +6275,14 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         )
     }
 
+    // `numbers` only matters to `JsonCursor`'s own impl (#966 malformed-
+    // number follow-up) -- threaded through here purely to satisfy the
+    // shared `DocumentCursor::is_falsy` signature, and passed along
+    // unchanged to the recursive `Alias` arm below.
+    #[allow(clippy::only_used_in_recursion)]
     #[inline]
-    fn is_falsy(&self) -> bool {
-        // A value is falsy if it's null or false
+    fn is_falsy(&self, numbers: JsonConvention) -> bool {
+        // A value is falsy if it's null or false.
         match self.value() {
             YamlValue::Null => true,
             YamlValue::String(s) => {
@@ -6312,7 +6317,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
             // unwrapped, so a hand-built index cannot panic here.
             YamlValue::Alias { .. } => self
                 .resolve_alias_target_cursor()
-                .map_or(true, |target| target.is_falsy()),
+                .map_or(true, |target| target.is_falsy(numbers)),
             _ => false,
         }
     }
@@ -12060,7 +12065,11 @@ mod tests {
             if let YamlValue::Mapping(fields) = first_doc(root) {
                 if let Some(field) = fields.into_iter().next() {
                     let cursor = field.value_cursor();
-                    assert_eq!(cursor.is_falsy(), expect_falsy, "{name}");
+                    assert_eq!(
+                        cursor.is_falsy(JsonConvention::Preserve),
+                        expect_falsy,
+                        "{name}"
+                    );
                     continue;
                 }
             }
