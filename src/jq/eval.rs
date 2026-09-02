@@ -29104,6 +29104,27 @@ fn path_probe_stage() -> Expr {
     ])))
 }
 
+/// The stages an isolating arm appends after the body it evaluates: a single
+/// [`path_probe_stage`] when the continuation needs each output's own path,
+/// and nothing otherwise.
+///
+/// Extracted for #1510, where eight arms (`FuncDef`, `Limit`, `FirstExpr`,
+/// `LastExpr`, `If`, `Try`, `Label`, and `eval_bind_with_path_context`) all
+/// stopped needing to build an owned `[body.clone(), probe]` pair once
+/// `eval_stage_with_path_context` let them pass the body by borrow. What is
+/// left is only the trailing probe, which is small, fixed, and -- unlike the
+/// body -- genuinely has to be constructed. Call it *outside* any loop or
+/// closure the arm runs, so a fan-out pays for one probe rather than one per
+/// output. `Vec::new()` does not allocate, so the unpaired case still costs
+/// nothing.
+fn probe_stages(paired: bool) -> Vec<Expr> {
+    if paired {
+        vec![path_probe_stage()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Split one [`path_probe_stage`] output back into `(path, value)`.
 ///
 /// `fallback_path` answers the shapes the probe never produces (anything
@@ -29804,6 +29825,7 @@ fn eval_bind_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // probe -- see `path_probe_stage` (#1409). Gated on `rest` actually
     // consulting path context so the common case pays nothing.
     let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+    let probe = probe_stages(paired);
     let mut all_results: Vec<OwnedValue> = Vec::new();
     let mut stopped = None;
     for bound_val in bound_values {
@@ -29813,20 +29835,15 @@ fn eval_bind_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // too -- reused rather than duplicating its exact `partial(...,
         // Control::Error(e))` wrapping by hand.
         let body_result = match substitute(&bound_val) {
-            Ok(substituted_body) => {
-                let mut body_stages = vec![substituted_body];
-                if paired {
-                    body_stages.push(path_probe_stage());
-                }
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &body_stages,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                )
-            }
+            Ok(substituted_body) => eval_stage_with_path_context::<W, S>(
+                &substituted_body,
+                &probe,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            ),
             Err(e) => QueryResult::Error(e),
         };
         if let Some(stop) = accumulate_path_context_step(&mut all_results, body_result) {
@@ -29947,12 +29964,45 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     current_path: &[OwnedValue],
     optional: bool,
 ) -> QueryResult<'a, W> {
-    if exprs.is_empty() {
+    let Some((first, rest)) = exprs.split_first() else {
         return QueryResult::Owned(value.clone());
-    }
+    };
+    eval_stage_with_path_context::<W, S>(
+        first,
+        rest,
+        value,
+        root,
+        file_origin,
+        current_path,
+        optional,
+    )
+}
 
-    let (first, rest) = exprs.split_first().unwrap();
-
+/// One pipe stage, plus the stages that follow it, threaded by borrow.
+///
+/// Split out of `eval_pipe_with_path_context_internal` (#1510) so the arms
+/// that prepend a stage can pass the stage as `&Expr` instead of
+/// materialising `[stage] ++ rest` as an owned `Vec<Expr>`. `Expr` is a
+/// recursive `Box`/`Vec` tree with a derived `Clone`, so that splice was a
+/// deep copy of the whole remaining pipeline -- paid once per `Comma`
+/// branch, once per `If` fan-out output, and once per recursion level of a
+/// `DefCall`, in an evaluator whose `Shared(Rc<_>)`/`BoundBody` nodes exist
+/// precisely to make that tree cheap to share.
+///
+/// Splitting `(first, rest)` out of the slice is exact rather than
+/// approximate: nothing below reads `exprs` after `split_first`, so calling
+/// this with `(x, rest)` is by construction identical to calling
+/// `eval_pipe_with_path_context_internal` with `[x] ++ rest`.
+#[allow(clippy::too_many_arguments)]
+fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    first: &Expr,
+    rest: &[Expr],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Handle PathNoArg - return the current path. Position unchanged, so
     // `rest` continues against the ambient `root`/`current_path` (#1449:
     // routed through the shared helper #1445 already extracted for this
@@ -30285,28 +30335,19 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             }
         }
         Expr::Paren(inner) => {
-            // Parentheses don't change path, just evaluate inner
-            if rest.is_empty() {
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &[(**inner).clone()],
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                )
-            } else {
-                let mut combined = vec![(**inner).clone()];
-                combined.extend(rest.iter().cloned());
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &combined,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                )
-            }
+            // Parentheses don't change path, just evaluate inner. Prepending
+            // the parenthesised stage to `rest` is a borrow, not a splice
+            // (#1510) -- the `rest.is_empty()` case needs no separate arm
+            // any more, since an empty `rest` is already the empty slice.
+            eval_stage_with_path_context::<W, S>(
+                inner,
+                rest,
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            )
         }
         // `.[EXPR]?`/`.[S:E]?`: the same carve-out `eval_single` and
         // `eval_each` each already make for this shape (their matching arms
@@ -30438,20 +30479,39 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 )
             }
         }
-        Expr::Optional(inner) => {
-            let mut combined = vec![(**inner).clone()];
-            combined.extend(rest.iter().cloned());
-            eval_pipe_with_path_context_internal::<W, S>(
-                &combined,
-                value,
-                root,
-                file_origin,
-                current_path,
-                true,
-            )
-        }
+        Expr::Optional(inner) => eval_stage_with_path_context::<W, S>(
+            inner,
+            rest,
+            value,
+            root,
+            file_origin,
+            current_path,
+            true,
+        ),
+        // Flatten a nested pipe into this one. A `Pipe` prepends its whole
+        // stage list rather than a single stage, so it is the one arm the
+        // #1510 borrow cannot serve in general: `[i0..in] ++ rest` is two
+        // segments, and `rest: &[Expr]` holds one. See #2175 for making
+        // `rest` itself two-segment, which is what would retire the splice
+        // below.
+        //
+        // Only the empty-`rest` shape avoids it here. Earlier drafts also
+        // special-cased an empty and a one-stage inner pipe, both of which
+        // would be pure borrows -- but `parse_postfix` pops a length-1 chain
+        // instead of wrapping it (`if chain.len() == 1 { expr = chain.pop() }`),
+        // so the parser emits neither, and nothing else was found that feeds
+        // one to *this* evaluator. They are dropped rather than left as arms
+        // no test can reach; the splice below answers them correctly anyway,
+        // since `[] ++ rest` and `[only] ++ rest` are what it already builds.
+        Expr::Pipe(inner_exprs) if rest.is_empty() => eval_pipe_with_path_context_internal::<W, S>(
+            inner_exprs,
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
         Expr::Pipe(inner_exprs) => {
-            // Flatten nested pipe - combine inner pipe with rest
             let mut combined = inner_exprs.clone();
             combined.extend(rest.iter().cloned());
             eval_pipe_with_path_context_internal::<W, S>(
@@ -31013,10 +31073,14 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             Err(e) => QueryResult::Error(e),
             Ok(bound) => {
                 let _guard = enter_def_call_frame(*frames);
-                let mut stages = vec![(**bound).clone()];
-                stages.extend(rest.iter().cloned());
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &stages,
+                // The bound body stays behind its `Rc` (#1510). Deep-copying
+                // it out was self-defeating here above all: `BoundBody`'s
+                // whole point is to share one tree across calls, and a
+                // recursive `def` under path tracking rebuilds a fresh
+                // `DefCall` per level, so the clone was charged per level.
+                eval_stage_with_path_context::<W, S>(
+                    bound,
+                    rest,
                     value,
                     root,
                     file_origin,
@@ -31028,18 +31092,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // Transparent, for the same reason it is transparent to evaluation:
         // the argument this wraps is ordinary code, and it must keep the
         // caller's own path context when it runs.
-        Expr::Shared(inner) => {
-            let mut stages = vec![(**inner).clone()];
-            stages.extend(rest.iter().cloned());
-            eval_pipe_with_path_context_internal::<W, S>(
-                &stages,
-                value,
-                root,
-                file_origin,
-                current_path,
-                optional,
-            )
-        }
+        Expr::Shared(inner) => eval_stage_with_path_context::<W, S>(
+            inner,
+            rest,
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
         Expr::FuncDef {
             name,
             params,
@@ -31051,32 +31112,20 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
             let bound_then = bind_def(name, params, body, then, bound);
-            // #2094 review: the unpaired (common) case passes `bound_then`
-            // through as a one-element slice with no clone at all, so this
-            // arm keeps the full benefit of `bind_def`'s own cache -- only
-            // the paired case, which must append `path_probe_stage()`,
-            // needs an owned `Vec` (and so a clone of the cached tree) to
-            // build one.
-            let then_result = if paired {
-                let then_stages = [(*bound_then).clone(), path_probe_stage()];
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &then_stages,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                )
-            } else {
-                eval_pipe_with_path_context_internal::<W, S>(
-                    core::slice::from_ref(&*bound_then),
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                )
-            };
+            // #2094 review kept `bound_then` clone-free in the unpaired
+            // (common) case so this arm keeps the full benefit of
+            // `bind_def`'s own cache; #1510 extends that to the paired case,
+            // which now carries the probe in `rest` rather than cloning the
+            // cached tree into an owned pair to put it next to.
+            let then_result = eval_stage_with_path_context::<W, S>(
+                &bound_then,
+                &probe_stages(paired),
+                value,
+                root,
+                file_origin,
+                current_path,
+                optional,
+            );
             if rest.is_empty() {
                 then_result
             } else if paired {
@@ -31217,12 +31266,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let mut body_stages = vec![(**expr).clone()];
-            if paired {
-                body_stages.push(path_probe_stage());
-            }
-            let body_result = eval_pipe_with_path_context_internal::<W, S>(
-                &body_stages,
+            let body_result = eval_stage_with_path_context::<W, S>(
+                expr,
+                &probe_stages(paired),
                 value,
                 root,
                 file_origin,
@@ -31292,12 +31338,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             if needs_path_context(expr) || rest.iter().any(needs_path_context) =>
         {
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let mut body_stages = vec![(**expr).clone()];
-            if paired {
-                body_stages.push(path_probe_stage());
-            }
-            let body_result = eval_pipe_with_path_context_internal::<W, S>(
-                &body_stages,
+            let body_result = eval_stage_with_path_context::<W, S>(
+                expr,
+                &probe_stages(paired),
                 value,
                 root,
                 file_origin,
@@ -31357,12 +31400,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         // `QueryResult` variant set this evaluator ever produces.
         Expr::LastExpr(expr) if needs_path_context(expr) || rest.iter().any(needs_path_context) => {
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let mut body_stages = vec![(**expr).clone()];
-            if paired {
-                body_stages.push(path_probe_stage());
-            }
-            let body_result = eval_pipe_with_path_context_internal::<W, S>(
-                &body_stages,
+            let body_result = eval_stage_with_path_context::<W, S>(
+                expr,
+                &probe_stages(paired),
                 value,
                 root,
                 file_origin,
@@ -31714,14 +31754,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+            // Built once, outside the fan-out: the closure below runs per
+            // `cond` output, and this used to deep-clone the taken branch
+            // into an owned pair on every one of them (#1510).
+            let probe = probe_stages(paired);
             let branch_result = eval_fanout(cond_result, |truthy| {
                 let branch = if truthy { then_branch } else { else_branch };
-                let mut stages = vec![(**branch).clone()];
-                if paired {
-                    stages.push(path_probe_stage());
-                }
-                eval_pipe_with_path_context_internal::<W, S>(
-                    &stages,
+                eval_stage_with_path_context::<W, S>(
+                    branch,
+                    &probe,
                     value,
                     root,
                     file_origin,
@@ -31786,10 +31827,12 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // scoping stays intact.
             let mut branch_outputs = Vec::new();
             for sub_expr in exprs {
-                let mut combined = vec![sub_expr.clone()];
-                combined.extend(rest.iter().cloned());
-                let step = eval_pipe_with_path_context_internal::<W, S>(
-                    &combined,
+                // Combining is by borrow (#1510): the splice this replaces
+                // deep-copied the whole of `rest` once per branch, so a wide
+                // comma paid it as many times as it had branches.
+                let step = eval_stage_with_path_context::<W, S>(
+                    sub_expr,
+                    rest,
                     value,
                     root,
                     file_origin,
@@ -31809,13 +31852,10 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let with_probe = |e: &Expr| -> Vec<Expr> {
-                let mut v = vec![e.clone()];
-                if paired {
-                    v.push(path_probe_stage());
-                }
-                v
-            };
+            // One probe for the whole arm, shared by the body and by
+            // whichever catch handler runs -- the closure this replaces
+            // deep-cloned its argument on each of up to five calls (#1510).
+            let probe = probe_stages(paired);
             // Evaluate the try body (and catch handler) through the
             // path-context evaluator too, so `try select(file_index == 1)
             // catch ...` -- a natural `--eval-all` idiom -- resolves
@@ -31823,8 +31863,9 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // follow-up). Mirrors `eval_try`'s Error/Break/Partial handling
             // above, just routed through path context instead of
             // `eval_single`.
-            let result = eval_pipe_with_path_context_internal::<W, S>(
-                &with_probe(try_expr),
+            let result = eval_stage_with_path_context::<W, S>(
+                try_expr,
+                &probe,
                 value,
                 root,
                 file_origin,
@@ -31922,18 +31963,15 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let mut body_stages = vec![(**body).clone()];
-            if paired {
-                body_stages.push(path_probe_stage());
-            }
             // Evaluate the label body through the path-context evaluator
             // too, so `label $out | ... file_index ...` -- a natural (if
             // inert) wrapper -- resolves correctly instead of silently
             // falling back to the 0/null stub. Paired with the
             // `needs_path_context` fix for `Label`: one without the other
             // still drops path context silently (#715 follow-up).
-            let result = eval_pipe_with_path_context_internal::<W, S>(
-                &body_stages,
+            let result = eval_stage_with_path_context::<W, S>(
+                body,
+                &probe_stages(paired),
                 value,
                 root,
                 file_origin,
@@ -63981,6 +64019,48 @@ mod tests {
         assert_eq!(
             outputs(b"[10,20]", ".[] | (key, key)"),
             vec!["0", "0", "1", "1"]
+        );
+    }
+
+    /// #1510: `eval_stage_with_path_context`'s two `Expr::Pipe` arms. A
+    /// nested pipe is the one stage shape that still has to splice
+    /// `[i0..in] ++ rest` into an owned `Vec<Expr>`, because `rest:
+    /// &[Expr]` cannot hold two segments (#2175) -- but only when `rest` is
+    /// non-empty. Both arms have to keep threading the path, so `key` has
+    /// to name the *last* component reached, not the one the outer pipe was
+    /// at when it entered the parentheses.
+    ///
+    /// `parse_postfix` pops a length-1 chain rather than wrapping it, so
+    /// `(.a)` is an `Expr::Paren`, never a one-stage `Expr::Pipe` -- these
+    /// two are the only `Expr::Pipe` stage shapes reachable here.
+    #[test]
+    fn test_nested_pipe_stage_keeps_path_context_1510() {
+        // Non-empty `rest` (`| key` follows the parentheses): the splice arm.
+        assert_eq!(
+            outputs(br#"[{"a":{"b":1}}]"#, ".[] | (.a|.b) | key"),
+            vec!["\"b\""]
+        );
+        // Empty `rest` (nothing follows the parentheses): the borrow arm.
+        assert_eq!(
+            outputs(br#"[{"a":{"b":1}}]"#, ".[] | (.a | key)"),
+            vec!["\"a\""]
+        );
+    }
+
+    /// #1510 companion: the same two arms under a fan-out, pinning that the
+    /// path is rebuilt per element rather than shared across them. The
+    /// splice arm rebuilds `combined` on every element, so a regression that
+    /// hoisted or reused it would show up here as both elements reporting
+    /// the first one's index.
+    #[test]
+    fn test_nested_pipe_stage_paths_are_per_element_1510() {
+        assert_eq!(
+            outputs(br#"[{"a":{"b":1}},{"a":{"b":2}}]"#, ".[] | (.a|.b) | path"),
+            vec![r#"[0,"a","b"]"#, r#"[1,"a","b"]"#]
+        );
+        assert_eq!(
+            outputs(br#"[{"a":{"b":1}},{"a":{"b":2}}]"#, ".[] | (.a | path)"),
+            vec![r#"[0,"a"]"#, r#"[1,"a"]"#]
         );
     }
 

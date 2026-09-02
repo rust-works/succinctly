@@ -33,6 +33,62 @@
 //! timed, so the reported cost isolates the write-path evaluator itself
 //! rather than being diluted by a constant per-sample index-build cost.
 //!
+//! # AST-shape groups (#1510)
+//!
+//! The groups above all vary *element count*: how many values the write walks
+//! over. The five `bench_path_*_ast` groups vary something else -- the size
+//! and shape of the **query** under path tracking, at a fixed element count --
+//! because that is the dimension `eval_stage_with_path_context`'s cost is
+//! charged on. Before #1510, every arm of the path-context evaluator that
+//! prepended a stage materialised `[stage] ++ rest` as an owned `Vec<Expr>`,
+//! and `Expr` is a recursive `Box`/`Vec` tree with a derived `Clone` -- so
+//! each of those was a deep copy of the whole remaining pipeline, paid once
+//! per `Comma` branch, once per `If` fan-out output, once per `Paren` stage,
+//! and once per recursion level of a `def`.
+//!
+//! Sweeping the query shape rather than the data is what makes that visible.
+//! Measured across these five groups on both an Apple M4 Pro and an AMD Ryzen
+//! 9 7950X (idle, interleaved base/fix within each rep, median of 3, #1510's
+//! parent commit as the baseline), every configuration improved on both, and
+//! the two agreed on every trend. Figures below are `ARM / x86`. The
+//! *direction* the ratio moves differs per group, and it is worth knowing
+//! which before reading a future run:
+//!
+//! - `paren_chain` is the group whose exponent changes, and its win grows with
+//!   `k`: -14/-11% at 1, -31/-25% at 4, -45/-51% at 16, -57/-60% at 64. Stage
+//!   `i` of `k` used to copy the `k - i` stages ahead of it, so the chain paid
+//!   O(k^2) node copies and now pays none.
+//! - `comma_rest` moves the *other* way (-15/-16% at one trailing stage, to
+//!   -0.4/-2% at sixty-four), and `recursive_def` likewise (-22/-23% at 1, to
+//!   -3/-5% at 64). The removed clone is linear in pipeline length, but the
+//!   navigation beside it is worse than linear -- each `Field` stage copies
+//!   the ambient `current_path`, which is itself growing -- so the clone's
+//!   *share* falls as the pipeline lengthens even though its absolute cost
+//!   rises.
+//! - `comma_width` and `if_fanout` are near-flat in their sweep (-12% to -7%
+//!   and -4% to -8% respectively, on both chips): clone and navigation both
+//!   scale linearly with fan-out, so widening alone does not separate them.
+//!
+//! The practical reading: this change pays best on short pipelines with heavy
+//! nesting or fan-out, and is progressively masked -- never reversed -- as
+//! per-stage navigation cost grows.
+//!
+//! **Every query in these groups ends in a bare `path`, and that is load-
+//! bearing, not decoration.** `eval_pipe_with_path_context_internal` is
+//! reached only when `needs_path_context` says so, and its trigger set is
+//! `path` (no argument), `key`, `parent`, `parent(n)` and `file_index` --
+//! *not* `path(f)`, which real jq's one-argument form maps to and which this
+//! crate resolves through the separate `resolve_node` walker instead. Written
+//! with `path(f)`, these five groups exercised that other machinery and left
+//! the code they exist to measure untouched: a counting global allocator put
+//! their allocation totals byte-for-byte identical before and after the
+//! change. Any future edit here must keep a trigger builtin in the pipeline,
+//! and is worth re-checking the same way rather than by timing alone.
+//!
+//! The expected paths asserted below were captured from the pinned jq 1.7.1
+//! oracle using the equivalent `path(f)` spelling of each query, which yields
+//! the same path values; only the routing differs.
+//!
 //! Run with:
 //! ```bash
 //! cargo bench --bench jq_write_path_bench
@@ -672,6 +728,331 @@ fn bench_del_shared_prefix_width(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// AST-shape groups (#1510). Element count is fixed; the query varies.
+// ---------------------------------------------------------------------------
+
+/// Elements the AST-shape groups fan out over. Fixed, so a sweep below moves
+/// only the query's own size -- large enough that per-element evaluator work
+/// dominates the one-off parse, small enough that the widest query shape
+/// still runs in reasonable time.
+const AST_ELEMS: usize = 100;
+
+/// Comma branches / `if` fan-out outputs / `def` recursion levels swept by the
+/// groups below.
+const AST_WIDTHS: &[usize] = &[2, 8, 32, 128];
+
+/// Trailing pipe stages after the fanning stage -- the `rest` whose AST used
+/// to be deep-copied once per branch.
+const AST_REST_STAGES: &[usize] = &[1, 4, 16, 64];
+
+/// A depth-`k` chain of `{"d": ...}` wrappers around `0`, so a query can
+/// navigate `k` trailing `.d` stages into it.
+fn nest_d(k: usize) -> String {
+    let mut out = String::from("0");
+    for _ in 0..k {
+        out = format!(r#"{{"d":{out}}}"#);
+    }
+    out
+}
+
+/// `k` trailing `.d` stages, pipe-separated -- the `rest` of the pipeline.
+fn rest_stages(k: usize) -> String {
+    core::iter::repeat(".d")
+        .take(k)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// `{"foo": [ {"b0": NEST, ..., "b<w-1>": NEST} x AST_ELEMS ]}`.
+fn comma_doc(width: usize, depth: usize) -> Vec<u8> {
+    let nest = nest_d(depth);
+    let mut elem = String::from("{");
+    for j in 0..width {
+        if j > 0 {
+            elem.push(',');
+        }
+        elem.push_str(&format!(r#""b{j}":{nest}"#));
+    }
+    elem.push('}');
+    let mut out = String::from(r#"{"foo":["#);
+    for i in 0..AST_ELEMS {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&elem);
+    }
+    out.push_str("]}");
+    out.into_bytes()
+}
+
+/// `[path(.foo[] | (.b0, ..., .b<w-1>) | .d | ... | .d)]`.
+fn comma_query(width: usize, depth: usize) -> String {
+    let branches = (0..width)
+        .map(|j| format!(".b{j}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[.foo[] | ({branches}) | {} | path]", rest_stages(depth))
+}
+
+/// The path `comma_query` must report for element `i`, branch `j`:
+/// `["foo", i, "b<j>", "d" x depth]`.
+fn expected_comma_path(i: usize, j: usize, depth: usize) -> OwnedValue {
+    let mut p = vec![
+        OwnedValue::String("foo".into()),
+        OwnedValue::Int(i as i64),
+        OwnedValue::String(format!("b{j}")),
+    ];
+    p.extend(core::iter::repeat(OwnedValue::String("d".into())).take(depth));
+    OwnedValue::Array(p)
+}
+
+/// Assert `comma_query`'s full output, then time it. Shared by the two comma
+/// groups, which differ only in which of `(width, depth)` they sweep -- the
+/// premise check is the same either way, and duplicating it is exactly the
+/// "duplicated predicates diverge silently" trap this repo warns about.
+fn bench_comma_shape(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    param: usize,
+    width: usize,
+    depth: usize,
+) {
+    let json = comma_doc(width, depth);
+    let expr = parse(&comma_query(width, depth)).expect("must parse");
+
+    // Guard the premise: one path per (element, branch), in that order, each
+    // naming the branch key and every trailing stage. A future bug that made
+    // the comma drop branches, or the trailing stages stop extending the
+    // path, would otherwise read here as a speedup.
+    let OwnedValue::Array(paths) = eval_one(&expr, &json) else {
+        panic!("width={width} depth={depth}: must produce an array");
+    };
+    assert_eq!(
+        paths.len(),
+        AST_ELEMS * width,
+        "width={width} depth={depth}: one path per element per branch"
+    );
+    for i in 0..AST_ELEMS {
+        for j in 0..width {
+            assert_eq!(
+                paths[i * width + j],
+                expected_comma_path(i, j, depth),
+                "width={width} depth={depth}: path ({i},{j}) mismatch"
+            );
+        }
+    }
+
+    let index = JsonIndex::build(&json);
+    group.throughput(Throughput::Elements((AST_ELEMS * width) as u64));
+    group.bench_with_input(BenchmarkId::from_parameter(param), &json, |b, json| {
+        b.iter(|| {
+            let cursor = index.root(black_box(json));
+            black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+        });
+    });
+}
+
+/// `Comma` under path tracking, sweeping **branch count** at a fixed trailing
+/// pipeline. This is the shape #1409 introduced and #1510 removes the cost
+/// of: the pre-#1510 `Comma` arm spliced `[branch] ++ rest` into an owned
+/// `Vec<Expr>` inside its own `for` loop, so a `w`-way comma deep-copied the
+/// whole trailing pipeline `w` times per element.
+fn bench_path_comma_width_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_ast_comma_width");
+    for &width in AST_WIDTHS {
+        bench_comma_shape(&mut group, width, width, 4);
+    }
+    group.finish();
+}
+
+/// The same shape, sweeping **trailing pipeline length** at a fixed branch
+/// count. Read the before/after ratio across the sweep rather than any single
+/// row: navigation and the removed clone are both linear in the number of
+/// trailing stages, so what identifies the clone is the ratio *growing* with
+/// pipeline size -- lost in the navigation at one stage, dominant at 64.
+fn bench_path_comma_rest_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_ast_comma_rest");
+    for &depth in AST_REST_STAGES {
+        bench_comma_shape(&mut group, depth, 8, depth);
+    }
+    group.finish();
+}
+
+/// A chain of parenthesised stages under path tracking -- `(.d) | (.d) | ...`.
+///
+/// The one group here whose *exponent* moves, not just its constant: the
+/// pre-#1510 `Paren` arm rebuilt `[inner] ++ rest` at every stage, so stage
+/// `i` of `k` copied the `k - i` stages still ahead of it and the chain cost
+/// O(k^2) node copies in total. It now borrows and copies none, so the sweep
+/// should flatten from quadratic to linear rather than merely shifting down.
+fn bench_path_paren_chain_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_ast_paren_chain");
+    for &k in AST_REST_STAGES {
+        let nest = nest_d(k);
+        let mut json = String::from(r#"{"foo":["#);
+        for i in 0..AST_ELEMS {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&nest);
+        }
+        json.push_str("]}");
+        let json = json.into_bytes();
+
+        let chain = core::iter::repeat("(.d)")
+            .take(k)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let expr = parse(&format!("[.foo[] | {chain} | path]")).expect("must parse");
+
+        // Guard the premise: one path per element, each descending all k
+        // stages -- a parenthesised stage that stopped extending the path
+        // would otherwise read as a speedup.
+        let OwnedValue::Array(paths) = eval_one(&expr, &json) else {
+            panic!("k={k}: must produce an array");
+        };
+        assert_eq!(paths.len(), AST_ELEMS, "k={k}: one path per element");
+        for (i, p) in paths.iter().enumerate() {
+            let mut expected = vec![OwnedValue::String("foo".into()), OwnedValue::Int(i as i64)];
+            expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(k));
+            assert_eq!(*p, OwnedValue::Array(expected), "k={k}: path {i} mismatch");
+        }
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(AST_ELEMS as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `if` under path tracking with a *generating* condition, sweeping how many
+/// outputs that condition produces.
+///
+/// `if`'s branch evaluation runs once per condition output, and the pre-#1510
+/// arm built its `[branch] ++ probe` pair inside that closure -- so the taken
+/// branch was deep-copied once per output rather than once per `if`. Both
+/// arms are `.b` so the sweep moves only the fan-out width, never which
+/// branch is taken or how much navigation follows.
+fn bench_path_if_fanout_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_ast_if_fanout");
+    const DEPTH: usize = 4;
+    for &width in AST_WIDTHS {
+        let nest = nest_d(DEPTH);
+        let flags = core::iter::repeat("true")
+            .take(width)
+            .collect::<Vec<_>>()
+            .join(",");
+        let elem = format!(r#"{{"f":[{flags}],"b":{nest}}}"#);
+        let mut json = String::from(r#"{"foo":["#);
+        for i in 0..AST_ELEMS {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&elem);
+        }
+        json.push_str("]}");
+        let json = json.into_bytes();
+
+        let expr = parse(&format!(
+            "[.foo[] | if .f[] then .b else .b end | {} | path]",
+            rest_stages(DEPTH)
+        ))
+        .expect("must parse");
+
+        // Guard the premise: the condition really fans out `width` ways, and
+        // every output still carries the full path through `.b` and the
+        // trailing stages.
+        let OwnedValue::Array(paths) = eval_one(&expr, &json) else {
+            panic!("width={width}: must produce an array");
+        };
+        assert_eq!(
+            paths.len(),
+            AST_ELEMS * width,
+            "width={width}: one path per element per condition output"
+        );
+        for i in 0..AST_ELEMS {
+            let mut expected = vec![OwnedValue::String("foo".into()), OwnedValue::Int(i as i64)];
+            expected.push(OwnedValue::String("b".into()));
+            expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(DEPTH));
+            let expected = OwnedValue::Array(expected);
+            for j in 0..width {
+                assert_eq!(
+                    paths[i * width + j],
+                    expected,
+                    "width={width}: path ({i},{j}) mismatch"
+                );
+            }
+        }
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements((AST_ELEMS * width) as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(width), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// A recursive `def` under path tracking, sweeping recursion depth.
+///
+/// Covers the `DefCall`/`Shared` arms -- item 1 of #2092, fixed by the same
+/// change. Those arms deref'd through the `Rc` that `BoundBody`/`Expr::Shared`
+/// exist to share and deep-copied the body back out, and since a recursive
+/// call rebuilds a fresh `DefCall` at every level, that copy was charged per
+/// level rather than once.
+fn bench_path_recursive_def_ast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_ast_recursive_def");
+    for &k in AST_REST_STAGES {
+        let nest = nest_d(k);
+        let mut json = String::from(r#"{"foo":["#);
+        for i in 0..AST_ELEMS {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&nest);
+        }
+        json.push_str("]}");
+        let json = json.into_bytes();
+
+        let expr = parse(&format!(
+            "def down(n): if n == 0 then . else .d | down(n - 1) end; \
+             [.foo[] | down({k}) | path]"
+        ))
+        .expect("must parse");
+
+        // Guard the premise: the recursion really descends k levels under
+        // path tracking. If `down` ever stopped being seen through by the
+        // path-context evaluator it would report a shorter path, not an error.
+        let OwnedValue::Array(paths) = eval_one(&expr, &json) else {
+            panic!("k={k}: must produce an array");
+        };
+        assert_eq!(paths.len(), AST_ELEMS, "k={k}: one path per element");
+        for (i, p) in paths.iter().enumerate() {
+            let mut expected = vec![OwnedValue::String("foo".into()), OwnedValue::Int(i as i64)];
+            expected.extend(core::iter::repeat(OwnedValue::String("d".into())).take(k));
+            assert_eq!(*p, OwnedValue::Array(expected), "k={k}: path {i} mismatch");
+        }
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(AST_ELEMS as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(k), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_del_array,
@@ -686,5 +1067,10 @@ criterion_group!(
     bench_del_filtered_descent_depth,
     bench_del_shared_prefix_depth,
     bench_del_shared_prefix_width,
+    bench_path_comma_width_ast,
+    bench_path_comma_rest_ast,
+    bench_path_paren_chain_ast,
+    bench_path_if_fanout_ast,
+    bench_path_recursive_def_ast,
 );
 criterion_main!(benches);
