@@ -26473,6 +26473,22 @@ fn test_getpath_non_array_path_suppressed_by_optional_2053() -> Result<()> {
     Ok(())
 }
 
+/// #2053: the same non-array-path guard's *unsuppressed* sibling branch --
+/// without `?`, the same malformed path argument still raises through the
+/// native bypass arm, matching jq's own "Path must be specified as an
+/// array" message. Verified against jq 1.7.1.
+#[test]
+fn test_getpath_non_array_path_raises_without_optional_2053() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"getpath("x")"#], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("Path must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #1531: a generator argument must be pulled lazily, so `body` runs against
 /// argument value N *before* value N+1 is evaluated. Once `body` fails, jq
 /// never evaluates the rest of the argument -- side effects included.
