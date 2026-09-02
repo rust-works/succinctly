@@ -17819,6 +17819,128 @@ fn test_deeply_nested_conditional_wrapping_hits_frame_guard_without_growing_valu
     Ok(())
 }
 
+/// #2135: `install_def_calls`'s `Expr::Pipe` arm used to charge the same flat
+/// `frames + 1` to every sibling regardless of how many siblings existed or
+/// where the recursive call sat among them -- nesting depth compounded
+/// through repeated descent, but sibling *breadth* in one `Vec` did not
+/// compound at all. A recursive `def` whose body is a wide, flat pipe (many
+/// trivial `.` stages, one of which recurses) carries real native stack cost
+/// per level that the guard never saw: confirmed live before this fix, this
+/// exact repro (200 pipe stages wrapping `deep(m-1)`, called to depth 1,500)
+/// raised `thread '<unknown>' has overflowed its stack` / `fatal runtime
+/// error: stack overflow, aborting` (SIGABRT, exit 134) -- with real jq 1.7.1
+/// returning `null`, exit 0, on the identical filter. Charging each pipe
+/// sibling `frames + i + 1` (its own position, not a flat `+1`) now prices a
+/// sibling near the end of a wide pipe the same as an equally-deep nested
+/// wrapping, so `MAX_EVAL_FRAMES` fires here as a clean, catchable error
+/// well before the native stack would.
+#[test]
+fn test_wide_recursive_pipe_reports_cleanly_not_stack_overflow_2135() -> Result<()> {
+    let chain = std::iter::repeat_n(".", 200)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let query = format!("def deep(m): if m == 0 then . else ({chain} | deep(m-1)) end; deep(1500)");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2135 follow-up finding: `Expr::Object` shares `Pipe`'s gap even though
+/// the issue that found it only named `Pipe`/`Comma`. `build_object_entries`
+/// (`src/jq/eval.rs`) recurses once per object entry with real cleanup
+/// (`acc.pop()`) after the recursive call, so it cannot be tail-call
+/// eliminated -- a wide object literal wrapping a recursive call crashed the
+/// same way `Pipe` did, at the same (200, 1500) shape, confirmed live before
+/// this fix. `install_def_calls`'s new `Expr::Object` arm charges each
+/// entry's key/value the same position-based `frames + i + 1` `Pipe` uses.
+#[test]
+fn test_wide_recursive_object_reports_cleanly_not_stack_overflow_2135() -> Result<()> {
+    let entries = (0..200)
+        .map(|i| format!(r#""k{i}":1"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        r#"def deep(m): if m == 0 then . else (({{{entries},"r":deep(m-1)}}) | .r) end; deep(1500)"#
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("exceeded maximum recursion depth"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("stack overflow") && !stderr.contains("fatal runtime error"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2135 sibling investigation: `Expr::Comma` looks like it should need the
+/// same position-based charge as `Pipe`/`Object` above -- same `Vec<Expr>`
+/// sibling shape -- but `eval_comma` (`src/jq/eval.rs`) is a flat loop over
+/// its siblings, not a per-sibling self-recursive call chain, so it was left
+/// on the ordinary flat `frames + 1` charge. This rebuilds the `Pipe` repro's
+/// exact (width=200, depth=1500) shape through `Comma`/`last` instead of a
+/// piped chain and confirms it neither crashes nor false-positives on
+/// `MAX_EVAL_FRAMES` -- both the width and the depth here match the shape
+/// that overflows the stack through `Pipe`.
+#[test]
+fn test_wide_recursive_comma_neither_crashes_nor_false_positives_2135() -> Result<()> {
+    let ones = std::iter::repeat_n("1", 200).collect::<Vec<_>>().join(", ");
+    let query =
+        format!("def deep(m): if m == 0 then . else (last(({ones}, deep(m-1)))) end; deep(1500)");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "null");
+    Ok(())
+}
+
+/// #2135: the fix must not create false positives on the ordinary, common
+/// shapes real jq programs use -- a wide array/object literal or a long pipe
+/// with no recursive `def` inside never creates a `DefCall`, so nothing here
+/// is ever checked against `MAX_EVAL_FRAMES` regardless of width. Matches
+/// real jq 1.7.1 byte for byte on all three (confirmed live).
+#[test]
+fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
+    let array = format!(
+        "[{}] | length",
+        (0..100_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &array], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "100000");
+
+    let object = format!(
+        "{{{}}} | length",
+        (0..50_000)
+            .map(|i| format!(r#""k{i}":{i}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let (stdout, stderr, code) = run_jq_full(&["-c", &object], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "50000");
+
+    let pipe = std::iter::repeat_n(".", 50_000)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let (stdout, stderr, code) = run_jq_full(&["-c", &pipe], Some("42"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "42");
+    Ok(())
+}
+
 /// #1371: the depth guard has to be reachable from every evaluator, not just
 /// the plain one, and each reports it differently. A runaway recursion under a
 /// *truncating* consumer goes through `eval_each`'s own `DefCall` arm, and one

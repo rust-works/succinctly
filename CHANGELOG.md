@@ -289,6 +289,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A recursive `def` whose body is a wide, flat pipe or object literal could abort the
+  process with a real native stack overflow instead of raising `MAX_EVAL_FRAMES`'s catchable
+  error** (#2135). `install_def_calls`'s frame-charging model (#1371/#2080) only accumulated
+  cost through *nesting* — an expression descending into another, like array-wrapping
+  `[[[X]]]` — charging a flat `frames + 1` to every sibling of an `Expr::Pipe`/`Expr::Object`
+  node regardless of how many siblings existed or which one held the recursive call. A
+  200-stage pipe (or 200-entry object) wrapping a recursive `deep(m-1)` call in its last
+  position carried real native stack cost per level of `deep`'s own recursion — `eval_pipe`'s
+  and `build_object_entries`'s own per-sibling recursion is not guaranteed to be
+  tail-call-eliminated — that the guard never counted, so `MAX_EVAL_FRAMES` (40,000) never
+  fired and `deep(1500)` overflowed the real stack instead (confirmed live: `thread
+  '<unknown>' has overflowed its stack`, SIGABRT, exit 134, where real jq 1.7.1 returns `null`,
+  exit 0, on the identical filter).
+
+  Fixed by charging pipe/object sibling `i` (0-indexed) `frames + i + 1` instead of a flat
+  `frames + 1`, pricing a sibling near the end of a wide pipe/object the same as an
+  equally-deep nested wrapping, while a sibling near the front — genuinely cheap in
+  `eval_pipe`'s own recursion, since reaching it needs no extra frames — stays cheap. An
+  ordinary long *non-recursive* pipe or wide array/object literal is unaffected either way:
+  nothing is checked against `MAX_EVAL_FRAMES` until a `DefCall` is actually reached, and one
+  with no recursive call inside never creates one, regardless of width (verified: a 100,000
+  element array literal, a 50,000-key object literal, and a 50,000-stage non-recursive pipe
+  all still evaluate exactly as before). `Expr::Comma` looks like the same shape but was
+  confirmed, by direct experiment, *not* to share the gap — `eval_comma` is a flat loop over
+  its siblings, not a per-sibling self-recursive call chain — so it was left unchanged.
+  `MAX_EVAL_FRAMES` itself did not need to change: re-bisected crash floors for several
+  width/depth shapes all show the guard now firing with better than 6x safety margin below
+  the real (pre-fix) crash floor. See `install_def_calls`'s `Expr::Pipe`/`Expr::Comma`/
+  `Expr::Object` arms and `MAX_EVAL_FRAMES`'s own doc comment (`src/jq/eval.rs`) for the full
+  account.
+
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
   hardcoding `false`** (#2015). Both builtins are defined in terms of
   `any(...)` (`IN(s)` is `any(s == .; .)`, `IN(src; s)` is
