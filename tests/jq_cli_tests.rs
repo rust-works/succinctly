@@ -13953,6 +13953,110 @@ fn test_resolve_slice_bound_type_error_still_drops_valid_prefix_1517_known_gap()
     Ok(())
 }
 
+/// #2245: `resolve_slice_expr` (the `path()`/`=`/`del()` write-path
+/// resolver for `E[S:T]`) evaluated `T` (`end`) exactly once overall,
+/// reused across every `S` value -- the identical bug #2225/PR #2244 fixed
+/// for the two value-mode siblings (`eval_slice_expr` in this file and
+/// `eval_generic.rs`). jq's own `S as $s | T as $t | E | .[$s:$t]`
+/// desugaring re-runs `T` fresh for every `$s`, observable whenever `T` has
+/// side effects (`input`) -- verified live against jq 1.7.1 for every
+/// assertion below.
+#[test]
+fn test_resolve_slice_expr_reevaluates_end_bound_per_start_2245() -> Result<()> {
+    // Assignment: a stale `end` silently corrupted data instead of just
+    // producing a wrong side-effect count.
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "-n",
+            r#"input as $doc | $doc | .[(0,3):(input)] = ["X"]"#,
+        ],
+        Some("[10,20,30,40,50,60]\n2\n4\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["X",30,40,"X",60]"#);
+
+    // `del()`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "-n", r"input as $doc | $doc | del(.[(0,3):(input)])"],
+        Some("[10,20,30,40,50,60]\n2\n4\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[30,50,60]");
+
+    // `path()`: each `s` gets its own freshly-consumed `input` value, not
+    // the first one reused.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "-n", r"input as $doc | $doc | path(.[(0,1):(input)])"],
+        Some("[10,20,30]\n5\n7\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":5}]\n[{\"start\":1,\"end\":7}]\n"
+    );
+
+    Ok(())
+}
+
+/// #2245 (found in this fix's own review/live-oracle verification, not the
+/// issue's original scope): the untrackable-target checks in
+/// `resolve_slice_expr` name a representative `(s, e)` pair in their error
+/// message, so `end` has to be evaluated *lazily* right there rather than
+/// upfront -- `end`'s own emptiness/escape still has to win over the
+/// trackability error the same way it always did, exactly mirroring the
+/// cross-product loop's own priority below it.
+#[test]
+fn test_resolve_slice_expr_untrackable_target_end_bound_still_lazy_2245() -> Result<()> {
+    // `end` completely empty for every `s` -- the trackability error never
+    // fires at all (verified live: no error, no output).
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r"[path((1,2)[(0,1):(empty)])]"], Some("null"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "[]");
+
+    // `end` errors before producing any value -- that error wins over the
+    // trackability check entirely (not "Invalid path expression").
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((1,2)[(0,1):(error("boom"))])"#],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+
+    // `end` yields a real first value -- the trackability error fires,
+    // naming that value (not a stale or absent one).
+    let (stdout, stderr, code) = run_jq_full(&["-c", r"path((1,2)[(0,1):(2,3)])"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("\"start\":0,") && stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2245 (found in this fix's own live-oracle verification): `target`'s own
+/// escape has to keep taking priority over `start`'s trailing escape in the
+/// final result, even though `end` is now resolved inside the loop instead
+/// of upfront -- a first draft of this fix broke the loop on `target`'s
+/// escape without ever folding it into the returned error, silently
+/// exiting 0 with the correct partial output but no error at all.
+#[test]
+fn test_resolve_slice_expr_target_escape_still_surfaces_in_final_result_2245() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((select((true,error("t"))))[(0,1):(2,3)])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(stderr.contains('t'), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `walk_impl` applies `f` via `eval_owned_expr_fork` at every level
