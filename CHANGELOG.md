@@ -314,16 +314,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversion) *both* validated nothing at all for their own `Array` arms — not even the older
   #1677 missing/doubled-comma-*between two real children* check, which
   `cursor_to_owned_at_depth`'s own `Object` arm neighbor already had (#1956) and
-  `standard_json_to_jq_value`'s `Object` arm never did either. Neither gap was previously
-  reachable as a live differential against real jq: whatever either function converts is still
-  printed via `write_output_jq_value`/`print_json` immediately afterward regardless of what
-  `-e`'s own materialize() call found, and `print_json`'s independent, pre-existing #1643/#1676
-  checks re-validate the same document on the way out — confirmed live against the pre-fix
-  binary (`git stash`) that every CLI-reachable repro tried still correctly rejected malformed
-  input purely through that redundant check. Both are fixed now regardless, each reusing the
-  same per-child `preceding_delimiter_ok`/`preceding_gap_ok` check the array/object arms that
-  already had it use — a future refactor that ever removes the masking check in `print_json`
-  would otherwise have silently reintroduced this bug with nothing here to catch it.
+  `standard_json_to_jq_value`'s `Object` arm never did either. Neither gap was reachable as a
+  live differential *through the `succinctly` CLI binary against real jq*: whatever either
+  function converts is still printed via `write_output_jq_value`/`print_json` immediately
+  afterward regardless of what `-e`'s own materialize() call found, and `print_json`'s
+  independent, pre-existing #1643/#1676 checks re-validate the same document on the way out —
+  confirmed live against the pre-fix binary (`git stash`) that every CLI-reachable repro tried
+  still correctly rejected malformed input purely through that redundant check.
+
+  That masking is CLI-specific, though, and does not extend to this crate used as a library:
+  `JqValue` is public API (`pub use lazy::JqValue` in `src/jq/mod.rs`), and
+  `JqValue::from_cursor(...).materialize()`/`.into_owned()` are directly callable with no
+  `print_json` redispatch anywhere in that call chain — code review confirmed empirically
+  (reconstructing the pre-fix function in isolation) that a library embedder calling
+  `materialize()`/`into_owned()` directly on a cursor built over `[1 2, 3]` or `[,]` got a
+  silently wrong `OwnedValue` back, not an error. So this was a live, silently-wrong-output bug
+  for any consumer of the public `JqValue` API, not merely a latent defense-in-depth
+  improvement — the CLI's own redundant `print_json` check happened to mask it for the one
+  entry point (`succinctly jq`) this issue's own repro used. Both are fixed now regardless,
+  each reusing the same per-child `preceding_delimiter_ok`/`preceding_gap_ok` check the
+  array/object arms that already had it use — a future refactor that ever removes the masking
+  check in `print_json` would otherwise have silently reintroduced this bug for the CLI too,
+  with nothing here left to catch it.
   `cursor_to_owned_at_depth`'s `Array`/`Object` arms also gained `container_gap_ok`, the same
   empty-container check as `to_owned_cursor_at_depth` above (it has its own container cursor to
   check against); `standard_json_to_jq_value`'s arms do not gain an equivalent empty-container
