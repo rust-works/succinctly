@@ -18397,6 +18397,59 @@ fn test_func_call_arity_mismatch_reports_clean_error_1016() -> Result<()> {
     Ok(())
 }
 
+/// A zero-arity builtin/literal keyword (`length`, `not`, `null`, `true`,
+/// `false`, ...) immediately followed by `(` is a wrong-arity call, not a
+/// stray token -- real jq resolves it the same way #1473/#2037 already
+/// resolve a genuinely-undefined name: a compile-time "X/1 is not defined"
+/// error (exit 3), not a raw parser rejection of the `(`. Before this fix,
+/// succinctly's zero-arity keyword recognizers returned their node the
+/// instant they matched, so the parser choked on the following `(` as an
+/// unexpected character instead. Verified against the pinned oracle
+/// (`/usr/bin/jq`, jq-1.7.1); whitespace before `(` is accepted too,
+/// matching real jq (#2110).
+#[test]
+fn test_zero_arity_builtin_called_with_args_reports_not_defined_2110() -> Result<()> {
+    for (filter, name) in [
+        ("length(1)", "length/1"),
+        ("length (1)", "length/1"),
+        ("not(1)", "not/1"),
+        ("null(1)", "null/1"),
+        ("true(1)", "true/1"),
+        ("false(1)", "false/1"),
+        ("modulemeta(\"x\")", "modulemeta/1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert!(
+            stderr.contains("jq: 1 compile error"),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// `if(1)`-shaped input must stay a genuine *syntax* error (jq's own `if`
+/// grammar, not a resolvable name) -- confirmed live against the pinned
+/// oracle that real jq gives a syntax error here too (different wording,
+/// "unexpected end of file", since `(1)` is consumed as `if`'s own
+/// condition and then no `then` follows), never "if/1 is not defined". Only
+/// a genuine zero-arity *builtin* routes through
+/// `zero_arity_or_wrong_arity_call` (#2110); `if`/`try`/`reduce`/etc. never
+/// do, and this pins that they still don't.
+#[test]
+fn test_if_called_with_args_stays_a_syntax_error_not_arity_error_2110() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "if(1)"], None)?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(!stderr.contains("is not defined"), "stderr: {stderr:?}");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.
