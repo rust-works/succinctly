@@ -856,6 +856,47 @@ pub fn strip_redundant_leading_zeros(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(stripped)
 }
 
+/// Whether `bytes` becomes valid RFC 8259 number syntax after inserting a
+/// single `0` immediately after a trailing `.` that sits right before an
+/// exponent marker (`1.e999` -> `1.0e999`).
+///
+/// Real jq's own number reader tolerates this shape, the same kind of
+/// leniency [`strip_redundant_leading_zeros`] already models for a
+/// redundant leading zero. Shared for the identical reason that function
+/// is: two independent "recover a lenient-but-invalid number's own
+/// literal spelling" call sites need it
+/// ([`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes)
+/// and [`crate::json::light`]'s `DocumentValue::number_literal`
+/// implementation, #2220).
+///
+/// Composes with the leading-zero leniency too: pass a
+/// [`strip_redundant_leading_zeros`] result here (when one exists) instead
+/// of the original `bytes`, so a token with *both* issues at once
+/// (`007.e999`) is still recognized -- inserting the trailing-dot fixup
+/// never touches the leading digits either way, so checking on whichever
+/// form already applies is sufficient; there is no need to try every
+/// combination of "stripped or not."
+///
+/// Returns `bool`, not the fixed-up candidate `Option<Vec<u8>>` the way
+/// [`strip_redundant_leading_zeros`] does: both call sites always
+/// materialize the *original* `bytes` on success, never this function's
+/// own inserted-`0` candidate, so there is no stripped text either caller
+/// ever wants back.
+#[must_use]
+pub fn has_trailing_dot_before_exponent(bytes: &[u8]) -> bool {
+    let Some(dot_pos) = bytes
+        .windows(2)
+        .position(|w| w[0] == b'.' && (w[1] == b'e' || w[1] == b'E'))
+    else {
+        return false;
+    };
+    let mut fixed = Vec::with_capacity(bytes.len() + 1);
+    fixed.extend_from_slice(&bytes[..=dot_pos]);
+    fixed.push(b'0');
+    fixed.extend_from_slice(&bytes[dot_pos + 1..]);
+    is_valid_number(&fixed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

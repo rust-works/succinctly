@@ -1532,8 +1532,9 @@ impl OwnedValue {
         // also ends up here) still fell all the way through to the lossy
         // `parse_i64_or_f64` below, losing the leading zero *and* any
         // exponent notation *and* any trailing zeros in one go (#1149).
-        if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes) {
-            if crate::json::validate::is_valid_number(&stripped) {
+        let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
+        if let Some(stripped) = &zero_stripped {
+            if crate::json::validate::is_valid_number(stripped) {
                 return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
             }
         }
@@ -1546,26 +1547,26 @@ impl OwnedValue {
         // there, not the double-precision-clamped
         // `1.7976931348623157e+308` a naive f64 parse produces (confirmed
         // live against jq 1.7.1, #2220). Same pattern as the leading-dot
-        // and leading-zero escapes above: check whether inserting `0`
-        // right after the trailing `.` makes the token strictly valid,
-        // and if so, still materialize the *original* text as the literal
-        // spelling -- `Self::from_number_literal` (via `parse_i64_or_f64`)
-        // parses a trailing-dot float natively, so no separate reparse of
-        // the original text is needed here. A bare trailing `.` with no
-        // exponent (`1.`) is deliberately left alone: real jq doesn't
-        // preserve that spelling either (`[1.]` -> `[1]` on both sides),
-        // so the existing lossy fallback below already matches jq there.
-        if let Some(dot_pos) = bytes
-            .windows(2)
-            .position(|w| w[0] == b'.' && (w[1] == b'e' || w[1] == b'E'))
-        {
-            let mut fixed = Vec::with_capacity(bytes.len() + 1);
-            fixed.extend_from_slice(&bytes[..=dot_pos]);
-            fixed.push(b'0');
-            fixed.extend_from_slice(&bytes[dot_pos + 1..]);
-            if crate::json::validate::is_valid_number(&fixed) {
-                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
-            }
+        // and leading-zero escapes above: [`has_trailing_dot_before_exponent`]
+        // checks whether inserting `0` right after the trailing `.` makes
+        // the token strictly valid, and if so, still materialize the
+        // *original* text as the literal spelling -- `Self::from_number_literal`
+        // (via `parse_i64_or_f64`) parses a trailing-dot float natively, so
+        // no separate reparse of the original text is needed here. A bare
+        // trailing `.` with no exponent (`1.`) is deliberately left alone:
+        // real jq doesn't preserve that spelling either (`[1.]` -> `[1]`
+        // on both sides), so the existing lossy fallback below already
+        // matches jq there.
+        //
+        // Checked against the leading-zero-stripped form (when one
+        // exists), not always `bytes` itself, so the two escapes compose:
+        // a token can have both a redundant leading zero *and* a trailing
+        // dot before its exponent at once (`007.e999` -> jq's `7E+999`,
+        // confirmed live) -- neither escape alone fixes that, since each
+        // only resolves its own half.
+        let base = zero_stripped.as_deref().unwrap_or(bytes);
+        if crate::json::validate::has_trailing_dot_before_exponent(base) {
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
@@ -2523,24 +2524,48 @@ mod tests {
     /// stored `NumberRepr` is `Float(INFINITY)` -- the literal text is what
     /// makes the eventual jq-compat display (`1E+999`, not the `f64::MAX`
     /// stand-in) correct, not this stored numeric value.
+    ///
+    /// Code review: `OwnedValue`'s `PartialEq` for `NumberLiteral` compares
+    /// only the parsed `NumberRepr`, not the stored `Box<str>` text (two
+    /// literals that both overflow to the same infinity compare equal
+    /// regardless of spelling) -- `assert_eq!` against a full
+    /// `NumberLiteral(...)` value would silently pass even if this escape
+    /// stored a mangled or wrong literal, defeating the point of this
+    /// test. Match and assert on the literal text explicitly instead.
     #[test]
     fn test_from_number_bytes_preserves_trailing_dot_before_exponent_spelling() {
-        assert_eq!(
-            OwnedValue::from_number_bytes(b"1.e5"),
-            OwnedValue::NumberLiteral(NumberRepr::Float(100000.0), "1.e5".into())
-        );
-        assert_eq!(
-            OwnedValue::from_number_bytes(b"-1.e5"),
-            OwnedValue::NumberLiteral(NumberRepr::Float(-100000.0), "-1.e5".into())
-        );
-        assert_eq!(
-            OwnedValue::from_number_bytes(b"1.e999"),
-            OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1.e999".into())
-        );
-        assert_eq!(
-            OwnedValue::from_number_bytes(b"-1.e999"),
-            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1.e999".into())
-        );
+        for (bytes, expected_repr, expected_literal) in [
+            (&b"1.e5"[..], NumberRepr::Float(100000.0), "1.e5"),
+            (&b"-1.e5"[..], NumberRepr::Float(-100000.0), "-1.e5"),
+            (&b"1.e999"[..], NumberRepr::Float(f64::INFINITY), "1.e999"),
+            (
+                &b"-1.e999"[..],
+                NumberRepr::Float(f64::NEG_INFINITY),
+                "-1.e999",
+            ),
+            // Composes with the leading-zero escape above: a token can
+            // have both a redundant leading zero *and* a trailing dot
+            // before its exponent at once (`007.e999`) -- neither escape
+            // alone fixes it, since each only resolves its own half.
+            (
+                &b"007.e999"[..],
+                NumberRepr::Float(f64::INFINITY),
+                "007.e999",
+            ),
+            (
+                &b"-007.e999"[..],
+                NumberRepr::Float(f64::NEG_INFINITY),
+                "-007.e999",
+            ),
+        ] {
+            match OwnedValue::from_number_bytes(bytes) {
+                OwnedValue::NumberLiteral(repr, literal) => {
+                    assert_eq!(repr, expected_repr, "input {bytes:?}");
+                    assert_eq!(&*literal, expected_literal, "input {bytes:?}");
+                }
+                other => panic!("input {bytes:?}: expected NumberLiteral, got {other:?}"),
+            }
+        }
         // A trailing dot with *no* exponent (`1.`) is untouched by this
         // escape -- real jq doesn't preserve that spelling either (`[1.]`
         // -> `[1]`), so it still degrades to a plain `Float` via the

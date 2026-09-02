@@ -19702,8 +19702,38 @@ fn test_jq_trailing_dot_before_exponent_preserves_exact_literal_2220() -> Result
         ("[1.e999]", "[1E+999]"),
         ("[-1.e999]", "[-1E+999]"),
         ("[1.e-999]", "[1E-999]"),
+        // Composes with the leading-zero escape (#1149): a token can have
+        // both a redundant leading zero and a trailing dot before its
+        // exponent at once. Code review found the first draft's two
+        // escapes didn't compose, silently reproducing this issue's own
+        // clamped-infinity symptom for just this compound shape.
+        ("[007.e5]", "[7E+5]"),
+        ("[007.e999]", "[7E+999]"),
+        ("[-007.e999]", "[-7E+999]"),
+        ("[00.e999]", "[0E+999]"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "input {input:?}: stderr {stderr:?}");
+        assert_eq!(out.trim(), expected, "input {input:?}");
+    }
+
+    Ok(())
+}
+
+/// #2220 also needed fixing in `StandardJson::number_literal()`
+/// (`src/json/light.rs`), a sibling conversion `-S`/sort-keys and other
+/// DOM-materializing consumers route through instead of
+/// `OwnedValue::from_number_bytes` directly -- code review found the
+/// original fix only touched `from_number_bytes`, leaving this identical
+/// clamped-infinity bug fully reachable via `-S` alone.
+#[test]
+fn test_jq_trailing_dot_before_exponent_preserved_via_sort_keys_2220() -> Result<()> {
+    for (input, expected) in [
+        (r#"{"a":1.e999}"#, r#"{"a":1E+999}"#),
+        (r#"{"b":1,"a":007.e5}"#, r#"{"a":7E+5,"b":1}"#),
+        (r#"{"b":1,"a":007.e999}"#, r#"{"a":7E+999,"b":1}"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-cS", "."], Some(input))?;
         assert_eq!(code, 0, "input {input:?}: stderr {stderr:?}");
         assert_eq!(out.trim(), expected, "input {input:?}");
     }
