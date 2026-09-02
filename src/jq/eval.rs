@@ -4458,6 +4458,42 @@ fn items_to_result<'a, W: Clone + AsRef<[u64]>>(items: Vec<Item<'a, W>>) -> Quer
     owned_vec_to_result(items.into_iter().map(Item::into_owned).collect())
 }
 
+/// Fallible twin of [`items_to_result`] (#2024 code review): the
+/// all-`Borrowed` fast path is unchanged (it defers decoding rather than
+/// doing any itself, so there's nothing to check yet -- the eventual
+/// consumer, e.g. [`push_owned_values_checked`], is what raises), but the
+/// mixed/owned branch converted every item through bare [`Item::into_owned`]
+/// unconditionally, silently substituting `""` for an undecodable item
+/// instead of raising -- the #1746-shaped bug one layer upstream of
+/// [`limit_with_n`]'s own fix just below: `limit(2; 1, .a)` on an
+/// undecodable `.a` mixes an `Owned` literal (`1`) with a `Borrowed` `.a`,
+/// so it never reaches the all-`Borrowed` fast path at all. Stops at the
+/// first undecodable item, keeping whatever prefix already converted
+/// cleanly -- the same partial-prefix contract every other `_checked`
+/// sibling in this file gives.
+fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
+    items: Vec<Item<'a, W>>,
+) -> QueryResult<'a, W> {
+    if items.iter().all(|i| matches!(i, Item::Borrowed(_))) {
+        let borrowed: Vec<StandardJson<'a, W>> = items
+            .into_iter()
+            .map(|i| match i {
+                Item::Borrowed(v) => v,
+                Item::Owned(_) => unreachable!("checked above"),
+            })
+            .collect();
+        return borrowed_vec_to_result(borrowed);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item.into_owned_checked() {
+            Ok(v) => out.push(v),
+            Err(e) => return partial(out, Control::Error(e)),
+        }
+    }
+    owned_vec_to_result(out)
+}
+
 /// Pull at most one output, then stop the generator — jq's
 /// `def first(f): label $out | (f, break $out);`.
 ///
@@ -27961,7 +27997,12 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // and fired their side effects (#820).
     let (taken, flow) = each_take_n::<W, S>(expr, value, optional, n);
     let satisfied = taken.len() >= n;
-    let result = items_to_result(taken);
+    // #2024: `items_to_result_checked`, not `items_to_result` -- the mainline
+    // `Stopped`/`Exhausted` arms return `result` straight through, so a
+    // mixed `Owned`/`Borrowed` `taken` batch (e.g. `limit(2; 1, .a)`, a
+    // literal alongside a field navigation) must already be decode-checked
+    // by the time it gets here, not just the `!satisfied` branch below.
+    let result = items_to_result_checked(taken);
     match flow {
         // Stopped because `n` outputs arrived: jq's own `foreach ... break
         // $out` fires here, so nothing past that point is ever reached and a
@@ -27977,17 +28018,27 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 result
             } else {
                 let mut prefix = Vec::new();
-                // #2024: a decode failure discovered while materializing the
+                // A decode failure discovered while materializing the
                 // pre-escape prefix describes a value the generator already
                 // produced *before* its own terminator fired, so it outranks
-                // that terminator's control -- the same precedence
-                // `fanout_arg`'s own flush-then-stop arms give a flushed
-                // `pending_first`'s decode failure over the argument's
-                // trailing control.
-                if let Some(decode_control) = push_owned_values_checked(result, &mut prefix) {
-                    return partial(prefix, decode_control);
-                }
-                partial(prefix, control)
+                // that terminator's control -- `fanout_arg`'s own doc
+                // comment's rule 3 already establishes that precedence for
+                // `halt`/`break` specifically ("body's own error can outrank
+                // a trailing halt"; `setpath((1, halt_error(6)); 1)` exits 5,
+                // never reaching the halt), and it holds here too: a decode
+                // failure can only originate from a raw, not-yet-decoded
+                // document byte span (`StandardJson::String`, never a
+                // query-constructed `OwnedValue::String`), so a document
+                // containing the bytes that trigger one would already have
+                // failed real jq's own UTF-8-validating parser before any
+                // `halt`/`break` in the same query could fire -- the same
+                // precedence `fanout_arg`'s own flush-then-stop arms give a
+                // flushed `pending_first`'s decode failure over the
+                // argument's trailing control, and the same shape `eval_as`'s
+                // own bound-control-vs-fallback match already uses.
+                let final_control =
+                    push_owned_values_checked(result, &mut prefix).unwrap_or(control);
+                partial(prefix, final_control)
             }
         }
     }
@@ -46283,6 +46334,47 @@ mod tests {
         query!(
             b"{\"a\":\"\xff\xfe\"}",
             r#"limit(3; (.a, error("x")))"#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2024 code review: the fix above only exercised `Flow::Escaped`'s
+    /// `!satisfied` branch, but the far more common case -- `n` outputs
+    /// actually reached (`Flow::Stopped`) -- returned `items_to_result`'s
+    /// (not `_checked`) output straight through, completely unguarded.
+    /// `limit(2; 1, .a)` mixes an `Owned` literal (`1`) with a `Borrowed`
+    /// `.a`, which routes `items_to_result`/`_checked` through the
+    /// mixed-batch branch (`items.iter().all(Borrowed)` is false), the one
+    /// that actually converts eagerly -- unlike the all-`Borrowed` fast path,
+    /// which just defers. Pre-fix this gave `ManyOwned([Int(1),
+    /// String("")])` (silent `""` substitution for `.a`, `n=2` reached
+    /// cleanly, no error at all); post-fix it raises, keeping the
+    /// successfully-converted `1` as the `Partial` prefix.
+    #[test]
+    fn test_eval_limit_stopped_mixed_batch_raises_decode_failure_2024() {
+        query!(
+            b"{\"a\":\"\xff\xfe\"}",
+            r"limit(2; 1, .a)",
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2024 code review: pins the halt/break-vs-decode-failure precedence
+    /// `limit_with_n`'s `Flow::Escaped` arm now has (see its own comment,
+    /// citing `fanout_arg`'s rule 3) -- a decode failure discovered while
+    /// materializing the pre-escape prefix outranks even a `halt_error`,
+    /// since the failure describes a value the generator already produced
+    /// *before* the halt fired.
+    #[test]
+    fn test_eval_limit_escaped_prefix_decode_failure_outranks_halt_2024() {
+        query!(
+            b"{\"a\":\"\xff\xfe\"}",
+            r"limit(3; (.a, halt_error(6)))",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
