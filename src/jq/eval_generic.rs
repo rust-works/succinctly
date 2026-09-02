@@ -44,7 +44,7 @@ use super::eval::{
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
     try_reserve_product, vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag,
-    Flow, JqSemantics, LimitN, QueryResult, YqSemantics,
+    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8816,12 +8816,12 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     node: &PathNode<V>,
-    path: &mut Vec<OwnedValue>,
+    path: &Rc<PathTrail>,
     out: &mut Vec<OwnedValue>,
 ) -> Result<(), EvalError> {
     match expr {
         Expr::Identity => {
-            out.push(OwnedValue::Array(path.clone()));
+            out.push(OwnedValue::Array(path.to_vec()));
             Ok(())
         }
         Expr::Paren(inner) => path_walk_generic::<S, V>(inner, node, path, out),
@@ -8836,62 +8836,71 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // error comes before anything is produced -- which is the case
             // the discarded-branch version was checked against.
             let mut branch = Vec::new();
-            let _ = path_walk_generic::<S, V>(inner, node, &mut path.clone(), &mut branch);
+            let _ = path_walk_generic::<S, V>(inner, node, path, &mut branch);
             out.append(&mut branch);
             Ok(())
         }
         Expr::Comma(exprs) => {
             for e in exprs {
-                path_walk_generic::<S, V>(e, node, &mut path.clone(), out)?;
+                path_walk_generic::<S, V>(e, node, path, out)?;
             }
             Ok(())
         }
-        Expr::Pipe(exprs) => match exprs.split_first() {
-            None => {
-                out.push(OwnedValue::Array(path.clone()));
-                Ok(())
-            }
-            Some((first, [])) => path_walk_generic::<S, V>(first, node, path, out),
-            Some((first, rest)) => {
-                // Each output of `first` is a distinct position to continue
-                // the rest of the pipe from, so the step is re-walked rather
-                // than batched -- the same per-output shape `Expr::Iterate`
-                // needs below.
-                let mut heads = Vec::new();
-                let stepped = path_step_generic::<S, V>(
-                    first,
-                    node,
-                    path,
-                    S::COLLAPSE_DUPLICATE_KEYS,
-                    &mut heads,
-                );
-                let rest_expr = if rest.len() == 1 {
-                    rest[0].clone()
-                } else {
-                    Expr::Pipe(rest.to_vec())
-                };
-                // Heads the step produced *before* failing are earlier in
-                // jq's generator order than its own error, so they are walked
-                // first and only then is the error propagated -- the same
-                // "never un-emit an output already produced" rule the
-                // `Builtin::Path` arm applies at the top level.
-                for (mut next_path, next_node) in heads {
-                    path_walk_generic::<S, V>(&rest_expr, &next_node, &mut next_path, out)?;
-                }
-                stepped
-            }
-        },
+        Expr::Pipe(exprs) => path_walk_pipe_generic::<S, V>(exprs, node, path, out),
         // A terminal navigation step: take it, then emit each resulting path.
         _ => {
             let mut heads = Vec::new();
             let stepped =
                 path_step_generic::<S, V>(expr, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
             for (p, _) in heads {
-                out.push(OwnedValue::Array(p));
+                out.push(OwnedValue::Array(p.to_vec()));
             }
             stepped
         }
     }
+}
+
+/// [`path_walk_generic`]'s own `Expr::Pipe` case, split out to work on a
+/// borrowed `&[Expr]` slice rather than a single `&Expr` (#2058).
+///
+/// Before this, the `Pipe` arm split one component off at a time and
+/// rewrapped the remainder in a *new*, owned `Expr::Pipe(rest.to_vec())` just
+/// to recurse — an O(remaining length) clone of `Expr` nodes at every one of
+/// a `d`-element pipe's `d` stages, summing to O(d^2) for a flat
+/// `.c.c.c...c[0]`-shaped chain (exactly the AST-clone-per-stage pattern
+/// #1510 already fixed in `eval.rs`'s own path-context evaluator — see this
+/// crate's top-level `CHANGELOG.md`). Passing `rest` straight through as a
+/// slice is O(1): no clone, just a pointer/length pair. Combined with
+/// [`PathTrail`] (an O(1)-extend `Rc`-list replacing the identical
+/// `path.to_vec()`-then-push clone this arm's `path` parameter used to pay
+/// every stage too), a `d`-deep static chain is now O(d) end to end here.
+fn path_walk_pipe_generic<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    node: &PathNode<V>,
+    path: &Rc<PathTrail>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), EvalError> {
+    let Some((first, rest)) = exprs.split_first() else {
+        out.push(OwnedValue::Array(path.to_vec()));
+        return Ok(());
+    };
+    if rest.is_empty() {
+        return path_walk_generic::<S, V>(first, node, path, out);
+    }
+    // Each output of `first` is a distinct position to continue the rest of
+    // the pipe from, so the step is re-walked rather than batched -- the
+    // same per-output shape `Expr::Iterate` needs.
+    let mut heads = Vec::new();
+    let stepped =
+        path_step_generic::<S, V>(first, node, path, S::COLLAPSE_DUPLICATE_KEYS, &mut heads);
+    // Heads the step produced *before* failing are earlier in jq's generator
+    // order than its own error, so they are walked first and only then is
+    // the error propagated -- the same "never un-emit an output already
+    // produced" rule the `Builtin::Path` arm applies at the top level.
+    for (next_path, next_node) in heads {
+        path_walk_pipe_generic::<S, V>(rest, &next_node, &next_path, out)?;
+    }
+    stepped
 }
 
 /// One navigation step: from `node` at `path`, produce every (path, node)
@@ -8899,13 +8908,13 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
 fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     node: &PathNode<V>,
-    path: &[OwnedValue],
+    path: &Rc<PathTrail>,
     collapse_duplicate_keys: bool,
-    out: &mut Vec<(Vec<OwnedValue>, PathNode<V>)>,
+    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
 ) -> Result<(), EvalError> {
     match expr {
         Expr::Identity => {
-            out.push((path.to_vec(), node.clone()));
+            out.push((Rc::clone(path), node.clone()));
             Ok(())
         }
         Expr::Paren(inner) => {
@@ -8931,9 +8940,10 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             };
-            let mut p = path.to_vec();
-            p.push(OwnedValue::String(name.clone()));
-            out.push((p, next));
+            out.push((
+                PathTrail::extend(path, OwnedValue::String(name.clone())),
+                next,
+            ));
             Ok(())
         }
         Expr::Index { idx, key } => {
@@ -8967,9 +8977,10 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             };
-            let mut p = path.to_vec();
-            p.push(index_component_value(idx, key));
-            out.push((p, next));
+            out.push((
+                PathTrail::extend(path, index_component_value(idx, key)),
+                next,
+            ));
             Ok(())
         }
         Expr::Iterate => match node {
@@ -8993,16 +9004,18 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                         let Some(key) = key_display_string(&field.key) else {
                             return Err(fields.malformed_member_error());
                         };
-                        let mut p = path.to_vec();
-                        p.push(OwnedValue::String(key.into_owned()));
-                        out.push((p, PathNode::At(field.value_cursor)));
+                        out.push((
+                            PathTrail::extend(path, OwnedValue::String(key.into_owned())),
+                            PathNode::At(field.value_cursor),
+                        ));
                     }
                     Ok(())
                 } else if let Some(elements) = v.as_array() {
                     for (i, ec) in elements.collect_cursors().into_iter().enumerate() {
-                        let mut p = path.to_vec();
-                        p.push(OwnedValue::Int(i as i64));
-                        out.push((p, PathNode::At(ec)));
+                        out.push((
+                            PathTrail::extend(path, OwnedValue::Int(i as i64)),
+                            PathNode::At(ec),
+                        ));
                     }
                     Ok(())
                 } else {
@@ -9029,37 +9042,9 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
         // so before these arms existed each one hit the `unreachable!` below
         // and aborted the process with exit 101 -- a live, CLI-reachable
         // panic, not a can't-happen.
-        Expr::Pipe(exprs) => match exprs.split_first() {
-            None => {
-                out.push((path.to_vec(), node.clone()));
-                Ok(())
-            }
-            Some((first, [])) => {
-                path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, out)
-            }
-            Some((first, rest)) => {
-                let mut heads = Vec::new();
-                let stepped = path_step_generic::<S, V>(
-                    first,
-                    node,
-                    path,
-                    collapse_duplicate_keys,
-                    &mut heads,
-                );
-                let rest_expr = if rest.len() == 1 {
-                    rest[0].clone()
-                } else {
-                    Expr::Pipe(rest.to_vec())
-                };
-                // Positions completed through the whole chain land in `out`
-                // before `stepped`'s own error surfaces, for the same
-                // generator-order reason as `path_walk_generic`'s `Pipe` arm.
-                for (p, n) in heads {
-                    path_step_generic::<S, V>(&rest_expr, &n, &p, collapse_duplicate_keys, out)?;
-                }
-                stepped
-            }
-        },
+        Expr::Pipe(exprs) => {
+            path_step_pipe_generic::<S, V>(exprs, node, path, collapse_duplicate_keys, out)
+        }
         Expr::Comma(exprs) => {
             for e in exprs {
                 path_step_generic::<S, V>(e, node, path, collapse_duplicate_keys, out)?;
@@ -9079,6 +9064,38 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
         // can arrive here.
         other => unreachable!("non-navigable path expression reached the cursor walk: {other:?}"),
     }
+}
+
+/// [`path_step_generic`]'s own `Expr::Pipe` case, split out the same way
+/// [`path_walk_pipe_generic`] is (#2058): a nested nested pipe reached as one
+/// step inside an *outer* pipe (`path(((.a|.b)|.c))`, see the doc comment
+/// where this arm used to live) is rare, but recurses on a borrowed `&[Expr]`
+/// slice here for the identical reason -- no owned `Expr::Pipe(rest.to_vec())`
+/// rebuilt per stage, and `path`'s own O(1) `PathTrail::extend` instead of an
+/// O(depth) `Vec` clone-and-push.
+fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    node: &PathNode<V>,
+    path: &Rc<PathTrail>,
+    collapse_duplicate_keys: bool,
+    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
+) -> Result<(), EvalError> {
+    let Some((first, rest)) = exprs.split_first() else {
+        out.push((Rc::clone(path), node.clone()));
+        return Ok(());
+    };
+    if rest.is_empty() {
+        return path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, out);
+    }
+    let mut heads = Vec::new();
+    let stepped = path_step_generic::<S, V>(first, node, path, collapse_duplicate_keys, &mut heads);
+    // Positions completed through the whole chain land in `out` before
+    // `stepped`'s own error surfaces, for the same generator-order reason as
+    // `path_walk_pipe_generic`.
+    for (p, n) in heads {
+        path_step_pipe_generic::<S, V>(rest, &n, &p, collapse_duplicate_keys, out)?;
+    }
+    stepped
 }
 
 /// Whether a pipe stage carrying path context can be resolved by walking
@@ -9298,11 +9315,16 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             let stepped = path_step_generic::<S, V>(
                 expr,
                 &PathNode::At(pos.node),
-                &pos.path,
+                &PathTrail::from_slice(&pos.path),
                 true,
                 &mut heads,
             );
             for (path, node) in heads {
+                // `path_step_generic` now hands back an `Rc<PathTrail>`
+                // (#2058); this caller's own `path` stays a plain
+                // `Vec<OwnedValue>` (see `PathTrail::from_slice`'s own doc
+                // comment for why), so it flattens back out here.
+                let path = path.to_vec();
                 // An absent node is where the bridge and this walk genuinely
                 // disagree, so it is handed back rather than answered.
                 //
@@ -10416,7 +10438,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 return match path_walk_generic::<S, V>(
                     path_expr,
                     &PathNode::At(root),
-                    &mut Vec::new(),
+                    &PathTrail::root(),
                     &mut out,
                 ) {
                     Ok(()) => owned_vec_to_generic_result(out),

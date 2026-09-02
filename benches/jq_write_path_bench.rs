@@ -728,6 +728,142 @@ fn bench_del_shared_prefix_width(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// #2058: path-resolution cost per *step*, independent of branch count
+// =============================================================================
+
+/// A `d`-deep `{"c": ...}` chain terminating in a **fixed**-size, 8-element
+/// array: `{"c":{"c":...{"c":[0,1,...,7]}}}`.
+///
+/// Unlike [`deep_chain_doc`] (whose leaf grows with `d`, so it can't tell a
+/// per-step cost from a per-branch one apart), the leaf here is pinned at 8
+/// elements regardless of `d` — every group below fans out over exactly two
+/// of those eight (`[0]`/`[1]`), so widening `d` moves only the shared-prefix
+/// depth, never the branch count or the leaf size. That is the isolation
+/// #2058 asks for: `jq_write_path_del_shared_prefix_depth` above scales *both*
+/// together and still reads an exponent of ~1.6 after #1690, because this
+/// term survives underneath it.
+fn two_branch_chain_doc(d: usize) -> Vec<u8> {
+    let mut out = String::new();
+    for _ in 0..d {
+        out.push_str(r#"{"c":"#);
+    }
+    out.push_str("[0,1,2,3,4,5,6,7]");
+    for _ in 0..d {
+        out.push('}');
+    }
+    out.into_bytes()
+}
+
+/// `.c` repeated `d` times — the shared static prefix every group below
+/// appends `[0]`/`[1]` to.
+fn two_branch_prefix(d: usize) -> String {
+    ".c".repeat(d)
+}
+
+/// `[path(.c...c[0], .c...c[1])] | length` over [`two_branch_chain_doc`] —
+/// the `path()` row of #2058's own repro table, which pays the per-step cost
+/// worst of the three (it does no writing at all, so every clone here was
+/// pure waste). Wrapped in `length` so the timed output stays O(1) regardless
+/// of `d` (a `[path(...)]` result itself is small and flat, but this keeps
+/// the premise check and the benchmarked expression identical in shape to
+/// the `=`/`del` groups below).
+fn bench_two_branch_path_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_two_branch_path_depth");
+    for &d in DEPTHS {
+        let json = two_branch_chain_doc(d);
+        let prefix = two_branch_prefix(d);
+        let expr =
+            parse(&format!("[path({prefix}[0], {prefix}[1])] | length")).expect("must parse");
+
+        // Guard the premise: exactly two paths reported (one per branch), or
+        // a bug that drops a branch would read as a spurious speedup.
+        assert_eq!(
+            eval_one(&expr, &json),
+            OwnedValue::Int(2),
+            "d={d}: must report exactly two paths"
+        );
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(d as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `(.c...c[0], .c...c[1]) = 9` over [`two_branch_chain_doc`] — the `=` row.
+fn bench_two_branch_assign_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_two_branch_assign_depth");
+    for &d in DEPTHS {
+        let json = two_branch_chain_doc(d);
+        let prefix = two_branch_prefix(d);
+        let expr = parse(&format!("({prefix}[0], {prefix}[1]) = 9")).expect("must parse");
+
+        // Guard the premise: both targeted elements become 9, and every
+        // other leaf element survives untouched -- a write that silently
+        // no-ops, or clobbers the whole array, would otherwise read as a
+        // speedup.
+        let out = eval_one(&expr, &json);
+        let OwnedValue::Array(items) = leaf_array(&out, d) else {
+            panic!("d={d}: the leaf must stay an array");
+        };
+        let expected: Vec<OwnedValue> = (0..8)
+            .map(|i| {
+                if i < 2 {
+                    OwnedValue::Int(9)
+                } else {
+                    OwnedValue::Int(i)
+                }
+            })
+            .collect();
+        assert_eq!(*items, expected, "d={d}: unexpected leaf contents");
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(d as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `del(.c...c[0], .c...c[1])` over [`two_branch_chain_doc`] — the `del` row.
+fn bench_two_branch_del_depth(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_two_branch_del_depth");
+    for &d in DEPTHS {
+        let json = two_branch_chain_doc(d);
+        let prefix = two_branch_prefix(d);
+        let expr = parse(&format!("del({prefix}[0], {prefix}[1])")).expect("must parse");
+
+        // Guard the premise: exactly the two targeted elements are gone and
+        // the remaining six survive, in order.
+        let out = eval_one(&expr, &json);
+        let OwnedValue::Array(items) = leaf_array(&out, d) else {
+            panic!("d={d}: the leaf must stay an array");
+        };
+        let expected: Vec<OwnedValue> = (2..8).map(OwnedValue::Int).collect();
+        assert_eq!(*items, expected, "d={d}: unexpected leaf contents");
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements(d as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(d), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // AST-shape groups (#1510). Element count is fixed; the query varies.
 // ---------------------------------------------------------------------------
@@ -1067,6 +1203,9 @@ criterion_group!(
     bench_del_filtered_descent_depth,
     bench_del_shared_prefix_depth,
     bench_del_shared_prefix_width,
+    bench_two_branch_path_depth,
+    bench_two_branch_assign_depth,
+    bench_two_branch_del_depth,
     bench_path_comma_width_ast,
     bench_path_comma_rest_ast,
     bench_path_paren_chain_ast,
