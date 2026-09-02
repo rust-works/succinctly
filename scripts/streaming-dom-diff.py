@@ -99,6 +99,9 @@ def diverges(binary, doc_path, query, output, extra_flags):
 
 def main(argv=None):
     args = parse_args(argv)
+    if not (os.path.isfile(args.binary) and os.access(args.binary, os.X_OK)):
+        sys.exit(f"--binary {args.binary!r} is not an executable file "
+                  "(build it first: cargo build --release --features cli)")
     docs = collect_corpus(args.corpus)
 
     print(f"=== {len(docs)} documents, query={args.query!r}, "
