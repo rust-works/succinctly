@@ -1,0 +1,1 @@
+map(select(.x > 1))
