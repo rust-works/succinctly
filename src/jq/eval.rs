@@ -40554,21 +40554,23 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
 /// verbatim>". Both arms are ordinary `error(...)`-shaped and suppressible by
 /// `?`, unlike a decode failure (#1620) -- confirmed live,
 /// `("foo","null") | modulemeta?` produces no output, exit 0 (#2111).
+///
+/// Routed through `scalar_fallback` (#1907 item 5) rather than a hand-rolled
+/// decode-failure/optional/type-error triplet: its `err` closure inspects the
+/// captured `value` to pick the message, the same idiom `flatten`'s own
+/// `scalar_fallback` calls already use to build a value-dependent error.
 fn builtin_modulemeta<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    match &value {
-        StandardJson::String(s) => match s.as_str() {
-            Ok(_) if optional => QueryResult::None,
-            Ok(name) => QueryResult::Error(EvalError::new(format!("module not found: {name}"))),
-            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
-        },
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(
-            "modulemeta input module name must be a string",
+    scalar_fallback(&value, optional, || match &value {
+        StandardJson::String(s) => EvalError::new(format!(
+            "module not found: {}",
+            s.as_str()
+                .expect("scalar_fallback already returned on a decode failure")
         )),
-    }
+        _ => EvalError::new("modulemeta input module name must be a string"),
+    })
 }
 
 /// Builtin: pick(keys) - select only specified keys from object/array (yq)
@@ -61632,6 +61634,26 @@ mod tests {
         // input produces no output rather than propagating.
         query!(b"null", "modulemeta?", QueryResult::None => {});
         query!(br#""foo""#, "modulemeta?", QueryResult::None => {});
+    }
+
+    /// #2111: a genuine decode failure on `.` must still survive `optional`,
+    /// the same #1620 rule `test_builtin_upper_in_decode_failure_survives_optional_2015`
+    /// pins for `IN(s)` -- `scalar_fallback`'s own decode-failure check runs
+    /// before `optional` is ever consulted, so this must never reach the
+    /// `err` closure's `s.as_str().expect(...)` at all.
+    #[test]
+    fn test_modulemeta_decode_failure_survives_optional_2111() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        match builtin_modulemeta::<Vec<u64>>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+        match builtin_modulemeta::<Vec<u64>>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got: {other:?}"),
+        }
     }
 
     #[test]
