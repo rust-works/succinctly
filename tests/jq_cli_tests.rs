@@ -31626,14 +31626,17 @@ fn test_index_expr_one_empty_key_does_not_short_circuit_others_2032() -> Result<
 /// cases above, this time via `input` (a stateful generator that consumes
 /// from the CLI's document stream) rather than a side-channel write --
 /// `.[$keys]`'s target must be *re-read* from the stream once per key, not
-/// read once and reused. `run_jq_full` execs the real CLI subprocess, which
-/// always dispatches through `eval_generic::eval_index_expr`
-/// (`eval::eval_index_expr` has no CLI-reachable path at all -- it's a
-/// separate, pure-in-process library entry point with no `input`/`inputs`
-/// builtin and no observable side-effect mechanism in its own unit tests,
-/// so its sibling fix is covered there only by reachability/regression
+/// read once and reused. `run_jq_full` execs the real CLI subprocess in
+/// `succinctly jq` mode, which always dispatches through
+/// `eval_generic::eval_index_expr` -- `jq_runner.rs` never calls
+/// `eval::eval_index_expr` at all. #2153: `eval::eval_index_expr` is *not*
+/// CLI-unreachable in general, though -- `succinctly yq` reaches it via
+/// `yq_runner.rs`'s `evaluate_input` (`jq::eval::<Vec<u64>,
+/// YqSemantics>(expr, cursor)`, at least 8 call sites, triggered by e.g.
+/// `-n`/`-R`/`--slurp`), so its sibling fix is covered there both by that
+/// live yq-mode path and by `eval.rs`'s own in-process `#[cfg(test)]` unit
 /// tests on pure targets, e.g.
-/// `test_computed_index_ordinary_cross_product_unaffected_1634`).
+/// `test_computed_index_ordinary_cross_product_unaffected_1634`.
 /// Verified against jq 1.7.1: both emit `[1,4]` (key `"a"` re-reads `input`
 /// to get `{"a":1,"b":2}` -> `.a` = 1; key `"b"` re-reads `input` again to
 /// get `{"a":3,"b":4}` -> `.b` = 4).
