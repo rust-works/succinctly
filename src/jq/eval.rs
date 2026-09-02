@@ -26954,10 +26954,10 @@ fn eval_owned_fast_path<S: EvalSemantics>(
             };
             match arith_combine::<S>(*op, input.clone(), literal_to_owned(lit)) {
                 Ok(v) => Some(Ok(Some(v))),
-                // Suppress to `None` under `optional` (the fold construct's
-                // own trailing `?`) rather than propagating, same rule
-                // `eval_arithmetic`'s general-path handling of `optional`
-                // applies for this shape.
+                // Mirrors the `Field`/`Index` arms' own `_ if optional`
+                // convention below, so a caller that ever does reach this
+                // arm with `optional: true` gets the same suppression they
+                // would.
                 Err(_) if optional => Some(Ok(None)),
                 Err(e) => Some(Err(e)),
             }
@@ -55778,15 +55778,13 @@ mod tests {
 
     #[test]
     fn test_2086_bare_arithmetic_fast_path_type_error_respects_optional() {
-        // #2086: the new fast-path arm must preserve the `Field`/`Index`
-        // arms' own established convention (this function's doc comment's
-        // "unobservable except in speed" contract) -- a per-step `?`
-        // (`optional`, threaded down from the fold construct's own
-        // trailing `?`) suppresses this step's error to `None` instead of
-        // propagating it, exactly like a `Field`/`Index` type mismatch
-        // already does. Both halves confirmed live against jq 1.7.1:
-        // unsuppressed errors, suppressed emits nothing (exit 0, no
-        // output).
+        // #2086: a type error from this arm propagates normally (exercising
+        // the arm's `Err(e) => Some(Err(e))` branch) and, per #693, a `?`
+        // wrapping the *whole* `reduce` doesn't set `optional: true` for the
+        // fold's own per-step evaluation -- it's caught after the fact by
+        // the outer `eval_try`, same as `eval_arithmetic`'s general path.
+        // Both confirmed live against jq 1.7.1: unsuppressed errors,
+        // suppressed emits nothing (exit 0, no output).
         query!(b"1", r#"reduce range(3) as $x (1; . + "a")"#,
             QueryResult::Error(e) => {
                 assert!(e.message.contains("cannot be added"));
