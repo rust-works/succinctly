@@ -720,7 +720,8 @@ discarded, matching #1641/#1679 and the "buffering the whole record" non-goal be
   (`succinctly::jq::eval`/`eval_using`) feeds raw, untrusted bytes straight into
   `JsonIndex::build` and this evaluator, with no re-serialization step and no upstream
   decode-failure check to have already caught it. #1746 added a new fallible
-  `to_owned_checked`/`to_owned_checked_at_depth` sibling, mirroring
+  `to_owned_checked`/`to_owned_checked_at_depth` sibling (renamed to `to_owned`/
+  `to_owned_at_depth` by #1989, which made the checked conversion the default), mirroring
   `eval_generic::to_owned_at_depth`'s already-fixed shape, and fixed the whole-document
   read/write family (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
   `builtin_setpath`, `builtin_del`, `delpaths_one`) plus `map`/`map_values`/`to_entries`.

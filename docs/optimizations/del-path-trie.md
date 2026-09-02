@@ -150,7 +150,8 @@ pay it alike, so it is not `del()`'s — it lives in the shared path-resolution 
 one of them enters. And `del()`'s own two columns are within noise of each other, as they must
 be when two branches have nothing to share.
 
-A `sample` profile of the `del` and `=` shapes at D=240 puts `to_owned_checked_at_depth` among
+A `sample` profile of the `del` and `=` shapes at D=240 puts `to_owned_at_depth` (named
+`to_owned_checked_at_depth` when this was captured; renamed by #1989) among
 the heaviest frames in both, alongside `OwnedValue::clone` and `IndexMap` bucket cloning — the
 signature of re-materializing an owned subtree per navigation step, which is O(d²) for a
 `d`-deep chain by construction. Tracked as

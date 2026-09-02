@@ -21079,7 +21079,7 @@ fn test_argument_type_mismatch_optional_arms_produce_no_output_1164() -> Result<
 
 /// #1801: `load()`'s YAML path (`yaml_value_to_owned_checked`) raises on an
 /// undecodable string scalar instead of silently substituting `null`,
-/// mirroring the `StandardJson` family's own `to_owned_checked` (#1746/
+/// mirroring the `StandardJson` family's own `to_owned` (#1746/
 /// #1755/#1620). Not suppressed by `?` -- a decode failure is never
 /// catchable, same convention as every other `decode_failure`-constructed
 /// error in this codebase.

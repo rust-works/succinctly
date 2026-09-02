@@ -79,6 +79,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project's benchmarking discipline — split out to #2194 rather than
   bundled into this refactor-only change.
 
+- **`eval.rs`'s infallible `to_owned` is renamed to `to_owned_lossy`, and the
+  fallible `to_owned_checked` takes over the short name `to_owned`** (#1989),
+  making the checked conversion the file's compiler-enforced default: a new
+  bare `to_owned` call site now gets the `Result`-returning, decode-failure-
+  raising conversion, and reaching for the silently-lossy one requires
+  spelling out `to_owned_lossy` — a deliberate, visible act that has to be
+  justified against that function's own three-loss soundness rule (an
+  undecodable string becomes `""`, an undecodable object key is dropped
+  entirely, and a trailing unpaired member (#1194) is silently ignored).
+  `to_owned_for_error_message` was considered and rejected as the lossy
+  variant's new name — roughly a third of its remaining call sites aren't
+  error-message contexts at all, and a name that lies at a third of its
+  sites is worse than one that just names the hazard.
+
+  A full audit of every one of the file's ~75 production `to_owned` call
+  sites (84 including 9 test-module sites) preceded the rename: 62 were
+  confirmed genuinely safe (fed only already-validated values — inside
+  `scalar_fallback`, behind an explicit `scalar_decode_failure` guard, or
+  fed exclusively by an already-owned/reindexed document), and 13 across 6
+  real clusters were live bugs, each fixed here with its own regression
+  test (temporarily reverted and confirmed to reproduce the pre-fix
+  symptom before being re-applied):
+
+  - `QueryResult::collect_owned`'s unchecked fold, reached via
+    `fanout_two_args`'s eager two-argument path and
+    `fanout_regex_pattern_with_collected_flags` — the highest-severity
+    cluster, since it silently substituted a wrong *argument* value (e.g.
+    `splits(","; .flags)` on an undecodable `.flags` silently applied no
+    flags) rather than just misreporting an error. Both routes now go
+    through the file's existing `stream_outputs_checked`, the same twin
+    #2023 already used to fix the parallel single-argument `fanout_arg`
+    path.
+  - `builtin_any`/`builtin_all`/`any_all_f`'s jq-mode fallback arm, which
+    (unlike the yq-mode arms beside it) had no `scalar_decode_failure`
+    guard, so `any`/`all(cond)` on an undecodable string input reported
+    `Cannot iterate over string ("")` and was `?`-suppressible, instead of
+    raising.
+  - `builtin_last_stream`'s three borrowed-output arms, the direct sibling
+    of `builtin_skip`'s own decode-failure conversion (also part of this
+    issue) that its own doc comment says should be "kept in sync" but
+    wasn't.
+  - `Item::into_owned` at `builtin_limit`/`builtin_first_stream`'s two
+    call sites (of 7 total; the other 5 audited safe) — both emit the
+    materialized value as the query's own output, so the file's own
+    already-documented gap was live wrong data there, matching #1972's
+    precedent that a parser-unreachable-but-library-reachable site is
+    still worth fixing.
+  - `push_owned_values` at unary minus's operand conversion, which made
+    `-.a` on an undecodable `.a` report `string ("") cannot be negated` —
+    a catchable, `?`-suppressible message naming content the document
+    never held — instead of the (non-suppressible) decode failure.
+  - `builtin_implode`'s per-element conversion, mirroring #1755's own
+    per-element fix in the sort family: an undecodable array element was
+    reported as `"" can't be imploded, ...` and suppressed by `?`.
+
+  Four smaller, still-benign-today shapes surfaced during the same audit
+  are split out to #2196 rather than bundled here: `Item::into_owned`'s
+  own naming (not renamed by this issue), `builtin_implode`'s top-level
+  (non-element) `_ if optional` arm, `builtin_combinations_n`'s remaining
+  unchecked `stream_outputs` use, and the now-backwards-reading `_checked`
+  suffix on `stream_outputs_checked`/`push_owned_values_checked`/
+  `promote_borrowed_checked`.
+
 ### Fixed
 
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
