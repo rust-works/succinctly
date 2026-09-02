@@ -65483,6 +65483,31 @@ mod tests {
         }
     }
 
+    /// `delete_path_steps`'s (#2115) `Expr::Iterate` arm re-classifies `rest`
+    /// against each element via `yq_del_slice_outcome`, per #1116/#1162/
+    /// #1219 -- this exercises its `DropParent(ref target)` outcome
+    /// specifically (a non-empty, slice-free residual prefix before the
+    /// trailing slice-run, `.x` here), which drops that prefix's own key
+    /// from each element via a nested `delete_at_path` call rather than
+    /// removing the element itself (`DropParent(Expr::Identity)`, covered
+    /// elsewhere) or recursing further (`NotApplicable`). Live-verified
+    /// against real yq v4.53.3: `.a[].x[1:3]` on
+    /// `{"a":[{"x":[1,2,3,4]},{"x":[5,6,7,8]}]}` drops `x` from both
+    /// elements entirely, leaving `{"a":[{},{}]}`.
+    #[test]
+    fn test_yq_del_iterate_droparent_target_via_trailing_slice_run_2115() {
+        let json: &[u8] = br#"{"a":[{"x":[1,2,3,4]},{"x":[5,6,7,8]}]}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse("del(.a[].x[1:3])").unwrap();
+        let out: Vec<String> = eval::<Vec<u64>, YqSemantics>(&expr, cursor)
+            .collect_owned()
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect();
+        assert_eq!(out, vec![r#"{"a":[{},{}]}"#]);
+    }
+
     #[test]
     fn test_update_compound_and_alternative_assign_autovivify_too() {
         // The same auto-vivification applies to every write operator that
@@ -65500,6 +65525,44 @@ mod tests {
             // used to reach the same slot through `get_path_mut`'s loop.)
             (b"{}", ".a[0].b |= 9", Ok(r#"{"a":[{"b":9}]}"#)),
             (b"[{},{}]", ".[0].x += 1", Ok(r#"[{"x":1},{}]"#)),
+        ]);
+    }
+
+    /// `update_path_steps`'s (#2115) own `Expr::Index` arm reaches its
+    /// *fresh* branch (padding needed, more path after it) only when the
+    /// `Index` step itself is dispatched from the main loop rather than
+    /// swept up by an earlier `Field`'s own fresh-run collection --
+    /// `.a[0].b |= 9` on `{}` above doesn't reach it, since `.a` is itself
+    /// fresh and its collection greedily absorbs the `Index` step too
+    /// (built by `wrap_fresh`, not by this arm). Here `.a` already exists,
+    /// so it's peeled with no frame, and `.a[3]` is genuinely dispatched by
+    /// the main loop against a real (already-existing) array that still
+    /// needs padding.
+    #[test]
+    fn test_update_index_arm_fresh_branch_reached_after_existing_prefix_2115() {
+        assert_outcomes(&[
+            (
+                br#"{"a":[1,2]}"#,
+                ".a[3].b |= 9",
+                Ok(r#"{"a":[1,2,null,{"b":9}]}"#),
+            ),
+            // #1877/#1894: the same `!wrote && undo_stranded` collapse
+            // `update_path_steps`'s `Field` arm has, exercised through the
+            // `Index` arm instead -- the padding this would have needed is
+            // discarded entirely rather than left half-built.
+            (br#"{"a":[1,2]}"#, ".a[3].b |= empty", Ok(r#"{"a":[1,2]}"#)),
+            // A negative index still out of bounds after counting back from
+            // the end (`-5` against a 2-element array) is a write-time
+            // application error raised by `resolve_setpath_index` itself,
+            // before `write_index`'s own padding would ever run -- unlike
+            // `-1` against this same array, which resolves to the array's
+            // *existing* last element and takes the "already exists" branch
+            // instead (never reaching this arm's fresh path at all).
+            (
+                br#"{"a":[1,2]}"#,
+                ".a[-5].b |= 9",
+                Err("Out of bounds negative array index"),
+            ),
         ]);
     }
 
@@ -66130,6 +66193,29 @@ mod tests {
                 } else {
                     panic!("Expected nested object");
                 }
+            }
+        );
+    }
+
+    /// `delete_path_steps`'s (#2115) `Expr::Index` arm reassigns `root` to an
+    /// existing array element and loops rather than recursing -- covered
+    /// here by continuing one more step (`.b`) past it, so the walk doesn't
+    /// stop at the very first component.
+    #[test]
+    fn test_del_index_then_field_peels_in_place_2115() {
+        query!(br#"{"a": [{"b": 1}, {"b": 2}]}"#, r"del(.a[1].b)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Array(arr) = obj.get("a").unwrap() else {
+                    panic!("expected array");
+                };
+                let OwnedValue::Object(first) = &arr[0] else {
+                    panic!("expected object");
+                };
+                assert!(first.contains_key("b"), "del() touched the wrong element");
+                let OwnedValue::Object(second) = &arr[1] else {
+                    panic!("expected object");
+                };
+                assert!(!second.contains_key("b"), "del() left the key behind");
             }
         );
     }
