@@ -4352,7 +4352,13 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
         let (one, truncated) = match (from_val, to_val, step_val) {
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                eval_range_values::<W>(f, t, st)
+                // Try the exact-`i64` path first; it self-detects overflow
+                // (`None`) and only then do we pay for a from-scratch `f64`
+                // recomputation -- see `eval_range_values`'s own doc comment.
+                match eval_range_values::<W>(f, t, st) {
+                    Some(result) => result,
+                    None => eval_range_values_f64::<W>(f as f64, t as f64, st as f64),
+                }
             }
             (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
         };
@@ -29151,39 +29157,151 @@ fn range_max_exceeded_error() -> EvalError {
     EvalError::new("range: maximum iterations exceeded")
 }
 
-/// Helper to generate range values, capped at [`MAX_RANGE`] per call.
+/// Helper to generate range values, capped at [`MAX_RANGE`] per call --
+/// issue #2131's revised fix.
 ///
-/// Returns whether the cap actually cut the range short (`true`) or the
-/// range finished naturally within it (`false`) -- deliberately *not* an
+/// Returns `None` the instant `i64` arithmetic would overflow, signalling
+/// the caller ([`each_range`]'s `emit`) to discard whatever this call
+/// already pushed and recompute the *entire* range from scratch via
+/// [`eval_range_values_f64`] instead, matching jq's own `f64`-based model at
+/// that point. Otherwise returns `Some((result, truncated))`, `truncated`
+/// meaning the cap actually cut the range short (`true`) rather than the
+/// range finishing naturally within it (`false`) -- deliberately *not* an
 /// error here: this has no visibility into whether the caller's own sink
 /// would have stopped asking before the cap anyway (`first`/`limit`'s
 /// demand-driven early exit, #2089), only [`each_range`]'s `emit` does, so
 /// the truncation verdict is reported back rather than acted on locally.
+///
+/// # Safety criterion
+///
+/// The only way this loop can misbehave is the `i64` addition wrapping via
+/// two's-complement (#2131's original bug: plain `i +=`, no guard at all).
+/// [`i64::checked_add`] makes that impossible to miss -- the moment a
+/// partial sum would leave `i64`'s range, it returns `None` and this
+/// function bails immediately via `?`, before that value is ever observed or
+/// pushed. There is no separate bound to prove equivalent to this behavior
+/// (the earlier `±2^53` gate had to prove its threshold made `i64` and
+/// `f64` arithmetic agree bit-for-bit); overflow-freedom is checked exactly,
+/// by the same arithmetic that would otherwise overflow, at every step it
+/// could occur, however many magnitude combinations of `from`/`to`/`step`
+/// might trigger it.
+///
+/// # Cap-boundary decoupling (round 3)
+///
+/// An earlier revision of this loop checked the cap and attempted the
+/// advance in the same unconditional step (`while i < to && values.len() <
+/// MAX_RANGE { push; i = i.checked_add(step)?; }`): on the iteration whose
+/// push made `values.len()` reach [`MAX_RANGE`] -- the very last one the cap
+/// allows -- it still went on to compute `i.checked_add(step)` the exact
+/// same way every other iteration does, including the `?` that bails the
+/// *whole function* on overflow. If that lookahead candidate overflowed
+/// `i64` (astronomically large `step`s make this easy: the 100,001st
+/// candidate can leave `i64` range even when all 100,000 pushed values were
+/// perfectly valid), the caller discarded every already-correct pushed
+/// value for an `f64` recomputation none of them needed. Confirmed live:
+/// `nth(250; range(0; 9223372036854775807; 92234642714974))` returned the
+/// wrong, `f64`-derived answer instead of the exact `250 * 92234642714974`.
+///
+/// The loop above still computes that one lookahead at the cap boundary --
+/// there is no way to know whether one more value exists without it -- but
+/// interprets its result *locally* (`i.checked_add(step).is_some_and(|next|
+/// next < to)`) instead of bailing the whole function via `?` on failure.
+/// This is sound, not merely convenient: if `i.checked_add(step)` overflows
+/// here, the true mathematical next value exceeds `i64::MAX` (or, on the
+/// descending arm, is below `i64::MIN`), and `to` is always itself a valid
+/// `i64` (`<= i64::MAX` / `>= i64::MIN`) -- so an out-of-`i64`-range
+/// candidate can *never* satisfy `< to` (`> to` descending) either. That
+/// makes it indistinguishable from natural exhaustion: `truncated = false`
+/// is provably correct, not a guess, whenever this specific check overflows
+/// (see `test_eval_range_values_cap_hit_lookahead_overflow_does_not_bail_2131`,
+/// which confirms `range(0; i64::MAX; 92234642714974)` mathematically has
+/// *exactly* `MAX_RANGE` values -- `99999 * step < i64::MAX` but
+/// `100000 * step > i64::MAX` -- so this isn't even a close call once
+/// checked by hand). A cap-hit range whose lookahead does *not* overflow
+/// and genuinely has more values keeps reporting `truncated = true` exactly
+/// as before (`test_eval_range_values_cap_hit_genuine_truncation_still_flagged_2131`).
+///
+/// This cap-boundary lookahead is a fundamentally different call than the
+/// per-iteration advance on a *non*-cap-terminated loop: that one is still
+/// gated by `?`, because there the loop genuinely needs `i`'s next value to
+/// keep going, and an overflow there means the range ran off the edge of
+/// representable `i64` space while still short of the cap -- the
+/// genuine-overflow case the rest of this doc comment describes, where
+/// bailing to `eval_range_values_f64` is what makes near-`i64::MIN`/`MAX`
+/// ranges match jq's own boundary-adjacent rounding behavior (see the
+/// issue's own repro below). The cap-boundary lookahead has no such
+/// obligation: it exists purely to answer "does one more value exist" for
+/// a batch this call has *already* finished correctly computing, so there
+/// is nothing to discard either way. A natural exit (the `while` condition
+/// itself becoming false, cap never engaged) never sets `truncated`, so it
+/// stays at its `false` initial value -- no lookahead needed there at all.
+///
+/// This also *narrows* the previous gate correctly: a range with no
+/// overflow risk at all -- e.g. a nanosecond-epoch-scale
+/// `range(1_700_000_000_000_000_000; 1_700_000_000_000_000_010; 1)`, whose
+/// magnitude sits well past `2^53` but whose 10-step walk never comes close
+/// to `i64::MAX` -- now keeps its exact `i64` answer instead of being
+/// blanket-routed to `f64`, where at that magnitude every value in the
+/// range rounds to the *same* double and the whole range degenerates to
+/// empty. The previous `±2^53` gate was sufficient for correctness but far
+/// more conservative than the actual overflow risk (`i64::MIN`/`i64::MAX`
+/// adjacent, roughly `±9.2 * 10^18`) -- six orders of magnitude tighter than
+/// it needed to be, and this was that gate's own undisclosed regression.
+///
+/// A genuine `i64::MIN`/`i64::MAX`-adjacent case (the issue's own repro,
+/// `range(-9223372036854775758; -9223372036854775808; -100)`) still
+/// overflows on its very first `checked_add` (`from` is only 50 above
+/// `i64::MIN`, and `step` subtracts 100 more) and still correctly falls
+/// back to `f64` -- see `test_eval_range_values_overflow_detection_2131` and
+/// the rest of this module's `#2131`-tagged tests for the sign/step-width
+/// combinations swept to confirm this.
 fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
     to: i64,
     step: i64,
-) -> (QueryResult<'a, W>, bool) {
+) -> Option<(QueryResult<'a, W>, bool)> {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
     if step > 0 {
         let mut i = from;
-        while i < to && values.len() < MAX_RANGE {
+        while i < to {
             values.push(OwnedValue::Int(i));
-            i += step;
+            if values.len() >= MAX_RANGE {
+                // Cap hit on the push that just happened. Whether this is a
+                // *real* truncation depends on whether one more value would
+                // exist -- which still needs the next candidate, but this
+                // lookahead's overflow is handled locally (`is_some_and`
+                // rather than `?`) rather than bailing the whole function:
+                // if `i.checked_add(step)` overflows `i64`, the true
+                // mathematical next value exceeds `i64::MAX`, and since
+                // `to` is itself always a valid `i64` (<= `i64::MAX`), that
+                // hypothetical next value can never be `< to` either --
+                // it's provably not part of the range, exactly as if this
+                // were natural exhaustion. So an overflow here safely
+                // resolves to `false`, never to a bail: unlike the
+                // non-cap advance below, this call is answering "does a
+                // next value exist" for the *already-correct* batch this
+                // call already pushed, not "what is it", so there is
+                // nothing to discard either way (#2131 round 3).
+                truncated = i.checked_add(step).is_some_and(|next| next < to);
+                break;
+            }
+            i = i.checked_add(step)?;
         }
-        truncated = i < to;
     } else if step < 0 {
         let mut i = from;
-        while i > to && values.len() < MAX_RANGE {
+        while i > to {
             values.push(OwnedValue::Int(i));
-            i += step;
+            if values.len() >= MAX_RANGE {
+                truncated = i.checked_add(step).is_some_and(|next| next > to);
+                break;
+            }
+            i = i.checked_add(step)?;
         }
-        truncated = i > to;
     }
 
-    (owned_vec_to_result(values), truncated)
+    Some((owned_vec_to_result(values), truncated))
 }
 
 /// Helper to generate range values over floats, capped at [`MAX_RANGE`] per
@@ -42833,6 +42951,419 @@ mod tests {
                 lazy,
                 "eval_each diverged from eval_single for `{src}` on {}",
                 core::str::from_utf8(json).unwrap()
+            );
+        }
+    }
+
+    /// Shared by the `#2131` `eval_range_values` tests below: converts its
+    /// `Option<(QueryResult, bool)>` return into a plain `Option<(Vec<i64>,
+    /// bool)>` for equality comparison -- `QueryResult` doesn't derive
+    /// `PartialEq` (and doesn't need to for production code, only here).
+    /// Panics if a value comes back that isn't `Int`, since every input this
+    /// helper is used with is an all-integer `range` (the only case
+    /// [`eval_range_values`] is ever invoked for).
+    fn eval_range_values_i64(from: i64, to: i64, step: i64) -> Option<(Vec<i64>, bool)> {
+        eval_range_values::<Vec<u64>>(from, to, step).map(|(qr, truncated)| {
+            let values = match qr {
+                QueryResult::None => Vec::new(),
+                QueryResult::Owned(OwnedValue::Int(i)) => vec![i],
+                QueryResult::ManyOwned(items) => items
+                    .into_iter()
+                    .map(|v| match v {
+                        OwnedValue::Int(i) => i,
+                        other => panic!("expected Int, got {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected an Int-only range result, got {other:?}"),
+            };
+            (values, truncated)
+        })
+    }
+
+    /// Independent reference for [`eval_range_values`]'s computation,
+    /// entirely in `i128` -- used only by the sweep test below to
+    /// cross-check its `checked_add`-based overflow detection over a wide
+    /// range of magnitudes, without relying on the same arithmetic it's
+    /// checking. `i128` has enormous headroom over anything a
+    /// `MAX_RANGE`-bounded `i64` walk can produce (at most `MAX_RANGE`
+    /// additions of an `i64`-magnitude step, nowhere near `i128::MAX`), so
+    /// this reference can never overflow itself; it instead explicitly
+    /// checks each candidate next value against `i64::MIN..=i64::MAX` right
+    /// where [`eval_range_values`]'s own `checked_add` would fail, in the
+    /// same push-then-add order (the current `i` is always already valid --
+    /// by induction from `from` itself, an `i64` -- so only the *next* value
+    /// needs checking, exactly mirroring what `checked_add` guards).
+    ///
+    /// Cap-checked *after* each push, mirroring [`eval_range_values`]'s own
+    /// round-3 decoupling (round 3, #2131): an earlier version of this
+    /// reference checked the cap and the lookahead together in one
+    /// `while`/`&&` condition, the same structural shape the real
+    /// `checked_add`-based fix originally shared and that let a
+    /// cap-terminated lookahead overflow wrongly discard an entire
+    /// already-correct answer via `return None`. That shared blind spot
+    /// meant this reference validated "matches an equally flawed model,"
+    /// not the real correctness property. This version still computes the
+    /// cap-boundary lookahead (there is no way to know whether one more
+    /// value exists without it) but, exactly like the real fix's
+    /// `i.checked_add(step).is_some_and(|next| next < to)`, treats an
+    /// out-of-`i64`-range candidate there as proof no further value exists
+    /// (`truncated = false`) rather than as a signal to bail -- `to` is
+    /// always representable in `i64`, so a candidate that isn't can never
+    /// satisfy the comparison against it either way. Only a lookahead
+    /// attempted on a *non*-cap-terminated iteration (the loop's own
+    /// advance, still needed to keep going) can trigger this reference's
+    /// `None`, mirroring `eval_range_values`'s own `?`. Decoupling it here
+    /// independently re-derives the same conclusion via `i128` arithmetic
+    /// instead of trusting the production code's own control flow.
+    fn reference_range_i64(from: i64, to: i64, step: i64) -> Option<(Vec<i64>, bool)> {
+        let to128 = to as i128;
+        let step128 = step as i128;
+        let mut i: i128 = from as i128;
+        let mut values = Vec::new();
+        let mut truncated = false;
+        let in_i64 = |v: i128| (i64::MIN as i128..=i64::MAX as i128).contains(&v);
+
+        if step > 0 {
+            while i < to128 {
+                values.push(i as i64);
+                if values.len() >= MAX_RANGE {
+                    let next = i + step128;
+                    truncated = in_i64(next) && next < to128;
+                    break;
+                }
+                let next = i + step128;
+                if !in_i64(next) {
+                    return None;
+                }
+                i = next;
+            }
+        } else if step < 0 {
+            while i > to128 {
+                values.push(i as i64);
+                if values.len() >= MAX_RANGE {
+                    let next = i + step128;
+                    truncated = in_i64(next) && next > to128;
+                    break;
+                }
+                let next = i + step128;
+                if !in_i64(next) {
+                    return None;
+                }
+                i = next;
+            }
+        }
+        Some((values, truncated))
+    }
+
+    /// #2131 (revised fix): pins the specific magnitudes the issue and its
+    /// review turned up, directly against [`eval_range_values`] -- the
+    /// near-`i64::MIN` original repro (must overflow on the very first
+    /// `checked_add`), the nanosecond-epoch-scale case the revised fix
+    /// exists to recover (must stay on the exact `i64` path -- the earlier
+    /// `±2^53` gate routed this to `f64`, where it silently degenerated to
+    /// `[]`), and the `2^53`-magnitude confirmed-hangs-in-real-jq shape
+    /// (also must now stay on the exact `i64` path: `i64` has no
+    /// precision-loss problem at that magnitude the way `f64` does, a
+    /// beneficial side effect of narrowing the gate, not a new bug).
+    #[test]
+    fn test_eval_range_values_overflow_detection_2131() {
+        // Ordinary small range: exact, no overflow.
+        assert_eq!(
+            eval_range_values_i64(0, 10, 1),
+            Some(((0..10).collect(), false))
+        );
+
+        // The regression this refinement fixes: a nanosecond-epoch-scale
+        // range whose magnitude is well past the old `2^53` gate but whose
+        // 10-step walk never comes close to `i64::MAX` -- must stay exact.
+        assert_eq!(
+            eval_range_values_i64(1_700_000_000_000_000_000, 1_700_000_000_000_000_010, 1),
+            Some((
+                (1_700_000_000_000_000_000..1_700_000_000_000_000_010).collect(),
+                false
+            ))
+        );
+
+        // The confirmed-hangs-in-real-jq shape: completes correctly and
+        // quickly on the `i64` path instead of needing `MAX_RANGE` to save
+        // it (`f64` can't advance past `2^53` by `1`; `i64` has no such
+        // problem).
+        let bound = 1i64 << 53;
+        assert_eq!(
+            eval_range_values_i64(bound - 2, bound + 2, 1),
+            Some(((bound - 2..bound + 2).collect(), false))
+        );
+
+        // The issue's own repro: `from` is 50 above `i64::MIN`, `step`
+        // subtracts 100 more -- overflows on the very first `checked_add`,
+        // before a single value beyond `from` is ever produced.
+        assert_eq!(
+            eval_range_values_i64(-9223372036854775758, -9223372036854775808, -100),
+            None
+        );
+
+        // Overflow near `i64::MAX` on the first add: the gap to `to` (10)
+        // is far smaller than `step` (1000), so the first push-then-add
+        // already overshoots.
+        assert_eq!(eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000), None);
+
+        // Mirror at `i64::MIN`, negative step.
+        assert_eq!(eval_range_values_i64(i64::MIN + 10, i64::MIN, -1000), None);
+
+        // Overflow NOT on the first add: from 0, a step just past half of
+        // `i64::MAX` only overshoots on its *second* application.
+        let big_step = i64::MAX / 2 + 100;
+        assert_eq!(eval_range_values_i64(0, i64::MAX, big_step), None);
+
+        // Zero-iteration cases at the most extreme possible magnitudes: the
+        // `while` condition fails on entry, so no add is ever attempted
+        // regardless of how extreme `from`/`to` are.
+        assert_eq!(
+            eval_range_values_i64(i64::MAX, i64::MIN, 1),
+            Some((Vec::new(), false))
+        );
+        assert_eq!(
+            eval_range_values_i64(i64::MIN, i64::MAX, -1),
+            Some((Vec::new(), false))
+        );
+
+        // step == 0: always trivially empty (matches jq's `else empty end`
+        // arm), regardless of from/to magnitude -- no add is ever attempted.
+        assert_eq!(
+            eval_range_values_i64(i64::MIN, i64::MAX, 0),
+            Some((Vec::new(), false))
+        );
+    }
+
+    /// #2131 round 3: pins the exact live repro a review found in round 2's
+    /// `checked_add`-based fix -- `values.len() == MAX_RANGE` is reached on
+    /// the same push whose lookahead candidate (the 100,001st value, needed
+    /// only to answer "does one more value exist", never to be pushed
+    /// itself) overflows `i64`. Round 2's structure computed that lookahead
+    /// the same way it computed every other iteration's advance and bailed
+    /// the *whole function* via `?` when it overflowed, discarding all
+    /// 100,000 already-correct pushed values for an `f64` recomputation
+    /// none of them needed: `nth(250; range(0; 9223372036854775807;
+    /// 92234642714974))` returned `23058660678743610` (wrong, `f64`-derived)
+    /// instead of the exact `250 * 92234642714974 = 23058660678743500` --
+    /// confirmed live before this fix, both via `succinctly jq` directly and
+    /// via this test with round 2's code temporarily restored.
+    ///
+    /// The round-3 fix still computes that one lookahead at the cap
+    /// boundary (there is no way to know whether one more value exists
+    /// without it), but interprets its overflow *locally* instead of
+    /// bailing: `100000 * 92234642714974 = 9223464271497400000` exceeds
+    /// `i64::MAX`, and since `to` (`i64::MAX` here) is itself always a
+    /// valid `i64`, an out-of-`i64`-range candidate can never be `< to`
+    /// either -- it is provably not part of the range, exactly as if the
+    /// range had exhausted naturally. So this specific range, despite its
+    /// astronomically large step, mathematically has *exactly* `MAX_RANGE`
+    /// values (`99999 * step < to` but `100000 * step > to`, verified by
+    /// hand) -- hitting the cap here does not actually cut anything short,
+    /// so `truncated` must come back `false`, not `true`; what matters is
+    /// that this returns `Some` at all; instead of the round-2 bug's `None`,
+    /// discarding every already-correct pushed value.
+    #[test]
+    fn test_eval_range_values_cap_hit_lookahead_overflow_does_not_bail_2131() {
+        let step = 92234642714974i64;
+        let (values, truncated) =
+            eval_range_values_i64(0, i64::MAX, step).expect("cap-hit exit must not overflow-bail");
+        assert_eq!(values.len(), MAX_RANGE);
+        assert!(
+            !truncated,
+            "this range has exactly MAX_RANGE values (100000 * step already exceeds `to`), \
+             so hitting the cap here is natural exhaustion, not real truncation"
+        );
+        assert_eq!(values[250], 250 * step, "must be the exact i64 value");
+        assert_eq!(values[MAX_RANGE - 1], (MAX_RANGE as i64 - 1) * step);
+
+        // Mirror at the descending arm: `i64::MIN`-adjacent `to`, negative
+        // step, same magnitude -- same "exactly MAX_RANGE values" shape.
+        let (values, truncated) = eval_range_values_i64(0, i64::MIN, -step)
+            .expect("cap-hit exit must not overflow-bail (descending)");
+        assert_eq!(values.len(), MAX_RANGE);
+        assert!(!truncated);
+        assert_eq!(values[250], -250 * step);
+    }
+
+    /// #2131 round 3, contrast case: a cap-hit range whose lookahead does
+    /// *not* overflow and genuinely has more values beyond `MAX_RANGE`
+    /// (`to` is `MAX_RANGE + 5`, well within `i64`) -- `truncated` must
+    /// still come back `true` here. Exists alongside the overflow case
+    /// above to prove the round-3 fix didn't over-correct into always
+    /// reporting `false` at the cap boundary: the two cases share the same
+    /// code path (the `i.checked_add(step).is_some_and(...)` lookahead),
+    /// differing only in whether that lookahead overflows.
+    #[test]
+    fn test_eval_range_values_cap_hit_genuine_truncation_still_flagged_2131() {
+        let to = MAX_RANGE as i64 + 5;
+        let (values, truncated) =
+            eval_range_values_i64(0, to, 1).expect("small-step cap hit never overflows");
+        assert_eq!(values.len(), MAX_RANGE);
+        assert!(
+            truncated,
+            "5 more values ({MAX_RANGE}..{to}) genuinely exist beyond the cap"
+        );
+
+        let (values, truncated) =
+            eval_range_values_i64(0, -to, -1).expect("small-step cap hit never overflows");
+        assert_eq!(values.len(), MAX_RANGE);
+        assert!(truncated);
+    }
+
+    /// #2131 (revised fix): sweeps a magnitude-diverse, deterministic grid
+    /// of `(from, to, step)` triples -- anchored at and around
+    /// `i64::MIN`/`i64::MAX`, `±2^53`, the nanosecond-epoch scale, and
+    /// small/huge steps in both directions -- against
+    /// [`reference_range_i64`]'s independent `i128` computation. Every
+    /// combination must agree on both whether overflow occurs (`Some` vs.
+    /// `None`) and, when it doesn't, the exact pushed sequence and
+    /// truncation flag. Not a substitute for the analytical argument in
+    /// [`eval_range_values`]'s own doc comment, but the same kind of
+    /// adversarial sweep #2131's review already ran against the
+    /// now-replaced `±2^53` gate, scaled to this narrower criterion.
+    /// Deterministic (no RNG) and cheap: `to` is derived from `from` and
+    /// `step` with a small iteration-count target `k` for most
+    /// combinations, with only a few `k` values large enough to actually
+    /// engage the `MAX_RANGE` cap, keeping the whole grid well under a
+    /// second.
+    #[test]
+    fn test_eval_range_values_matches_i128_reference_sweep_2131() {
+        let bound = 1i64 << 53;
+        let from_anchors: &[i64] = &[
+            i64::MIN,
+            i64::MIN + 1,
+            i64::MIN / 2,
+            -bound - 2,
+            -bound,
+            -bound + 2,
+            -1_700_000_000_000_000_010,
+            -100,
+            -1,
+            0,
+            1,
+            100,
+            1_700_000_000_000_000_000,
+            bound - 2,
+            bound,
+            bound + 2,
+            i64::MAX / 2,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        let steps: &[i64] = &[
+            1,
+            -1,
+            2,
+            -2,
+            100,
+            -100,
+            1_000_000_000_000_000,
+            -1_000_000_000_000_000,
+            // `i64::MAX / MAX_RANGE`-neighborhood: the live #2131-round-3
+            // repro's own step (`nth(250; range(0; 9223372036854775807;
+            // 92234642714974))`). Combined with `from = 0` and `k = 130_000`
+            // below, this is the specific "cap hit on the 100,000th push AND
+            // the never-pushed 100,001st lookahead candidate (needed only
+            // to answer whether one more value exists) overflows `i64`"
+            // shape the round-3 fix exists for -- neither of the wider
+            // `i64::MAX / 4`/`i64::MAX` steps below reproduces it, since
+            // those overflow long before the cap is ever reached.
+            92234642714974,
+            -92234642714974,
+            i64::MAX / 4,
+            -(i64::MAX / 4),
+            i64::MAX,
+            i64::MIN,
+        ];
+        // Small `k`s keep most combinations cheap (a handful of iterations);
+        // one `k` per (from, step) pair is pushed well past `MAX_RANGE` so
+        // the cap-interacts-with-overflow-detection path gets exercised too.
+        let ks: &[i128] = &[1, 3, 10, 130_000];
+
+        let mut combos = 0usize;
+        for &from in from_anchors {
+            for &step in steps {
+                for &k in ks {
+                    combos += 1;
+                    let to128 =
+                        (from as i128 + step as i128 * k).clamp(i64::MIN as i128, i64::MAX as i128);
+                    let to = to128 as i64;
+
+                    let expected = reference_range_i64(from, to, step);
+                    let actual = eval_range_values_i64(from, to, step);
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch for from={from}, to={to}, step={step}"
+                    );
+                }
+            }
+        }
+        assert_eq!(combos, from_anchors.len() * steps.len() * ks.len());
+    }
+
+    /// #2131 (revised fix), end to end through the full `each_range`/`emit`
+    /// dispatch (not just [`eval_range_values`] directly): a range with no
+    /// overflow risk keeps its exact `Int` values regardless of how large
+    /// its magnitude is, while a range that genuinely cannot be computed in
+    /// `i64` without overflowing falls back to `Float` -- confirming the
+    /// routing decision in `each_range`'s `emit` closure (the `match` on
+    /// `eval_range_values`'s `Option`) actually reaches production code, not
+    /// just the unit-level tests above.
+    #[test]
+    fn test_range_dispatch_falls_back_to_f64_only_on_genuine_overflow_2131() {
+        fn range_values(src: &str) -> Vec<OwnedValue> {
+            let json: &[u8] = b"null";
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(src).unwrap();
+            let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
+            values
+        }
+
+        // Ordinary small range: every value is an exact Int.
+        for v in range_values("range(0;10;1)") {
+            assert!(matches!(v, OwnedValue::Int(_)), "expected Int, got {v:?}");
+        }
+
+        // The nanosecond-epoch-scale regression case: no overflow risk at
+        // all, so it must stay Int end to end, with the exact expected
+        // sequence (no precision loss, unlike the old `±2^53`-gated fix).
+        let ns = range_values("[range(1700000000000000000;1700000000000000010;1)]");
+        assert_eq!(ns.len(), 1, "expected a single array result");
+        match &ns[0] {
+            OwnedValue::Array(items) => {
+                let ints: Vec<i64> = items
+                    .iter()
+                    .map(|v| match v {
+                        OwnedValue::Int(i) => *i,
+                        other => panic!("expected Int, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    ints,
+                    (1_700_000_000_000_000_000i64..1_700_000_000_000_000_010).collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+
+        // The issue's own repro: overflows on the first `checked_add`,
+        // falls back to `f64`, and (matching real jq, whose `from`/`to`
+        // round to the same double at this magnitude) produces no values.
+        assert_eq!(
+            range_values("range(-9223372036854775758;-9223372036854775808;-100)"),
+            Vec::new()
+        );
+
+        // A genuine near-`i64::MAX` overflow: routed to the f64 path, so
+        // values come back as Float even though the source literals were
+        // plain integers.
+        for v in range_values("range(9223372036854774000;9223372036854775807;1000000000000000)") {
+            assert!(
+                matches!(v, OwnedValue::Float(_)),
+                "expected Float once a genuine i64 overflow is detected, got {v:?}"
             );
         }
     }

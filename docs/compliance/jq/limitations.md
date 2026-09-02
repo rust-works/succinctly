@@ -2840,7 +2840,247 @@ own repro table didn't happen to list, not new ones introduced by this fix.
 - `eval_range_values`'s integer stepping (`i += step`) has no overflow
   guard — pre-existing, reproduces identically before this fix too, and
   needs its own oracle verification before choosing a direction. Tracked as
-  [#2131](https://github.com/rust-works/succinctly/issues/2131).
+  [#2131](https://github.com/rust-works/succinctly/issues/2131). **Fixed**:
+  see the next section.
+
+### `range`'s `i64` fast path at extreme magnitude (#2131): overflow-checked in place, extending the same #2089 hang-avoidance divergence
+
+The gap the previous section left open: `eval_range_values` (the exact-`i64`
+fast path taken when `from`/`to`/`step` are all integers) computed
+`i += step` in plain `i64` arithmetic with no overflow guard. Near
+`i64::MIN`/`i64::MAX` this wrapped via two's-complement and streamed garbage
+instead of erroring or matching jq:
+
+```console
+$ echo null | succinctly jq 'range(-9223372036854775758; -9223372036854775808; -100)' | head -3   # before this fix
+-9223372036854775758
+9223372036854775758     # wrapped past i64::MIN
+9223372036854775658
+```
+
+Real jq represents every number as `f64`, so it has no `i64`-overflow concept
+at all — only precision loss: two integers close enough together at a large
+enough magnitude round to the *same* double, so a `range` between them is a
+zero-iteration loop by construction (`from > to` is false from the start).
+
+**First fix (superseded below):** `eval_range_values` only took the `i64`
+path when `from`, `to`, *and* `step` were all within `±2^53` (the magnitude
+where every `i64` round-trips through `f64` losslessly), routing anything
+outside that blanket cutoff to the pre-existing, `MAX_RANGE`-capped
+`eval_range_values_f64`. This was correct — it made overflow impossible by
+construction — but far more conservative than the actual overflow risk
+(`i64::MIN`/`i64::MAX`-adjacent, `~±9.2 * 10^18`, six orders of magnitude
+looser than `±2^53`), with a real, disclosed-but-understated side effect: an
+ordinary large-but-safe integer range — a nanosecond-epoch timestamp span, a
+large database ID range — got silently routed to `f64` purely on magnitude,
+where at that scale every value in a short range can round to the *same*
+double and the range degenerates to `[]`. For a realistic input, that is
+worse than the original overflow bug it replaced (wrong-looking wrapped
+output, at least visibly wrong; a silent empty result at exit 0 is not).
+
+**Current fix:** `eval_range_values` now uses `i.checked_add(step)` in place
+of the bare `i += step`, bailing out (`None`) the instant an addition would
+leave `i64`'s range; `each_range`'s `emit` closure reacts to `None` by
+discarding whatever that call already pushed and recomputing the *entire*
+range from scratch via `eval_range_values_f64`, exactly as the `±2^53` gate
+did for its own out-of-bound cases. The blanket magnitude cutoff and its
+`range_i64_fast_path_is_safe`/`I64_F64_EXACT_BOUND` gate are gone; there is
+no separate threshold to prove correct, because the check *is* the same
+arithmetic that would otherwise overflow, performed at the exact point it
+could occur. The safety property is now: **no possible sequence of
+`i += step`, starting at `from` and stopping at or before `to`, can ever
+overflow `i64`** — narrower than "agrees with `f64`", and (unlike the
+`±2^53` proof) not something that needs `from`/`to`/`step` bounded in
+advance, since `checked_add` detects the exact condition directly rather
+than a sufficient-but-loose approximation of it. Verified two ways: an
+analytical argument in `eval_range_values`'s own doc comment (`src/jq/eval.rs`),
+and `test_eval_range_values_matches_i128_reference_sweep_2131`, which
+differentially checks it against an independent `i128`-arithmetic
+reimplementation of the same loop across a magnitude-diverse grid anchored
+at `i64::MIN`/`i64::MAX`, `±2^53`, and the nanosecond-epoch scale.
+
+**Round-3 refinement, cap-boundary decoupling.** A review of the
+`checked_add`-based fix above found one more gap in *how* it was applied:
+the loop checked the cap (`values.len() < MAX_RANGE`) and attempted the
+advance in the same unconditional step, so on the iteration whose push
+reached the cap it still computed the next candidate the exact same way
+every other iteration does — including bailing the *whole call* via `?` if
+that candidate overflowed `i64`, discarding every already-correct value it
+had pushed for an `f64` recomputation none of them needed — confirmed live:
+`nth(250; range(0; 9223372036854775807; 92234642714974))` returned a wrong,
+`f64`-derived answer (`23058660678743610`) instead of the exact
+`250 * 92234642714974 = 23058660678743500`. The fix still computes that one
+lookahead at the cap boundary — there is no way to know whether one more
+value exists without it — but interprets its overflow *locally* rather than
+bailing: `to` is always representable in `i64`, so a candidate that
+overflows `i64` can never be less than `to` (greater than `to` on the
+descending arm) either, meaning it's provably not part of the range —
+indistinguishable from natural exhaustion. A cap-terminated exit therefore
+never *discards* on that overflow, only ever resolves its own `truncated`
+verdict to `false` in exactly the cases where that's providably correct
+(and still resolves to `true` when a cap-hit range's lookahead doesn't
+overflow and genuinely has more values, e.g. `range(0;100005;1)`).
+`reference_range_i64` shared the original revision's same unconditional
+structure (so the sweep above validated "matches an equally flawed model,"
+not the real property); it was corrected the same way, and the sweep's own
+`steps` grid gained a dedicated entry at this magnitude
+(`92234642714974`) so this class of bug is caught automatically rather
+than by inspection alone.
+
+This keeps the original repro fixed:
+
+```console
+$ echo null | succinctly jq 'range(-9223372036854775758; -9223372036854775808; -100)'
+$                                                                                     # empty, exit 0 -- matches jq 1.7.1
+```
+
+(`from` is only 50 above `i64::MIN` and `step` subtracts 100 more, so
+`checked_add` overflows on the very first application — the fallback engages
+before a single extra value is ever produced.) But it recovers the
+nanosecond-scale case the `±2^53` gate used to silently break:
+
+```console
+$ echo null | succinctly jq -c '[range(1700000000000000000; 1700000000000000010; 1)]'
+[1700000000000000000,1700000000000000001,1700000000000000002,1700000000000000003,1700000000000000004,1700000000000000005,1700000000000000006,1700000000000000007,1700000000000000008,1700000000000000009]
+```
+
+This range has no overflow risk whatsoever (a 10-step walk, nowhere near
+`i64::MAX`), so `checked_add` never trips and the exact `i64` answer comes
+back untouched — the fix this section documents.
+
+It also changes the confirmed-hangs-in-real-jq case from the previous
+section: once `i` reaches `2^53` with `step == 1`, `i + 1` rounds back to
+exactly `i` in `f64` arithmetic (the next representable double after `2^53`
+is `2^53 + 2`, not `2^53 + 1`), so real jq's own `while(. < $upto; . + $by)`
+never advances and never terminates — confirmed live and killed by hand
+while investigating this issue (`timeout 3 jq -c 'range(9007199254740990;
+9007199254740994; 1)'` hangs until killed, repeating `9007199254740992`
+forever). Under the `±2^53` gate this range (`to` exceeds the cutoff) was
+routed to `f64` same as any out-of-bound range, and the pre-existing
+`MAX_RANGE` cap (#2089) raised instead of looping forever — the same
+ADR-0018 rule 4c shape `repeat(f)`'s hang precedent documents above, reached
+through `range`'s dispatch rather than through `repeat`'s own round loop.
+Under the current fix this range has no `i64` overflow risk at all (`i64`
+has no precision-loss problem at this magnitude the way `f64` does: every
+integer here is exactly representable, and `i.checked_add(1)` always
+advances by exactly 1), so it now stays on the exact `i64` path and
+completes correctly and quickly, well under `MAX_RANGE`, rather than needing
+the cap to save it:
+
+```console
+$ echo null | succinctly jq -c '[range(9007199254740990; 9007199254740994; 1)]'
+[9007199254740990,9007199254740991,9007199254740992,9007199254740993]
+```
+
+A beneficial side effect of the narrower gate, not a new problem — `MAX_RANGE`
+still raises on any range that genuinely needs more than 100000 values,
+overflow or not.
+
+**Widened divergence from jq's own arithmetic, covering the *entire*
+`2^53`–`i64::MAX` range, not a narrow band near the top.** The divergence
+starts exactly at `2^53` (`9007199254740992`) — not "near `i64::MAX`" as an
+earlier revision of this section implied by leading with a single
+boundary-adjacent example. jq 1.7.1's actual number model above `2^53` is
+not plain `f64`: it preserves each literal as a `decNumber` (`src/jv.c`,
+`DEC_INIT_BASE`) and only rounds through a 17-significant-digit decimal
+intermediate when a value crosses into arithmetic (`. + $by` inside
+`while`'s definition), so its behavior differs from a bare `i64`-to-`f64`
+cast, and differs *again* depending on where in that ~3-order-of-magnitude
+range (`9007199254740992` to `9223372036854775807`) the values fall. A
+sweep from just above `2^53` through `i64::MAX` (all against the pinned jq
+1.7.1 oracle, every probe near this magnitude `timeout`-guarded — this has
+hung a live session twice in this issue's own history) found the divergence
+is close to universal across the whole range, not occasional, in two
+distinct shapes:
+
+- **Hang sub-band, `2^53` up to approximately `2^57`
+  (`144115188075855872`, `~1.441 * 10^17`):** real jq's own
+  `while(. < $upto; . + $by)` never advances and never terminates. Once `.`
+  rounds through `decNumber`-to-`double` conversion, `. + 1` rounds back to
+  exactly `.` (the increment is too small relative to the representable
+  gap at this magnitude to move to a different double), so the loop
+  condition never changes and jq spins forever, repeating the same value —
+  this is the mechanism the previous revision of this section documented
+  for the single literal `range(9007199254740990; 9007199254740994; 1)`,
+  but confirmed here to hold across a ~16x (roughly `2^4`) span of
+  magnitude, not one specific value: live-confirmed (`timeout`-killed) at
+  `9007199254740992`, `9007199254740993`, `10000000000000000`,
+  `20000000000000000`, `50000000000000000`, `80000000000000000`, several
+  points between `1.2 * 10^17` and `1.43 * 10^17`, and non-round
+  17-digit values (`12345678901234567`, `67891234567890123`).
+- **Truncate sub-band, approximately `2^57` up through `i64::MAX`:** real jq
+  terminates, but after emitting only its starting value — `. + $by` still
+  rounds through `decNumber`/`double` conversion, but now the rounded
+  increment is large enough to jump `.` past `$upto` in a single step
+  instead of rounding back to `.` itself, so the `while` loop exits after
+  exactly one iteration rather than spinning. Live-confirmed single-value
+  output (`[from]`, not the full walk) at `200000000000000000`,
+  `500000000000000000`, `800000000000000000`, `900000000000000000`,
+  `1000000000000000000`, `1230000000000000000`, `1700000000000000000`,
+  `4600000000000000000`, and this section's own pre-existing example,
+  `range(9223372036854775800; 9223372036854775807; 1)`.
+- **The boundary between the two sub-bands sits close to `2^57`,** not
+  precisely pinned to it: bisecting with a fixed `range(v; v+10; 1)` shape
+  found `144110000000000000` still hangs while `144115188075855871`
+  (`2^57 - 1`) already truncates to one value — a span of under
+  `10^10` around `2^57` itself. This is reported as *approximately* located
+  rather than an exact global constant because the true cutover is a
+  property of each specific value's bit pattern relative to its own
+  magnitude's rounding granularity (which doubles every power of two), not
+  a single sharp threshold that holds for every `from`/`to`/`step`
+  combination — a different span or step could shift exactly where a given
+  magnitude lands between the two shapes.
+
+**The nanosecond-epoch example from the fix above is itself an instance of
+this same divergence, not a case of matching jq.** `range(1700000000000000000;
+1700000000000000010; 1)` sits at `~1.7 * 10^18`, well inside the truncate
+sub-band just described. succinctly's overflow-free `i64` walk gives the
+exact 10-value enumeration documented above; real jq 1.7.1 gives a single
+value, `[1700000000000000000]`, live-confirmed. Presenting that example
+earlier as an unqualified fix would overstate it: succinctly did not
+*regain* parity with jq at this magnitude (jq never enumerated all 10
+values in the first place, both before and after this fix), it became
+*internally exact and consistent* where it previously produced a different
+wrong answer (silently empty, from the superseded `±2^53` gate). That is a
+real improvement — predictable, exact `i64` arithmetic beats silent `f64`
+rounding into an empty result — but it is not jq parity, and every other
+large-but-`i64`-safe integer range above `2^53` falls into the same
+category: succinctly now returns the mathematically exact enumeration,
+which is *usually not* what jq 1.7.1 itself would produce at that
+magnitude, whichever of the two sub-bands above it lands in.
+
+Two further shapes, both unaffected by this fix's own logic since they're
+both about *jq's* arithmetic or a separate, pre-existing part of
+succinctly's own dispatch rather than the exact-`i64`-path divergence just
+described:
+
+- **Both sides use `f64`** (a plain float literal, or an `i64` range where
+  `checked_add` genuinely detects overflow and falls back): reproducible via
+  `range(72057594037927936.0; 72057594037927944.0; 1)` — jq 1.7.1 gives one
+  value, `[72057594037927936.0]`, where succinctly's own (unchanged)
+  `eval_range_values_f64` gives `[]`. This is `eval_range_values_f64`'s own
+  pre-existing fidelity gap, exactly as recorded before this revision,
+  independent of the dispatch mechanism above it.
+- **succinctly stays on the exact `i64` path where jq's own arithmetic
+  would round, stall, or hang** — new to this revision's scope, since the
+  `±2^53` gate used to route every such case to `f64` too (matching jq's
+  *answer* incidentally, by sharing its precision loss, though not its
+  hang in the lower sub-band — the `MAX_RANGE` cap raised there instead,
+  the same ADR-0018 rule 4c trade-off `repeat(f)`'s hang precedent
+  documents elsewhere in this file). Whenever `eval_range_values` has no
+  overflow risk, its answer is the exact integer computation, which is
+  *always* what jq would compute too below `2^53`, but is no longer proven
+  to bit-match jq's own `f64`/`decNumber` arithmetic at any magnitude above
+  it — not just near the true overflow zone the way the `±2^53` gate's
+  property held. This is the redesign's own trade-off, stated directly in
+  the issue that requested it: the new safety criterion is "no `i64`
+  overflow", not "bit-identical to jq's own number model" — and is accepted
+  for the same reason the `2^53` hang case is accepted above (ADR-0018 rule
+  4c: not a case of succinctly emitting unreadable output, corrupting data,
+  or discarding a write, and the alternative — silently degrading
+  large-but-safe integers to `f64`, as the `±2^53` gate did, or reproducing
+  jq's own hang, as ADR-0018 does not require — is the worse failure mode
+  for the realistic inputs this magnitude range covers).
 
 ## Provenance
 

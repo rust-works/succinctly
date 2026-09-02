@@ -31745,3 +31745,193 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// range() i64 fast-path overflow at extreme magnitude (issue #2131)
+// =============================================================================
+//
+// `range`'s all-integer fast path (`eval_range_values`, `src/jq/eval.rs`) did
+// plain `i64` `i += step` with no overflow guard: near `i64::MIN`/`i64::MAX`
+// this wrapped via two's-complement and streamed garbage instead of erroring
+// or matching jq. Real jq represents every number as `f64`, so at these
+// magnitudes it has no "overflow" concept, only precision loss -- two
+// integers that round to the same `f64` compare equal, so a `range` between
+// them is a zero-iteration loop by construction.
+//
+// The fix (`eval_range_values`, `src/jq/eval.rs`) replaces the plain `+=`
+// with `i.checked_add(step)`, bailing out (`None`) the instant an addition
+// would leave `i64`'s range; `each_range`'s `emit` closure then falls back to
+// the pre-existing, `MAX_RANGE`-capped `eval_range_values_f64`, matching jq's
+// own `f64`-based model, for that one `(from, to, step)` combination.
+//
+// An earlier version of this fix gated the `i64` path behind a blanket
+// `±2^53` magnitude cutoff (the threshold where every integer round-trips
+// through `f64` losslessly) -- correct, but far more conservative than the
+// actual overflow risk (`i64::MIN`/`i64::MAX`-adjacent, ~`±9.2 * 10^18`, six
+// orders of magnitude tighter than it needed to be). That blanket cutoff
+// silently degraded ordinary large-but-safe integers (nanosecond-epoch
+// timestamps, large database IDs) to `f64`, where at that magnitude they can
+// round to the same double and the whole range collapses to empty. The
+// `checked_add`-based fix below only ever falls back when an overflow is
+// genuinely about to happen, so it keeps the exact `i64` answer for every
+// range that doesn't actually risk one, however large its magnitude.
+
+/// The issue's own repro: two `i64` literals only 50 apart at `~2^63`
+/// magnitude round to the *same* `f64` once parsed, so real jq's
+/// `while(. > $upto; . + $by)` never even emits its own starting value --
+/// confirmed live against the pinned jq 1.7.1 oracle (empty output, exit 0).
+/// Before this fix, succinctly's unconditional `i64` fast path instead wrapped
+/// `from + step` past `i64::MIN` via two's-complement and streamed garbage.
+/// `from` is only 50 above `i64::MIN` and `step` subtracts 100 more, so the
+/// revised fix's `checked_add` overflows on the very first application,
+/// falling back to `f64` before a single value is ever produced.
+#[test]
+fn test_range_i64_overflow_original_repro_matches_jq_2131() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "range(-9223372036854775758; -9223372036854775808; -100)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "", "expected no output, matching real jq");
+    Ok(())
+}
+
+/// A range straddling `2^53` -- the top of jq's own exact-`f64` zone, and
+/// where the earlier, now-replaced `±2^53`-gated fix drew its line -- has no
+/// `i64` overflow risk at all (nowhere near `i64::MIN`/`i64::MAX`), so it
+/// still takes the exact `i64` fast path: verified against the pinned jq
+/// 1.7.1 oracle, byte-for-byte identical output.
+#[test]
+fn test_range_near_boundary_still_uses_i64_fast_path_2131() -> Result<()> {
+    let (stdout, code) = run_jq_null("[range(9007199254740982;9007199254740992;1)]", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "[9007199254740982,9007199254740983,9007199254740984,9007199254740985,\
+9007199254740986,9007199254740987,9007199254740988,9007199254740989,\
+9007199254740990,9007199254740991]"
+    );
+    Ok(())
+}
+
+/// A range whose `to` bound is close to `i64::MAX` (`i64::MAX - ~1.8e15`,
+/// still a valid `i64`) with a `step` (`1e15`) large enough to overshoot it
+/// in one add must route to the `f64` path rather than the exact `i64`
+/// one -- before this fix, `eval_range_values` computed this directly in
+/// `i64` and (depending on the exact combination) either produced an answer
+/// jq itself would not, or -- as this exact case does when misrouted --
+/// panics on `attempt to add with overflow` in a debug build (confirmed
+/// while developing this fix); the revised fix's `checked_add` catches this
+/// on the very first addition. The chosen step is large relative to the
+/// span so real jq also terminates quickly rather than stalling near this
+/// magnitude; verified against the pinned jq 1.7.1 oracle (timeout-guarded
+/// during development -- this specific combination returns instantly).
+#[test]
+fn test_range_beyond_boundary_routes_to_f64_path_2131() -> Result<()> {
+    let (stdout, code) = run_jq_null(
+        "[range(9223372036854774000;9223372036854775807;1000000000000000)]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[9223372036854774000]");
+    Ok(())
+}
+
+/// The confirmed-hangs-in-real-jq shape from the issue's own investigation:
+/// once `i` reaches `2^53` with `step == 1`, `i + 1` rounds back to exactly
+/// `i` in `f64` arithmetic (the next representable double after `2^53` is
+/// `2^53 + 2`, not `2^53 + 1`), so real jq's `while` loop never advances and
+/// never terminates -- reproduced live and killed by hand while
+/// investigating this issue; NOT re-run here against the real oracle (would
+/// hang the test suite). Per ADR-0018's host-process-endangering exception,
+/// succinctly is not obligated to reproduce that hang.
+///
+/// Under the earlier, now-replaced `±2^53`-gated fix, this range (`to`
+/// exceeds the gate) was routed to `f64` same as any out-of-bound range, and
+/// the pre-existing `MAX_RANGE` cap (#2089) raised instead of looping
+/// forever. The revised, `checked_add`-based fix changes this: `i64` has no
+/// precision-loss problem at `2^53`'s magnitude the way `f64` does (every
+/// integer here is exactly representable and `i += 1` always advances by
+/// exactly 1), and this walk is nowhere near `i64::MIN`/`i64::MAX`, so
+/// `checked_add` never trips -- the range now stays on the exact `i64` path
+/// and completes correctly, well under `MAX_RANGE`, instead of needing the
+/// cap to save it. A nice side effect of narrowing the gate, not a
+/// regression: this asserts succinctly's own behavior completes (not a
+/// hang) with the exact correct answer.
+#[test]
+fn test_range_2_53_magnitude_completes_via_i64_not_hang_or_cap_2131() -> Result<()> {
+    let (stdout, code) = run_jq_null("[range(9007199254740990; 9007199254740994; 1)]", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "[9007199254740990,9007199254740991,9007199254740992,9007199254740993]"
+    );
+    Ok(())
+}
+
+/// #2131's own regression that this refinement fixes: a nanosecond-epoch-
+/// scale integer range with no `i64` overflow risk at all -- its magnitude
+/// (`~1.7e18`) sits well past the earlier, now-replaced `±2^53` gate, but
+/// its 10-step walk never comes remotely close to `i64::MAX`
+/// (`~9.2e18`). The earlier gate routed this to `f64` purely on magnitude,
+/// where every one of these 10 integers rounds to the *same* double and the
+/// range silently degenerates to empty -- worse than the original overflow
+/// bug for a realistic input (nanosecond timestamps, large database IDs),
+/// since it fails silently at exit 0 rather than producing wrong data loudly.
+/// The revised fix keeps this on the exact `i64` path, matching what an
+/// unpatched, pre-#2131 build already produced for this specific range (this
+/// magnitude has no overflow risk, so the original bug never affected it) --
+/// not a claim about matching real jq here, which has its own separate
+/// `decNumber`-vs-`double` quirk at this magnitude (out of this issue's
+/// scope; see `docs/compliance/jq/limitations.md`).
+#[test]
+fn test_range_nanosecond_epoch_scale_stays_exact_i64_2131() -> Result<()> {
+    let (stdout, code) = run_jq_null(
+        "[range(1700000000000000000;1700000000000000010;1)]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(
+        stdout.trim(),
+        "[1700000000000000000,1700000000000000001,1700000000000000002,\
+1700000000000000003,1700000000000000004,1700000000000000005,\
+1700000000000000006,1700000000000000007,1700000000000000008,\
+1700000000000000009]"
+    );
+    Ok(())
+}
+
+/// #2131 round 3: pins the exact live repro a review found in round 2's
+/// `checked_add`-based fix. `eval_range_values`'s loop hit `MAX_RANGE`
+/// (100000 pushed values) on the same push whose lookahead candidate --
+/// the 100,001st value, needed only to answer "does one more value exist",
+/// never pushed itself -- overflows `i64` (`100000 * 92234642714974`
+/// exceeds `i64::MAX`). Round 2's structure computed that lookahead the
+/// same way it computed every other iteration's advance and bailed the
+/// *entire* function on its overflow, discarding all 100000 already-correct
+/// pushed values for an `f64` recomputation none of them needed:
+///
+/// ```console
+/// $ succinctly jq -nc 'nth(250; range(0;9223372036854775807;92234642714974))'
+/// 23058660678743610     # wrong, f64-derived (before this fix)
+/// ```
+///
+/// The round-3 fix still computes that one lookahead at the cap boundary,
+/// but interprets its overflow *locally* (as proof no further value could
+/// exist -- `to` is always representable in `i64`, so an out-of-range
+/// candidate could never be less than it anyway) instead of bailing the
+/// whole function on it: `nth(250; ...)` must come back with the exact
+/// `i64` value `250 * 92234642714974`, matching the same step used with a
+/// `to` small enough that the cap is never engaged
+/// (`range(0;92234642714974000;92234642714974)`, verified separately as a
+/// control while developing this fix and confirmed to already agree).
+#[test]
+fn test_range_cap_hit_lookahead_overflow_keeps_exact_i64_answer_2131() -> Result<()> {
+    let (stdout, code) = run_jq_null("nth(250; range(0;9223372036854775807;92234642714974))", &[])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), (250i64 * 92234642714974).to_string());
+    Ok(())
+}
