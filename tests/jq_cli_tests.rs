@@ -8893,14 +8893,13 @@ fn test_computed_bracket_threads_path_context_2100() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "");
 
-    // The literal-slice arm is still missing from the path-context pipe
-    // evaluator (#2215), so a *folded* slice keeps naming its container's
-    // path while the computed spelling above names the slice component.
-    // Pinned as the current, deliberately-documented asymmetry rather than
-    // left to be discovered as a surprise by the next reader.
+    // #2215 added the literal-slice arm to the path-context pipe evaluator,
+    // so a *folded* slice now names the slice component the same way the
+    // computed spelling above does, instead of stopping at its container's
+    // path.
     let (stdout, _, code) = run_jq_full(&["-c", "[.a | .[0:3] | key]"], Some(r#"{"a":[1,2,3]}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#"["a"]"#);
+    assert_eq!(stdout.trim(), r#"[{"start":0,"end":3}]"#);
 
     // Target re-evaluated fresh per key (#2032), preserved even when the
     // per-key target is probed for its own path (`paired`, since `key`
@@ -9092,10 +9091,12 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "");
 
-    // Partial-target arms discard the target's own partial prefix
-    // entirely (asymmetric with the index twin's keep-the-prefix rule --
-    // this function's own doc comment) -- so a successful `[1,2]` ahead of
-    // the escape contributes nothing to stdout.
+    // Partial-target arms discard the *target's own* partial prefix
+    // entirely, exactly like the index twin's identical rule -- so a
+    // successful `[1,2]` ahead of the escape contributes nothing to
+    // stdout. This is distinct from a mid-loop slice-*application* error,
+    // covered further below, which keeps whatever earlier `(s, e)` pairs
+    // already contributed.
     let (_, stderr, code) = run_jq_full(
         &["-c", "(([1,2],error(\"x\")))[(0.5):(1.5)] | key"],
         Some(r"{}"),
@@ -9117,7 +9118,7 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "");
 
-    // Unpaired `target_pairs` (#2100's own charged-only-where-read
+    // Unpaired target output (#2100's own charged-only-where-read
     // optimization): the bracket's local `rest` is empty (nothing chains
     // after it *within this branch*), even though a comma sibling (`key`)
     // is what put the whole expression through path-context evaluation.
@@ -9144,14 +9145,14 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "");
 
-    // Mid-loop `Err` discards whatever this call already accumulated
-    // (unlike the index twin): the first target ([2,3], sliceable)
-    // succeeds, but the second (a bare number, not sliceable) errors, and
-    // neither's `key` output reaches stdout.
+    // Mid-loop `Err` keeps whatever this call already accumulated, exactly
+    // like the index twin: the first target ([2,3], sliceable) succeeds and
+    // its `key` output survives, before the second (a bare number, not
+    // sliceable) errors.
     let (stdout, stderr, code) =
         run_jq_full(&["-c", "(([2,3],1))[(0.5):(1.5)] | key"], Some(r"{}"))?;
     assert_eq!(code, 5, "stderr: {stderr}");
-    assert_eq!(stdout.trim(), "");
+    assert_eq!(stdout.trim(), r#"{"start":0.5,"end":1.5}"#);
 
     // Final `bounds_escape` arm: the loop over every `(s, e, t)` triple
     // completes normally, but the start-bound stream itself carried a
