@@ -22183,21 +22183,39 @@ fn resolve_node<'a, S: EvalSemantics>(
         // and raised jq's own `#530` "Invalid path expression" unconditionally
         // -- even on a bare `path(. | stderr)`, which real jq answers `[]`
         // (confirmed live against jq 1.7.1). Perform each builtin's own side
-        // effect here, matching its value-mode counterpart exactly, then
-        // delegate the actual path-tracking to bare `Expr::Identity` -- this
-        // inherits every one of Identity's existing rules (the untracked
-        // bare-`.` passthrough, the four-primitives `is_primitive` branch)
-        // instead of re-deriving them for a fifth and sixth call site.
+        // effect here (via the shared `write_stderr_value`/`write_debug_line`
+        // helpers their value-mode counterparts also call, so the formatting
+        // rule can't drift between the two), then hand back the same
+        // zero-copy passthrough branch `Select`/the type-filter family above
+        // already use for "navigates nothing, inherits whatever trackability
+        // was already ambient" -- review: an earlier draft delegated to
+        // `resolve_leaf(&Expr::Identity, ...)` instead, which for a
+        // *trackable* branch routes through that function's `is_primitive`
+        // arm and deep-clones `value` via `eval_each_owned`'s own
+        // `Expr::Identity` fast path (`input.clone()`) -- real allocation
+        // this call has no use for, since there is nothing left to decode
+        // that `value` doesn't already hold. Both constructions are provably
+        // equivalent for the `!trackable` case too: `resolve_leaf`'s own
+        // early bare-`.` exemption builds this identical
+        // `PathBranch::passthrough(root, Cow::Borrowed(value), false,
+        // snapshot)` shape.
         Expr::Builtin(Builtin::Stderr) => {
-            match value {
-                OwnedValue::String(s) => write_stderr(s),
-                other => write_stderr(&owned_value_to_json::<S>(other)),
-            }
-            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+            write_stderr_value::<S>(value);
+            Ok(vec![PathBranch::passthrough(
+                PathPrefix::root(),
+                Cow::Borrowed(value),
+                trackable,
+                snapshot,
+            )])
         }
         Expr::Builtin(Builtin::Debug) => {
             write_debug_line::<S>(value);
-            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+            Ok(vec![PathBranch::passthrough(
+                PathPrefix::root(),
+                Cow::Borrowed(value),
+                trackable,
+                snapshot,
+            )])
         }
         // `debug(msg)`'s own definition is `(msg|debug|empty), .` -- `msg`'s
         // generator runs for its side effects only, in true per-item order
@@ -22219,7 +22237,12 @@ fn resolve_node<'a, S: EvalSemantics>(
             if let Flow::Escaped(control) = flow {
                 return Err((Vec::new(), EvalEscape::from(control)));
             }
-            resolve_leaf::<S>(&Expr::Identity, value, trackable, snapshot, keep)
+            Ok(vec![PathBranch::passthrough(
+                PathPrefix::root(),
+                Cow::Borrowed(value),
+                trackable,
+                snapshot,
+            )])
         }
 
         other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
@@ -40192,11 +40215,23 @@ fn builtin_stderr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
-    match &owned {
+    write_stderr_value::<S>(&owned);
+    QueryResult::Owned(owned)
+}
+
+/// The write half of [`builtin_stderr`] -- raw content for a string, compact
+/// JSON otherwise -- factored out so `resolve_node`'s own `Builtin::Stderr`
+/// arm (#2234, path context) can perform the identical side effect without
+/// hand-copying the match (review: an earlier draft of that arm did exactly
+/// that, the kind of duplicated formatting rule CLAUDE.md's own optimization
+/// notes warn drifts silently -- `Builtin::Debug`'s sibling arm already
+/// reuses [`write_debug_line`] this same way, so this brings `Stderr` to the
+/// same standard rather than being the one call site left copying it by hand).
+fn write_stderr_value<S: EvalSemantics>(value: &OwnedValue) {
+    match value {
         OwnedValue::String(s) => write_stderr(s),
         other => write_stderr(&owned_value_to_json::<S>(other)),
     }
-    QueryResult::Owned(owned)
 }
 
 /// Builtin: halt_error / halt_error(exit_code) - print input to stderr and
