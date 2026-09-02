@@ -2134,6 +2134,21 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         following_gap_ok(self.text, key_end)
     }
 
+    /// #2211: reuses the same `trailing_gap_ok` primitive this module's own
+    /// `empty_container_gap_ok` free function already runs for
+    /// `stream_json`/`stream_json_pretty`, and `jq_runner.rs`'s copy already
+    /// runs for `print_json` -- one gap-scanning definition, three entry
+    /// points shaped for what each caller already has in hand (this one:
+    /// only the container's own cursor and which bracket closes it, no
+    /// resolved value or raw span required).
+    #[inline]
+    fn container_gap_ok(&self, close_char: u8) -> bool {
+        match self.text_position() {
+            Some(pos) => trailing_gap_ok(self.text, pos + 1, close_char),
+            None => true,
+        }
+    }
+
     #[inline]
     fn line(&self) -> usize {
         JsonCursor::line(self)

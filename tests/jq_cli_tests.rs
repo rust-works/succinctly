@@ -21223,6 +21223,119 @@ fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() ->
     Ok(())
 }
 
+/// #2211: `evaluate_bytes_lazy` (the `JqValue`-iterator-based default path
+/// used for a non-cursor-transparent filter -- `if`/arithmetic/function
+/// calls/anything `expr_is_cursor_transparent` answers `false` for) never
+/// checked a container's own "apparently empty" delimiter gap at all, unlike
+/// `print_json`'s identical check (#1676) that the cursor-transparent `.`
+/// path above already exercises. `eval_generic::to_owned_cursor_at_depth`'s
+/// array/object loops only ever validate the delimiter *preceding a real
+/// child* (#1677's `preceding_delimiter_ok`/`key_delimiter_ok`/
+/// `value_delimiter_ok` family) -- when the walk produces zero real
+/// children at all, nothing ran that check, so `[,]`/`{,}` (bare, or nested
+/// inside an otherwise well-formed document) silently "healed" into
+/// `[]`/`{}` at exit 0. `if true then . else . end` forces the lazy path
+/// (see `test_lazyseq_map_halt_propagates_through_default_lazy_path`'s own
+/// comment for why plain `.` doesn't); this is the issue's own repro
+/// (`{"a": [,]}`) plus every sibling shape from that shape's own family.
+/// Verified against `/usr/bin/jq` 1.7.1, which rejects every one of these
+/// at exit 5, matching the cursor-transparent path's own #1676 fix.
+#[test]
+fn test_jq_lazy_path_rejects_stray_comma_in_empty_container_2211() -> Result<()> {
+    for input in [
+        // The issue's own exact repro: a nested empty array.
+        r#"{"a": [,]}"#,
+        // Bare, top-level empty containers with a stray comma.
+        "[,]",
+        "{,}",
+        "{  ,  }",
+        "[  ,  ]",
+        // Nested empty object, and nested one level deeper than the
+        // issue's own repro.
+        r#"{"a": {,}}"#,
+        r#"{"a": {"b": [,]}}"#,
+        "[[,]]",
+        "[{,}]",
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2211: a non-empty container with a genuinely malformed comma (a stray
+/// comma *between* two real children, or a leading comma before the first
+/// real key/element) was already correctly rejected on the lazy path before
+/// this fix -- only the *apparently empty* case above was the gap. Pins
+/// that this fix didn't change (or need to change) this already-correct
+/// behavior.
+#[test]
+fn test_jq_lazy_path_already_rejected_nonempty_stray_comma_2211() -> Result<()> {
+    for input in [r#"{"a":[1,,2]}"#, r#"{,"a":1}"#] {
+        let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2211: well-formed documents -- including genuinely empty containers,
+/// which must still print as `[]`/`{}` rather than being caught by the new
+/// check -- are unaffected on the lazy path, matching the cursor-transparent
+/// path's own equivalent (`test_jq_wellformed_documents_unaffected_by_1677`)
+/// and real jq.
+#[test]
+fn test_jq_lazy_path_wellformed_empty_containers_unaffected_2211() -> Result<()> {
+    for (input, expected) in [
+        ("{}", "{}"),
+        ("[]", "[]"),
+        (r#"{"a":[]}"#, r#"{"a":[]}"#),
+        (r#"{"a":{}}"#, r#"{"a":{}}"#),
+        ("[[],{},[1,2],{\"x\":1}]", "[[],{},[1,2],{\"x\":1}]"),
+        (r#"{"a":1,"b":[1,2,3]}"#, r#"{"a":1,"b":[1,2,3]}"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
+        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
+/// #2211 follow-up (filed as #2243), pinned here as a known, still-open gap
+/// rather than left silently uncovered: a trailing comma after a *real*
+/// scalar last child (`[1,]`, `{"a":1,}`) is a related but distinct shape
+/// from the apparently-empty-container case this issue fixed -- catching it
+/// needs the last real child's own text-end position, which
+/// `to_owned_cursor_at_depth`'s array/object loops don't track at all (the
+/// #2211 fix only needed the container's own opening-delimiter position,
+/// correct for the empty case but not this one). The cursor-transparent `.`
+/// path already gets this right via `print_json`'s `scalar_end_pos`/
+/// `trailing_gap_ok` pair (#1676); the lazy path does not yet share it. A
+/// future fix for #2243 should update this test rather than leave it
+/// silently passing on the wrong behavior.
+#[test]
+fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_still_a_known_gap_2243() -> Result<()> {
+    for (input, expected) in [(r"[1,]", "[1]"), (r#"{"a":1,}"#, r#"{"a":1}"#)] {
+        let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
+        assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "{input}");
+    }
+
+    Ok(())
+}
+
 /// #1643 follow-up: `-S`/`-C`/`--slurp` bypass `print_json` entirely --
 /// they materialize via `parse_json_stream`'s fallback (which backs the
 /// "original" input path `-S`/`-C`/`--slurp` force), reaching

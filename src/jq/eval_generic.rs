@@ -391,6 +391,15 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
+        // #2211: `key_delimiter_ok`/`value_delimiter_ok` above only ever run
+        // against a real field -- a stray `,` with no real field at all
+        // (`{,}`) leaves the loop never having run, so nothing above catches
+        // it. `map.is_empty()` after the walk is exactly that case (a
+        // genuine `{}` also reaches here, and `container_gap_ok` answers
+        // `true` for it -- see that method's own doc comment).
+        if map.is_empty() && !cursor.container_gap_ok(b'}') {
+            return Err(cursor.malformed_delimiter_error());
+        }
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -407,6 +416,11 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1)?);
             elems = rest;
             is_first = false;
+        }
+        // #2211: same reasoning as the object arm's own check just above,
+        // for a stray `,` with no real element (`[,]`).
+        if items.is_empty() && !cursor.container_gap_ok(b']') {
+            return Err(cursor.malformed_delimiter_error());
         }
         Ok(OwnedValue::Array(items))
     } else {

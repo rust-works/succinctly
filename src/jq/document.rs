@@ -231,6 +231,36 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         EvalError::new("Invalid document text: malformed delimiter")
     }
 
+    /// Whether an array/object cursor whose child walk produced **zero**
+    /// real children is genuinely empty (`[]`, `{}`) rather than a stray
+    /// `,` with no real child at all (`[,]`, `{,}`) -- #2211.
+    ///
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok) (#1677) only
+    /// ever runs *against a real child* -- it has nothing to check when the
+    /// walk yields no children at all, which is exactly the gap
+    /// `crate::json::light`'s own `empty_container_gap_ok`/`trailing_gap_ok`
+    /// pair closed for the CLI's cursor-native writers (#1676) and this
+    /// closes for [`crate::jq::eval_generic::to_owned_cursor_at_depth`] (and
+    /// therefore every `evaluate_bytes_lazy`-reachable filter that isn't one
+    /// of that evaluator's natively-matched shapes, e.g. `if`/arithmetic/
+    /// function calls) -- the one materializing conversion that still
+    /// silently accepted `[,]` as `[]` because it held a per-child cursor at
+    /// every point except the empty case, where there is no child cursor to
+    /// hold.
+    ///
+    /// `close_char` is the container's own closing delimiter (`]` for an
+    /// array, `}` for an object); the caller already knows which arm it is
+    /// in, so unlike `empty_container_gap_ok` (whose callers don't) there is
+    /// no need to derive it from the container's own raw span here.
+    ///
+    /// The default answers `true` unconditionally, same reasoning as
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok): every format
+    /// but JSON validates this while parsing.
+    fn container_gap_ok(&self, close_char: u8) -> bool {
+        let _ = close_char;
+        true
+    }
+
     /// Whether the value immediately following this key (at `key_end`, the
     /// key's own already-known span end) is preceded by exactly one `:`
     /// (#1677) -- the forward-scan twin of
