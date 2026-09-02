@@ -34,9 +34,9 @@ use alloc::collections::BTreeMap;
 use std::collections::BTreeMap;
 
 use super::expr::{
-    ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, Import, Include, Literal,
-    MergeFlags, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern, PatternEntry,
-    Program, StringPart,
+    ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
+    Literal, MergeFlags, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern,
+    PatternEntry, Program, StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
 
@@ -2148,7 +2148,7 @@ impl<'a> Parser<'a> {
             params,
             body: Box::new(body),
             then: Box::new(then),
-            bound: BoundBody::default(),
+            bound: FuncDefBound::default(),
         })
     }
 
@@ -4548,7 +4548,7 @@ impl<'a> Parser<'a> {
                 params,
                 body: Box::new(body),
                 then: Box::new(result),
-                bound: BoundBody::default(),
+                bound: FuncDefBound::default(),
             };
         }
 

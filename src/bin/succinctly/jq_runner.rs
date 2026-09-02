@@ -17,7 +17,7 @@ use succinctly::jq::eval_generic::{
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
-    self, format_number_jq_compat, nonfinite_display_string, BoundBody, EvalError, Expr,
+    self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, FuncDefBound,
     JqSemantics, JqValue, OwnedValue, Program, UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
@@ -158,7 +158,7 @@ impl ModuleLoader {
                 params,
                 body: Box::new(body),
                 then: Box::new(expr),
-                bound: BoundBody::default(),
+                bound: FuncDefBound::default(),
             };
         }
 
@@ -172,7 +172,7 @@ impl ModuleLoader {
                     params,
                     body: Box::new(body),
                     then: Box::new(expr),
-                    bound: BoundBody::default(),
+                    bound: FuncDefBound::default(),
                 };
             }
         }
@@ -191,7 +191,7 @@ impl ModuleLoader {
                     params,
                     body: Box::new(body),
                     then: Box::new(expr),
-                    bound: BoundBody::default(),
+                    bound: FuncDefBound::default(),
                 };
             }
         }
@@ -267,7 +267,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             params,
             body: Box::new(rewrite_namespaced_calls(*body)),
             then: Box::new(rewrite_namespaced_calls(*then)),
-            bound: BoundBody::default(),
+            bound: FuncDefBound::default(),
         },
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op,
