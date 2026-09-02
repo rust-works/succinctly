@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Expr::Index` and `Expr::Slice` now carry their own float-spelling keys** (#1401),
+  replacing the separate `Expr::IndexNumber`/`Expr::SliceNumber` variants that #1088 and
+  #1326 added beside them. `Expr::Index(i64)` is now
+  `Expr::Index { idx: i64, key: Option<NumberKey> }`, and `Expr::Slice` gains
+  `start_key`/`end_key`; both are breaking changes for callers that construct or match
+  these variants directly. The `Expr::index()` and `Expr::slice()` constructors are
+  unchanged.
+
+  Preserving a float literal's own spelling in `path()` output (`path(.[2.0])` is `[2.0]`)
+  behaves exactly as before — only the representation moved. The paired form required all
+  63 sites that ask "is this an index/a slice" to spell out both members of each pair, and
+  a site that forgot one got an `unreachable!()` instead of an answer, which is what
+  `delete_expr_array_paths` did from #1088 until #1326 closed it. One variant per family
+  makes that shape unrepresentable rather than merely tested for, and removes both
+  `Expr`-scrutinee `unreachable!()` fallbacks along with it. `size_of::<Expr>()` is
+  unchanged at 96 bytes and is now pinned by a test.
+
 ### Fixed
 
 - **`succinctly::jq::eval`'s object-construction key/value slots and jq-mode

@@ -26,69 +26,59 @@ pub enum Expr {
     /// Field access: `.foo`
     Field(String),
 
-    /// Array index access: `.[0]` or `.[-1]`
-    Index(i64),
-
-    /// Array index access whose *original number* has to survive into
-    /// `path()` output: `.[2.0]`, `.[1.7]`, `.[1e10]`, `.[2.00]`.
+    /// Array index access: `.[0]`, `.[-1]`, `.[2.0]`.
+    ///
+    /// `idx` is what every step that *navigates* — reading, `setpath`,
+    /// `del` — actually uses (the truncation-toward-zero
+    /// `numeric_key_to_index` applies). `key` carries the number the
+    /// component reports itself as in `path()` output when that differs
+    /// from `idx`'s own rendering, and is `None` otherwise.
     ///
     /// jq appends the resolved key **verbatim** as the path component, so a
     /// number that still carries its own spelling keeps it —
     /// `path(.[2.0])` is `[2.0]` and `path(.[1e10])` is `[1E+10]`, not
-    /// `[2]`/`[10000000000]` (#1088). [`Expr::Index`]'s bare `i64` has
-    /// nowhere to put that, so a float-spelled key folds to this instead.
+    /// `[2]`/`[10000000000]` (#1088). An integer-*spelled* key renders
+    /// identically whether it goes out as `OwnedValue::Int` or as its own
+    /// literal, so it carries no `key` at all and the hot `.foo.bar[0]`
+    /// path is untouched. Nor does a negated one — see [`NumberKey`].
     ///
-    /// `idx` is exactly the `i64` [`Expr::Index`] would have carried (the
-    /// same truncation-toward-zero `numeric_key_to_index` applies), and
-    /// every step that *navigates* — reading, `setpath`, `del` — uses it
-    /// and behaves identically. Only the rendering of the component
-    /// differs, which is why nearly every match site pairs the two arms:
-    /// `Expr::Index(idx) | Expr::IndexNumber { idx, .. }`.
-    ///
-    /// An integer-*spelled* key never reaches here: `2` renders the same
-    /// whether it goes out as `OwnedValue::Int` or as its own literal, so
-    /// it keeps folding to [`Expr::Index`] and the hot `.foo.bar[0]` path
-    /// is untouched. Nor does a negated one — see [`NumberKey`].
-    IndexNumber {
+    /// **A key that needs preserving belongs in a field here, not in a
+    /// sibling variant.** #1088 originally added an `Expr::IndexNumber`
+    /// beside this one and #1326 repeated the shape for slices; every site
+    /// asking "is this an index component" then had to spell out both
+    /// members of the pair, and one that forgot got an `unreachable!()`
+    /// instead of an answer — twice. #1401 folded them back in, which is
+    /// what makes that failure mode unrepresentable rather than merely
+    /// tested for.
+    Index {
         /// The index every navigation step actually uses.
         idx: i64,
-        /// The number the component is reported as.
-        key: NumberKey,
+        /// The number the component is reported as, when it kept a spelling
+        /// of its own that `idx` cannot render.
+        key: Option<NumberKey>,
     },
 
-    /// Array slice: `.[2:5]` or `.[2:]` or `.[:5]`
+    /// Array slice: `.[2:5]`, `.[2:]`, `.[:5]`, `.[1.5:3.5]`.
+    ///
+    /// `start`/`end` are what every step that *navigates* — reading,
+    /// `setpath`, `del` — actually uses (`fold_slice_bound` folds each).
+    /// `start_key`/`end_key` carry the number each bound reports itself as
+    /// in `path()` output when that differs, independently: a slice with
+    /// one float-spelled bound and one absent/plain bound (`.[1.5:]`,
+    /// `.[1.5:3]`) carries a key for that bound only, never a synthesized
+    /// one for the other.
+    ///
+    /// jq appends each resolved bound **verbatim** as the path component,
+    /// so a bound that still carries its own spelling keeps it --
+    /// `path(.[1.5:3.5])` is `[{"start":1.5,"end":3.5}]`, not
+    /// `[{"start":1,"end":4}]` (#1326, following on from #1088). A slice
+    /// whose bounds are both integer-spelled or absent carries no key at
+    /// all, and the hot `.foo.bar[1:3]` path is untouched. Nor does a
+    /// negated bound (`.[-1.5:]`) — see [`NumberKey`].
+    ///
+    /// See [`Expr::Index`] for why these keys live here rather than in a
+    /// sibling `SliceNumber` variant (#1401).
     Slice {
-        start: Option<i64>,
-        end: Option<i64>,
-    },
-
-    /// Array slice whose *original number* has to survive into `path()`
-    /// output for at least one bound: `.[1.5:3.5]`, `.[1.0:3]`, `.[:3.00]`.
-    ///
-    /// The slice-bound sibling of [`Expr::IndexNumber`] (#1326, following
-    /// on from #1088): jq appends each resolved bound **verbatim** as the
-    /// path component, so a bound that still carries its own spelling keeps
-    /// it -- `path(.[1.5:3.5])` is `[{"start":1.5,"end":3.5}]`, not
-    /// `[{"start":1,"end":4}]`. [`Expr::Slice`]'s bare `Option<i64>` pair has
-    /// nowhere to put that, so a slice with at least one float-spelled bound
-    /// folds to this instead.
-    ///
-    /// `start`/`end` are exactly the `Option<i64>` pair [`Expr::Slice`]
-    /// would have carried (the same bound-folding `fold_slice_bound`
-    /// applies to each), and every step that *navigates* — reading,
-    /// `setpath`, `del` — uses them and behaves identically. Only the
-    /// rendering of the path component differs, which is why nearly every
-    /// match site pairs the two arms:
-    /// `Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }`.
-    ///
-    /// A bound is only ever carried here when *its own* `NumberKey` is
-    /// `Some` — a slice with one float-spelled bound and one absent/plain
-    /// bound (`.[1.5:]`, `.[1.5:3]`) still reaches here with the other
-    /// key field `None`, not a synthesized one. A slice whose bounds are
-    /// *both* integer-spelled or absent never reaches here at all: it keeps
-    /// folding to plain [`Expr::Slice`], and the hot `.foo.bar[1:3]` path is
-    /// untouched. Nor does a negated bound (`.[-1.5:]`) — see [`NumberKey`].
-    SliceNumber {
         /// The start bound every navigation step actually uses.
         start: Option<i64>,
         /// The end bound every navigation step actually uses.
@@ -125,7 +115,8 @@ pub enum Expr {
     /// this errors at the source instead.
     ///
     /// A float key is *not* on that list any more: it keeps its own
-    /// spelling in `path()` output, via [`Expr::IndexNumber`] (#1088).
+    /// spelling in `path()` output, via [`Expr::Index`]'s own `key` field
+    /// (#1088).
     IndexExpr {
         /// The value being indexed — the postfix chain so far.
         target: Box<Self>,
@@ -143,9 +134,8 @@ pub enum Expr {
     /// [`Expr::Pipe`]. `S` is evaluated outer, `T` middle, `E` inner.
     ///
     /// A bound that fully folds to a constant never reaches here: the parser
-    /// keeps producing a static [`Expr::Slice`]/[`Expr::SliceNumber`]
-    /// whenever *both* present bounds are constant (#1326), so the existing
-    /// fast paths and every match site pairing those two are untouched.
+    /// keeps producing a static [`Expr::Slice`] whenever *both* present
+    /// bounds are constant (#1326), so the existing fast paths are untouched.
     SliceExpr {
         /// The value being sliced — the postfix chain so far.
         target: Box<Self>,
@@ -1470,7 +1460,8 @@ pub enum ObjectKey {
     Expr(Box<Expr>),
 }
 
-/// The number an [`Expr::IndexNumber`] component is reported as by `path()`.
+/// The number an [`Expr::Index`]/[`Expr::Slice`] component is reported as by
+/// `path()`, when it kept a spelling its own `i64` cannot render.
 ///
 /// jq's rule for a numeric path component is that there is no rule: the
 /// resolved key value is appended unchanged, so whatever spelling it still
@@ -1560,44 +1551,14 @@ pub enum Literal {
 }
 
 impl Expr {
-    /// The number this static array-index component reports itself as in
-    /// `path()` output, if it is anything other than its own `i64`.
+    /// Whether this is a static slice path component.
     ///
-    /// Exists so the `Expr::Index(idx) | Expr::IndexNumber { idx, .. }`
-    /// or-pattern stays a *single* arm at the three sites that render a
-    /// path component: they bind `idx` from the pattern and ask for the
-    /// spelling separately, instead of duplicating the body once per
-    /// variant (#1088).
-    pub(crate) fn index_number_key(&self) -> Option<&NumberKey> {
-        match self {
-            Self::IndexNumber { key, .. } => Some(key),
-            _ => None,
-        }
-    }
-
-    /// The numbers this static slice component's two bounds report
-    /// themselves as in `path()` output, if either is anything other than
-    /// its own `i64` -- the slice-bound sibling of [`Self::index_number_key`]
-    /// (#1326), for the same reason: keeps the
-    /// `Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. }`
-    /// or-pattern a single arm at the sites that render a path component.
-    pub(crate) fn slice_number_keys(&self) -> (Option<&NumberKey>, Option<&NumberKey>) {
-        match self {
-            Self::SliceNumber {
-                start_key, end_key, ..
-            } => (start_key.as_ref(), end_key.as_ref()),
-            _ => (None, None),
-        }
-    }
-
-    /// Whether this is a slice path component, `Expr::Slice` or its
-    /// float-bound sibling `Expr::SliceNumber` (#1326) -- one definition for
-    /// the callers that only need "is this a slice", so a boolean-only check
-    /// doesn't hand-copy the two-variant or-pattern a match arm that also
-    /// needs `start`/`end` still has to spell out itself (CLAUDE.md:
-    /// "duplicated predicates diverge silently", #106).
+    /// One definition for the callers that only need "is this a slice", so
+    /// a boolean-only check doesn't hand-copy a pattern that the match arms
+    /// needing `start`/`end` spell out themselves (CLAUDE.md: "duplicated
+    /// predicates diverge silently", #106).
     pub(crate) fn is_slice(&self) -> bool {
-        matches!(self, Self::Slice { .. } | Self::SliceNumber { .. })
+        matches!(self, Self::Slice { .. })
     }
 
     /// Create an identity expression.
@@ -1612,7 +1573,7 @@ impl Expr {
 
     /// Create an index expression.
     pub fn index(i: i64) -> Self {
-        Self::Index(i)
+        Self::Index { idx: i, key: None }
     }
 
     /// Create an iterate expression.
@@ -1630,7 +1591,12 @@ impl Expr {
 
     /// Create a slice expression.
     pub fn slice(start: Option<i64>, end: Option<i64>) -> Self {
-        Self::Slice { start, end }
+        Self::Slice {
+            start,
+            end,
+            start_key: None,
+            end_key: None,
+        }
     }
 
     /// Create a computed-bounds slice expression: `target[start:end]`.
@@ -1846,56 +1812,92 @@ mod tests {
     fn test_expr_constructors() {
         assert_eq!(Expr::identity(), Expr::Identity);
         assert_eq!(Expr::field("foo"), Expr::Field("foo".into()));
-        assert_eq!(Expr::index(0), Expr::Index(0));
+        assert_eq!(Expr::index(0), Expr::Index { idx: 0, key: None });
         assert_eq!(Expr::iterate(), Expr::Iterate);
         assert_eq!(
             Expr::slice(Some(1), Some(3)),
             Expr::Slice {
                 start: Some(1),
-                end: Some(3)
+                end: Some(3),
+                start_key: None,
+                end_key: None,
             }
         );
     }
 
-    /// #1827: pins the three shared predicates' own classification of each
-    /// paired family's two members, so a future edit to `is_slice()`/
-    /// `index_number_key()`/`slice_number_keys()` cannot silently start
-    /// treating a plain/`*Number` pair differently. This alone does not
-    /// catch a *third* future paired variant, or a dispatch site elsewhere
-    /// that skips these predicates and pattern-matches the pair by hand
-    /// (most sites do, via the `Expr::Index(idx) | Expr::IndexNumber {
-    /// idx, .. }` or-pattern) — see
-    /// `test_index_and_slice_number_siblings_behave_identically_1827` in
-    /// `tests/jq_index_number_invariant_tests.rs` for the end-to-end
-    /// behavioral check that covers those sites instead.
+    /// #1827/#1401: pins that a float-spelled component is classified
+    /// exactly as its plain counterpart by every shared predicate, and that
+    /// the preserved spelling is the *only* thing that differs.
+    ///
+    /// Before #1401 this pinned two *pairs* of variants
+    /// (`Index`/`IndexNumber`, `Slice`/`SliceNumber`) against each other,
+    /// because a site could handle one member and forget the sibling — the
+    /// `delete_expr_array_paths` bug #1827 exists to catch. Folding the
+    /// keys onto the surviving variants made that unrepresentable, so what
+    /// is left to pin is the classification itself. The end-to-end
+    /// behavioural equivalence of the two spellings across the dispatch
+    /// sites lives in `tests/jq_index_number_invariant_tests.rs`.
     #[test]
-    fn test_index_and_slice_number_pairs_share_predicate_classification_1827() {
-        let index = Expr::Index(1);
-        let index_number = Expr::IndexNumber {
+    fn test_float_spelled_components_classify_as_plain_ones_1827() {
+        let index = Expr::Index { idx: 1, key: None };
+        let index_number = Expr::Index {
             idx: 1,
-            key: NumberKey::Literal(1.0, "1.0".into()),
+            key: Some(NumberKey::Literal(1.0, "1.0".into())),
         };
-        assert_eq!(index.index_number_key(), None);
-        assert!(matches!(index_number.index_number_key(), Some(k) if k.value() == 1.0));
         assert!(!index.is_slice());
         assert!(!index_number.is_slice());
+        assert!(matches!(index, Expr::Index { idx: 1, key: None }));
+        assert!(matches!(
+            &index_number,
+            Expr::Index { idx: 1, key: Some(k) } if k.value() == 1.0
+        ));
 
         let slice = Expr::Slice {
             start: Some(1),
             end: Some(3),
+            start_key: None,
+            end_key: None,
         };
-        let slice_number = Expr::SliceNumber {
+        let slice_number = Expr::Slice {
             start: Some(1),
             end: Some(3),
             start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
             end_key: None,
         };
-        assert_eq!(slice.slice_number_keys(), (None, None));
-        let (start_key, end_key) = slice_number.slice_number_keys();
-        assert!(matches!(start_key, Some(k) if k.value() == 1.0));
-        assert_eq!(end_key, None);
         assert!(slice.is_slice());
         assert!(slice_number.is_slice());
+        // A bound only ever carries its *own* key: the plain `end` bound
+        // stays `None` rather than getting a synthesized spelling.
+        assert!(matches!(
+            &slice_number,
+            Expr::Slice { start_key: Some(k), end_key: None, .. } if k.value() == 1.0
+        ));
+    }
+
+    /// #1401: pins `Expr`'s footprint, so the next variant that grows it
+    /// has to say so in a diff rather than land unmeasured.
+    ///
+    /// #1088 and #1326 each added a variant that widened this enum, and the
+    /// cost only surfaced when #1401 went looking for it afterwards.
+    /// `Expr` is stored by value throughout (`Vec<Self>` in `Pipe`/`Comma`/
+    /// `FuncCall` args) and deep-cloned per binding by `substitute_var`, so
+    /// the width is paid by programs that never use the widening variant.
+    ///
+    /// 96 bytes is currently held jointly by `Slice` (16 + 16 + 32 + 32)
+    /// and `FuncDef` (24 + 24 + 8 + 8 + 24, since #2094's `bound` cache) —
+    /// so shrinking either one alone does not move this number. Re-measure
+    /// with `cargo +nightly rustc --features cli --lib -- -Zprint-type-sizes`
+    /// before changing it. Same 64-bit gate as `EvalError`'s own pin
+    /// (`src/jq/error.rs`), for the same reason.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn test_expr_size_is_pinned_1401() {
+        assert_eq!(
+            core::mem::size_of::<Expr>(),
+            96,
+            "size_of::<Expr>() moved -- every parsed program pays this, whether or not it \
+             uses the variant that grew. See #1401 before re-pinning."
+        );
     }
 
     #[test]

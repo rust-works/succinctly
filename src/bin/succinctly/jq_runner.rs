@@ -449,10 +449,8 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         // Expressions that don't contain sub-expressions - return as-is
         Expr::Identity
         | Expr::Field(_)
-        | Expr::Index(_)
-        | Expr::IndexNumber { .. }
+        | Expr::Index { .. }
         | Expr::Slice { .. }
-        | Expr::SliceNumber { .. }
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::Literal(_)
@@ -4345,10 +4343,7 @@ fn expr_is_cursor_transparent(expr: &jq::Expr) -> bool {
 /// can still be holding the root cursor.
 fn expr_descends(expr: &jq::Expr) -> bool {
     match expr {
-        jq::Expr::Field(_)
-        | jq::Expr::Index(_)
-        | jq::Expr::IndexNumber { .. }
-        | jq::Expr::Iterate => true,
+        jq::Expr::Field(_) | jq::Expr::Index { .. } | jq::Expr::Iterate => true,
         jq::Expr::Paren(inner) => expr_descends(inner),
         _ => false,
     }
@@ -4360,11 +4355,9 @@ fn expr_descends(expr: &jq::Expr) -> bool {
 /// have materialized it.
 fn expr_is_root_safe(expr: &jq::Expr) -> bool {
     match expr {
-        jq::Expr::Identity
-        | jq::Expr::Field(_)
-        | jq::Expr::Index(_)
-        | jq::Expr::IndexNumber { .. }
-        | jq::Expr::Iterate => true,
+        jq::Expr::Identity | jq::Expr::Field(_) | jq::Expr::Index { .. } | jq::Expr::Iterate => {
+            true
+        }
         // `debug` forwards its input untouched, so it is root-safe for the
         // same reason `.` is -- and it is the builtin #1653's own repro
         // (`.[] | debug`) is built from.

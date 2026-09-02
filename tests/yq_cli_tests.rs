@@ -18866,7 +18866,7 @@ fn test_yq_scalar_target_noop_pre_last_component_1232() -> Result<()> {
 /// key chain (`.[$k1][$k2]`) that never touches a literal `Field`/`Index`
 /// node at all, falsifying "the no-op only needs to special-case a literal
 /// path component". `resolve_dynamic_indexes` folds `$k1`/`$k2` into
-/// concrete `Expr::IndexNumber` components before `get_path_mut` ever runs,
+/// concrete key-carrying `Expr::Index` components before `get_path_mut` runs,
 /// so the *write* itself exercises the exact same fixed arms as the
 /// literal-path tests above.
 ///

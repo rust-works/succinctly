@@ -982,9 +982,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Field(name) => index_object_by_name::<W>(value, name, optional),
 
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
-            index_array_by_position::<W>(value, *idx, optional)
-        }
+        Expr::Index { idx, .. } => index_array_by_position::<W>(value, *idx, optional),
 
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
 
@@ -992,7 +990,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             eval_slice_expr::<W, S>(target, start, end, value, optional)
         }
 
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => match value {
+        Expr::Slice { start, end, .. } => match value {
             StandardJson::Array(elements) => {
                 // Fast path: full slice [:] / [0:] returns the original array unchanged
                 if matches!(start, None | Some(0)) && end.is_none() {
@@ -16241,7 +16239,12 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Targets::Borrowed(ts) => {
             for s in starts {
                 for e in &ends {
-                    let slice_expr = Expr::Slice { start: *s, end: *e };
+                    let slice_expr = Expr::Slice {
+                        start: *s,
+                        end: *e,
+                        start_key: None,
+                        end_key: None,
+                    };
                     for t in ts {
                         match eval_single::<W, S>(&slice_expr, t.clone(), optional) {
                             // #1943: to_owned_checked, not to_owned -- the
@@ -16519,8 +16522,8 @@ impl PathAssignOutcome {
 /// and a defensive terminal-shape check (not currently reachable: every
 /// leaf `push_path_components` can push is one of `needs_path_prepass`'s
 /// own static-classified variants, and the slice check above already
-/// excludes `Slice`/`SliceNumber`, so by this point `last` can only be
-/// `Field`/`Index`/`IndexNumber`/`Iterate` -- confirmed via patch-coverage
+/// excludes `Slice`, so by this point `last` can only be
+/// `Field`/`Index`/`Iterate` -- confirmed via patch-coverage
 /// output, not just assumed; kept as the one thing standing between a
 /// future new static-classified `Expr` variant and this function silently
 /// treating an unrelated shape as a valid no-op terminal).
@@ -16543,13 +16546,13 @@ fn yq_assign_classify(path: &Expr, root: &OwnedValue) -> PathAssignOutcome {
     }
     // Defensive, not currently reachable: every leaf `push_path_components`
     // can push here is one of `needs_path_prepass`'s own static-classified
-    // variants (`Field`/`Index`/`IndexNumber`/`Slice`/`SliceNumber`/
-    // `Iterate` -- `Identity` is dropped above, anything else fails the
+    // variants (`Field`/`Index`/`Slice`/`Iterate` -- `Identity` is
+    // dropped above, anything else fails the
     // caller's own `!needs_path_prepass` gate before ever reaching this
     // function), and the slice check just above already excludes
-    // `Slice`/`SliceNumber` wherever they appear, including as `last`. So
-    // by this point `last` can only be `Field`/`Index`/`IndexNumber`/
-    // `Iterate` -- confirmed via patch-coverage output (this arm's own
+    // `Slice` wherever it appears, including as `last`. So by this point
+    // `last` can only be `Field`/`Index`/`Iterate` -- confirmed via
+    // patch-coverage output (this arm's own
     // branch never fires), not just assumed. Kept rather than removed:
     // it's the one thing standing between a future new
     // static-classified `Expr` variant (added to `needs_path_prepass`
@@ -16557,7 +16560,7 @@ fn yq_assign_classify(path: &Expr, root: &OwnedValue) -> PathAssignOutcome {
     // an unrelated shape as a valid no-op terminal.
     if !matches!(
         unwrap_path_component(last).0,
-        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate
     ) {
         return PathAssignOutcome::NeedsRhs;
     }
@@ -16575,7 +16578,7 @@ fn yq_assign_classify(path: &Expr, root: &OwnedValue) -> PathAssignOutcome {
 /// a real container, instead of `navigate_read_only`'s own unconditional
 /// `Absent` for that case (#1432) -- a read-only, non-mutating dry run of
 /// [`set_path_steps`]'s own per-element `Iterate` recursion, restricted to
-/// the `Field`/`Index`/`IndexNumber`/`Iterate` step vocabulary that's all
+/// the `Field`/`Index`/`Iterate` step vocabulary that's all
 /// `yq_assign_classify`'s own slice/terminal-shape gates ever let through.
 /// `TotalNoop` whenever a fanned-into container is empty --
 /// [`set_path_steps`]'s own `Iterate` arm does nothing when there are no
@@ -16642,7 +16645,7 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
                 None => PathAssignOutcome::NeedsRhs,
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
+        Expr::Index { idx, .. } => match current {
             OwnedValue::Array(arr) => match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
                 Some(i) => classify_yq_assign_prefix(&arr[i], rest),
                 None => PathAssignOutcome::NeedsRhs,
@@ -16665,8 +16668,8 @@ fn classify_yq_assign_prefix(current: &OwnedValue, steps: &[Expr]) -> PathAssign
         },
         // Defensive, not currently reachable: `steps` only ever contains
         // `yq_assign_classify`'s own flattened `prefix`, whose every
-        // component is already provably one of `Field`/`Index`/
-        // `IndexNumber`/`Iterate` by the time it reaches here -- see that
+        // component is already provably one of `Field`/`Index`/`Iterate`
+        // by the time it reaches here -- see that
         // function's own identical "Defensive, not currently reachable"
         // comment on its terminal-component check, confirmed there via
         // patch-coverage output the same way this arm's own is (never
@@ -16987,7 +16990,7 @@ fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> bool {
                 },
                 _ => return false,
             },
-            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match current {
+            Expr::Index { idx, .. } => match current {
                 OwnedValue::Array(arr) => {
                     match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
                         Some(i) => &arr[i],
@@ -18132,7 +18135,7 @@ fn set_path<S: EvalSemantics>(
                 ))
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, .. } => {
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 *write_index(arr, *idx)? = new_value;
@@ -18243,7 +18246,7 @@ fn set_path<S: EvalSemantics>(
         // an array — that is the whole reason jq has a separate sentence for
         // it. An out-of-range range clamps rather than erroring, unlike the
         // `Expr::Index` arm above: `[1,2,3] | .[5:9] = ["x"]` appends.
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
+        Expr::Slice { start, end, .. } => through_slice(
             root,
             *start,
             *end,
@@ -18293,13 +18296,7 @@ fn set_path<S: EvalSemantics>(
 fn is_atomic_path_component(expr: &Expr) -> bool {
     matches!(
         unwrap_path_component(expr).0,
-        Expr::Identity
-            | Expr::Field(_)
-            | Expr::Index(_)
-            | Expr::IndexNumber { .. }
-            | Expr::Iterate
-            | Expr::Slice { .. }
-            | Expr::SliceNumber { .. }
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
     )
 }
 
@@ -18449,8 +18446,7 @@ fn set_path_steps<S: EvalSemantics>(
                 // which the split-based walker also routed through
                 // catch-and-swallow -- delegates unchanged.
                 let (component, optional) = unwrap_path_component(last);
-                if let Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } = component
-                {
+                if let Expr::Slice { start, end, .. } = component {
                     return through_slice(
                         root,
                         *start,
@@ -18500,7 +18496,7 @@ fn set_path_steps<S: EvalSemantics>(
                     ));
                 }
             }
-            Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+            Expr::Index { idx, .. } => {
                 autovivify_array(root);
                 if let OwnedValue::Array(arr) = root {
                     // A still-negative index after counting back from the end
@@ -18610,7 +18606,7 @@ fn set_path_steps<S: EvalSemantics>(
                 ))
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, .. } => {
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
@@ -18693,7 +18689,7 @@ fn set_path_steps<S: EvalSemantics>(
         // `terminal_write` is always `false` here: `steps` is flat and this
         // is not its last element, so there is real path left after the
         // slice for `edit` to navigate (#1321).
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
+        Expr::Slice { start, end, .. } => through_slice(
             root,
             *start,
             *end,
@@ -19281,7 +19277,7 @@ fn update_path<S: EvalSemantics>(
                 Err(EvalError::cannot_index_with_field(owned_type_name(root), name).into())
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, .. } => {
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
@@ -19556,7 +19552,7 @@ fn update_path<S: EvalSemantics>(
                             )
                         }
                     }
-                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+                    Expr::Index { idx, .. } => {
                         // #1428: see the `Field` arm above. `write_index` pads
                         // with `Null`s to reach a positive out-of-range index,
                         // so the undo restores the original length rather than
@@ -19654,7 +19650,7 @@ fn update_path<S: EvalSemantics>(
                     // target for every operator, live-verified
                     // (`.a[1:3][] |= . * 10` on `a: [1,2,3,4]` stays
                     // unchanged).
-                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                    Expr::Slice { start, end, .. } => {
                         through_slice(
                             root,
                             *start,
@@ -19691,7 +19687,7 @@ fn update_path<S: EvalSemantics>(
         // yq mode: real yq's container no-op (#1142) applies here too,
         // unconditional on the operator -- see the Pipe-chain arm's
         // matching comment above for the full rationale.
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => through_slice(
+        Expr::Slice { start, end, .. } => through_slice(
             root,
             *start,
             *end,
@@ -19767,10 +19763,8 @@ fn needs_path_prepass(expr: &Expr) -> bool {
     match expr {
         Expr::Identity
         | Expr::Field(_)
-        | Expr::Index(_)
-        | Expr::IndexNumber { .. }
+        | Expr::Index { .. }
         | Expr::Slice { .. }
-        | Expr::SliceNumber { .. }
         | Expr::Iterate => false,
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_prepass),
         Expr::Optional(inner) | Expr::Paren(inner) => needs_path_prepass(inner),
@@ -20059,7 +20053,7 @@ fn key_to_path_component(
         // Truncation toward zero, as in the value path.
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             if scalar_noop {
-                return Ok(Expr::Index(0));
+                return Ok(Expr::Index { idx: 0, key: None });
             }
             // Null belongs with array: a write builds the array the index names,
             // so `null | .[nan] = 5` is the NaN complaint in jq too.
@@ -20094,9 +20088,9 @@ fn key_to_path_component(
 /// `NumberLiteral` to plain `Float` for exactly the same reason. A negative
 /// float arriving from *data* keeps its spelling in both.
 fn numeric_path_component(idx: i64, key: &OwnedValue) -> Expr {
-    match number_key_for(key) {
-        Some(key) => Expr::IndexNumber { idx, key },
-        None => Expr::Index(idx),
+    Expr::Index {
+        idx,
+        key: number_key_for(key),
     }
 }
 
@@ -20122,12 +20116,10 @@ fn number_key_for(v: &OwnedValue) -> Option<NumberKey> {
 /// key-detection half (#1326), for a genuinely dynamic bound
 /// (`.[$a:$b]`, `.[(1+1):]`) rather than a literal one.
 ///
-/// Unlike an index, a slice bound has no single `Expr` variant carrying
-/// both the resolved `i64` and its own key together -- [`Expr::SliceNumber`]
-/// carries each bound's key as an independent optional field, so this
-/// returns just the key half; the caller pairs it with the bound's own
-/// already-resolved `i64` (from [`owned_bound_to_i64`]) when constructing
-/// the path component.
+/// [`Expr::Slice`] carries each bound's key as an independent optional
+/// field, so this returns just the key half; the caller pairs it with the
+/// bound's own already-resolved `i64` (from [`owned_bound_to_i64`]) when
+/// constructing the path component.
 fn numeric_slice_bound_key(v: &OwnedValue) -> Option<NumberKey> {
     number_key_for(v)
 }
@@ -20156,7 +20148,7 @@ pub(crate) fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedV
 /// descriptor is reported as, one bound at a time -- the slice-bound sibling
 /// of [`index_component_value`] (#1326), shared by [`walk_path`] and
 /// [`navigation_element`]. `eval_pipe_with_path_context_internal` has no
-/// `Expr::Slice`/`Expr::SliceNumber` arm at all -- a slice there falls
+/// `Expr::Slice` arm at all -- a slice there falls
 /// through to that function's generic, path-context-losing fallback, a
 /// pre-existing gap #1326 doesn't touch.
 ///
@@ -20855,12 +20847,7 @@ fn resolve_node<'a, S: EvalSemantics>(
                 // expression carve-out above.
                 let bare_navigation_primitive = matches!(
                     inner.as_ref(),
-                    Expr::Field(_)
-                        | Expr::Index(_)
-                        | Expr::IndexNumber { .. }
-                        | Expr::Iterate
-                        | Expr::Slice { .. }
-                        | Expr::SliceNumber { .. }
+                    Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
                 );
                 let branches = match resolve_node::<S>(inner, value, trackable, snapshot, keep) {
                     Ok(branches) => branches,
@@ -21921,7 +21908,13 @@ fn resolve_iterate_bounded<S: EvalSemantics>(
             .take(n)
             .map(|(i, v)| {
                 PathBranch::new(
-                    PathPrefix::extend(&root, Expr::Index(i as i64)),
+                    PathPrefix::extend(
+                        &root,
+                        Expr::Index {
+                            idx: i as i64,
+                            key: None,
+                        },
+                    ),
                     Cow::Borrowed(v),
                     true,
                 )
@@ -21957,13 +21950,18 @@ fn resolve_iterate_bounded<S: EvalSemantics>(
 fn navigation_element(component: &Expr) -> Option<OwnedValue> {
     match component {
         Expr::Field(name) => Some(OwnedValue::String(name.clone())),
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
-            Some(index_component_value(*idx, component.index_number_key()))
-        }
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
-            let (start_key, end_key) = component.slice_number_keys();
-            Some(slice_component_value(*start, start_key, *end, end_key))
-        }
+        Expr::Index { idx, key } => Some(index_component_value(*idx, key.as_ref())),
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => Some(slice_component_value(
+            *start,
+            start_key.as_ref(),
+            *end,
+            end_key.as_ref(),
+        )),
         _ => None,
     }
 }
@@ -22034,12 +22032,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     let is_primitive = trackable
         && matches!(
             expr,
-            Expr::Identity
-                | Expr::Field(_)
-                | Expr::Index(_)
-                | Expr::IndexNumber { .. }
-                | Expr::Slice { .. }
-                | Expr::SliceNumber { .. }
+            Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. }
         );
 
     if is_primitive {
@@ -22348,7 +22341,13 @@ fn push_recursive_branches<'a>(
     match value {
         OwnedValue::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                let path = PathPrefix::extend(prefix, Expr::Index(i as i64));
+                let path = PathPrefix::extend(
+                    prefix,
+                    Expr::Index {
+                        idx: i as i64,
+                        key: None,
+                    },
+                );
                 push_recursive_branches(&path, item, trackable, out);
             }
         }
@@ -22826,7 +22825,7 @@ impl FoldRegister {
 /// logic rather than re-deriving it.
 ///
 /// **Gated on `any_subexpr` finding an actual navigation step
-/// (`Field`/`Index`/`IndexNumber`/`Slice`/`SliceNumber`/`Iterate`)
+/// (`Field`/`Index`/`Slice`/`Iterate`)
 /// anywhere in `source`** -- only such a step can ever reach one of
 /// `resolve_node`'s own raising arms in the first place, so a source with
 /// none (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
@@ -22917,12 +22916,7 @@ fn resolve_fold_source<S: EvalSemantics>(
     let has_navigation = any_subexpr(source, &mut |e| {
         matches!(
             e,
-            Expr::Field(_)
-                | Expr::Index(_)
-                | Expr::IndexNumber { .. }
-                | Expr::Slice { .. }
-                | Expr::SliceNumber { .. }
-                | Expr::Iterate
+            Expr::Field(_) | Expr::Index { .. } | Expr::Slice { .. } | Expr::Iterate
         )
     });
     if !has_navigation {
@@ -24524,20 +24518,15 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         for (e, e_key) in ends {
             // #1326: a genuinely dynamic bound (unlike a literal one, which
             // the parser's own `fold_slice_bound` handles at parse time)
-            // keeps its float spelling the same way -- `Expr::SliceNumber`
-            // only when at least one side actually has a key to preserve,
-            // so an all-integer/absent-bound dynamic slice still produces
-            // the plain `Expr::Slice` every other match site already
-            // expects, unchanged.
-            let slice_expr = if s_key.is_some() || e_key.is_some() {
-                Expr::SliceNumber {
-                    start: *s,
-                    end: *e,
-                    start_key: s_key.clone(),
-                    end_key: e_key.clone(),
-                }
-            } else {
-                Expr::Slice { start: *s, end: *e }
+            // keeps its float spelling the same way -- each bound's key is
+            // carried only when that side actually has one, so an
+            // all-integer/absent-bound dynamic slice produces a `Slice`
+            // with both key fields `None`, exactly as before.
+            let slice_expr = Expr::Slice {
+                start: *s,
+                end: *e,
+                start_key: s_key.clone(),
+                end_key: e_key.clone(),
             };
             for PathBranch {
                 path: components,
@@ -26018,21 +26007,16 @@ fn substitute_var_impl(
         Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
-        Expr::Index(i) => Expr::Index(*i),
-        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+        Expr::Index { idx, key } => Expr::Index {
             idx: *idx,
             key: key.clone(),
         },
-        Expr::Slice { start, end } => Expr::Slice {
-            start: *start,
-            end: *end,
-        },
-        Expr::SliceNumber {
+        Expr::Slice {
             start,
             end,
             start_key,
             end_key,
-        } => Expr::SliceNumber {
+        } => Expr::Slice {
             start: *start,
             end: *end,
             start_key: start_key.clone(),
@@ -27232,7 +27216,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
                 name,
             )),
         }),
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => Some(match input {
+        Expr::Index { idx, .. } => Some(match input {
             OwnedValue::Array(items) => {
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
@@ -30461,11 +30445,11 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
                 ))
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, key } => {
             // Extend path with index, as written rather than as resolved
             // (#1088) -- see `index_component_value`.
             let mut new_path = current_path.to_vec();
-            new_path.push(index_component_value(*idx, first.index_number_key()));
+            new_path.push(index_component_value(*idx, key.as_ref()));
 
             // Get the element value
             if let OwnedValue::Array(arr) = value {
@@ -32474,21 +32458,25 @@ fn walk_path<S: EvalSemantics>(
                 optional,
             )?;
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, key } => {
             step_into::<S>(
                 expr,
-                index_component_value(*idx, expr.index_number_key()),
+                index_component_value(*idx, key.as_ref()),
                 value,
                 current_path,
                 out,
                 optional,
             )?;
         }
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
-            let (start_key, end_key) = expr.slice_number_keys();
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => {
             step_into::<S>(
                 expr,
-                slice_component_value(*start, start_key, *end, end_key),
+                slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
                 value,
                 current_path,
                 out,
@@ -33915,6 +33903,27 @@ impl DeleteTrieBuilder {
         }
     }
 
+    /// Get or create the child of `parent` reached by one array step.
+    ///
+    /// Shared by [`Self::child_of`]'s `Index` and `Slice` arms, which put
+    /// both step kinds in the same bucket on purpose -- see that arm's own
+    /// comment for why.
+    fn array_child(&mut self, parent: u32, step: ArrayStep, optional: bool) -> u32 {
+        let map = &self.trie.nodes[parent as usize].indices;
+        match map.get(&step) {
+            Some(&id) => {
+                self.trie.nodes[id as usize].optional |= optional;
+                id
+            }
+            None => {
+                let slot = map.len();
+                let id = self.push_node(parent, slot, false, optional);
+                self.trie.nodes[parent as usize].indices.insert(step, id);
+                id
+            }
+        }
+    }
+
     /// Get or create the child of `parent` reached by one atomic path step.
     ///
     /// Rejects any component shape the pre-#1690 `delete_expr_paths_at`'s dispatch
@@ -33954,30 +33963,19 @@ impl DeleteTrieBuilder {
             // `delete_trie_array` funnels every terminal key into a single
             // `delete_keys` call, and that one batch is what makes
             // overlapping ranges union instead of compound.
-            Expr::Index(_)
-            | Expr::IndexNumber { .. }
-            | Expr::Slice { .. }
-            | Expr::SliceNumber { .. } => {
-                let step = match component {
-                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => ArrayStep::Index(*idx),
-                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
-                        ArrayStep::Slice(*start, *end)
-                    }
-                    _ => unreachable!("outer match admitted only Index/Slice shapes"),
-                };
-                let map = &self.trie.nodes[parent as usize].indices;
-                match map.get(&step) {
-                    Some(&id) => {
-                        self.trie.nodes[id as usize].optional |= optional;
-                        id
-                    }
-                    None => {
-                        let slot = map.len();
-                        let id = self.push_node(parent, slot, false, optional);
-                        self.trie.nodes[parent as usize].indices.insert(step, id);
-                        id
-                    }
-                }
+            //
+            // #1401: each arm binds its own step directly. While `Index`
+            // and `Slice` were each a *pair* of variants this had to be one
+            // combined arm over four of them plus an inner re-match with an
+            // `unreachable!()` fallback -- and that fallback is exactly what
+            // a float-spelled index reached, from #1088 until #1326 added
+            // the missing arm. Folding the pairs away removes the shape
+            // that made the gap possible; #1827's
+            // `test_multi_target_del_reaches_array_step_dispatch_1827` is
+            // the test that covers this site.
+            Expr::Index { idx, .. } => self.array_child(parent, ArrayStep::Index(*idx), optional),
+            Expr::Slice { start, end, .. } => {
+                self.array_child(parent, ArrayStep::Slice(*start, *end), optional)
             }
             // See `needs_fanout_pass`'s doc comment for why a bare
             // `Expr::Iterate` can never reach a comma-grouped `del()` path
@@ -34852,7 +34850,7 @@ fn delete_at_path(
                 name,
             )),
         },
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
+        Expr::Index { idx, .. } => match root {
             OwnedValue::Array(arr) => {
                 if let Some(actual_idx) = resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
                     arr.remove(actual_idx);
@@ -34895,7 +34893,7 @@ fn delete_at_path(
         // silently empty rather than an error — unlike the `Expr::Index` arm
         // above, jq does not refuse an out-of-range slice, so `[1,2,3] |
         // del(.[5:9])` is `[1,2,3]`.
-        Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => match root {
+        Expr::Slice { start, end, .. } => match root {
             OwnedValue::Array(arr) => {
                 let range = SliceBounds::from_literals(*start, *end).resolve(arr.len());
                 arr.drain(range);
@@ -34966,7 +34964,7 @@ fn delete_at_path(
                             name,
                         )),
                     },
-                    Expr::Index(idx) | Expr::IndexNumber { idx, .. } => match root {
+                    Expr::Index { idx, .. } => match root {
                         OwnedValue::Array(arr) => {
                             match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
                                 Some(actual_idx) => {
@@ -35117,9 +35115,7 @@ fn delete_at_path(
                     // `=`/`|=` assignment, where a slice write auto-vivifies
                     // `null` instead of no-op'ing (a separate, documented
                     // divergence — see docs/compliance/jq/limitations.md).
-                    Expr::Slice { .. } | Expr::SliceNumber { .. }
-                        if matches!(root, OwnedValue::Null) =>
-                    {
+                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
                         delete_at_path_through_absent(&rest, optional, yq_mode)
                     }
                     // `scalar_noop`/`container_noop: false` — del()'s own
@@ -35208,7 +35204,7 @@ fn delete_at_path(
                     // auto-vivifying a `null` slice target through #1873's
                     // arm -- a semantics never oracle-verified for `del()`
                     // -- with nothing here to catch it.
-                    Expr::Slice { start, end } | Expr::SliceNumber { start, end, .. } => {
+                    Expr::Slice { start, end, .. } => {
                         through_slice(
                             root,
                             *start,
@@ -41157,21 +41153,16 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // Recursively expand in all subexpressions
         Expr::Identity => Expr::Identity,
         Expr::Field(s) => Expr::Field(s.clone()),
-        Expr::Index(i) => Expr::Index(*i),
-        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+        Expr::Index { idx, key } => Expr::Index {
             idx: *idx,
             key: key.clone(),
         },
-        Expr::Slice { start, end } => Expr::Slice {
-            start: *start,
-            end: *end,
-        },
-        Expr::SliceNumber {
+        Expr::Slice {
             start,
             end,
             start_key,
             end_key,
-        } => Expr::SliceNumber {
+        } => Expr::Slice {
             start: *start,
             end: *end,
             start_key: start_key.clone(),
@@ -41610,21 +41601,16 @@ fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
         Expr::Env => Expr::Env,
         Expr::Identity => Expr::Identity,
         Expr::Field(name) => Expr::Field(name.clone()),
-        Expr::Index(i) => Expr::Index(*i),
-        Expr::IndexNumber { idx, key } => Expr::IndexNumber {
+        Expr::Index { idx, key } => Expr::Index {
             idx: *idx,
             key: key.clone(),
         },
-        Expr::Slice { start, end } => Expr::Slice {
-            start: *start,
-            end: *end,
-        },
-        Expr::SliceNumber {
+        Expr::Slice {
             start,
             end,
             start_key,
             end_key,
-        } => Expr::SliceNumber {
+        } => Expr::Slice {
             start: *start,
             end: *end,
             start_key: start_key.clone(),
@@ -42747,15 +42733,15 @@ mod tests {
         );
     }
 
-    /// #1932: `eval_single`'s `Expr::Slice`/`Expr::SliceNumber` arm, in the
+    /// #1932: `eval_single`'s `Expr::Slice` arm, in the
     /// `StandardJson::Array` case, used an unchecked `to_owned` per element
     /// instead of `promote_borrowed_checked` -- the same #1755 bug shape
     /// already fixed for the adjacent `StandardJson::Object` arm a few
     /// lines below, missed on the array arm at the time. Exercised via
     /// `eval.rs`'s own library-API dispatch (`query!`), not the CLI, same as
     /// #1755's sort/unique family above (see that test's own comment) --
-    /// `eval_generic.rs` has no native arm for a bare `Expr::Slice`/
-    /// `Expr::SliceNumber` either, so its own catch-all fallback reaches
+    /// `eval_generic.rs` has no native arm for a bare `Expr::Slice`
+    /// either, so its own catch-all fallback reaches
     /// this exact function too, but only *after* first materializing the
     /// whole target via its own already-checked `to_owned_with_cursor` and
     /// re-serializing it to fresh JSON bytes (`eval_generic.rs`'s `_ =>` arm
@@ -42869,7 +42855,7 @@ mod tests {
     /// arm) only ever forwards `optional: true` *directly* into a callee for
     /// that one dynamic-bounds index/slice shape. Every other spelling of
     /// `?` -- including a literal-bounds slice like `.[0:1]?` (which folds
-    /// to `Expr::Slice`/`Expr::SliceNumber`, not `Expr::SliceExpr`, so it
+    /// to `Expr::Slice`, not `Expr::SliceExpr`, so it
     /// doesn't take that bypass either) and Assign/Update/SetPath/
     /// Combinations, none of which are Index/Slice at all -- instead
     /// evaluates its inner expression with the *ambient* `optional` and
@@ -42891,10 +42877,7 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let slice_expr = Expr::Slice {
-            start: None,
-            end: None,
-        };
+        let slice_expr = Expr::slice(None, None);
         match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), true) {
             QueryResult::None => {}
             other => panic!("expected None, got {other:?}"),
@@ -42905,7 +42888,7 @@ mod tests {
         }
     }
 
-    /// #2001: `eval_single`'s `Expr::Slice`/`Expr::SliceNumber` `Array` arm
+    /// #2001: `eval_single`'s `Expr::Slice` `Array` arm
     /// (available in both jq and yq mode, unlike the `Object` arm above,
     /// which is yq-only -- this arm has no `S::TAG` gate at all) has the
     /// identical gap the `Object` arm's own #1953 fix already closed --
@@ -42922,10 +42905,7 @@ mod tests {
         let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        let slice_expr = Expr::Slice {
-            start: None,
-            end: Some(1),
-        };
+        let slice_expr = Expr::slice(None, Some(1));
         match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), true) {
             QueryResult::None => {}
             other => panic!("expected None, got {other:?}"),
@@ -46682,7 +46662,9 @@ mod tests {
         let result = match expr {
             Expr::Identity => QueryResult::One(cursor.value()),
             Expr::Field(name) => index_object_by_name::<Vec<u64>>(cursor.value(), name, optional),
-            Expr::Index(idx) => index_array_by_position::<Vec<u64>>(cursor.value(), *idx, optional),
+            Expr::Index { idx, .. } => {
+                index_array_by_position::<Vec<u64>>(cursor.value(), *idx, optional)
+            }
             other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
         };
         match result {
@@ -46731,14 +46713,14 @@ mod tests {
             // Index: in bounds, negative-from-end, out of bounds (positive
             // and negative), on null, on a type that cannot be
             // position-indexed at all (with and without `?`).
-            (Expr::Index(1), arr(), false),
-            (Expr::Index(-1), arr(), false),
-            (Expr::Index(10), arr(), false),
-            (Expr::Index(-10), arr(), false),
-            (Expr::Index(0), OwnedValue::Null, false),
-            (Expr::Index(0), OwnedValue::String("x".to_string()), true),
-            (Expr::Index(0), OwnedValue::String("x".to_string()), false),
-            (Expr::Index(0), obj(), false),
+            (Expr::index(1), arr(), false),
+            (Expr::index(-1), arr(), false),
+            (Expr::index(10), arr(), false),
+            (Expr::index(-10), arr(), false),
+            (Expr::index(0), OwnedValue::Null, false),
+            (Expr::index(0), OwnedValue::String("x".to_string()), true),
+            (Expr::index(0), OwnedValue::String("x".to_string()), false),
+            (Expr::index(0), obj(), false),
         ];
 
         for (expr, input, optional) in cases {
@@ -62658,13 +62640,10 @@ mod tests {
         let steps = [
             Expr::Field("a".to_string()),
             Expr::Iterate,
-            Expr::Index(0),
+            Expr::index(0),
             Expr::Optional(Box::new(Expr::Iterate)),
             Expr::Field("b".to_string()),
-            Expr::Slice {
-                start: None,
-                end: None,
-            },
+            Expr::slice(None, None),
         ];
         let suffix = iterate_suffix_len(&steps);
         for cut in 0..=steps.len() {
@@ -62680,7 +62659,7 @@ mod tests {
         // what `usize::MAX` buys -- a sentinel no `rest.len()` can reach.
         let none = [
             Expr::Field("a".to_string()),
-            Expr::Index(0),
+            Expr::index(0),
             Expr::Field("b".to_string()),
         ];
         assert_eq!(iterate_suffix_len(&none), usize::MAX);
@@ -63263,12 +63242,12 @@ mod tests {
         );
 
         let mut root = OwnedValue::Null;
-        set_path::<JqSemantics>(&mut root, &Expr::Index(0), OwnedValue::Int(1), false, false)
+        set_path::<JqSemantics>(&mut root, &Expr::index(0), OwnedValue::Int(1), false, false)
             .unwrap();
         assert_eq!(root, OwnedValue::Array(vec![OwnedValue::Int(1)]));
 
         let mut root = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
-        set_path::<JqSemantics>(&mut root, &Expr::Index(4), OwnedValue::Int(9), false, false)
+        set_path::<JqSemantics>(&mut root, &Expr::index(4), OwnedValue::Int(9), false, false)
             .unwrap();
         assert_eq!(
             root,
@@ -67461,8 +67440,8 @@ mod tests {
             }
         );
         // A whole-valued float bound *does* fold at parse time, exercising
-        // the static `Expr::SliceNumber` path instead -- both routes must
-        // agree.
+        // the static `Expr::Slice`-with-keys path instead -- both routes
+        // must agree.
         query!(br"[1,2,3,4,5]", r"path(.[1.0:3.0])",
             QueryResult::Owned(v) => {
                 assert_eq!(v.to_json(), r#"[{"start":1.0,"end":3.0}]"#);
@@ -67530,10 +67509,10 @@ mod tests {
         );
     }
 
-    /// #1326: `Expr::SliceNumber` needs a rebuild arm in every AST walker
-    /// that reconstructs a filter's body, the same way #1088 already added
-    /// one for `Expr::IndexNumber` -- `substitute_var` (`E as $x | body`),
-    /// `expand_func_calls` (inlining a `def`), and `substitute_func_param`
+    /// #1326: a slice's preserved bound keys need to survive every AST
+    /// walker that reconstructs a filter's body, the same way #1088's index
+    /// key already did -- `substitute_var` (`E as $x | body`),
+    /// `install_def_calls` (binding a `def`), and `substitute_func_param`
     /// (substituting a parameterized `def`'s own argument). Each jq-level
     /// case here is end-to-end correct (oracle-verified against real jq
     /// 1.7.1), but doesn't exercise these three functions' own rebuild
@@ -67560,16 +67539,18 @@ mod tests {
         );
     }
 
-    /// #1326: direct calls into `substitute_var`/`expand_func_calls`/
-    /// `substitute_func_param` with a hand-built `Expr::SliceNumber`,
-    /// pinning each walker's own rebuild arm regardless of whether any
-    /// particular jq-level construct happens to route through it today --
-    /// a `def`/`as`-bound body containing a bare `Expr::SliceNumber` is
-    /// exactly the shape each function's own doc comment describes
-    /// walking past.
+    /// #1326: direct calls into `substitute_var`/`install_def_calls`/
+    /// `substitute_func_param` with a hand-built key-carrying
+    /// [`Expr::Slice`], pinning each walker's own rebuild arm regardless of
+    /// whether any particular jq-level construct happens to route through
+    /// it today -- a `def`/`as`-bound body containing such a slice is
+    /// exactly the shape each function's own doc comment describes walking
+    /// past. #1401 folded the former `SliceNumber` into `Slice`, which is
+    /// why one arm now covers both spellings; the clone-through of
+    /// `start_key`/`end_key` is what this still pins.
     #[test]
     fn test_ast_rebuild_walkers_clone_slice_number_directly_1326() {
-        let slice_number = Expr::SliceNumber {
+        let slice_number = Expr::Slice {
             start: Some(1),
             end: Some(3),
             start_key: Some(NumberKey::Literal(1.5, "1.5".into())),
@@ -67601,7 +67582,7 @@ mod tests {
     /// `nth(n; expr)` always parses through `Builtin::NthStream` instead (see
     /// `eval_nth_expr_n_argument_propagates_halt`'s doc comment) -- so
     /// `install_def_calls`'s own rebuild arm for it can only be reached by a
-    /// direct call. Unlike `Expr::SliceNumber` above (a leaf `install_def_calls`
+    /// direct call. Unlike `Expr::Slice` above (a leaf `install_def_calls`
     /// just clones), `NthExpr` carries two sub-expressions it must actually
     /// recurse into: both `n` and `expr` need their own call to `f` rewritten
     /// to a `DefCall`, not silently left as an unresolvable `FuncCall`.
@@ -67685,34 +67666,36 @@ mod tests {
         builder.finish()
     }
 
-    /// #1326 review: adding `Expr::SliceNumber` alongside `Expr::Slice` in
-    /// the array walker's error-construction match exposed that
-    /// `Expr::IndexNumber` had no arm of its own there either -- a
-    /// pre-existing #1088 gap (a float-spelled index reaching this path
-    /// would have hit the catch-all `unreachable!()` instead of the same
-    /// error `Expr::Index` gets), closed as a byproduct rather than a
-    /// deliberate target. Called directly rather than through a jq query:
-    /// `5 | del(.[2.0])`-shaped repros exit through a different,
+    /// #1326 review: adding a sibling slice variant alongside `Expr::Slice`
+    /// in the array walker's error-construction match exposed that the
+    /// then-separate `Expr::IndexNumber` had no arm of its own there
+    /// either -- a pre-existing #1088 gap (a float-spelled index reaching
+    /// this path would have hit the catch-all `unreachable!()` instead of
+    /// the same error a plain index gets), closed as a byproduct rather
+    /// than a deliberate target. Called directly rather than through a jq
+    /// query: `5 | del(.[2.0])`-shaped repros exit through a different,
     /// higher-level dispatch before ever reaching this specific match.
+    ///
     /// (#1690 moved the match from `delete_expr_array_paths` to
-    /// `delete_trie_array`; the arm and its wording are unchanged, and
-    /// `ArrayStep` collapses the `Index`/`IndexNumber` pair into one key
-    /// before it, which is what this asserts.)
+    /// `delete_trie_array`. #1401 then folded the paired variants away, so
+    /// the missing-arm shape this guards can no longer be written -- what
+    /// stays asserted is that a float-spelled index still collapses to the
+    /// same `ArrayStep` key, and so reports the same error.)
     #[test]
     fn test_delete_expr_array_paths_reports_index_number_like_plain_index_1326() {
-        let trie = one_step_trie(Expr::IndexNumber {
+        let trie = one_step_trie(Expr::Index {
             idx: 2,
-            key: NumberKey::Literal(2.0, "2.0".into()),
+            key: Some(NumberKey::Literal(2.0, "2.0".into())),
         });
         let err = delete_trie_array(OwnedValue::Int(5), &trie, DELETE_TRIE_ROOT, false)
             .expect_err("not an array");
         assert_eq!(err.message, "Cannot index number with number");
     }
 
-    /// #1827: the sibling of `test_delete_expr_array_paths_reports_index_number_like_plain_index_1326`
-    /// for the `Slice`/`SliceNumber` pair -- the same match's two `Slice { .. }
-    /// | Expr::SliceNumber { .. }` arms (one `if`-gated on a `String` value, one
-    /// not) had no direct test coverage at all before this, for either sibling.
+    /// #1827: the slice-bound sibling of
+    /// `test_delete_expr_array_paths_reports_index_number_like_plain_index_1326`
+    /// -- the same match's two slice arms (one `if`-gated on a `String`
+    /// value, one not) had no direct test coverage at all before this.
     /// Same reachability caveat as #1326's own test: called directly, since a
     /// parsed `del(.[1.0:3], .[3])`-shaped query exits through a different,
     /// higher-level dispatch before ever reaching this specific match (verified
@@ -67720,7 +67703,7 @@ mod tests {
     /// asserted here).
     #[test]
     fn test_delete_expr_array_paths_reports_slice_number_like_plain_slice_1827() {
-        let trie = one_step_trie(Expr::SliceNumber {
+        let trie = one_step_trie(Expr::Slice {
             start: Some(1),
             end: Some(3),
             start_key: Some(NumberKey::Literal(1.0, "1.0".into())),
@@ -67750,15 +67733,12 @@ mod tests {
     /// treats as a hard arity error, not a no-op.
     #[test]
     fn test_delete_trie_array_yq_mode_noop_scoped_to_index_step_2106() {
-        let index_trie = one_step_trie(Expr::Index(0));
+        let index_trie = one_step_trie(Expr::index(0));
         let value = delete_trie_array(OwnedValue::Int(5), &index_trie, DELETE_TRIE_ROOT, true)
             .expect("index step scalar no-op in yq mode");
         assert_eq!(value, OwnedValue::Int(5));
 
-        let slice_trie = one_step_trie(Expr::Slice {
-            start: Some(1),
-            end: Some(3),
-        });
+        let slice_trie = one_step_trie(Expr::slice(Some(1), Some(3)));
         let err = delete_trie_array(OwnedValue::Int(5), &slice_trie, DELETE_TRIE_ROOT, true)
             .expect_err("slice step must still error even in yq mode");
         assert_eq!(err.message, "Cannot index number with object");
