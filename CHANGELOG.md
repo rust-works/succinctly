@@ -150,6 +150,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   established, measured again here for `while`/`until`'s own evaluation
   path rather than assumed to carry over unchanged.
 
+- **`reduce`/`foreach`'s bare string/number-accumulating UPDATE body
+  (`. + <literal>`) no longer runs in O(n²)** (#2086): `substitute_vars`
+  folds a fold's `$x` into a `Literal` node before the loop runs, so
+  `reduce EXPR as $x (INIT; . + $x)`-shaped bodies reduce to a bare
+  `Expr::Arithmetic{Identity, Literal}` — a shape `eval_owned_fast_path`
+  didn't cover, so every step fell through to the general evaluator's
+  `to_json_for_reindex` + `JsonIndex::build` round-trip over the *whole*
+  current accumulator. `reduce range(N) as $x (""; . + "x")` measured
+  ~7.8s at `N=99999` (`REDUCE_FOREACH_MAX_STEPS`'s own ceiling); real jq
+  answers in ~0.02s at that scale. Fixed by extending
+  `eval_owned_fast_path` to answer `. + <literal>` directly against the
+  `OwnedValue` tree, reusing the same `arith_combine` dispatch every other
+  arithmetic call site already shares — measured ~0.17s at the same
+  `N=99999` after the fix, ~45x faster. Array/object-accumulating shapes
+  (`. + [$x]`) are not covered by this fix (measured *worse* than the
+  string case, ~36s at just 25,000 elements) — tracked separately as
+  #2152.
+
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped
   field**, on nearly every route that turns lazily-indexed JSON/YAML into an

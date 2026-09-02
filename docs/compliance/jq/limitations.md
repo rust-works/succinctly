@@ -2306,18 +2306,26 @@ rather than removing the cap outright.
 bound**: raising the flat per-invocation count also raises the worst-case CPU
 burned *before* the cap fires, for any UPDATE/EXTRACT body whose own
 per-invocation cost is superlinear -- concretely, repeated string growth:
-`reduce range(N) as $x (""; . + "x")` measures O(N²) in succinctly (`""`
-concatenation reallocates the whole accumulator each step) --
-**not** a divergence to accept under this section, but a genuine succinctly
-performance gap against real jq, which answers the identical query in
-apparently-linear time (`jq -cn '[range(N)] | length'`-scale cost, confirmed
-live: N=50,000/100,000/1,000,000 measure 0.01s/0.02s/0.15s against jq 1.7.1,
-vs. succinctly's 1.9s/7.8s at just the first two of those); filed separately
-as [#2086](https://github.com/rust-works/succinctly/issues/2086) rather than
-chased down here. Until that closes, this budget's real-world worst case
-before erroring is whatever that gap's own scaling implies at
-`REDUCE_FOREACH_MAX_STEPS` iterations -- measured directly at `100000`
-(this budget's own value): ~7.8s. A precomputed fanout-product bound
+`reduce range(N) as $x (""; . + "x")` originally measured O(N²) in succinctly
+(`""` concatenation re-serialized and reparsed the *whole* accumulator every
+step, via `eval_owned_input`'s general-evaluator fallback -- `Expr::Arithmetic`
+wasn't one of `eval_owned_fast_path`'s covered shapes), where real jq answers
+the identical query in apparently-linear time (`jq -cn '[range(N)] | length'`-scale
+cost, confirmed live: N=50,000/100,000/1,000,000 measure 0.01s/0.02s/0.15s
+against jq 1.7.1, vs. succinctly's original 1.9s/7.8s at just the first two of
+those). [#2086](https://github.com/rust-works/succinctly/issues/2086) closed
+this for exactly this bare shape (`. + <literal>`, `$x` already folded into a
+`Literal` by `substitute_vars` before the fold runs) by extending
+`eval_owned_fast_path` to answer it directly against the `OwnedValue` tree,
+reusing the same `arith_combine` dispatch every other arithmetic call site
+already shares -- measured directly at `REDUCE_FOREACH_MAX_STEPS` (`100000`)
+after that fix: ~0.17s, down from ~7.8s. Array/object-accumulating shapes
+(`reduce ... as $x ([]; . + [$x])`) are **not** covered by that fix -- after
+substitution the right-hand side is an `Expr::Array`/`Expr::Object`
+construction wrapping a `Literal`, not a bare `Literal` itself, so it still
+falls through to the same slow path, and measures *worse* than the string
+case ever did (~36s at just 25,000 elements); tracked separately as
+[#2152](https://github.com/rust-works/succinctly/issues/2152). A precomputed fanout-product bound
 (INIT-fork count x element count, both known before either loop starts)
 would not avoid this either way -- for the single-INIT-fork case #2079
 reports, fork count is 1, so the product collapses to the element count and
@@ -2368,16 +2376,29 @@ own memory-only bound).
 
 **The same superlinear-cost caveat #2079/#2086 already found for
 `reduce`/`foreach` applies here too, via the identical underlying
-mechanism** (`OwnedValue` string-append reallocates the whole accumulator
-per step): `[0,""] | until(.[0] >= N; [.[0]+1, .[1] + "x"]) | .[1] | length`
-measures ~15-16s at N approaching the new `100000` ceiling in this build,
-against real jq's own apparently-linear ~0.1-0.2s at the same N (confirmed
-live) -- somewhat higher than #2086's own ~7.8s figure for the analogous
-`reduce` shape (both walk the same O(N²) string-append path; the gap
-between the two isn't attributed further here), but the same accepted
-tradeoff: not chased down as part of this fix, since #2086 already tracks
-the underlying performance gap and a second, until/while-flavoured report
-would just be the same root cause observed through a different builtin.
+mechanism** (`eval_owned_input`'s general-evaluator fallback re-serializes
+and reparses the whole accumulator every step, for any `Expr::Arithmetic`
+shape `eval_owned_fast_path` doesn't cover): `[0,""] | until(.[0] >= N;
+[.[0]+1, .[1] + "x"]) | .[1] | length` measures ~15-16s at N approaching the
+new `100000` ceiling in this build, against real jq's own apparently-linear
+~0.1-0.2s at the same N (confirmed live). #2086's fix (see the previous
+section) closed this for `reduce`/`foreach`'s *bare* accumulator shape
+(`. + <literal>`), which brought that analogous `reduce` figure down from
+~7.8s to ~0.17s -- but this `until`/`while` repro's own state is
+array-wrapped (`[.[0]+1, .[1] + "x"]`, since a loop needs a counter *and* an
+accumulator, unlike `reduce`/`foreach`'s cleanly separate INIT-vs-`$x`
+shape), so neither inner arithmetic's left operand is the bare `.`
+`eval_owned_fast_path`'s new arm requires -- confirmed still ~15s after
+#2086 landed, not improved by it at all. A *bare* single-value `until`/
+`while` state (`"" | until(length >= N; . + "x")`) does hit the new fast
+path for its UPDATE, but only partially helps (~7.5-8.4s, confirmed live) --
+`until`/`while`'s own COND (`length >= N` here) is evaluated fresh every
+step too, and `length` isn't one of `eval_owned_fast_path`'s covered shapes
+either, so COND evaluation remains its own uncounted, unfixed round-trip.
+Tracked as [#2152](https://github.com/rust-works/succinctly/issues/2152)
+(array/object accumulation) and noted here rather than filing a third,
+narrower until/while-COND-specific issue for what is the same underlying
+"which `Expr` shapes does `eval_owned_fast_path` cover" question.
 
 ### `path(repeat(f))` tracking (#1906/#1935) only reaches `limit`/`first`'s *direct* child, not `nth` or a combinator-nested `repeat`
 
