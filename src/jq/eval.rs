@@ -3136,6 +3136,45 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
         }
     }
 
+    /// Materialize an item pushed by a producer whose sink protocol only ever
+    /// carries [`Item::Owned`], where the `Borrowed` arm is therefore dead
+    /// code (#2025).
+    ///
+    /// Three collecting sinks are in this position, and each is fed by exactly
+    /// one `sink(...)` call in its producer's whole body, all three passing
+    /// `Item::Owned`: [`binary_fanout_core`] (from `binary_fanout_each`, whose
+    /// only push is `combine`'s own result -- the *operands* are separately
+    /// routed through [`Self::into_owned_checked`] by `checked_fanout_operand`,
+    /// #1972), [`builtin_paths_filter`] (from `each_paths_filter`, whose only
+    /// push is a path array built over an already-[`to_owned_checked`]
+    /// document, #1829), and [`builtin_inputs`] (from `each_inputs`, whose only
+    /// push is a queued `OwnedValue`). Neither [`Self::into_owned`] nor
+    /// [`Self::into_owned_checked`] can therefore differ observably at any of
+    /// them.
+    ///
+    /// Spelled as its own method rather than a bare [`Self::into_owned`] for
+    /// two reasons. #2025 was filed against exactly these three sites on the
+    /// theory that they were unchecked materializations of document-sourced
+    /// strings, and closed only after the sink protocol above was re-derived by
+    /// hand; a classification pass that greps for the call *shape* (#1989) has
+    /// no way to see that argument otherwise, so the name carries it. And if a
+    /// producer ever starts pushing `Item::Borrowed` into one of these sinks,
+    /// the debug assertion fails in CI's debug test run rather than silently
+    /// substituting `""` for an undecodable string -- #1746's bug shape, which
+    /// is precisely what this would become.
+    ///
+    /// Release behaviour is [`Self::into_owned`]'s, unchanged: the assertion
+    /// documents and guards an invariant, it does not add a new failure mode to
+    /// a path that has none today.
+    fn into_owned_from_owned_producer(self) -> OwnedValue {
+        debug_assert!(
+            matches!(self, Item::Owned(_)),
+            "a producer pushed Item::Borrowed into a sink whose protocol is \
+             owned-only; see Item::into_owned_from_owned_producer (#2025)"
+        );
+        self.into_owned()
+    }
+
     /// Fallible twin of [`Self::into_owned`], raising
     /// [`EvalError::decode_failure`] on an undecodable borrowed string
     /// instead of silently substituting `""` (#1972) -- used where the
@@ -4790,7 +4829,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
         optional,
         combine,
         &mut |item: Item<'a, W>| {
-            out.push(item.into_owned());
+            out.push(item.into_owned_from_owned_producer());
             Demand::Continue
         },
     );
@@ -32746,7 +32785,7 @@ fn builtin_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut paths = Vec::new();
     let flow = each_paths_filter::<W, S>(filter, value, optional, &mut |item| {
-        paths.push(item.into_owned());
+        paths.push(item.into_owned_from_owned_producer());
         Demand::Continue
     });
     match flow {
@@ -35342,7 +35381,7 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn builtin_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'a, W> {
     let mut docs: Vec<OwnedValue> = Vec::new();
     match each_inputs::<W, S>(&mut |item| {
-        docs.push(item.into_owned());
+        docs.push(item.into_owned_from_owned_producer());
         Demand::Continue
     }) {
         // A `Continue`-only sink never stops, but the arm costs nothing and
