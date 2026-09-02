@@ -8771,6 +8771,151 @@ fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
     Ok(())
 }
 
+/// A computed bracket (`Expr::IndexExpr`/`Expr::SliceExpr`) must extend
+/// `current_path` the same way a literal `.foo`/`.[0]` does, so `key`/
+/// `parent`/`path` downstream (and inside the bracket's own key/bounds
+/// sub-expression) see the right position (#2100).
+///
+/// #1410 fixed a narrower bug in the same `Expr::Optional(IndexExpr|
+/// SliceExpr)` carve-out arm: an error inside the bracket's key/bounds must
+/// still escape through `?`. That fix left the arm calling the plain,
+/// path-context-blind evaluator and passing `current_path` through
+/// unchanged on a *successful* read -- the same gap the bare (no-`?`) case
+/// had, which fell to the generic `_ =>` catch-all's own documented
+/// "this loses path context for complex expressions" comment. No jq oracle
+/// exists for any of this -- every `needs_path_context` trigger but `path`
+/// is a succinctly extension -- so the plain evaluator's own semantics
+/// (`eval_index_expr`/`eval_slice_expr`) is the reference every case below
+/// is pinned against.
+#[test]
+fn test_computed_bracket_threads_path_context_2100() -> Result<()> {
+    // The issue's own headline repros: computed key, flipped from wrong to
+    // correct.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#".a | .["" + "b"] | key"#],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#""b""#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[key]"], Some(r#"{"a":{"a":9}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "9");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", r#".a | .["b"] | parent"#],
+        Some(r#"{"a":{"b":{"c":1}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"b":{"c":1}}"#);
+
+    // The `?`-carve-out's *successful* path (not covered by #1410's own
+    // test, which only exercises the error-escaping half): `.a` is `1`, a
+    // non-container, so `.[key]?` (key resolves to `"a"`) suppresses to
+    // nothing and only the `1` branch survives.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[key]?, 1)"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
+
+    // Regression control: a bare computed key with no `key`/`parent`/`path`
+    // anywhere in the pipe never needs path context at all, so it must stay
+    // on today's cheap route and answer exactly as before.
+    let (stdout, _, code) = run_jq_full(&["-c", "--arg", "k", "a", ".[$k]"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
+
+    // Computed slice bounds (a genuine `Expr::SliceExpr`, not folded to a
+    // literal `Expr::Slice` at parse time since `(0,1)` is multi-valued):
+    // each `(s, e)` pair must extend the path with its own
+    // `{"start":s,"end":e}` component before `key` runs.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[(0,1):(3)] | key"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "{\"start\":0,\"end\":3}\n{\"start\":1,\"end\":3}"
+    );
+
+    // Escape-ordering (#791/#400/#494 extended to a `rest`-triggered
+    // escape, which the plain evaluator's value-only model never had to
+    // reason about): key "a" succeeds and must survive in the output
+    // prefix; key "b"'s own downstream `error` must outrank the still-
+    // pending `halt` a later key-stream attempt would have reached.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#".[("a","b",halt)] | if key=="b" then error("x") else . end"#,
+        ],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains('x'), "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "1");
+
+    // A halt reaching an *empty* key stream must still escape, not be
+    // swallowed into "no keys, no output" (code review). The plain
+    // evaluator's own `keys.is_empty()` short-circuit is only reachable
+    // with no pending halt (a bare `QueryResult::Halt` returns before it);
+    // the path-context twin folds bare and partial halts into one arm, so
+    // the same short-circuit had to learn about `pending_halt`. `halt_error`
+    // rather than `halt` because it is the shape whose escape is
+    // observable on both channels -- exit 5 and the payload on stderr --
+    // where a bare `halt` differs only by the `[]` a swallowed halt lets
+    // the enclosing array print.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[.a | .[halt_error] | key]"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout}, stderr: {stderr}");
+    assert_eq!(stdout.trim(), "");
+    assert_eq!(stderr.trim(), r#"{"b":1}"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[.a | .[halt] | key]"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Same through #1410's `?` carve-out, which shares the twin: `?` covers
+    // the indexing, never a halt (#791).
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "[.a | .[halt]? | key]"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // The slice twin already routed its empty-bound short-circuit through
+    // `partial`, which collapses an empty prefix back to the bare halt --
+    // pinned here so the two brackets can't drift apart again.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[.a | .[(halt):(2)] | key]"],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // The literal-slice arm is still missing from the path-context pipe
+    // evaluator (#2215), so a *folded* slice keeps naming its container's
+    // path while the computed spelling above names the slice component.
+    // Pinned as the current, deliberately-documented asymmetry rather than
+    // left to be discovered as a surprise by the next reader.
+    let (stdout, _, code) = run_jq_full(&["-c", "[.a | .[0:3] | key]"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a"]"#);
+
+    // Target re-evaluated fresh per key (#2032), preserved even when the
+    // per-key target is probed for its own path (`paired`, since `key`
+    // downstream needs it): `input` must be consumed exactly once per key,
+    // in order, not double-read or reordered by the probe.
+    let (stdout, _, code) = run_jq_full(
+        &["-n", "-c", r#"[(input)[("a","b")] | key]"#],
+        Some("{\"a\":1,\"z\":9}\n{\"b\":2,\"z\":9}\n"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"["a","b"]"#);
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
