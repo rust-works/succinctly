@@ -1311,3 +1311,75 @@ fn test_parity_pipe_path_context_bypasses_reindex_bridge_1909() {
         assert_parity(json, filter);
     }
 }
+
+/// #1519: a `?//`-alternatives bind under a short-circuiting consumer re-runs
+/// once per alternative, because jq's `?//` catches *any* escaping break --
+/// including the one its own `builtin.jq` macros raise -- and reads it as
+/// "this alternative failed, try the next".
+///
+/// succinctly's builtins are native Rust and signal satisfaction as
+/// `Demand::Stop`/`Flow::Stopped` instead, so the retry lives in
+/// `each_pattern_alternatives` (`src/jq/eval.rs`) and
+/// `each_pattern_alternatives_generic` (`src/jq/eval_generic.rs`) -- two
+/// independent copies of the same loop, plus separate copies of the reshaped
+/// terminal sinks (`each_take_first`/`each_take_first_generic`,
+/// `each_take_nth`/`nth_with_n_generic`). These rows exist so neither copy can
+/// be changed without the other.
+///
+/// Note `first(...)`/`last(...)` are additionally intercepted by
+/// `eval_generic.rs`'s own native routing before `eval.rs`'s `eval_each` ever
+/// sees them (#1461), so the `first` rows here exercise a genuinely different
+/// code path in each evaluator rather than the same one twice.
+#[test]
+fn test_parity_pattern_alternatives_under_short_circuit_1519() {
+    let null = b"null";
+    for filter in [
+        // One answer per alternative, per consumer.
+        "[isempty(1 as $x ?// $y | 5)]",
+        "[isempty(1 as $x ?// $y ?// $z | 5)]",
+        "[first(1 as $x ?// $y | 5, 6)]",
+        "[limit(1; 1 as $x ?// $y | 5)]",
+        "[nth(1; 1 as $x ?// $y | 5, 6)]",
+        "[any(1 as $x ?// $y | true; .)]",
+        "[all(1 as $x ?// $y | false; .)]",
+        // The counter-continuation and next-pattern rules.
+        "[limit(2; 1 as $x ?// $y | 5,6)]",
+        r#"[first([1] as [$x] ?// $x | ($x|tostring), "z")]"#,
+        r#"[first((1,2) as $x ?// $y | $x, "z")]"#,
+        r#"[first(1 as $a ?// $b | (2 as $c ?// $d | 9), "z")]"#,
+        // A retried alternative that exhausts still reaches the builtin's own
+        // exhaustion answer.
+        r#"[isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else empty end)]"#,
+        r"[any([1] as [$x] ?// $x | ($x == 1); .)]",
+        // Shapes that must NOT retry, so a too-eager fix drifts one evaluator.
+        "[isempty(1 as $x ?// $y | empty)]",
+        "[first(1 as $x ?// $y | empty)]",
+        "[limit(0; 1 as $x ?// $y | 5)]",
+        "[1 as $x ?// $y | 5]",
+        "[label $out | (1 as $x ?// $y | 5), break $out]",
+        "[1 as $x ?// $y | label $in | (5, break $in)]",
+    ] {
+        assert_parity(null, filter);
+    }
+}
+
+/// #1519, cursor-backed twin of the row above: the generic evaluator keeps a
+/// single `first(...)` item cursor-backed (`generic_item_to_result`) but has to
+/// route a multi-item `?//` retry through the batch adapter instead, so the two
+/// spellings are genuinely different code. Run against a real document rather
+/// than `null` so the cursor path is actually taken.
+#[test]
+fn test_parity_pattern_alternatives_short_circuit_over_document_1519() {
+    let json = br#"{"a": [1, 2], "b": {"k": "v"}}"#;
+    for filter in [
+        "[first(.a as [$p] ?// $p | $p, 9)]",
+        "[first(.b as {k:$p} ?// $p | $p, 9)]",
+        "[first(.a as {k:$p} ?// [$p,$q] | [$p,$q], 9)]",
+        "[isempty(.a as [$p] ?// $p | $p)]",
+        "[limit(1; .a as [$p] ?// $p | $p)]",
+        "[nth(1; .a as [$p] ?// $p | $p, 7)]",
+        "[.a as [$p] ?// $p | $p]",
+    ] {
+        assert_parity(json, filter);
+    }
+}

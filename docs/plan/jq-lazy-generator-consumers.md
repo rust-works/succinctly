@@ -83,15 +83,32 @@ through `eval_generic.rs`'s wildcard into `eval.rs`, since `Expr::Label` has no 
 `eval_single` arm there — which made an entire 490-case sweep blind to the `eval_generic.rs`
 copy of the loop. The wrapper is now applied to the `break $o` terminator alone.
 
-**One divergence Stage 5's own oracle sweep found and did not attempt.** `?//`-alternatives
-wrapped in a short-circuiting consumer: real jq's builtins are macro-expanded `label $out |
-... break $out` definitions, and its `?//` operator retries the next alternative on *any*
-escaping break, including one addressed to a label entirely outside the `?//` — so
-`isempty(1 as $x ?// $y | 5)` is `false` **twice** in real jq (a three-alternative chain,
-three times), where succinctly's native, non-macro-expanded `?//` resolution always answers
-once. Confirmed pre-existing (unaffected by Stage 5's changes) and orthogonal to this
-document's own scope — filed as [#1519](https://github.com/rust-works/succinctly/issues/1519)
-rather than folded in.
+**One divergence Stage 5's own oracle sweep found and did not attempt — since fixed.**
+`?//`-alternatives wrapped in a short-circuiting consumer: real jq's builtins are
+macro-expanded `label $out | ... break $out` definitions, and its `?//` operator retries the
+next alternative on *any* escaping break, including one addressed to a label entirely outside
+the `?//` — so `isempty(1 as $x ?// $y | 5)` is `false` **twice** in real jq (a
+three-alternative chain, three times), where succinctly's native, non-macro-expanded `?//`
+resolution always answered once. Confirmed pre-existing (unaffected by Stage 5's changes) and
+orthogonal to this document's own scope — filed as
+[#1519](https://github.com/rust-works/succinctly/issues/1519) rather than folded in.
+
+[#1519](https://github.com/rust-works/succinctly/issues/1519) has since landed, and it turned
+out to be Stage 5's own mechanism rather than the "materially larger design question" it was
+filed as. `?//` had retried on `Control::Break` since
+[#1457](https://github.com/rust-works/succinctly/issues/1457) — every *user-written*
+`label`/`break` shape through a `?//` already matched jq exactly. The only missing piece was
+that a native builtin signals satisfaction as `Demand::Stop`/`Flow::Stopped` rather than by
+raising a break, and `each_pattern_alternatives` returned that immediately instead of falling
+through on the same `is_last` rule. `eval::is_retryable_stop` is the one-line predicate; the
+terminal sinks were reshaped to jq's own emit-then-stop macro shape so a retried alternative
+emits again. **The lesson for the rest of this document: `Flow::Stopped` and an escaping
+`break` are the same event wearing different clothes, and a consumer-visible rule stated for
+one of them needs checking against the other.** The residual — constructs that materialize the
+bind before the stop can reach it (`//`, a nested `first(...)`, `foreach`, a parenthesised bind
+whose break comes from a downstream pipe stage) — is items 9/10's own missing-lazy-arm class,
+not a `?//` question, and is tracked as
+[#2180](https://github.com/rust-works/succinctly/issues/2180).
 
 **Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
@@ -1260,11 +1277,17 @@ the reasoning behind each placement:
    no such native `eval_generic` arm and reaches Stage 5's new arms correctly — confirmed via
    `isempty(...)`-wrapped CLI tests instead.
 
-   **One divergence found and deliberately not attempted**: `?//`-alternatives wrapped in a
-   short-circuiting consumer re-run once per alternative in real jq (a macro-expansion/`?//`
-   retry-on-break interaction, unrelated to demand-forwarding) but not in succinctly. Confirmed
-   pre-existing, unaffected by this stage, and a materially larger design question — filed
-   separately as **#1519** rather than folded in.
+   **One divergence found and deliberately not attempted, since fixed**: `?//`-alternatives
+   wrapped in a short-circuiting consumer re-run once per alternative in real jq (a
+   macro-expansion/`?//` retry-on-break interaction) but did not in succinctly. Confirmed
+   pre-existing and unaffected by this stage, and filed separately as **#1519** rather than
+   folded in — on the estimate that it was a materially larger design question. That estimate
+   was wrong, and the correction is worth recording: it *was* demand-forwarding after all.
+   succinctly's builtins short-circuit with `Flow::Stopped` where jq's macros raise `break`,
+   and `each_pattern_alternatives` needed only to fall through on it exactly as it already did
+   for `Control::Break` (`eval::is_retryable_stop`), plus the terminal sinks reshaped to jq's
+   emit-then-stop shape. What remains is items 9/10's missing-lazy-arm class — a construct that
+   materializes the bind absorbs the stop before the `?//` sees it — tracked as **#2180**.
 8. **Option (c)** — mirror `Demand`/`Item`/`Flow` into `eval_generic.rs` for
    `Comma`/`Pipe`/`Paren`. Filed **#1461**, also Medium for the same reason (`first(1 | (1,
    input))` consumes documents), with the narrower `first_over_comma_generic` gap it sits

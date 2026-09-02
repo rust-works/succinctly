@@ -1,0 +1,1 @@
+[all(1 as $x ?// $y | false; .)]
