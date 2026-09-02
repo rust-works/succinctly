@@ -32958,7 +32958,17 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // instead of halting (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
-        result => (result.collect_owned(), None),
+        // #2188: `stream_outputs_checked`, not bare `collect_owned` --
+        // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned`,
+        // silently substituting `""` for an undecodable event leaf instead
+        // of raising, the same #1746-shaped bug this whole family has
+        // already been fixed for elsewhere. `stream_outputs_checked` gives
+        // the identical `(Vec<OwnedValue>, Option<Control>)` shape this
+        // match already destructures into, so no call-site restructuring is
+        // needed -- its own `Error`/`Break`/`Halt`/`Partial` arms are simply
+        // unreachable here, since this match's own arms above already
+        // intercept those variants before `result` can carry one.
+        result => stream_outputs_checked(result),
     };
 
     let mut outputs = Vec::new();
@@ -33039,6 +33049,20 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // See the matching arm in `builtin_fromstream`.
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
+        // #2188 audit: unlike `builtin_fromstream`'s identical shape, bare
+        // `collect_owned` here is safe by construction, not just untested --
+        // `stream_expr` is evaluated against this same `value`, which also
+        // becomes `depth` a few lines up. Any `value` complex enough for
+        // `stream_expr` to reach a nested undecodable string through it is
+        // necessarily a container (object/array), and a container always
+        // sorts above any `Int` path length in jq's ordering (`compare_values`
+        // just below) -- so `path_len > depth` is provably false for every
+        // event whenever `depth` is non-scalar, meaning every event is
+        // dropped before an undecodable leaf's silently-substituted `""`
+        // could ever reach `outputs`. `stream_expr` has no other source of
+        // document-backed (as opposed to literal/computed) content to draw
+        // an undecodable value from, so this holds for any `stream_expr`,
+        // not just one that reads `value` directly.
         result => (result.collect_owned(), None),
     };
 
@@ -46692,6 +46716,26 @@ mod tests {
         query!(
             b"{\"a\":\"\xff\xfe\"}",
             r"limit(3; (.a, halt_error(6)))",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2188 (found during the #1989 audit): `builtin_fromstream`'s
+    /// `collect_owned`-based fallback arm used bare `to_owned` for the
+    /// events it collects, silently substituting `""` for an undecodable
+    /// event leaf instead of raising. `{"events":[[[],"<bad>"]]}` gives
+    /// `.events[]` a single tostream-shaped `[path, leaf]` event with an
+    /// empty path (a top-level-leaf marker) and an undecodable leaf --
+    /// `fromstream` treats an empty path as immediately-complete, so this
+    /// isolates the `collect_owned` conversion itself rather than anything
+    /// in the accumulator loop.
+    #[test]
+    fn test_fromstream_raises_on_undecodable_event_leaf_2188() {
+        query!(
+            b"{\"events\":[[[],\"\xff\xfe\"]]}",
+            r"fromstream(.events[])",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
