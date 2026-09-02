@@ -20983,6 +20983,177 @@ fn test_deep_flat_assign_chain_exits_cleanly_not_stack_overflow_1429() -> Result
     Ok(())
 }
 
+/// A very long flat `|=` chain exits cleanly rather than crashing (#2115).
+///
+/// `update_path`'s `Expr::Pipe` arm used to rebuild `Expr::Pipe(exprs[1..
+/// ].to_vec())` and recurse once per path component, exactly the shape
+/// #1429 fixed for `=`'s own walker -- and, unlike `=`'s materialized-value
+/// RHS, `|=`'s update filter can report "produced nothing" from the
+/// terminal position no matter how deep it is, with no `Iterate` in sight
+/// (`null | .a.b.c |= empty` unwinds every freshly-autovivified level), so
+/// the naive "no `Iterate` ahead means this step can never strand" argument
+/// that flattened `=` does not by itself bound `|=`'s frame count. Measured
+/// on the pre-fix binary at 500,000 components: `SIGKILL` in a release
+/// build; a *debug* build never even got that far, the process runs out of
+/// stack between roughly 128 and 192 components (see this test's
+/// `_1429`-suffixed neighbor above, which pinned `|=` at a shallower depth
+/// than `=` for exactly that reason). `update_path_steps` now collects the
+/// maximal run of steps that must all autovivify together (autovivifying
+/// `Null` always succeeds and always produces an *empty* container, so
+/// nothing beneath it could already exist either), applies the update
+/// filter exactly once against a detached leaf standing in for the run,
+/// and builds (or discards) the whole run in one non-recursive loop --
+/// bounding stack use by the count of `Iterate`/`Slice` components in the
+/// path, not by its length, and there are none of those in this filter.
+///
+/// 1,000,000 rather than #1429's 200,000: this filter's own resulting
+/// document is 1,000,000 levels deep, well past `MAX_VALUE_TREE_DEPTH`
+/// (384) -- the *same* pre-existing, unrelated value-nesting guard #1429's
+/// own test trips once its rebuilt document is materialized, confirming
+/// that guard (not a stack-depth crash) is what stops this filter, at any
+/// depth comfortably past 384.
+///
+/// Passed via `-f`, not argv: see `test_deep_flat_assign_chain_exits_
+/// cleanly_not_stack_overflow_1429`'s own doc comment on why (Linux
+/// `ARG_MAX`).
+#[test]
+fn test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115() -> Result<()> {
+    let n = 1_000_000;
+    let path: String = (0..n).map(|i| format!(".k{i}")).collect();
+
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, "{path} |= 9")?;
+    let filter_path = filter_file.path().to_owned();
+
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "null")?;
+    let input_path = input_file.path().to_owned();
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-f",
+            filter_path.to_str().expect("temp path is utf-8"),
+            input_path.to_str().expect("temp path is utf-8"),
+        ],
+        None,
+    )?;
+    assert_ne!(code, 0, "out={out:?} err={err:?}");
+    assert!(
+        err.contains("nesting depth exceeds limit of 384"),
+        "expected the clean depth refusal, got err={err:?} code={code}"
+    );
+    assert!(
+        !err.contains("stack overflow") && !err.contains("fatal runtime error"),
+        "err={err:?}"
+    );
+    Ok(())
+}
+
+/// A very long flat `del()` chain over a `null` (or missing-field) document
+/// exits cleanly rather than crashing (#2115).
+///
+/// `delete_at_path` has no stranded-undo complexity at all -- per #476/#477
+/// a step that reaches `null` or an out-of-range index deletes nothing,
+/// because there was never anything there to have created -- but its old
+/// `Expr::Pipe` arm still rebuilt `Expr::Pipe(exprs[1..].to_vec())` and
+/// recursed once per component regardless, the identical stack-depth/
+/// `O(d^2)`-clone problem as `|=`'s. Measured on the pre-fix binary: `del()`
+/// on this exact shape (a chain over `null`, where every step is a no-op)
+/// `SIGKILL`ed a release build at 500,000 components and hung past a
+/// 120-second timeout at 1,000,000, confirmed live before this fix in this
+/// worktree (an even *lower* practical ceiling than `|=`'s, since deleting
+/// a chain of no-ops does no work at all to mask the crash behind).
+///
+/// `delete_path_steps` flattens `Field`/`Index` mid-chain navigation into a
+/// plain loop unconditionally (no "already exists vs. fresh" split needed,
+/// unlike `|=`'s walker): reassign `root` to the child slot and continue.
+/// A first review pass of this fix still recursed once per component
+/// whenever `root` was already `null` (via `delete_at_path_through_absent`,
+/// called afresh at every step because `null` can never gain a key) --
+/// exactly the shape this test is named for, and it alone reproduced the
+/// crash at 1,000,000 even after the `Field`/`Index`-exists case above was
+/// fixed. The final version loops in place there too: a `null` slot can
+/// never become anything else via `del()`, so there is nothing to detach a
+/// fresh scratch for, and the walk just continues holding the same
+/// reference.
+///
+/// Real jq itself agrees this is a no-op regardless of depth
+/// (`null | del(.a.b.c)` is `null`, confirmed against jq 1.7.1), so unlike
+/// the `|=` sibling test above there is no *other* guard to stop this one --
+/// a clean, unchanged `null` on stdout is the correct behavior at any depth,
+/// not merely the least-bad failure.
+#[test]
+fn test_deep_flat_delete_chain_exits_cleanly_not_stack_overflow_2115() -> Result<()> {
+    let n = 1_000_000;
+    let path: String = (0..n).map(|i| format!(".k{i}")).collect();
+
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, "del({path})")?;
+    let filter_path = filter_file.path().to_owned();
+
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, "null")?;
+    let input_path = input_file.path().to_owned();
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-f",
+            filter_path.to_str().expect("temp path is utf-8"),
+            input_path.to_str().expect("temp path is utf-8"),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "out={out:?} err={err:?}");
+    assert_eq!(out.trim(), "null");
+    assert!(
+        !err.contains("stack overflow") && !err.contains("fatal runtime error"),
+        "err={err:?}"
+    );
+    Ok(())
+}
+
+/// Sibling of the test above, exercising the *other* no-created-slot route
+/// through `delete_path_steps`: a chain that starts on a real (non-`null`)
+/// object whose very first key is missing, rather than a `null` document
+/// from the start. `Field`'s `None` arm (key not found) still makes exactly
+/// one recursive call into `delete_at_path_through_absent` -- there is a
+/// real design reason for that one, unlike the fixed bug the test above
+/// covers: no live slot exists yet to keep pointing at, so a detached
+/// `null` scratch has to be created somewhere -- but every step after that
+/// single transition walks the *same* scratch, which starts and stays
+/// `null`, so it takes the exact same in-place loop the test above
+/// confirms rather than recursing again.
+#[test]
+fn test_deep_flat_delete_chain_through_absent_first_key_exits_cleanly_2115() -> Result<()> {
+    let n = 1_000_000;
+    let path: String = (0..n).map(|i| format!(".k{i}")).collect();
+
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, "del(.missing{path})")?;
+    let filter_path = filter_file.path().to_owned();
+
+    let mut input_file = NamedTempFile::new()?;
+    writeln!(input_file, r#"{{"a":1}}"#)?;
+    let input_path = input_file.path().to_owned();
+
+    let (out, err, code) = run_jq_full(
+        &[
+            "-c",
+            "-f",
+            filter_path.to_str().expect("temp path is utf-8"),
+            input_path.to_str().expect("temp path is utf-8"),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "out={out:?} err={err:?}");
+    assert_eq!(out.trim(), r#"{"a":1}"#);
+    assert!(
+        !err.contains("stack overflow") && !err.contains("fatal runtime error"),
+        "err={err:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_as_pattern_deep_nesting_exits_cleanly_not_stack_overflow_1240() -> Result<()> {
     let n = 300;
