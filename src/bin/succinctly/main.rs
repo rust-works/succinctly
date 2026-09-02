@@ -2399,6 +2399,7 @@ mod jq_bench;
 mod jq_locate;
 mod jq_runner;
 mod json_validate;
+mod m2_gate;
 mod output;
 mod select_stats_report;
 mod text_generators;

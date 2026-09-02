@@ -82,6 +82,37 @@ impl IndentSpec {
     }
 }
 
+/// Which value-formatting convention JSON streaming should use (#1576).
+///
+/// Covers finite number literals, control-character escaping, and
+/// duplicate object keys -- the three things `--preserve-input`/
+/// `jq_compat` toggles together (ADR-0018 rule 5), so one enum selects all
+/// three rather than three independent parameters that are never
+/// independently selectable in practice.
+///
+/// - `Preserve`: echo the document's source number spelling verbatim
+///   (`1e100` stays `1e100`), use yq's escape table (no `\b`/`\f` short
+///   forms, DEL left raw), and keep every occurrence of a repeated object
+///   key -- real yq's own convention (#1008), and the only one
+///   `yq_runner.rs` ever selects, since yq has no `jq_compat` concept.
+/// - `JqCompat`: canonicalize number literals the way real jq's own reader
+///   does (`format_number_jq_compat` -- strips a redundant leading zero,
+///   canonicalizes exponent notation), use jq's escape table (`\b`/`\f`
+///   short forms, DEL escaped rather than left raw), and collapse a
+///   repeated object key to one field (first position, last value, exactly
+///   `IndexMap::insert` semantics, matching
+///   `EvalSemantics::COLLAPSE_DUPLICATE_KEYS`) -- real jq's default output
+///   convention, matching `stream_owned_value_json_jq`'s escaping and
+///   `format_number_jq_compat`'s reformatting, both already used by the
+///   jq CLI's non-streaming `print_json` path. `jq_runner.rs` selects this
+///   unless `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` is set, in
+///   which case it selects `Preserve` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonConvention {
+    Preserve,
+    JqCompat,
+}
+
 #[cfg(test)]
 mod indent_spec_tests {
     use super::IndentSpec;
@@ -401,6 +432,9 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// can be written directly to output without materializing OwnedValue.
     /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
     /// - `sort_keys`: sort mapping/object keys before writing (`-S`/`--sort-keys`)
+    /// - `numbers`: which value-formatting convention to use (#1576) -- a
+    ///   cursor type with no such distinction (YAML's own JSON-target
+    ///   writer, which always behaves as yq's single convention) ignores it.
     ///
     /// Default implementation returns an error indicating streaming is not supported.
     fn stream_json<W: core::fmt::Write>(
@@ -408,6 +442,7 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
+        _numbers: JsonConvention,
     ) -> StreamResult {
         Err(StreamFailure::Fmt)
     }
@@ -477,11 +512,14 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Only called when [`supports_sequence_streaming`](Self::supports_sequence_streaming)
     /// answers `true`; the default is the same "not supported" signal
     /// `stream_json` uses.
+    ///
+    /// `numbers`: see [`stream_json`](Self::stream_json)'s own doc comment.
     fn stream_sequence_json<W: core::fmt::Write>(
         _cursors: &[Self],
         _out: &mut W,
         _indent: IndentSpec,
         _sort_keys: bool,
+        _numbers: JsonConvention,
     ) -> StreamResult {
         Err(StreamFailure::Fmt)
     }

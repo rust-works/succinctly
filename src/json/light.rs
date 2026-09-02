@@ -1905,10 +1905,15 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
+    effective_fields_checked, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
+use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
-use crate::jq::{nonfinite_display_string, EvalError, YqSemantics};
+use crate::jq::{
+    format_number_jq_compat, nesting_depth_exceeded_message, nonfinite_display_string, EvalError,
+    JqSemantics, OwnedValue, YqSemantics, MAX_VALUE_TREE_DEPTH,
+};
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
 /// *materializing* route already raises for the same scalar, so a document
@@ -2006,6 +2011,46 @@ pub fn following_gap_ok(text: &[u8], key_end: usize) -> bool {
     found
 }
 
+/// Whether nothing but whitespace separates `gap_start` (a container's last
+/// scalar child's own already-known span end) from `close_char` (`]`/`}`) --
+/// #1576/#1676, mirroring `src/bin/succinctly/jq_runner.rs`'s own
+/// `trailing_gap_ok`/`validate_json_delimiters`. Catches a trailing `,`
+/// (`[1,2,]`, `{"a":1,}`) that [`stream_json_pretty`]'s own leading-delimiter
+/// check (run *before* each child) can't: there is no next child to run it
+/// against when the stray comma is the container's very last token.
+fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
+    let mut i = gap_start;
+    while i < text.len() {
+        match text[i] {
+            b if b.is_ascii_whitespace() => i += 1,
+            b if b == close_char => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Cheap end position (one past the last byte) of an already-resolved
+/// scalar `value` known to start at `start` -- `None` for a container,
+/// which [`trailing_gap_ok`]'s callers treat as "can't determine, skip"
+/// (matching `src/bin/succinctly/jq_runner.rs`'s own `scalar_end_pos`: a
+/// container's own last child might have arbitrary trailing whitespace
+/// before its closing bracket, so this is deliberately deferred rather than
+/// mistracked).
+fn scalar_end_pos<W: AsRef<[u64]> + Clone>(
+    start: usize,
+    value: &StandardJson<'_, W>,
+) -> Option<usize> {
+    match value {
+        StandardJson::String(s) => Some(start + s.raw_bytes().len()),
+        StandardJson::Number(n) => Some(start + n.raw_bytes().len()),
+        StandardJson::Bool(true) => Some(start + 4),
+        StandardJson::Bool(false) => Some(start + 5),
+        StandardJson::Null => Some(start + 4),
+        StandardJson::Array(_) | StandardJson::Object(_) | StandardJson::Error(_) => None,
+    }
+}
+
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     type Value = StandardJson<'a, W>;
 
@@ -2080,32 +2125,84 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         JsonCursor::cursor_at_position(self, line, col)
     }
 
+    /// #1576: pretty/sort-capable, unlike before -- compact+unsorted+
+    /// `Preserve` still takes the cheap verbatim-echo path below (a raw copy
+    /// beats re-walking the tree, and it's already atomic: one `write_str`
+    /// call, nothing to buffer), everything else recurses through
+    /// [`stream_json_pretty`]. `JqCompat` always recurses, even when
+    /// compact: reformatting a number literal (`format_number_jq_compat`)
+    /// is a per-node decision the whole-value echo can't make, regardless
+    /// of indentation.
+    ///
+    /// The recursing branch buffers into a local `String` and only copies
+    /// to `out` once `stream_json_pretty` fully succeeds (#1576 review):
+    /// unlike `YamlCursor`'s own `stream_json`, which streams straight to
+    /// `out` and accepts a partial prefix on a later structural failure as
+    /// a settled yq-mode trade (`stream_maybe_colored`'s own doc comment,
+    /// #1641/#1679), real jq's own architecture parses a document fully
+    /// before printing any of it -- confirmed live: `jq -c .` on
+    /// `[1,2,,]` prints nothing at all before erroring, not `[1,2`. This
+    /// cursor is jq's own JSON writer (unlike `YamlCursor`, which serves
+    /// both jq's and yq's JSON-target output), so it needs to match that
+    /// per-value atomicity, not YAML's. The buffer costs one value's worth
+    /// of memory, not the whole stream's: `.[]`'s own multiple top-level
+    /// results still call this once per element (`GenericResult::
+    /// stream_json`'s `ManyCursor` arm), so an earlier successfully-
+    /// written result stays on `out` even when a later one fails --
+    /// matching real jq's own non-atomic-*across*-results streaming.
     #[inline]
     fn stream_json<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
+        numbers: JsonConvention,
     ) -> StreamResult {
-        // Compact only: echo the raw bytes verbatim, since they're already
-        // valid JSON. Indented (pretty) JSON->JSON streaming isn't
-        // implemented here — callers fall back to the DOM path (#442 only
-        // extended the YAML-target and YAML-cursor-to-JSON pretty paths).
-        // `sort_keys` isn't implemented here either: `jq`'s own M2 gate
-        // (src/bin/succinctly/jq_runner.rs) excludes `-S` independently of
-        // this trait, so this is never reached with `sort_keys: true` today.
-        // Guard it explicitly so a future gate relaxation fails safe (falls
-        // back to the DOM path) instead of silently emitting unsorted keys.
-        if !indent.is_compact() || sort_keys {
+        if indent.is_compact() && !sort_keys && numbers == JsonConvention::Preserve {
+            if let Some(bytes) = self.raw_bytes() {
+                // SAFETY: JSON input is valid UTF-8 (checked during indexing)
+                let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
+                return Ok(out.write_str(s)?);
+            }
             return Err(StreamFailure::Fmt);
         }
-        if let Some(bytes) = self.raw_bytes() {
-            // SAFETY: JSON input is valid UTF-8 (checked during indexing)
-            let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
-            Ok(out.write_str(s)?)
-        } else {
-            Err(StreamFailure::Fmt)
+        // #1676 review: a stray `,` in an *apparently* empty container
+        // (`{,}`, `[,]`) has no child cursor at all for `stream_json_pretty`
+        // to find and check a delimiter against -- `JsonFields`/
+        // `JsonElements` carry only "the first child's cursor, or `None`",
+        // nothing for the empty case to compare its own text against. This
+        // cursor is the only place in the call chain that still has the
+        // container's own opening-bracket position for that comparison, so
+        // the check runs here, once, before recursing.
+        let value = self.value();
+        if matches!(
+            value,
+            StandardJson::Object(fields) if fields.is_empty()
+        ) || matches!(
+            value,
+            StandardJson::Array(elements) if elements.is_empty()
+        ) {
+            if let (Some(pos), Some(bytes)) = (self.text_position(), self.raw_bytes()) {
+                let close = bytes[bytes.len() - 1];
+                if !trailing_gap_ok(self.text(), pos + 1, close) {
+                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                        self.text(),
+                    )));
+                }
+            }
         }
+        let mut buf = String::new();
+        stream_json_pretty(
+            &mut buf,
+            value,
+            0,
+            indent.width,
+            indent.unit,
+            sort_keys,
+            numbers,
+            0,
+        )?;
+        Ok(out.write_str(&buf)?)
     }
 
     #[inline]
@@ -2126,10 +2223,61 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
 
+    /// Known gap (#1576 review, not fixed in this change): a structurally
+    /// invalid number (`1.2.3`) that `write_json_number`
+    /// (`JsonConvention::JqCompat`) sanitizes to `null` in *output* is not
+    /// reported as falsy *here*, since this checks `self.value()`'s own
+    /// source type (`StandardJson::Number`, not `Null`) with no access to
+    /// which `JsonConvention` the caller is about to render it under --
+    /// `--preserve-input`/`Preserve` echoes the same value unsanitized
+    /// (still a `Number`, correctly truthy), so this can't simply treat
+    /// every invalid number as falsy unconditionally either. `-e` on `.a`
+    /// over `{"a": 1.2.3}` therefore exits 0 via this cursor-streaming
+    /// path where the older `to_owned`-based materializing path (still
+    /// used whenever `can_json_fast_path` excludes a query, e.g. `-S`)
+    /// already correctly exits 1 -- an internal inconsistency between the
+    /// two paths, not a new divergence from real jq (which hard-rejects
+    /// `1.2.3` as a parse error, already a separate, documented gap, #966).
+    /// Fixing it properly needs `JsonConvention` threaded into
+    /// `is_falsy`'s signature, a wider, cross-cutting change affecting
+    /// `YamlCursor` too for a narrow combination (`-e` + a malformed
+    /// number + default `jq_compat`); tracked as a follow-up rather than
+    /// folded into this change.
     #[inline]
     fn is_falsy(&self) -> bool {
         // A value is falsy if it's null or false
         matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
+    }
+
+    /// #1576: `JsonCursor` now implements both `stream_sequence_*` methods
+    /// below (JSON only -- `stream_sequence_yaml` stays at the trait
+    /// default; JSON->YAML sequence streaming is a separate, unimplemented
+    /// gap, tracked as a follow-up rather than folded into this issue), so a
+    /// `LazySeq` whose elements are all still cursors renders straight from
+    /// the source document rather than through an `OwnedValue::Array`,
+    /// matching what #757 already did for `YamlCursor`.
+    #[inline]
+    fn supports_sequence_streaming() -> bool {
+        true
+    }
+
+    #[inline]
+    fn stream_sequence_json<Out: core::fmt::Write>(
+        cursors: &[Self],
+        out: &mut Out,
+        indent: IndentSpec,
+        sort_keys: bool,
+        numbers: JsonConvention,
+    ) -> StreamResult {
+        stream_json_sequence(
+            cursors,
+            out,
+            0,
+            indent.width,
+            indent.unit,
+            sort_keys,
+            numbers,
+        )
     }
 }
 
@@ -2426,6 +2574,435 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
             None => EvalError::new("Invalid JSON text"),
         }
     }
+}
+
+// ============================================================================
+// JSON to JSON Streaming Helpers (#1576)
+// ============================================================================
+
+/// Stream a JSON value as (pretty- or compact-, sorted- or unsorted-) JSON,
+/// without materializing an `OwnedValue` -- the pretty-capable counterpart
+/// [`JsonCursor::stream_json`] falls back to for anything but the
+/// compact+unsorted+`Preserve` case, which echoes raw source bytes instead
+/// (cheaper than re-walking the tree to reproduce them unchanged).
+///
+/// Structurally mirrors [`stream_json_as_yaml`] above (and
+/// `YamlCursor::stream_json_value` in `src/yaml/light.rs`, #757's own
+/// pretty-capable cursor writer): thread `current_indent`/`indent_spaces`/
+/// `unit`/`sort_keys` down through the recursion, write `,`/newline+indent
+/// between entries only when `indent_spaces > 0`, collect-and-sort object
+/// fields only when `sort_keys`. Simpler than both siblings in one respect:
+/// JSON has no tags, aliases or per-position scalar-type resolution to
+/// worry about, so this recurses on plain [`StandardJson`] values (not
+/// cursors) exactly like [`stream_json_as_yaml`] does.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors stream_owned_value_json_with_at_depth's own suppression; every param is threaded through this function's own recursion.
+fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    out: &mut Out,
+    value: StandardJson<'_, W>,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    numbers: JsonConvention,
+    depth: usize,
+) -> StreamResult {
+    // #1576 review: this writer recurses on plain values, not through
+    // `to_owned_at_depth`/`to_owned_cursor_at_depth`, so it doesn't get
+    // either of those functions' own `assert_nesting_depth` guard for
+    // free. Matches `print_json`'s own choice (`src/bin/succinctly/
+    // jq_runner.rs`, its own doc comment explains why in detail) rather
+    // than `to_owned_at_depth`'s: this writer, like `print_json`, already
+    // streams partial output before a leaf can fail, so a catchable error
+    // is required, not a panic -- and `MAX_VALUE_TREE_DEPTH` (384), not
+    // the narrower `MAX_NESTING_DEPTH` (256), is the ceiling every other
+    // value-tree consumer (including `print_json`) uses for exactly this
+    // reason (#1819).
+    if depth >= MAX_VALUE_TREE_DEPTH {
+        return Err(StreamFailure::Decode(EvalError::new(
+            nesting_depth_exceeded_message(MAX_VALUE_TREE_DEPTH),
+        )));
+    }
+    match value {
+        StandardJson::Null => Ok(out.write_str("null")?),
+        StandardJson::Bool(b) => Ok(out.write_str(if b { "true" } else { "false" })?),
+        StandardJson::Number(n) => Ok(write_json_number(out, n, numbers)?),
+        StandardJson::String(s) => write_json_string_pretty(out, s, numbers),
+        StandardJson::Array(elements) => {
+            if elements.is_empty() {
+                return Ok(out.write_str("[]")?);
+            }
+            out.write_char('[')?;
+            let next_indent = current_indent + indent_spaces;
+            let mut first = true;
+            let mut rest = elements;
+            // Tracks the last *scalar* element's own end position, for the
+            // trailing-comma check after the loop (`[1,2,]`) -- `None` once
+            // a container element is seen, matching `scalar_end_pos`'s own
+            // deferral (see its doc comment).
+            let mut last_scalar_end: Option<(&[u8], usize)> = None;
+            // Cursor-yielding `uncons_cursor`, not the plain value
+            // `Iterator`/`IntoIterator` impl: #1677's missing/doubled
+            // `,` check needs each element's own `text_position()`, which
+            // only the cursor carries -- `to_owned_at_depth`'s identical
+            // array arm (`eval_generic.rs`) is the precedent this mirrors.
+            while let Some((elem_cursor, next)) = rest.uncons_cursor() {
+                if !first {
+                    out.write_char(',')?;
+                }
+                last_scalar_end = None;
+                if let Some(pos) = elem_cursor.text_position() {
+                    let expected = if first { None } else { Some(b',') };
+                    if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                        return Err(StreamFailure::Decode(
+                            elem_cursor.malformed_delimiter_error(),
+                        ));
+                    }
+                    let elem_value = elem_cursor.value_at(pos);
+                    last_scalar_end =
+                        scalar_end_pos(pos, &elem_value).map(|end| (elem_cursor.text(), end));
+                }
+                first = false;
+                rest = next;
+                if indent_spaces > 0 {
+                    out.write_char('\n')?;
+                    write_json_indent(out, next_indent, unit)?;
+                }
+                stream_json_pretty(
+                    out,
+                    elem_cursor.value(),
+                    next_indent,
+                    indent_spaces,
+                    unit,
+                    sort_keys,
+                    numbers,
+                    depth + 1,
+                )?;
+            }
+            // #1676: a trailing `,` (`[1,2,]`) -- deferred (not checked) when
+            // the last element is itself a container, matching
+            // `scalar_end_pos`'s own precedent.
+            if let Some((text, gap_start)) = last_scalar_end {
+                if !trailing_gap_ok(text, gap_start, b']') {
+                    return Err(StreamFailure::Decode(EvalError::malformed_json_text(text)));
+                }
+            }
+            if indent_spaces > 0 {
+                out.write_char('\n')?;
+                write_json_indent(out, current_indent, unit)?;
+            }
+            Ok(out.write_char(']')?)
+        }
+        StandardJson::Object(fields) => {
+            if fields.is_empty() {
+                return Ok(out.write_str("{}")?);
+            }
+            // `effective_fields_checked` (`src/jq/document.rs`) is the
+            // validating sibling of `effective_fields` this writer used to
+            // call (#1576 review): besides applying the mode's own
+            // `COLLAPSE_DUPLICATE_KEYS` rule the same way (true for jq --
+            // a repeated key collapses to one field, first position, last
+            // value, exactly `IndexMap::insert` semantics; false for
+            // `--preserve-input`/yq, every occurrence kept, real yq's own
+            // behavior #1008 -- the same axis `numbers` already selects,
+            // ADR-0018 rule 5, so `JqCompat` doubles as the collapse flag
+            // here too), it also runs the same `key_is_malformed`/
+            // `key_delimiter_ok`/`value_delimiter_ok`/`ends_unpaired`
+            // checks `to_owned_at_depth`'s own object loop performs --
+            // closing the #1194 (bareword/non-string key) and #1677/#1676
+            // (missing/doubled `,`/`:`) gaps this writer used to have.
+            let mut items = effective_fields_checked(&fields, numbers == JsonConvention::JqCompat)
+                .map_err(StreamFailure::Decode)?;
+            // #1676: a trailing `,` (`{"a":1,}`) -- `effective_fields_checked`
+            // (and its own `ends_unpaired` check) only catches an *unpaired*
+            // trailing key (`{"a":1,"b"}`), not a dangling comma after a
+            // complete pair, since `uncons` simply stops at the last real
+            // field either way.
+            //
+            // Deliberately re-walks `fields` (unchecked -- delimiters are
+            // already known good from `effective_fields_checked` above) for
+            // the *true* last field in raw source/cursor order, rather than
+            // using `items.last()`: when `collapse` is true, `items` is
+            // `effective_fields_checked`'s already-collapsed, first-
+            // position-ordered result, whose own last entry can be a
+            // *earlier* duplicate key's position in the source text --
+            // `{"b":1,"a":2,"b":3}` collapses to `[b, a]` for `items`, but
+            // `a`'s value in the source is followed by `,"b":3}`, not `}`,
+            // so checking `items.last()` there would misfire on a
+            // perfectly well-formed document. The raw last field is always
+            // the right one to check regardless of collapsing, since a
+            // trailing comma is a property of the source text's own tail,
+            // not of whichever field ends up last in the display order.
+            let mut last_raw_field = None;
+            let mut raw_walk = fields;
+            while let Some((field, rest)) = raw_walk.uncons() {
+                last_raw_field = Some(field);
+                raw_walk = rest;
+            }
+            if let Some(last) = last_raw_field {
+                let last_value_cursor = last.value_cursor();
+                if let Some(pos) = last_value_cursor.text_position() {
+                    if let Some(end) = scalar_end_pos(pos, &last.value()) {
+                        if !trailing_gap_ok(last_value_cursor.text(), end, b'}') {
+                            return Err(StreamFailure::Decode(EvalError::malformed_json_text(
+                                last_value_cursor.text(),
+                            )));
+                        }
+                    }
+                }
+            }
+            out.write_char('{')?;
+            let next_indent = current_indent + indent_spaces;
+            let mut first = true;
+            if sort_keys {
+                // Sort by the *decoded* key, matching `-S`'s meaning
+                // everywhere else in this codebase (`write_object_entries`
+                // in `src/jq/stream.rs`, `YamlCursor::stream_json_value` in
+                // `src/yaml/light.rs`) -- not by the raw source span, which
+                // could disagree with decoded order for an escaped key.
+                let mut keyed = Vec::with_capacity(items.len());
+                for field in items {
+                    let StandardJson::String(k) = field.key else {
+                        // `effective_fields_checked` already refused any
+                        // key that isn't a well-formed `String` token
+                        // (#1194's `key_is_malformed`), so this is
+                        // unreachable in practice, matching
+                        // `stream_json_as_yaml`'s own key arm.
+                        keyed.push((String::new(), field));
+                        continue;
+                    };
+                    let key_str = k.as_str().map_err(json_decode_failure)?;
+                    keyed.push((key_str.into_owned(), field));
+                }
+                keyed.sort_by(|a, b| a.0.cmp(&b.0));
+                items = keyed.into_iter().map(|(_, field)| field).collect();
+            }
+            for field in items {
+                if !first {
+                    out.write_char(',')?;
+                }
+                first = false;
+                if indent_spaces > 0 {
+                    out.write_char('\n')?;
+                    write_json_indent(out, next_indent, unit)?;
+                }
+                if let StandardJson::String(k) = field.key {
+                    write_json_string_pretty(out, k, numbers)?;
+                } else {
+                    out.write_str("\"\"")?;
+                }
+                out.write_str(if indent_spaces > 0 { ": " } else { ":" })?;
+                stream_json_pretty(
+                    out,
+                    field.value,
+                    next_indent,
+                    indent_spaces,
+                    unit,
+                    sort_keys,
+                    numbers,
+                    depth + 1,
+                )?;
+            }
+            if indent_spaces > 0 {
+                out.write_char('\n')?;
+                write_json_indent(out, current_indent, unit)?;
+            }
+            Ok(out.write_char('}')?)
+        }
+        // Unlike `stream_json_as_yaml`'s identical-looking arm below (a
+        // pre-existing, unrelated writer this fix intentionally leaves
+        // alone), silently substituting `null` here is a real regression
+        // for this writer specifically (#1576 review): before this writer
+        // existed, every `map`/`sort`/etc. result reached `to_owned_cursor`
+        // (via the `OwnedValue::Array` fallback), which already raises a
+        // proper `#1194`-class diagnostic for a structurally malformed
+        // member/element (confirmed live: `map(.)` on
+        // `[1, {"bad": xyz123}]` reports "unexpected character" and exits
+        // 5 through that path) -- `map(.)` never used to silently emit
+        // `null` for this, so this writer must not start doing that either
+        // now that it renders `map`'s cursors directly. `EvalError::new`
+        // with `msg` isn't as specific as `to_owned_cursor`'s own
+        // `malformed_member_error`/`malformed_element_error` (this writer
+        // recurses on plain values, not cursors+fields, so that richer
+        // context isn't available here) -- but a real error is what
+        // matters: the caller (`GenericResult::stream_json`'s `LazySeq`
+        // arm) discards this writer's own partial output rather than the
+        // whole document silently reading back as valid JSON with a
+        // fabricated `null`.
+        StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::new(msg))),
+    }
+}
+
+/// Write a JSON string value using `numbers`'s escaping convention
+/// (`write_json_body_jq`/`write_json_body_yq`).
+///
+/// Zero-copy fast path, mirroring `src/bin/succinctly/jq_runner.rs`'s own
+/// `print_json`: a span with no `\` escape needs no re-encoding under
+/// *either* convention (both tables agree on every byte that can appear
+/// unescaped in valid JSON source, DEL included -- see `print_json`'s own
+/// long-standing identical choice not to special-case it), so it's echoed
+/// verbatim, quotes and all.
+fn write_json_string_pretty<Out: core::fmt::Write>(
+    out: &mut Out,
+    s: JsonString<'_>,
+    numbers: JsonConvention,
+) -> StreamResult {
+    let (raw, escaped) = s.raw_and_escaped();
+    // Unlike `print_json`'s own zero-copy check (`std::io::Write`, which
+    // passes bytes through unvalidated), this writer is `core::fmt::Write`
+    // -- a `str`-oriented trait -- so invalid UTF-8 in an unescaped span
+    // can't just be blasted through. Falling through to the decode-and-
+    // escape path below on that specific failure (rather than surfacing a
+    // bare `core::fmt::Error` right here) keeps this a proper diagnosable
+    // decode failure via `json_decode_failure`, matching #1615 -- not a
+    // second, worse way for the same class of bad input to go undiagnosed.
+    if !escaped {
+        if let Ok(text) = core::str::from_utf8(raw) {
+            return Ok(out.write_str(text)?);
+        }
+    }
+    let decoded = s.as_str().map_err(json_decode_failure)?;
+    out.write_char('"')?;
+    match numbers {
+        JsonConvention::Preserve => write_json_body_yq(out, &decoded)?,
+        JsonConvention::JqCompat => write_json_body_jq(out, &decoded)?,
+    }
+    Ok(out.write_char('"')?)
+}
+
+/// Write a JSON number literal per `numbers`'s convention -- `Preserve`
+/// echoes the source spelling verbatim (#1008, matching
+/// `real_output_finite_literal` in `src/jq/stream.rs`); `JqCompat`
+/// canonicalizes it via `format_number_jq_compat`, matching real jq's own
+/// reader/writer and the jq CLI's existing non-streaming `print_json`
+/// (`formatter.format_raw_number`, `src/bin/succinctly/output.rs`).
+///
+/// JSON source numbers are always finite (the grammar has no NaN/Infinity
+/// literal), unlike `OwnedValue`'s `NumberLiteral`, which can hold a
+/// *computed* infinite/NaN float from arithmetic -- so this needs none of
+/// `stream_owned_value_json_with`'s infinite-value handling.
+///
+/// #1576 review: mirrors `JqCompatFormatter`/`PreserveFormatter::
+/// format_raw_number` (`src/bin/succinctly/jq_runner.rs`) exactly, rather
+/// than the narrower `is_valid_number`-only gate an earlier revision of
+/// this function used -- that gate rejected a leading-dot span (`.500`)
+/// outright, where real jq (and this crate's own `print_json`) accepts it
+/// (`.500` -> `0.500`, #1171) via `OwnedValue::from_number_bytes`'s own
+/// prepend-`0`-and-reparse leniency. `Preserve` doesn't validate at all
+/// (`PreserveFormatter`'s own contract: echo the source spelling
+/// unconditionally, matching real yq's #1008 convention even for text
+/// that isn't a valid number at all); only `JqCompat` needs the fallback
+/// chain, since only it ever reformats.
+fn write_json_number<Out: core::fmt::Write>(
+    out: &mut Out,
+    n: JsonNumber<'_>,
+    numbers: JsonConvention,
+) -> core::fmt::Result {
+    let raw = n.raw_bytes();
+    match numbers {
+        JsonConvention::Preserve => {
+            let text = core::str::from_utf8(raw).map_err(|_| core::fmt::Error)?;
+            out.write_str(text)
+        }
+        JsonConvention::JqCompat => {
+            if crate::json::validate::is_valid_number(raw) {
+                return out.write_str(&format_number_jq_compat(raw));
+            }
+            // #966/#1171: the semi-index scanner accepts a number *span*
+            // more leniently than RFC 8259 (leading zeros, a leading dot,
+            // a malformed trailing shape like `1.2.3`). Sanitize via the
+            // same fallback every other "raw bytes -> number" conversion
+            // in this crate uses, instead of reformatting invalid text.
+            match OwnedValue::from_number_bytes(raw) {
+                OwnedValue::Int(i) => write!(out, "{i}"),
+                OwnedValue::Float(f) => {
+                    if f.is_finite() {
+                        write!(out, "{f}")
+                    } else {
+                        out.write_str(nonfinite_display_string::<JqSemantics>(f))
+                    }
+                }
+                // A leading-dot span (`.5`, `-.5`): `from_number_bytes`
+                // preserves its spelling as a `NumberLiteral` here instead
+                // of degrading to a plain `Float`, so trailing zeros
+                // survive (`.500` -> `0.500`, not `0.5`) -- route it
+                // through the same jq-compat reformatting a strictly-valid
+                // span gets above, via the literal's own text.
+                OwnedValue::NumberLiteral(_, literal) => {
+                    out.write_str(&format_number_jq_compat(literal.as_bytes()))
+                }
+                _ => out.write_str("null"),
+            }
+        }
+    }
+}
+
+/// Stream `cursors` as a single JSON array, one element per cursor, without
+/// materializing an `OwnedValue` for any of them (#1576, mirroring #757's
+/// `stream_json_sequence`/`stream_yaml_sequence` in `src/yaml/light.rs`).
+///
+/// Each cursor renders via its own `.value()` through [`stream_json_pretty`]
+/// -- cursors need not be siblings or share an index, since this is what
+/// renders a `map` chain's drained output (`LazySeq::drain_atomic`), where
+/// each element is wherever its own sub-expression navigated to.
+fn stream_json_sequence<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
+    cursors: &[JsonCursor<'_, W>],
+    out: &mut Out,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+    numbers: JsonConvention,
+) -> StreamResult {
+    if cursors.is_empty() {
+        return Ok(out.write_str("[]")?);
+    }
+    out.write_char('[')?;
+    let next_indent = current_indent + indent_spaces;
+    let mut first = true;
+    for cursor in cursors {
+        if !first {
+            out.write_char(',')?;
+        }
+        first = false;
+        if indent_spaces > 0 {
+            out.write_char('\n')?;
+            write_json_indent(out, next_indent, unit)?;
+        }
+        stream_json_pretty(
+            out,
+            cursor.value(),
+            next_indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            numbers,
+            // Each cursor is its own independent root (#757's own
+            // reasoning: "cursors need not be siblings"), so depth restarts
+            // at 0 per element -- matching `JsonCursor::stream_json`'s own
+            // top-level call, not a continuation of some shared ancestry.
+            0,
+        )?;
+    }
+    if indent_spaces > 0 {
+        out.write_char('\n')?;
+        write_json_indent(out, current_indent, unit)?;
+    }
+    Ok(out.write_char(']')?)
+}
+
+/// Write `spaces` copies of `unit` -- the JSON-to-JSON pretty writer's own
+/// indent primitive, distinct from [`write_json_yaml_indent`] below (which
+/// is JSON-to-*YAML*'s and always uses a space, since `JsonCursor::stream_yaml`
+/// doesn't honor `--tab` either -- see its own doc comment).
+fn write_json_indent<Out: core::fmt::Write>(
+    out: &mut Out,
+    spaces: usize,
+    unit: char,
+) -> core::fmt::Result {
+    for _ in 0..spaces {
+        out.write_char(unit)?;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -2896,27 +3473,36 @@ mod tests {
         assert_eq!(root.bp_position(), 0);
     }
 
-    // #749: `JsonCursor::stream_json`/`stream_yaml` don't implement
-    // `sort_keys` (they echo raw bytes / delegate to `stream_json_as_yaml`,
-    // neither of which reorders keys). Both must error rather than silently
-    // emit unsorted output, so a caller falls back to the DOM path instead
-    // of getting wrong output with no error.
+    // #1576: `JsonCursor::stream_json` now implements `sort_keys` (via
+    // `stream_json_pretty`'s `effective_fields`-then-sort, mirroring
+    // `YamlCursor::stream_json_value`); `stream_yaml` still doesn't --
+    // see `test_stream_yaml_rejects_sort_keys` just below, unchanged.
     #[test]
-    fn test_stream_json_rejects_sort_keys() {
+    fn test_stream_json_sort_keys_1576() {
         let json = br#"{"b": 1, "a": 2}"#;
         let index = JsonIndex::build(json);
         let root = index.root(json);
 
         let mut out = String::new();
-        assert!(root
-            .stream_json(&mut out, IndentSpec::COMPACT, true)
-            .is_err());
+        root.stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            true,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
+        assert_eq!(out, r#"{"a":2,"b":1}"#);
 
-        // sort_keys: false on the same input still takes the normal path.
+        // sort_keys: false on the same input still takes the normal
+        // (compact, raw-echo) path, order unchanged.
         out.clear();
-        assert!(root
-            .stream_json(&mut out, IndentSpec::COMPACT, false)
-            .is_ok());
+        root.stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
         assert_eq!(out, r#"{"b": 1, "a": 2}"#);
     }
 
@@ -4120,19 +4706,16 @@ mod tests {
         }
     }
 
-    /// #757: `JsonCursor` takes `DocumentCursor`'s three `stream_sequence_*`
-    /// defaults, which is what makes `GenericResult::stream_json`/`stream_yaml`'s
-    /// `LazySeq` arms fall back to materializing an `OwnedValue::Array` for JSON
-    /// instead of streaming from cursors.
-    ///
-    /// Both halves are pinned, because they protect different things. The probe
-    /// answering `false` is what keeps the two writers below from ever being
-    /// called; the writers failing *before writing anything* is what makes the
-    /// fallback safe if a future caller ever skips the probe. Without the second
-    /// half, dropping the probe would silently emit a partial value and then
-    /// error, with no way to unwrite it.
+    /// #1576: `JsonCursor` now implements `stream_sequence_json` (JSON
+    /// output only -- `stream_sequence_yaml`, JSON cursors rendered as a
+    /// YAML sequence, stays at the trait default and is pinned declining
+    /// below, a real gap tracked as a follow-up rather than folded into
+    /// this issue), which is what lets `GenericResult::stream_json`'s
+    /// `LazySeq` arm stream straight from cursors for JSON instead of
+    /// always materializing an `OwnedValue::Array`, mirroring what #757
+    /// already did for `YamlCursor`.
     #[test]
-    fn test_json_cursor_declines_sequence_streaming_757() {
+    fn test_json_cursor_streams_sequence_json_1576() {
         let json = br#"[{"a": 1}, {"b": 2}]"#;
         let index = JsonIndex::build(json);
         let root = index.root(json);
@@ -4142,18 +4725,52 @@ mod tests {
         let cursors = [first, second];
 
         assert!(
-            !<JsonCursor<'_, Vec<u64>> as DocumentCursor>::supports_sequence_streaming(),
-            "JsonCursor has no sequence writer; the probe must say so"
+            <JsonCursor<'_, Vec<u64>> as DocumentCursor>::supports_sequence_streaming(),
+            "JsonCursor has a sequence writer now; the probe must say so"
         );
 
-        for indent in [IndentSpec::COMPACT, IndentSpec::spaces(2)] {
-            let mut out = String::new();
-            assert!(
-                JsonCursor::stream_sequence_json(&cursors, &mut out, indent, false).is_err(),
-                "the default must decline, not half-write"
-            );
-            assert!(out.is_empty(), "nothing may reach `out`: {out:?}");
+        let mut out = String::new();
+        JsonCursor::stream_sequence_json(
+            &cursors,
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
+        assert_eq!(out, r#"[{"a":1},{"b":2}]"#);
 
+        let mut out = String::new();
+        JsonCursor::stream_sequence_json(
+            &cursors,
+            &mut out,
+            IndentSpec::spaces(2),
+            false,
+            JsonConvention::Preserve,
+        )
+        .unwrap();
+        assert_eq!(out, "[\n  {\n    \"a\": 1\n  },\n  {\n    \"b\": 2\n  }\n]");
+    }
+
+    /// `stream_sequence_yaml` (JSON cursors rendered as a YAML sequence)
+    /// stays at the `DocumentCursor` trait default -- out of #1576's scope
+    /// (JSON output only). Pinned the same way #757's original test pinned
+    /// both writers: the writer failing *before writing anything* is what
+    /// makes a future caller safe if it ever skips
+    /// `supports_sequence_streaming`'s probe -- but that probe itself now
+    /// answers `true` (see the JSON test above), so a caller that skips it
+    /// only to reach this arm would already be doing something else wrong.
+    #[test]
+    fn test_json_cursor_declines_sequence_streaming_yaml_757() {
+        let json = br#"[{"a": 1}, {"b": 2}]"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let elements = root.value().as_array().unwrap();
+        let (first, rest) = elements.uncons_cursor().unwrap();
+        let (second, _) = rest.uncons_cursor().unwrap();
+        let cursors = [first, second];
+
+        for indent in [IndentSpec::COMPACT, IndentSpec::spaces(2)] {
             let mut out = String::new();
             assert!(
                 JsonCursor::stream_sequence_yaml(&cursors, &mut out, indent, false).is_err(),
