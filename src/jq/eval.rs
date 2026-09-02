@@ -26937,6 +26937,31 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         Expr::Builtin(Builtin::ToString) => {
             Some(Ok(Some(OwnedValue::String(owned_to_string::<S>(input)))))
         }
+        // #2086: `. + <literal>` (the common string/number-accumulator
+        // shape a `reduce`/`foreach`/`until`/`while` UPDATE body takes,
+        // `$x` already folded into a `Literal` by `substitute_vars` before
+        // this ever runs) would otherwise fall through to the general
+        // evaluator below, which round-trips the *whole* accumulator
+        // through `to_json_for_reindex` + `JsonIndex::build` every single
+        // step -- O(current size) of avoidable serialize/parse work per
+        // step, compounding into O(n^2) over a growing accumulator.
+        Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
+            match right.as_ref() {
+                Expr::Literal(lit) => {
+                    match arith_combine::<S>(*op, input.clone(), literal_to_owned(lit)) {
+                        Ok(v) => Some(Ok(Some(v))),
+                        // Matches the `Field`/`Index` arms' own convention
+                        // above: a per-step `?` (`optional`, threaded down
+                        // from the fold construct's own trailing `?`)
+                        // suppresses this step's error to `None` rather
+                        // than propagating it.
+                        Err(_) if optional => Some(Ok(None)),
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                _ => None,
+            }
+        }
         Expr::Field(name) => Some(match input {
             OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
@@ -55715,6 +55740,61 @@ mod tests {
                 r"[foreach range(5001) as $x (0; .+$x; .)] | length"
             ),
             ["5001"]
+        );
+    }
+
+    #[test]
+    fn test_2086_bare_arithmetic_fast_path_matches_general_evaluator() {
+        // #2086: `. + <literal>` (the shape `substitute_vars` reduces a
+        // fold's `$x`-bound UPDATE body to) now answers directly against
+        // the `OwnedValue` tree in `eval_owned_fast_path`, instead of
+        // round-tripping the whole accumulator through
+        // `to_json_for_reindex` + `JsonIndex::build` every step -- see
+        // that function's own doc comment. Every arm here is confirmed
+        // live against jq 1.7.1 to still agree byte-for-byte with the
+        // general evaluator's answer, not just internally consistent.
+        assert_eq!(
+            outputs(b"null", r#"reduce range(5) as $x (""; . + "a")"#),
+            [r#""aaaaa""#]
+        );
+        assert_eq!(outputs(b"null", r"reduce range(5) as $x (0; . + 1)"), ["5"]);
+        assert_eq!(
+            outputs(b"null", r"reduce range(5) as $x (10; . - 1)"),
+            ["5"]
+        );
+        assert_eq!(
+            outputs(b"null", r"reduce range(5) as $x (2; . * 2)"),
+            ["64"]
+        );
+        assert_eq!(
+            outputs(b"null", r"reduce range(3) as $x (100; . / 10)"),
+            ["0.1"]
+        );
+        assert_eq!(
+            outputs(b"null", r"reduce range(3) as $x (10; . % 3)"),
+            ["1"]
+        );
+    }
+
+    #[test]
+    fn test_2086_bare_arithmetic_fast_path_type_error_respects_optional() {
+        // #2086: the new fast-path arm must preserve the `Field`/`Index`
+        // arms' own established convention (this function's doc comment's
+        // "unobservable except in speed" contract) -- a per-step `?`
+        // (`optional`, threaded down from the fold construct's own
+        // trailing `?`) suppresses this step's error to `None` instead of
+        // propagating it, exactly like a `Field`/`Index` type mismatch
+        // already does. Both halves confirmed live against jq 1.7.1:
+        // unsuppressed errors, suppressed emits nothing (exit 0, no
+        // output).
+        query!(b"1", r#"reduce range(3) as $x (1; . + "a")"#,
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("cannot be added"));
+            }
+        );
+        assert_eq!(
+            outputs(b"null", r#"(reduce range(3) as $x (1; . + "a"))?"#),
+            Vec::<&str>::new()
         );
     }
 
