@@ -1669,14 +1669,17 @@ fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let (keys, key_trailing) = match &entry.key {
         ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
         ObjectKey::Expr(key_expr) => {
-            stream_outputs(eval_single::<W, S>(key_expr, value.clone(), optional))
+            // #2022: checked, not `stream_outputs` -- an undecodable computed
+            // key must raise, not silently materialize as `""`.
+            stream_outputs_checked(eval_single::<W, S>(key_expr, value.clone(), optional))
         }
     };
     let sole = sole && keys.len() == 1;
 
     for key in keys {
+        // #2022: same fix as the key slot above, for the value slot.
         let (vals, val_trailing) =
-            stream_outputs(eval_single::<W, S>(&entry.value, value.clone(), optional));
+            stream_outputs_checked(eval_single::<W, S>(&entry.value, value.clone(), optional));
         let sole = sole && vals.len() == 1;
 
         for val in vals {
@@ -9834,14 +9837,18 @@ fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
 /// Materialize a `\(...)` slot's own outputs as rendered strings, plus a
 /// deferred escape if its generator terminates in an error/break/halt.
 ///
-/// Reuses [`stream_outputs`] (already fully general -- it just unpacks a
-/// `QueryResult` into `(Vec<OwnedValue>, Option<Control>)` with no
+/// Reuses [`stream_outputs_checked`] (already fully general -- it just
+/// unpacks a `QueryResult` into `(Vec<OwnedValue>, Option<Control>)` with no
 /// object-specific coupling) and stringifies each output the same way a
 /// single-valued slot already did (`owned_to_string`).
+///
+/// #2022: checked, not the bare [`stream_outputs`] this used before -- an
+/// undecodable `\(...)` slot value must raise, not silently interpolate as
+/// `""`, matching the yq-mode single-value fast path #1972 already fixed.
 fn string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<String>, Option<Control>) {
-    let (values, control) = stream_outputs(result);
+    let (values, control) = stream_outputs_checked(result);
     (values.iter().map(owned_to_string::<S>).collect(), control)
 }
 
@@ -43624,6 +43631,72 @@ mod tests {
             br#"[1,2,"ok",4]"#,
             ".[:] == .[:]",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+    }
+
+    /// #2022: object construction's computed-key slot fed its key generator's
+    /// output through `stream_outputs` (bare `to_owned`, via `collect_owned`),
+    /// silently substituting `""` for an undecodable key instead of raising --
+    /// the same #1746/#1972 shape already fixed at the sibling call sites
+    /// above, unreachable here only because `stream_outputs` (not
+    /// `stream_outputs_checked`) was doing the folding.
+    #[test]
+    fn test_object_construction_key_raises_on_decode_failure_2022() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "{(.a): 1}",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        // Positive control: valid data is unaffected.
+        query!(
+            br#"{"a": "ok"}"#,
+            "{(.a): 1}",
+            QueryResult::Owned(OwnedValue::Object(map)) => {
+                assert_eq!(map.get("ok"), Some(&OwnedValue::Int(1)));
+            }
+        );
+    }
+
+    /// #2022 sibling: object construction's value slot had the identical bug
+    /// -- `{"k": .a}` on an undecodable `.a` silently produced `{"k":""}`.
+    #[test]
+    fn test_object_construction_value_raises_on_decode_failure_2022() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "{\"k\": .a}",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            br#"{"a": "ok"}"#,
+            "{\"k\": .a}",
+            QueryResult::Owned(OwnedValue::Object(map)) => {
+                assert_eq!(map.get("k"), Some(&OwnedValue::String("ok".into())));
+            }
+        );
+    }
+
+    /// #2022 sibling: jq-mode string interpolation (`string_part_outputs`,
+    /// distinct from the yq-mode single-value fast path #1972 already fixed
+    /// below) had the same bug for a multi-output `\(...)` slot.
+    #[test]
+    fn test_jq_string_interpolation_raises_on_slot_decode_failure_2022() {
+        query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            r#""\(.a)""#,
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+        query!(
+            br#"{"a": "ok"}"#,
+            r#""\(.a)""#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "ok");
+            }
         );
     }
 
