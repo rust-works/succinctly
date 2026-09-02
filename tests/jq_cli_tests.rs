@@ -32210,6 +32210,80 @@ fn test_slice_expr_later_target_error_preserves_earlier_output_2143() -> Result<
     Ok(())
 }
 
+/// #2225: `E[S:T]` compiles as `S as $s | T as $t | E | .[$s:$t]` -- `T`
+/// (the end bound) sits inside `S`'s own binding scope, so it must be
+/// re-evaluated fresh once per `s` value, the same way #2143 already fixed
+/// `E` relative to `(s, e)` pairs one nesting level deeper. `succinctly`
+/// used to evaluate `T` once overall and reuse it across every `s`, firing
+/// a side effect in `T` once instead of once per `s`. Verified against jq
+/// 1.7.1: `stderr` fires twice, once per start value.
+#[test]
+fn test_slice_expr_end_bound_reevaluated_once_per_start_2225() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[(.)[(0,1):(stderr|2)]]"], Some("[10,20,30]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[10,20],[20]]");
+    assert_eq!(stderr, "[10,20,30][10,20,30]");
+    Ok(())
+}
+
+/// #2225 sibling: an end bound that's genuinely empty for one `s` value
+/// must not short-circuit the *other* `s` values -- each `s`'s own `T`
+/// evaluation is now independent, unlike the old once-overall evaluation,
+/// where an empty `T` for any `s` made the whole slice look empty. `input`
+/// (an impure, stateful generator) is what makes `T` vary per
+/// re-evaluation here: for `s = 0` it reads `"skip"` and yields nothing;
+/// re-evaluating `input` for `s = 1` reads `3` and yields it, so `.[1:3]`
+/// still contributes `[20,30]`. Verified against jq 1.7.1 (identical
+/// output).
+#[test]
+fn test_slice_expr_one_empty_end_bound_does_not_short_circuit_others_2225() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "input as $a | $a[(0,1):(if (input)==\"skip\" then empty else . end)]",
+        ],
+        Some("[10,20,30]\n\"skip\"\n3\n"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[20,30]");
+    Ok(())
+}
+
+/// #2225 (review finding, confirmed live against jq 1.7.1): a later `s`
+/// value's own end-bound error must not discard values already produced by
+/// an earlier `s`'s successful slice -- the same "later step's error
+/// outranks an earlier already-produced prefix, which still survives as
+/// `Partial`" rule #2143 already established for `E`'s own per-pair
+/// escape. `input` makes `T` differ per `s`: `s = 0` reads `3` and
+/// succeeds (`.[0:3]` = `[10,20,30]`), `s = 1` reads `"boom"` and raises.
+#[test]
+fn test_slice_expr_later_end_bound_error_preserves_earlier_output_2225() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-cn",
+            "input as $a | $a[(0,1):(if (input)==\"boom\" then error(\"boom\") else . end)]",
+        ],
+        Some("[10,20,30]\n3\n\"boom\"\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[10,20,30]");
+    assert!(stderr.contains("boom"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// Regression guard: an ordinary, fully-independent cross product (every
+/// `(s, e)` pair a real value, no stateful generators involved) must be
+/// completely unaffected by moving the end bound's evaluation inside the
+/// start-value loop. Matches jq's own doc comment example verbatim.
+#[test]
+fn test_slice_expr_ordinary_cross_product_unaffected_2225() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "[.[(0,1):(3,4)]]"], Some("[1,2,3,4,5]"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[1,2,3],[1,2,3,4],[2,3],[2,3,4]]");
+    Ok(())
+}
+
 /// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
 /// expression, so real jq's single shared path register moves onto `.a`'s
 /// own position as a side effect of evaluating it -- and UPDATE's own

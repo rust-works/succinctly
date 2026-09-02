@@ -43,8 +43,8 @@ use super::eval::{
     is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
-    try_reserve_product, vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag,
-    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8075,6 +8075,23 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 /// folding them into `out`, not just discarding `prefix`; tracked
 /// separately (issue filed alongside this fix) since it's a pre-existing
 /// gap shared with `eval_index_expr`, not something #2143 introduces.
+///
+/// #2225: `T` (`end`) is *also* now re-evaluated fresh for every `s`, not
+/// once overall as an earlier revision of this doc comment claimed ("its
+/// own (prefix, escape) pair is identical on every notional re-run" — false
+/// whenever `T` involves a stateful generator like `input`, and jq's own
+/// desugaring puts `T` inside `S`'s binding scope for exactly this reason).
+/// Confirmed live against jq 1.7.1 with a stateful `T`
+/// (`input as $a | $a[(0,1):(input)]` fed two distinct bound values on
+/// stdin, one per `s`): each `s` gets its own fresh `T` result, not a
+/// shared one. An empty `T` for a given `s` contributes nothing for that
+/// `s` and moves on to the next one — not a whole-function short-circuit
+/// the way an entirely-empty `S` is (verified live: a `T` that's empty only
+/// for `s == 0` still lets `s == 1` run). A `T` that produces some values
+/// before escaping processes those first, then folds the running `out` in
+/// as the escape's prefix, same as every other per-iteration escape here
+/// (verified live: `.[0:(1,2,error("boom"))]` prints the slices for `1`
+/// and `2` before raising).
 fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -8083,24 +8100,12 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    // Bounds first: an empty start or end stream must not evaluate the
+    // Bounds first: an empty start stream must not evaluate `end` or the
     // target at all.
     //
     // #1528: keeps each bound generator's own partial prefix instead of
     // discarding it on escape (same fix #1517 applied to the path-mode
-    // resolver, re-derived here for value mode). jq compiles `E[S:T]` as
-    // `S as $s | T as $t | E | .[$s:$t]` -- `T` (end) is nested inside `S`
-    // (start)'s own iteration and re-run fresh for every `$s`, so a `T`
-    // escape fires before `S` ever gets a chance to expose its own
-    // (confirmed against jq 1.7.1: `.[(0,1):error("b")]` on `[10,20,30]`
-    // prints nothing before raising `b`). `ends_escape` therefore wins over
-    // `starts_escape` for what ultimately propagates, and `starts` truncates
-    // to its own first value whenever `ends` escaped -- `start`'s second
-    // value would only ever be tried after `end`'s *own* re-run for it
-    // completes, which never happens once `end` has already escaped once.
-    // `end` itself is computed once here (not re-run per `s`), which is
-    // still correct: it depends only on `value`, not `s`, so its own
-    // (prefix, escape) pair is identical on every notional re-run.
+    // resolver, re-derived here for value mode).
     let (starts, starts_escape) =
         match eval_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor) {
             Ok(v) => v,
@@ -8112,21 +8117,6 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
             Some(control) => partial_generic(Vec::new(), control),
         };
     }
-    let (ends, ends_escape) = match eval_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil)
-    {
-        Ok(v) => v,
-        Err(control) => return partial_generic(Vec::new(), control),
-    };
-    let ends_escaped = ends_escape.is_some();
-    let bounds_escape = ends_escape.or(starts_escape);
-    if ends.is_empty() {
-        return match bounds_escape {
-            None => GenericResult::None,
-            Some(control) => partial_generic(Vec::new(), control),
-        };
-    }
-    let starts_len = if ends_escaped { 1 } else { starts.len() };
-    let starts = &starts[..starts_len];
 
     // Borrowed and owned targets are kept apart so the common (borrowed) case
     // never materializes the document — mirrors `eval_index_expr`.
@@ -8137,33 +8127,23 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
 
     // Start outer, end middle, target inner (#2143: target is now
     // re-evaluated once per (s, e) pair, so it is genuinely the innermost
-    // stage, not just looped as if it were). The result is always owned:
-    // slicing constructs a fresh array/string, same invariant as
-    // `eval::eval_slice_expr`. This is the actual dispatch path for an
-    // ordinary `.[$s:$e]` CLI read (see the comment on `Expr::SliceExpr`'s
-    // own match arm above), so this site -- not `eval::eval_slice_expr`'s
-    // sibling -- is what a real `succinctly jq`/`succinctly yq` invocation
-    // hits.
+    // stage, not just looped as if it were). `end` (#2225) is now
+    // re-evaluated once per `s`, so it is genuinely nested inside `start`'s
+    // own binding scope too, not looped as if it were. The result is
+    // always owned: slicing constructs a fresh array/string, same
+    // invariant as `eval::eval_slice_expr`. This is the actual dispatch
+    // path for an ordinary `.[$s:$e]` CLI read (see the comment on
+    // `Expr::SliceExpr`'s own match arm above), so this site -- not
+    // `eval::eval_slice_expr`'s sibling -- is what a real
+    // `succinctly jq`/`succinctly yq` invocation hits.
     //
-    // `starts.len() * ends.len()` is still fully known before the loop --
-    // only the per-pair target count varies -- so `try_reserve_product`
-    // reserves that much upfront as a baseline (the common case is exactly
-    // one output per pair), recovering the single upfront allocation the
-    // pre-#2143 code made for that case instead of paying amortized-
-    // doubling reallocation/copy costs on every slice query; both `starts`
-    // and `ends` are already known non-empty here (the `is_empty` checks
-    // above), so this never takes the zero-factor fast-return arm. See
-    // `eval::eval_slice_expr`'s identical comment for why this reuses the
-    // existing helper rather than a bespoke inline check: it keeps the
-    // refusal path covered by that function's own existing unit tests
-    // instead of adding new, practically-untestable ones (constructing
-    // real `starts`/`ends` generator output long enough to organically
-    // overflow this product would first exhaust memory building the
-    // *inputs*, long before this reservation could ever run).
-    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
-        Ok(out) => out,
-        Err(e) => return GenericResult::Error(e),
-    };
+    // No upfront `starts.len() * ends.len()` reservation baseline anymore:
+    // `ends.len()` is no longer known until each `s` iteration evaluates
+    // `end`, so there is nothing fixed to reserve before the loop starts.
+    // The per-target `try_reserve` calls inside the loop still protect
+    // every real allocation; only the pre-#2225 upfront-baseline
+    // optimization is gone, not the overflow protection itself.
+    let mut out: Vec<OwnedValue> = Vec::new();
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms
@@ -8177,7 +8157,13 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         };
     }
 
-    for s in starts {
+    for s in &starts {
+        // #2225: `end` evaluated fresh for this `s`, not once overall.
+        let (ends, ends_escape) =
+            match eval_slice_bound::<S, V>(end, value.clone(), cursor, f64::ceil) {
+                Ok(v) => v,
+                Err(control) => escape!(control),
+            };
         for e in &ends {
             let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
                 GenericResult::Error(e) => escape!(Control::Error(e)),
@@ -8257,11 +8243,21 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         }
+        // #2225: this `s`'s own `end` evaluation may have produced some
+        // values before escaping (a break/halt/error partway through its
+        // own stream) -- fold the running `out` in as that escape's
+        // prefix, same as every other per-iteration escape above, rather
+        // than discarding it or deferring it past values a *later* `s`
+        // might still contribute.
+        if let Some(control) = ends_escape {
+            escape!(control);
+        }
     }
-    // #1528: the bound-escape info threaded through above still has to
-    // reach the final result -- a successful loop doesn't mean `start`/`end`
-    // themselves didn't escape after producing `out`'s own values.
-    match bounds_escape {
+    // #1528: `start`'s own trailing escape info still has to reach the
+    // final result -- a successful loop doesn't mean `start` itself didn't
+    // escape after producing `out`'s own values. `end`'s own escape is now
+    // handled per-`s` above (#2225), not here.
+    match starts_escape {
         // #1048: a zero-result collapse here (every (start, end) pair
         // optional-suppressed) must be `None`, not `ManyOwned(vec![])`.
         None => owned_vec_to_generic_result(out),
