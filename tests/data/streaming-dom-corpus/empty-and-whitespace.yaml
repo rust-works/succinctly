@@ -1,0 +1,4 @@
+empty_string: ""
+whitespace_string: "   "
+empty_obj: {}
+empty_arr: []

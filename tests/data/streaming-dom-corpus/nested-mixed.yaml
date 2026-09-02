@@ -1,0 +1,14 @@
+people:
+  - name: "Alice"
+    bio: |
+      line one
+      line two
+    tags: [admin, "power user"]
+  - name: 'Bob'
+    bio: >
+      a folded
+      paragraph.
+    tags: []
+meta:
+  created: !!str 2024
+  note: "unicode: café 😀"

@@ -1,0 +1,2 @@
+thing: !mytag some-value
+other: !<tag:example.com,2000:custom> value

@@ -1,0 +1,2 @@
+obj: {a: 1, b: [1, 2, 3], c: {nested: true}}
+arr: [1, "two", 3.0, null, true]

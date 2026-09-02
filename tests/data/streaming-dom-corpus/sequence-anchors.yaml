@@ -1,0 +1,5 @@
+colors: &colors
+  - red
+  - green
+  - blue
+favorite: *colors

@@ -463,6 +463,12 @@ binary; `--slurpfile` is a jq flag `succinctly yq` does not accept, and `-P -I0`
 because `-I0`'s own `compact` already satisfies the gate) —
 [#1982](https://github.com/rust-works/succinctly/issues/1982).
 
+`scripts/streaming-dom-diff.py` mechanizes the routing-divergence lesson above: it runs a
+corpus of documents through both output routes (forcing DOM via `--arg unused 1`, which
+changes nothing else about the output config) and reports which documents diverge, so a flag
+or filter under review can be checked against the pre-existing divergence set instead of
+requiring a reviewer to remember it ([#1994](https://github.com/rust-works/succinctly/issues/1994)).
+
 The `-I0` nesting bug that surfaced along the way was *wider* than `map`: any filter
 `can_use_m2_streaming` rejects (`to_entries`, `with_entries`, `walk`, `--arg`-bearing
 queries, ...) reached the DOM emitter with an empty per-level indent string at `-I0`,

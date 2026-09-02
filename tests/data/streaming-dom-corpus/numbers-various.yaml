@@ -1,0 +1,6 @@
+int: 42
+negative: -17
+float: 3.14159
+exponential: 1.5e10
+zero: 0
+big: 99999999999999999999
