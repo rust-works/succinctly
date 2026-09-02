@@ -41873,6 +41873,20 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
 /// the guard now fires at depth 40, again better than 6x -- consistent
 /// across an order of magnitude of width, so `MAX_EVAL_FRAMES` itself did
 /// not need to change, only the per-sibling charge.
+///
+/// **Corrected by its own code review, twice more (#2135).** The
+/// position-based charge above compounded unconditionally -- a genuine bug,
+/// not a refinement: an entirely ordinary, non-recursive call sitting late
+/// in a wide *one-shot* pipe or object (no recursion anywhere) spuriously
+/// tripped this guard purely from its own textual position. And
+/// `Expr::StringInterpolation` shares `Expr::Object`'s own non-tail
+/// per-part recursion shape but had been given no charging arm at all,
+/// leaving a real, uncaught stack overflow reachable. See
+/// [`sibling_frame_charge`]'s own doc comment for the full account of both
+/// and the fix (an explicit `in_recursive_body` flag, not `frames` itself,
+/// gates when width compounds) -- the bisected numbers just above are for
+/// the case that flag now confirms unchanged: a recursive call's own
+/// wrapping, still charged exactly as bisected here.
 pub(crate) const MAX_EVAL_FRAMES: u32 = 40_000;
 
 /// Evaluate one call to a user-defined function (#1371).
