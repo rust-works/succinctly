@@ -3682,25 +3682,24 @@ mod tests {
 
     // #1576 coverage: `write_json_number`'s `JqCompat` fallback chain. The
     // semi-index accepts a number *span* more leniently than RFC 8259, so a
-    // trailing-dot mantissa (`1.`) reaches `from_number_bytes`, which parses
-    // it as a plain `Float` -- no source literal preserved.
+    // trailing-dot mantissa (`1.`) reaches `from_number_bytes`.
     //
-    // `1.` matches real jq (`[1.]` -> `[1]`, jq 1.7.1). `1.e999` does *not*:
-    // jq keeps the literal spelling (`[1E+999]`) where succinctly's
-    // `from_number_bytes` degrades it to an infinite `Float` and prints the
-    // clamped `JqSemantics` stand-in. That divergence is older than #1576
-    // and shared with the DOM printer (`--unbuffered` gives byte-identical
-    // output); it is pinned here as current behaviour, not endorsed --
-    // filed as #2220, which also notes that fixing it makes this test's
-    // `1.e999` rows read `1E+999` and may leave the non-finite arm below
-    // with no reachable caller at all.
+    // `1.` matches real jq (`[1.]` -> `[1]`, jq 1.7.1) via the plain-`Float`
+    // fallback -- that spelling isn't preserved by either tool. `1.e999`
+    // used to diverge the same way (degrading to an infinite `Float` and
+    // printing the clamped `JqSemantics` stand-in instead of jq's own
+    // `1E+999`), but #2220 added a third escape to `from_number_bytes`
+    // (alongside the pre-existing leading-dot/leading-zero ones) that
+    // preserves a trailing dot immediately before an exponent marker the
+    // same way, so this now matches jq exactly via the `NumberLiteral`
+    // reformatting arm below instead of the non-finite one.
     #[test]
     fn test_stream_json_number_invalid_span_float_fallback_1576() {
         for (json, expected) in [
             (&b"[1.]"[..], "[1]"),
             (&b"[-1.]"[..], "[-1]"),
-            (&b"[1.e999]"[..], "[1.7976931348623157e+308]"),
-            (&b"[-1.e999]"[..], "[-1.7976931348623157e+308]"),
+            (&b"[1.e999]"[..], "[1E+999]"),
+            (&b"[-1.e999]"[..], "[-1E+999]"),
         ] {
             let index = JsonIndex::build(json);
             let root = index.root(json);

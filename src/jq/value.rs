@@ -1537,6 +1537,36 @@ impl OwnedValue {
                 return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
             }
         }
+        // Real jq's own number reader also tolerates a trailing `.`
+        // immediately before an exponent marker (`1.e999` -> `1.0e999`,
+        // `-1.e5` -> `-1.0e5`) -- not valid per strict RFC 8259 (`frac`
+        // requires at least one digit after `.`), but real jq accepts it
+        // and, crucially, still uses the *exact* decimal value to decide
+        // how to print an out-of-range exponent: `1.e999` -> `1E+999`
+        // there, not the double-precision-clamped
+        // `1.7976931348623157e+308` a naive f64 parse produces (confirmed
+        // live against jq 1.7.1, #2220). Same pattern as the leading-dot
+        // and leading-zero escapes above: check whether inserting `0`
+        // right after the trailing `.` makes the token strictly valid,
+        // and if so, still materialize the *original* text as the literal
+        // spelling -- `Self::from_number_literal` (via `parse_i64_or_f64`)
+        // parses a trailing-dot float natively, so no separate reparse of
+        // the original text is needed here. A bare trailing `.` with no
+        // exponent (`1.`) is deliberately left alone: real jq doesn't
+        // preserve that spelling either (`[1.]` -> `[1]` on both sides),
+        // so the existing lossy fallback below already matches jq there.
+        if let Some(dot_pos) = bytes
+            .windows(2)
+            .position(|w| w[0] == b'.' && (w[1] == b'e' || w[1] == b'E'))
+        {
+            let mut fixed = Vec::with_capacity(bytes.len() + 1);
+            fixed.extend_from_slice(&bytes[..=dot_pos]);
+            fixed.push(b'0');
+            fixed.extend_from_slice(&bytes[dot_pos + 1..]);
+            if crate::json::validate::is_valid_number(&fixed) {
+                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
+            }
+        }
         let Ok(s) = core::str::from_utf8(bytes) else {
             return Self::Null;
         };
@@ -2483,6 +2513,42 @@ mod tests {
         // is set, but prefixing `0` doesn't make it strictly valid either.
         assert_eq!(OwnedValue::from_number_bytes(b"."), OwnedValue::Null);
         assert_eq!(OwnedValue::from_number_bytes(b"-."), OwnedValue::Null);
+    }
+
+    /// #2220: a trailing-dot mantissa immediately before an exponent marker
+    /// must preserve its own source spelling as a `NumberLiteral` too, the
+    /// same way the leading-dot case above does -- direct unit coverage of
+    /// `from_number_bytes`'s third escape, complementing the CLI-level
+    /// regression tests. `1.e999`'s magnitude overflows `f64`, so the
+    /// stored `NumberRepr` is `Float(INFINITY)` -- the literal text is what
+    /// makes the eventual jq-compat display (`1E+999`, not the `f64::MAX`
+    /// stand-in) correct, not this stored numeric value.
+    #[test]
+    fn test_from_number_bytes_preserves_trailing_dot_before_exponent_spelling() {
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"1.e5"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(100000.0), "1.e5".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"-1.e5"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(-100000.0), "-1.e5".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"1.e999"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1.e999".into())
+        );
+        assert_eq!(
+            OwnedValue::from_number_bytes(b"-1.e999"),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NEG_INFINITY), "-1.e999".into())
+        );
+        // A trailing dot with *no* exponent (`1.`) is untouched by this
+        // escape -- real jq doesn't preserve that spelling either (`[1.]`
+        // -> `[1]`), so it still degrades to a plain `Float` via the
+        // pre-existing fallback below, not a `NumberLiteral`.
+        assert_eq!(OwnedValue::from_number_bytes(b"1."), OwnedValue::Float(1.0));
+        // Genuinely malformed shapes (two dots) stay untouched by this
+        // escape too: the inserted `0` can't make `1.5.3` valid either way.
+        assert_eq!(OwnedValue::from_number_bytes(b"1.5.3"), OwnedValue::Null);
     }
 
     #[test]
