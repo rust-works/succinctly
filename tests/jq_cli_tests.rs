@@ -9032,6 +9032,259 @@ fn test_computed_bracket_threads_path_context_2100() -> Result<()> {
     Ok(())
 }
 
+/// Coverage-gap follow-up to [`test_computed_bracket_threads_path_context_2100`]
+/// (identified by CI patch-coverage on #2218): every escape/empty/multi-value
+/// arm of `eval_index_expr_with_path_context`/`eval_slice_expr_with_path_context`
+/// and their shared `drain_path_context_stream` classifier, not just the
+/// headline repros the original test pinned.
+///
+/// A key/slice-bound expression must be something `fold_index_key`/
+/// `fold_slice_bound` (`src/jq/parser.rs`) can't reduce to a literal, or the
+/// parser folds the bracket to `Expr::Index`/`Expr::Slice` before this file
+/// ever sees it, silently testing the *old*, pre-#2100 code path instead
+/// (live-verified while writing this test: a plain `.[0:1]`-shaped bound
+/// took that fallback and printed a stale `null` for `key` rather than
+/// exercising either new function at all). `("a","b")`/`(0,1)`-style commas
+/// and non-integer floats (`0.5`) are both fold-proof; a single bare literal
+/// in parens is not enough on its own.
+#[test]
+fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
+    // `drain_path_context_stream`'s `None`/keys.is_empty() arms: a key
+    // stream with zero outputs and no pending escape.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | .[empty] | key"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // `drain_path_context_stream`'s `Break` arm, reached via the key
+    // expression's own evaluation -- caught by the enclosing `label`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | .a | .[break $out] | key"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Index twin's target-result match: `ManyOwned` (a multi-valued
+    // target re-run per key), `None` (this key's target evaluates to
+    // nothing, but the loop must still continue for later keys, #2032),
+    // `Error`/`Break`/`Halt`/`Partial` (every target-level escape, each
+    // discarding this key's own output and returning whatever earlier
+    // keys already accumulated). `if true then 0 else 1 end` keeps the key
+    // a runtime `0` without folding to a literal `Expr::Index`.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a,.b)[if true then 0 else 1 end] | key"],
+        Some(r#"{"a":[1,2],"b":[3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n0");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[empty[(\"a\",\"b\")] | key]"], Some(r"{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[(error(\"boom\"))[(\"a\",\"b\")] | key]"],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | [(break $out)[(\"a\",\"b\")] | key]"],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[(halt)[(\"a\",\"b\")] | key]"], Some(r"{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[((1,error(\"x\")))[(\"a\",\"b\")] | key]"],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains('x'), "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "");
+
+    // A later key's own index error (indexing an array with a string)
+    // outranks nothing pending, but still exercises the keep-the-prefix
+    // `Err` arm: the first key's `key` output survives on stdout.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".arr | .[(0,\"a\")] | key"],
+        Some(r#"{"arr":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "0");
+
+    // Keys stream completes normally but carries a pending halt (#1897):
+    // both prior keys' outputs are printed before the process halts.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".[(\"a\",\"b\",halt)] | key"],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"a\"\n\"b\"");
+
+    // Slice twin's own bound resolver: an absent bound (`None`), and a
+    // conversion failure/empty stream on either side.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | .[(0,1):] | key"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "{\"start\":0,\"end\":null}\n{\"start\":1,\"end\":null}"
+    );
+
+    let (stdout, _, code) =
+        run_jq_full(&["-c", ".a | .[:(2,3)] | key"], Some(r#"{"a":[1,2,3,4]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "{\"start\":null,\"end\":2}\n{\"start\":null,\"end\":3}"
+    );
+
+    let (_, stderr, code) = run_jq_full(
+        &["-c", ".a | .[(\"x\"):(3)] | key"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("integers"), "stderr: {stderr}");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[(empty):(3)] | key"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    let (_, stderr, code) = run_jq_full(
+        &["-c", ".a | .[(0):(\"x\")] | key"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("integers"), "stderr: {stderr}");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[(0):(empty)] | key"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Slice twin's own target-result match -- same six escape/multi-value
+    // arms as the index twin above, but through `eval_slice_expr_with_
+    // path_context`'s independent copy. `(0.5):(1.5)` is fold-proof (a
+    // non-integer float bound never folds to `Expr::Slice`).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a,.b)[(0.5):(1.5)] | key"],
+        Some(r#"{"a":[1,2],"b":[3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "{\"start\":0.5,\"end\":1.5}\n{\"start\":0.5,\"end\":1.5}"
+    );
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[empty[(0.5):(1.5)] | key]"], Some(r"{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
+
+    let (_, stderr, code) =
+        run_jq_full(&["-c", "(error(\"boom\"))[(0.5):(1.5)] | key"], Some(r"{}"))?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "label $out | [(break $out)[(0.5):(1.5)] | key]"],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "(halt)[(0.5):(1.5)] | key"], Some(r"{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Partial-target arms discard the target's own partial prefix
+    // entirely (asymmetric with the index twin's keep-the-prefix rule --
+    // this function's own doc comment) -- so a successful `[1,2]` ahead of
+    // the escape contributes nothing to stdout.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", "(([1,2],error(\"x\")))[(0.5):(1.5)] | key"],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains('x'), "stderr: {stderr}");
+
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            "label $out | [(([1,2],break $out))[(0.5):(1.5)] | key]",
+        ],
+        Some(r"{}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "(([1,2],halt))[(0.5):(1.5)] | key"], Some(r"{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Unpaired `target_pairs` (#2100's own charged-only-where-read
+    // optimization): the bracket's local `rest` is empty (nothing chains
+    // after it *within this branch*), even though a comma sibling (`key`)
+    // is what put the whole expression through path-context evaluation.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (.[(0,1):(3)], key)"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[1,2,3]\n[2,3]\n\"a\"");
+
+    // `rest`'s own escape mid-loop over `(s, e, t)` triples: the first
+    // `(start, end)` combination's `key` output survives before `error`
+    // aborts the second.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", ".a | .[(0,1):(3)] | key, error(\"x\")"],
+        Some(r#"{"a":[1,2,3,4]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert!(stderr.contains('x'), "stderr: {stderr}");
+
+    // `Ok(None)` from `slice_owned_value_read`: an optional (`?`) slice of
+    // a non-container target silently contributes nothing.
+    let (stdout, _, code) = run_jq_full(&["-c", ".[(0,1):(3)]? | key"], Some("1"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+
+    // Mid-loop `Err` discards whatever this call already accumulated
+    // (unlike the index twin): the first target ([2,3], sliceable)
+    // succeeds, but the second (a bare number, not sliceable) errors, and
+    // neither's `key` output reaches stdout.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(([2,3],1))[(0.5):(1.5)] | key"], Some(r"{}"))?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "");
+
+    // Final `bounds_escape` arm: the loop over every `(s, e, t)` triple
+    // completes normally, but the start-bound stream itself carried a
+    // pending halt after two successful values.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | .[(0,1,halt):(3)] | key"],
+        Some(r#"{"a":[10,20,30,40]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        "{\"start\":0,\"end\":3}\n{\"start\":1,\"end\":3}"
+    );
+
+    Ok(())
+}
+
 /// `keys_unsorted` stays lazy through `length`/`.[]`/`.[n]`/`first`/`last`
 /// (#140), backed by a new `JqValue::LazyKeysArray` output writer in
 /// `print_json`. Uses `run_jq_full` (the pre-built binary) to exercise that
