@@ -29823,25 +29823,36 @@ fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
 #[test]
 fn test_modulemeta_always_errors_like_jq_2111() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta"], Some("null"))?;
-    assert_eq!(stdout, "", "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("modulemeta input module name must be a string"),
-        "stderr: {stderr:?}"
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <stdin>:0): modulemeta input module name must be a string\n"
     );
     assert_eq!(code, 5);
 
     let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta"], Some(r#""foo""#))?;
-    assert_eq!(stdout, "", "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("module not found: foo"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "jq: error (at <stdin>:0): module not found: foo\n");
     assert_eq!(code, 5);
 
     // `?` suppresses both -- ordinary errors, not decode failures (#1620).
     let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta?"], Some("null"))?;
     assert_eq!(stdout, "", "stderr: {stderr:?}");
     assert_eq!(code, 0, "stderr: {stderr:?}");
+
+    // `-n` (null-input) is a genuinely separate dispatch path -- it bypasses
+    // stdin/JsonIndex construction entirely rather than merely feeding `.` a
+    // literal `null`. The old (pre-#2111) version of this test reached
+    // `modulemeta` this way; keep that path covered too, not just stdin-fed
+    // evaluation above. `-n` has no stdin source, so jq's own location tag
+    // is `<unknown>`, not `<stdin>`.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "modulemeta"], None)?;
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr,
+        "jq: error (at <unknown>): modulemeta input module name must be a string\n"
+    );
+    assert_eq!(code, 5);
 
     Ok(())
 }

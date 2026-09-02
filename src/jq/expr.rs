@@ -1177,8 +1177,10 @@ pub enum Builtin {
     BSearch(Box<Expr>),
 
     // Phase 10: Object functions
-    /// `modulemeta` - get module metadata for the input module name (stub
-    /// for compatibility). Real jq's builtin is arity 0, not arity 1 (#2035).
+    /// `modulemeta` - get module metadata for the input module name. Real
+    /// jq's builtin is arity 0, not arity 1 (#2035), and always errors --
+    /// succinctly has no real module system to describe, and matches that
+    /// behavior rather than stubbing it out (#2111).
     ModuleMeta,
     /// `pick(keys)` - select only specified keys from object/array (yq)
     Pick(Box<Expr>),
